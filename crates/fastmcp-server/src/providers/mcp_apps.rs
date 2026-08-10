@@ -8,7 +8,10 @@ use std::fmt;
 
 use fastmcp_core::{McpContext, McpResult};
 use fastmcp_protocol::common_types::AbsoluteUri;
-use fastmcp_protocol::{FinalResource, MCP_APPS_HTML_MIME_TYPE, Resource, ResourceContent};
+use fastmcp_protocol::{
+    FinalResource, MCP_APPS_HTML_MIME_TYPE, McpAppsMetadataError, McpAppsResourceMetadata,
+    Resource, ResourceContent,
+};
 
 use crate::ResourceHandler;
 
@@ -19,6 +22,7 @@ pub struct McpAppsUiResource {
     name: String,
     description: Option<String>,
     html: String,
+    apps_metadata: Option<McpAppsResourceMetadata>,
 }
 
 impl McpAppsUiResource {
@@ -40,6 +44,7 @@ impl McpAppsUiResource {
             name,
             description: None,
             html: html.into(),
+            apps_metadata: None,
         })
     }
 
@@ -48,6 +53,23 @@ impl McpAppsUiResource {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = Some(description.into());
         self
+    }
+
+    /// Adds typed final-only Apps rendering metadata for this View.
+    ///
+    /// The supplied CSP, sandbox permissions, and host view domain are
+    /// validated before this resource can be registered. This metadata is
+    /// never projected into exact MCP 2024-11-05 discovery or reads.
+    pub fn with_apps_metadata(
+        mut self,
+        metadata: McpAppsResourceMetadata,
+    ) -> Result<Self, McpAppsUiResourceError> {
+        let metadata = validated_apps_metadata(metadata)?;
+        metadata.to_open_metadata().map_err(|_| {
+            McpAppsUiResourceError::InvalidMetadata(McpAppsMetadataError::InvalidResourceMetadata)
+        })?;
+        self.apps_metadata = Some(metadata);
+        Ok(self)
     }
 
     /// Returns the exact final catalog entry published for this document.
@@ -62,7 +84,13 @@ impl McpAppsUiResource {
             mime_type: Some(MCP_APPS_HTML_MIME_TYPE.to_owned()),
             size: None,
             annotations: None,
-            meta: None,
+            meta: self.apps_metadata.as_ref().map_or(None, |metadata| {
+                Some(
+                    metadata
+                        .to_open_metadata()
+                        .expect("validated MCP Apps resource metadata serializes"),
+                )
+            }),
         }
     }
 
@@ -108,6 +136,8 @@ pub enum McpAppsUiResourceError {
     UriMustUseUiPrefix,
     /// A resource needs a stable non-empty catalog name.
     EmptyName,
+    /// Typed Apps rendering metadata did not satisfy its closed validation rules.
+    InvalidMetadata(McpAppsMetadataError),
 }
 
 impl fmt::Display for McpAppsUiResourceError {
@@ -117,11 +147,26 @@ impl fmt::Display for McpAppsUiResourceError {
                 formatter.write_str("MCP Apps UI resource URI must start with ui://")
             }
             Self::EmptyName => formatter.write_str("MCP Apps UI resource name must not be empty"),
+            Self::InvalidMetadata(error) => {
+                write!(formatter, "MCP Apps UI resource metadata: {error}")
+            }
         }
     }
 }
 
 impl std::error::Error for McpAppsUiResourceError {}
+
+fn validated_apps_metadata(
+    metadata: McpAppsResourceMetadata,
+) -> Result<McpAppsResourceMetadata, McpAppsUiResourceError> {
+    McpAppsResourceMetadata::try_new(
+        metadata.csp,
+        metadata.permissions,
+        metadata.domain,
+        metadata.prefers_border,
+    )
+    .map_err(McpAppsUiResourceError::InvalidMetadata)
+}
 
 #[cfg(test)]
 mod tests {
@@ -129,8 +174,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use fastmcp_core::{Cx, McpContext, McpErrorCode, SessionState};
-    use fastmcp_protocol::ReadResourceParams;
     use fastmcp_protocol::common_types::AbsoluteUri;
+    use fastmcp_protocol::{
+        McpAppsResourceCsp, McpAppsResourceMetadata, McpAppsResourcePermission,
+        McpAppsResourcePermissions, ReadResourceParams,
+    };
 
     use super::*;
     use crate::{DuplicateBehavior, Router};
@@ -171,6 +219,96 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ui_resource_publishes_typed_apps_csp_permissions_and_domain_metadata() {
+        let metadata = McpAppsResourceMetadata::try_new(
+            Some(
+                McpAppsResourceCsp::try_new(
+                    Some(vec!["https://api.weather.example".to_owned()]),
+                    None,
+                    None,
+                    None,
+                )
+                .expect("bounded CSP is valid"),
+            ),
+            Some(McpAppsResourcePermissions {
+                geolocation: Some(McpAppsResourcePermission::default()),
+                ..McpAppsResourcePermissions::default()
+            }),
+            Some("weather-view.host.example".to_owned()),
+            Some(true),
+        )
+        .expect("typed Apps metadata is valid");
+        let resource = McpAppsUiResource::try_new(
+            AbsoluteUri::parse("ui://weather/dashboard").expect("valid ui URI"),
+            "weather-dashboard",
+            "<main>weather</main>",
+        )
+        .expect("ui resource configuration is valid")
+        .with_apps_metadata(metadata)
+        .expect("typed Apps metadata is accepted");
+
+        let metadata = resource
+            .final_catalog_entry()
+            .mcp_apps_metadata()
+            .expect("published metadata remains closed and typed")
+            .expect("Apps resource publishes its presentation metadata");
+        assert_eq!(
+            metadata.domain.as_deref(),
+            Some("weather-view.host.example")
+        );
+        assert_eq!(metadata.prefers_border, Some(true));
+        assert!(
+            metadata
+                .permissions
+                .as_ref()
+                .and_then(|permissions| permissions.geolocation.as_ref())
+                .is_some()
+        );
+        assert_eq!(
+            metadata
+                .csp
+                .as_ref()
+                .and_then(|csp| csp.connect_domains.as_deref()),
+            Some(["https://api.weather.example".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn changing_only_the_apps_domain_to_empty_rejects_metadata_without_catalog_mutation() {
+        let accepted = McpAppsResourceMetadata::try_new(
+            None,
+            None,
+            Some("weather-view.host.example".to_owned()),
+            None,
+        )
+        .expect("non-empty domain is valid");
+        let planted = McpAppsResourceMetadata {
+            domain: Some(String::new()),
+            ..accepted.clone()
+        };
+        let resource = McpAppsUiResource::try_new(
+            AbsoluteUri::parse("ui://weather/dashboard").expect("valid ui URI"),
+            "weather-dashboard",
+            "<main>weather</main>",
+        )
+        .expect("ui resource configuration is valid");
+        let catalog_before = resource.final_catalog_entry();
+
+        assert_eq!(
+            resource
+                .clone()
+                .with_apps_metadata(planted)
+                .expect_err("only an empty domain makes the typed metadata invalid"),
+            McpAppsUiResourceError::InvalidMetadata(McpAppsMetadataError::InvalidDomain)
+        );
+        assert_eq!(
+            resource.final_catalog_entry().meta,
+            catalog_before.meta,
+            "rejected metadata cannot alter the published final catalog entry"
+        );
+    }
+
     struct CountingUiResource {
         inner: McpAppsUiResource,
         reads: Arc<AtomicUsize>,
@@ -205,7 +343,7 @@ mod tests {
         };
         let mut router = Router::new();
         router
-            .add_final_resource_with_behavior(resource, DuplicateBehavior::Error)
+            .add_mcp_apps_ui_resource_with_behavior(resource, DuplicateBehavior::Error)
             .expect("final-only UI resource registers");
 
         let state = SessionState::new();

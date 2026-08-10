@@ -10,7 +10,7 @@ use fastmcp_console::stats::ServerStats;
 use fastmcp_core::McpResult;
 use fastmcp_protocol::extensions::{
     ExtensionSettingsCompatibilityResolver, official_mcp_apps_extension_id,
-    validate_official_mcp_apps_server_settings,
+    validate_official_mcp_apps_descriptor, validate_official_mcp_apps_server_settings,
 };
 use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy};
 use fastmcp_protocol::{
@@ -27,9 +27,9 @@ use crate::providers::McpAppsUiResource;
 #[cfg(test)]
 use crate::proxy::ProxyFinalCatalog;
 use crate::proxy::{
-    ProxyFinalTaskRelay, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
-    ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
-    ProxyTypedCatalog,
+    ProxyCompletionHandler, ProxyFinalTaskRelay, ProxyPromptCatalog, ProxyPromptHandler,
+    ProxyResourceCatalog, ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+    ProxyToolHandler, ProxyTypedCatalog,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;
@@ -466,27 +466,66 @@ impl ServerBuilder {
         Ok(self)
     }
 
+    /// Returns whether this destination owns an active, exact official Apps
+    /// capability configuration. Merely advertising the official identifier
+    /// is insufficient: the frozen descriptor, local enablement, and exact
+    /// empty server settings must all be present.
+    fn has_active_official_mcp_apps(&self) -> bool {
+        let apps_id = official_mcp_apps_extension_id();
+        self.extension_runtime.as_ref().is_some_and(|runtime| {
+            runtime.local_enablement.is_enabled(&apps_id)
+                && runtime
+                    .handlers
+                    .descriptor_registry()
+                    .descriptor(&apps_id)
+                    .is_some_and(|descriptor| {
+                        validate_official_mcp_apps_descriptor(descriptor).is_ok()
+                    })
+                && runtime
+                    .server_discovery
+                    .extensions
+                    .get(&apps_id)
+                    .is_some_and(|settings| {
+                        validate_official_mcp_apps_server_settings(settings).is_ok()
+                    })
+        })
+    }
+
     /// Registers one final-only `ui://` HTML document for a negotiated MCP Apps View.
     ///
     /// This resource is deliberately absent from exact MCP 2024-11-05
     /// discovery and reads. Call [`Self::mcp_apps`] first so the server also
     /// advertises the matching modern bilateral extension capability.
     pub fn mcp_apps_ui_resource(mut self, resource: McpAppsUiResource) -> McpResult<Self> {
-        let apps_id = official_mcp_apps_extension_id();
-        let configured = self
-            .extension_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.server_discovery.extensions.contains_key(&apps_id));
-        if !configured {
+        if !self.has_active_official_mcp_apps() {
             return Err(fastmcp_core::McpError::invalid_request(
                 "MCP Apps UI resources require ServerBuilder::mcp_apps first",
             ));
         }
         self.router
-            .add_final_resource_with_behavior(resource, self.on_duplicate)?;
+            .add_mcp_apps_ui_resource_with_behavior(resource, self.on_duplicate)?;
         self.capabilities
             .resources
             .get_or_insert_with(ResourcesCapability::default);
+        Ok(self)
+    }
+
+    /// Registers a tool with final-only MCP Apps metadata.
+    ///
+    /// Register the linked [`McpAppsUiResource`] first. The router validates
+    /// the tool's typed `_meta.ui.resourceUri` against that exact final Apps
+    /// HTML resource before either tool catalog is changed. Unlike
+    /// [`Self::tool`], this Apps-specific entry point returns the registration
+    /// failure directly.
+    pub fn mcp_apps_tool<H: ToolHandler + 'static>(mut self, handler: H) -> McpResult<Self> {
+        if !self.has_active_official_mcp_apps() {
+            return Err(fastmcp_core::McpError::invalid_request(
+                "MCP Apps tools require ServerBuilder::mcp_apps first",
+            ));
+        }
+        self.router
+            .add_mcp_apps_tool_with_behavior(handler, self.on_duplicate)?;
+        self.capabilities.tools = Some(ToolsCapability::default());
         Ok(self)
     }
 
@@ -797,6 +836,27 @@ impl ServerBuilder {
         self
     }
 
+    /// Returns whether this proxy registration will own the exact prompt
+    /// target after the configured duplicate policy is applied.
+    ///
+    /// Router registration intentionally returns `Ok(())` when `Warn` or
+    /// `Ignore` retains an existing target. Completion providers must not use
+    /// that successful no-op as authorization to bind an upstream to the
+    /// retained local target.
+    fn proxy_prompt_wins_admission(&self, name: &str) -> bool {
+        self.router.get_prompt(name).is_none() || self.on_duplicate == DuplicateBehavior::Replace
+    }
+
+    /// Returns whether this proxy registration will own the exact resource
+    /// template target after the configured duplicate policy is applied.
+    ///
+    /// See [`Self::proxy_prompt_wins_admission`] for why `Ok(())` alone is
+    /// insufficient for proxy completion binding.
+    fn proxy_resource_template_wins_admission(&self, uri_template: &str) -> bool {
+        self.router.get_resource_template(uri_template).is_none()
+            || self.on_duplicate == DuplicateBehavior::Replace
+    }
+
     /// Registers proxy handlers for a remote MCP server.
     ///
     /// Use [`ProxyCatalog::from_client`] or [`ProxyClient::catalog`] to fetch
@@ -811,7 +871,28 @@ impl ServerBuilder {
             );
             return self;
         }
-
+        let catalog_era = match catalog.era() {
+            Ok(era) => era,
+            Err(error) => {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Rejected proxied catalog without one exact era; code={:?}",
+                    error.code
+                );
+                return self;
+            }
+        };
+        let completion_supported = match client.supports_completion() {
+            Ok(supported) => supported,
+            Err(error) => {
+                log::error!(
+                    target: "fastmcp_rust::builder",
+                    "Failed to determine proxied completion support; code={:?}",
+                    error.code
+                );
+                false
+            }
+        };
         // Preserve the existing legacy capability behavior. Exact-final tools
         // contribute only after immutable final registration succeeds.
         let has_tools = !catalog.tools.is_empty();
@@ -875,28 +956,63 @@ impl ServerBuilder {
         }
 
         for template in catalog.resource_templates {
-            if let Err(error) = self.router.add_legacy_resource_with_behavior(
+            let downstream_uri = template.uri_template.clone();
+            let completion_target_admitted =
+                self.proxy_resource_template_wins_admission(&downstream_uri);
+            match self.router.add_legacy_resource_with_behavior(
                 ProxyResourceHandler::from_template(template, client.clone()),
                 self.on_duplicate,
             ) {
-                log::error!(
-                    target: "fastmcp_rust::builder",
-                    "Failed to register proxied resource template; code={:?}",
-                    error.code
-                );
+                Ok(()) if completion_target_admitted => {
+                    if completion_supported && catalog_era == ProtocolEra::Legacy2024 {
+                        self.router.add_legacy_resource_template_completion_handler(
+                            downstream_uri.clone(),
+                            ProxyCompletionHandler::for_resource_template(
+                                client.clone(),
+                                downstream_uri.clone(),
+                                downstream_uri,
+                            ),
+                        );
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    log::error!(
+                        target: "fastmcp_rust::builder",
+                        "Failed to register proxied resource template; code={:?}",
+                        error.code
+                    );
+                }
             }
         }
 
         for prompt in catalog.prompts {
-            if let Err(error) = self.router.add_legacy_prompt_with_behavior(
+            let downstream_name = prompt.name.clone();
+            let completion_target_admitted = self.proxy_prompt_wins_admission(&downstream_name);
+            match self.router.add_legacy_prompt_with_behavior(
                 ProxyPromptHandler::new(prompt, client.clone()),
                 self.on_duplicate,
             ) {
-                log::error!(
-                    target: "fastmcp_rust::builder",
-                    "Failed to register proxied prompt; code={:?}",
-                    error.code
-                );
+                Ok(()) if completion_target_admitted => {
+                    if completion_supported && catalog_era == ProtocolEra::Legacy2024 {
+                        self.router.add_legacy_prompt_completion_handler(
+                            downstream_name.clone(),
+                            ProxyCompletionHandler::for_prompt(
+                                client.clone(),
+                                downstream_name.clone(),
+                                downstream_name,
+                            ),
+                        );
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    log::error!(
+                        target: "fastmcp_rust::builder",
+                        "Failed to register proxied prompt; code={:?}",
+                        error.code
+                    );
+                }
             }
         }
 
@@ -914,28 +1030,67 @@ impl ServerBuilder {
         }
 
         for template in catalog.final_resource_templates {
-            if let Err(error) = self.router.add_final_resource_with_behavior(
+            let downstream_uri = template.uri_template.clone();
+            let completion_target_admitted =
+                self.proxy_resource_template_wins_admission(&downstream_uri);
+            match self.router.add_final_resource_with_behavior(
                 FinalProxyResourceTemplateHandler::new(template, client.clone()),
                 self.on_duplicate,
             ) {
-                log::error!(
-                    target: "fastmcp_rust::builder",
-                    "Failed to register exact-final proxied resource template; code={:?}",
-                    error.code
-                );
+                Ok(())
+                    if completion_target_admitted
+                        && completion_supported
+                        && catalog_era == ProtocolEra::Modern2026 =>
+                {
+                    self.router.add_resource_template_completion_handler(
+                        downstream_uri.clone(),
+                        ProxyCompletionHandler::for_resource_template(
+                            client.clone(),
+                            downstream_uri.clone(),
+                            downstream_uri,
+                        ),
+                    );
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    log::error!(
+                        target: "fastmcp_rust::builder",
+                        "Failed to register exact-final proxied resource template; code={:?}",
+                        error.code
+                    );
+                }
             }
         }
 
         for prompt in catalog.final_prompts {
-            if let Err(error) = self.router.add_final_prompt_with_behavior(
+            let downstream_name = prompt.name.clone();
+            let completion_target_admitted = self.proxy_prompt_wins_admission(&downstream_name);
+            match self.router.add_final_prompt_with_behavior(
                 FinalProxyPromptHandler::new(prompt, client.clone()),
                 self.on_duplicate,
             ) {
-                log::error!(
-                    target: "fastmcp_rust::builder",
-                    "Failed to register exact-final proxied prompt; code={:?}",
-                    error.code
-                );
+                Ok(())
+                    if completion_target_admitted
+                        && completion_supported
+                        && catalog_era == ProtocolEra::Modern2026 =>
+                {
+                    self.router.add_prompt_completion_handler(
+                        downstream_name.clone(),
+                        ProxyCompletionHandler::for_prompt(
+                            client.clone(),
+                            downstream_name.clone(),
+                            downstream_name,
+                        ),
+                    );
+                }
+                Ok(()) => {}
+                Err(error) => {
+                    log::error!(
+                        target: "fastmcp_rust::builder",
+                        "Failed to register exact-final proxied prompt; code={:?}",
+                        error.code
+                    );
+                }
             }
         }
 
@@ -990,6 +1145,7 @@ impl ServerBuilder {
     ) -> Result<Self, fastmcp_core::McpError> {
         let proxy_client = ProxyClient::from_client(client)?;
         let catalog = proxy_client.catalog_typed()?;
+        let completion_supported = proxy_client.supports_completion()?;
         let (tool_count, resource_count, template_count, prompt_count) = match catalog {
             ProxyTypedCatalog {
                 tools: ProxyToolCatalog::Legacy(tools),
@@ -1016,6 +1172,10 @@ impl ServerBuilder {
                     )?;
                 }
                 for template in resource_templates {
+                    let upstream_uri = template.uri_template.clone();
+                    let downstream_uri = format!("{prefix}/{upstream_uri}");
+                    let completion_target_admitted =
+                        self.proxy_resource_template_wins_admission(&downstream_uri);
                     self.router.add_resource_with_behavior(
                         ProxyResourceHandler::from_template_with_prefix(
                             template,
@@ -1024,12 +1184,36 @@ impl ServerBuilder {
                         ),
                         self.on_duplicate,
                     )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_legacy_resource_template_completion_handler(
+                            downstream_uri.clone(),
+                            ProxyCompletionHandler::for_resource_template(
+                                proxy_client.clone(),
+                                downstream_uri,
+                                upstream_uri,
+                            ),
+                        );
+                    }
                 }
                 for prompt in prompts {
+                    let upstream_name = prompt.name.clone();
+                    let downstream_name = format!("{prefix}/{upstream_name}");
+                    let completion_target_admitted =
+                        self.proxy_prompt_wins_admission(&downstream_name);
                     self.router.add_prompt_with_behavior(
                         ProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_legacy_prompt_completion_handler(
+                            downstream_name.clone(),
+                            ProxyCompletionHandler::for_prompt(
+                                proxy_client.clone(),
+                                downstream_name,
+                                upstream_name,
+                            ),
+                        );
+                    }
                 }
                 counts
             }
@@ -1052,10 +1236,24 @@ impl ServerBuilder {
                     )?;
                 }
                 for prompt in prompts {
+                    let upstream_name = prompt.name.clone();
+                    let downstream_name = format!("{prefix}/{upstream_name}");
+                    let completion_target_admitted =
+                        self.proxy_prompt_wins_admission(&downstream_name);
                     self.router.add_final_prompt_with_behavior(
                         FinalProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_prompt_completion_handler(
+                            downstream_name.clone(),
+                            ProxyCompletionHandler::for_prompt(
+                                proxy_client.clone(),
+                                downstream_name,
+                                upstream_name,
+                            ),
+                        );
+                    }
                 }
                 counts
             }
@@ -1158,6 +1356,7 @@ impl ServerBuilder {
                 "proxy typed catalog era contradicts its immutable upstream route",
             ));
         }
+        let completion_supported = proxy_client.supports_completion()?;
         let task_relay = if catalog_era == ProtocolEra::Modern2026 {
             proxy_client.final_tasks_relay()?
         } else {
@@ -1209,16 +1408,42 @@ impl ServerBuilder {
                     )?;
                 }
                 for template in resource_templates {
+                    let downstream_uri = template.uri_template.clone();
+                    let completion_target_admitted =
+                        self.proxy_resource_template_wins_admission(&downstream_uri);
                     self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::from_template(template, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_legacy_resource_template_completion_handler(
+                            downstream_uri.clone(),
+                            ProxyCompletionHandler::for_resource_template(
+                                proxy_client.clone(),
+                                downstream_uri.clone(),
+                                downstream_uri,
+                            ),
+                        );
+                    }
                 }
                 for prompt in prompts {
+                    let downstream_name = prompt.name.clone();
+                    let completion_target_admitted =
+                        self.proxy_prompt_wins_admission(&downstream_name);
                     self.router.add_legacy_prompt_with_behavior(
                         ProxyPromptHandler::new(prompt, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_legacy_prompt_completion_handler(
+                            downstream_name.clone(),
+                            ProxyCompletionHandler::for_prompt(
+                                proxy_client.clone(),
+                                downstream_name.clone(),
+                                downstream_name,
+                            ),
+                        );
+                    }
                 }
                 if has_tools {
                     self.capabilities.tools = Some(ToolsCapability::default());
@@ -1257,16 +1482,42 @@ impl ServerBuilder {
                     )?;
                 }
                 for template in resource_templates {
+                    let downstream_uri = template.uri_template.clone();
+                    let completion_target_admitted =
+                        self.proxy_resource_template_wins_admission(&downstream_uri);
                     self.router.add_final_resource_with_behavior(
                         FinalProxyResourceTemplateHandler::new(template, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_resource_template_completion_handler(
+                            downstream_uri.clone(),
+                            ProxyCompletionHandler::for_resource_template(
+                                proxy_client.clone(),
+                                downstream_uri.clone(),
+                                downstream_uri,
+                            ),
+                        );
+                    }
                 }
                 for prompt in prompts {
+                    let downstream_name = prompt.name.clone();
+                    let completion_target_admitted =
+                        self.proxy_prompt_wins_admission(&downstream_name);
                     self.router.add_final_prompt_with_behavior(
                         FinalProxyPromptHandler::new(prompt, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_prompt_completion_handler(
+                            downstream_name.clone(),
+                            ProxyCompletionHandler::for_prompt(
+                                proxy_client.clone(),
+                                downstream_name.clone(),
+                                downstream_name,
+                            ),
+                        );
+                    }
                 }
             }
             _ => {
@@ -1317,6 +1568,14 @@ impl ServerBuilder {
     /// the failure is logged and fluent builder construction continues.
     #[must_use]
     pub fn mount(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
+            log::error!(
+                target: "fastmcp_rust::mount",
+                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
+            );
+            return self;
+        }
+
         let has_tools = server.has_tools();
         let has_resources = server.has_resources();
         let has_prompts = server.has_prompts();
@@ -1372,6 +1631,14 @@ impl ServerBuilder {
     /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate).
     #[must_use]
     pub fn mount_tools(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
+            log::error!(
+                target: "fastmcp_rust::mount",
+                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
+            );
+            return self;
+        }
+
         let source_router = server.into_router();
         let result =
             self.router
@@ -1416,6 +1683,14 @@ impl ServerBuilder {
     /// both static resources and resource templates.
     #[must_use]
     pub fn mount_resources(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
+            log::error!(
+                target: "fastmcp_rust::mount",
+                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
+            );
+            return self;
+        }
+
         let source_router = server.into_router();
         let result =
             self.router
@@ -1869,13 +2144,13 @@ mod tests {
     use super::*;
     use asupersync::Cx;
     use fastmcp_core::{McpContext, McpResult};
-    use fastmcp_protocol::common_types::{ContentBlock, Implementation};
+    use fastmcp_protocol::common_types::{AbsoluteUri, ContentBlock, Implementation};
     use fastmcp_protocol::extensions::ExtensionNegotiationError;
     use fastmcp_protocol::protocol_policy::{ProtocolEra, ProtocolPolicy, StdioOpeningFrame};
     use fastmcp_protocol::{
         CallToolResult, CompleteResult, Content, CoreResult, FinalCallToolResult, FinalCoreResult,
-        JsonRpcRequest, LegacyContent, LegacyCoreResult, Prompt, Resource, ResourceContent,
-        ResultMeta, Tool,
+        FinalTool, JsonRpcRequest, LegacyContent, LegacyCoreResult, Prompt, Resource,
+        ResourceContent, ResultMeta, Tool,
     };
 
     // ── Stub handlers ────────────────────────────────────────────────
@@ -1917,6 +2192,83 @@ mod tests {
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
             Ok(vec![Content::text("legacy")])
         }
+    }
+
+    struct MountedAppsTool;
+
+    impl crate::ToolHandler for MountedAppsTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "mounted_apps_tool".to_owned(),
+                description: Some("final-only Apps mount fixture".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn final_definition(&self) -> Option<FinalTool> {
+            let metadata = fastmcp_protocol::McpAppsToolMetadata::try_new(
+                Some(
+                    AbsoluteUri::parse("ui://mount/dashboard")
+                        .expect("fixed Apps mount URI is valid"),
+                ),
+                None,
+            )
+            .expect("fixed Apps mount metadata is valid")
+            .to_open_metadata()
+            .expect("fixed Apps mount metadata serializes");
+            Some(FinalTool {
+                name: "mounted_apps_tool".to_owned(),
+                title: None,
+                description: Some("final-only Apps mount fixture".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: Some(metadata),
+            })
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("Apps mount fixture")])
+        }
+    }
+
+    fn apps_mount_child() -> crate::Server {
+        let resource = McpAppsUiResource::try_new(
+            AbsoluteUri::parse("ui://mount/dashboard").expect("fixed Apps mount URI is valid"),
+            "mounted-apps-dashboard",
+            "<main>Apps mount fixture</main>",
+        )
+        .expect("fixed Apps mount resource is valid");
+        ServerBuilder::new("apps-child", "1.0")
+            .mcp_apps()
+            .expect("child Apps extension installs")
+            .mcp_apps_ui_resource(resource)
+            .expect("child Apps resource registers")
+            .mcp_apps_tool(MountedAppsTool)
+            .expect("child Apps tool registers")
+            .build()
+    }
+
+    fn apps_resource_bound_tool_mount_child() -> crate::Server {
+        let resource = McpAppsUiResource::try_new(
+            AbsoluteUri::parse("ui://mount/dashboard").expect("fixed Apps mount URI is valid"),
+            "mounted-apps-dashboard",
+            "<main>Apps mount fixture</main>",
+        )
+        .expect("fixed Apps mount resource is valid");
+        ServerBuilder::new("apps-resource-child", "1.0")
+            .mcp_apps()
+            .expect("child Apps extension installs")
+            .mcp_apps_ui_resource(resource)
+            .expect("child Apps resource registers")
+            .tool(TestTool)
+            .build()
     }
 
     struct TestResource;
@@ -2679,6 +3031,14 @@ mod tests {
     }
 
     #[test]
+    fn builder_mcp_apps_tool_requires_apps_opt_in() {
+        let error = ServerBuilder::new("srv", "1.0")
+            .mcp_apps_tool(TestTool)
+            .expect_err("Apps tools must not register before Apps negotiation is configured");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+    }
+
+    #[test]
     fn builder_legacy_tool_is_explicit_and_does_not_claim_modern_tools() {
         let server = ServerBuilder::new("srv", "1.0")
             .legacy_tool(ExactLegacyOnlyTool)
@@ -3033,6 +3393,157 @@ mod tests {
     }
 
     #[test]
+    fn builder_mount_rejects_apps_bound_child_without_apps_opt_in_atomically() {
+        let main = ServerBuilder::new("main", "1.0")
+            .tool(TestTool)
+            .resource(TestResource)
+            .mount(apps_mount_child(), None)
+            .build();
+
+        assert!(main.has_tools());
+        assert!(main.has_resources());
+        assert!(
+            main.extension_registry_receipt().is_none(),
+            "rejecting a child must not adopt its Apps extension runtime"
+        );
+
+        let router = main.into_router();
+        assert_eq!(router.tools_count(), 1, "the rejected child adds no tools");
+        assert_eq!(
+            router.resources_count(),
+            1,
+            "the rejected child adds no resources"
+        );
+    }
+
+    #[test]
+    fn builder_mount_accepts_apps_bound_child_with_active_apps_opt_in() {
+        let main = ServerBuilder::new("main", "1.0")
+            .mcp_apps()
+            .expect("parent Apps extension installs")
+            .mount(apps_mount_child(), None)
+            .build();
+
+        assert!(main.has_tools());
+        assert!(main.has_resources());
+        assert_eq!(
+            main.extension_registry_receipt()
+                .expect("parent retains its Apps extension runtime")
+                .descriptor_count(),
+            1,
+            "mounting does not transfer or merge the child extension runtime"
+        );
+
+        let router = main.into_router();
+        assert_eq!(router.tools_count(), 1);
+        assert_eq!(router.resources_count(), 1);
+    }
+
+    #[test]
+    fn builder_mount_tools_rejects_apps_bound_child_without_apps_opt_in_atomically() {
+        let main = ServerBuilder::new("main", "1.0")
+            .resource(TestResource)
+            .mount_tools(apps_resource_bound_tool_mount_child(), None)
+            .build();
+
+        assert!(!main.has_tools());
+        assert!(main.has_resources());
+        assert!(
+            main.extension_registry_receipt().is_none(),
+            "rejecting a child must not adopt its Apps extension runtime"
+        );
+
+        let router = main.into_router();
+        assert_eq!(router.tools_count(), 0, "the rejected child adds no tools");
+        assert_eq!(
+            router.resources_count(),
+            1,
+            "the rejected child leaves existing destination resources unchanged"
+        );
+    }
+
+    #[test]
+    fn builder_mount_tools_accepts_apps_bound_child_with_active_apps_opt_in() {
+        let resource = McpAppsUiResource::try_new(
+            AbsoluteUri::parse("ui://mount/dashboard").expect("fixed Apps mount URI is valid"),
+            "mounted-apps-dashboard",
+            "<main>Apps mount fixture</main>",
+        )
+        .expect("fixed Apps mount resource is valid");
+        let main = ServerBuilder::new("main", "1.0")
+            .mcp_apps()
+            .expect("parent Apps extension installs")
+            .mcp_apps_ui_resource(resource)
+            .expect("parent Apps resource registers")
+            .mount_tools(apps_mount_child(), None)
+            .build();
+
+        assert!(main.has_tools());
+        assert!(main.has_resources());
+        assert_eq!(
+            main.extension_registry_receipt()
+                .expect("parent retains its Apps extension runtime")
+                .descriptor_count(),
+            1,
+            "mounting does not transfer or merge the child extension runtime"
+        );
+
+        let router = main.into_router();
+        assert_eq!(router.tools_count(), 1);
+        assert_eq!(router.resources_count(), 1);
+    }
+
+    #[test]
+    fn builder_mount_resources_rejects_apps_bound_child_without_apps_opt_in_atomically() {
+        let main = ServerBuilder::new("main", "1.0")
+            .tool(TestTool)
+            .mount_resources(apps_mount_child(), None)
+            .build();
+
+        assert!(main.has_tools());
+        assert!(!main.has_resources());
+        assert!(
+            main.extension_registry_receipt().is_none(),
+            "rejecting a child must not adopt its Apps extension runtime"
+        );
+
+        let router = main.into_router();
+        assert_eq!(
+            router.tools_count(),
+            1,
+            "the rejected child leaves existing destination tools unchanged"
+        );
+        assert_eq!(
+            router.resources_count(),
+            0,
+            "the rejected child adds no resources"
+        );
+    }
+
+    #[test]
+    fn builder_mount_resources_accepts_apps_bound_child_with_active_apps_opt_in() {
+        let main = ServerBuilder::new("main", "1.0")
+            .mcp_apps()
+            .expect("parent Apps extension installs")
+            .mount_resources(apps_mount_child(), None)
+            .build();
+
+        assert!(!main.has_tools());
+        assert!(main.has_resources());
+        assert_eq!(
+            main.extension_registry_receipt()
+                .expect("parent retains its Apps extension runtime")
+                .descriptor_count(),
+            1,
+            "mounting does not transfer or merge the child extension runtime"
+        );
+
+        let router = main.into_router();
+        assert_eq!(router.tools_count(), 0);
+        assert_eq!(router.resources_count(), 1);
+    }
+
+    #[test]
     fn builder_mount_tools_only() {
         let source = ServerBuilder::new("sub", "1.0")
             .tool(TestTool)
@@ -3206,6 +3717,276 @@ mod tests {
     }
 
     // ── Proxy registration ─────────────────────────────────────────
+
+    struct CompletionProxyBackend {
+        supported: bool,
+        result: CoreResult,
+        calls: Arc<Mutex<Vec<fastmcp_client::CompletionParams>>>,
+    }
+
+    struct LocalFinalCompletionPrompt;
+
+    impl crate::PromptHandler for LocalFinalCompletionPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "final-deploy".to_owned(),
+                description: Some("local completion target".to_owned()),
+                arguments: vec![fastmcp_protocol::PromptArgument {
+                    name: "environment".to_owned(),
+                    description: None,
+                    required: false,
+                }],
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn final_definition(&self) -> Option<fastmcp_protocol::FinalPrompt> {
+            Some(fastmcp_protocol::FinalPrompt {
+                name: "final-deploy".to_owned(),
+                title: Some("Local Final Deploy".to_owned()),
+                description: Some("local completion target".to_owned()),
+                icons: None,
+                arguments: Some(vec![fastmcp_protocol::FinalPromptArgument {
+                    name: "environment".to_owned(),
+                    title: Some("Local Environment".to_owned()),
+                    description: None,
+                    required: Some(false),
+                }]),
+                meta: None,
+            })
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl crate::proxy::ProxyBackend for CompletionProxyBackend {
+        fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+            Ok(Vec::new())
+        }
+
+        fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+            Ok(Vec::new())
+        }
+
+        fn call_tool(&mut self, _: &str, _: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(Vec::new())
+        }
+
+        fn call_tool_with_progress(
+            &mut self,
+            _: &str,
+            _: serde_json::Value,
+            _: crate::proxy::ProgressCallback<'_>,
+        ) -> McpResult<Vec<Content>> {
+            Ok(Vec::new())
+        }
+
+        fn read_resource(&mut self, _: &str) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+
+        fn get_prompt(
+            &mut self,
+            _: &str,
+            _: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn supports_completion(&mut self) -> McpResult<bool> {
+            Ok(self.supported)
+        }
+
+        fn complete_result(
+            &mut self,
+            params: fastmcp_client::CompletionParams,
+        ) -> McpResult<CoreResult> {
+            self.calls
+                .lock()
+                .expect("completion proxy call log is not poisoned")
+                .push(params);
+            Ok(self.result.clone())
+        }
+    }
+
+    fn legacy_completion_proxy_catalog() -> ProxyTypedCatalog {
+        ProxyTypedCatalog {
+            tools: ProxyToolCatalog::Legacy(Vec::new()),
+            resources: ProxyResourceCatalog::Legacy(Vec::new()),
+            resource_templates: ProxyResourceTemplateCatalog::Legacy(Vec::new()),
+            prompts: ProxyPromptCatalog::Legacy(vec![Prompt {
+                name: "legacy-deploy".to_owned(),
+                description: None,
+                arguments: Vec::new(),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }]),
+        }
+    }
+
+    fn final_completion_proxy_catalog() -> ProxyTypedCatalog {
+        let prompt = serde_json::from_value(serde_json::json!({
+            "name": "final-deploy",
+            "title": "Upstream Final Deploy",
+            "arguments": [{"name": "environment", "title": "Environment"}]
+        }))
+        .expect("the final completion prompt fixture is valid");
+        ProxyTypedCatalog {
+            tools: ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+            resources: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+            resource_templates: ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(
+                Vec::new(),
+            )),
+            prompts: ProxyPromptCatalog::Final(ProxyFinalCatalog::new(vec![prompt])),
+        }
+    }
+
+    fn final_completion_proxy_template_catalog() -> ProxyTypedCatalog {
+        let template = serde_json::from_value(serde_json::json!({
+            "uriTemplate": "completion://{environment}",
+            "name": "upstream-completion-template",
+            "title": "Upstream Completion Template",
+        }))
+        .expect("the final completion resource-template fixture is valid");
+        ProxyTypedCatalog {
+            tools: ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+            resources: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+            resource_templates: ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(vec![
+                template,
+            ])),
+            prompts: ProxyPromptCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+        }
+    }
+
+    fn legacy_completion_proxy_template_catalog() -> ProxyTypedCatalog {
+        ProxyTypedCatalog {
+            tools: ProxyToolCatalog::Legacy(Vec::new()),
+            resources: ProxyResourceCatalog::Legacy(Vec::new()),
+            resource_templates: ProxyResourceTemplateCatalog::Legacy(vec![ResourceTemplate {
+                uri_template: "completion://{environment}".to_owned(),
+                name: "upstream-completion-template".to_owned(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }]),
+            prompts: ProxyPromptCatalog::Legacy(Vec::new()),
+        }
+    }
+
+    fn local_completion_template() -> ResourceTemplate {
+        ResourceTemplate {
+            uri_template: "completion://{environment}".to_owned(),
+            name: "local-completion-template".to_owned(),
+            description: Some("local completion target".to_owned()),
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn legacy_completion_proxy_result() -> CoreResult {
+        CoreResult::Legacy(LegacyCoreResult::Completion(
+            fastmcp_protocol::LegacyCompletionResult {
+                completion: fastmcp_protocol::CompletionValues {
+                    values: vec!["legacy-staging".to_owned()],
+                    total: Some(1),
+                    has_more: Some(false),
+                },
+                meta: None,
+            },
+        ))
+    }
+
+    fn final_completion_proxy_result() -> CoreResult {
+        CoreResult::Final(FinalCoreResult::Completion {
+            result: CompleteResult::new(
+                fastmcp_protocol::FinalCompletionResult {
+                    completion: fastmcp_protocol::FinalCompletionValues {
+                        values: vec!["final-staging".to_owned()],
+                        total: Some(
+                            serde_json::from_str("92233720368547758081234567890")
+                                .expect("the fixed exact completion total is a JSON integer"),
+                        ),
+                        has_more: Some(false),
+                    },
+                },
+                ResultMeta::server_generated(
+                    Implementation::try_new("completion-upstream", "1.0")
+                        .expect("the fixed completion implementation is valid"),
+                ),
+            ),
+            diagnostic: None,
+        })
+    }
+
+    fn final_completion_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "completion/complete",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {
+                    "type": "ref/prompt",
+                    "name": "final-deploy",
+                    "title": "Final Deploy",
+                },
+                "argument": {"name": "environment", "value": "sta"},
+                "context": {"arguments": {"region": "us-east-1"}},
+            })),
+            id,
+        )
+    }
+
+    fn final_resource_template_completion_request(id: i64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "completion/complete",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {
+                    "type": "ref/resource",
+                    "uri": "completion://{environment}",
+                },
+                "argument": {"name": "environment", "value": "sta"},
+            })),
+            id,
+        )
+    }
+
+    fn legacy_completion_request(id: i64, reference: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "completion/complete",
+            Some(serde_json::json!({
+                "ref": reference,
+                "argument": {"name": "environment", "value": "sta"},
+            })),
+            id,
+        )
+    }
 
     fn final_proxy_catalog() -> ProxyCatalog {
         ProxyCatalog {
@@ -3775,6 +4556,682 @@ mod tests {
                 .expect("the test call log lock is not poisoned")
                 .is_empty(),
             "the legacy-only name must be rejected before the final upstream is called"
+        );
+    }
+
+    #[test]
+    fn public_proxy_completion_forwards_exact_legacy_and_final_results() {
+        let legacy_calls = Arc::new(Mutex::new(Vec::new()));
+        let final_calls = Arc::new(Mutex::new(Vec::new()));
+        let server = ServerBuilder::new("completion-proxy", "1.0")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: legacy_completion_proxy_result(),
+                    calls: Arc::clone(&legacy_calls),
+                }),
+                legacy_completion_proxy_catalog(),
+            )
+            .expect("the exact legacy completion proxy installs")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: final_completion_proxy_result(),
+                    calls: Arc::clone(&final_calls),
+                }),
+                final_completion_proxy_catalog(),
+            )
+            .expect("the exact final completion proxy installs")
+            .build();
+
+        let mut legacy_session = initialized_legacy_proxy_session(&server);
+        let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+        let request_sender = crate::RequestSender::new(
+            Arc::new(crate::PendingRequests::new()),
+            Arc::new(|message| Err(format!("unexpected outbound message in test: {message:?}"))),
+        );
+        let legacy = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut legacy_session,
+                JsonRpcRequest::new(
+                    "completion/complete",
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "legacy-deploy"},
+                        "argument": {"name": "environment", "value": "sta"},
+                    })),
+                    821_i64,
+                ),
+                &notification_sender,
+                &request_sender,
+            )
+            .expect("the public exact-2024 completion path returns a response")
+            .result
+            .expect("the exact-2024 completion response has a result payload");
+        assert_eq!(
+            legacy["completion"]["values"],
+            serde_json::json!(["legacy-staging"])
+        );
+
+        let final_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            822,
+            crate::InboundRequestTransport::Memory,
+        );
+        let final_response = server
+            .dispatch_stateless(&final_inbound, &final_completion_request(822))
+            .expect("the public final completion path returns a response")
+            .result
+            .expect("the final completion response has a result payload");
+        assert_eq!(final_response["resultType"], "complete");
+        assert_eq!(
+            final_response["completion"]["values"],
+            serde_json::json!(["final-staging"])
+        );
+        assert_eq!(
+            final_response["completion"]["total"],
+            serde_json::json!(92233720368547758081234567890_u128),
+            "the proxy retains the final arbitrary-precision completion total"
+        );
+
+        let legacy_calls = legacy_calls
+            .lock()
+            .expect("legacy completion call log is not poisoned");
+        assert_eq!(legacy_calls.len(), 1);
+        assert!(matches!(
+            &legacy_calls[0].reference,
+            fastmcp_client::CompletionReference::Prompt { name } if name == "legacy-deploy"
+        ));
+        assert!(legacy_calls[0].context.is_none());
+        let final_calls = final_calls
+            .lock()
+            .expect("final completion call log is not poisoned");
+        assert_eq!(final_calls.len(), 1);
+        assert!(matches!(
+            &final_calls[0].reference,
+            fastmcp_client::CompletionReference::PromptWithTitle { name, title }
+                if name == "final-deploy" && title == "Final Deploy"
+        ));
+        assert_eq!(
+            final_calls[0]
+                .context
+                .as_ref()
+                .and_then(|context| context.arguments.as_ref())
+                .and_then(|arguments| arguments.get("region")),
+            Some(&"us-east-1".to_owned()),
+            "the proxy forwards final completion context unchanged"
+        );
+    }
+
+    #[test]
+    fn public_proxy_completion_unsupported_upstream_rejects_without_downstream_mutation() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let server = ServerBuilder::new("completion-proxy", "1.0")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: false,
+                    result: final_completion_proxy_result(),
+                    calls: Arc::clone(&calls),
+                }),
+                final_completion_proxy_catalog(),
+            )
+            .expect("changing only upstream completion support preserves catalog registration")
+            .build();
+        let discovery = serde_json::to_value(
+            server
+                .server_discovery()
+                .expect("the final proxy server remains discoverable"),
+        )
+        .expect("discovery serializes");
+        assert!(
+            discovery["capabilities"].get("completions").is_none(),
+            "an unsupported upstream must not create a downstream completion claim"
+        );
+
+        let before_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            823,
+            crate::InboundRequestTransport::Memory,
+        );
+        let before = server
+            .dispatch_stateless(
+                &before_inbound,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    823_i64,
+                ),
+            )
+            .expect("the proxied final prompt catalog is public before rejection")
+            .result
+            .expect("the proxied final prompt catalog has a result payload");
+        let rejected_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            824,
+            crate::InboundRequestTransport::Memory,
+        );
+        let rejected = server
+            .dispatch_stateless(&rejected_inbound, &final_completion_request(824))
+            .expect("the unsupported completion request receives a JSON-RPC error");
+        assert_eq!(
+            rejected.error.and_then(|error| error.code.as_i32()),
+            Some(-32601),
+            "the absent local completion handler rejects before an upstream call"
+        );
+        assert!(rejected.result.is_none());
+        let after_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            825,
+            crate::InboundRequestTransport::Memory,
+        );
+        let after = server
+            .dispatch_stateless(
+                &after_inbound,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    825_i64,
+                ),
+            )
+            .expect("the proxied final prompt catalog remains public after rejection")
+            .result
+            .expect("the proxied final prompt catalog still has a result payload");
+        assert_eq!(
+            before, after,
+            "the rejected request cannot mutate downstream catalog state"
+        );
+        assert!(
+            calls
+                .lock()
+                .expect("completion proxy call log is not poisoned")
+                .is_empty(),
+            "the unsupported upstream is never invoked"
+        );
+    }
+
+    #[test]
+    fn public_proxy_completion_duplicate_local_target_keeps_no_upstream_mapping() {
+        for duplicate_behavior in [DuplicateBehavior::Warn, DuplicateBehavior::Ignore] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let server = ServerBuilder::new("completion-proxy", "1.0")
+                .prompt(LocalFinalCompletionPrompt)
+                .on_duplicate(duplicate_behavior)
+                .proxy_typed(
+                    ProxyClient::from_backend(CompletionProxyBackend {
+                        supported: true,
+                        result: final_completion_proxy_result(),
+                        calls: Arc::clone(&calls),
+                    }),
+                    final_completion_proxy_catalog(),
+                )
+                .expect("retaining the local final prompt is a successful duplicate admission")
+                .build();
+
+            let discovery = serde_json::to_value(
+                server
+                    .server_discovery()
+                    .expect("the retained local prompt server remains discoverable"),
+            )
+            .expect("discovery serializes");
+            assert!(
+                discovery["capabilities"].get("completions").is_none(),
+                "{duplicate_behavior:?} must not advertise an upstream provider for a retained local target"
+            );
+
+            let before_inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                826,
+                crate::InboundRequestTransport::Memory,
+            );
+            let before = server
+                .dispatch_stateless(
+                    &before_inbound,
+                    &JsonRpcRequest::new(
+                        "prompts/list",
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            },
+                        })),
+                        826_i64,
+                    ),
+                )
+                .expect("the retained local prompt is visible through the public final list")
+                .result
+                .expect("the retained local prompt list has a result payload");
+            assert_eq!(
+                before["prompts"][0]["title"], "Local Final Deploy",
+                "{duplicate_behavior:?} retains the pre-existing local prompt target"
+            );
+
+            let rejected_inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                827,
+                crate::InboundRequestTransport::Memory,
+            );
+            let rejected = server
+                .dispatch_stateless(&rejected_inbound, &final_completion_request(827))
+                .expect("the absent completion mapping returns a JSON-RPC error");
+            assert_eq!(
+                rejected.error.and_then(|error| error.code.as_i32()),
+                Some(-32601),
+                "{duplicate_behavior:?} rejects before invocation because no upstream mapping was installed"
+            );
+            assert!(rejected.result.is_none());
+
+            let after_inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                828,
+                crate::InboundRequestTransport::Memory,
+            );
+            let after = server
+                .dispatch_stateless(
+                    &after_inbound,
+                    &JsonRpcRequest::new(
+                        "prompts/list",
+                        Some(serde_json::json!({
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            },
+                        })),
+                        828_i64,
+                    ),
+                )
+                .expect("the rejected request leaves the retained local target public")
+                .result
+                .expect("the retained local prompt list still has a result payload");
+            assert_eq!(
+                before, after,
+                "{duplicate_behavior:?} completion rejection cannot mutate the retained local target"
+            );
+            assert!(
+                calls
+                    .lock()
+                    .expect("completion proxy call log is not poisoned")
+                    .is_empty(),
+                "{duplicate_behavior:?} must not invoke the upstream completion backend"
+            );
+        }
+    }
+
+    #[test]
+    fn public_proxy_completion_replace_installs_upstream_mapping_for_replaced_target() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let server = ServerBuilder::new("completion-proxy", "1.0")
+            .prompt(LocalFinalCompletionPrompt)
+            .on_duplicate(DuplicateBehavior::Replace)
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: final_completion_proxy_result(),
+                    calls: Arc::clone(&calls),
+                }),
+                final_completion_proxy_catalog(),
+            )
+            .expect("Replace admits the exact upstream final prompt target")
+            .build();
+
+        let discovery = serde_json::to_value(
+            server
+                .server_discovery()
+                .expect("the replacement proxy server remains discoverable"),
+        )
+        .expect("discovery serializes");
+        assert_eq!(
+            discovery["capabilities"]["completions"],
+            serde_json::json!({}),
+            "the real upstream mapping advertises final completion support"
+        );
+
+        let list_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            829,
+            crate::InboundRequestTransport::Memory,
+        );
+        let prompts = server
+            .dispatch_stateless(
+                &list_inbound,
+                &JsonRpcRequest::new(
+                    "prompts/list",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                    })),
+                    829_i64,
+                ),
+            )
+            .expect("the replaced prompt is public through the final list")
+            .result
+            .expect("the replaced prompt list has a result payload");
+        assert_eq!(
+            prompts["prompts"][0]["title"], "Upstream Final Deploy",
+            "Replace exposes the admitted upstream prompt instead of the local target"
+        );
+
+        let completion_inbound = crate::InboundRequestContext::new(
+            Cx::for_testing(),
+            830,
+            crate::InboundRequestTransport::Memory,
+        );
+        let completion = server
+            .dispatch_stateless(&completion_inbound, &final_completion_request(830))
+            .expect("the replaced target forwards through the public final completion route")
+            .result
+            .expect("the replaced target completion has a result payload");
+        assert_eq!(
+            completion["completion"]["values"],
+            serde_json::json!(["final-staging"])
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("completion proxy call log is not poisoned")
+                .len(),
+            1,
+            "Replace installs exactly one upstream completion invocation path"
+        );
+    }
+
+    #[test]
+    fn public_final_proxy_completion_replacement_evicts_proxy_targets_and_restores_local_providers()
+    {
+        let prompt_calls = Arc::new(Mutex::new(Vec::new()));
+        let template_calls = Arc::new(Mutex::new(Vec::new()));
+        let evicted = ServerBuilder::new("completion-proxy", "1.0")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: final_completion_proxy_result(),
+                    calls: Arc::clone(&prompt_calls),
+                }),
+                final_completion_proxy_catalog(),
+            )
+            .expect("the final prompt proxy installs")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: final_completion_proxy_result(),
+                    calls: Arc::clone(&template_calls),
+                }),
+                final_completion_proxy_template_catalog(),
+            )
+            .expect("the final resource-template proxy installs")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .prompt(LocalFinalCompletionPrompt)
+            .resource_template(local_completion_template())
+            .build();
+
+        let discovery = serde_json::to_value(
+            evicted
+                .server_discovery()
+                .expect("the locally replaced catalog remains discoverable"),
+        )
+        .expect("discovery serializes");
+        assert!(
+            discovery["capabilities"].get("completions").is_none(),
+            "replacing every proxied final target removes proxy completion advertisement"
+        );
+        for (id, request) in [
+            (831, final_completion_request(831)),
+            (832, final_resource_template_completion_request(832)),
+        ] {
+            let inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                id,
+                crate::InboundRequestTransport::Memory,
+            );
+            let rejected = evicted
+                .dispatch_stateless(&inbound, &request)
+                .expect("the evicted completion mapping returns a JSON-RPC error");
+            assert_eq!(
+                rejected.error.and_then(|error| error.code.as_i32()),
+                Some(-32601),
+                "the local replacement has no retained upstream completion provider"
+            );
+            assert!(rejected.result.is_none());
+        }
+        assert!(
+            prompt_calls
+                .lock()
+                .expect("prompt completion proxy call log is not poisoned")
+                .is_empty()
+        );
+        assert!(
+            template_calls
+                .lock()
+                .expect("template completion proxy call log is not poisoned")
+                .is_empty()
+        );
+
+        let prompt_calls = Arc::new(Mutex::new(Vec::new()));
+        let template_calls = Arc::new(Mutex::new(Vec::new()));
+        let restored = ServerBuilder::new("completion-proxy", "1.0")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: final_completion_proxy_result(),
+                    calls: Arc::clone(&prompt_calls),
+                }),
+                final_completion_proxy_catalog(),
+            )
+            .expect("the final prompt proxy installs")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: final_completion_proxy_result(),
+                    calls: Arc::clone(&template_calls),
+                }),
+                final_completion_proxy_template_catalog(),
+            )
+            .expect("the final resource-template proxy installs")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .prompt(LocalFinalCompletionPrompt)
+            .resource_template(local_completion_template())
+            .prompt_completion_handler("final-deploy", TestCompletion)
+            .resource_template_completion_handler("completion://{environment}", TestCompletion)
+            .build();
+        let discovery = serde_json::to_value(
+            restored
+                .server_discovery()
+                .expect("the local completion providers make final discovery available"),
+        )
+        .expect("discovery serializes");
+        assert_eq!(
+            discovery["capabilities"]["completions"],
+            serde_json::json!({}),
+            "only the restored local final providers advertise completion support"
+        );
+        for (id, request) in [
+            (833, final_completion_request(833)),
+            (834, final_resource_template_completion_request(834)),
+        ] {
+            let inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                id,
+                crate::InboundRequestTransport::Memory,
+            );
+            let response = restored
+                .dispatch_stateless(&inbound, &request)
+                .expect("the local replacement provider handles the public final request")
+                .result
+                .expect("the local replacement provider returns a result payload");
+            assert_eq!(
+                response["completion"]["values"],
+                serde_json::json!(["staging"])
+            );
+        }
+        assert!(
+            prompt_calls
+                .lock()
+                .expect("prompt completion proxy call log is not poisoned")
+                .is_empty(),
+            "local prompt providers must not invoke the displaced proxy"
+        );
+        assert!(
+            template_calls
+                .lock()
+                .expect("template completion proxy call log is not poisoned")
+                .is_empty(),
+            "local template providers must not invoke the displaced proxy"
+        );
+    }
+
+    #[test]
+    fn public_legacy_proxy_completion_replacement_evicts_proxy_targets_and_restores_local_provider()
+    {
+        let prompt_calls = Arc::new(Mutex::new(Vec::new()));
+        let template_calls = Arc::new(Mutex::new(Vec::new()));
+        let evicted = ServerBuilder::new("completion-proxy", "1.0")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: legacy_completion_proxy_result(),
+                    calls: Arc::clone(&prompt_calls),
+                }),
+                legacy_completion_proxy_catalog(),
+            )
+            .expect("the legacy prompt proxy installs")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: legacy_completion_proxy_result(),
+                    calls: Arc::clone(&template_calls),
+                }),
+                legacy_completion_proxy_template_catalog(),
+            )
+            .expect("the legacy resource-template proxy installs")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .legacy_prompt(LocalFinalCompletionPrompt)
+            .legacy_resource_template(local_completion_template())
+            .build();
+        let mut legacy_session = initialized_legacy_proxy_session(&evicted);
+        let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+        let request_sender = crate::RequestSender::new(
+            Arc::new(crate::PendingRequests::new()),
+            Arc::new(|message| Err(format!("unexpected outbound message in test: {message:?}"))),
+        );
+        for request in [
+            legacy_completion_request(
+                835,
+                serde_json::json!({"type": "ref/prompt", "name": "legacy-deploy"}),
+            ),
+            legacy_completion_request(
+                836,
+                serde_json::json!({"type": "ref/resource", "uri": "completion://{environment}"}),
+            ),
+        ] {
+            let rejected = evicted
+                .dispatch_request(
+                    &Cx::for_testing(),
+                    &mut legacy_session,
+                    request,
+                    &notification_sender,
+                    &request_sender,
+                )
+                .expect("the public replaced legacy target returns a JSON-RPC error");
+            assert_eq!(
+                rejected.error.and_then(|error| error.code.as_i32()),
+                Some(-32601),
+                "the local replacement has no retained upstream completion provider"
+            );
+            assert!(rejected.result.is_none());
+        }
+        assert!(
+            prompt_calls
+                .lock()
+                .expect("prompt completion proxy call log is not poisoned")
+                .is_empty()
+        );
+        assert!(
+            template_calls
+                .lock()
+                .expect("template completion proxy call log is not poisoned")
+                .is_empty()
+        );
+
+        let prompt_calls = Arc::new(Mutex::new(Vec::new()));
+        let template_calls = Arc::new(Mutex::new(Vec::new()));
+        let restored = ServerBuilder::new("completion-proxy", "1.0")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: legacy_completion_proxy_result(),
+                    calls: Arc::clone(&prompt_calls),
+                }),
+                legacy_completion_proxy_catalog(),
+            )
+            .expect("the legacy prompt proxy installs")
+            .proxy_typed(
+                ProxyClient::from_backend(CompletionProxyBackend {
+                    supported: true,
+                    result: legacy_completion_proxy_result(),
+                    calls: Arc::clone(&template_calls),
+                }),
+                legacy_completion_proxy_template_catalog(),
+            )
+            .expect("the legacy resource-template proxy installs")
+            .on_duplicate(DuplicateBehavior::Replace)
+            .legacy_prompt(LocalFinalCompletionPrompt)
+            .legacy_resource_template(local_completion_template())
+            .legacy_completion_handler(TestCompletion)
+            .build();
+        let mut legacy_session = initialized_legacy_proxy_session(&restored);
+        let notification_sender: crate::NotificationSender = Arc::new(|_| {});
+        let request_sender = crate::RequestSender::new(
+            Arc::new(crate::PendingRequests::new()),
+            Arc::new(|message| Err(format!("unexpected outbound message in test: {message:?}"))),
+        );
+        for request in [
+            legacy_completion_request(
+                837,
+                serde_json::json!({"type": "ref/prompt", "name": "legacy-deploy"}),
+            ),
+            legacy_completion_request(
+                838,
+                serde_json::json!({"type": "ref/resource", "uri": "completion://{environment}"}),
+            ),
+        ] {
+            let response = restored
+                .dispatch_request(
+                    &Cx::for_testing(),
+                    &mut legacy_session,
+                    request,
+                    &notification_sender,
+                    &request_sender,
+                )
+                .expect("the public local legacy provider returns a response")
+                .result
+                .expect("the local legacy provider returns a result payload");
+            assert_eq!(
+                response["completion"]["values"],
+                serde_json::json!(["staging"])
+            );
+        }
+        assert!(
+            prompt_calls
+                .lock()
+                .expect("prompt completion proxy call log is not poisoned")
+                .is_empty()
+        );
+        assert!(
+            template_calls
+                .lock()
+                .expect("template completion proxy call log is not poisoned")
+                .is_empty()
         );
     }
 

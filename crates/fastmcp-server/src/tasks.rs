@@ -1551,7 +1551,11 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// typed notification before returning success. That is the create-before-reply
 /// boundary: a caller may return the `CreateTaskResult` only after this method
 /// has succeeded. Delivery is deliberately separate from persistence so a
-/// transport reconnect cannot erase an accepted task transition.
+/// transport reconnect cannot erase an accepted task transition. Every write
+/// must retain a status-shaped task, a notification containing that exact task,
+/// and the immutable task identity and retention fields from its prior
+/// generation. Atomic operations returning `false` must leave all of those
+/// retained values unchanged.
 pub trait FinalTaskStore: Send + Sync {
     /// Durably records a newly created task and its status notification.
     fn create_task(
@@ -1664,8 +1668,8 @@ pub trait FinalTaskStore: Send + Sync {
     /// Legacy raw accepted-input claim.
     ///
     /// New task-service code must use
-    /// [`Self::take_input_for_owner_if_current`], which binds the claim to a
-    /// service owner before it can reach application code.
+    /// [`Self::take_input_handoff_for_owner_if_current`], which binds the
+    /// claim to a service owner before it can reach application code.
     fn take_input_if_current(
         &self,
         _expected: &FinalTaskSnapshot,
@@ -1696,9 +1700,7 @@ pub trait FinalTaskStore: Send + Sync {
     }
 
     /// Reads the immutable operation descriptor only if `expected` still
-    /// names the exact live task generation. A runtime obtains this before it
-    /// claims an accepted-input handoff, so terminal or cancellation winners
-    /// cannot yield input without its originating operation.
+    /// names the exact live task generation.
     fn work_descriptor_if_current(
         &self,
         _expected: &FinalTaskSnapshot,
@@ -1706,6 +1708,31 @@ pub trait FinalTaskStore: Send + Sync {
         Err(McpError::internal_error(
             "Final task store does not implement task-work lookup",
         ))
+    }
+
+    /// Atomically claims the complete accepted-input handoff and attests its
+    /// task, generation, and owner binding. Existing stores may derive this
+    /// from the established claim methods, but durable stores must preserve
+    /// the same association atomically.
+    fn take_input_handoff_for_owner_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+    ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
+        let Some(work_descriptor) = self.work_descriptor_if_current(expected)? else {
+            return Ok(None);
+        };
+        let Some(input_responses) = self.take_input_for_owner_if_current(expected, owner_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(FinalTaskAcceptedInputClaim::new(
+            expected.task().base().task_id.clone(),
+            expected.generation(),
+            owner_id,
+            work_descriptor,
+            input_responses,
+        )))
     }
 
     /// Returns one `working` task whose initial application work has not yet
@@ -1759,6 +1786,25 @@ pub trait FinalTaskStore: Send + Sync {
         Err(McpError::internal_error(
             "Final task store does not implement initial-work claiming",
         ))
+    }
+
+    /// Atomically claims initial work and attests its task, generation, and
+    /// owner binding before the runtime can pass it to application code.
+    fn take_initial_work_handoff_for_owner_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+    ) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
+        Ok(self
+            .take_initial_work_for_owner_if_current(expected, owner_id)?
+            .map(|work_descriptor| {
+                FinalTaskInitialWorkClaim::new(
+                    expected.task().base().task_id.clone(),
+                    expected.generation(),
+                    owner_id,
+                    work_descriptor,
+                )
+            }))
     }
 
     /// Releases an initial-work recovery lease after a supervisor did not
@@ -2167,6 +2213,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         notification: FinalTaskStatusNotification,
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
+        validate_final_task_storage_shape(&task)?;
         ensure_final_task_notification_matches_task(&task, &notification)?;
         let now = (self.clock)();
         validate_final_task_runtime_durations(&task)?;
@@ -2203,6 +2250,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         work_descriptor: FinalTaskWorkDescriptor,
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
+        validate_final_task_storage_shape(&task)?;
         ensure_final_task_notification_matches_task(&task, &notification)?;
         if !matches!(task, FinalTask::Working(_)) {
             return Err(McpError::invalid_params(
@@ -2313,7 +2361,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -2347,7 +2394,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -2380,7 +2426,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(&task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -2426,7 +2471,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_exact_dispatch = state.handoff_leases.get(&task_id).is_some_and(|lease| {
             lease.generation == expected.generation()
                 && lease.dispatch_elected
@@ -2463,6 +2507,16 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         expected: &FinalTaskSnapshot,
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskInputResponses>> {
+        Ok(self
+            .take_input_handoff_for_owner_if_current(expected, owner_id)?
+            .map(|claim| claim.input_responses))
+    }
+
+    fn take_input_handoff_for_owner_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+    ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
         if owner_id.is_empty() {
             return Err(McpError::invalid_params(
                 "Final task handoff owner must be non-empty",
@@ -2474,7 +2528,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
                 .tasks
@@ -2488,6 +2541,15 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let Some(input_responses) = state.accepted_inputs.get(task_id).cloned() else {
             return Ok(None);
         };
+        let work_descriptor = state
+            .work_descriptors
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "In-memory final task store is missing a working task descriptor",
+                )
+            })?;
         insert_in_memory_final_task_handoff_lease(
             &mut state,
             task_id.clone(),
@@ -2496,7 +2558,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             owner_id,
             now,
         )?;
-        Ok(Some(input_responses))
+        Ok(Some(FinalTaskAcceptedInputClaim::new(
+            task_id.clone(),
+            expected.generation(),
+            owner_id,
+            work_descriptor,
+            input_responses,
+        )))
     }
 
     fn work_descriptor_if_current(
@@ -2583,6 +2651,16 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         expected: &FinalTaskSnapshot,
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
+        Ok(self
+            .take_initial_work_handoff_for_owner_if_current(expected, owner_id)?
+            .map(|claim| claim.work_descriptor))
+    }
+
+    fn take_initial_work_handoff_for_owner_if_current(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+    ) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
         if owner_id.is_empty() {
             return Err(McpError::invalid_params(
                 "Final task handoff owner must be non-empty",
@@ -2594,7 +2672,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation())
             || !state
                 .tasks
@@ -2616,7 +2693,12 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             owner_id,
             now,
         )?;
-        Ok(Some(work_descriptor))
+        Ok(Some(FinalTaskInitialWorkClaim::new(
+            task_id.clone(),
+            expected.generation(),
+            owner_id,
+            work_descriptor,
+        )))
     }
 
     fn restore_initial_work_if_current(
@@ -2638,12 +2720,10 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         dispatch_fence: Option<u64>,
         work_descriptor: FinalTaskWorkDescriptor,
     ) -> McpResult<bool> {
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
             lease.generation == generation
                 && lease.kind == InMemoryFinalTaskHandoffKind::Initial
@@ -2730,12 +2810,10 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 "Cannot restore an empty accepted-input handoff",
             ));
         }
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let owns_matching_lease = state.handoff_leases.get(task_id).is_some_and(|lease| {
             lease.generation == generation
                 && lease.kind == InMemoryFinalTaskHandoffKind::Resumed
@@ -2787,7 +2865,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&generation)
             || !state
                 .tasks
@@ -2831,7 +2908,6 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let renewed_expires_at = in_memory_final_task_handoff_lease_expiry(now)?;
         let Some(lease) = state.handoff_leases.get(task_id) else {
             return Ok(false);
@@ -2876,12 +2952,10 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         owner_id: &str,
         dispatch_fence: u64,
     ) -> McpResult<bool> {
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         let Some(lease) = state.handoff_leases.get(task_id) else {
             return Ok(false);
         };
@@ -2936,12 +3010,10 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
 
     fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
         let task_id = &expected.task().base().task_id;
-        let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(false);
         }
@@ -2967,13 +3039,13 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             ));
         }
         ensure_final_task_notification_matches_task(&cancelled_task, &cancelled_notification)?;
+        validate_final_task_transition(expected.task(), &cancelled_task)?;
         validate_final_task_runtime_durations(&cancelled_task)?;
         let now = (self.clock)();
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        reclaim_expired_in_memory_final_tasks(&mut state, now);
         if state.generations.get(task_id) != Some(&expected.generation()) {
             return Ok(None);
         }
@@ -3043,6 +3115,22 @@ fn ensure_final_task_notification_matches_task(
     Ok(())
 }
 
+/// Compares complete durable task values without relying on handwritten
+/// equality across the protocol's open-preserving task result fields.
+fn final_tasks_match_exactly(left: &FinalTask, right: &FinalTask) -> McpResult<bool> {
+    let left = serde_json::to_value(left).map_err(|error| {
+        McpError::internal_error(format!(
+            "Could not encode retained final task for exact comparison: {error}"
+        ))
+    })?;
+    let right = serde_json::to_value(right).map_err(|error| {
+        McpError::internal_error(format!(
+            "Could not encode retained final task for exact comparison: {error}"
+        ))
+    })?;
+    Ok(left == right)
+}
+
 fn validate_final_task_runtime_durations(task: &FinalTask) -> McpResult<()> {
     for (field, duration) in [
         ("ttlMs", task.base().ttl_ms.as_ref()),
@@ -3055,6 +3143,130 @@ fn validate_final_task_runtime_durations(task: &FinalTask) -> McpResult<()> {
                 ))
             })?;
         }
+    }
+    Ok(())
+}
+
+/// Validates the final Task shape before it crosses a durable-store boundary.
+///
+/// `FinalTask` is intentionally constructible as Rust data, so the store must
+/// not rely on wire deserialization to keep the discriminating status aligned
+/// with its variant. In particular, an empty `input_required` task would have
+/// no valid MRTR handoff to recover or deliver to a supervisor.
+fn validate_final_task_storage_shape(task: &FinalTask) -> McpResult<()> {
+    let expected_status = match task {
+        FinalTask::Working(_) => FinalTaskStatus::Working,
+        FinalTask::InputRequired { input_requests, .. } => {
+            if input_requests.is_empty() {
+                return Err(McpError::invalid_params(
+                    "input_required tasks require at least one input request",
+                ));
+            }
+            FinalTaskInputLedger::from_requests(input_requests)
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            FinalTaskStatus::InputRequired
+        }
+        FinalTask::Completed { .. } => FinalTaskStatus::Completed,
+        FinalTask::Failed { .. } => FinalTaskStatus::Failed,
+        FinalTask::Cancelled(_) => FinalTaskStatus::Cancelled,
+    };
+    if task.base().status != expected_status {
+        return Err(McpError::invalid_params(
+            "Final task status must match its status-specific payload",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a final Task transition before mutating any retained state.
+///
+/// A task's identity and retention contract are fixed at creation. Letting a
+/// later state transition change `ttlMs`, `pollIntervalMs`, or `createdAt`
+/// would make the wire-visible task disagree with the durable expiry and can
+/// turn a recovered supervisor handoff into an unbounded retention leak.
+fn validate_final_task_transition(current: &FinalTask, replacement: &FinalTask) -> McpResult<()> {
+    validate_final_task_storage_shape(replacement)?;
+
+    let current_base = current.base();
+    let replacement_base = replacement.base();
+    if current_base.task_id != replacement_base.task_id {
+        return Err(McpError::invalid_params(
+            "Final task replacement must preserve taskId",
+        ));
+    }
+    if current_base.created_at != replacement_base.created_at {
+        return Err(McpError::invalid_params(
+            "Final task replacement must preserve createdAt",
+        ));
+    }
+    if current_base.ttl_ms != replacement_base.ttl_ms {
+        return Err(McpError::invalid_params(
+            "Final task replacement must preserve ttlMs",
+        ));
+    }
+    if current_base.poll_interval_ms != replacement_base.poll_interval_ms {
+        return Err(McpError::invalid_params(
+            "Final task replacement must preserve pollIntervalMs",
+        ));
+    }
+
+    let transition_is_valid = match current_base.status {
+        FinalTaskStatus::Working => matches!(
+            replacement_base.status,
+            FinalTaskStatus::Working
+                | FinalTaskStatus::InputRequired
+                | FinalTaskStatus::Completed
+                | FinalTaskStatus::Failed
+                | FinalTaskStatus::Cancelled
+        ),
+        FinalTaskStatus::InputRequired => matches!(
+            replacement_base.status,
+            FinalTaskStatus::Working
+                | FinalTaskStatus::InputRequired
+                | FinalTaskStatus::Completed
+                | FinalTaskStatus::Failed
+                | FinalTaskStatus::Cancelled
+        ),
+        FinalTaskStatus::Completed | FinalTaskStatus::Failed | FinalTaskStatus::Cancelled => false,
+    };
+    if !transition_is_valid {
+        return Err(McpError::invalid_params(
+            "Final task replacement is not a valid lifecycle transition",
+        ));
+    }
+    Ok(())
+}
+
+/// Re-validates the store attestation that binds a private handoff payload to
+/// the exact candidate and service owner that claimed it.
+fn validate_final_task_handoff_binding(
+    expected: &FinalTaskSnapshot,
+    expected_owner_id: &str,
+    task_id: &FinalTaskId,
+    generation: u64,
+    owner_id: &str,
+    handoff_kind: &'static str,
+) -> McpResult<()> {
+    if !matches!(expected.task(), FinalTask::Working(_))
+        || task_id != &expected.task().base().task_id
+        || generation != expected.generation()
+        || owner_id != expected_owner_id
+        || owner_id.is_empty()
+    {
+        return Err(McpError::internal_error(format!(
+            "Final task store returned a {handoff_kind} handoff for the wrong task, generation, or owner"
+        )));
+    }
+    Ok(())
+}
+
+/// Ensures an opaque descriptor still satisfies its one required structural
+/// invariant at the durable handoff boundary.
+fn validate_final_task_work_descriptor(work_descriptor: &FinalTaskWorkDescriptor) -> McpResult<()> {
+    if work_descriptor.as_value().is_null() {
+        return Err(McpError::internal_error(
+            "Final task store returned a null application work descriptor",
+        ));
     }
     Ok(())
 }
@@ -3160,6 +3372,11 @@ fn replace_in_memory_final_task(
     input_mutation: InMemoryFinalTaskInputMutation,
 ) -> McpResult<()> {
     let task_id = task.base().task_id.clone();
+    let current = state
+        .tasks
+        .get(&task_id)
+        .ok_or_else(|| McpError::invalid_params("Task not found"))?;
+    validate_final_task_transition(current, &task)?;
     let generation = next_in_memory_final_task_generation(state)?;
     let working = matches!(&task, FinalTask::Working(_));
     let terminal = matches!(
@@ -3370,6 +3587,72 @@ impl FinalTaskWorkDescriptor {
     #[must_use]
     pub const fn as_value(&self) -> &serde_json::Value {
         &self.0
+    }
+}
+
+/// Store-attested initial-work payload for one exact owner-bound handoff.
+///
+/// A durable store returns this only from its atomic initial-work claim. The
+/// runtime checks every binding again before the opaque descriptor can reach
+/// application code, so a permissive store cannot substitute another task's
+/// operation into a valid recovery candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalTaskInitialWorkClaim {
+    task_id: FinalTaskId,
+    generation: u64,
+    owner_id: String,
+    work_descriptor: FinalTaskWorkDescriptor,
+}
+
+impl FinalTaskInitialWorkClaim {
+    /// Creates one store-returned initial-work claim.
+    #[must_use]
+    pub fn new(
+        task_id: FinalTaskId,
+        generation: u64,
+        owner_id: impl Into<String>,
+        work_descriptor: FinalTaskWorkDescriptor,
+    ) -> Self {
+        Self {
+            task_id,
+            generation,
+            owner_id: owner_id.into(),
+            work_descriptor,
+        }
+    }
+}
+
+/// Store-attested accepted-input payload for one exact owner-bound handoff.
+///
+/// The descriptor and accepted inputs are returned together so no recovery
+/// path can combine a descriptor from one durable task with input retained for
+/// another task or generation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalTaskAcceptedInputClaim {
+    task_id: FinalTaskId,
+    generation: u64,
+    owner_id: String,
+    work_descriptor: FinalTaskWorkDescriptor,
+    input_responses: FinalTaskInputResponses,
+}
+
+impl FinalTaskAcceptedInputClaim {
+    /// Creates one store-returned accepted-input claim.
+    #[must_use]
+    pub fn new(
+        task_id: FinalTaskId,
+        generation: u64,
+        owner_id: impl Into<String>,
+        work_descriptor: FinalTaskWorkDescriptor,
+        input_responses: FinalTaskInputResponses,
+    ) -> Self {
+        Self {
+            task_id,
+            generation,
+            owner_id: owner_id.into(),
+            work_descriptor,
+            input_responses,
+        }
     }
 }
 
@@ -4094,21 +4377,14 @@ impl FinalTaskRuntime {
         task_id: &FinalTaskId,
     ) -> McpResult<Option<FinalTaskAcceptedInput>> {
         let current = self.load_task_snapshot(task_id)?;
-        let Some(work_descriptor) = self.store.work_descriptor_if_current(&current)? else {
-            return Ok(None);
-        };
-        let input_responses = self
+        let claim = self
             .store
-            .take_input_for_owner_if_current(&current, FINAL_TASK_TEST_DIRECT_OWNER)?;
-        Ok(
-            input_responses.map(|input_responses| FinalTaskAcceptedInput {
-                task_id: task_id.clone(),
-                generation: current.generation(),
-                work_descriptor,
-                input_responses,
-                authority: None,
-            }),
-        )
+            .take_input_handoff_for_owner_if_current(&current, FINAL_TASK_TEST_DIRECT_OWNER)?;
+        claim
+            .map(|claim| {
+                self.validate_accepted_input_claim(&current, FINAL_TASK_TEST_DIRECT_OWNER, claim)
+            })
+            .transpose()
     }
 
     /// Atomically recovers one durably accepted input handoff for a newly
@@ -4125,28 +4401,27 @@ impl FinalTaskRuntime {
             let Some(candidate) = self.store.next_accepted_input_snapshot_after(None)? else {
                 return Ok(None);
             };
+            let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
             let task_id = candidate.task().base().task_id.clone();
             if !matches!(candidate.task(), FinalTask::Working(_)) {
                 return Err(McpError::internal_error(
                     "Final task store returned a non-working accepted-input recovery candidate",
                 ));
             }
-            let Some(work_descriptor) = self.store.work_descriptor_if_current(&candidate)? else {
-                continue;
-            };
-            let Some(input_responses) = self
-                .store
-                .take_input_for_owner_if_current(&candidate, FINAL_TASK_TEST_DIRECT_OWNER)?
+            let Some(claim) = self.store.take_input_handoff_for_owner_if_current(
+                &candidate,
+                FINAL_TASK_TEST_DIRECT_OWNER,
+            )?
             else {
                 continue;
             };
-            return Ok(Some(FinalTaskAcceptedInput {
-                task_id,
-                generation: candidate.generation(),
-                work_descriptor,
-                input_responses,
-                authority: None,
-            }));
+            let handoff = self.validate_accepted_input_claim(
+                &candidate,
+                FINAL_TASK_TEST_DIRECT_OWNER,
+                claim,
+            )?;
+            debug_assert_eq!(handoff.task_id(), &task_id);
+            return Ok(Some(handoff));
         }
         Err(McpError::internal_error(
             "Accepted-input recovery exceeded bounded lost-CAS retries",
@@ -4170,29 +4445,23 @@ impl FinalTaskRuntime {
             else {
                 return Ok(None);
             };
+            let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
             if !matches!(candidate.task(), FinalTask::Working(_)) {
                 return Err(McpError::internal_error(
                     "Final task store returned a non-working accepted-input recovery candidate",
                 ));
             }
-            let Some(work_descriptor) = self.store.work_descriptor_if_current(&candidate)? else {
-                continue;
-            };
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(input_responses) = self
+            let Some(claim) = self
                 .store
-                .take_input_for_owner_if_current(&candidate, owner_id)?
+                .take_input_handoff_for_owner_if_current(&candidate, owner_id)?
             else {
                 continue;
             };
-            return Ok(Some(FinalTaskAcceptedInput {
-                task_id: candidate.task().base().task_id.clone(),
-                generation: candidate.generation(),
-                work_descriptor,
-                input_responses,
-                authority: None,
-            }));
+            return self
+                .validate_accepted_input_claim(&candidate, owner_id, claim)
+                .map(Some);
         }
         Err(McpError::internal_error(
             "Accepted-input recovery exceeded bounded lost-CAS retries",
@@ -4207,24 +4476,24 @@ impl FinalTaskRuntime {
             let Some(candidate) = self.store.next_initial_work_snapshot_after(None)? else {
                 return Ok(None);
             };
+            let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
             if !matches!(candidate.task(), FinalTask::Working(_)) {
                 return Err(McpError::internal_error(
                     "Final task store returned a non-working initial-work recovery candidate",
                 ));
             }
             let task_id = candidate.task().base().task_id.clone();
-            let Some(work_descriptor) = self
-                .store
-                .take_initial_work_for_owner_if_current(&candidate, FINAL_TASK_TEST_DIRECT_OWNER)?
+            let Some(claim) = self.store.take_initial_work_handoff_for_owner_if_current(
+                &candidate,
+                FINAL_TASK_TEST_DIRECT_OWNER,
+            )?
             else {
                 continue;
             };
-            return Ok(Some(FinalTaskInitialWork {
-                task_id,
-                generation: candidate.generation(),
-                work_descriptor,
-                authority: None,
-            }));
+            let handoff =
+                self.validate_initial_work_claim(&candidate, FINAL_TASK_TEST_DIRECT_OWNER, claim)?;
+            debug_assert_eq!(handoff.task_id(), &task_id);
+            return Ok(Some(handoff));
         }
         Err(McpError::internal_error(
             "Initial-work recovery exceeded bounded lost-CAS retries",
@@ -4246,6 +4515,7 @@ impl FinalTaskRuntime {
             else {
                 return Ok(None);
             };
+            let candidate = self.validate_loaded_task_snapshot(candidate, None)?;
             if !matches!(candidate.task(), FinalTask::Working(_)) {
                 return Err(McpError::internal_error(
                     "Final task store returned a non-working initial-work recovery candidate",
@@ -4253,18 +4523,15 @@ impl FinalTaskRuntime {
             }
             cx.checkpoint()
                 .map_err(|error| McpError::internal_error(error.to_string()))?;
-            let Some(work_descriptor) = self
+            let Some(claim) = self
                 .store
-                .take_initial_work_for_owner_if_current(&candidate, owner_id)?
+                .take_initial_work_handoff_for_owner_if_current(&candidate, owner_id)?
             else {
                 continue;
             };
-            return Ok(Some(FinalTaskInitialWork {
-                task_id: candidate.task().base().task_id.clone(),
-                generation: candidate.generation(),
-                work_descriptor,
-                authority: None,
-            }));
+            return self
+                .validate_initial_work_claim(&candidate, owner_id, claim)
+                .map(Some);
         }
         Err(McpError::internal_error(
             "Initial-work recovery exceeded bounded lost-CAS retries",
@@ -4280,15 +4547,12 @@ impl FinalTaskRuntime {
         let current = self.load_task_snapshot(task_id)?;
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        let work_descriptor = self
+        let claim = self
             .store
-            .take_initial_work_for_owner_if_current(&current, owner_id)?;
-        Ok(work_descriptor.map(|work_descriptor| FinalTaskInitialWork {
-            task_id: task_id.clone(),
-            generation: current.generation(),
-            work_descriptor,
-            authority: None,
-        }))
+            .take_initial_work_handoff_for_owner_if_current(&current, owner_id)?;
+        claim
+            .map(|claim| self.validate_initial_work_claim(&current, owner_id, claim))
+            .transpose()
     }
 
     fn take_accepted_input_with_checkpoint(
@@ -4298,23 +4562,14 @@ impl FinalTaskRuntime {
         owner_id: &str,
     ) -> McpResult<Option<FinalTaskAcceptedInput>> {
         let current = self.load_task_snapshot(task_id)?;
-        let Some(work_descriptor) = self.store.work_descriptor_if_current(&current)? else {
-            return Ok(None);
-        };
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
-        let input_responses = self
+        let claim = self
             .store
-            .take_input_for_owner_if_current(&current, owner_id)?;
-        Ok(
-            input_responses.map(|input_responses| FinalTaskAcceptedInput {
-                task_id: task_id.clone(),
-                generation: current.generation(),
-                work_descriptor,
-                input_responses,
-                authority: None,
-            }),
-        )
+            .take_input_handoff_for_owner_if_current(&current, owner_id)?;
+        claim
+            .map(|claim| self.validate_accepted_input_claim(&current, owner_id, claim))
+            .transpose()
     }
 
     /// Refuses bare Tasks because no originating application work can be
@@ -4630,6 +4885,7 @@ impl FinalTaskRuntime {
             None,
         )?);
         let cancelled_notification = final_task_notification(&cancelled_task);
+        self.validate_task_transition_write(&current, &cancelled_task, &cancelled_notification)?;
         let cancellation = self.store.request_cancellation_and_clear_input_if_current(
             &current,
             cancelled_task,
@@ -4640,11 +4896,70 @@ impl FinalTaskRuntime {
                 "Task state changed before cancellation could be recorded",
             ));
         };
-        if matches!(cancellation.task(), FinalTask::Cancelled(_)) {
+        let cancellation = self.validate_loaded_task_snapshot(cancellation, Some(task_id))?;
+        let terminal_cancellation =
+            self.validate_cancellation_store_result(&current, &cancelled_task, cancellation)?;
+        if terminal_cancellation {
             self.emit(cancelled_notification);
         }
         self.signal_task_service_cancellation(task_id.clone());
         Ok(FinalCancelTaskResult::default())
+    }
+
+    /// Ensures cancellation's store result is either the unchanged exact
+    /// elected snapshot or the exact terminal cancellation proposed by this
+    /// runtime. A permissive backend must not substitute another active or
+    /// terminal task after winning the cancellation compare-and-swap.
+    fn validate_cancellation_store_result(
+        &self,
+        expected: &FinalTaskSnapshot,
+        cancelled_task: &FinalTask,
+        returned: FinalTaskSnapshot,
+    ) -> McpResult<bool> {
+        let terminal = match returned.task() {
+            FinalTask::Cancelled(_) => {
+                validate_final_task_transition(expected.task(), returned.task()).map_err(|_| {
+                    McpError::internal_error(
+                        "Final task store returned an invalid terminal cancellation transition",
+                    )
+                })?;
+                if returned.generation() == expected.generation()
+                    || !final_tasks_match_exactly(returned.task(), cancelled_task)?
+                {
+                    return Err(McpError::internal_error(
+                        "Final task store substituted the intended terminal cancellation",
+                    ));
+                }
+                true
+            }
+            FinalTask::Working(_) => {
+                if returned.generation() != expected.generation()
+                    || !final_tasks_match_exactly(returned.task(), expected.task())?
+                    || !self
+                        .store
+                        .is_cancellation_requested(&expected.task().base().task_id)?
+                {
+                    return Err(McpError::internal_error(
+                        "Final task store returned a substituted active cancellation snapshot",
+                    ));
+                }
+                false
+            }
+            _ => {
+                return Err(McpError::internal_error(
+                    "Final task store returned a non-working active cancellation snapshot",
+                ));
+            }
+        };
+        let committed = self.load_task_snapshot(&expected.task().base().task_id)?;
+        if committed.generation() != returned.generation()
+            || !final_tasks_match_exactly(committed.task(), returned.task())?
+        {
+            return Err(McpError::internal_error(
+                "Final task store returned cancellation data that is not durably retained",
+            ));
+        }
+        Ok(terminal)
     }
 
     /// Returns durable cancellation intent for a caller-owned task worker.
@@ -4738,12 +5053,166 @@ impl FinalTaskRuntime {
             .store
             .get_task_snapshot(task_id)?
             .ok_or_else(|| McpError::invalid_params("Task not found"))?;
-        if &snapshot.task().base().task_id != task_id {
+        self.validate_loaded_task_snapshot(snapshot, Some(task_id))
+    }
+
+    /// Admits task data returned by any durable-store implementation before
+    /// runtime code can branch on its status or hand it to a worker.
+    fn validate_loaded_task_snapshot(
+        &self,
+        snapshot: FinalTaskSnapshot,
+        expected_task_id: Option<&FinalTaskId>,
+    ) -> McpResult<FinalTaskSnapshot> {
+        validate_final_task_storage_shape(snapshot.task()).map_err(|error| {
+            McpError::internal_error(format!(
+                "Final task store returned an invalid durable task shape: {}",
+                error.message
+            ))
+        })?;
+        validate_final_task_runtime_durations(snapshot.task()).map_err(|error| {
+            McpError::internal_error(format!(
+                "Final task store returned a task with an invalid runtime duration: {}",
+                error.message
+            ))
+        })?;
+        if let Some(expected_task_id) = expected_task_id
+            && &snapshot.task().base().task_id != expected_task_id
+        {
             return Err(McpError::internal_error(
                 "Final task store returned a task under the wrong identifier",
             ));
         }
         Ok(snapshot)
+    }
+
+    /// Validates a store-returned initial-work claim before application code
+    /// can observe its descriptor.
+    fn validate_initial_work_claim(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+        claim: FinalTaskInitialWorkClaim,
+    ) -> McpResult<FinalTaskInitialWork> {
+        validate_final_task_handoff_binding(
+            expected,
+            owner_id,
+            &claim.task_id,
+            claim.generation,
+            &claim.owner_id,
+            "initial-work",
+        )?;
+        validate_final_task_work_descriptor(&claim.work_descriptor)?;
+        self.validate_claim_snapshot_still_current(expected)?;
+        Ok(FinalTaskInitialWork {
+            task_id: claim.task_id,
+            generation: claim.generation,
+            work_descriptor: claim.work_descriptor,
+            authority: None,
+        })
+    }
+
+    /// Validates a store-returned accepted-input claim before application code
+    /// can observe either the originating descriptor or private input map.
+    fn validate_accepted_input_claim(
+        &self,
+        expected: &FinalTaskSnapshot,
+        owner_id: &str,
+        claim: FinalTaskAcceptedInputClaim,
+    ) -> McpResult<FinalTaskAcceptedInput> {
+        validate_final_task_handoff_binding(
+            expected,
+            owner_id,
+            &claim.task_id,
+            claim.generation,
+            &claim.owner_id,
+            "accepted-input",
+        )?;
+        validate_final_task_work_descriptor(&claim.work_descriptor)?;
+        if claim.input_responses.is_empty() {
+            return Err(McpError::internal_error(
+                "Final task store returned an empty accepted-input handoff",
+            ));
+        }
+        self.validate_claim_snapshot_still_current(expected)?;
+        Ok(FinalTaskAcceptedInput {
+            task_id: claim.task_id,
+            generation: claim.generation,
+            work_descriptor: claim.work_descriptor,
+            input_responses: claim.input_responses,
+            authority: None,
+        })
+    }
+
+    /// Re-reads the durable record after a handoff claim so even a legacy
+    /// claim implementation cannot pass work to the application after its
+    /// expected active generation has changed.
+    fn validate_claim_snapshot_still_current(&self, expected: &FinalTaskSnapshot) -> McpResult<()> {
+        let current = self.load_task_snapshot(&expected.task().base().task_id)?;
+        if current.generation() != expected.generation()
+            || !final_tasks_match_exactly(current.task(), expected.task())?
+        {
+            return Err(McpError::internal_error(
+                "Final task store changed the claimed task before application handoff",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks the store's post-commit value before observers can treat a
+    /// successful compare-and-swap as an application-visible transition.
+    fn validate_committed_transition(
+        &self,
+        expected: &FinalTaskSnapshot,
+        intended: &FinalTask,
+    ) -> McpResult<()> {
+        let committed = self.load_task_snapshot(&intended.base().task_id)?;
+        validate_final_task_transition(expected.task(), committed.task()).map_err(|_| {
+            McpError::internal_error(
+                "Final task store committed an invalid durable task transition",
+            )
+        })?;
+        if committed.generation() == expected.generation()
+            || !final_tasks_match_exactly(committed.task(), intended)?
+        {
+            return Err(McpError::internal_error(
+                "Final task store substituted a durable task transition",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks the store's create-before-reply value before publishing a task
+    /// handle or observer notification.
+    fn validate_committed_new_task(&self, intended: &FinalTask) -> McpResult<()> {
+        let committed = self.load_task_snapshot(&intended.base().task_id)?;
+        if !final_tasks_match_exactly(committed.task(), intended)? {
+            return Err(McpError::internal_error(
+                "Final task store substituted a newly created durable task",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates a new task immediately before its durable create boundary.
+    fn validate_new_task_write(
+        &self,
+        task: &FinalTask,
+        notification: &FinalTaskStatusNotification,
+    ) -> McpResult<()> {
+        validate_final_task_storage_shape(task)?;
+        ensure_final_task_notification_matches_task(task, notification)?;
+        validate_final_task_runtime_durations(task)
+    }
+
+    /// Validates a replacement immediately before an atomic durable write.
+    fn validate_task_transition_write(
+        &self,
+        expected: &FinalTaskSnapshot,
+        task: &FinalTask,
+        notification: &FinalTaskStatusNotification,
+    ) -> McpResult<()> {
+        self.validate_new_task_write(task, notification)?;
+        validate_final_task_transition(expected.task(), task)
     }
 
     fn persist_new_with_work(
@@ -4753,8 +5222,11 @@ impl FinalTaskRuntime {
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
         let notification = final_task_notification(&task);
+        self.validate_new_task_write(&task, &notification)?;
+        validate_final_task_work_descriptor(&work_descriptor)?;
         self.store
-            .create_task_with_work(task, notification.clone(), work_descriptor)?;
+            .create_task_with_work(task.clone(), notification.clone(), work_descriptor)?;
+        self.validate_committed_new_task(&task)?;
         // Creation has crossed the durable create-before-reply boundary. A
         // post-commit observer failure must never erase the client handle by
         // turning this accepted operation into an RPC error.
@@ -4779,6 +5251,8 @@ impl FinalTaskRuntime {
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
         let notification = final_task_notification(&task);
+        self.validate_new_task_write(&task, &notification)?;
+        validate_final_task_work_descriptor(&work_descriptor)?;
         {
             let signal = self
                 .service_signal
@@ -4789,9 +5263,13 @@ impl FinalTaskRuntime {
                     "Final task creation requires an installed ready task service",
                 ));
             }
-            self.store
-                .create_task_with_work(task, notification.clone(), work_descriptor)?;
+            self.store.create_task_with_work(
+                task.clone(),
+                notification.clone(),
+                work_descriptor,
+            )?;
         }
+        self.validate_committed_new_task(&task)?;
         // The durable commit above is the acceptance point. Observer failures
         // cannot revoke the returned task handle.
         self.emit(notification);
@@ -4810,9 +5288,10 @@ impl FinalTaskRuntime {
             _ => None,
         };
         let notification = final_task_notification(&task);
+        self.validate_task_transition_write(expected, &task, &notification)?;
         if !self.store.replace_task_and_append_input_if_current(
             expected,
-            task,
+            task.clone(),
             notification.clone(),
             input_responses,
         )? {
@@ -4820,6 +5299,7 @@ impl FinalTaskRuntime {
                 "Task state changed before the transition could be recorded",
             ));
         }
+        self.validate_committed_transition(expected, &task)?;
         self.emit(notification);
         if let Some(task_id) = wakeup_task_id {
             self.signal_task_service(task_id);
@@ -4833,15 +5313,17 @@ impl FinalTaskRuntime {
         task: FinalTask,
     ) -> McpResult<()> {
         let notification = final_task_notification(&task);
+        self.validate_task_transition_write(expected, &task, &notification)?;
         if !self.store.replace_task_and_clear_input_if_current(
             expected,
-            task,
+            task.clone(),
             notification.clone(),
         )? {
             return Err(McpError::invalid_params(
                 "Task state changed before the transition could be recorded",
             ));
         }
+        self.validate_committed_transition(expected, &task)?;
         self.emit(notification);
         Ok(())
     }
@@ -4855,6 +5337,7 @@ impl FinalTaskRuntime {
         task: FinalTask,
     ) -> McpResult<()> {
         let notification = final_task_notification(&task);
+        self.validate_task_transition_write(expected, &task, &notification)?;
         if !self
             .store
             .replace_task_and_clear_input_for_handoff_if_current(
@@ -4862,12 +5345,13 @@ impl FinalTaskRuntime {
                 owner_id,
                 dispatch_fence,
                 cancellation_required,
-                task,
+                task.clone(),
                 notification.clone(),
             )?
         {
             return Err(stale_final_task_handoff_error());
         }
+        self.validate_committed_transition(expected, &task)?;
         self.emit(notification);
         Ok(())
     }
@@ -6337,6 +6821,15 @@ mod tests {
                 .take_initial_work_for_owner_if_current(expected, owner_id)
         }
 
+        fn take_initial_work_handoff_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
+            self.inner
+                .take_initial_work_handoff_for_owner_if_current(expected, owner_id)
+        }
+
         fn restore_initial_work_if_current(
             &self,
             task_id: &FinalTaskId,
@@ -6405,11 +6898,13 @@ mod tests {
                 .take_input_for_owner_if_current(expected, owner_id)
         }
 
-        fn work_descriptor_if_current(
+        fn take_input_handoff_for_owner_if_current(
             &self,
             expected: &FinalTaskSnapshot,
-        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
-            self.inner.work_descriptor_if_current(expected)
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
+            self.inner
+                .take_input_handoff_for_owner_if_current(expected, owner_id)
         }
 
         fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
@@ -6610,11 +7105,39 @@ mod tests {
                 .take_input_for_owner_if_current(expected, owner_id)
         }
 
-        fn work_descriptor_if_current(
+        fn take_input_handoff_for_owner_if_current(
             &self,
             expected: &FinalTaskSnapshot,
-        ) -> McpResult<Option<FinalTaskWorkDescriptor>> {
-            self.inner.work_descriptor_if_current(expected)
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
+            let mut lose_first_take = self
+                .lose_first_take
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *lose_first_take {
+                *lose_first_take = false;
+                if self
+                    .inner
+                    .take_input_handoff_for_owner_if_current(expected, owner_id)?
+                    .is_some()
+                    && let Some(dispatch_fence) =
+                        self.inner.begin_handoff_dispatch_for_owner_if_current(
+                            &expected.task().base().task_id,
+                            expected.generation(),
+                            owner_id,
+                        )?
+                {
+                    let _ = self.inner.finish_handoff_dispatch_for_owner_if_current(
+                        &expected.task().base().task_id,
+                        expected.generation(),
+                        owner_id,
+                        dispatch_fence,
+                    )?;
+                }
+                return Ok(None);
+            }
+            self.inner
+                .take_input_handoff_for_owner_if_current(expected, owner_id)
         }
 
         fn next_accepted_input_snapshot_after(
@@ -6698,6 +7221,15 @@ mod tests {
                 dispatch_fence,
                 input_responses,
             )
+        }
+
+        fn take_input_handoff_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
+            self.inner
+                .take_input_handoff_for_owner_if_current(expected, owner_id)
         }
 
         fn begin_handoff_dispatch_for_owner_if_current(
@@ -7013,7 +7545,9 @@ mod tests {
             serde_json::from_value(serde_json::json!({"content": []}))
                 .expect("typed terminal task result");
         match handoff {
-            FinalTaskSupervisorHandoff::Initial(initial) => initial.complete_task(result, None)?,
+            FinalTaskSupervisorHandoff::Initial(initial) => {
+                initial.complete_task(result, None)?;
+            }
             FinalTaskSupervisorHandoff::Resumed(accepted) => {
                 accepted.complete_task(result, None)?;
             }
@@ -7156,6 +7690,277 @@ mod tests {
         )
     }
 
+    /// Deliberately permissive custom store used to prove that the runtime,
+    /// rather than one built-in store implementation, guards task data at its
+    /// durable read and write boundaries.
+    struct RuntimeBoundaryProbeFinalTaskStore {
+        snapshot: Mutex<FinalTaskSnapshot>,
+        transition_write_calls: AtomicUsize,
+        transition_result_override: Mutex<Option<FinalTask>>,
+        work_descriptor: Mutex<Option<FinalTaskWorkDescriptor>>,
+        accepted_inputs: Mutex<Option<FinalTaskInputResponses>>,
+        initial_claim_override: Mutex<Option<FinalTaskInitialWorkClaim>>,
+        accepted_claim_override: Mutex<Option<FinalTaskAcceptedInputClaim>>,
+        cancellation_result_override: Mutex<Option<FinalTaskSnapshot>>,
+        force_false_cas: AtomicBool,
+    }
+
+    impl RuntimeBoundaryProbeFinalTaskStore {
+        fn new(task: FinalTask) -> Self {
+            Self {
+                snapshot: Mutex::new(FinalTaskSnapshot::new(task, 1)),
+                transition_write_calls: AtomicUsize::new(0),
+                transition_result_override: Mutex::new(None),
+                work_descriptor: Mutex::new(Some(final_test_work_descriptor())),
+                accepted_inputs: Mutex::new(None),
+                initial_claim_override: Mutex::new(None),
+                accepted_claim_override: Mutex::new(None),
+                cancellation_result_override: Mutex::new(None),
+                force_false_cas: AtomicBool::new(false),
+            }
+        }
+
+        fn snapshot(&self) -> FinalTaskSnapshot {
+            self.snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn replace_snapshot_for_read(&self, task: FinalTask) {
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *snapshot = FinalTaskSnapshot::new(task, snapshot.generation());
+        }
+
+        fn set_accepted_inputs(&self, input_responses: FinalTaskInputResponses) {
+            *self
+                .accepted_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input_responses);
+        }
+    }
+
+    impl FinalTaskStore for RuntimeBoundaryProbeFinalTaskStore {
+        fn create_task(
+            &self,
+            task: FinalTask,
+            _notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.replace_snapshot_for_read(task);
+            Ok(())
+        }
+
+        fn create_task_with_work(
+            &self,
+            task: FinalTask,
+            _notification: FinalTaskStatusNotification,
+            work_descriptor: FinalTaskWorkDescriptor,
+        ) -> McpResult<()> {
+            self.replace_snapshot_for_read(task);
+            *self
+                .work_descriptor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(work_descriptor);
+            Ok(())
+        }
+
+        fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
+            let snapshot = self.snapshot();
+            if &snapshot.task().base().task_id != task_id {
+                return Ok(None);
+            }
+            Ok(Some(snapshot.into_task()))
+        }
+
+        fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
+            let snapshot = self.snapshot();
+            if &snapshot.task().base().task_id != task_id {
+                return Ok(None);
+            }
+            Ok(Some(snapshot))
+        }
+
+        fn replace_task(
+            &self,
+            task: FinalTask,
+            _notification: FinalTaskStatusNotification,
+        ) -> McpResult<()> {
+            self.replace_snapshot_for_read(task);
+            Ok(())
+        }
+
+        fn replace_task_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            _notification: FinalTaskStatusNotification,
+        ) -> McpResult<bool> {
+            if self.force_false_cas.load(AtomicOrdering::SeqCst) {
+                return Ok(false);
+            }
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if snapshot.generation() != expected.generation() {
+                return Ok(false);
+            }
+            let next_generation = snapshot
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| McpError::internal_error("probe generation exhausted"))?;
+            let committed_task = self
+                .transition_result_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or(task);
+            *snapshot = FinalTaskSnapshot::new(committed_task, next_generation);
+            Ok(true)
+        }
+
+        fn replace_task_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<bool> {
+            self.transition_write_calls
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            self.replace_task_if_current(expected, task, notification)
+        }
+
+        fn next_initial_work_snapshot_after(
+            &self,
+            _after_task_id: Option<&FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            Ok(Some(self.snapshot()))
+        }
+
+        fn take_initial_work_handoff_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
+            if let Some(claim) = self
+                .initial_claim_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Ok(Some(claim));
+            }
+            Ok(self
+                .work_descriptor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .map(|work_descriptor| {
+                    FinalTaskInitialWorkClaim::new(
+                        expected.task().base().task_id.clone(),
+                        expected.generation(),
+                        owner_id,
+                        work_descriptor,
+                    )
+                }))
+        }
+
+        fn next_accepted_input_snapshot_after(
+            &self,
+            _after_task_id: Option<&FinalTaskId>,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            Ok(self
+                .accepted_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+                .then(|| self.snapshot()))
+        }
+
+        fn take_input_handoff_for_owner_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+        ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
+            if let Some(claim) = self
+                .accepted_claim_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Ok(Some(claim));
+            }
+            let Some(input_responses) = self
+                .accepted_inputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            else {
+                return Ok(None);
+            };
+            let work_descriptor = self
+                .work_descriptor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| McpError::internal_error("probe descriptor missing"))?;
+            Ok(Some(FinalTaskAcceptedInputClaim::new(
+                expected.task().base().task_id.clone(),
+                expected.generation(),
+                owner_id,
+                work_descriptor,
+                input_responses,
+            )))
+        }
+
+        fn request_cancellation_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            cancelled_task: FinalTask,
+            _cancelled_notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            if let Some(snapshot) = self
+                .cancellation_result_override
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Ok(Some(snapshot));
+            }
+            let mut snapshot = self
+                .snapshot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.force_false_cas.load(AtomicOrdering::SeqCst)
+                || snapshot.generation() != expected.generation()
+            {
+                return Ok(None);
+            }
+            let generation = snapshot
+                .generation()
+                .checked_add(1)
+                .ok_or_else(|| McpError::internal_error("probe generation exhausted"))?;
+            *snapshot = FinalTaskSnapshot::new(cancelled_task, generation);
+            Ok(Some(snapshot.clone()))
+        }
+
+        fn request_cancellation(&self, _task_id: &FinalTaskId) -> McpResult<()> {
+            Ok(())
+        }
+
+        fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
+            Ok(!self.force_false_cas.load(AtomicOrdering::SeqCst)
+                && self.snapshot().generation() == expected.generation())
+        }
+
+        fn is_cancellation_requested(&self, _task_id: &FinalTaskId) -> McpResult<bool> {
+            Ok(true)
+        }
+    }
+
     #[test]
     fn task_03_in_memory_runtime_constructor_lifecycle_positive() {
         let runtime = FinalTaskRuntime::in_memory(
@@ -7189,6 +7994,476 @@ mod tests {
             runtime
                 .is_cancellation_requested(&task_id)
                 .expect("cancellation intent remains readable")
+        );
+    }
+
+    #[test]
+    fn task_03_runtime_accepts_bound_custom_store_handoffs() {
+        let initial = final_working_task_without_ttl("task-runtime-custom-handoff-positive");
+        let task_id = initial.base().task_id.clone();
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+
+        let initial_work = runtime
+            .recover_initial_work()
+            .expect("a bound initial-work claim is accepted")
+            .expect("the valid custom store provides initial work");
+        assert_eq!(initial_work.task_id(), &task_id);
+        assert_eq!(initial_work.generation(), store.snapshot().generation());
+        assert_eq!(
+            initial_work.work_descriptor(),
+            &final_test_work_descriptor()
+        );
+
+        let responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed accepted-input fixture");
+        store.set_accepted_inputs(responses.clone());
+        let accepted_input = runtime
+            .recover_accepted_input()
+            .expect("a bound accepted-input claim is accepted")
+            .expect("the valid custom store provides accepted input");
+        assert_eq!(accepted_input.task_id(), &task_id);
+        assert_eq!(accepted_input.generation(), store.snapshot().generation());
+        assert_eq!(accepted_input.input_responses(), &responses);
+    }
+
+    #[test]
+    fn task_03_runtime_accepts_valid_custom_store_create_with_work() {
+        let initial = final_working_task_without_ttl("task-runtime-custom-create-positive-old");
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let created = final_working_task_without_ttl("task-runtime-custom-create-positive-new");
+
+        runtime
+            .persist_new_with_work(created.clone(), final_test_work_descriptor())
+            .expect("a valid custom-store create-with-work remains accepted");
+
+        let committed = store.snapshot();
+        assert!(
+            final_tasks_match_exactly(committed.task(), &created).expect("compare created task"),
+            "the valid custom store retains exactly the create-with-work task"
+        );
+    }
+
+    #[test]
+    fn task_03_runtime_rejects_malformed_custom_store_read_without_mutating_the_snapshot() {
+        let valid = final_working_task_without_ttl("task-runtime-custom-read");
+        let task_id = valid.base().task_id.clone();
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(valid.clone()));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+
+        assert!(matches!(
+            runtime
+                .get_task(&task_id)
+                .expect("the otherwise identical valid custom-store task is admitted")
+                .task,
+            FinalTask::Working(_)
+        ));
+
+        let FinalTask::Working(mut malformed_base) = valid else {
+            unreachable!("the fixture is a working task");
+        };
+        malformed_base.status = FinalTaskStatus::Cancelled;
+        store.replace_snapshot_for_read(FinalTask::Working(malformed_base));
+        let before = store.snapshot();
+        let before_wire = serde_json::to_value(before.task())
+            .expect("serialize malformed custom-store snapshot before rejection");
+
+        let error = runtime
+            .get_task(&task_id)
+            .expect_err("changing only the retained status must reject the custom-store read");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        let after = store.snapshot();
+        assert_eq!(
+            serde_json::to_value(after.task())
+                .expect("serialize malformed custom-store snapshot after rejection"),
+            before_wire,
+            "the runtime must not rewrite a malformed custom-store read"
+        );
+        assert_eq!(
+            after.generation(),
+            before.generation(),
+            "a rejected custom-store read cannot advance its generation"
+        );
+    }
+
+    #[test]
+    fn task_03_runtime_write_boundary_rejects_malformed_custom_store_transition_unchanged() {
+        let initial = final_working_task_without_ttl("task-runtime-custom-write");
+        let task_id = initial.base().task_id.clone();
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let initial_snapshot = runtime
+            .load_task_snapshot(&task_id)
+            .expect("the valid custom-store snapshot is admitted at the runtime boundary");
+
+        let FinalTask::Working(mut updated_base) = initial_snapshot.task().clone() else {
+            unreachable!("the fixture begins in the working state");
+        };
+        updated_base.status_message = Some("accepted update".to_owned());
+        let accepted = FinalTask::Working(updated_base);
+        runtime
+            .persist_transition_clearing_input(&initial_snapshot, accepted.clone())
+            .expect("the custom store receives an otherwise valid transition");
+        assert_eq!(
+            store.transition_write_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the accepted transition reaches the arbitrary store exactly once"
+        );
+
+        let before_rejection = store.snapshot();
+        let before_wire = serde_json::to_value(before_rejection.task())
+            .expect("serialize custom-store snapshot before malformed write");
+        let FinalTask::Working(mut malformed_base) = accepted else {
+            unreachable!("the accepted transition remains working");
+        };
+        malformed_base.status = FinalTaskStatus::Cancelled;
+        let malformed = FinalTask::Working(malformed_base);
+
+        let error = runtime
+            .persist_transition_clearing_input(&before_rejection, malformed)
+            .expect_err(
+                "changing only the status/variant alignment rejects before the store write",
+            );
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        assert_eq!(
+            store.transition_write_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "the malformed transition cannot reach an arbitrary store implementation"
+        );
+        let after_rejection = store.snapshot();
+        assert_eq!(
+            serde_json::to_value(after_rejection.task())
+                .expect("serialize custom-store snapshot after malformed write rejection"),
+            before_wire,
+            "the near-identical rejected write leaves the durable task unchanged"
+        );
+        assert_eq!(
+            after_rejection.generation(),
+            before_rejection.generation(),
+            "the rejected write cannot advance the arbitrary store generation"
+        );
+    }
+
+    #[test]
+    fn task_03_runtime_rejects_custom_store_create_descriptor_and_retention_drift_unchanged() {
+        let initial = final_working_task_without_ttl("task-runtime-custom-create");
+        let task_id = initial.base().task_id.clone();
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let before = store.snapshot();
+
+        let invalid_descriptor = FinalTaskWorkDescriptor(serde_json::Value::Null);
+        let error = runtime
+            .persist_new_with_work(
+                final_working_task_without_ttl("task-runtime-custom-new"),
+                invalid_descriptor,
+            )
+            .expect_err("a null work descriptor rejects before a permissive create");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        let FinalTask::Working(mut identity_drifted_base) = before.task().clone() else {
+            unreachable!("the probe begins working");
+        };
+        identity_drifted_base.task_id = FinalTaskId::parse("task-runtime-custom-create-other")
+            .expect("fixed replacement task ID is valid");
+        let error = runtime
+            .persist_transition_clearing_input(&before, FinalTask::Working(identity_drifted_base))
+            .expect_err("changing only task identity rejects before the store write");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+
+        let FinalTask::Working(mut drifted_base) = before.task().clone() else {
+            unreachable!("the probe begins working");
+        };
+        drifted_base.ttl_ms = Some(serde_json::from_str("1").expect("valid ttl fixture"));
+        let error = runtime
+            .persist_transition_clearing_input(&before, FinalTask::Working(drifted_base))
+            .expect_err("changing only retained ttl rejects before the store write");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+
+        let after = store.snapshot();
+        assert!(
+            final_tasks_match_exactly(before.task(), after.task()).expect("compare probe task"),
+            "create and retention rejections leave the permissive store unchanged"
+        );
+        assert_eq!(after.generation(), before.generation());
+        assert_eq!(after.task().base().task_id, task_id);
+    }
+
+    #[test]
+    fn task_03_runtime_rejects_custom_store_recovery_claim_binding_substitution_unchanged() {
+        let initial = final_working_task_without_ttl("task-runtime-custom-recovery");
+        let task_id = initial.base().task_id.clone();
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let baseline = store.snapshot();
+        *store
+            .initial_claim_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(FinalTaskInitialWorkClaim::new(
+                task_id.clone(),
+                baseline.generation(),
+                "different-owner",
+                final_test_work_descriptor(),
+            ));
+        let error = runtime
+            .recover_initial_work()
+            .expect_err("changing only the owner rejects an initial recovery handoff");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        *store
+            .initial_claim_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(FinalTaskInitialWorkClaim::new(
+                FinalTaskId::parse("task-runtime-custom-recovery-other")
+                    .expect("fixed substituted task ID is valid"),
+                baseline.generation(),
+                FINAL_TASK_TEST_DIRECT_OWNER,
+                final_test_work_descriptor(),
+            ));
+        let error = runtime
+            .recover_initial_work()
+            .expect_err("changing only task identity rejects an initial recovery handoff");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        *store
+            .initial_claim_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(FinalTaskInitialWorkClaim::new(
+                task_id.clone(),
+                baseline.generation(),
+                FINAL_TASK_TEST_DIRECT_OWNER,
+                FinalTaskWorkDescriptor(serde_json::Value::Null),
+            ));
+        let error = runtime
+            .recover_initial_work()
+            .expect_err("changing only the work descriptor rejects before application handoff");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        let responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed accepted-input fixture");
+        store.set_accepted_inputs(responses.clone());
+        *store
+            .accepted_claim_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(FinalTaskAcceptedInputClaim::new(
+                task_id.clone(),
+                baseline.generation().saturating_add(1),
+                FINAL_TASK_TEST_DIRECT_OWNER,
+                final_test_work_descriptor(),
+                responses,
+            ));
+        let error = runtime
+            .recover_accepted_input()
+            .expect_err("changing only the generation rejects an accepted-input handoff");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        *store
+            .accepted_claim_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(FinalTaskAcceptedInputClaim::new(
+                task_id,
+                baseline.generation(),
+                FINAL_TASK_TEST_DIRECT_OWNER,
+                final_test_work_descriptor(),
+                FinalTaskInputResponses::new(),
+            ));
+        let error = runtime
+            .recover_accepted_input()
+            .expect_err("changing only accepted-input payload emptiness rejects before handoff");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+        let after = store.snapshot();
+        assert!(
+            final_tasks_match_exactly(baseline.task(), after.task()).expect("compare probe task"),
+            "rejected recovery claims never rewrite the retained task"
+        );
+        assert_eq!(after.generation(), baseline.generation());
+    }
+
+    #[test]
+    fn task_03_runtime_rejects_custom_store_cancellation_substitution_and_false_cas_unchanged() {
+        let initial = final_working_task_without_ttl("task-runtime-custom-cancel");
+        let task_id = initial.base().task_id.clone();
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let before = store.snapshot();
+        let FinalTask::Working(base) = before.task().clone() else {
+            unreachable!("the probe begins working");
+        };
+        let substituted = FinalTask::Cancelled(
+            transition_terminal_final_task_base(
+                base,
+                FinalTaskStatus::Cancelled,
+                Some("substituted cancellation".to_owned()),
+            )
+            .expect("fixed cancellation transition"),
+        );
+        *store
+            .cancellation_result_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FinalTaskSnapshot::new(
+            substituted,
+            before.generation().saturating_add(1),
+        ));
+        let error = runtime
+            .cancel_task(&task_id)
+            .expect_err("a near-identical cancelled task cannot substitute the runtime intent");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        let FinalTask::Working(mut substituted_active_base) = before.task().clone() else {
+            unreachable!("the probe remains working after rejected terminal substitution");
+        };
+        substituted_active_base.status_message = Some("substituted active cancellation".to_owned());
+        *store
+            .cancellation_result_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(FinalTaskSnapshot::new(
+            FinalTask::Working(substituted_active_base),
+            before.generation(),
+        ));
+        let error = runtime
+            .cancel_task(&task_id)
+            .expect_err("an active cancellation result must retain the exact expected snapshot");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+
+        *store
+            .cancellation_result_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        store.force_false_cas.store(true, AtomicOrdering::SeqCst);
+        let FinalTask::Working(mut terminal_base) = before.task().clone() else {
+            unreachable!("the probe remains working after rejected substitution");
+        };
+        terminal_base.status_message = Some("terminal candidate".to_owned());
+        let error = runtime
+            .persist_transition_clearing_input(&before, FinalTask::Working(terminal_base))
+            .expect_err("a false compare-and-swap is not an accepted terminal transition");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        let after = store.snapshot();
+        assert!(
+            final_tasks_match_exactly(before.task(), after.task()).expect("compare probe task"),
+            "substitution and false-CAS rejection leave the durable task unchanged"
+        );
+        assert_eq!(after.generation(), before.generation());
+    }
+
+    #[test]
+    fn task_03_runtime_rejects_custom_store_terminal_transition_substitution() {
+        let initial = final_working_task_without_ttl("task-runtime-custom-terminal");
+        let task_id = initial.base().task_id.clone();
+        let store = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(initial));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).expect("valid final task policy"),
+            Arc::new(|_| {}),
+        );
+        let before = store.snapshot();
+        let FinalTask::Working(base) = before.task().clone() else {
+            unreachable!("the probe begins working");
+        };
+        let intended = FinalTask::Cancelled(
+            transition_terminal_final_task_base(
+                base.clone(),
+                FinalTaskStatus::Cancelled,
+                Some("intended terminal transition".to_owned()),
+            )
+            .expect("fixed terminal transition is valid"),
+        );
+        let substituted = FinalTask::Cancelled(
+            transition_terminal_final_task_base(
+                base,
+                FinalTaskStatus::Cancelled,
+                Some("substituted terminal transition".to_owned()),
+            )
+            .expect("fixed substituted terminal transition is valid"),
+        );
+        *store
+            .transition_result_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(substituted);
+
+        let error = runtime
+            .persist_transition_clearing_input(&before, intended)
+            .expect_err("a store may not substitute a near-identical terminal transition");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+        let after = store.snapshot();
+        assert!(
+            !final_tasks_match_exactly(before.task(), after.task()).expect("compare probe task"),
+            "the deliberately permissive store records its substituted write for boundary detection"
+        );
+        assert_eq!(after.generation(), before.generation().saturating_add(1));
+        assert_eq!(after.task().base().task_id, task_id);
+    }
+
+    #[test]
+    fn task_03_in_memory_false_cas_does_not_reclaim_expired_retained_task() {
+        let (store, now) = in_memory_store_with_test_clock(4);
+        let task = final_task_with_durations("task-false-cas-retention", Some("1"), None);
+        let task_id = task.base().task_id.clone();
+        let notification = final_task_notification(&task);
+        store
+            .create_task_with_work(task.clone(), notification, final_test_work_descriptor())
+            .expect("bounded retained task is created");
+        let current = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generations
+            .get(&task_id)
+            .copied()
+            .expect("created task retains a generation");
+        *now.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += StdDuration::from_millis(2);
+        let stale = FinalTaskSnapshot::new(task.clone(), current.saturating_add(1));
+        assert!(
+            !store
+                .replace_task_if_current(&stale, task.clone(), final_task_notification(&task))
+                .expect("stale compare-and-swap returns false"),
+            "changing only the expected generation loses the CAS"
+        );
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.tasks.contains_key(&task_id) && state.expires_at.contains_key(&task_id),
+            "a false CAS must not use expiry cleanup to delete retained task state"
         );
     }
 
@@ -7546,16 +8821,19 @@ mod tests {
     }
 
     #[test]
-    fn task_03_in_memory_store_transition_preserves_creation_expiry() {
+    fn task_03_in_memory_store_allows_status_update_but_rejects_ttl_drift_without_losing_recovery()
+    {
         const TTL_MS: u64 = 60_000;
         let (store, now) = in_memory_store_with_test_clock(1);
         let expiring = final_working_task_with_ttl("task-replacement-expiry", TTL_MS);
         let task_id = expiring.base().task_id.clone();
         store
-            .create_task(expiring.clone(), final_task_notification(&expiring))
-            .expect("expiring task creates");
-
-        let non_expiring = final_working_task_without_ttl("task-replacement-expiry");
+            .create_task_with_work(
+                expiring.clone(),
+                final_task_notification(&expiring),
+                final_test_work_descriptor(),
+            )
+            .expect("expiring task and its initial supervisor handoff create atomically");
         let mut clock = now
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7563,16 +8841,85 @@ mod tests {
             .checked_add(StdDuration::from_millis(TTL_MS - 1))
             .expect("test clock reaches one millisecond before creation expiry");
         drop(clock);
-        store
-            .replace_task(non_expiring.clone(), final_task_notification(&non_expiring))
-            .expect("transition keeps the creation-time retention deadline");
+
+        let snapshot_before_update = store
+            .get_task_snapshot(&task_id)
+            .expect("pre-deadline task snapshot is readable")
+            .expect("pre-deadline task remains retained");
+        let FinalTask::Working(mut updated_base) = expiring.clone() else {
+            unreachable!("the fixture is a working task");
+        };
+        updated_base.status_message = Some("still working".to_owned());
+        let updated = FinalTask::Working(updated_base);
         assert!(
             store
-                .get_task(&task_id)
-                .expect("pre-deadline transition lookup is readable")
-                .is_some(),
-            "the one-variable pre-deadline case remains retained"
+                .replace_task_if_current(
+                    &snapshot_before_update,
+                    updated.clone(),
+                    final_task_notification(&updated),
+                )
+                .expect("an otherwise identical working update is accepted"),
+            "changing only the mutable status message preserves the creation retention contract"
         );
+
+        let snapshot_before_rejection = store
+            .get_task_snapshot(&task_id)
+            .expect("post-update task snapshot is readable")
+            .expect("post-update task remains retained");
+        let task_before_rejection = serde_json::to_value(snapshot_before_rejection.task())
+            .expect("serialize retained task before TTL rejection");
+        let notification_before_rejection = serde_json::to_value(
+            store
+                .latest_notification(&task_id)
+                .expect("post-update notification remains retained"),
+        )
+        .expect("serialize retained notification before TTL rejection");
+        let FinalTask::Working(mut ttl_drift_base) = updated else {
+            unreachable!("the accepted update remains a working task");
+        };
+        ttl_drift_base.ttl_ms = None;
+        let ttl_drift = FinalTask::Working(ttl_drift_base);
+        let error = store
+            .replace_task_if_current(
+                &snapshot_before_rejection,
+                ttl_drift.clone(),
+                final_task_notification(&ttl_drift),
+            )
+            .expect_err("changing only ttlMs must not rewrite durable retention");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        assert!(error.message.contains("ttlMs"));
+
+        let snapshot_after_rejection = store
+            .get_task_snapshot(&task_id)
+            .expect("task snapshot remains readable after TTL rejection")
+            .expect("TTL rejection cannot remove the retained task");
+        assert_eq!(
+            serde_json::to_value(snapshot_after_rejection.task())
+                .expect("serialize retained task after TTL rejection"),
+            task_before_rejection,
+            "the near-identical rejected transition preserves the durable task"
+        );
+        assert_eq!(
+            snapshot_after_rejection.generation(),
+            snapshot_before_rejection.generation(),
+            "the rejected TTL drift cannot advance the durable generation"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .latest_notification(&task_id)
+                    .expect("notification remains retained after TTL rejection"),
+            )
+            .expect("serialize retained notification after TTL rejection"),
+            notification_before_rejection,
+            "the rejected TTL drift cannot replace the durable notification"
+        );
+        let recovered = test_next_initial_work(&store)
+            .expect("initial supervisor handoff remains recoverable")
+            .expect("retention rejection cannot erase initial task work");
+        assert_eq!(recovered.task_id(), &task_id);
+        assert_eq!(recovered.work_descriptor(), &final_test_work_descriptor());
+
         let mut clock = now
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7583,9 +8930,9 @@ mod tests {
         assert!(
             store
                 .get_task(&task_id)
-                .expect("replacement task lookup is readable")
+                .expect("expired task lookup is readable")
                 .is_none(),
-            "a transition cannot extend or remove the creation-time expiry"
+            "the accepted status update and rejected TTL drift retain the original creation deadline"
         );
     }
 
@@ -9185,8 +10532,9 @@ mod tests {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let delivered_for_emitter = Arc::clone(&delivered);
+        let runtime_store: Arc<dyn FinalTaskStore> = store.clone();
         let runtime = FinalTaskRuntime::new(
-            Arc::clone(&store),
+            runtime_store,
             FinalTaskRuntimeConfig::new(60_000, Some(5_000))
                 .expect("a finite final task policy is valid"),
             Arc::new(move |notification| {

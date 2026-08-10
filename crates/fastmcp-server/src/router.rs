@@ -7,6 +7,7 @@ use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Duration;
 
+#[cfg(feature = "tasks")]
 use crate::FinalTaskRuntime;
 use crate::Session;
 use crate::bidirectional::{
@@ -22,6 +23,7 @@ use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
     CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
 };
+#[cfg(all(feature = "proxy", feature = "tasks"))]
 use crate::proxy::ProxyFinalTaskRelay;
 #[cfg(test)]
 use asupersync::time::wall_now;
@@ -37,6 +39,7 @@ use fastmcp_core::{
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
+#[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
 use fastmcp_protocol::methods::COMPLETION_COMPLETE;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
@@ -360,14 +363,37 @@ fn canonical_final_catalog_tags(tags: Option<&[String]>) -> Vec<String> {
 struct FinalCatalogCursor {
     catalog: FinalCatalogKind,
     revision: u64,
+    state: Option<FinalCatalogState>,
     query: FinalCatalogQuery,
     offset: u64,
+}
+
+/// Opaque connection-state snapshot bound into a final catalog cursor.
+///
+/// A final catalog can be filtered by a connection's disabled-component set.
+/// The cursor must therefore be rejected after either the connection identity
+/// or its state revision changes rather than treating an offset from a prior
+/// filtered view as a continuation of the current one.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FinalCatalogState {
+    partition: [u8; 32],
+    revision: u64,
+}
+
+fn final_catalog_state(request_ctx: &McpContext) -> Option<FinalCatalogState> {
+    request_ctx
+        .session_cache_partition()
+        .map(|(partition, revision)| FinalCatalogState {
+            partition,
+            revision,
+        })
 }
 
 fn decode_final_catalog_cursor_offset(
     cursor: Option<&str>,
     expected_catalog: FinalCatalogKind,
     expected_revision: u64,
+    expected_state: Option<&FinalCatalogState>,
     expected_query: &FinalCatalogQuery,
     catalog_length: usize,
 ) -> McpResult<usize> {
@@ -389,6 +415,11 @@ fn decode_final_catalog_cursor_offset(
     if cursor.revision != expected_revision {
         return Err(McpError::invalid_params(
             "final catalog cursor references a stale catalog revision",
+        ));
+    }
+    if cursor.state.as_ref() != expected_state {
+        return Err(McpError::invalid_params(
+            "final catalog cursor references stale connection state",
         ));
     }
     if &cursor.query != expected_query {
@@ -591,6 +622,7 @@ fn handler_mrtr_input_requests(result: &InputRequiredResult) -> McpResult<MrtrIn
     )
 }
 
+#[cfg(feature = "tasks")]
 fn encode_final_task_result(
     result: fastmcp_protocol::tasks_extension::CreateTaskResult,
 ) -> McpResult<serde_json::Value> {
@@ -600,6 +632,7 @@ fn encode_final_task_result(
     serde_json::from_str(&encoded).map_err(McpError::from)
 }
 
+#[cfg(feature = "tasks")]
 fn require_final_tasks_capability(metadata: &OpenMetadata) -> McpResult<()> {
     let declared = metadata
         .client_capabilities()
@@ -1392,6 +1425,7 @@ fn encode_cursor_offset(offset: usize) -> String {
 fn encode_final_catalog_cursor(
     catalog: FinalCatalogKind,
     revision: u64,
+    state: Option<FinalCatalogState>,
     query: &FinalCatalogQuery,
     offset: usize,
 ) -> String {
@@ -1399,6 +1433,7 @@ fn encode_final_catalog_cursor(
     let payload = FinalCatalogCursor {
         catalog,
         revision,
+        state,
         query: query.clone(),
         offset,
     };
@@ -1406,26 +1441,36 @@ fn encode_final_catalog_cursor(
     BASE64_STANDARD.encode(bytes)
 }
 
-/// Pages an already-filtered immutable final catalog.
+/// Pages an already-filtered final catalog snapshot.
 ///
-/// Filtering must precede cursor arithmetic so an exact-legacy-only entry
-/// cannot create an empty modern page or shift a final peer's cursor.
+/// Filtering must precede cursor arithmetic so an exact-legacy-only or
+/// connection-disabled entry cannot create an empty modern page or shift a
+/// final peer's cursor.
 fn page_final_catalog<T: Clone>(
     items: Vec<T>,
     cursor: Option<&str>,
     page_size: Option<usize>,
     catalog: FinalCatalogKind,
     revision: u64,
+    state: Option<FinalCatalogState>,
     query: &FinalCatalogQuery,
 ) -> McpResult<(Vec<T>, Option<String>)> {
-    let offset = decode_final_catalog_cursor_offset(cursor, catalog, revision, query, items.len())?;
+    let offset = decode_final_catalog_cursor_offset(
+        cursor,
+        catalog,
+        revision,
+        state.as_ref(),
+        query,
+        items.len(),
+    )?;
     let Some(page_size) = page_size else {
         return Ok((items, None));
     };
     let end = offset.saturating_add(page_size).min(items.len());
     Ok((
         items.get(offset..end).unwrap_or_default().to_vec(),
-        (end < items.len()).then(|| encode_final_catalog_cursor(catalog, revision, query, end)),
+        (end < items.len())
+            .then(|| encode_final_catalog_cursor(catalog, revision, state, query, end)),
     ))
 }
 
@@ -1726,6 +1771,10 @@ pub struct Router {
     completion_handler: Option<BoxedCompletionHandler>,
     /// Whether the server-wide completion fallback is admitted for final dispatch.
     default_final_completion_enabled: bool,
+    /// Legacy completion providers selected by exact prompt name.
+    legacy_prompt_completion_handlers: HashMap<String, BoxedCompletionHandler>,
+    /// Legacy completion providers selected by exact resource-template URI.
+    legacy_resource_template_completion_handlers: HashMap<String, BoxedCompletionHandler>,
     /// Final completion providers selected by exact prompt name.
     final_prompt_completion_handlers: HashMap<String, BoxedCompletionHandler>,
     /// Final completion providers selected by exact resource-template URI.
@@ -1764,10 +1813,12 @@ pub struct Router {
     final_cache_hints: FinalCacheHintPolicy,
     /// Application-owned durable final Tasks runtime used only after the
     /// request metadata has admitted the official extension.
+    #[cfg(feature = "tasks")]
     final_task_runtime: Option<FinalTaskRuntime>,
     /// One route-bound upstream final Tasks relay. This is distinct from the
     /// local runtime because upstream task IDs must never be recreated or
     /// translated into local task state.
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
     /// Bounded, process-local final request-state records for tool, resource,
     /// and prompt retries. A state is accepted only if this router issued it.
@@ -1783,6 +1834,8 @@ impl Router {
             tool_order: Vec::new(),
             completion_handler: None,
             default_final_completion_enabled: false,
+            legacy_prompt_completion_handlers: HashMap::new(),
+            legacy_resource_template_completion_handlers: HashMap::new(),
             final_prompt_completion_handlers: HashMap::new(),
             final_resource_template_completion_handlers: HashMap::new(),
             resources: HashMap::new(),
@@ -1800,16 +1853,20 @@ impl Router {
             list_page_size: None,
             final_catalog_revision: 0,
             final_cache_hints: FinalCacheHintPolicy::default(),
+            #[cfg(feature = "tasks")]
             final_task_runtime: None,
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
             mrtr_exchanges: Arc::new(MrtrExchangeRegistry::new()),
         }
     }
 
+    #[cfg(feature = "tasks")]
     pub(crate) fn set_final_task_runtime(&mut self, runtime: Option<FinalTaskRuntime>) {
         self.final_task_runtime = runtime;
     }
 
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub(crate) fn set_final_task_relay(&mut self, relay: Option<Arc<ProxyFinalTaskRelay>>) {
         self.final_task_relay = relay;
     }
@@ -1891,6 +1948,64 @@ impl Router {
         });
     }
 
+    /// Rejects a modern handler template that could select an already-admitted
+    /// modern resource route. Dispatch must never resolve such a collision by
+    /// registration order or by the specificity tie-breaker.
+    fn reject_final_template_collisions(
+        &self,
+        candidate: &ReversibleResourceTemplate,
+        replacing_source: Option<&str>,
+    ) -> McpResult<()> {
+        for uri in self.final_resources.keys() {
+            if candidate
+                .match_uri(uri)
+                .map_err(|_| McpError::invalid_params("resource template match admission failed"))?
+                .is_some()
+            {
+                return Err(McpError::invalid_params(
+                    "resource template collides with an exact final resource",
+                ));
+            }
+        }
+
+        for (source, entry) in &self.resource_templates {
+            if replacing_source == Some(source.as_str()) {
+                continue;
+            }
+            let Some(existing) = entry.matcher.as_ref() else {
+                continue;
+            };
+            if reversible_templates_may_overlap(candidate, existing)? {
+                return Err(McpError::invalid_params(
+                    "resource template collides with an admitted final resource template",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rejects a modern exact resource whose byte-exact URI is matched by an
+    /// already-admitted modern resource template.
+    fn reject_final_exact_resource_template_collisions(&self, uri: &str) -> McpResult<()> {
+        for entry in self.resource_templates.values() {
+            let Some(matcher) = entry.matcher.as_ref() else {
+                continue;
+            };
+            if matcher
+                .match_uri(uri)
+                .map_err(|_| McpError::invalid_params("resource template match admission failed"))?
+                .is_some()
+            {
+                return Err(McpError::invalid_params(
+                    "exact final resource collides with an admitted resource template",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Adds a tool handler.
     ///
     /// If a tool with the same name already exists, it will be replaced.
@@ -1921,7 +2036,7 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_tool_registration_with_behavior(handler, behavior, true, true)
+        self.add_tool_registration_with_behavior(handler, behavior, true, true, false)
     }
 
     /// Adds an exact-final-only tool with duplicate handling.
@@ -1930,7 +2045,20 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_tool_registration_with_behavior(handler, behavior, true, false)
+        self.add_tool_registration_with_behavior(handler, behavior, true, false, false)
+    }
+
+    /// Adds a final-only tool carrying validated MCP Apps metadata.
+    ///
+    /// This is deliberately narrower than ordinary tool registration: callers
+    /// must first install the Apps extension through the builder, and the tool
+    /// is never projected into exact MCP 2024-11-05 discovery or dispatch.
+    pub(crate) fn add_mcp_apps_tool_with_behavior<H: ToolHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_tool_registration_with_behavior(handler, behavior, true, false, true)
     }
 
     /// Adds an intentionally exact-2024-only tool with duplicate policy.
@@ -1944,7 +2072,7 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_tool_registration_with_behavior(handler, behavior, false, true)
+        self.add_tool_registration_with_behavior(handler, behavior, false, true, false)
     }
 
     fn add_tool_registration_with_behavior<H: ToolHandler + 'static>(
@@ -1953,6 +2081,7 @@ impl Router {
         behavior: crate::DuplicateBehavior,
         admit_final: bool,
         legacy_enabled: bool,
+        allow_mcp_apps: bool,
     ) -> Result<(), McpError> {
         let def = crate::catch_extension_unwind(|| handler.definition()).map_err(|_payload| {
             McpError::internal_error("tool definition hook panicked during admission")
@@ -1996,12 +2125,147 @@ impl Router {
         } else {
             AdmittedToolRegistration::legacy_only(handler, def)
         };
+        if let Some(final_registration) = admitted.final_registration.as_ref() {
+            self.validate_mcp_apps_tool_admission(
+                &final_registration.final_definition,
+                allow_mcp_apps,
+            )?;
+        }
         self.tools.insert(name.clone(), admitted);
         if !existed {
             self.tool_order.push(name);
         }
         self.advance_final_catalog_revision();
         Ok(())
+    }
+
+    /// Keeps Apps metadata on its explicit, negotiated, exact-final path.
+    fn validate_mcp_apps_tool_admission(
+        &self,
+        tool: &FinalTool,
+        allow_mcp_apps: bool,
+    ) -> McpResult<()> {
+        let metadata = tool.mcp_apps_metadata().map_err(|error| {
+            McpError::invalid_request(format!("invalid MCP Apps tool metadata: {error}"))
+        })?;
+        if metadata.is_some() && !allow_mcp_apps {
+            return Err(McpError::invalid_request(
+                "MCP Apps tool metadata requires ServerBuilder::mcp_apps_tool",
+            ));
+        }
+        self.validate_mcp_apps_tool_resource_binding(tool)
+    }
+
+    /// Verifies that a final tool's optional Apps UI binding selects a
+    /// registered final Apps HTML resource before either catalog is mutated.
+    fn validate_mcp_apps_tool_resource_binding(&self, tool: &FinalTool) -> McpResult<()> {
+        let binding = tool.mcp_apps_resource_binding().map_err(|error| {
+            McpError::invalid_request(format!("invalid MCP Apps tool metadata: {error}"))
+        })?;
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        let resource = self
+            .final_resources
+            .get(binding.resource_uri.as_str())
+            .ok_or_else(|| {
+                McpError::invalid_request(format!(
+                    "MCP Apps UI resource is not registered: {}",
+                    binding.resource_uri
+                ))
+            })?;
+        binding
+            .validate_resource(&resource.definition)
+            .map_err(|error| {
+                McpError::invalid_request(format!("invalid MCP Apps UI resource binding: {error}"))
+            })
+    }
+
+    /// Prevents replacement of one final Apps resource with a definition that
+    /// would invalidate an already-admitted tool binding.
+    fn validate_mcp_apps_resource_bindings(&self, resource: &FinalResource) -> McpResult<()> {
+        for tool in self.tools.values() {
+            let Some(final_registration) = tool.final_registration.as_ref() else {
+                continue;
+            };
+            let binding = final_registration
+                .final_definition
+                .mcp_apps_resource_binding()
+                .map_err(|error| {
+                    McpError::invalid_request(format!("invalid MCP Apps tool metadata: {error}"))
+                })?;
+            if let Some(binding) = binding
+                && binding.resource_uri == resource.uri
+            {
+                binding.validate_resource(resource).map_err(|error| {
+                    McpError::invalid_request(format!(
+                        "invalid MCP Apps UI resource replacement: {error}"
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Prevents generic resource registration from projecting an Apps View
+    /// into exact MCP 2024-11-05. The typed provider is admitted only through
+    /// the builder's negotiated final-only registration path.
+    fn validate_mcp_apps_ui_resource_admission(
+        &self,
+        resource: &FinalResource,
+        allow_mcp_apps: bool,
+    ) -> McpResult<()> {
+        let requires_mcp_apps = Self::mcp_apps_ui_resource_requires_special_admission(resource)?;
+        if !requires_mcp_apps {
+            return Ok(());
+        }
+        if !allow_mcp_apps {
+            return Err(McpError::invalid_request(
+                "MCP Apps UI resources require ServerBuilder::mcp_apps_ui_resource",
+            ));
+        }
+        let is_apps_html = resource.uri.as_str().starts_with("ui://")
+            && resource.mime_type.as_deref() == Some(fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE);
+        if !is_apps_html {
+            return Err(McpError::invalid_request(
+                "MCP Apps UI resources must use a ui:// URI and the MCP Apps HTML MIME type",
+            ));
+        }
+        Ok(())
+    }
+
+    fn mcp_apps_ui_resource_requires_special_admission(
+        resource: &FinalResource,
+    ) -> McpResult<bool> {
+        let metadata = resource.mcp_apps_metadata().map_err(|error| {
+            McpError::invalid_request(format!("invalid MCP Apps resource metadata: {error}"))
+        })?;
+        let is_apps_html = resource.uri.as_str().starts_with("ui://")
+            && resource.mime_type.as_deref() == Some(fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE);
+        Ok(is_apps_html || metadata.is_some())
+    }
+
+    /// Returns whether this router contains a final-only MCP Apps component.
+    ///
+    /// Builder-level composition uses this inventory before consuming a child
+    /// server. Invalid retained final metadata is treated as Apps-bound so a
+    /// malformed child cannot bypass the destination's Apps opt-in gate.
+    #[must_use]
+    pub(crate) fn has_mcp_apps_bound_components(&self) -> bool {
+        self.final_resources.values().any(|registration| {
+            Self::mcp_apps_ui_resource_requires_special_admission(&registration.definition)
+                .unwrap_or(true)
+        }) || self.tools.values().any(|registration| {
+            registration
+                .final_registration
+                .as_ref()
+                .is_some_and(|final_registration| {
+                    final_registration
+                        .final_definition
+                        .mcp_apps_metadata()
+                        .map_or(true, |metadata| metadata.is_some())
+                })
+        })
     }
 
     /// Registers the handler for `completion/complete`.
@@ -2020,6 +2284,34 @@ impl Router {
     pub fn add_legacy_completion_handler<H: CompletionHandler + 'static>(&mut self, handler: H) {
         self.completion_handler = Some(Box::new(handler));
         self.default_final_completion_enabled = false;
+    }
+
+    /// Registers a legacy completion provider for one exact prompt name.
+    ///
+    /// This route takes precedence over the legacy server-wide fallback and is
+    /// removed atomically when `Replace` admits a new prompt at the same name.
+    pub(crate) fn add_legacy_prompt_completion_handler<H: CompletionHandler + 'static>(
+        &mut self,
+        prompt_name: impl Into<String>,
+        handler: H,
+    ) {
+        self.legacy_prompt_completion_handlers
+            .insert(prompt_name.into(), Box::new(handler));
+    }
+
+    /// Registers a legacy completion provider for one exact resource-template URI.
+    ///
+    /// This route takes precedence over the legacy server-wide fallback and is
+    /// removed atomically when `Replace` admits a new template at the same URI.
+    pub(crate) fn add_legacy_resource_template_completion_handler<
+        H: CompletionHandler + 'static,
+    >(
+        &mut self,
+        uri_template: impl Into<String>,
+        handler: H,
+    ) {
+        self.legacy_resource_template_completion_handlers
+            .insert(uri_template.into(), Box::new(handler));
     }
 
     /// Registers a final completion provider for one exact prompt name.
@@ -2085,6 +2377,7 @@ impl Router {
             crate::DuplicateBehavior::Replace,
             true,
             true,
+            false,
         ) {
             log::warn!(
                 target: "fastmcp_rust::router",
@@ -2101,6 +2394,7 @@ impl Router {
             crate::DuplicateBehavior::Replace,
             false,
             true,
+            false,
         ) {
             log::warn!(
                 target: "fastmcp_rust::router",
@@ -2119,7 +2413,7 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_resource_registration_with_behavior(handler, behavior, true, true)
+        self.add_resource_registration_with_behavior(handler, behavior, true, true, false)
     }
 
     /// Adds an exact-final-only resource or resource template with duplicate handling.
@@ -2128,7 +2422,16 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_resource_registration_with_behavior(handler, behavior, true, false)
+        self.add_resource_registration_with_behavior(handler, behavior, true, false, false)
+    }
+
+    /// Adds one final-only MCP Apps HTML resource after builder-level Apps opt-in.
+    pub(crate) fn add_mcp_apps_ui_resource_with_behavior<H: ResourceHandler + 'static>(
+        &mut self,
+        handler: H,
+        behavior: crate::DuplicateBehavior,
+    ) -> Result<(), McpError> {
+        self.add_resource_registration_with_behavior(handler, behavior, true, false, true)
     }
 
     /// Adds an exact-2024-only resource handler with duplicate handling.
@@ -2137,7 +2440,7 @@ impl Router {
         handler: H,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_resource_registration_with_behavior(handler, behavior, false, true)
+        self.add_resource_registration_with_behavior(handler, behavior, false, true, false)
     }
 
     fn add_resource_registration_with_behavior<H: ResourceHandler + 'static>(
@@ -2146,6 +2449,7 @@ impl Router {
         behavior: crate::DuplicateBehavior,
         admit_final: bool,
         legacy_enabled: bool,
+        allow_mcp_apps: bool,
     ) -> Result<(), McpError> {
         let (template, def) =
             crate::catch_extension_unwind(|| (handler.template(), handler.definition())).map_err(
@@ -2205,6 +2509,10 @@ impl Router {
             };
             let (matcher, specificity) = if admit_final {
                 let (matcher, specificity) = admit_resource_template(&template.uri_template)?;
+                self.reject_final_template_collisions(
+                    &matcher,
+                    Some(template.uri_template.as_str()),
+                )?;
                 (Some(matcher), specificity)
             } else {
                 let matcher = legacy_matcher.as_ref().ok_or_else(|| {
@@ -2238,6 +2546,12 @@ impl Router {
                 .transpose()?;
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resource_templates.contains_key(&template.uri_template);
+            if existed {
+                self.legacy_resource_template_completion_handlers
+                    .remove(&template.uri_template);
+                self.final_resource_template_completion_handlers
+                    .remove(&template.uri_template);
+            }
             let entry = ResourceTemplateEntry {
                 matcher,
                 specificity,
@@ -2271,6 +2585,11 @@ impl Router {
             let final_definition = admit_final
                 .then(|| admit_final_resource_definition(&handler, &def, uri_use_policy))
                 .transpose()?;
+            if let Some(final_definition) = final_definition.as_ref() {
+                self.validate_mcp_apps_ui_resource_admission(final_definition, allow_mcp_apps)?;
+                self.validate_mcp_apps_resource_bindings(final_definition)?;
+                self.reject_final_exact_resource_template_collisions(&def.uri)?;
+            }
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resources.contains_key(&def.uri);
             self.resources.insert(def.uri.clone(), boxed);
@@ -2402,6 +2721,7 @@ impl Router {
         };
         let (matcher, specificity) = if admit_final {
             let (matcher, specificity) = admit_resource_template(&key)?;
+            self.reject_final_template_collisions(&matcher, Some(key.as_str()))?;
             (Some(matcher), specificity)
         } else {
             let matcher = legacy_matcher.as_ref().ok_or_else(|| {
@@ -2419,6 +2739,12 @@ impl Router {
                 )
             })
             .transpose()?;
+        if existed {
+            self.legacy_resource_template_completion_handlers
+                .remove(&key);
+            self.final_resource_template_completion_handlers
+                .remove(&key);
+        }
         let needs_rebuild = match self.resource_templates.get_mut(&key) {
             Some(existing) => {
                 existing.template = template;
@@ -2577,6 +2903,10 @@ impl Router {
         let final_definition = admit_final
             .then(|| admit_final_prompt_definition(&handler, &def))
             .transpose()?;
+        if existed {
+            self.legacy_prompt_completion_handlers.remove(&def.name);
+            self.final_prompt_completion_handlers.remove(&def.name);
+        }
         self.prompts.insert(def.name.clone(), Box::new(handler));
         if legacy_enabled {
             self.final_only_prompts.remove(&def.name);
@@ -3051,9 +3381,16 @@ impl Router {
             return Err(error);
         }
 
-        let handler = self
-            .completion_handler
-            .as_ref()
+        let target_handler = match &params.reference {
+            LegacyCompletionReference::Prompt { name } => {
+                self.legacy_prompt_completion_handlers.get(name)
+            }
+            LegacyCompletionReference::Resource { uri } => {
+                self.legacy_resource_template_completion_handlers.get(uri)
+            }
+        };
+        let handler = target_handler
+            .or(self.completion_handler.as_ref())
             .ok_or_else(|| McpError::method_not_found(COMPLETION_COMPLETE))?;
         let handler_ctx =
             derive_handler_context(request_ctx, None, None, None, ProtocolEra::Legacy2024);
@@ -3111,6 +3448,15 @@ impl Router {
         let provider_handler = match &params.reference {
             FinalCompletionReference::Prompt { name }
             | FinalCompletionReference::PromptWithTitle { name, .. } => {
+                // Completion is a reference-discovery surface as well as an
+                // invocation surface. Keep a component disabled for this
+                // modern connection indistinguishable from an unregistered
+                // prompt, before consulting its schema or a provider.
+                if !request_ctx.is_prompt_enabled(name) {
+                    return Err(McpError::invalid_params(
+                        "completion prompt reference is not registered",
+                    ));
+                }
                 let prompt = self.final_prompts.get(name).ok_or_else(|| {
                     McpError::invalid_params("completion prompt reference is not registered")
                 })?;
@@ -3129,6 +3475,15 @@ impl Router {
                 self.final_prompt_completion_handlers.get(name)
             }
             FinalCompletionReference::Resource { uri } => {
+                // Resource-template completion must use the same modern
+                // connection visibility gate as templates/list and
+                // resources/read. In particular, never fall through to the
+                // global completion provider for a hidden template.
+                if !request_ctx.is_resource_enabled(uri) {
+                    return Err(McpError::invalid_params(
+                        "completion resource reference is not registered",
+                    ));
+                }
                 let template = self
                     .resource_templates
                     .get(uri)
@@ -3222,9 +3577,9 @@ impl Router {
     /// Dispatches a modern request through the transport-neutral final router.
     ///
     /// This is the modern server-side routing seam. It deliberately has no
-    /// `Session` argument: list results come from the immutable router catalog.
-    /// Transport entry points may additionally supply a durable modern
-    /// connection partition for MRTR binding and continuation ownership.
+    /// `Session` argument: the router catalog is immutable, while a supplied
+    /// modern connection context can still filter disabled components and bind
+    /// both cursor continuations and MRTR retries to its durable partition.
     /// Every successful response is re-emitted through the final
     /// complete-result contract. State-bearing lifecycle methods and exact
     /// 2024-11-05 wire results stay on the legacy adapter rather than
@@ -3622,6 +3977,7 @@ impl Router {
         Ok(())
     }
 
+    #[cfg(feature = "tasks")]
     fn admit_final_task_tool(&self, metadata: &OpenMetadata) -> McpResult<&FinalTaskRuntime> {
         require_final_tasks_capability(metadata)?;
         let runtime = self.final_task_runtime.as_ref().ok_or_else(|| {
@@ -3729,10 +4085,12 @@ impl Router {
                     result,
                 )
             }
+            #[cfg(feature = "tasks")]
             FinalToolOutcome::CreateTask {
                 work_descriptor,
                 status_message,
             } => {
+                #[cfg(all(feature = "proxy", feature = "tasks"))]
                 if let Some(relay) = self.final_task_relay.as_ref() {
                     // A relayed task is already durable upstream. Decode its
                     // private carrier only after the downstream capability
@@ -3901,6 +4259,7 @@ impl Router {
                 .iter()
                 .filter_map(|name| self.tools.get(name))
                 .filter(|entry| entry.final_registration.is_some())
+                .filter(|entry| request_ctx.is_tool_enabled(&entry.definition.name))
                 .map(|entry| entry.definition.clone())
                 .filter(|tool| tag_filters.is_none_or(|filters| filters.matches(&tool.tags)))
                 .collect::<Vec<_>>()
@@ -3913,6 +4272,7 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::Tools,
             self.final_catalog_revision,
+            final_catalog_state(request_ctx),
             &query,
         )?;
         let result = ListToolsResult { tools, next_cursor };
@@ -3964,13 +4324,14 @@ impl Router {
         let resources = self
             .resource_order
             .iter()
-            .filter_map(|uri| self.final_resources.get(uri))
-            .filter(|entry| {
+            .filter_map(|uri| self.final_resources.get(uri).map(|entry| (uri, entry)))
+            .filter(|(uri, _)| request_ctx.is_resource_enabled(uri))
+            .filter(|(_, entry)| {
                 filters
                     .as_ref()
                     .is_none_or(|filters| filters.matches(&entry.tags))
             })
-            .map(|entry| {
+            .map(|(_, entry)| {
                 admit_final_resource_uri(
                     entry.uri_use_policy,
                     &entry.definition.uri,
@@ -3985,6 +4346,7 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::Resources,
             self.final_catalog_revision,
+            final_catalog_state(request_ctx),
             &query,
         )?;
         Ok(FinalListResourcesResult {
@@ -4010,8 +4372,9 @@ impl Router {
         let resource_templates = self
             .resource_template_order
             .iter()
-            .filter_map(|key| self.resource_templates.get(key))
-            .filter_map(|entry| {
+            .filter_map(|key| self.resource_templates.get(key).map(|entry| (key, entry)))
+            .filter(|(key, _)| request_ctx.is_resource_enabled(key))
+            .filter_map(|(_, entry)| {
                 entry
                     .final_definition
                     .as_ref()
@@ -4029,6 +4392,7 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::ResourceTemplates,
             self.final_catalog_revision,
+            final_catalog_state(request_ctx),
             &query,
         )?;
         Ok(FinalListResourceTemplatesResult {
@@ -4054,13 +4418,14 @@ impl Router {
         let prompts = self
             .prompt_order
             .iter()
-            .filter_map(|name| self.final_prompts.get(name))
-            .filter(|entry| {
+            .filter_map(|name| self.final_prompts.get(name).map(|entry| (name, entry)))
+            .filter(|(name, _)| request_ctx.is_prompt_enabled(name))
+            .filter(|(_, entry)| {
                 filters
                     .as_ref()
                     .is_none_or(|filters| filters.matches(&entry.tags))
             })
-            .map(|entry| entry.definition.clone())
+            .map(|(_, entry)| entry.definition.clone())
             .collect();
         let (prompts, next_cursor) = page_final_catalog(
             prompts,
@@ -4068,6 +4433,7 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::Prompts,
             self.final_catalog_revision,
+            final_catalog_state(request_ctx),
             &query,
         )?;
         Ok(FinalListPromptsResult {
@@ -4366,7 +4732,13 @@ impl Router {
             return Err(error);
         }
         let progress_marker = final_progress_marker(&params.meta)?;
-        if !session_state.is_tool_enabled(&params.name) {
+        // Modern connection state is attached to `request_ctx`. Stateless
+        // callers still supply the explicit `session_state`, so both views
+        // must admit the component before a final handler (or an MRTR state)
+        // can be reached.
+        if !session_state.is_tool_enabled(&params.name)
+            || !request_ctx.is_tool_enabled(&params.name)
+        {
             return Err(McpError::new(
                 McpErrorCode::MethodNotFound,
                 format!("Tool '{}' is disabled for this session", params.name),
@@ -4412,6 +4784,7 @@ impl Router {
         // `CreateTask`, that side effect cannot be rolled back after the
         // proxy returns. Require the exact downstream Tasks declaration
         // before invoking any task-capable proxy handler.
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
         if declares_final_tasks && self.final_task_relay.is_some() {
             require_final_tasks_capability(&params.meta)?;
         }
@@ -4468,12 +4841,15 @@ impl Router {
                             }
                         }
                     }
+                    #[cfg(feature = "tasks")]
                     FinalToolOutcome::CreateTask { .. } if !declares_final_tasks => {
                         return Err(McpError::invalid_request(
                             "tool returned CreateTask without declaring final Tasks capability",
                         ));
                     }
-                    FinalToolOutcome::InputRequired(_) | FinalToolOutcome::CreateTask { .. } => {}
+                    FinalToolOutcome::InputRequired(_) => {}
+                    #[cfg(feature = "tasks")]
+                    FinalToolOutcome::CreateTask { .. } => {}
                 }
                 Ok(result)
             }
@@ -4793,7 +5169,9 @@ impl Router {
         if let Some(error) = budget_error(request_ctx) {
             return Err(error);
         }
-        if !session_state.is_resource_enabled(uri) {
+        // See the corresponding final tools/call check: a modern connection's
+        // durable component state lives on the request context.
+        if !session_state.is_resource_enabled(uri) || !request_ctx.is_resource_enabled(uri) {
             return Err(McpError::new(
                 McpErrorCode::ResourceNotFound,
                 format!("Resource '{uri}' is disabled for this session"),
@@ -5157,7 +5535,11 @@ impl Router {
             return Err(error);
         }
         let progress_marker = final_progress_marker(&params.meta)?;
-        if !session_state.is_prompt_enabled(&params.name) {
+        // See the corresponding final tools/call check: a modern connection's
+        // durable component state lives on the request context.
+        if !session_state.is_prompt_enabled(&params.name)
+            || !request_ctx.is_prompt_enabled(&params.name)
+        {
             return Err(McpError::new(
                 McpErrorCode::PromptNotFound,
                 format!("Prompt '{}' is disabled for this session", params.name),
@@ -5327,6 +5709,16 @@ impl Router {
         }
     }
 
+    /// Returns whether mounting preserves component keys exactly.
+    ///
+    /// `Some("")` is deliberately equivalent to no prefix: [`Self::apply_prefix`]
+    /// leaves every key byte-for-byte unchanged in both cases. Final route
+    /// projection and collision admission must use this rule rather than
+    /// distinguishing the two `Option` representations.
+    fn prefix_preserves_keys(prefix: Option<&str>) -> bool {
+        prefix.is_none_or(str::is_empty)
+    }
+
     /// Validates a prefix string.
     ///
     /// Prefixes must be alphanumeric plus underscores and hyphens,
@@ -5368,52 +5760,278 @@ impl Router {
             }
         }
 
-        if behavior != crate::DuplicateBehavior::Error {
-            return result;
+        if behavior == crate::DuplicateBehavior::Error {
+            let mut conflicts = Vec::new();
+            if selection.includes_tools() {
+                for name in other.tools.keys() {
+                    let mounted_name = Self::apply_prefix(name, prefix);
+                    if self.tools.contains_key(&mounted_name) {
+                        conflicts.push(("Tool", mounted_name));
+                    }
+                }
+            }
+            if selection.includes_resources() {
+                for uri in other.resources.keys() {
+                    let mounted_uri = Self::apply_prefix(uri, prefix);
+                    if self.resources.contains_key(&mounted_uri) {
+                        conflicts.push(("Resource", mounted_uri));
+                    }
+                }
+                for uri_template in other.resource_templates.keys() {
+                    let mounted_uri_template = Self::apply_prefix(uri_template, prefix);
+                    if self.resource_templates.contains_key(&mounted_uri_template) {
+                        conflicts.push(("Resource template", mounted_uri_template));
+                    }
+                }
+            }
+            if selection.includes_prompts() {
+                for name in other.prompts.keys() {
+                    let mounted_name = Self::apply_prefix(name, prefix);
+                    if self.prompts.contains_key(&mounted_name) {
+                        conflicts.push(("Prompt", mounted_name));
+                    }
+                }
+            }
+
+            conflicts.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
+            result
+                .errors
+                .extend(conflicts.into_iter().map(|(kind, key)| {
+                    format!(
+                        "Mount rejected because {kind} already exists; component_key={}",
+                        safe_log_label(&key)
+                    )
+                }));
         }
 
-        let mut conflicts = Vec::new();
-        if selection.includes_tools() {
-            for name in other.tools.keys() {
-                let mounted_name = Self::apply_prefix(name, prefix);
-                if self.tools.contains_key(&mounted_name) {
-                    conflicts.push(("Tool", mounted_name));
+        self.preflight_final_resource_route_collisions(
+            other,
+            prefix,
+            behavior,
+            selection,
+            &mut result,
+        );
+        self.preflight_mcp_apps_mount_bindings(other, prefix, behavior, selection, &mut result);
+        result
+    }
+
+    /// Projects the final resource routes that a mount would leave in the
+    /// destination, then refuses ambiguous exact/template or template/template
+    /// languages before consuming any source handlers. A nonempty prefix
+    /// produces legacy-only resources, so it cannot introduce a final route
+    /// collision.
+    fn preflight_final_resource_route_collisions(
+        &self,
+        other: &Self,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+        selection: MountSelection,
+        result: &mut MountResult,
+    ) {
+        if !selection.includes_resources() {
+            return;
+        }
+
+        let mut final_resources: HashSet<String> = self.final_resources.keys().cloned().collect();
+        let mut final_templates: HashMap<String, ReversibleResourceTemplate> = self
+            .resource_templates
+            .iter()
+            .filter_map(|(uri_template, entry)| {
+                entry
+                    .final_definition
+                    .as_ref()
+                    .zip(entry.matcher.as_ref())
+                    .map(|(_, matcher)| (uri_template.clone(), matcher.clone()))
+            })
+            .collect();
+
+        for uri in other.resources.keys() {
+            let mounted_uri = Self::apply_prefix(uri, prefix);
+            let replaces_destination = !self.resources.contains_key(&mounted_uri)
+                || behavior == crate::DuplicateBehavior::Replace;
+            if !replaces_destination {
+                continue;
+            }
+            if Self::prefix_preserves_keys(prefix) && other.final_resources.contains_key(uri) {
+                final_resources.insert(mounted_uri);
+            } else {
+                final_resources.remove(&mounted_uri);
+            }
+        }
+
+        for (uri_template, entry) in &other.resource_templates {
+            let mounted_uri_template = Self::apply_prefix(uri_template, prefix);
+            let replaces_destination = !self.resource_templates.contains_key(&mounted_uri_template)
+                || behavior == crate::DuplicateBehavior::Replace;
+            if !replaces_destination {
+                continue;
+            }
+            if Self::prefix_preserves_keys(prefix)
+                && let Some(matcher) = entry
+                    .final_definition
+                    .as_ref()
+                    .zip(entry.matcher.as_ref())
+                    .map(|(_, matcher)| matcher.clone())
+            {
+                final_templates.insert(mounted_uri_template, matcher);
+            } else {
+                final_templates.remove(&mounted_uri_template);
+            }
+        }
+
+        let mut template_routes: Vec<_> = final_templates.iter().collect();
+        template_routes.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let mut exact_routes: Vec<_> = final_resources.iter().collect();
+        exact_routes.sort_unstable();
+        let mut collisions = Vec::new();
+
+        for (template_uri, matcher) in &template_routes {
+            for exact_uri in &exact_routes {
+                match matcher.match_uri(exact_uri) {
+                    Ok(Some(_)) => collisions.push(format!(
+                        "Mount rejected because a final resource template collides with an exact final resource; template_key={}; resource_key={}",
+                        safe_log_label(template_uri),
+                        safe_log_label(exact_uri)
+                    )),
+                    Ok(None) => {}
+                    Err(_) => collisions.push(format!(
+                        "Mount rejected because a final resource template lost match admission; template_key={}",
+                        safe_log_label(template_uri)
+                    )),
                 }
             }
         }
+
+        for (index, (left_uri, left)) in template_routes.iter().enumerate() {
+            for (right_uri, right) in template_routes.iter().skip(index + 1) {
+                match reversible_templates_may_overlap(left, right) {
+                    Ok(true) => collisions.push(format!(
+                        "Mount rejected because final resource template languages collide; left_template_key={}; right_template_key={}",
+                        safe_log_label(left_uri),
+                        safe_log_label(right_uri)
+                    )),
+                    Ok(false) => {}
+                    Err(_) => collisions.push(format!(
+                        "Mount rejected because a final resource template lost match admission; template_key={}",
+                        safe_log_label(left_uri)
+                    )),
+                }
+            }
+        }
+
+        collisions.sort_unstable();
+        collisions.dedup();
+        result.errors.extend(collisions);
+    }
+
+    fn preflight_mcp_apps_mount_bindings(
+        &self,
+        other: &Self,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+        selection: MountSelection,
+        result: &mut MountResult,
+    ) {
+        let mut final_resources: HashMap<String, FinalResource> = self
+            .final_resources
+            .iter()
+            .map(|(uri, registration)| (uri.clone(), registration.definition.clone()))
+            .collect();
+        let mut final_tools: HashMap<String, FinalTool> = self
+            .tools
+            .iter()
+            .filter_map(|(name, registration)| {
+                registration
+                    .final_registration
+                    .as_ref()
+                    .map(|final_registration| {
+                        (name.clone(), final_registration.final_definition.clone())
+                    })
+            })
+            .collect();
+
         if selection.includes_resources() {
-            for uri in other.resources.keys() {
+            for (uri, _handler) in &other.resources {
                 let mounted_uri = Self::apply_prefix(uri, prefix);
-                if self.resources.contains_key(&mounted_uri) {
-                    conflicts.push(("Resource", mounted_uri));
+                let replacing = !self.resources.contains_key(&mounted_uri)
+                    || matches!(behavior, crate::DuplicateBehavior::Replace);
+                if !replacing {
+                    continue;
                 }
-            }
-            for uri_template in other.resource_templates.keys() {
-                let mounted_uri_template = Self::apply_prefix(uri_template, prefix);
-                if self.resource_templates.contains_key(&mounted_uri_template) {
-                    conflicts.push(("Resource template", mounted_uri_template));
+                let source_final = other.final_resources.get(uri);
+                if !Self::prefix_preserves_keys(prefix)
+                    && source_final.is_some_and(|registration| {
+                        Self::mcp_apps_ui_resource_requires_special_admission(
+                            &registration.definition,
+                        )
+                        .unwrap_or(true)
+                    })
+                {
+                    result.errors.push(format!(
+                        "Mount rejected because a final-only MCP Apps UI resource cannot be prefixed; resource_key={}",
+                        safe_log_label(uri)
+                    ));
+                    continue;
                 }
-            }
-        }
-        if selection.includes_prompts() {
-            for name in other.prompts.keys() {
-                let mounted_name = Self::apply_prefix(name, prefix);
-                if self.prompts.contains_key(&mounted_name) {
-                    conflicts.push(("Prompt", mounted_name));
+                if Self::prefix_preserves_keys(prefix) {
+                    if let Some(registration) = source_final {
+                        final_resources.insert(mounted_uri, registration.definition.clone());
+                    } else {
+                        final_resources.remove(&mounted_uri);
+                    }
+                } else {
+                    final_resources.remove(&mounted_uri);
                 }
             }
         }
 
-        conflicts.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
-        result
-            .errors
-            .extend(conflicts.into_iter().map(|(kind, key)| {
-                format!(
-                    "Mount rejected because {kind} already exists; component_key={}",
-                    safe_log_label(&key)
-                )
-            }));
-        result
+        if selection.includes_tools() {
+            for (name, registration) in &other.tools {
+                let mounted_name = Self::apply_prefix(name, prefix);
+                let replacing = !self.tools.contains_key(&mounted_name)
+                    || matches!(behavior, crate::DuplicateBehavior::Replace);
+                if !replacing {
+                    continue;
+                }
+                if let Some(final_registration) = registration.final_registration.as_ref() {
+                    let mut definition = final_registration.final_definition.clone();
+                    definition.name.clone_from(&mounted_name);
+                    final_tools.insert(mounted_name, definition);
+                } else {
+                    final_tools.remove(&mounted_name);
+                }
+            }
+        }
+
+        for (name, tool) in final_tools {
+            let binding = match tool.mcp_apps_resource_binding() {
+                Ok(binding) => binding,
+                Err(error) => {
+                    result.errors.push(format!(
+                        "Mount rejected because tool has invalid MCP Apps metadata; tool_key={}; error={error}",
+                        safe_log_label(&name)
+                    ));
+                    continue;
+                }
+            };
+            let Some(binding) = binding else {
+                continue;
+            };
+            let Some(resource) = final_resources.get(binding.resource_uri.as_str()) else {
+                result.errors.push(format!(
+                    "Mount rejected because an MCP Apps tool binding has no final HTML resource; tool_key={}; resource_uri={}",
+                    safe_log_label(&name),
+                    binding.resource_uri
+                ));
+                continue;
+            };
+            if let Err(error) = binding.validate_resource(resource) {
+                result.errors.push(format!(
+                    "Mount rejected because an MCP Apps tool binding is invalid; tool_key={}; error={error}",
+                    safe_log_label(&name)
+                ));
+            }
+        }
     }
 
     fn should_mount_duplicate(
@@ -5732,7 +6350,7 @@ impl Router {
                 !existed && !self.resource_order.iter().any(|u| u == &mounted_uri);
             self.resources
                 .insert(mounted_uri.clone(), Box::new(mounted));
-            if prefix.is_none() {
+            if Self::prefix_preserves_keys(prefix) {
                 if let Some(final_registration) = final_resources.remove(&uri) {
                     self.final_resources
                         .insert(mounted_uri.clone(), final_registration);
@@ -5740,11 +6358,12 @@ impl Router {
                     self.final_resources.remove(&mounted_uri);
                 }
             } else {
-                // Prefixed resource URIs are intentionally legacy-only: the
-                // mounting namespace is not an absolute final URI.
+                // Nonempty-prefixed resource URIs are intentionally
+                // legacy-only: the mounting namespace is not an absolute
+                // final URI.
                 self.final_resources.remove(&mounted_uri);
             }
-            if prefix.is_none() && final_only_resources.contains(&uri) {
+            if Self::prefix_preserves_keys(prefix) && final_only_resources.contains(&uri) {
                 self.final_only_resources.insert(mounted_uri.clone());
             } else {
                 self.final_only_resources.remove(&mounted_uri);
@@ -5778,7 +6397,7 @@ impl Router {
                     MountedResourceHandler::new(handler, uri.clone(), mounted_uri.clone());
                 self.resources
                     .insert(mounted_uri.clone(), Box::new(mounted));
-                if prefix.is_none() {
+                if Self::prefix_preserves_keys(prefix) {
                     if let Some(final_registration) = final_resources.remove(&uri) {
                         self.final_resources
                             .insert(mounted_uri.clone(), final_registration);
@@ -5788,7 +6407,7 @@ impl Router {
                 } else {
                     self.final_resources.remove(&mounted_uri);
                 }
-                if prefix.is_none() && final_only_resources.contains(&uri) {
+                if Self::prefix_preserves_keys(prefix) && final_only_resources.contains(&uri) {
                     self.final_only_resources.insert(mounted_uri.clone());
                 } else {
                     self.final_only_resources.remove(&mounted_uri);
@@ -5872,7 +6491,8 @@ impl Router {
             } else {
                 None
             };
-            let final_enabled = prefix.is_none() && entry.final_definition.is_some();
+            let final_enabled =
+                Self::prefix_preserves_keys(prefix) && entry.final_definition.is_some();
             let (matcher, specificity) = if final_enabled {
                 match admit_resource_template(&mounted_uri_template) {
                     Ok((matcher, specificity)) => (Some(matcher), specificity),
@@ -5898,11 +6518,12 @@ impl Router {
                 specificity,
                 template: mounted_template,
                 handler: mounted_handler,
-                // A mount prefix produces a relative legacy namespace (for
-                // example, `peer/mcp://...`). It cannot preserve the exact
-                // final absolute-URI contract, so mirror static-resource
-                // mounting and expose the mounted route to legacy only.
-                final_definition: if prefix.is_none() {
+                // A nonempty mount prefix produces a relative legacy
+                // namespace (for example, `peer/mcp://...`). It cannot
+                // preserve the exact final absolute-URI contract, so mirror
+                // static-resource mounting and expose the mounted route to
+                // legacy only.
+                final_definition: if Self::prefix_preserves_keys(prefix) {
                     entry.final_definition.map(|mut definition| {
                         definition.uri_template = mounted_uri_template.clone();
                         definition
@@ -5975,7 +6596,8 @@ impl Router {
                 } else {
                     None
                 };
-                let final_enabled = prefix.is_none() && entry.final_definition.is_some();
+                let final_enabled =
+                    Self::prefix_preserves_keys(prefix) && entry.final_definition.is_some();
                 let (matcher, specificity) = if final_enabled {
                     match admit_resource_template(&mounted_uri_template) {
                         Ok((matcher, specificity)) => (Some(matcher), specificity),
@@ -6001,10 +6623,11 @@ impl Router {
                     specificity,
                     template: mounted_template,
                     handler: mounted_handler,
-                    // See the ordered-template path above: prefixed template
-                    // routes are legacy-only because their URI namespace is
-                    // no longer absolute for exact final resource contents.
-                    final_definition: if prefix.is_none() {
+                    // See the ordered-template path above: nonempty-prefixed
+                    // template routes are legacy-only because their URI
+                    // namespace is no longer absolute for exact final
+                    // resource contents.
+                    final_definition: if Self::prefix_preserves_keys(prefix) {
                         entry.final_definition.map(|mut definition| {
                             definition.uri_template = mounted_uri_template.clone();
                             definition
@@ -6436,6 +7059,37 @@ fn resource_template_specificity(
     (literal_bytes, literal_parts, template.parts().len())
 }
 
+/// Returns whether two reversible template languages might intersect.
+///
+/// A literal prefix is emitted before any expression and therefore provides a
+/// byte-exact proof of disjointness when the prefixes disagree. When the
+/// prefixes are compatible, reject conservatively: an RFC 6570 capture can be
+/// omitted or can absorb following literals, so accepting without a full
+/// language-intersection proof would reintroduce dispatch-order authority.
+fn reversible_templates_may_overlap(
+    left: &ReversibleResourceTemplate,
+    right: &ReversibleResourceTemplate,
+) -> McpResult<bool> {
+    let left_prefix = reversible_template_leading_literal_prefix(left)?;
+    let right_prefix = reversible_template_leading_literal_prefix(right)?;
+    Ok(left_prefix.starts_with(&right_prefix) || right_prefix.starts_with(&left_prefix))
+}
+
+fn reversible_template_leading_literal_prefix(
+    matcher: &ReversibleResourceTemplate,
+) -> McpResult<String> {
+    let mut literal = String::new();
+    for part in matcher.template().parts() {
+        let UriTemplatePart::Literal(part) = part else {
+            break;
+        };
+        literal.push_str(part);
+    }
+    fastmcp_protocol::UriTemplate::parse(&literal)
+        .and_then(|template| template.expand(&TemplateValues::new()))
+        .map_err(|_| McpError::internal_error("admitted resource template lost literal prefix"))
+}
+
 // ============================================================================
 // Resource Reader Implementation
 // ============================================================================
@@ -6864,7 +7518,7 @@ mod safe_log_label_tests {
 #[cfg(test)]
 mod cursor_tests {
     use super::{
-        FinalCatalogKind, FinalCatalogQuery, decode_cursor_offset,
+        FinalCatalogKind, FinalCatalogQuery, FinalCatalogState, decode_cursor_offset,
         decode_final_catalog_cursor_offset, encode_cursor_offset, encode_final_catalog_cursor,
     };
 
@@ -6915,7 +7569,7 @@ mod cursor_tests {
         let include_tags = vec!["Visible".to_owned(), "visible".to_owned()];
         let exclude_tags = vec!["excluded".to_owned()];
         let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
-        let cursor = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 7);
+        let cursor = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, None, &query, 7);
         let equivalent_include_tags = vec!["visible".to_owned()];
         let equivalent_query = FinalCatalogQuery::from_tag_filters(
             Some(&equivalent_include_tags),
@@ -6926,6 +7580,7 @@ mod cursor_tests {
                 Some(&cursor),
                 FinalCatalogKind::Resources,
                 41,
+                None,
                 &equivalent_query,
                 8,
             )
@@ -6936,6 +7591,7 @@ mod cursor_tests {
             Some(&cursor),
             FinalCatalogKind::Resources,
             42,
+            None,
             &query,
             8,
         )
@@ -6946,6 +7602,7 @@ mod cursor_tests {
             Some(&cursor),
             FinalCatalogKind::Prompts,
             41,
+            None,
             &query,
             8,
         )
@@ -6959,17 +7616,20 @@ mod cursor_tests {
             Some(&cursor),
             FinalCatalogKind::Resources,
             41,
+            None,
             &other_query,
             8,
         )
         .expect_err("changing only the request filters rejects the continuation");
         assert!(wrong_query.message.contains("query filters"));
 
-        let out_of_range = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 8);
+        let out_of_range =
+            encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, None, &query, 8);
         let range_error = decode_final_catalog_cursor_offset(
             Some(&out_of_range),
             FinalCatalogKind::Resources,
             41,
+            None,
             &query,
             8,
         )
@@ -6979,6 +7639,44 @@ mod cursor_tests {
                 .message
                 .contains("outside the requested catalog page")
         );
+    }
+
+    #[test]
+    fn final_catalog_cursor_rejects_only_a_changed_connection_state() {
+        let query = FinalCatalogQuery::from_tag_filters(None, None);
+        let state = Some(FinalCatalogState {
+            partition: [7; 32],
+            revision: 3,
+        });
+        let cursor =
+            encode_final_catalog_cursor(FinalCatalogKind::Tools, 41, state.clone(), &query, 1);
+        assert_eq!(
+            decode_final_catalog_cursor_offset(
+                Some(&cursor),
+                FinalCatalogKind::Tools,
+                41,
+                state.as_ref(),
+                &query,
+                2,
+            )
+            .expect("the original connection state accepts its cursor"),
+            1
+        );
+
+        let changed_state = Some(FinalCatalogState {
+            partition: [7; 32],
+            revision: 4,
+        });
+        let error = decode_final_catalog_cursor_offset(
+            Some(&cursor),
+            FinalCatalogKind::Tools,
+            41,
+            changed_state.as_ref(),
+            &query,
+            2,
+        )
+        .expect_err("changing only the state revision rejects the continuation");
+        assert!(error.message.contains("stale connection state"));
     }
 }
 
@@ -12706,11 +13404,13 @@ mod router_tests {
         let include_tags = vec!["visible".to_owned()];
         let exclude_tags = vec!["excluded".to_owned()];
         let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
+        let cursor_state = final_catalog_state(&request_ctx);
         assert_eq!(
             decode_final_catalog_cursor_offset(
                 Some(cursor),
                 FinalCatalogKind::Tools,
                 router.final_catalog_revision,
+                cursor_state.as_ref(),
                 &query,
                 2,
             )
@@ -12782,6 +13482,7 @@ mod router_tests {
         let valid_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Tools,
             router.final_catalog_revision,
+            final_catalog_state(&request_ctx),
             &query,
             0,
         );
@@ -12800,8 +13501,13 @@ mod router_tests {
             .final_catalog_revision
             .checked_sub(1)
             .expect("registered tools advance the final catalog revision");
-        let stale_cursor =
-            encode_final_catalog_cursor(FinalCatalogKind::Tools, stale_revision, &query, 0);
+        let stale_cursor = encode_final_catalog_cursor(
+            FinalCatalogKind::Tools,
+            stale_revision,
+            final_catalog_state(&request_ctx),
+            &query,
+            0,
+        );
         let stale = router
             .dispatch_stateless(
                 &request_ctx,
@@ -12814,6 +13520,7 @@ mod router_tests {
         let wrong_kind_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Prompts,
             router.final_catalog_revision,
+            final_catalog_state(&request_ctx),
             &query,
             0,
         );
@@ -12831,6 +13538,7 @@ mod router_tests {
         let wrong_query_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Tools,
             router.final_catalog_revision,
+            final_catalog_state(&request_ctx),
             &other_query,
             0,
         );
@@ -12846,6 +13554,7 @@ mod router_tests {
         let out_of_range_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Tools,
             router.final_catalog_revision,
+            final_catalog_state(&request_ctx),
             &query,
             2,
         );
@@ -14420,6 +15129,132 @@ mod router_tests {
     }
 
     #[test]
+    fn modern_connection_visibility_blocks_final_completion_before_provider_invocation() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_completion_handler(CountingCompletion {
+            final_calls: Arc::clone(&final_calls),
+        });
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        const TEMPLATE_URI: &str = "resource://completion-visibility/{id}";
+        router.add_resource_template(marked_template(TEMPLATE_URI, "completion-visibility"));
+
+        let prompt_catalog_before = serde_json::to_vec(&router.prompts())
+            .expect("prompt catalog serializes before completion dispatch");
+        let template_catalog_before = serde_json::to_vec(&router.resource_templates())
+            .expect("resource-template catalog serializes before completion dispatch");
+        let prompt_request = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                "argument": {"name": "topic", "value": "sta"},
+            })),
+            1_871_i64,
+        );
+        let resource_request = JsonRpcRequest::new(
+            COMPLETION_COMPLETE,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "ref": {"type": "ref/resource", "uri": TEMPLATE_URI},
+                "argument": {"name": "id", "value": "sta"},
+            })),
+            1_872_i64,
+        );
+        let prompt_request_bytes =
+            serde_json::to_vec(&prompt_request).expect("prompt completion request serializes");
+        let resource_request_bytes = serde_json::to_vec(&resource_request)
+            .expect("resource-template completion request serializes");
+
+        let cx = Cx::for_testing();
+        let allowed_connection = ModernConnection::new();
+        let allowed_inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            1_871,
+            InboundRequestTransport::Stdio,
+            &allowed_connection,
+        );
+        let allowed_context = allowed_inbound.request_context();
+        for request in [&prompt_request, &resource_request] {
+            let result = router
+                .dispatch_stateless(&allowed_context, request)
+                .expect("a visible completion target reaches the fallback provider");
+            assert_eq!(
+                result["completion"]["values"],
+                serde_json::json!(["staging"])
+            );
+        }
+        assert_eq!(final_calls.load(Ordering::SeqCst), 2);
+
+        let denied_connection = ModernConnection::new();
+        let denied_inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            1_871,
+            InboundRequestTransport::Stdio,
+            &denied_connection,
+        );
+        let denied_context = denied_inbound.request_context();
+        assert!(denied_context.disable_prompt("prompt-argument-boundary"));
+        assert!(denied_context.disable_resource(TEMPLATE_URI));
+
+        assert_eq!(
+            serde_json::to_vec(&prompt_request)
+                .expect("prompt completion request remains serializable"),
+            prompt_request_bytes,
+            "connection visibility is the sole planted prompt-completion dimension"
+        );
+        let hidden_prompt = router
+            .dispatch_stateless(&denied_context, &prompt_request)
+            .expect_err("a hidden prompt cannot be used as a completion reference");
+        assert_eq!(hidden_prompt.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            hidden_prompt.message,
+            "completion prompt reference is not registered"
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&resource_request)
+                .expect("resource-template completion request remains serializable"),
+            resource_request_bytes,
+            "connection visibility is the sole planted resource-template-completion dimension"
+        );
+        let hidden_resource = router
+            .dispatch_stateless(&denied_context, &resource_request)
+            .expect_err("a hidden resource template cannot reach the fallback provider");
+        assert_eq!(hidden_resource.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            hidden_resource.message,
+            "completion resource reference is not registered"
+        );
+        assert_eq!(
+            final_calls.load(Ordering::SeqCst),
+            2,
+            "refused completion references must not invoke the fallback provider"
+        );
+        assert_eq!(
+            serde_json::to_vec(&router.prompts())
+                .expect("prompt catalog serializes after completion refusal"),
+            prompt_catalog_before,
+            "completion refusal cannot mutate the prompt catalog"
+        );
+        assert_eq!(
+            serde_json::to_vec(&router.resource_templates())
+                .expect("resource-template catalog serializes after completion refusal"),
+            template_catalog_before,
+            "completion refusal cannot mutate the resource-template catalog"
+        );
+    }
+
+    #[test]
     fn explicit_legacy_completion_is_not_discovered_or_dispatched_as_final() {
         let mut router = Router::new();
         router.add_legacy_completion_handler(EchoCompletion);
@@ -14920,6 +15755,357 @@ mod router_tests {
             router.resource_templates_count(),
             template_count,
             "rejected template admission cannot mutate the registered catalog"
+        );
+    }
+
+    #[test]
+    fn final_resource_registration_rejects_template_language_collisions_atomically() {
+        let mut template_router = Router::new();
+        template_router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{first}", "first"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the first reversible template is admitted");
+        let templates_before = serde_json::to_vec(&template_router.resource_templates())
+            .expect("the admitted template catalog serializes");
+
+        let error = template_router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{second}", "second"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("renaming only the capture must not create a tie-broken route");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&template_router.resource_templates())
+                .expect("a rejected collision leaves the template catalog serializable"),
+            templates_before,
+            "template-template collision rejection leaves the catalog unchanged"
+        );
+
+        let mut exact_router = Router::new();
+        exact_router
+            .add_resource_with_behavior(
+                NamedResource::new("mcp://resource/books"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the exact final resource is admitted");
+        let exact_count = exact_router.resources_count();
+        let error = exact_router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{id}", "template"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("a template cannot shadow an exact final resource");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(exact_router.resources_count(), exact_count);
+        assert_eq!(exact_router.resource_templates_count(), 0);
+
+        let mut reverse_router = Router::new();
+        reverse_router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{id}", "template"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the reversible template is admitted before the planted exact collision");
+        let templates_before = serde_json::to_vec(&reverse_router.resource_templates())
+            .expect("the admitted template catalog serializes");
+        let error = reverse_router
+            .add_resource_with_behavior(
+                NamedResource::new("mcp://resource/books"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("an exact final resource cannot be hidden behind a template");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(reverse_router.resources_count(), 0);
+        assert_eq!(
+            serde_json::to_vec(&reverse_router.resource_templates())
+                .expect("the template catalog remains serializable after refusal"),
+            templates_before,
+            "exact-resource collision rejection leaves the existing template unchanged"
+        );
+
+        let mut disjoint_router = Router::new();
+        disjoint_router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://alpha/{id}", "alpha"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("a disjoint template is admitted");
+        disjoint_router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://beta/{id}", "beta"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("a template with a conflicting literal prefix remains independent");
+        assert_eq!(disjoint_router.resource_templates_count(), 2);
+    }
+
+    #[test]
+    fn final_resource_mount_rejects_cross_router_language_collisions_atomically() {
+        let exact_uri = "mcp://resource/books";
+
+        let mut exact_destination = Router::new();
+        exact_destination
+            .add_resource_with_behavior(
+                NamedResource::new(exact_uri),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the exact final resource is admitted before mounting");
+        let exact_before = serde_json::to_vec(&exact_destination.resources())
+            .expect("the exact destination catalog serializes");
+        let mut template_source = Router::new();
+        template_source
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{id}", "mounted-template"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the independently admitted source template is valid");
+
+        let result = exact_destination.mount_resources(template_source, None);
+        assert!(!result.is_success());
+        assert_eq!(
+            serde_json::to_vec(&exact_destination.resources())
+                .expect("a rejected mount preserves the destination catalog"),
+            exact_before,
+            "template-after-exact mount rejection leaves every destination resource unchanged"
+        );
+        assert_eq!(exact_destination.resource_templates_count(), 0);
+
+        let mut template_destination = Router::new();
+        template_destination
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{id}", "destination-template"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the final template is admitted before mounting");
+        let templates_before = serde_json::to_vec(&template_destination.resource_templates())
+            .expect("the template destination catalog serializes");
+        let mut exact_source = Router::new();
+        exact_source
+            .add_resource_with_behavior(
+                NamedResource::new(exact_uri),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the independently admitted source resource is valid");
+
+        let result = template_destination.mount_resources(exact_source, None);
+        assert!(!result.is_success());
+        assert_eq!(template_destination.resources_count(), 0);
+        assert_eq!(
+            serde_json::to_vec(&template_destination.resource_templates())
+                .expect("a rejected mount preserves the destination template catalog"),
+            templates_before,
+            "exact-after-template mount rejection leaves every destination template unchanged"
+        );
+
+        let mut first_template_destination = Router::new();
+        first_template_destination
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{first}", "first-template"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the first final template is admitted");
+        let templates_before = serde_json::to_vec(&first_template_destination.resource_templates())
+            .expect("the first template destination catalog serializes");
+        let mut second_template_source = Router::new();
+        second_template_source
+            .add_resource_template_with_behavior(
+                marked_template("mcp://resource/{second}", "second-template"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the independently admitted second template is valid");
+
+        let result = first_template_destination.mount_resources(second_template_source, None);
+        assert!(!result.is_success());
+        assert_eq!(
+            serde_json::to_vec(&first_template_destination.resource_templates())
+                .expect("a rejected mount preserves the original template catalog"),
+            templates_before,
+            "template-language overlap cannot make mount order a dispatch authority"
+        );
+    }
+
+    #[test]
+    fn empty_prefix_mount_matches_unprefixed_final_route_projection() {
+        const EXACT_URI: &str = "mcp://resource/books";
+
+        for prefix in [None, Some("")] {
+            let mut destination = Router::new();
+            destination
+                .add_resource_with_behavior(
+                    NamedResource::new(EXACT_URI),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the destination exact final resource is admitted");
+            let resources_before = serde_json::to_vec(&destination.resources())
+                .expect("the destination catalog serializes before the mount");
+            let mut source = Router::new();
+            source
+                .add_resource_template_with_behavior(
+                    marked_template("mcp://resource/{id}", "one-variable-template"),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the source one-variable final template is admitted");
+
+            let result = destination.mount_resources(source, prefix);
+
+            assert!(
+                !result.is_success(),
+                "an unchanged-key mount must reject the final route collision for {prefix:?}"
+            );
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("collides with an exact final resource")),
+                "the rejection must retain the exact/template collision reason for {prefix:?}"
+            );
+            assert_eq!(
+                serde_json::to_vec(&destination.resources())
+                    .expect("the rejected mount leaves the destination catalog serializable"),
+                resources_before,
+                "the one-variable collision leaves the destination unchanged for {prefix:?}"
+            );
+            assert_eq!(destination.resource_templates_count(), 0);
+            assert!(destination.final_resources.contains_key(EXACT_URI));
+
+            let mut template_destination = Router::new();
+            template_destination
+                .add_resource_template_with_behavior(
+                    marked_template("mcp://resource/{id}", "one-variable-destination-template"),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the destination one-variable final template is admitted");
+            let templates_before = serde_json::to_vec(&template_destination.resource_templates())
+                .expect("the destination template catalog serializes before the mount");
+            let mut exact_source = Router::new();
+            exact_source
+                .add_resource_with_behavior(
+                    NamedResource::new(EXACT_URI),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the source exact final resource is admitted");
+
+            let result = template_destination.mount_resources(exact_source, prefix);
+
+            assert!(
+                !result.is_success(),
+                "the reverse unchanged-key collision must reject for {prefix:?}"
+            );
+            assert!(
+                result
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("collides with an exact final resource")),
+                "the reverse rejection must retain the exact/template collision reason for {prefix:?}"
+            );
+            assert_eq!(
+                serde_json::to_vec(&template_destination.resource_templates())
+                    .expect("the rejected reverse mount leaves the template catalog serializable"),
+                templates_before,
+                "the reverse one-variable collision leaves the destination unchanged for {prefix:?}"
+            );
+            assert_eq!(template_destination.resources_count(), 0);
+            assert!(
+                template_destination.resource_templates["mcp://resource/{id}"]
+                    .final_definition
+                    .is_some()
+            );
+        }
+
+        for prefix in [None, Some("")] {
+            let mut destination = Router::new();
+            destination
+                .add_resource_template_with_behavior(
+                    marked_template("mcp://alpha/{id}", "destination-disjoint"),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the destination disjoint final template is admitted");
+            let mut source = Router::new();
+            source
+                .add_resource_template_with_behavior(
+                    marked_template("mcp://beta/{id}", "source-disjoint"),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the source disjoint final template is admitted");
+
+            let result = destination.mount_resources(source, prefix);
+
+            assert!(
+                result.is_success(),
+                "a disjoint unchanged-key mount remains admissible for {prefix:?}"
+            );
+            assert_eq!(destination.resource_templates_count(), 2);
+            assert!(
+                destination.resource_templates["mcp://beta/{id}"]
+                    .final_definition
+                    .is_some(),
+                "an empty prefix cannot downgrade a disjoint final template for {prefix:?}"
+            );
+        }
+
+        for prefix in [None, Some("")] {
+            let mut destination = Router::new();
+            destination
+                .add_final_resource_with_behavior(
+                    NamedResource::new(EXACT_URI),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the destination final-only exact resource is admitted");
+            let mut source = Router::new();
+            source
+                .add_legacy_resource_template_with_behavior(
+                    marked_template("mcp://resource/{id}", "legacy-template"),
+                    crate::DuplicateBehavior::Replace,
+                )
+                .expect("the source legacy-only template is admitted");
+
+            let result = destination.mount_resources(source, prefix);
+
+            assert!(
+                result.is_success(),
+                "a legacy-only template remains isolated for {prefix:?}"
+            );
+            assert!(destination.final_resources.contains_key(EXACT_URI));
+            assert!(
+                destination.resource_templates["mcp://resource/{id}"]
+                    .final_definition
+                    .is_none(),
+                "legacy-only template mounting cannot enter final routing for {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_only_template_mount_remains_final_isolated() {
+        let exact_uri = "mcp://resource/books";
+        let mut destination = Router::new();
+        destination
+            .add_final_resource_with_behavior(
+                NamedResource::new(exact_uri),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the final-only exact resource is admitted");
+        let mut legacy_source = Router::new();
+        legacy_source
+            .add_legacy_resource_template_with_behavior(
+                marked_template("mcp://resource/{id}", "legacy-template"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("the frozen exact-2024 template is admitted in its own catalog");
+
+        let result = destination.mount_resources(legacy_source, None);
+        assert!(result.is_success());
+        assert_eq!(destination.resources_count(), 1);
+        assert_eq!(destination.resource_templates_count(), 1);
+        assert!(destination.final_resources.contains_key(exact_uri));
+        assert!(
+            destination.resource_templates["mcp://resource/{id}"]
+                .final_definition
+                .is_none(),
+            "a legacy-only template remains absent from final dispatch after mounting"
         );
     }
 
@@ -17259,6 +18445,315 @@ mod router_tests {
     }
 
     #[test]
+    fn modern_connection_disablements_block_final_handlers_before_mrtr_state_is_minted() {
+        let tool_final_calls = Arc::new(AtomicUsize::new(0));
+        let resource_final_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_final_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&tool_final_calls),
+            })
+            .expect("tool registration succeeds");
+        router.add_resource(InputRequiredResource {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&resource_final_calls),
+        });
+        router.add_prompt(InputRequiredPrompt {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&prompt_final_calls),
+        });
+
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let tool_request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-tool",
+                "arguments": {},
+            })),
+            611_i64,
+        );
+        let resource_request = JsonRpcRequest::new(
+            "resources/read",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "uri": "file:///input-required-resource",
+            })),
+            612_i64,
+        );
+        let prompt_request = JsonRpcRequest::new(
+            "prompts/get",
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "name": "input-required-prompt",
+            })),
+            613_i64,
+        );
+        let request_bytes = [
+            serde_json::to_vec(&tool_request).expect("tool request serializes"),
+            serde_json::to_vec(&resource_request).expect("resource request serializes"),
+            serde_json::to_vec(&prompt_request).expect("prompt request serializes"),
+        ];
+
+        let cx = Cx::for_testing();
+        let allowed_connection = ModernConnection::new();
+        let allowed_inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            611,
+            InboundRequestTransport::Stdio,
+            &allowed_connection,
+        );
+        let allowed_ctx = allowed_inbound.request_context();
+        let allowed_cancellation = allowed_inbound
+            .mrtr_continuation_cancellation()
+            .expect("modern connection supplies continuation ownership");
+
+        for request in [&tool_request, &resource_request, &prompt_request] {
+            let result = router
+                .dispatch_stateless_with_continuation_cancellation(
+                    &allowed_ctx,
+                    request,
+                    &allowed_cancellation,
+                )
+                .expect("enabled final component reaches its handler");
+            assert_eq!(result["resultType"], "input_required");
+            assert!(
+                result["requestState"].is_string(),
+                "an enabled MRTR-capable handler mints framework-owned state"
+            );
+        }
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
+
+        let denied_connection = ModernConnection::new();
+        let denied_inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            611,
+            InboundRequestTransport::Stdio,
+            &denied_connection,
+        );
+        let denied_ctx = denied_inbound.request_context();
+        let denied_cancellation = denied_inbound
+            .mrtr_continuation_cancellation()
+            .expect("modern connection supplies continuation ownership");
+        assert!(denied_ctx.disable_tool("input-required-tool"));
+        assert!(denied_ctx.disable_resource("file:///input-required-resource"));
+        assert!(denied_ctx.disable_prompt("input-required-prompt"));
+
+        assert_eq!(
+            serde_json::to_vec(&tool_request).expect("tool request remains serializable"),
+            request_bytes[0],
+            "connection state is the sole tool-request admission difference"
+        );
+        let tool_error = router
+            .dispatch_stateless_with_continuation_cancellation(
+                &denied_ctx,
+                &tool_request,
+                &denied_cancellation,
+            )
+            .expect_err("a disabled tool cannot mint final MRTR state");
+        assert_eq!(tool_error.code, McpErrorCode::MethodNotFound);
+
+        assert_eq!(
+            serde_json::to_vec(&resource_request).expect("resource request remains serializable"),
+            request_bytes[1],
+            "connection state is the sole resource-request admission difference"
+        );
+        let resource_error = router
+            .dispatch_stateless_with_continuation_cancellation(
+                &denied_ctx,
+                &resource_request,
+                &denied_cancellation,
+            )
+            .expect_err("a disabled resource cannot mint final MRTR state");
+        assert_eq!(resource_error.code, McpErrorCode::ResourceNotFound);
+
+        assert_eq!(
+            serde_json::to_vec(&prompt_request).expect("prompt request remains serializable"),
+            request_bytes[2],
+            "connection state is the sole prompt-request admission difference"
+        );
+        let prompt_error = router
+            .dispatch_stateless_with_continuation_cancellation(
+                &denied_ctx,
+                &prompt_request,
+                &denied_cancellation,
+            )
+            .expect_err("a disabled prompt cannot mint final MRTR state");
+        assert_eq!(prompt_error.code, McpErrorCode::PromptNotFound);
+
+        assert_eq!(
+            tool_final_calls.load(Ordering::SeqCst),
+            1,
+            "refused tool dispatch must not invoke the MRTR-capable handler"
+        );
+        assert_eq!(
+            resource_final_calls.load(Ordering::SeqCst),
+            1,
+            "refused resource dispatch must not invoke the MRTR-capable handler"
+        );
+        assert_eq!(
+            prompt_final_calls.load(Ordering::SeqCst),
+            1,
+            "refused prompt dispatch must not invoke the MRTR-capable handler"
+        );
+    }
+
+    #[test]
+    fn modern_connection_disablements_filter_final_catalog_discovery() {
+        let template_uri = "file:///input-required-template/{id}";
+        let mut router = Router::new();
+        router
+            .add_tool(NamedTool::new("connection-scoped-tool"))
+            .expect("tool registration succeeds");
+        router.add_resource(NamedResource::new("file:///connection-scoped-resource"));
+        router
+            .add_resource_template_with_behavior(
+                ResourceTemplate {
+                    uri_template: template_uri.to_owned(),
+                    name: "connection-scoped-template".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("resource-template registration succeeds");
+        router.add_prompt(NamedPrompt::new("connection-scoped-prompt"));
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            614,
+            InboundRequestTransport::Stdio,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let list_request = |method, id| {
+            JsonRpcRequest::new(
+                method,
+                Some(serde_json::json!({"_meta": metadata.clone()})),
+                id,
+            )
+        };
+
+        let tools = router
+            .dispatch_stateless(&request_ctx, &list_request("tools/list", 614_i64))
+            .expect("enabled tool is discovered");
+        let resources = router
+            .dispatch_stateless(&request_ctx, &list_request("resources/list", 615_i64))
+            .expect("enabled resource is discovered");
+        let templates = router
+            .dispatch_stateless(
+                &request_ctx,
+                &list_request("resources/templates/list", 616_i64),
+            )
+            .expect("enabled resource template is discovered");
+        let prompts = router
+            .dispatch_stateless(&request_ctx, &list_request("prompts/list", 617_i64))
+            .expect("enabled prompt is discovered");
+        assert_eq!(tools["tools"][0]["name"], "connection-scoped-tool");
+        assert_eq!(
+            resources["resources"][0]["uri"],
+            "file:///connection-scoped-resource"
+        );
+        assert_eq!(
+            templates["resourceTemplates"][0]["uriTemplate"],
+            template_uri
+        );
+        assert_eq!(prompts["prompts"][0]["name"], "connection-scoped-prompt");
+
+        assert!(request_ctx.disable_tool("connection-scoped-tool"));
+        assert!(request_ctx.disable_resource("file:///connection-scoped-resource"));
+        assert!(request_ctx.disable_resource(template_uri));
+        assert!(request_ctx.disable_prompt("connection-scoped-prompt"));
+
+        let hidden_tools = router
+            .dispatch_stateless(&request_ctx, &list_request("tools/list", 618_i64))
+            .expect("disabled tool discovery remains a valid final response");
+        let hidden_resources = router
+            .dispatch_stateless(&request_ctx, &list_request("resources/list", 619_i64))
+            .expect("disabled resource discovery remains a valid final response");
+        let hidden_templates = router
+            .dispatch_stateless(
+                &request_ctx,
+                &list_request("resources/templates/list", 620_i64),
+            )
+            .expect("disabled template discovery remains a valid final response");
+        let hidden_prompts = router
+            .dispatch_stateless(&request_ctx, &list_request("prompts/list", 621_i64))
+            .expect("disabled prompt discovery remains a valid final response");
+        assert_eq!(hidden_tools["tools"], serde_json::json!([]));
+        assert_eq!(hidden_resources["resources"], serde_json::json!([]));
+        assert_eq!(hidden_templates["resourceTemplates"], serde_json::json!([]));
+        assert_eq!(hidden_prompts["prompts"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn final_catalog_cursor_rejects_only_a_changed_connection_state() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router
+            .add_tool(NamedTool::new("first-connection-cursor-tool"))
+            .expect("first tool registration succeeds");
+        router
+            .add_tool(NamedTool::new("second-connection-cursor-tool"))
+            .expect("second tool registration succeeds");
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 622, Budget::INFINITE, &state);
+        let initial = final_tools_list_request(None, None, None, 622_i64);
+        let initial_bytes = serde_json::to_vec(&initial).expect("initial request serializes");
+        let first_page = router
+            .dispatch_stateless(&request_ctx, &initial)
+            .expect("the initial final catalog page is admitted");
+        let cursor = first_page["nextCursor"]
+            .as_str()
+            .expect("the first page has a continuation")
+            .to_owned();
+
+        assert!(request_ctx.disable_tool("first-connection-cursor-tool"));
+        assert_eq!(
+            serde_json::to_vec(&initial).expect("initial request remains serializable"),
+            initial_bytes,
+            "connection state is the sole changed catalog-continuation dimension"
+        );
+        let stale = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(Some(&cursor), None, None, 623_i64),
+            )
+            .expect_err("a disabled-component change invalidates the prior final cursor");
+        assert_eq!(stale.code, McpErrorCode::InvalidParams);
+        assert!(stale.message.contains("stale connection state"));
+
+        let refreshed = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_list_request(None, None, None, 624_i64),
+            )
+            .expect("a cursor-free request observes the new connection state");
+        assert_eq!(
+            refreshed["tools"][0]["name"],
+            "second-connection-cursor-tool"
+        );
+    }
+
+    #[test]
     fn modern_connection_disconnect_is_the_only_changed_retry_dimension_and_cancels_state() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let mut router = Router::new();
@@ -18889,5 +20384,226 @@ mod router_tests {
         };
         assert!(result.is_success());
         assert!(!result.has_components());
+    }
+
+    struct AppsLinkedTool;
+
+    impl ToolHandler for AppsLinkedTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "apps-linked-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn final_definition(&self) -> Option<FinalTool> {
+            let metadata = fastmcp_protocol::McpAppsToolMetadata::try_new(
+                Some(
+                    AbsoluteUri::parse("ui://weather/dashboard").expect("fixed Apps URI is valid"),
+                ),
+                Some(vec![fastmcp_protocol::McpAppsToolVisibility::App]),
+            )
+            .expect("fixed Apps metadata is valid")
+            .to_open_metadata()
+            .expect("fixed Apps metadata serializes");
+            Some(FinalTool {
+                name: "apps-linked-tool".to_owned(),
+                title: None,
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: Some(metadata),
+            })
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct AppsBoundResource {
+        mime_type: &'static str,
+    }
+
+    impl ResourceHandler for AppsBoundResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "ui://weather/dashboard".to_owned(),
+                name: "weather-dashboard".to_owned(),
+                description: None,
+                mime_type: Some(self.mime_type.to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn apps_tool_registration_requires_a_registered_html_ui_resource() {
+        let mut router = Router::new();
+        router
+            .add_mcp_apps_ui_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("matching Apps HTML resource registers first");
+        router
+            .add_mcp_apps_tool_with_behavior(AppsLinkedTool, crate::DuplicateBehavior::Error)
+            .expect("tool binding to the registered Apps HTML resource is admitted");
+        assert!(router.tools().is_empty(), "Apps tools are final-only");
+        assert!(
+            router
+                .resolve_tool_for_era("apps-linked-tool", Some(ProtocolEra::Legacy2024),)
+                .is_none()
+        );
+        assert!(
+            router
+                .resolve_tool_for_era("apps-linked-tool", Some(ProtocolEra::Modern2026),)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn apps_tool_registration_rejects_only_a_non_html_ui_resource_without_mutation() {
+        let mut router = Router::new();
+        router
+            .add_final_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: "text/plain",
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("the one-field MIME variant remains a valid final resource");
+
+        let error = router
+            .add_mcp_apps_tool_with_behavior(AppsLinkedTool, crate::DuplicateBehavior::Error)
+            .expect_err("only replacing the Apps HTML MIME type rejects the linked tool");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(
+            router.tools().is_empty(),
+            "rejected Apps linkage cannot add the tool to the legacy or final catalog"
+        );
+    }
+
+    #[test]
+    fn generic_registration_rejects_apps_ui_resources_and_tools_without_mutation() {
+        let mut router = Router::new();
+        let resource_error = router
+            .add_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect_err("generic registration must not expose an Apps View to exact 2024");
+        assert_eq!(resource_error.code, McpErrorCode::InvalidRequest);
+        assert!(router.resources().is_empty());
+
+        router
+            .add_mcp_apps_ui_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("the negotiated final-only Apps resource registers");
+        let tool_error = router
+            .add_tool_with_behavior(AppsLinkedTool, crate::DuplicateBehavior::Error)
+            .expect_err("generic registration must not publish Apps metadata without opt-in");
+        assert_eq!(tool_error.code, McpErrorCode::InvalidRequest);
+        assert!(router.tools().is_empty());
+    }
+
+    #[test]
+    fn apps_binding_mounts_reject_dangling_tools_replacements_and_prefixes_atomically() {
+        let mut source = Router::new();
+        source
+            .add_mcp_apps_ui_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("source Apps resource registers");
+        source
+            .add_mcp_apps_tool_with_behavior(AppsLinkedTool, crate::DuplicateBehavior::Error)
+            .expect("source Apps tool registers");
+
+        let mut tools_only_destination = Router::new();
+        let tools_only = tools_only_destination.mount_tools(source, None);
+        assert!(!tools_only.is_success());
+        assert!(tools_only_destination.tools().is_empty());
+
+        let mut destination = Router::new();
+        destination
+            .add_mcp_apps_ui_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("destination Apps resource registers");
+        destination
+            .add_mcp_apps_tool_with_behavior(AppsLinkedTool, crate::DuplicateBehavior::Error)
+            .expect("destination Apps tool registers");
+
+        let mut incompatible_resource = Router::new();
+        incompatible_resource
+            .add_final_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: "text/plain",
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("non-Apps final resource is independently admissible");
+        let replacement = destination.mount_resources_with_behavior(
+            incompatible_resource,
+            None,
+            crate::DuplicateBehavior::Replace,
+        );
+        assert!(!replacement.is_success());
+        assert_eq!(
+            destination
+                .final_resources
+                .get("ui://weather/dashboard")
+                .expect("rejected replacement retains the HTML resource")
+                .definition
+                .mime_type
+                .as_deref(),
+            Some(fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE)
+        );
+
+        let mut prefixed_source = Router::new();
+        prefixed_source
+            .add_mcp_apps_ui_resource_with_behavior(
+                AppsBoundResource {
+                    mime_type: fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE,
+                },
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("prefixed source Apps resource registers");
+        prefixed_source
+            .add_mcp_apps_tool_with_behavior(AppsLinkedTool, crate::DuplicateBehavior::Error)
+            .expect("prefixed source Apps tool registers");
+        let mut prefixed_destination = Router::new();
+        let prefixed = prefixed_destination.mount(prefixed_source, Some("peer"));
+        assert!(!prefixed.is_success());
+        assert!(prefixed_destination.tools().is_empty());
+        assert!(prefixed_destination.resources().is_empty());
     }
 }

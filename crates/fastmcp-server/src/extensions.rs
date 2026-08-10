@@ -19,7 +19,7 @@ use fastmcp_protocol::extensions::{
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId, ExtensionRegistryReceipt,
-    ExtensionSettings,
+    ExtensionSettings, JsonRpcRequest,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -228,6 +228,8 @@ pub enum ExtensionHandlerInvocationError {
     Protocol(ExtensionDispatchError),
     /// No handler was registered for an otherwise admitted extension request method.
     HandlerNotFound(ExtensionHandlerKey),
+    /// A descriptor-owned extension request was sent as an id-less notification.
+    RequestEnvelopeRequired(ExtensionHandlerKey),
     /// The admitted typed handler returned an MCP error.
     Handler(McpError),
 }
@@ -247,6 +249,12 @@ impl fmt::Display for ExtensionHandlerInvocationError {
                 key.extension_id(),
                 key.method()
             ),
+            Self::RequestEnvelopeRequired(key) => write!(
+                formatter,
+                "extension request requires a JSON-RPC request id: {}/{}",
+                key.extension_id(),
+                key.method()
+            ),
             Self::Handler(error) => write!(formatter, "extension handler failed: {error}"),
         }
     }
@@ -257,7 +265,9 @@ impl std::error::Error for ExtensionHandlerInvocationError {
         match self {
             Self::Protocol(error) => Some(error),
             Self::Handler(error) => Some(error),
-            Self::RegistryNotFrozen | Self::HandlerNotFound(_) => None,
+            Self::RegistryNotFrozen
+            | Self::HandlerNotFound(_)
+            | Self::RequestEnvelopeRequired(_) => None,
         }
     }
 }
@@ -522,15 +532,17 @@ impl ExtensionHandlerRegistry {
     ///
     /// The protocol admission call binds this invocation to the exact frozen
     /// descriptor receipt, current negotiated extension set, modern era, and
-    /// client-to-server ownership before the handler is looked up or executed.
+    /// client-to-server ownership and request envelope before the handler is
+    /// looked up or executed. A handler can only be registered for a
+    /// descriptor's request method, so an id-less notification is rejected
+    /// generically before its parameters can reach stateful extension code.
     pub fn invoke(
         &self,
         negotiated: &NegotiatedExtensionSet,
         protocol_era: ProtocolEra,
         extension_id: &ExtensionId,
-        method: &str,
+        request: &JsonRpcRequest,
         context: &McpContext,
-        parameters: Value,
     ) -> Result<Value, ExtensionHandlerInvocationError> {
         if !self.frozen {
             return Err(ExtensionHandlerInvocationError::RegistryNotFrozen);
@@ -541,12 +553,18 @@ impl ExtensionHandlerRegistry {
                 &self.descriptor_registry,
                 protocol_era,
                 extension_id,
-                method,
+                &request.method,
                 ExtensionDirection::ClientToServer,
             )
             .map_err(ExtensionHandlerInvocationError::Protocol)?;
+        let key = ExtensionHandlerKey::new(extension_id.clone(), &request.method);
+        if request.is_notification() {
+            return Err(ExtensionHandlerInvocationError::RequestEnvelopeRequired(
+                key,
+            ));
+        }
         let key = self
-            .lookup(extension_id, method)
+            .lookup(extension_id, &request.method)
             .map_err(|error| match error {
                 ExtensionHandlerLookupError::RegistryNotFrozen => {
                     ExtensionHandlerInvocationError::RegistryNotFrozen
@@ -560,7 +578,13 @@ impl ExtensionHandlerRegistry {
             .get(key)
             .ok_or_else(|| ExtensionHandlerInvocationError::HandlerNotFound(key.clone()))?;
         handler
-            .invoke(context, parameters)
+            .invoke(
+                context,
+                request
+                    .params
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )
             .map_err(ExtensionHandlerInvocationError::Handler)
     }
 }
@@ -580,7 +604,9 @@ mod tests {
         register_official_tasks_extension,
     };
     use fastmcp_protocol::protocol_policy::ProtocolEra;
-    use fastmcp_protocol::{ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId};
+    use fastmcp_protocol::{
+        ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId, JsonRpcRequest,
+    };
     use serde::{Deserialize, Serialize};
     use serde_json::json;
 
@@ -951,9 +977,8 @@ mod tests {
                     &negotiated,
                     ProtocolEra::Modern2026,
                     &id,
-                    "tasks/get",
+                    &JsonRpcRequest::new("tasks/get", Some(json!({"value": 41})), 1_i64),
                     &context,
-                    json!({"value": 41}),
                 )
                 .expect("negotiated protocol admission invokes the typed get handler"),
             json!({"next": 42})
@@ -964,9 +989,8 @@ mod tests {
                     &negotiated,
                     ProtocolEra::Modern2026,
                     &id,
-                    "tasks/update",
+                    &JsonRpcRequest::new("tasks/update", Some(json!({"title": "review"})), 2_i64),
                     &context,
-                    json!({"title": "review"}),
                 )
                 .expect("the same registry invokes the differently typed update handler"),
             json!({"updated_title": "REVIEW"})
@@ -978,9 +1002,8 @@ mod tests {
                 &negotiated,
                 ProtocolEra::Modern2026,
                 &id,
-                "tasks/get",
+                &JsonRpcRequest::new("tasks/get", Some(json!({"unexpected": true})), 3_i64),
                 &context,
-                json!({"unexpected": true}),
             )
             .expect_err("one malformed request field shape must reject before the handler runs");
         let ExtensionHandlerInvocationError::Handler(error) = error else {
@@ -991,6 +1014,61 @@ mod tests {
             get_calls.load(Ordering::Relaxed),
             1,
             "failed typed decoding cannot invoke the registered handler"
+        );
+    }
+
+    #[test]
+    fn extension_request_descriptor_rejects_an_idless_near_match_before_handler_invocation() {
+        let (descriptors, id) = tasks_descriptors();
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted_calls = Arc::clone(&calls);
+        handlers
+            .register(
+                id.clone(),
+                "tasks/update",
+                move |_context: &McpContext, _request: UpdateTaskRequest| {
+                    counted_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(serde_json::json!({"resultType": "complete"}))
+                },
+            )
+            .expect("typed Tasks update handler registers");
+        handlers.freeze().expect("handler registry freezes");
+        let negotiated = negotiated_tasks(handlers.descriptor_registry(), &id);
+        let context = McpContext::new(Cx::for_testing(), 72);
+        let parameters = json!({"title": "review"});
+
+        assert_eq!(
+            handlers
+                .invoke(
+                    &negotiated,
+                    ProtocolEra::Modern2026,
+                    &id,
+                    &JsonRpcRequest::new("tasks/update", Some(parameters.clone()), 4_i64),
+                    &context,
+                )
+                .expect("the request-shaped extension frame is admitted"),
+            json!({"resultType": "complete"})
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let error = handlers
+            .invoke(
+                &negotiated,
+                ProtocolEra::Modern2026,
+                &id,
+                &JsonRpcRequest::notification("tasks/update", Some(parameters)),
+                &context,
+            )
+            .expect_err("removing only the request id must reject before handler invocation");
+        assert!(matches!(
+            error,
+            ExtensionHandlerInvocationError::RequestEnvelopeRequired(_)
+        ));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the rejected id-less near-match must leave handler-owned state unchanged"
         );
     }
 }

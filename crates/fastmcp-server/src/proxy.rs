@@ -7,12 +7,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use asupersync::Cx;
-use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpResponseKind};
+use asupersync::combinator::select::{Either, Select};
+use fastmcp_client::http_executor::{LegacyHttpRequest, ModernHttpClient, ModernHttpResponseKind};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
     Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
-    ClientProtocolPlan, FinalToolCallOutcome, ModernHttpSubscriptionListenEvent,
-    ModernHttpSubscriptionListener, ReverseRequestHandlers,
+    ClientProtocolPlan, CompletionParams, CompletionReference, FinalToolCallOutcome,
+    ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, ReverseRequestHandlers,
 };
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
 use fastmcp_protocol::common_types::RawIcon;
@@ -28,24 +29,27 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientExtensionDiscovery, ClientInfo,
-    CompleteResult, Content, CoreRequest, CoreResult, CreateTaskResult,
+    CompleteResult, CompletionValues, Content, CoreRequest, CoreResult, CreateTaskResult,
     ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings, FinalCallToolResult,
-    FinalCancelTaskParams, FinalCancelTaskResult, FinalCoreResult, FinalGetPromptResult,
-    FinalGetTaskParams, FinalGetTaskResult, FinalProgressNotificationParams,
-    FinalReadResourceResult, FinalRequestMeta, FinalTaskId, GetPromptResult, InitializeParams,
-    InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyContent,
-    LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsResult, Prompt,
-    PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
-    ServerDiscoverResult, ServerExtensionDiscovery, ServerNotification, SubscriptionFilter,
-    Task as FinalTask, TaskInputResponses as FinalTaskInputResponses, Tool, ToolAnnotations,
-    UpdateTaskParams, UpdateTaskResult, decode_strict_jsonrpc_message, task_subscription_ids,
+    FinalCancelTaskParams, FinalCancelTaskResult, FinalCompletionParams, FinalCompletionValues,
+    FinalCoreResult, FinalGetPromptResult, FinalGetTaskParams, FinalGetTaskResult,
+    FinalProgressNotificationParams, FinalReadResourceResult, FinalRequestMeta, FinalTaskId,
+    GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, LegacyCompletionParams, LegacyCompletionReference, LegacyContent,
+    LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsResult, ProgressParams,
+    Prompt, PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent,
+    ResourceTemplate, ServerDiscoverResult, ServerExtensionDiscovery, ServerNotification,
+    SubscriptionFilter, Task as FinalTask, TaskInputResponses as FinalTaskInputResponses, Tool,
+    ToolAnnotations, UpdateTaskParams, UpdateTaskResult, decode_strict_jsonrpc_message,
+    task_subscription_ids,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
 use crate::handler::{
-    FinalResourceReadCacheHintProvenance, FinalToolOutcome, FinalToolSchemaAuthority,
-    PromptHandler, ResourceHandler, ToolHandler, UpstreamFinalToolSchemaRegistration, UriParams,
+    CompletionHandler, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
+    FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
+    UpstreamFinalToolSchemaRegistration, UriParams,
 };
 
 /// Progress callback signature used by proxy backends.
@@ -59,19 +63,229 @@ pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<Strin
 /// parameters, including their raw decimal/exponent lexemes.
 pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotificationParams);
 
-/// One live upstream final Tasks subscription owned by a downstream request.
-///
-/// The only shipped implementation wraps the selected modern HTTP listener.
-/// Exact-2024 and stdio proxies deliberately have no fallback implementation:
-/// a collector is not a live notification relay.
-pub(crate) trait ProxyFinalTaskListener: Send {
-    /// Reads one already-admitted upstream Tasks listener event.
-    fn next(&mut self, cx: &Cx) -> McpResult<ProxyFinalTaskListenerEvent>;
+/// One final Tasks request that has reserved its route-local request ID but
+/// has not started upstream I/O.  Modern HTTP clients are cloneable and
+/// stateless after discovery, so this value deliberately owns everything
+/// needed to perform its one request after the proxy route mutex is released.
+#[doc(hidden)]
+pub enum ProxyFinalTaskOperation {
+    /// A task-capable final tools/call request.
+    CallTool {
+        /// Upstream tool name.
+        name: String,
+        /// Upstream tool arguments.
+        arguments: serde_json::Value,
+    },
+    /// A final tasks/get request.
+    Get { task_id: FinalTaskId },
+    /// A final tasks/update request.
+    Update {
+        /// Snapshot previously admitted on this route.
+        task: FinalTask,
+        /// Exact input response map.
+        input_responses: FinalTaskInputResponses,
+    },
+    /// A final tasks/cancel request.
+    Cancel { task_id: FinalTaskId },
 }
 
-/// One relay-relevant final Tasks stream event.
-pub(crate) enum ProxyFinalTaskListenerEvent {
-    /// Upstream accepted exactly the requested task filter.
+/// A detached modern final Tasks request.
+#[doc(hidden)]
+pub struct ProxyFinalTaskRequest {
+    client: ModernHttpClient,
+    request_id: RequestId,
+    operation: ProxyFinalTaskOperation,
+    maximum_response_bytes: usize,
+}
+
+enum ProxyFinalTaskResponse {
+    CallTool(FinalToolCallOutcome),
+    Get(FinalGetTaskResult),
+    Update(UpdateTaskResult),
+    Cancel(FinalCancelTaskResult),
+}
+
+impl ProxyFinalTaskRequest {
+    async fn execute(self, ctx: &McpContext) -> McpResult<ProxyFinalTaskResponse> {
+        let Self {
+            client,
+            request_id,
+            operation,
+            maximum_response_bytes,
+        } = self;
+        await_proxy_request_or_cancellation(
+            ctx,
+            Box::pin(async move {
+                match operation {
+                    ProxyFinalTaskOperation::CallTool { name, arguments } => client
+                        .call_tool_final_outcome(
+                            ctx.cx(),
+                            request_id,
+                            &name,
+                            arguments,
+                            maximum_response_bytes,
+                        )
+                        .await
+                        .map(ProxyFinalTaskResponse::CallTool)
+                        .map_err(|error| {
+                            McpError::invalid_request(format!(
+                                "Proxy HTTP final tools/call failed: {error}"
+                            ))
+                        }),
+                    ProxyFinalTaskOperation::Get { task_id } => client
+                        .get_task_final(ctx.cx(), request_id, task_id, maximum_response_bytes)
+                        .await
+                        .map(ProxyFinalTaskResponse::Get)
+                        .map_err(|error| {
+                            McpError::invalid_request(format!(
+                                "Proxy HTTP final tasks/get failed: {error}"
+                            ))
+                        }),
+                    ProxyFinalTaskOperation::Update {
+                        task,
+                        input_responses,
+                    } => client
+                        .update_task_final(
+                            ctx.cx(),
+                            request_id,
+                            &task,
+                            input_responses,
+                            maximum_response_bytes,
+                        )
+                        .await
+                        .map(ProxyFinalTaskResponse::Update)
+                        .map_err(|error| {
+                            McpError::invalid_request(format!(
+                                "Proxy HTTP final tasks/update failed: {error}"
+                            ))
+                        }),
+                    ProxyFinalTaskOperation::Cancel { task_id } => client
+                        .cancel_task_final(ctx.cx(), request_id, task_id, maximum_response_bytes)
+                        .await
+                        .map(ProxyFinalTaskResponse::Cancel)
+                        .map_err(|error| {
+                            McpError::invalid_request(format!(
+                                "Proxy HTTP final tasks/cancel failed: {error}"
+                            ))
+                        }),
+                }
+            }),
+        )
+        .await
+    }
+}
+
+/// A detached upstream final Tasks listener opening.
+#[doc(hidden)]
+pub struct ProxyFinalTaskListenerRequest {
+    client: ModernHttpClient,
+    request_id: RequestId,
+    notifications: SubscriptionFilter,
+    limits: SseLimits,
+}
+
+impl ProxyFinalTaskListenerRequest {
+    async fn open(self, ctx: &McpContext) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
+        let listener = await_proxy_request_or_cancellation(
+            ctx,
+            Box::pin(async move {
+                self.client
+                    .open_subscriptions_listener(
+                        ctx.cx(),
+                        self.request_id,
+                        self.notifications,
+                        self.limits,
+                    )
+                    .await
+                    .map_err(|error| {
+                        McpError::invalid_request(format!(
+                            "Proxy HTTP final subscriptions/listen failed: {error}"
+                        ))
+                    })
+            }),
+        )
+        .await?;
+        Ok(Box::new(ProxyHttpFinalTaskListener { listener }))
+    }
+}
+
+/// One committed exact-2024 upstream request detached from its proxy route.
+///
+/// A [`ProxyClient`] starts this handle while it exclusively owns the mutable
+/// upstream route, then releases that route before it waits or sends the
+/// cancellation control.  The client HTTP layer attests the initial POST
+/// before constructing [`LegacyHttpRequest`], so a downstream cancellation
+/// can never emit a legacy control for an uncommitted request.
+#[doc(hidden)]
+pub struct ProxyLegacyHttpRequest {
+    request: CoreRequest,
+    handle: LegacyHttpRequest,
+}
+
+impl ProxyLegacyHttpRequest {
+    fn new(request: CoreRequest, handle: LegacyHttpRequest) -> Self {
+        Self { request, handle }
+    }
+
+    async fn wait(&mut self, cx: &Cx) -> McpResult<JsonRpcResponse> {
+        match self
+            .handle
+            .wait(cx)
+            .await
+            .map_err(proxy_http_connection_error)?
+        {
+            JsonRpcMessage::Response(response) => Ok(response),
+            JsonRpcMessage::Request(_) => Err(McpError::invalid_request(
+                "Proxy HTTP legacy client returned a request while its response was required",
+            )),
+        }
+    }
+
+    async fn cancel(&mut self, cx: &Cx) -> McpResult<()> {
+        self.handle
+            .cancel(cx, None)
+            .await
+            .map_err(proxy_http_connection_error)
+    }
+
+    fn decode_response(self, response: JsonRpcResponse, method: &str) -> McpResult<CoreResult> {
+        if let Some(error) = response.error.as_ref() {
+            return Err(McpError::internal_error(format!(
+                "Proxy HTTP upstream rejected {method}: {} ({})",
+                error.message, error.code
+            )));
+        }
+        self.request.decode_response(&response).map_err(|error| {
+            McpError::invalid_request(format!(
+                "Proxy HTTP upstream response is invalid for the selected era: {error}"
+            ))
+        })
+    }
+}
+
+/// One live upstream final Tasks subscription owned by a downstream request.
+///
+/// Backends that report [`ProxyBackend::supports_final_tasks_relay`] must
+/// return a listener that emits exactly one
+/// [`ProxyFinalTaskListenerEvent::Acknowledged`] event before any notification
+/// or terminal event. The only shipped implementation wraps the selected
+/// modern HTTP listener. Exact-2024 and stdio proxies deliberately have no
+/// fallback implementation: a collector is not a live notification relay.
+pub trait ProxyFinalTaskListener: Send {
+    /// Reads the next already-admitted upstream Tasks listener event.
+    fn next(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyFinalTaskListenerEvent>;
+}
+
+/// One event emitted by a [`ProxyFinalTaskListener`].
+///
+/// A listener emits [`Self::Acknowledged`] exactly once before emitting a
+/// notification or [`Self::Terminal`].
+pub enum ProxyFinalTaskListenerEvent {
+    /// Upstream accepted the requested task filter.
     Acknowledged(SubscriptionFilter),
     /// One typed task status update.
     Notification(fastmcp_protocol::TaskStatusNotification),
@@ -357,6 +571,24 @@ pub trait ProxyBackend: Send {
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>>;
 
+    /// Returns whether the selected upstream exposes `completion/complete`.
+    ///
+    /// Exact 2024 routes report their negotiated core method surface; final
+    /// routes report support only when their retained discovery capabilities
+    /// contain `completions`. Custom backends default to unavailable so a
+    /// downstream proxy never advertises a route it cannot execute.
+    fn supports_completion(&mut self) -> McpResult<bool> {
+        Ok(false)
+    }
+
+    /// Completes one prompt or resource-template argument without projecting
+    /// away the selected upstream result era.
+    fn complete_result(&mut self, _params: CompletionParams) -> McpResult<CoreResult> {
+        Err(McpError::invalid_request(
+            "Proxy upstream does not provide completion/complete",
+        ))
+    }
+
     /// Calls a tool while retaining the exact response model selected upstream.
     ///
     /// Historical backends only provide closed handler content, which can be
@@ -425,6 +657,105 @@ pub trait ProxyBackend: Send {
         )))
     }
 
+    /// Runs one completion under the downstream request's cancellation domain.
+    fn complete_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        self.complete_result(params)
+    }
+
+    /// Runs one tool request under the downstream request's cancellation domain.
+    fn call_tool_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        self.call_tool_result(name, arguments)
+    }
+
+    /// Runs one progress-capable tool request under the downstream request's
+    /// cancellation domain.
+    fn call_tool_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        self.call_tool_result_with_final_progress(name, arguments, on_progress)
+    }
+
+    /// Runs one exact-2024 tool request and forwards its legacy progress
+    /// notifications through the request-scoped callback.
+    fn call_tool_result_with_context_and_legacy_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        _on_progress: ProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.call_tool_result_with_context(ctx, name, arguments)
+    }
+
+    /// Starts a committed exact-2024 request that a [`ProxyClient`] can await
+    /// or cancel after releasing its route mutex.
+    ///
+    /// Generic and non-HTTP backends retain their existing synchronous path.
+    /// The HTTP backend overrides this only for its selected exact legacy
+    /// route, where the returned handle owns its response correlation and
+    /// bounded late-response retirement.
+    #[doc(hidden)]
+    fn start_legacy_request_with_context(
+        &mut self,
+        _ctx: &McpContext,
+        _method: &str,
+        _parameters: serde_json::Value,
+    ) -> McpResult<Option<ProxyLegacyHttpRequest>> {
+        Ok(None)
+    }
+
+    /// Starts a committed exact-2024 completion request after the backend has
+    /// translated the proxy completion surface into legacy wire parameters.
+    ///
+    /// This separate hook keeps that era-specific translation inside the
+    /// route lock while still returning the detached request handle before the
+    /// caller waits or sends cancellation control.
+    #[doc(hidden)]
+    fn start_legacy_completion_with_context(
+        &mut self,
+        _ctx: &McpContext,
+        _params: CompletionParams,
+    ) -> McpResult<Option<ProxyLegacyHttpRequest>> {
+        Ok(None)
+    }
+
+    /// Runs one resource read under the downstream request's cancellation domain.
+    fn read_resource_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        self.read_resource_result(uri)
+    }
+
+    /// Runs one prompt lookup under the downstream request's cancellation domain.
+    fn get_prompt_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        self.get_prompt_result(name, arguments)
+    }
+
     /// Returns whether this exact selected upstream admits the complete final
     /// Tasks relay surface. A false result is not a request failure: ordinary
     /// proxy operations remain available without advertising Tasks downstream.
@@ -469,7 +800,35 @@ pub trait ProxyBackend: Send {
         ))
     }
 
+    /// Reserves a final Tasks request without beginning upstream I/O.
+    ///
+    /// Native modern HTTP backends override this to detach a cloneable,
+    /// stateless request from the route mutex. Other backends retain their
+    /// existing synchronous implementation until they can offer the same
+    /// ownership guarantee.
+    #[doc(hidden)]
+    fn start_final_task_request(
+        &mut self,
+        _operation: ProxyFinalTaskOperation,
+    ) -> McpResult<Option<ProxyFinalTaskRequest>> {
+        Ok(None)
+    }
+
+    /// Reserves a final Tasks listener opening without beginning upstream I/O.
+    #[doc(hidden)]
+    fn start_final_task_listener(
+        &mut self,
+        _notifications: SubscriptionFilter,
+    ) -> McpResult<Option<ProxyFinalTaskListenerRequest>> {
+        Ok(None)
+    }
+
     /// Opens one live, route-bound upstream Tasks listener.
+    ///
+    /// Backends that support the final Tasks relay override this method and
+    /// return a listener that acknowledges the requested filter before any
+    /// notification or terminal event. The default preserves legacy proxy
+    /// behavior by rejecting the final-only operation.
     fn open_final_task_listener(
         &mut self,
         _notifications: SubscriptionFilter,
@@ -1024,6 +1383,29 @@ impl ProxyBackend for Client {
         }
     }
 
+    fn supports_completion(&mut self) -> McpResult<bool> {
+        self.ensure_initialized()?;
+        match self.selected_protocol_era() {
+            Some(ProtocolEra::Legacy2024) => Ok(true),
+            Some(ProtocolEra::Modern2026) => self
+                .server_discovery()
+                .map(discovery_supports_final_completion)
+                .transpose()?
+                .unwrap_or(false),
+            None => Err(McpError::internal_error(
+                "Proxy client has no selected protocol era for completion/complete",
+            )),
+        }
+    }
+
+    fn complete_result(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
+        match Client::complete(self, params)? {
+            result @ CoreResult::Legacy(LegacyCoreResult::Completion(_))
+            | result @ CoreResult::Final(FinalCoreResult::Completion { .. }) => Ok(result),
+            _ => Err(unexpected_proxy_result("completion/complete")),
+        }
+    }
+
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         legacy_contents_to_handler(Client::call_tool(self, name, arguments)?)
     }
@@ -1087,6 +1469,74 @@ impl ProxyBackend for Client {
             | result @ CoreResult::Final(FinalCoreResult::PromptsGet { .. }) => Ok(result),
             _ => Err(unexpected_proxy_result("prompts/get")),
         }
+    }
+
+    fn complete_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<CoreResult> {
+        self.complete_with_cancellation(ctx.cx(), &ctx.request_cancellation(), params, |_| {})
+    }
+
+    fn call_tool_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::TOOLS_CALL,
+            serde_json::json!({"name": name, "arguments": arguments}),
+            |_| {},
+        )
+    }
+
+    fn call_tool_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        _on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::TOOLS_CALL,
+            serde_json::json!({"name": name, "arguments": arguments}),
+            |_| {},
+        )
+    }
+
+    fn read_resource_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<CoreResult> {
+        self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::RESOURCES_READ,
+            serde_json::json!({"uri": uri}),
+            |_| {},
+        )
+    }
+
+    fn get_prompt_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<CoreResult> {
+        self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::PROMPTS_GET,
+            serde_json::json!({"name": name, "arguments": arguments}),
+            |_| {},
+        )
     }
 }
 
@@ -1311,6 +1761,80 @@ struct ProxyFinalTaskReservation {
     active: bool,
 }
 
+/// Admits the one legal event sequence for a relayed Tasks listener.
+///
+/// A backend is an extension point, so its documented acknowledgement-first
+/// contract cannot be trusted at the router boundary. Keeping this state next
+/// to the relay makes the invariant hold for every backend, including custom
+/// backends that do not use the shipped modern HTTP listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyFinalTaskListenerPhase {
+    AwaitingAcknowledgement,
+    Streaming,
+    Terminated,
+}
+
+struct AdmittedProxyFinalTaskListener {
+    inner: Box<dyn ProxyFinalTaskListener>,
+    phase: ProxyFinalTaskListenerPhase,
+}
+
+impl AdmittedProxyFinalTaskListener {
+    fn new(inner: Box<dyn ProxyFinalTaskListener>) -> Self {
+        Self {
+            inner,
+            phase: ProxyFinalTaskListenerPhase::AwaitingAcknowledgement,
+        }
+    }
+
+    fn reject_sequence(&mut self, message: &'static str) -> McpResult<ProxyFinalTaskListenerEvent> {
+        self.phase = ProxyFinalTaskListenerPhase::Terminated;
+        Err(McpError::invalid_request(message))
+    }
+}
+
+impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
+    fn next(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyFinalTaskListenerEvent> {
+        if self.phase == ProxyFinalTaskListenerPhase::Terminated {
+            return Err(McpError::invalid_request(
+                "Proxy final Tasks listener was polled after terminal completion",
+            ));
+        }
+
+        let event = self.inner.next(cx, request_cancellation)?;
+        match (self.phase, event) {
+            (
+                ProxyFinalTaskListenerPhase::AwaitingAcknowledgement,
+                ProxyFinalTaskListenerEvent::Acknowledged(filter),
+            ) => {
+                self.phase = ProxyFinalTaskListenerPhase::Streaming;
+                Ok(ProxyFinalTaskListenerEvent::Acknowledged(filter))
+            }
+            (ProxyFinalTaskListenerPhase::AwaitingAcknowledgement, _) => self
+                .reject_sequence("Proxy upstream Tasks listener did not acknowledge before events"),
+            (
+                ProxyFinalTaskListenerPhase::Streaming,
+                ProxyFinalTaskListenerEvent::Acknowledged(_),
+            ) => self.reject_sequence("Proxy upstream Tasks listener acknowledged more than once"),
+            (
+                ProxyFinalTaskListenerPhase::Streaming,
+                ProxyFinalTaskListenerEvent::Notification(notification),
+            ) => Ok(ProxyFinalTaskListenerEvent::Notification(notification)),
+            (ProxyFinalTaskListenerPhase::Streaming, ProxyFinalTaskListenerEvent::Terminal) => {
+                self.phase = ProxyFinalTaskListenerPhase::Terminated;
+                Ok(ProxyFinalTaskListenerEvent::Terminal)
+            }
+            (ProxyFinalTaskListenerPhase::Terminated, _) => {
+                unreachable!("terminated Tasks listener is rejected before its backend is polled")
+            }
+        }
+    }
+}
+
 impl Drop for ProxyFinalTaskReservation {
     fn drop(&mut self) {
         if self.active {
@@ -1475,6 +1999,7 @@ impl ProxyFinalTaskRelay {
 
     pub(crate) fn dispatch_get(
         &self,
+        ctx: &McpContext,
         parameters: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         self.ensure_modern_http_route()?;
@@ -1483,7 +2008,7 @@ impl ProxyFinalTaskRelay {
         let requested = self.known_task(&parameters.task_id)?;
         let result = self
             .client
-            .get_final_task(requested.base().task_id.clone())?;
+            .get_final_task(ctx, requested.base().task_id.clone())?;
         self.record_task(result.task.clone())?;
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/get response serialization failed")
@@ -1492,6 +2017,7 @@ impl ProxyFinalTaskRelay {
 
     pub(crate) fn dispatch_update(
         &self,
+        ctx: &McpContext,
         parameters: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         self.ensure_modern_http_route()?;
@@ -1500,7 +2026,7 @@ impl ProxyFinalTaskRelay {
         let task = self.known_task(&parameters.task_id)?;
         let result = self
             .client
-            .update_final_task(&task, parameters.input_responses)?;
+            .update_final_task(ctx, &task, parameters.input_responses)?;
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/update response serialization failed")
         })
@@ -1508,13 +2034,16 @@ impl ProxyFinalTaskRelay {
 
     pub(crate) fn dispatch_cancel(
         &self,
+        ctx: &McpContext,
         parameters: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         self.ensure_modern_http_route()?;
         let parameters = serde_json::from_value::<FinalCancelTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
         let task = self.known_task(&parameters.task_id)?;
-        let result = self.client.cancel_final_task(task.base().task_id.clone())?;
+        let result = self
+            .client
+            .cancel_final_task(ctx, task.base().task_id.clone())?;
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/cancel response serialization failed")
         })
@@ -1522,6 +2051,7 @@ impl ProxyFinalTaskRelay {
 
     pub(crate) fn open_listener(
         &self,
+        ctx: &McpContext,
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
         self.ensure_modern_http_route()?;
@@ -1531,7 +2061,12 @@ impl ProxyFinalTaskRelay {
         for task_id in &task_ids {
             self.known_task(task_id)?;
         }
-        self.client.open_final_task_listener(notifications)
+        self.client
+            .open_final_task_listener(ctx, notifications)
+            .map(|listener| {
+                Box::new(AdmittedProxyFinalTaskListener::new(listener))
+                    as Box<dyn ProxyFinalTaskListener>
+            })
     }
 
     pub(crate) fn record_notification(
@@ -1791,6 +2326,48 @@ impl ProxyHttpClient {
         }
     }
 
+    fn completion_parameters(&self, params: CompletionParams) -> McpResult<serde_json::Value> {
+        match self.binding.era() {
+            ProtocolEra::Modern2026 => serde_json::to_value(params).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Proxy HTTP final completion parameters could not serialize: {error}"
+                ))
+            }),
+            ProtocolEra::Legacy2024 => {
+                if params.context.is_some() {
+                    return Err(McpError::invalid_params(
+                        "MCP 2024-11-05 completion cannot represent completion context",
+                    ));
+                }
+                let reference = match params.reference {
+                    CompletionReference::Prompt { name } => {
+                        LegacyCompletionReference::Prompt { name }
+                    }
+                    CompletionReference::PromptWithTitle { .. } => {
+                        return Err(McpError::invalid_params(
+                            "MCP 2024-11-05 completion cannot represent a prompt title",
+                        ));
+                    }
+                    CompletionReference::Resource { uri } => {
+                        LegacyCompletionReference::Resource { uri }
+                    }
+                };
+                serde_json::to_value(LegacyCompletionParams {
+                    reference,
+                    argument: fastmcp_protocol::LegacyCompletionArgument {
+                        name: params.argument.name,
+                        value: params.argument.value,
+                    },
+                })
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP legacy completion parameters could not serialize: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
     fn ensure_legacy_initialized(&mut self) -> McpResult<()> {
         if self.legacy_initialized {
             return Ok(());
@@ -1802,7 +2379,7 @@ impl ProxyHttpClient {
             capabilities: self.client_capabilities.clone(),
             client_info: self.client_info.clone(),
         };
-        let response = self.request_legacy_response(
+        let response = self.request_legacy_response_unscoped(
             fastmcp_protocol::methods::INITIALIZE,
             serde_json::to_value(parameters).map_err(|error| {
                 McpError::internal_error(format!(
@@ -1865,6 +2442,7 @@ impl ProxyHttpClient {
 
     fn request_legacy_response(
         &mut self,
+        ctx: &McpContext,
         method: &str,
         parameters: serde_json::Value,
         request_id: RequestId,
@@ -1874,11 +2452,15 @@ impl ProxyHttpClient {
                 "Modern HTTP proxy connection entered a legacy request path",
             ));
         }
-        let response = block_on(
-            self.connection
-                .request(&self.cx, method, parameters, request_id),
-        )
-        .map_err(proxy_http_connection_error)?;
+        let response = block_on(await_proxy_request_or_cancellation(
+            ctx,
+            Box::pin(async {
+                self.connection
+                    .request(ctx.cx(), method, parameters, request_id.clone())
+                    .await
+                    .map_err(proxy_http_connection_error)
+            }),
+        ))?;
         match response {
             ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok(response),
             ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
@@ -1907,6 +2489,19 @@ impl ProxyHttpClient {
         parameters: serde_json::Value,
         on_progress: FinalProgressCallback<'_>,
     ) -> McpResult<CoreResult> {
+        self.request_result_with_context_and_final_progress(None, method, parameters, on_progress)
+    }
+
+    fn request_result_with_context_and_final_progress(
+        &mut self,
+        ctx: Option<&McpContext>,
+        method: &str,
+        parameters: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        if let Some(ctx) = ctx {
+            ctx.checkpoint()?;
+        }
         if self.binding.era() == ProtocolEra::Legacy2024 {
             self.ensure_legacy_initialized()?;
         }
@@ -1919,25 +2514,54 @@ impl ProxyHttpClient {
             },
         )?;
         let request_id = self.next_request_id()?;
-        let response = match self.connection.selected_protocol_era() {
+        let response_result = match self.connection.selected_protocol_era() {
             ProtocolEra::Modern2026 => {
                 let ClientHttpConnection::Modern(client) = &mut self.connection else {
                     return Err(McpError::internal_error(
                         "HTTP proxy connection era disagrees with its modern transport",
                     ));
                 };
-                receive_modern_response(
-                    client,
-                    &self.cx,
-                    method,
-                    parameters,
+                match ctx {
+                    Some(ctx) => block_on(receive_modern_response_with_cancellation(
+                        client,
+                        ctx,
+                        method,
+                        parameters,
+                        &request_id,
+                        on_progress,
+                    )),
+                    None => receive_modern_response(
+                        client,
+                        &self.cx,
+                        method,
+                        parameters,
+                        &request_id,
+                        on_progress,
+                    ),
+                }
+            }
+            ProtocolEra::Legacy2024 => match ctx {
+                Some(ctx) => {
+                    self.request_legacy_response(ctx, method, parameters, request_id.clone())
+                }
+                None => {
+                    self.request_legacy_response_unscoped(method, parameters, request_id.clone())
+                }
+            },
+        };
+        let response = match response_result {
+            Ok(response) => response,
+            Err(error)
+                if ctx.is_some_and(|ctx| ctx.request_cancellation().is_cancel_requested())
+                    && self.connection.selected_protocol_era() == ProtocolEra::Legacy2024 =>
+            {
+                self.cancel_legacy_request(
+                    ctx.expect("cancellation context was checked"),
                     &request_id,
-                    on_progress,
-                )?
+                )?;
+                return Err(error);
             }
-            ProtocolEra::Legacy2024 => {
-                self.request_legacy_response(method, parameters, request_id.clone())?
-            }
+            Err(error) => return Err(error),
         };
         if let Some(error) = response.error.as_ref() {
             return Err(McpError::internal_error(format!(
@@ -1951,9 +2575,106 @@ impl ProxyHttpClient {
             ))
         })
     }
+
+    fn request_legacy_response_unscoped(
+        &mut self,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+    ) -> McpResult<JsonRpcResponse> {
+        if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Err(McpError::internal_error(
+                "Modern HTTP proxy connection entered a legacy request path",
+            ));
+        }
+        let response = block_on(
+            self.connection
+                .request(&self.cx, method, parameters, request_id),
+        )
+        .map_err(proxy_http_connection_error)?;
+        match response {
+            ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => Ok(response),
+            ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
+                Err(McpError::invalid_request(
+                    "Proxy HTTP legacy client returned a request while its response was required",
+                ))
+            }
+            ClientHttpResponse::Modern(_) => Err(McpError::internal_error(
+                "Modern HTTP proxy connection entered a legacy request path",
+            )),
+        }
+    }
+
+    fn request_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let mut ignore_final_progress = |_| {};
+        self.request_result_with_context_and_final_progress(
+            Some(ctx),
+            method,
+            parameters,
+            &mut ignore_final_progress,
+        )
+    }
+
+    fn cancel_legacy_request(&mut self, ctx: &McpContext, request_id: &RequestId) -> McpResult<()> {
+        block_on(self.connection.notify(
+            ctx.cx(),
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": request_id})),
+        ))
+        .map_err(proxy_http_connection_error)
+    }
 }
 
 impl ProxyBackend for ProxyHttpClient {
+    fn start_legacy_request_with_context(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<Option<ProxyLegacyHttpRequest>> {
+        if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Ok(None);
+        }
+        ctx.checkpoint()?;
+        self.ensure_legacy_initialized()?;
+        let parameters = self.request_parameters(parameters)?;
+        let request = CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&parameters))
+            .map_err(|error| {
+                McpError::invalid_params(format!(
+                    "Proxy HTTP request is invalid for the selected upstream era: {error}"
+                ))
+            })?;
+        let request_id = self.next_request_id()?;
+        let handle = block_on(self.connection.start_legacy_request(
+            ctx.cx(),
+            method,
+            parameters,
+            request_id,
+        ))
+        .map_err(proxy_http_connection_error)?;
+        Ok(Some(ProxyLegacyHttpRequest::new(request, handle)))
+    }
+
+    fn start_legacy_completion_with_context(
+        &mut self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<Option<ProxyLegacyHttpRequest>> {
+        if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Ok(None);
+        }
+        self.start_legacy_request_with_context(
+            ctx,
+            fastmcp_protocol::methods::COMPLETION_COMPLETE,
+            self.completion_parameters(params)?,
+        )
+    }
+
     fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         match self.list_tool_catalog()? {
             ProxyToolCatalog::Legacy(tools) => Ok(tools),
@@ -2175,6 +2896,25 @@ impl ProxyBackend for ProxyHttpClient {
         }
     }
 
+    fn supports_completion(&mut self) -> McpResult<bool> {
+        match self.binding.era() {
+            ProtocolEra::Legacy2024 => Ok(true),
+            ProtocolEra::Modern2026 => self
+                .connection
+                .server_discovery()
+                .map(discovery_supports_final_completion)
+                .transpose()?
+                .unwrap_or(false),
+        }
+    }
+
+    fn complete_result(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
+        self.request_result(
+            fastmcp_protocol::methods::COMPLETION_COMPLETE,
+            self.completion_parameters(params)?,
+        )
+    }
+
     fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         match self.call_tool_result(name, arguments)? {
             CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
@@ -2265,6 +3005,97 @@ impl ProxyBackend for ProxyHttpClient {
         arguments: HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         self.request_result(
+            fastmcp_protocol::methods::PROMPTS_GET,
+            serde_json::json!({"name": name, "arguments": arguments}),
+        )
+    }
+
+    fn complete_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<CoreResult> {
+        self.request_result_with_context(
+            ctx,
+            fastmcp_protocol::methods::COMPLETION_COMPLETE,
+            self.completion_parameters(params)?,
+        )
+    }
+
+    fn call_tool_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.request_result_with_context(
+            ctx,
+            fastmcp_protocol::methods::TOOLS_CALL,
+            serde_json::json!({"name": name, "arguments": arguments}),
+        )
+    }
+
+    fn call_tool_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.request_result_with_context_and_final_progress(
+            Some(ctx),
+            fastmcp_protocol::methods::TOOLS_CALL,
+            serde_json::json!({"name": name, "arguments": arguments}),
+            on_progress,
+        )
+    }
+
+    fn call_tool_result_with_context_and_legacy_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: ProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let result = self.call_tool_result_with_context(ctx, name, arguments)?;
+        if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Ok(result);
+        }
+        while let Some(notification) = self.connection.take_legacy_notification() {
+            if notification.method != "notifications/progress" || notification.id.is_some() {
+                continue;
+            }
+            let Some(parameters) = notification.params else {
+                continue;
+            };
+            let Ok(progress) = serde_json::from_value::<ProgressParams>(parameters) else {
+                continue;
+            };
+            on_progress(progress.progress, progress.total, progress.message);
+        }
+        Ok(result)
+    }
+
+    fn read_resource_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<CoreResult> {
+        self.request_result_with_context(
+            ctx,
+            fastmcp_protocol::methods::RESOURCES_READ,
+            serde_json::json!({"uri": uri}),
+        )
+    }
+
+    fn get_prompt_result_with_context(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<CoreResult> {
+        self.request_result_with_context(
+            ctx,
             fastmcp_protocol::methods::PROMPTS_GET,
             serde_json::json!({"name": name, "arguments": arguments}),
         )
@@ -2362,6 +3193,46 @@ impl ProxyBackend for ProxyHttpClient {
         })
     }
 
+    fn start_final_task_request(
+        &mut self,
+        operation: ProxyFinalTaskOperation,
+    ) -> McpResult<Option<ProxyFinalTaskRequest>> {
+        if !self.supports_final_tasks_relay()? {
+            return Err(McpError::invalid_request(
+                "Proxy upstream does not admit the complete final Tasks relay surface",
+            ));
+        }
+        let ClientHttpConnection::Modern(client) = &self.connection else {
+            return Ok(None);
+        };
+        Ok(Some(ProxyFinalTaskRequest {
+            client: client.clone(),
+            request_id: self.next_request_id()?,
+            operation,
+            maximum_response_bytes: Self::MAX_RESPONSE_BYTES,
+        }))
+    }
+
+    fn start_final_task_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Option<ProxyFinalTaskListenerRequest>> {
+        if !self.supports_final_tasks_relay()? {
+            return Err(McpError::invalid_request(
+                "Proxy upstream does not admit the complete final Tasks relay surface",
+            ));
+        }
+        let ClientHttpConnection::Modern(client) = &self.connection else {
+            return Ok(None);
+        };
+        Ok(Some(ProxyFinalTaskListenerRequest {
+            client: client.clone(),
+            request_id: self.next_request_id()?,
+            notifications,
+            limits: Self::sse_limits(),
+        }))
+    }
+
     fn open_final_task_listener(
         &mut self,
         notifications: SubscriptionFilter,
@@ -2392,8 +3263,20 @@ struct ProxyHttpFinalTaskListener {
 }
 
 impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
-    fn next(&mut self, cx: &Cx) -> McpResult<ProxyFinalTaskListenerEvent> {
-        match block_on(self.listener.next_event(cx)).map_err(|error| {
+    fn next(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyFinalTaskListenerEvent> {
+        match block_on(await_proxy_operation_or_cancellation(
+            cx,
+            request_cancellation,
+            Box::pin(self.listener.next_event(cx)),
+        ))
+        .map_err(|error| {
+            if error.code == fastmcp_core::McpErrorCode::RequestCancelled {
+                return error;
+            }
             McpError::invalid_request(format!(
                 "Proxy HTTP final Tasks listener rejected an upstream frame: {error}"
             ))
@@ -2412,6 +3295,15 @@ impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
             ),
         }
     }
+}
+
+fn discovery_supports_final_completion(discovery: &ServerDiscoverResult) -> McpResult<bool> {
+    let capabilities = serde_json::to_value(discovery.capabilities()).map_err(|error| {
+        McpError::internal_error(format!(
+            "Proxy final completion discovery capabilities could not be encoded: {error}"
+        ))
+    })?;
+    Ok(capabilities.get("completions").is_some())
 }
 
 /// Proves the complete Tasks surface before the proxy advertises it downstream.
@@ -2564,6 +3456,148 @@ fn receive_modern_response(
                         request,
                         &mut *on_progress,
                     )?;
+                    continue;
+                }
+                return response_for_request(message, request_id);
+            }
+        }
+        ModernHttpResponseKind::EmptyAcknowledgement => Err(McpError::invalid_request(
+            "Proxy HTTP modern request received a notification acknowledgement where a correlated response was required",
+        )),
+        ModernHttpResponseKind::HttpFailure => Err(McpError::invalid_request(
+            "Proxy HTTP modern request received an unsuccessful HTTP response",
+        )),
+    }
+}
+
+/// Awaits one upstream I/O step or the downstream request's cancellation.
+///
+/// The losing future is dropped immediately.  For a modern HTTP response this
+/// drops the request-owned response body; for an exact-2024 request the caller
+/// follows the cancellation result by posting the standard cancellation
+/// control on the pinned message endpoint.
+async fn await_proxy_request_or_cancellation<T>(
+    ctx: &McpContext,
+    operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + '_>>,
+) -> McpResult<T> {
+    ctx.checkpoint()?;
+    let cancellation = ctx.request_cancellation();
+    let cancellation_wait = Box::pin(async move {
+        cancellation.cancelled().await;
+    });
+    match Select::new(operation, cancellation_wait)
+        .await
+        .map_err(|_| {
+            McpError::internal_error("Proxy cancellation race was polled after completion")
+        })? {
+        Either::Left(result) => result,
+        Either::Right(()) => Err(McpError::request_cancelled()),
+    }
+}
+
+/// Awaits an upstream operation or a request-owned cancellation token when no
+/// full [`McpContext`] can be moved into the operation. This is used by the
+/// final Tasks listener, whose upstream SSE read must wake even when it is
+/// otherwise silent.
+async fn await_proxy_operation_or_cancellation<T>(
+    cx: &Cx,
+    request_cancellation: &fastmcp_core::McpRequestCancellation,
+    operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + '_>>,
+) -> McpResult<T> {
+    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+    let cancellation = request_cancellation.clone();
+    let cancellation_wait = Box::pin(async move {
+        cancellation.cancelled().await;
+    });
+    match Select::new(operation, cancellation_wait)
+        .await
+        .map_err(|_| {
+            McpError::internal_error("Proxy cancellation race was polled after completion")
+        })? {
+        Either::Left(result) => result,
+        Either::Right(()) => Err(McpError::request_cancelled()),
+    }
+}
+
+async fn receive_modern_response_with_cancellation(
+    client: &ModernHttpClient,
+    ctx: &McpContext,
+    method: &str,
+    parameters: serde_json::Value,
+    request_id: &RequestId,
+    on_progress: FinalProgressCallback<'_>,
+) -> McpResult<JsonRpcResponse> {
+    let response = await_proxy_request_or_cancellation(
+        ctx,
+        Box::pin(async {
+            client
+                .request(ctx.cx(), method, parameters, Some(request_id.clone()))
+                .await
+                .map_err(|error| {
+                    McpError::internal_error(format!("Proxy HTTP modern request failed: {error}"))
+                })
+        }),
+    )
+    .await?;
+    match response.metadata().kind() {
+        ModernHttpResponseKind::Json => {
+            let body = await_proxy_request_or_cancellation(
+                ctx,
+                Box::pin(async {
+                    response
+                        .read_to_end(ctx.cx(), ProxyHttpClient::MAX_RESPONSE_BYTES)
+                        .await
+                        .map_err(|error| {
+                            McpError::internal_error(format!(
+                                "Proxy HTTP modern JSON response could not be read: {error}"
+                            ))
+                        })
+                }),
+            )
+            .await?;
+            response_for_request(
+                decode_strict_jsonrpc_message(&body, ProxyHttpClient::MAX_RESPONSE_BYTES).map_err(
+                    |_| McpError::invalid_request("Proxy HTTP modern response was not JSON-RPC"),
+                )?,
+                request_id,
+            )
+        }
+        ModernHttpResponseKind::Sse => {
+            let mut stream = response
+                .into_sse_stream(ProxyHttpClient::sse_limits())
+                .map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Proxy HTTP modern SSE response could not be opened: {error}"
+                    ))
+                })?;
+            loop {
+                let event = await_proxy_request_or_cancellation(
+                    ctx,
+                    Box::pin(async {
+                        stream.next_event(ctx.cx()).await.map_err(|error| {
+                            McpError::internal_error(format!(
+                                "Proxy HTTP modern SSE response could not be read: {error}"
+                            ))
+                        })
+                    }),
+                )
+                .await?;
+                let Some(event) = event else {
+                    return Err(McpError::invalid_request(
+                        "Proxy HTTP modern SSE response ended before its correlated result",
+                    ));
+                };
+                let message = decode_strict_jsonrpc_message(
+                    event.as_bytes(),
+                    ProxyHttpClient::MAX_RESPONSE_BYTES,
+                )
+                .map_err(|_| {
+                    McpError::invalid_request("Proxy HTTP modern SSE event was not JSON-RPC")
+                })?;
+                if let JsonRpcMessage::Request(request) = &message
+                    && request.is_notification()
+                {
+                    forward_modern_progress_notification(event.as_bytes(), request, on_progress)?;
                     continue;
                 }
                 return response_for_request(message, request_id);
@@ -3281,6 +4315,85 @@ impl ProxyClient {
         f(&mut *guard)
     }
 
+    /// Starts an exact-2024 request while the mutable route is exclusively
+    /// held, then returns its independent client handle.  Waiting and any
+    /// cancellation control deliberately happen after this function returns,
+    /// when the route mutex has been dropped.
+    fn start_legacy_request_with_context(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<Option<ProxyLegacyHttpRequest>> {
+        self.with_backend(|backend| {
+            backend.start_legacy_request_with_context(ctx, method, parameters)
+        })
+    }
+
+    /// Starts an exact-2024 completion under the mutable route lock, then
+    /// releases that lock before the returned handle is awaited or cancelled.
+    fn start_legacy_completion_with_context(
+        &self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<Option<ProxyLegacyHttpRequest>> {
+        self.with_backend(|backend| backend.start_legacy_completion_with_context(ctx, params))
+    }
+
+    /// Waits for one committed exact-2024 request outside the route mutex.
+    ///
+    /// [`LegacyHttpRequest`] exists only after the upstream request POST is
+    /// acknowledged, so the cancellation branch may emit its control without
+    /// risking a pre-commit legacy notification. The handle, rather than the
+    /// route lock, owns response correlation and late-frame retirement.
+    fn await_legacy_request_with_context(
+        &self,
+        ctx: &McpContext,
+        mut request: ProxyLegacyHttpRequest,
+        method: &str,
+    ) -> McpResult<CoreResult> {
+        let response = block_on(await_proxy_request_or_cancellation(
+            ctx,
+            Box::pin(async { request.wait(ctx.cx()).await }),
+        ));
+        match response {
+            Ok(response) => request.decode_response(response, method),
+            Err(error) if ctx.request_cancellation().is_cancel_requested() => {
+                request.cancel(ctx.cx())?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns whether the selected upstream has an executable
+    /// `completion/complete` route.
+    pub fn supports_completion(&self) -> McpResult<bool> {
+        self.with_backend(|backend| backend.supports_completion())
+    }
+
+    /// Completes one argument without erasing the exact selected-era result.
+    pub fn complete_typed(
+        &self,
+        ctx: &McpContext,
+        params: CompletionParams,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        if let Some(request) = self.start_legacy_completion_with_context(ctx, params.clone())? {
+            let result = self.await_legacy_request_with_context(
+                ctx,
+                request,
+                fastmcp_protocol::methods::COMPLETION_COMPLETE,
+            )?;
+            ctx.checkpoint()?;
+            return self.admit_upstream_result("completion/complete", result);
+        }
+        let result =
+            self.with_backend(|backend| backend.complete_result_with_context(ctx, params))?;
+        ctx.checkpoint()?;
+        self.admit_upstream_result("completion/complete", result)
+    }
+
     pub fn call_tool(
         &self,
         ctx: &McpContext,
@@ -3288,6 +4401,43 @@ impl ProxyClient {
         arguments: serde_json::Value,
     ) -> McpResult<Vec<Content>> {
         ctx.checkpoint()?;
+        if ctx.has_progress_reporter()
+            && self.upstream_binding.is_some_and(|binding| {
+                binding.era() == ProtocolEra::Legacy2024
+                    && binding.adapter() == ProxyUpstreamAdapter::LegacyHttpSse
+            })
+        {
+            // The exact legacy HTTP backend queues interleaved progress on its
+            // pinned SSE ingress. Drain the admitted legacy frames through the
+            // current request reporter before returning the correlated result.
+            let result = self.with_backend(|backend| {
+                let mut callback = |progress, total, message: Option<String>| {
+                    if let Some(total) = total {
+                        ctx.report_progress_with_total(progress, total, message.as_deref());
+                    } else {
+                        ctx.report_progress(progress, message.as_deref());
+                    }
+                };
+                backend.call_tool_result_with_context_and_legacy_progress(
+                    ctx,
+                    name,
+                    arguments,
+                    &mut callback,
+                )
+            })?;
+            ctx.checkpoint()?;
+            return match self.admit_upstream_result("tools/call", result)? {
+                CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                    legacy_tool_result_to_handler(result)
+                }
+                CoreResult::Final(FinalCoreResult::ToolsCall { .. }) => {
+                    Err(McpError::invalid_request(
+                        "Proxy cannot project a final tools/call result to the legacy handler surface",
+                    ))
+                }
+                _ => Err(unexpected_proxy_result("tools/call")),
+            };
+        }
         if ctx.has_progress_reporter() {
             if self
                 .upstream_binding
@@ -3307,6 +4457,7 @@ impl ProxyClient {
                 };
                 backend.call_tool_with_progress(name, arguments, &mut callback)
             })?;
+            ctx.checkpoint()?;
             return legacy_contents_to_handler(handler_contents_to_legacy(content)?);
         }
 
@@ -3380,9 +4531,29 @@ impl ProxyClient {
         on_progress: FinalProgressCallback<'_>,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        let parameters = serde_json::json!({"name": name, "arguments": arguments.clone()});
+        if let Some(request) = self.start_legacy_request_with_context(
+            ctx,
+            fastmcp_protocol::methods::TOOLS_CALL,
+            parameters.clone(),
+        )? {
+            let result = self.await_legacy_request_with_context(
+                ctx,
+                request,
+                fastmcp_protocol::methods::TOOLS_CALL,
+            )?;
+            ctx.checkpoint()?;
+            return self.admit_upstream_result("tools/call", result);
+        }
         let result = self.with_backend(|backend| {
-            backend.call_tool_result_with_final_progress(name, arguments, on_progress)
+            backend.call_tool_result_with_context_and_final_progress(
+                ctx,
+                name,
+                arguments,
+                on_progress,
+            )
         })?;
+        ctx.checkpoint()?;
         self.admit_upstream_result("tools/call", result)
     }
 
@@ -3405,36 +4576,127 @@ impl ProxyClient {
                 "Proxy final Tasks relay is unavailable for this upstream route",
             ));
         }
-        self.with_backend(|backend| backend.call_tool_final_outcome(name, arguments))
+        let operation = ProxyFinalTaskOperation::CallTool {
+            name: name.to_owned(),
+            arguments: arguments.clone(),
+        };
+        let outcome =
+            match self.with_backend(|backend| backend.start_final_task_request(operation))? {
+                Some(request) => match block_on(request.execute(ctx))? {
+                    ProxyFinalTaskResponse::CallTool(outcome) => outcome,
+                    ProxyFinalTaskResponse::Get(_)
+                    | ProxyFinalTaskResponse::Update(_)
+                    | ProxyFinalTaskResponse::Cancel(_) => {
+                        return Err(McpError::internal_error(
+                            "Proxy final Tasks request returned the wrong operation result",
+                        ));
+                    }
+                },
+                None => {
+                    self.with_backend(|backend| backend.call_tool_final_outcome(name, arguments))?
+                }
+            };
+        ctx.checkpoint()?;
+        Ok(outcome)
     }
 
-    fn get_final_task(&self, task_id: FinalTaskId) -> McpResult<FinalGetTaskResult> {
-        self.with_backend(|backend| backend.get_final_task(task_id))
+    fn get_final_task(
+        &self,
+        ctx: &McpContext,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalGetTaskResult> {
+        let operation = ProxyFinalTaskOperation::Get {
+            task_id: task_id.clone(),
+        };
+        match self.with_backend(|backend| backend.start_final_task_request(operation))? {
+            Some(request) => match block_on(request.execute(ctx))? {
+                ProxyFinalTaskResponse::Get(result) => Ok(result),
+                ProxyFinalTaskResponse::CallTool(_)
+                | ProxyFinalTaskResponse::Update(_)
+                | ProxyFinalTaskResponse::Cancel(_) => Err(McpError::internal_error(
+                    "Proxy final Tasks request returned the wrong operation result",
+                )),
+            },
+            None => self.with_backend(|backend| backend.get_final_task(task_id)),
+        }
     }
 
     fn update_final_task(
         &self,
+        ctx: &McpContext,
         task: &FinalTask,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<UpdateTaskResult> {
-        self.with_backend(|backend| backend.update_final_task(task, input_responses))
+        let operation = ProxyFinalTaskOperation::Update {
+            task: task.clone(),
+            input_responses: input_responses.clone(),
+        };
+        match self.with_backend(|backend| backend.start_final_task_request(operation))? {
+            Some(request) => match block_on(request.execute(ctx))? {
+                ProxyFinalTaskResponse::Update(result) => Ok(result),
+                ProxyFinalTaskResponse::CallTool(_)
+                | ProxyFinalTaskResponse::Get(_)
+                | ProxyFinalTaskResponse::Cancel(_) => Err(McpError::internal_error(
+                    "Proxy final Tasks request returned the wrong operation result",
+                )),
+            },
+            None => self.with_backend(|backend| backend.update_final_task(task, input_responses)),
+        }
     }
 
-    fn cancel_final_task(&self, task_id: FinalTaskId) -> McpResult<FinalCancelTaskResult> {
-        self.with_backend(|backend| backend.cancel_final_task(task_id))
+    fn cancel_final_task(
+        &self,
+        ctx: &McpContext,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalCancelTaskResult> {
+        let operation = ProxyFinalTaskOperation::Cancel {
+            task_id: task_id.clone(),
+        };
+        match self.with_backend(|backend| backend.start_final_task_request(operation))? {
+            Some(request) => match block_on(request.execute(ctx))? {
+                ProxyFinalTaskResponse::Cancel(result) => Ok(result),
+                ProxyFinalTaskResponse::CallTool(_)
+                | ProxyFinalTaskResponse::Get(_)
+                | ProxyFinalTaskResponse::Update(_) => Err(McpError::internal_error(
+                    "Proxy final Tasks request returned the wrong operation result",
+                )),
+            },
+            None => self.with_backend(|backend| backend.cancel_final_task(task_id)),
+        }
     }
 
     fn open_final_task_listener(
         &self,
+        ctx: &McpContext,
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
-        self.with_backend(|backend| backend.open_final_task_listener(notifications))
+        match self
+            .with_backend(|backend| backend.start_final_task_listener(notifications.clone()))?
+        {
+            Some(request) => block_on(request.open(ctx)),
+            None => self.with_backend(|backend| backend.open_final_task_listener(notifications)),
+        }
     }
 
     /// Reads a resource without erasing exact legacy fields or final result state.
     pub fn read_resource_typed(&self, ctx: &McpContext, uri: &str) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
-        let result = self.with_backend(|backend| backend.read_resource_result(uri))?;
+        if let Some(request) = self.start_legacy_request_with_context(
+            ctx,
+            fastmcp_protocol::methods::RESOURCES_READ,
+            serde_json::json!({"uri": uri}),
+        )? {
+            let result = self.await_legacy_request_with_context(
+                ctx,
+                request,
+                fastmcp_protocol::methods::RESOURCES_READ,
+            )?;
+            ctx.checkpoint()?;
+            return self.admit_upstream_result("resources/read", result);
+        }
+        let result =
+            self.with_backend(|backend| backend.read_resource_result_with_context(ctx, uri))?;
+        ctx.checkpoint()?;
         self.admit_upstream_result("resources/read", result)
     }
 
@@ -3446,7 +4708,22 @@ impl ProxyClient {
         arguments: HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
-        let result = self.with_backend(|backend| backend.get_prompt_result(name, arguments))?;
+        if let Some(request) = self.start_legacy_request_with_context(
+            ctx,
+            fastmcp_protocol::methods::PROMPTS_GET,
+            serde_json::json!({"name": name, "arguments": arguments}),
+        )? {
+            let result = self.await_legacy_request_with_context(
+                ctx,
+                request,
+                fastmcp_protocol::methods::PROMPTS_GET,
+            )?;
+            ctx.checkpoint()?;
+            return self.admit_upstream_result("prompts/get", result);
+        }
+        let result = self
+            .with_backend(|backend| backend.get_prompt_result_with_context(ctx, name, arguments))?;
+        ctx.checkpoint()?;
         self.admit_upstream_result("prompts/get", result)
     }
 
@@ -3508,6 +4785,153 @@ impl ProxyClient {
             ));
         }
         Ok(result)
+    }
+}
+
+/// Completion adapter that binds one downstream reference to one selected
+/// upstream reference.
+pub(crate) struct ProxyCompletionHandler {
+    client: ProxyClient,
+    prompt_names: HashMap<String, String>,
+    resource_templates: HashMap<String, String>,
+}
+
+impl ProxyCompletionHandler {
+    pub(crate) fn new(client: ProxyClient) -> Self {
+        Self {
+            client,
+            prompt_names: HashMap::new(),
+            resource_templates: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn for_prompt(
+        client: ProxyClient,
+        downstream_name: impl Into<String>,
+        upstream_name: impl Into<String>,
+    ) -> Self {
+        let mut handler = Self::new(client);
+        handler.add_prompt_target(downstream_name, upstream_name);
+        handler
+    }
+
+    pub(crate) fn for_resource_template(
+        client: ProxyClient,
+        downstream_uri: impl Into<String>,
+        upstream_uri: impl Into<String>,
+    ) -> Self {
+        let mut handler = Self::new(client);
+        handler.add_resource_template_target(downstream_uri, upstream_uri);
+        handler
+    }
+
+    pub(crate) fn add_prompt_target(
+        &mut self,
+        downstream_name: impl Into<String>,
+        upstream_name: impl Into<String>,
+    ) {
+        self.prompt_names
+            .insert(downstream_name.into(), upstream_name.into());
+    }
+
+    pub(crate) fn add_resource_template_target(
+        &mut self,
+        downstream_uri: impl Into<String>,
+        upstream_uri: impl Into<String>,
+    ) {
+        self.resource_templates
+            .insert(downstream_uri.into(), upstream_uri.into());
+    }
+
+    fn rewrite_legacy(&self, params: LegacyCompletionParams) -> McpResult<CompletionParams> {
+        let reference = match params.reference {
+            LegacyCompletionReference::Prompt { name } => CompletionReference::Prompt {
+                name: self.prompt_names.get(&name).cloned().ok_or_else(|| {
+                    McpError::invalid_params("completion prompt reference is not proxied")
+                })?,
+            },
+            LegacyCompletionReference::Resource { uri } => CompletionReference::Resource {
+                uri: self.resource_templates.get(&uri).cloned().ok_or_else(|| {
+                    McpError::invalid_params("completion resource reference is not proxied")
+                })?,
+            },
+        };
+        Ok(CompletionParams {
+            reference,
+            argument: fastmcp_client::CompletionArgument {
+                name: params.argument.name,
+                value: params.argument.value,
+            },
+            context: None,
+        })
+    }
+
+    fn rewrite_final(&self, params: FinalCompletionParams) -> McpResult<CompletionParams> {
+        let reference = match params.reference {
+            CompletionReference::Prompt { name } => CompletionReference::Prompt {
+                name: self.prompt_names.get(&name).cloned().ok_or_else(|| {
+                    McpError::invalid_params("completion prompt reference is not proxied")
+                })?,
+            },
+            CompletionReference::PromptWithTitle { name, title } => {
+                CompletionReference::PromptWithTitle {
+                    name: self.prompt_names.get(&name).cloned().ok_or_else(|| {
+                        McpError::invalid_params("completion prompt reference is not proxied")
+                    })?,
+                    title,
+                }
+            }
+            CompletionReference::Resource { uri } => CompletionReference::Resource {
+                uri: self.resource_templates.get(&uri).cloned().ok_or_else(|| {
+                    McpError::invalid_params("completion resource reference is not proxied")
+                })?,
+            },
+        };
+        Ok(CompletionParams {
+            reference,
+            argument: params.argument,
+            context: params.context,
+        })
+    }
+}
+
+impl CompletionHandler for ProxyCompletionHandler {
+    fn complete_legacy(
+        &self,
+        ctx: &McpContext,
+        params: LegacyCompletionParams,
+    ) -> McpResult<CompletionValues> {
+        match self
+            .client
+            .complete_typed(ctx, self.rewrite_legacy(params)?)?
+        {
+            CoreResult::Legacy(LegacyCoreResult::Completion(result)) => Ok(result.completion),
+            CoreResult::Final(FinalCoreResult::Completion { .. }) => {
+                Err(McpError::invalid_request(
+                    "Proxy cannot use an exact final completion result for a legacy handler path",
+                ))
+            }
+            _ => Err(unexpected_proxy_result("completion/complete")),
+        }
+    }
+
+    fn complete_final(
+        &self,
+        ctx: &McpContext,
+        params: FinalCompletionParams,
+    ) -> McpResult<FinalCompletionValues> {
+        match self
+            .client
+            .complete_typed(ctx, self.rewrite_final(params)?)?
+        {
+            CoreResult::Final(FinalCoreResult::Completion { result, .. }) => {
+                Ok(result.payload.completion)
+            }
+            CoreResult::Legacy(LegacyCoreResult::Completion(_)) => Err(McpError::invalid_request(
+                "Proxy cannot use an exact legacy completion result for a final handler path",
+            )),
+            _ => Err(unexpected_proxy_result("completion/complete")),
+        }
     }
 }
 
@@ -3902,7 +5326,7 @@ mod tests {
     use fastmcp_client::{
         CanonicalHttpUrl, ClientHttpConnection, ClientProtocolPlan, FinalToolCallOutcome,
     };
-    use fastmcp_core::{McpContext, McpErrorCode, block_on};
+    use fastmcp_core::{McpContext, McpErrorCode, McpRequestCancellation, block_on};
     use fastmcp_protocol::common_types::ContentBlock;
     use fastmcp_protocol::protocol_policy::{
         HttpModernProbe, HttpProbeBody, ProtocolEra, ProtocolPolicy,
@@ -3998,6 +5422,33 @@ mod tests {
             baseline,
             "the rejected frame cannot alter the admitted raw-parameter baseline"
         );
+    }
+
+    #[test]
+    fn proxy_final_tasks_silent_listener_wakes_on_downstream_cancellation() {
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        assert!(cancellation.cancel());
+        let error = block_on(await_proxy_operation_or_cancellation(
+            &cx,
+            &cancellation,
+            Box::pin(async { std::future::pending::<fastmcp_core::McpResult<()>>().await }),
+        ))
+        .expect_err("a silent final Tasks listener must wake when its downstream request cancels");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn proxy_final_tasks_ready_listener_is_not_reclassified_as_cancelled() {
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let delivered = block_on(await_proxy_operation_or_cancellation(
+            &cx,
+            &cancellation,
+            Box::pin(async { Ok::<_, fastmcp_core::McpError>("acknowledged") }),
+        ))
+        .expect("changing only the silent upstream operation to an acknowledgement preserves it");
+        assert_eq!(delivered, "acknowledged");
     }
 
     #[test]
@@ -4201,6 +5652,7 @@ mod tests {
     struct FinalTaskRelayBackend {
         calls: Arc<Mutex<Vec<&'static str>>>,
         task: CreateTaskResult,
+        listener_events: Option<VecDeque<ProxyFinalTaskListenerEvent>>,
     }
 
     impl FinalTaskRelayBackend {
@@ -4217,7 +5669,11 @@ mod tests {
     }
 
     impl ProxyFinalTaskListener for FinalTaskRelayListener {
-        fn next(&mut self, _cx: &Cx) -> fastmcp_core::McpResult<ProxyFinalTaskListenerEvent> {
+        fn next(
+            &mut self,
+            _cx: &Cx,
+            _request_cancellation: &fastmcp_core::McpRequestCancellation,
+        ) -> fastmcp_core::McpResult<ProxyFinalTaskListenerEvent> {
             self.events.pop_front().ok_or_else(|| {
                 fastmcp_core::McpError::internal_error(
                     "final Tasks relay test listener was polled after terminal completion",
@@ -4336,10 +5792,12 @@ mod tests {
         ) -> fastmcp_core::McpResult<Box<dyn ProxyFinalTaskListener>> {
             self.record("subscriptions/listen");
             Ok(Box::new(FinalTaskRelayListener {
-                events: VecDeque::from([
-                    ProxyFinalTaskListenerEvent::Acknowledged(notifications),
-                    ProxyFinalTaskListenerEvent::Terminal,
-                ]),
+                events: self.listener_events.take().unwrap_or_else(|| {
+                    VecDeque::from([
+                        ProxyFinalTaskListenerEvent::Acknowledged(notifications),
+                        ProxyFinalTaskListenerEvent::Terminal,
+                    ])
+                }),
             }))
         }
     }
@@ -4380,6 +5838,7 @@ mod tests {
             FinalTaskRelayBackend {
                 calls: Arc::clone(&calls),
                 task: upstream.clone(),
+                listener_events: None,
             },
             final_task_relay_binding(ProtocolEra::Modern2026),
             "2026-07-28",
@@ -4421,42 +5880,60 @@ mod tests {
         let task_id = final_task_relay_result().task.base().task_id.clone();
         let meta = serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default()))
             .expect("exact final Task metadata serializes");
+        let task_context = McpContext::new(Cx::for_testing(), 732);
         let get = relay
-            .dispatch_get(serde_json::json!({"_meta": meta.clone(), "taskId": task_id}))
+            .dispatch_get(
+                &task_context,
+                serde_json::json!({"_meta": meta.clone(), "taskId": task_id}),
+            )
             .expect("the retained upstream handle permits tasks/get");
         assert_eq!(get["taskId"], "proxy-task-73");
         assert_eq!(get["resultType"], "complete");
         let update = relay
-            .dispatch_update(serde_json::json!({
-                "_meta": meta.clone(),
-                "taskId": "proxy-task-73",
-                "inputResponses": {},
-            }))
+            .dispatch_update(
+                &task_context,
+                serde_json::json!({
+                    "_meta": meta.clone(),
+                    "taskId": "proxy-task-73",
+                    "inputResponses": {},
+                }),
+            )
             .expect("the retained upstream handle permits tasks/update");
         assert_eq!(update["resultType"], "complete");
         let cancel = relay
-            .dispatch_cancel(serde_json::json!({"_meta": meta, "taskId": "proxy-task-73"}))
+            .dispatch_cancel(
+                &task_context,
+                serde_json::json!({"_meta": meta, "taskId": "proxy-task-73"}),
+            )
             .expect("the retained upstream handle permits tasks/cancel");
         assert_eq!(cancel["resultType"], "complete");
 
         let mut notifications = SubscriptionFilter::default();
         set_task_subscription_ids(&mut notifications, vec![task_id])
             .expect("the task filter is exact");
+        let listener_context = McpContext::new(Cx::for_testing(), 734);
+        let listener_cancellation = fastmcp_core::McpRequestCancellation::new();
         let mut listener = relay
-            .open_listener(notifications.clone())
+            .open_listener(&listener_context, notifications.clone())
             .expect("the relay opens one live route-bound listener");
         match listener
-            .next(&Cx::for_testing())
+            .next(listener_context.cx(), &listener_cancellation)
             .expect("the upstream listener acknowledges first")
         {
             ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
-                assert_eq!(accepted, notifications)
+                assert_eq!(
+                    serde_json::to_value(accepted)
+                        .expect("the upstream acknowledgement serializes"),
+                    serde_json::to_value(notifications)
+                        .expect("the requested Tasks filter serializes"),
+                    "the relay retains the exact upstream acknowledgement"
+                );
             }
             _ => panic!("the relay must retain the upstream acknowledgement"),
         }
         assert!(matches!(
             listener
-                .next(&Cx::for_testing())
+                .next(listener_context.cx(), &listener_cancellation)
                 .expect("the upstream listener completes"),
             ProxyFinalTaskListenerEvent::Terminal
         ));
@@ -4477,12 +5954,65 @@ mod tests {
     }
 
     #[test]
+    fn proxy_final_tasks_relay_rejects_terminal_before_acknowledgement() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let upstream = final_task_relay_result();
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalTaskRelayBackend {
+                calls: Arc::clone(&calls),
+                task: upstream.clone(),
+                listener_events: Some(VecDeque::from([ProxyFinalTaskListenerEvent::Terminal])),
+            },
+            final_task_relay_binding(ProtocolEra::Modern2026),
+            "2026-07-28",
+        )
+        .expect("the modern route binding is exact");
+        let relay = proxy
+            .final_tasks_relay()
+            .expect("relay discovery is available")
+            .expect("the modern HTTP route installs the relay");
+        relay
+            .record_task(upstream.task.clone())
+            .expect("the test retains the upstream Task handle");
+
+        let mut notifications = SubscriptionFilter::default();
+        set_task_subscription_ids(
+            &mut notifications,
+            vec![upstream.task.base().task_id.clone()],
+        )
+        .expect("the task filter is exact");
+        let listener_context = McpContext::new(Cx::for_testing(), 735);
+        let listener_cancellation = fastmcp_core::McpRequestCancellation::new();
+        let mut listener = relay
+            .open_listener(&listener_context, notifications)
+            .expect("the relay opens the upstream listener before it observes its events");
+
+        let error = listener
+            .next(listener_context.cx(), &listener_cancellation)
+            .expect_err("changing only the first event to terminal must reject the listener");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Proxy upstream Tasks listener did not acknowledge before events"
+        );
+        assert_eq!(
+            calls
+                .lock()
+                .expect("final Tasks relay calls are not poisoned")
+                .as_slice(),
+            &["subscriptions/listen"],
+            "the rejected listener never triggers another upstream control request"
+        );
+    }
+
+    #[test]
     fn proxy_final_tasks_relay_is_inert_for_exact_2024_without_backend_invocation() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::clone(&calls),
                 task: final_task_relay_result(),
+                listener_events: None,
             },
             final_task_relay_binding(ProtocolEra::Legacy2024),
             "2024-11-05",
@@ -4745,6 +6275,8 @@ mod tests {
         resources: Vec<Resource>,
         prompts: Vec<Prompt>,
         state: Arc<Mutex<TestState>>,
+        cancel_after_tool: Option<McpRequestCancellation>,
+        legacy_progress: Option<(f64, Option<f64>, Option<String>)>,
     }
 
     impl ProxyBackend for TestBackend {
@@ -4771,8 +6303,16 @@ mod tests {
             name: &str,
             arguments: serde_json::Value,
         ) -> fastmcp_core::McpResult<Vec<Content>> {
+            let cancellation = self.cancel_after_tool.clone();
             let mut guard = self.state.lock().expect("state lock poisoned");
             guard.last_tool.replace((name.to_string(), arguments));
+            drop(guard);
+            if let Some(cancellation) = cancellation {
+                assert!(
+                    cancellation.cancel(),
+                    "the test cancellation must win after the upstream backend completes"
+                );
+            }
             Ok(vec![Content::Text {
                 text: "ok".to_string(),
             }])
@@ -4786,6 +6326,19 @@ mod tests {
         ) -> fastmcp_core::McpResult<Vec<Content>> {
             on_progress(0.5, Some(1.0), Some("half".to_string()));
             self.call_tool(name, arguments)
+        }
+
+        fn call_tool_result_with_context_and_legacy_progress(
+            &mut self,
+            _ctx: &McpContext,
+            name: &str,
+            arguments: serde_json::Value,
+            on_progress: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<CoreResult> {
+            if let Some((progress, total, message)) = self.legacy_progress.clone() {
+                on_progress(progress, total, message);
+            }
+            self.call_tool_result(name, arguments)
         }
 
         fn read_resource(&mut self, uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
@@ -5893,6 +7446,14 @@ exec sleep 2
         stream.flush().expect("flush native HTTP response");
     }
 
+    fn write_chunked_sse_event(stream: &mut TcpStream, event: &[u8]) {
+        write!(stream, "{:X}\r\n", event.len()).expect("write SSE chunk length");
+        stream.write_all(event).expect("write SSE chunk body");
+        stream
+            .write_all(b"\r\n")
+            .expect("write SSE chunk terminator");
+    }
+
     /// Writes a scripted modern discovery response for the sessionless
     /// modern HTTP client (a session header would be rejected).
     fn write_http_discovery_response(stream: &mut TcpStream, body: &[u8]) {
@@ -6684,6 +8245,170 @@ exec sleep 2
             assert_eq!(messages[2]["id"], serde_json::json!(2));
             assert_eq!(messages[3]["id"], serde_json::json!(3));
         }
+    }
+
+    #[test]
+    fn proxy_legacy_http_post_commit_cancellation_leaves_the_route_available_to_a_sibling() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind native HTTP listener for request-scoped cancellation");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target =
+            format!("http://{address}/legacy-message?session=request-scope");
+        let expected_message_target = legacy_message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener
+                .accept()
+                .expect("accept exact legacy SSE GET for request-scoped cancellation");
+            let sse_request = read_http_request(&mut sse);
+            write!(
+                sse,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write streaming SSE response head");
+            let initialize_event = format!(
+                "event: endpoint\ndata: {expected_message_target}\n\n\
+                 event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"legacy-proxy-peer\",\"version\":\"1.0.0\"}}}}}}\n\n"
+            );
+            write_chunked_sse_event(&mut sse, initialize_event.as_bytes());
+            sse.flush().expect("flush initialize SSE event");
+
+            let mut posts = Vec::new();
+            for _ in 0..2 {
+                let (mut post, _) = listener
+                    .accept()
+                    .expect("accept legacy lifecycle POST before request work");
+                let request = read_http_request(&mut post);
+                write_http_response(&mut post, 202, "application/json", b"");
+                posts.push(request);
+            }
+
+            let (mut first, _) = listener
+                .accept()
+                .expect("accept the first committed tools/call POST");
+            let first_request = read_http_request(&mut first);
+            write_http_response(&mut first, 202, "application/json", b"");
+            posts.push(first_request);
+
+            let (mut sibling, _) = listener
+                .accept()
+                .expect("accept sibling tools/call while the first request waits");
+            let sibling_request = read_http_request(&mut sibling);
+            write_http_response(&mut sibling, 202, "application/json", b"");
+            posts.push(sibling_request);
+            write_chunked_sse_event(
+                &mut sse,
+                b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"sibling\"}]}}\n\n",
+            );
+            sse.flush().expect("flush sibling terminal SSE response");
+
+            let (mut cancellation, _) = listener
+                .accept()
+                .expect("accept post-commit legacy cancellation control");
+            let cancellation_request = read_http_request(&mut cancellation);
+            write_http_response(&mut cancellation, 202, "application/json", b"");
+            posts.push(cancellation_request);
+            write_chunked_sse_event(
+                &mut sse,
+                b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"late\"}]}}\n\n",
+            );
+            sse.write_all(b"0\r\n\r\n")
+                .expect("write terminal SSE chunk");
+            sse.flush()
+                .expect("flush retired first-request terminal SSE response");
+            (sse_request, posts)
+        });
+
+        let proxy = ProxyClient::from_backend(legacy_http_proxy_client(
+            &legacy_sse_target,
+            &legacy_message_target,
+            ClientCapabilities::default(),
+        ));
+        let precommit_cancellation = McpRequestCancellation::new();
+        assert!(precommit_cancellation.cancel());
+        let precommit_context = McpContext::new(Cx::for_testing(), 611)
+            .with_request_cancellation(precommit_cancellation);
+        assert_eq!(
+            proxy
+                .call_tool_typed(&precommit_context, "precommit", serde_json::json!({}))
+                .expect_err("a pre-commit cancellation must reject before any upstream POST")
+                .code,
+            McpErrorCode::RequestCancelled,
+        );
+
+        let first_cancellation = McpRequestCancellation::new();
+        let first_context = McpContext::new(Cx::for_request(), 612)
+            .with_request_cancellation(first_cancellation.clone());
+        let first = proxy
+            .start_legacy_request_with_context(
+                &first_context,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                serde_json::json!({"name": "first", "arguments": {}}),
+            )
+            .expect("the first request starts under the route lock")
+            .expect("the exact legacy HTTP route returns its committed handle");
+
+        let sibling_context = McpContext::new(Cx::for_request(), 613);
+        let CoreResult::Legacy(LegacyCoreResult::ToolsCall(sibling)) = proxy
+            .call_tool_typed(&sibling_context, "sibling", serde_json::json!({}))
+            .expect("the sibling must progress while the first request waits")
+        else {
+            panic!("the exact legacy sibling result must remain lossless");
+        };
+        assert_eq!(
+            sibling.content,
+            vec![LegacyContent::Text {
+                text: "sibling".to_owned(),
+                annotations: None,
+                additional: BTreeMap::new(),
+            }],
+            "waiting for one request must not retain the route mutex"
+        );
+
+        assert!(first_cancellation.cancel());
+        assert_eq!(
+            proxy
+                .await_legacy_request_with_context(
+                    &first_context,
+                    first,
+                    fastmcp_protocol::methods::TOOLS_CALL,
+                )
+                .expect_err("post-commit cancellation must reject the first request")
+                .code,
+            McpErrorCode::RequestCancelled,
+        );
+
+        let (sse, posts) = server
+            .join()
+            .expect("request-scoped cancellation server must join");
+        assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        let messages: Vec<serde_json::Value> = posts
+            .iter()
+            .map(|post| serde_json::from_slice(&post.body).expect("legacy proxy POST is JSON-RPC"))
+            .collect();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message["method"].as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("initialize"),
+                Some("notifications/initialized"),
+                Some("tools/call"),
+                Some("tools/call"),
+                Some("notifications/cancelled"),
+            ],
+            "the pre-cancelled request emitted neither an upstream call nor cancellation control"
+        );
+        assert_eq!(messages[2]["id"], serde_json::json!(2));
+        assert_eq!(messages[3]["id"], serde_json::json!(3));
+        assert_eq!(
+            messages[4]["params"],
+            serde_json::json!({"requestId": 2}),
+            "only the committed first request receives a cancellation control"
+        );
     }
 
     #[test]
@@ -8915,6 +10640,84 @@ exec sleep 2
         assert!(calls[0].1.is_some_and(|v| (v - 1.0).abs() < f64::EPSILON));
     }
 
+    #[test]
+    fn proxy_exact_2024_progress_is_forwarded_to_the_downstream_reporter() {
+        use fastmcp_core::ProgressReporter;
+
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend {
+                legacy_progress: Some((3.0, Some(7.0), Some("legacy upstream".to_owned()))),
+                ..TestBackend::default()
+            },
+            ProxyUpstreamBinding {
+                era: ProtocolEra::Legacy2024,
+                adapter: ProxyUpstreamAdapter::LegacyHttpSse,
+                policy: ProtocolPolicy::LegacyOnly,
+                configuration_generation: 93,
+            },
+            "2024-11-05",
+        )
+        .expect("the exact legacy HTTP route is admitted");
+        let sender = Arc::new(TestNotificationSender {
+            calls: Mutex::new(Vec::new()),
+        });
+        let context = McpContext::with_progress(
+            Cx::for_testing(),
+            93,
+            ProgressReporter::new(Arc::clone(&sender) as Arc<dyn fastmcp_core::NotificationSender>),
+        );
+
+        proxy
+            .call_tool(&context, "legacy-progress", serde_json::json!({}))
+            .expect("the legacy upstream result remains usable after progress forwarding");
+        assert_eq!(
+            sender
+                .calls
+                .lock()
+                .expect("progress sender is not poisoned")
+                .as_slice(),
+            &[(3.0, Some(7.0), Some("legacy upstream".to_owned()))],
+            "the exact-2024 callback reaches the downstream request reporter"
+        );
+    }
+
+    #[test]
+    fn proxy_exact_2024_progress_does_not_invent_a_notification_when_upstream_is_silent() {
+        use fastmcp_core::ProgressReporter;
+
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            ProxyUpstreamBinding {
+                era: ProtocolEra::Legacy2024,
+                adapter: ProxyUpstreamAdapter::LegacyHttpSse,
+                policy: ProtocolPolicy::LegacyOnly,
+                configuration_generation: 94,
+            },
+            "2024-11-05",
+        )
+        .expect("the otherwise identical exact legacy HTTP route is admitted");
+        let sender = Arc::new(TestNotificationSender {
+            calls: Mutex::new(Vec::new()),
+        });
+        let context = McpContext::with_progress(
+            Cx::for_testing(),
+            94,
+            ProgressReporter::new(Arc::clone(&sender) as Arc<dyn fastmcp_core::NotificationSender>),
+        );
+
+        proxy
+            .call_tool(&context, "legacy-progress", serde_json::json!({}))
+            .expect("changing only the upstream progress frame keeps the tool result usable");
+        assert!(
+            sender
+                .calls
+                .lock()
+                .expect("progress sender is not poisoned")
+                .is_empty(),
+            "a silent exact-2024 upstream must not synthesize downstream progress"
+        );
+    }
+
     // =========================================================================
     // read_with_uri — URI without slash in resource URI
     // =========================================================================
@@ -9053,6 +10856,60 @@ exec sleep 2
         let guard = state.lock().unwrap();
         let (name, _) = guard.last_tool.as_ref().unwrap();
         assert_eq!(name, "plain-tool");
+    }
+
+    #[test]
+    fn proxy_client_rejects_completed_upstream_result_when_request_cancels_during_call() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let cancellation = McpRequestCancellation::new();
+        let proxy = ProxyClient::from_backend(TestBackend {
+            state: Arc::clone(&state),
+            cancel_after_tool: Some(cancellation.clone()),
+            ..TestBackend::default()
+        });
+        let context = McpContext::new(Cx::for_testing(), 2).with_request_cancellation(cancellation);
+
+        let error = proxy
+            .call_tool_typed(&context, "plain-tool", serde_json::json!({"y": 2}))
+            .expect_err(
+                "changing only request cancellation after the upstream call must reject its result",
+            );
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            state
+                .lock()
+                .expect("state lock is not poisoned")
+                .last_tool
+                .as_ref()
+                .map(|(name, _)| name.as_str()),
+            Some("plain-tool"),
+            "the backend completed, but its result is not released after cancellation"
+        );
+    }
+
+    #[test]
+    fn proxy_client_does_not_contact_backend_when_request_is_pre_cancelled() {
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let cancellation = McpRequestCancellation::new();
+        assert!(cancellation.cancel());
+        let proxy = ProxyClient::from_backend(TestBackend {
+            state: Arc::clone(&state),
+            ..TestBackend::default()
+        });
+        let context = McpContext::new(Cx::for_testing(), 3).with_request_cancellation(cancellation);
+
+        let error = proxy
+            .call_tool_typed(&context, "plain-tool", serde_json::json!({"y": 3}))
+            .expect_err("a pre-commit cancellation must reject before the upstream call");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(
+            state
+                .lock()
+                .expect("state lock is not poisoned")
+                .last_tool
+                .is_none(),
+            "a cancelled request makes zero upstream backend contact"
+        );
     }
 
     // =========================================================================

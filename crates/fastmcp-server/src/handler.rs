@@ -35,7 +35,9 @@ use fastmcp_protocol::{
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
+#[cfg(feature = "proxy")]
 use crate::proxy::ProxyClient;
+#[cfg(feature = "tasks")]
 use crate::tasks::FinalTaskWorkDescriptor;
 
 // ============================================================================
@@ -763,6 +765,7 @@ pub enum FinalToolOutcome {
     /// retry state without coercing the result into a legacy projection.
     InputRequired(InputRequiredResult),
     /// Create one durable working task after negotiated capability admission.
+    #[cfg(feature = "tasks")]
     CreateTask {
         /// Non-null opaque application work persisted with the new task.
         ///
@@ -787,9 +790,11 @@ impl From<InputRequiredResult> for FinalToolOutcome {
     }
 }
 
+#[cfg(feature = "tasks")]
 const UNDECLARED_FINAL_TASK_OUTCOME_ERROR: &str =
     "tool returned CreateTask without declaring final Tasks capability";
 
+#[cfg(feature = "tasks")]
 fn admit_declared_final_tool_outcome(
     declares_final_tasks: bool,
     outcome: FinalToolOutcome,
@@ -2066,6 +2071,7 @@ pub type BoxedCompletionHandler = Box<dyn CompletionHandler>;
 /// The legacy definition is deliberately only a dispatch fallback. The router
 /// reads [`Self::final_definition`] during admission, so final discovery keeps
 /// the upstream `size`, annotations, icon collection, and metadata verbatim.
+#[cfg(feature = "proxy")]
 pub(crate) struct FinalProxyResourceHandler {
     legacy: Resource,
     final_definition: FinalResource,
@@ -2073,6 +2079,7 @@ pub(crate) struct FinalProxyResourceHandler {
     client: ProxyClient,
 }
 
+#[cfg(feature = "proxy")]
 impl FinalProxyResourceHandler {
     pub(crate) fn new(final_definition: FinalResource, client: ProxyClient) -> Self {
         let external_uri = final_definition.uri.as_str().to_owned();
@@ -2094,6 +2101,7 @@ impl FinalProxyResourceHandler {
     }
 }
 
+#[cfg(feature = "proxy")]
 impl ResourceHandler for FinalProxyResourceHandler {
     fn definition(&self) -> Resource {
         self.legacy.clone()
@@ -2117,6 +2125,7 @@ impl ResourceHandler for FinalProxyResourceHandler {
 }
 
 /// Proxy adapter for an upstream exact-final resource-template catalog entry.
+#[cfg(feature = "proxy")]
 pub(crate) struct FinalProxyResourceTemplateHandler {
     legacy_template: ResourceTemplate,
     final_definition: FinalResourceTemplate,
@@ -2124,6 +2133,7 @@ pub(crate) struct FinalProxyResourceTemplateHandler {
     client: ProxyClient,
 }
 
+#[cfg(feature = "proxy")]
 impl FinalProxyResourceTemplateHandler {
     pub(crate) fn new(final_definition: FinalResourceTemplate, client: ProxyClient) -> Self {
         let external_uri_template = final_definition.uri_template.clone();
@@ -2145,6 +2155,7 @@ impl FinalProxyResourceTemplateHandler {
     }
 }
 
+#[cfg(feature = "proxy")]
 impl ResourceHandler for FinalProxyResourceTemplateHandler {
     fn definition(&self) -> Resource {
         Resource {
@@ -2199,6 +2210,7 @@ impl ResourceHandler for FinalProxyResourceTemplateHandler {
 }
 
 /// Proxy adapter for an upstream exact-final prompt catalog entry.
+#[cfg(feature = "proxy")]
 pub(crate) struct FinalProxyPromptHandler {
     legacy: Prompt,
     final_definition: FinalPrompt,
@@ -2206,6 +2218,7 @@ pub(crate) struct FinalProxyPromptHandler {
     client: ProxyClient,
 }
 
+#[cfg(feature = "proxy")]
 impl FinalProxyPromptHandler {
     pub(crate) fn new(final_definition: FinalPrompt, client: ProxyClient) -> Self {
         let external_name = final_definition.name.clone();
@@ -2254,6 +2267,7 @@ impl FinalProxyPromptHandler {
     }
 }
 
+#[cfg(feature = "proxy")]
 impl PromptHandler for FinalProxyPromptHandler {
     fn definition(&self) -> Prompt {
         self.legacy.clone()
