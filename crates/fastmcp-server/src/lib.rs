@@ -4884,11 +4884,27 @@ impl ServerHttpSession {
             Ok(request) => request,
             Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
         };
-        let endpoint_response = self
+        let endpoint_response = match self
             .endpoint_session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .handle(cx, request)?;
+            .handle(cx, request)
+        {
+            Ok(endpoint_response) => endpoint_response,
+            // The transport refuses to construct an SSE body for a frame
+            // whose shape cannot own one (an id-less notification, or a
+            // request that already selected a JSON response) before the
+            // endpoint's own rejection arm can run; peers get the same
+            // graceful 400 the non-streaming arm produces.
+            Err(DualEraHttpEndpointError::Transport(TransportError::Io(error)))
+                if error.kind() == std::io::ErrorKind::InvalidInput =>
+            {
+                return Ok(Err(ServerHttpEndpointResponse::Immediate(
+                    HttpResponse::bad_request(),
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
             return self.handle_modern(cx, endpoint_response).map(Err);
         };
