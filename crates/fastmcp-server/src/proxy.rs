@@ -567,6 +567,53 @@ fn handler_prompt_to_legacy(message: PromptMessage) -> McpResult<LegacyPromptMes
     })
 }
 
+/// Maximum pages the proxy will acquire while materializing one modern catalog.
+///
+/// Proxy registration creates a fixed downstream snapshot, so every page must
+/// be collected before any entry is registered. The bound keeps an upstream
+/// cursor cycle or an unbounded catalog from turning that one-time operation
+/// into unbounded work.
+const MAX_MODERN_PROXY_CATALOG_PAGES: usize = 64;
+
+/// Collects one paginated modern catalog without accepting a cursor cycle.
+///
+/// The caller owns selected-era decoding; this helper owns only the invariant
+/// shared by tools, resources, templates, and prompts. Returning an error
+/// drops the locally accumulated entries, so the caller cannot construct a
+/// partial proxy catalog after an invalid cursor sequence.
+fn collect_modern_proxy_catalog_pages<T>(
+    method: &str,
+    mut fetch_page: impl FnMut(Option<&str>) -> McpResult<(Vec<T>, Option<String>)>,
+) -> McpResult<Vec<T>> {
+    let mut entries = Vec::new();
+    let mut cursor = None;
+    let mut observed_cursors = HashSet::new();
+
+    for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
+        let (page, next_cursor) = fetch_page(cursor.as_deref())?;
+        entries.extend(page);
+
+        let Some(next_cursor) = next_cursor else {
+            return Ok(entries);
+        };
+        if cursor.as_deref() == Some(next_cursor.as_str()) {
+            return Err(McpError::invalid_request(format!(
+                "Proxy modern {method} catalog returned a non-advancing cursor"
+            )));
+        }
+        if !observed_cursors.insert(next_cursor.clone()) {
+            return Err(McpError::invalid_request(format!(
+                "Proxy modern {method} catalog returned a repeated cursor"
+            )));
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Err(McpError::invalid_request(format!(
+        "Proxy modern {method} catalog exceeded its {MAX_MODERN_PROXY_CATALOG_PAGES}-page limit"
+    )))
+}
+
 impl ProxyBackend for Client {
     fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
@@ -581,25 +628,29 @@ impl ProxyBackend for Client {
         let era = self.selected_protocol_era().ok_or_else(|| {
             McpError::invalid_request("Proxy client has no selected protocol era for tools/list")
         })?;
-        if self.server_capabilities().tools.is_none() {
-            return Ok(match era {
-                ProtocolEra::Legacy2024 => ProxyToolCatalog::Legacy(Vec::new()),
-                ProtocolEra::Modern2026 => ProxyToolCatalog::Final(Vec::new()),
-            });
-        }
         match era {
-            ProtocolEra::Legacy2024 => Client::list_tools(self).map(ProxyToolCatalog::Legacy),
-            ProtocolEra::Modern2026 => match Client::list_tools_typed(self, None)? {
-                CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
-                    Ok(ProxyToolCatalog::Final(result.payload.tools))
+            ProtocolEra::Legacy2024 => {
+                if self.server_capabilities().tools.is_none() {
+                    Ok(ProxyToolCatalog::Legacy(Vec::new()))
+                } else {
+                    Client::list_tools(self).map(ProxyToolCatalog::Legacy)
                 }
-                CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
-                    Err(McpError::invalid_request(
-                        "Modern proxy client received a legacy tools/list result",
-                    ))
-                }
-                _ => Err(unexpected_proxy_result("tools/list")),
-            },
+            }
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::TOOLS_LIST,
+                |cursor| match Client::list_tools_typed(self, cursor)? {
+                    CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
+                        Ok((result.payload.tools, result.payload.next_cursor))
+                    }
+                    CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern proxy client received a legacy tools/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("tools/list")),
+                },
+            )
+            .map(ProxyToolCatalog::Final),
         }
     }
 
@@ -618,20 +669,36 @@ impl ProxyBackend for Client {
                 "Proxy client has no selected protocol era for resources/list",
             )
         })?;
-        if self.server_capabilities().resources.is_none() {
-            return Ok(match era {
-                ProtocolEra::Legacy2024 => ProxyResourceCatalog::Legacy(Vec::new()),
-                ProtocolEra::Modern2026 => ProxyResourceCatalog::Final(Vec::new()),
-            });
-        }
-        match Client::list_resources_typed(self, None)? {
-            CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
-                Ok(ProxyResourceCatalog::Legacy(result.resources))
+        match era {
+            ProtocolEra::Legacy2024 => {
+                if self.server_capabilities().resources.is_none() {
+                    return Ok(ProxyResourceCatalog::Legacy(Vec::new()));
+                }
+                match Client::list_resources_typed(self, None)? {
+                    CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                        Ok(ProxyResourceCatalog::Legacy(result.resources))
+                    }
+                    CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+                        Ok(ProxyResourceCatalog::Final(result.payload.resources))
+                    }
+                    _ => Err(unexpected_proxy_result("resources/list")),
+                }
             }
-            CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                Ok(ProxyResourceCatalog::Final(result.payload.resources))
-            }
-            _ => Err(unexpected_proxy_result("resources/list")),
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::RESOURCES_LIST,
+                |cursor| match Client::list_resources_typed(self, cursor)? {
+                    CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+                        Ok((result.payload.resources, result.payload.next_cursor))
+                    }
+                    CoreResult::Legacy(LegacyCoreResult::ResourcesList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern proxy client received a legacy resources/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("resources/list")),
+                },
+            )
+            .map(ProxyResourceCatalog::Final),
         }
     }
 
@@ -650,20 +717,41 @@ impl ProxyBackend for Client {
                 "Proxy client has no selected protocol era for resources/templates/list",
             )
         })?;
-        if self.server_capabilities().resources.is_none() {
-            return Ok(match era {
-                ProtocolEra::Legacy2024 => ProxyResourceTemplateCatalog::Legacy(Vec::new()),
-                ProtocolEra::Modern2026 => ProxyResourceTemplateCatalog::Final(Vec::new()),
-            });
-        }
-        match Client::list_resource_templates_typed(self, None)? {
-            CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
-                ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
-            ),
-            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(
-                ProxyResourceTemplateCatalog::Final(result.payload.resource_templates),
-            ),
-            _ => Err(unexpected_proxy_result("resources/templates/list")),
+        match era {
+            ProtocolEra::Legacy2024 => {
+                if self.server_capabilities().resources.is_none() {
+                    return Ok(ProxyResourceTemplateCatalog::Legacy(Vec::new()));
+                }
+                match Client::list_resource_templates_typed(self, None)? {
+                    CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
+                        ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
+                    ),
+                    CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
+                        result, ..
+                    }) => Ok(ProxyResourceTemplateCatalog::Final(
+                        result.payload.resource_templates,
+                    )),
+                    _ => Err(unexpected_proxy_result("resources/templates/list")),
+                }
+            }
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                |cursor| match Client::list_resource_templates_typed(self, cursor)? {
+                    CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
+                        result, ..
+                    }) => Ok((
+                        result.payload.resource_templates,
+                        result.payload.next_cursor,
+                    )),
+                    CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern proxy client received a legacy resources/templates/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("resources/templates/list")),
+                },
+            )
+            .map(ProxyResourceTemplateCatalog::Final),
         }
     }
 
@@ -680,20 +768,36 @@ impl ProxyBackend for Client {
         let era = self.selected_protocol_era().ok_or_else(|| {
             McpError::invalid_request("Proxy client has no selected protocol era for prompts/list")
         })?;
-        if self.server_capabilities().prompts.is_none() {
-            return Ok(match era {
-                ProtocolEra::Legacy2024 => ProxyPromptCatalog::Legacy(Vec::new()),
-                ProtocolEra::Modern2026 => ProxyPromptCatalog::Final(Vec::new()),
-            });
-        }
-        match Client::list_prompts_typed(self, None)? {
-            CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
-                Ok(ProxyPromptCatalog::Legacy(result.prompts))
+        match era {
+            ProtocolEra::Legacy2024 => {
+                if self.server_capabilities().prompts.is_none() {
+                    return Ok(ProxyPromptCatalog::Legacy(Vec::new()));
+                }
+                match Client::list_prompts_typed(self, None)? {
+                    CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                        Ok(ProxyPromptCatalog::Legacy(result.prompts))
+                    }
+                    CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+                        Ok(ProxyPromptCatalog::Final(result.payload.prompts))
+                    }
+                    _ => Err(unexpected_proxy_result("prompts/list")),
+                }
             }
-            CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                Ok(ProxyPromptCatalog::Final(result.payload.prompts))
-            }
-            _ => Err(unexpected_proxy_result("prompts/list")),
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::PROMPTS_LIST,
+                |cursor| match Client::list_prompts_typed(self, cursor)? {
+                    CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+                        Ok((result.payload.prompts, result.payload.next_cursor))
+                    }
+                    CoreResult::Legacy(LegacyCoreResult::PromptsList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern proxy client received a legacy prompts/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("prompts/list")),
+                },
+            )
+            .map(ProxyPromptCatalog::Final),
         }
     }
 
@@ -1173,6 +1277,13 @@ impl ProxyHttpClient {
         Ok(parameters)
     }
 
+    fn modern_catalog_parameters(cursor: Option<&str>) -> serde_json::Value {
+        match cursor {
+            Some(cursor) => serde_json::json!({"cursor": cursor}),
+            None => serde_json::json!({}),
+        }
+    }
+
     fn ensure_legacy_initialized(&mut self) -> McpResult<()> {
         if self.legacy_initialized {
             return Ok(());
@@ -1321,14 +1432,38 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_tool_catalog(&mut self) -> McpResult<ProxyToolCatalog> {
-        match self.request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))? {
-            CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
-                Ok(ProxyToolCatalog::Legacy(result.tools))
+        match self.binding.era() {
+            ProtocolEra::Legacy2024 => {
+                match self
+                    .request_result(fastmcp_protocol::methods::TOOLS_LIST, serde_json::json!({}))?
+                {
+                    CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                        Ok(ProxyToolCatalog::Legacy(result.tools))
+                    }
+                    CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
+                        Ok(ProxyToolCatalog::Final(result.payload.tools))
+                    }
+                    _ => Err(unexpected_proxy_result("tools/list")),
+                }
             }
-            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
-                Ok(ProxyToolCatalog::Final(result.payload.tools))
-            }
-            _ => Err(unexpected_proxy_result("tools/list")),
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::TOOLS_LIST,
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::TOOLS_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
+                    CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
+                        Ok((result.payload.tools, result.payload.next_cursor))
+                    }
+                    CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern HTTP proxy received a legacy tools/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("tools/list")),
+                },
+            )
+            .map(ProxyToolCatalog::Final),
         }
     }
 
@@ -1342,17 +1477,37 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_resource_catalog(&mut self) -> McpResult<ProxyResourceCatalog> {
-        match self.request_result(
-            fastmcp_protocol::methods::RESOURCES_LIST,
-            serde_json::json!({}),
-        )? {
-            CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
-                Ok(ProxyResourceCatalog::Legacy(result.resources))
-            }
-            CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                Ok(ProxyResourceCatalog::Final(result.payload.resources))
-            }
-            _ => Err(unexpected_proxy_result("resources/list")),
+        match self.binding.era() {
+            ProtocolEra::Legacy2024 => match self.request_result(
+                fastmcp_protocol::methods::RESOURCES_LIST,
+                serde_json::json!({}),
+            )? {
+                CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                    Ok(ProxyResourceCatalog::Legacy(result.resources))
+                }
+                CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+                    Ok(ProxyResourceCatalog::Final(result.payload.resources))
+                }
+                _ => Err(unexpected_proxy_result("resources/list")),
+            },
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::RESOURCES_LIST,
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::RESOURCES_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
+                    CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+                        Ok((result.payload.resources, result.payload.next_cursor))
+                    }
+                    CoreResult::Legacy(LegacyCoreResult::ResourcesList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern HTTP proxy received a legacy resources/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("resources/list")),
+                },
+            )
+            .map(ProxyResourceCatalog::Final),
         }
     }
 
@@ -1366,17 +1521,40 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_resource_template_catalog(&mut self) -> McpResult<ProxyResourceTemplateCatalog> {
-        match self.request_result(
-            fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
-            serde_json::json!({}),
-        )? {
-            CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
-                ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
-            ),
-            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(
-                ProxyResourceTemplateCatalog::Final(result.payload.resource_templates),
-            ),
-            _ => Err(unexpected_proxy_result("resources/templates/list")),
+        match self.binding.era() {
+            ProtocolEra::Legacy2024 => match self.request_result(
+                fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                serde_json::json!({}),
+            )? {
+                CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(result)) => Ok(
+                    ProxyResourceTemplateCatalog::Legacy(result.resource_templates),
+                ),
+                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }) => Ok(
+                    ProxyResourceTemplateCatalog::Final(result.payload.resource_templates),
+                ),
+                _ => Err(unexpected_proxy_result("resources/templates/list")),
+            },
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
+                    CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
+                        result, ..
+                    }) => Ok((
+                        result.payload.resource_templates,
+                        result.payload.next_cursor,
+                    )),
+                    CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern HTTP proxy received a legacy resources/templates/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("resources/templates/list")),
+                },
+            )
+            .map(ProxyResourceTemplateCatalog::Final),
         }
     }
 
@@ -1390,17 +1568,37 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_prompt_catalog(&mut self) -> McpResult<ProxyPromptCatalog> {
-        match self.request_result(
-            fastmcp_protocol::methods::PROMPTS_LIST,
-            serde_json::json!({}),
-        )? {
-            CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
-                Ok(ProxyPromptCatalog::Legacy(result.prompts))
-            }
-            CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                Ok(ProxyPromptCatalog::Final(result.payload.prompts))
-            }
-            _ => Err(unexpected_proxy_result("prompts/list")),
+        match self.binding.era() {
+            ProtocolEra::Legacy2024 => match self.request_result(
+                fastmcp_protocol::methods::PROMPTS_LIST,
+                serde_json::json!({}),
+            )? {
+                CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                    Ok(ProxyPromptCatalog::Legacy(result.prompts))
+                }
+                CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+                    Ok(ProxyPromptCatalog::Final(result.payload.prompts))
+                }
+                _ => Err(unexpected_proxy_result("prompts/list")),
+            },
+            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
+                fastmcp_protocol::methods::PROMPTS_LIST,
+                |cursor| match self.request_result(
+                    fastmcp_protocol::methods::PROMPTS_LIST,
+                    Self::modern_catalog_parameters(cursor),
+                )? {
+                    CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+                        Ok((result.payload.prompts, result.payload.next_cursor))
+                    }
+                    CoreResult::Legacy(LegacyCoreResult::PromptsList(_)) => {
+                        Err(McpError::invalid_request(
+                            "Modern HTTP proxy received a legacy prompts/list result",
+                        ))
+                    }
+                    _ => Err(unexpected_proxy_result("prompts/list")),
+                },
+            )
+            .map(ProxyPromptCatalog::Final),
         }
     }
 
@@ -3887,6 +4085,60 @@ mod tests {
     }
 
     #[test]
+    fn proxy_catalog_rejects_one_non_advancing_modern_cursor_without_replacing_catalog() {
+        let retained_catalog = ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Modern2026),
+            final_tools: vec![final_catalog_tool()],
+            ..ProxyCatalog::default()
+        };
+        let retained_tool_wire = serde_json::to_vec(&retained_catalog.final_tools)
+            .expect("retained final tools serialize");
+
+        let mut second_page = final_catalog_tool();
+        second_page.name = "weather-page-two".to_owned();
+        let first_page = final_catalog_tool();
+        let mut page_requests = 0;
+        let replacement = super::collect_modern_proxy_catalog_pages(
+            fastmcp_protocol::methods::TOOLS_LIST,
+            |cursor| {
+                page_requests += 1;
+                match cursor {
+                    None => Ok((vec![first_page.clone()], Some("tools-page-2".to_owned()))),
+                    Some("tools-page-2") => {
+                        // The one forbidden difference from the terminal
+                        // positive page is retaining this same cursor.
+                        Ok((vec![second_page.clone()], Some("tools-page-2".to_owned())))
+                    }
+                    Some(cursor) => Err(fastmcp_core::McpError::invalid_request(format!(
+                        "unexpected test cursor {cursor}"
+                    ))),
+                }
+            },
+        )
+        .map(|final_tools| ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Modern2026),
+            final_tools,
+            ..ProxyCatalog::default()
+        });
+        let error = replacement.expect_err(
+            "only changing the terminal nextCursor to the current cursor must fail closed",
+        );
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("non-advancing cursor"));
+        assert_eq!(
+            page_requests, 2,
+            "the repeated cursor is rejected before a third catalog request"
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&retained_catalog.final_tools)
+                .expect("retained final tools remain serializable"),
+            retained_tool_wire,
+            "the failed replacement cannot expose the first partial modern page"
+        );
+    }
+
+    #[test]
     fn typed_catalog_rejects_one_field_legacy_binding_contradiction() {
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTypedCatalogBackend {
@@ -4523,11 +4775,15 @@ exec sleep 2
             );
 
             let responses = [
-                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
-                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","resources":[],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
-                br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","resourceTemplates":[],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
-                br#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","prompts":[],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
-                br#"{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","content":[{"type":"text","text":"forwarded"}]}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"echo","inputSchema":{"type":"object"}}],"nextCursor":"tools-page-2","ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[{"name":"echo-next","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","resources":[{"uri":"https://example.test/one","name":"resource-one"}],"nextCursor":"resources-page-2","ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","resources":[{"uri":"https://example.test/two","name":"resource-two"}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","resourceTemplates":[{"uriTemplate":"https://example.test/{city}","name":"template-one"}],"nextCursor":"templates-page-2","ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","resourceTemplates":[{"uriTemplate":"https://example.test/{region}","name":"template-two"}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":8,"result":{"resultType":"complete","prompts":[{"name":"prompt-one"}],"nextCursor":"prompts-page-2","ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":9,"result":{"resultType":"complete","prompts":[{"name":"prompt-two"}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
+                br#"{"jsonrpc":"2.0","id":10,"result":{"resultType":"complete","content":[{"type":"text","text":"forwarded"}]}}"#.as_slice(),
             ];
             let mut normal_requests = Vec::new();
             for response in responses {
@@ -4566,6 +4822,48 @@ exec sleep 2
         let ProxyToolCatalog::Final(tools) = catalog.tools else {
             panic!("modern HTTP catalog must retain its exact final tool model");
         };
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["echo", "echo-next"],
+            "the proxy retains every modern tools/list page"
+        );
+        let ProxyResourceCatalog::Final(resources) = catalog.resources else {
+            panic!("modern HTTP catalog must retain its exact final resource model");
+        };
+        assert_eq!(
+            resources
+                .iter()
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>(),
+            ["resource-one", "resource-two"],
+            "the proxy retains every modern resources/list page"
+        );
+        let ProxyResourceTemplateCatalog::Final(resource_templates) = catalog.resource_templates
+        else {
+            panic!("modern HTTP catalog must retain exact final resource templates");
+        };
+        assert_eq!(
+            resource_templates
+                .iter()
+                .map(|template| template.name.as_str())
+                .collect::<Vec<_>>(),
+            ["template-one", "template-two"],
+            "the proxy retains every modern resources/templates/list page"
+        );
+        let ProxyPromptCatalog::Final(prompts) = catalog.prompts else {
+            panic!("modern HTTP catalog must retain its exact final prompt model");
+        };
+        assert_eq!(
+            prompts
+                .iter()
+                .map(|prompt| prompt.name.as_str())
+                .collect::<Vec<_>>(),
+            ["prompt-one", "prompt-two"],
+            "the proxy retains every modern prompts/list page"
+        );
         let final_tool = tools
             .first()
             .expect("modern HTTP catalog returns the remote tool");
@@ -4608,8 +4906,12 @@ exec sleep 2
         );
         let expected_methods = [
             "tools/list",
+            "tools/list",
+            "resources/list",
             "resources/list",
             "resources/templates/list",
+            "resources/templates/list",
+            "prompts/list",
             "prompts/list",
             "tools/call",
         ];
@@ -4628,7 +4930,27 @@ exec sleep 2
                 serde_json::json!({})
             );
         }
-        let call = serde_json::from_slice::<serde_json::Value>(&normal[4].body)
+        for (request, cursor) in normal.iter().zip([
+            None,
+            Some("tools-page-2"),
+            None,
+            Some("resources-page-2"),
+            None,
+            Some("templates-page-2"),
+            None,
+            Some("prompts-page-2"),
+            None,
+        ]) {
+            let parameters = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("modern paged catalog request JSON")["params"]
+                .clone();
+            assert_eq!(
+                parameters.get("cursor").and_then(serde_json::Value::as_str),
+                cursor,
+                "only second modern catalog pages carry their predecessor cursor"
+            );
+        }
+        let call = serde_json::from_slice::<serde_json::Value>(&normal[8].body)
             .expect("modern handler request JSON");
         assert_eq!(call["method"], "tools/call");
         assert_eq!(call["params"]["name"], "echo");
