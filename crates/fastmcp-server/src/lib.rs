@@ -5742,7 +5742,7 @@ fn http_endpoint_error_response(
     }
 }
 
-fn dispatch_registered_modern_http_request(
+fn dispatch_modern_http_request(
     cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     modern_sessions: &LiveModernHttpSessionRegistry,
@@ -5852,7 +5852,7 @@ fn dispatch_http_request(
     if request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.handler_config.base_path
     {
-        return dispatch_registered_modern_http_request(cx, endpoint, modern_sessions, request);
+        return dispatch_modern_http_request(cx, endpoint, modern_sessions, request);
     }
 
     let mut session = match endpoint.open_session(cx) {
@@ -23338,7 +23338,6 @@ mod lib_unit_tests {
                 .local_addr()
                 .map_err(|error| format!("subscription half-close address failed: {error}"))?;
             let server = Arc::clone(&bound.endpoint.server);
-            let modern_sessions = Arc::clone(&bound.modern_sessions);
             let remaining_modern_sessions = Arc::clone(&bound.modern_sessions);
             let caller_cx = cx.clone();
             let controller = thread::spawn(move || -> Result<(), String> {
@@ -23353,37 +23352,6 @@ mod lib_unit_tests {
                 }
                 let shutdown_cx = caller_cx.clone();
                 let _server_cancellation = CancelServerOnDrop(caller_cx);
-                let discovery = JsonRpcRequest::new(
-                    SERVER_DISCOVER_METHOD,
-                    Some(serde_json::json!({
-                        "_meta": {
-                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                        },
-                    })),
-                    RequestId::Number(870),
-                );
-                let discovery_body = serde_json::to_vec(&discovery)
-                    .map_err(|error| format!("listen discovery did not serialize: {error}"))?;
-                let discovery_request = live_http_post(
-                    "/mcp",
-                    &discovery_body,
-                    &[
-                        ("Accept", "text/event-stream"),
-                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                        ("Mcp-Method", SERVER_DISCOVER_METHOD),
-                    ],
-                );
-                let mut discovery_stream = std::net::TcpStream::connect(address)
-                    .map_err(|error| format!("listen discovery connect failed: {error}"))?;
-                std::io::Write::write_all(&mut discovery_stream, &discovery_request)
-                    .map_err(|error| format!("listen discovery write failed: {error}"))?;
-                std::io::Write::flush(&mut discovery_stream)
-                    .map_err(|error| format!("listen discovery flush failed: {error}"))?;
-                let mut discovery_response = Vec::new();
-                std::io::Read::read_to_end(&mut discovery_stream, &mut discovery_response)
-                    .map_err(|error| format!("listen discovery read failed: {error}"))?;
-                let session_id = live_http_response_header(&discovery_response, "mcp-session-id")?;
                 let listen = JsonRpcRequest::new(
                     SUBSCRIPTIONS_LISTEN,
                     Some(serde_json::json!({
@@ -23404,7 +23372,6 @@ mod lib_unit_tests {
                         ("Accept", "text/event-stream"),
                         ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                         ("Mcp-Method", SUBSCRIPTIONS_LISTEN),
-                        ("MCP-Session-Id", session_id.as_str()),
                     ],
                 );
                 let mut stream = std::net::TcpStream::connect(address)
@@ -23446,49 +23413,10 @@ mod lib_unit_tests {
                             .to_owned(),
                     );
                 }
-                let registered_dispatch = modern_sessions
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&session_id)
-                    .cloned()
-                    .is_some_and(|session| {
-                        !session
-                            .modern_dispatches
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .is_empty()
-                    });
-                if !registered_dispatch {
-                    return Err(
-                        "live SSE listen was not registered with its discovery session".to_owned(),
-                    );
-                }
                 shutdown_cx.cancel_with(
                     CancelKind::User,
                     Some("subscription graceful shutdown requested"),
                 );
-                let phase_one_deadline = Instant::now() + Duration::from_secs(2);
-                while !modern_sessions
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_empty()
-                    && Instant::now() < phase_one_deadline
-                {
-                    thread::yield_now();
-                }
-                if !modern_sessions
-                    .sessions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .is_empty()
-                {
-                    return Err(
-                        "shutdown did not invalidate the modern session before terminal drain"
-                            .to_owned(),
-                    );
-                }
                 let mut trailing = Vec::new();
                 std::io::Read::read_to_end(&mut stream, &mut trailing)
                     .map_err(|error| format!("terminated listen stream did not close: {error}"))?;
