@@ -6307,6 +6307,83 @@ mod tests {
         }
     }
 
+    struct FencedCompletingFinalTaskSupervisor;
+
+    impl ApplicationTaskSupervisor for FencedCompletingFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                let result: FinalTaskCallToolResult =
+                    serde_json::from_value(serde_json::json!({"content": []}))
+                        .expect("typed terminal task result");
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.complete_task(result, Some("completed by elected handoff".to_owned()))
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(result, Some("completed by elected handoff".to_owned()))
+                    }
+                }?;
+                Ok(())
+            })
+        }
+    }
+
+    struct StaleFenceCompletingFinalTaskSupervisor {
+        store: Arc<InMemoryFinalTaskStore>,
+        observed_error: Arc<Mutex<Option<McpError>>>,
+    }
+
+    impl ApplicationTaskSupervisor for StaleFenceCompletingFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let store = Arc::clone(&self.store);
+            let observed_error = Arc::clone(&self.observed_error);
+            Box::pin(async move {
+                let task_id = final_task_handoff_task_id(&handoff).clone();
+                {
+                    let mut state = store
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let lease = state.handoff_leases.get_mut(&task_id).expect(
+                        "the elected handoff retains its exact in-memory dispatch lease",
+                    );
+                    let replacement_fence = lease
+                        .dispatch_fence
+                        .expect("the supervisor is invoked only after dispatch election")
+                        .checked_add(1)
+                        .expect("test dispatch fence remains representable");
+                    lease.dispatch_fence = Some(replacement_fence);
+                    state.next_dispatch_fence = replacement_fence;
+                }
+
+                let result: FinalTaskCallToolResult =
+                    serde_json::from_value(serde_json::json!({"content": []}))
+                        .expect("typed terminal task result");
+                let error = match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.complete_task(result, Some("stale fence must fail".to_owned()))
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(result, Some("stale fence must fail".to_owned()))
+                    }
+                }
+                .expect_err("changing only the elected fence rejects the terminal transition");
+                *observed_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                Ok(())
+            })
+        }
+    }
+
     fn final_roots_request() -> FinalTaskInputRequests {
         let mut requests = FinalTaskInputRequests::new();
         requests.insert(

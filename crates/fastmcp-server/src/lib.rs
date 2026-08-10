@@ -23097,32 +23097,9 @@ mod lib_unit_tests {
             );
             let body = serde_json::to_vec(&request)
                 .map_err(|error| format!("live SSE request did not serialize: {error}"))?;
-            let discovery = JsonRpcRequest::new(
-                SERVER_DISCOVER_METHOD,
-                Some(serde_json::json!({
-                    "_meta": {
-                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                    },
-                })),
-                812_i64,
-            );
-            let discovery_body = serde_json::to_vec(&discovery)
-                .map_err(|error| format!("live SSE discovery did not serialize: {error}"))?;
-            let discovery = live_http_post(
-                "/mcp",
-                &discovery_body,
-                &[
-                    ("Accept", "application/json"),
-                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
-                ],
-            );
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
-                    let discovery = live_http_exchange(address, discovery).await?;
-                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
                     let request = live_http_post(
                         "/mcp",
                         &body,
@@ -23131,7 +23108,6 @@ mod lib_unit_tests {
                             ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                             ("Mcp-Method", "tools/call"),
                             ("Mcp-Name", "http_request_scoped_progress"),
-                            ("MCP-Session-Id", session_id.as_str()),
                         ],
                     );
                     let deadline = caller_cx
@@ -23244,33 +23220,9 @@ mod lib_unit_tests {
             );
             let body = serde_json::to_vec(&request)
                 .map_err(|error| format!("live malformed request did not serialize: {error}"))?;
-            let discovery = JsonRpcRequest::new(
-                SERVER_DISCOVER_METHOD,
-                Some(serde_json::json!({
-                    "_meta": {
-                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
-                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                    },
-                })),
-                812_i64,
-            );
-            let discovery_body = serde_json::to_vec(&discovery).map_err(|error| {
-                format!("live malformed SSE discovery did not serialize: {error}")
-            })?;
-            let discovery = live_http_post(
-                "/mcp",
-                &discovery_body,
-                &[
-                    ("Accept", "application/json"),
-                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
-                    ("Mcp-Method", SERVER_DISCOVER_METHOD),
-                ],
-            );
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
-                    let discovery = live_http_exchange(address, discovery).await?;
-                    let session_id = live_http_response_header(&discovery, "mcp-session-id")?;
                     let request = live_http_post(
                         "/mcp",
                         &body,
@@ -23279,7 +23231,6 @@ mod lib_unit_tests {
                             ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                             ("Mcp-Method", "tools/call"),
                             ("Mcp-Name", "http_request_scoped_progress"),
-                            ("MCP-Session-Id", session_id.as_str()),
                         ],
                     );
                     let response = live_http_exchange(address, request).await;
