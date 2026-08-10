@@ -19747,6 +19747,9 @@ mod lib_unit_tests {
                         .map_err(|error| format!("MRTR roots response failed: {error}"))?,
                     )
                     .map_err(|error| format!("MRTR roots response did not serialize: {error}"))?;
+                    // The retry leg reads its result from an ordinary JSON
+                    // response; a progress token would demand an owned SSE
+                    // body and turn this Accept into a 406.
                     let retry = JsonRpcRequest::new(
                         "tools/call",
                         Some(serde_json::json!({
@@ -19757,7 +19760,6 @@ mod lib_unit_tests {
                             "_meta": {
                                 MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
                                 FINAL_CLIENT_CAPABILITIES_META_KEY: {},
-                                "progressToken": "live-http-mrtr-sse",
                             },
                         })),
                         923_i64,
