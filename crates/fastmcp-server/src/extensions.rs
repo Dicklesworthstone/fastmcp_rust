@@ -608,10 +608,11 @@ mod tests {
     use fastmcp_core::{McpContext, McpErrorCode, McpResult};
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionRegistryError,
-        ExtensionSettings, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
-        official_tasks_descriptor, official_tasks_empty_settings,
-        register_official_tasks_extension,
+        ExtensionSettings, ServerExtensionDiscovery, official_tasks_descriptor,
+        official_tasks_empty_settings, register_official_tasks_extension,
     };
+    #[cfg(feature = "apps")]
+    use fastmcp_protocol::extensions::official_mcp_apps_empty_server_settings;
     use fastmcp_protocol::protocol_policy::ProtocolEra;
     use fastmcp_protocol::{
         ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId, JsonRpcRequest,
@@ -785,6 +786,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "apps")]
     fn official_apps_server_metadata_is_emitted_from_the_frozen_registry() {
         let (descriptors, tasks_id) = tasks_descriptors();
         let mut handlers = ExtensionHandlerRegistry::new(descriptors);
@@ -820,6 +822,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "apps")]
     fn official_apps_rejects_unowned_client_to_server_handler_without_mutation() {
         let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
         let apps_id = handlers
@@ -859,6 +862,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "apps")]
     fn official_apps_installation_duplicate_is_rejected_without_mutating_metadata() {
         let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
         let apps_id = handlers
@@ -879,6 +883,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "apps")]
     fn manually_registered_official_apps_metadata_requires_the_empty_marker() {
         let mut descriptors = ExtensionDescriptorRegistry::new();
         let apps_id = fastmcp_protocol::register_official_mcp_apps_extension(&mut descriptors)

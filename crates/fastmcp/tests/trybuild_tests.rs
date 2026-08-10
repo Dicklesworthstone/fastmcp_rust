@@ -137,6 +137,33 @@ pub fn probe() {
         absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
     },
     DownstreamFeatureSymbolProbe {
+        name: "apps-absent-private-protocol-namespace",
+        features: &[],
+        source: r#"
+use mcp::__private::protocol::McpAppsBridgeError;
+
+pub fn probe() {
+    let _: Option<McpAppsBridgeError> = None;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("McpAppsBridgeError"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "apps-absent-extension-handler-installation",
+        features: &[],
+        source: r#"
+use mcp::{ExtensionDescriptorRegistry, ExtensionHandlerRegistry};
+
+pub fn probe() {
+    let mut registry = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
+    let _ = registry.install_official_mcp_apps();
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("install_official_mcp_apps"),
+    },
+    DownstreamFeatureSymbolProbe {
         name: "modern-server-construction-present",
         features: &[],
         source: r#"
