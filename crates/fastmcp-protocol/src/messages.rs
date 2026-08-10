@@ -4005,7 +4005,13 @@ fn decode_final_tools_call(input: &str) -> Result<FinalCoreResult, CoreDispatchE
         crate::result::parse_exact_json(input).map_err(|_| CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
             method: TOOLS_CALL,
-        })?;
+        })?
+    else {
+        return Err(CoreDispatchError::InvalidResult {
+            era: ProtocolEra::Modern2026,
+            method: TOOLS_CALL,
+        });
+    };
     if wire.get("serverInfo").is_some() {
         return Err(CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,

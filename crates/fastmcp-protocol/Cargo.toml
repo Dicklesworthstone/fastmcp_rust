@@ -17,6 +17,11 @@ default = []
 legacy-2024-11-05 = []
 tasks = []
 apps = []
+# Placeholder for JOSE/JWT support gated by the server auth features
+# (enterprise-auth, oauth-client-credentials, builtin-auth-server,
+# jwt-resource-auth). No protocol code is gated on it yet; it exists so
+# those optional server features resolve.
+jose = []
 
 [dependencies]
 fastmcp-core.workspace = true

@@ -1962,10 +1962,12 @@ fn resolve_local_reference_with_charge<'a>(
     let source_scope = find_schema_resource_scope(root_schema, source, charge)?
         .ok_or("unresolved local schema reference")?;
     let (identifier, fragment) = split_uri_reference_fragment(reference);
-    let fragment = fragment
-        .map(decode_uri_fragment)
-        .transpose()
-        .ok_or("invalid local schema reference")?;
+    let fragment = match fragment {
+        Some(fragment) => {
+            Some(decode_uri_fragment(fragment).ok_or("invalid local schema reference")?)
+        }
+        None => None,
+    };
     let resource = if identifier.is_empty() {
         source_scope.resource
     } else {
