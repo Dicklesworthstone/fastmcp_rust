@@ -5895,7 +5895,9 @@ impl ServerHttpSession {
             return self.handle_modern(cx, endpoint_response, modern_request_cancellation);
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
-        self.handle_legacy(cx, endpoint_response)
+        {
+            self.handle_legacy(cx, endpoint_response)
+        }
         #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
         {
             let _ = endpoint_response;
