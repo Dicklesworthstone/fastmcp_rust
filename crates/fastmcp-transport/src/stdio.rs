@@ -903,6 +903,7 @@ impl<R: Read + AsFd> StdioRecvHalf<R> {
 }
 
 /// Independently owned NDJSON send half for stdio transport.
+#[derive(Debug)]
 pub struct StdioSendHalf<W> {
     writer: Option<W>,
     codec: Codec,
