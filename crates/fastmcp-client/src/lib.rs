@@ -4393,6 +4393,183 @@ impl HttpSubscriptionListener<'_> {
     }
 }
 
+/// A durable final Tasks snapshot attached to one HTTP client on demand.
+///
+/// The handle intentionally owns only the latest admitted task snapshot. Each
+/// operation receives the owning [`HttpClient`] so that every wire request
+/// continues to use that client's sole monotonic JSON-RPC ID allocator.
+#[derive(Clone, Debug)]
+pub struct FinalTaskHandle {
+    task: FinalTask,
+}
+
+impl FinalTaskHandle {
+    fn new(task: FinalTask) -> Self {
+        Self { task }
+    }
+
+    /// Returns the last task snapshot admitted for this handle.
+    #[must_use]
+    pub const fn task(&self) -> &FinalTask {
+        &self.task
+    }
+
+    /// Returns this handle's opaque durable task identifier.
+    #[must_use]
+    pub fn task_id(&self) -> &FinalTaskId {
+        &self.task.base().task_id
+    }
+
+    /// Reads the authoritative current snapshot through `tasks/get`.
+    ///
+    /// The stored snapshot changes only after the response has passed the
+    /// exact task-ID check in the HTTP Tasks decoder.
+    pub async fn poll(
+        &mut self,
+        cx: &Cx,
+        client: &mut HttpClient,
+    ) -> Result<&FinalTask, HttpClientError> {
+        let task = client
+            .get_final_task_snapshot(cx, self.task_id().clone())
+            .await?;
+        self.task = task;
+        Ok(&self.task)
+    }
+
+    /// Supplies input for an `input_required` task.
+    ///
+    /// A successful `tasks/update` result is only an empty acknowledgement;
+    /// it does not contain a replacement task snapshot. Use [`Self::poll`] or
+    /// [`Self::watch`] to observe the server's subsequent task state.
+    pub async fn resume_input(
+        &mut self,
+        cx: &Cx,
+        client: &mut HttpClient,
+        input_responses: FinalTaskInputResponses,
+    ) -> Result<FinalUpdateTaskResult, HttpClientError> {
+        client
+            .submit_final_task_input(cx, &self.task, input_responses)
+            .await
+    }
+
+    /// Opens one live `notifications/tasks` stream for exactly this task.
+    ///
+    /// The resulting watcher is caller-driven and does not reconnect or poll
+    /// after stream termination. The Tasks extension exposes neither a replay
+    /// cursor nor a resumption token, so a new watch must begin from an
+    /// explicit [`Self::poll`] reconciliation.
+    pub async fn watch<'client, 'handle>(
+        &'handle mut self,
+        cx: &Cx,
+        client: &'client mut HttpClient,
+        limits: sse::SseLimits,
+    ) -> Result<FinalTaskWatch<'client, 'handle>, HttpClientError> {
+        let mut notifications = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(
+            &mut notifications,
+            vec![self.task_id().clone()],
+        )
+        .map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "final task handle could not compose its task subscription filter",
+            ))
+        })?;
+        let listener = client
+            .open_subscriptions_listener(cx, notifications, limits)
+            .await?;
+        Ok(FinalTaskWatch {
+            listener,
+            handle: self,
+        })
+    }
+}
+
+/// One high-level event from a [`FinalTaskHandle`] watcher.
+#[derive(Debug, Clone)]
+pub enum FinalTaskWatchEvent {
+    /// The server acknowledged the exact task filter requested by the watcher.
+    Acknowledged {
+        /// The task-only subscription filter accepted by the server.
+        accepted_filter: SubscriptionFilter,
+    },
+    /// A full task snapshot replaced the handle's previous snapshot.
+    TaskUpdated(FinalTaskStatusNotification),
+    /// The request-owned subscription stream terminated normally.
+    Terminal {
+        /// The JSON-RPC ID that owns the terminating subscription result.
+        subscription_id: RequestId,
+        /// The typed final subscription result.
+        result: CompleteResult<FinalSubscriptionsListenResult>,
+    },
+}
+
+/// A live task-only HTTP subscription bound to one mutable task handle.
+///
+/// Holding this watcher prevents concurrent polling or input submission with
+/// the same [`HttpClient`] and handle, preserving the client's existing
+/// request-ID ownership and a single ordered task snapshot.
+pub struct FinalTaskWatch<'client, 'handle> {
+    listener: HttpSubscriptionListener<'client>,
+    handle: &'handle mut FinalTaskHandle,
+}
+
+impl FinalTaskWatch<'_, '_> {
+    /// Reads one task watcher event and applies each admitted task snapshot.
+    ///
+    /// `None` is returned only after the terminal event was already yielded.
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<FinalTaskWatchEvent>, HttpClientError> {
+        let event = self.listener.next_event(cx).await?;
+        match event {
+            None => Ok(None),
+            Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
+                let accepted_task_ids = task_subscription_ids(&accepted_filter)
+                    .map_err(|_| {
+                        HttpClientError::CoreResult(McpError::invalid_request(
+                            "final task subscription acknowledgement has invalid task IDs",
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        HttpClientError::CoreResult(McpError::invalid_request(
+                            "final task subscription acknowledgement omitted the requested task",
+                        ))
+                    })?;
+                if accepted_task_ids.len() != 1
+                    || accepted_task_ids.first() != Some(self.handle.task_id())
+                {
+                    return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                        "final task subscription acknowledgement did not accept the requested task",
+                    )));
+                }
+                Ok(Some(FinalTaskWatchEvent::Acknowledged { accepted_filter }))
+            }
+            Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => {
+                if &notification.params.task.base().task_id != self.handle.task_id() {
+                    return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                        "final task notification does not match this handle",
+                    )));
+                }
+                self.handle.task = notification.params.task.clone();
+                Ok(Some(FinalTaskWatchEvent::TaskUpdated(notification)))
+            }
+            Some(ModernHttpSubscriptionListenEvent::Terminal {
+                subscription_id,
+                result,
+            }) => Ok(Some(FinalTaskWatchEvent::Terminal {
+                subscription_id,
+                result,
+            })),
+            Some(ModernHttpSubscriptionListenEvent::Notification(_)) => {
+                Err(HttpClientError::CoreResult(McpError::invalid_request(
+                    "final task watcher received a non-Tasks subscription event",
+                )))
+            }
+        }
+    }
+}
+
 impl HttpClient {
     /// Connects one immutable HTTP plan and completes the selected era's
     /// required lifecycle before exposing the client.
@@ -5122,6 +5299,75 @@ impl HttpClient {
             .await?
             .collect(cx)
             .await
+    }
+
+    /// Attaches a durable final Tasks handle by reading its current snapshot.
+    ///
+    /// The returned handle remains transport-neutral state; later operations
+    /// take this same client so all requests retain its negotiated HTTP
+    /// connection and monotonic JSON-RPC request-ID allocation.
+    pub async fn attach_final_task(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+    ) -> Result<FinalTaskHandle, HttpClientError> {
+        self.get_final_task_snapshot(cx, task_id)
+            .await
+            .map(FinalTaskHandle::new)
+    }
+
+    async fn get_final_task_snapshot(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+    ) -> Result<FinalTask, HttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let request_id = self.next_request_id()?;
+        self.connection
+            .get_task_final(cx, request_id, task_id, DEFAULT_FINAL_CACHE_MAX_BYTES)
+            .await
+            .map(|result| result.task)
+            .map_err(HttpClientError::Connection)
+    }
+
+    async fn submit_final_task_input(
+        &mut self,
+        cx: &Cx,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+    ) -> Result<FinalUpdateTaskResult, HttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let FinalTask::InputRequired { input_requests, .. } = task else {
+            return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                "tasks/update requires an input_required final task",
+            )));
+        };
+        let ledger = TaskInputLedger::from_requests(input_requests).map_err(|_| {
+            HttpClientError::CoreResult(McpError::invalid_params(
+                "final task input requests are not an admitted ledger",
+            ))
+        })?;
+        ledger.validate_responses(&input_responses).map_err(|_| {
+            HttpClientError::CoreResult(McpError::invalid_params(
+                "tasks/update inputResponses do not match the retained task input requests",
+            ))
+        })?;
+
+        let request_id = self.next_request_id()?;
+        self.connection
+            .update_task_final(
+                cx,
+                request_id,
+                task,
+                input_responses,
+                DEFAULT_FINAL_CACHE_MAX_BYTES,
+            )
+            .await
+            .map_err(HttpClientError::Connection)
     }
 
     fn core_request_parameters(
