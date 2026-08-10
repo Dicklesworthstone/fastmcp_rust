@@ -840,8 +840,8 @@ mod tests {
     use crate::{
         DiscoveryCacheHints, ResultPeerDiagnostic, SERVER_DISCOVER_METHOD,
         SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
-        ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult, ServerInfo,
-        ServerInstructions,
+        ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
+        ServerDiscoveryError, ServerInfo, ServerInstructions,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
