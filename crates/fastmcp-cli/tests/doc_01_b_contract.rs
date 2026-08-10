@@ -217,8 +217,7 @@ fn doc_01_b_public_binary_positive() {
         normalized_stdout(&long_help),
         format!(
             "{}{}",
-            PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX,
-            PROVISIONAL_PUBLIC_STATUS_STANZA
+            PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX, PROVISIONAL_PUBLIC_STATUS_STANZA
         )
     );
 
@@ -272,10 +271,7 @@ fn doc_01_b_public_binary_planted_negative() {
 
     let planted_candidate = PublicHelpCandidate {
         oracle: baseline.oracle,
-        stdout: raw_help_with_root_claim(
-            &baseline.stdout,
-            "FastMCP supports MCP 2026-07-28.",
-        ),
+        stdout: raw_help_with_root_claim(&baseline.stdout, "FastMCP supports MCP 2026-07-28."),
     };
     assert_eq!(
         admit_public_root_help(&mut state, planted_candidate),

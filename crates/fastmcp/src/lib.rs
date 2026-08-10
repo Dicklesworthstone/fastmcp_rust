@@ -417,20 +417,21 @@ pub use fastmcp_transport::{event_store, http, memory, websocket};
 pub use fastmcp_server::{
     AllowAllAuthProvider, ApplicationTaskSupervisor, AuthProvider, AuthRequest,
     AuthorizedTaskServiceRunner, BannerStyle, BidirectionalSenders, BoundHttpServer, BoxFuture,
-    CompletionHandler, ConsoleConfig, DEFAULT_IN_MEMORY_FINAL_TASKS, FinalTaskAcceptedInput,
-    FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
-    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    FinalToolOutcome, FinalToolSchemaAuthority, HttpServerConfig, InMemoryFinalTaskStore,
-    InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
-    NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend,
-    ProxyCatalog, ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog,
-    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, RequestSender,
-    ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse,
-    ServerHttpSession, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, TagFilters,
-    TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    CompletionHandler, ConsoleConfig, DEFAULT_IN_MEMORY_FINAL_TASKS,
+    FinalResourceReadCacheHintProvenance, FinalTaskAcceptedInput, FinalTaskInitialWork,
+    FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolOutcome,
+    FinalToolSchemaAuthority, HttpServerConfig, InMemoryFinalTaskStore, InboundRequestContext,
+    InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
+    PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
+    ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
+    ProxyToolCatalog, ProxyTypedCatalog, RequestSender, ResourceHandler, Router, Server,
+    ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerStats,
+    Session, StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
+    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 pub use fastmcp_server::{
     DuplicateBehavior, LifespanHooks, LoggingConfig, ServerExtensionConfigurationError,
@@ -470,12 +471,15 @@ pub use fastmcp_client::{
     FinalCacheTtlDiagnostic, FinalResultCache, FinalTask, FinalTaskInputResponses,
     FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
     HttpClientError, HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
-    MAX_FINAL_CACHE_MAX_BYTES, McpAppsBridgeTransport, McpAppsHost, McpAppsHostConfiguration,
-    McpAppsHostError, McpAppsHostPolicy, McpAppsInMemoryHostTransport,
-    McpAppsInMemoryViewTransport, OpaquePagination, PaginationBounds, PendingRequestRecord,
-    ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
-    RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
-    StdioRequestExecutor, SubscriptionFilter, SubscriptionListenCollector, mcp_apps_in_memory_pair,
+    MAX_FINAL_CACHE_MAX_BYTES, McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost,
+    McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
+    McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport, McpAppsInMemoryWireHostTransport,
+    McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
+    McpAppsWireHostConfiguration, McpAppsWireHostPolicy, OpaquePagination, PaginationBounds,
+    PendingRequestRecord, ProgressCallback, Request, RequestExecution, RequestExecutor,
+    RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation,
+    StdioRequestExecution, StdioRequestExecutor, SubscriptionFilter, SubscriptionListenCollector,
+    mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
 };
 
 // Public client HTTP execution and configuration surfaces.
@@ -518,14 +522,18 @@ pub mod auto {
         ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
         ClientProtocolPlanError, ClientSession, FinalTask, FinalTaskInputResponses,
         FinalTaskStatusNotification, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
-        HttpClientError, HttpSubscriptionListener, StdioRequestExecution, StdioRequestExecutor,
-        SubscriptionFilter, SubscriptionListenCollector,
+        HttpClientError, HttpSubscriptionListener, McpAppsClientWirePolicy, McpAppsHostError,
+        McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
+        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
+        McpAppsWireHostPolicy, Request, RequestExecution, RequestExecutor, ReverseRequest,
+        ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
+        SubscriptionFilter, SubscriptionListenCollector, mcp_apps_in_memory_wire_pair,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
         ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionNegotiationError,
         ExtensionSettings, ExtensionSettingsCompatibilityResolver, ExtensionSettingsResolution,
-        OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        McpAppsClientSettings, OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
         OfficialTasksNegotiationResolver, official_tasks_descriptor, official_tasks_empty_settings,
         register_official_tasks_extension,
     };
@@ -537,11 +545,13 @@ pub mod auto {
     pub use fastmcp_protocol::{
         AdmittedSchema, ClientCapabilities, ClientInfo, FinalCallToolResult, FinalCancelTaskResult,
         FinalCoreResultType, FinalGetPromptResult, FinalGetTaskResult, FinalReadResourceResult,
-        FinalTaskId, JsonRpcResponse, RequestId, ReversibleResourceTemplate, SchemaAdmissionError,
-        TemplateValue, TemplateValues, UriTemplate, UriTemplateError, UriTemplateExpansionLimits,
-        ValidationError, ValidationResult, admit_final_schema, validate_final_core_result,
+        FinalTaskId, JsonRpcRequest, JsonRpcResponse, RequestId, ReversibleResourceTemplate,
+        SchemaAdmissionError, TemplateValue, TemplateValues, UriTemplate, UriTemplateError,
+        UriTemplateExpansionLimits, ValidationError, ValidationResult, admit_final_schema,
+        validate_final_core_result,
     };
     pub use fastmcp_protocol::{schema, tasks_extension};
+    pub use fastmcp_transport::Transport;
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
     /// Creates the public client builder with its immutable Auto stdio plan.
@@ -659,9 +669,13 @@ pub mod modern {
         FinalTaskInputResponses, FinalTaskStatusNotification, FinalToolCallOutcome,
         FinalUpdateTaskResult, HttpClientError, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
         MAX_FINAL_CACHE_MAX_BYTES, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
-        MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, OpaquePagination, PaginationBounds,
-        PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
-        SubscriptionFilter, SubscriptionListenCollector,
+        MAX_MRTR_TOTAL_INPUT_RESPONSES, McpAppsClientWirePolicy, McpAppsHostError,
+        McpAppsHttpClientWirePolicy, McpAppsInMemoryWireHostTransport,
+        McpAppsInMemoryWireViewTransport, McpAppsWireBridgeTransport, McpAppsWireHost,
+        McpAppsWireHostConfiguration, McpAppsWireHostPolicy, MrtrInputResponses, OpaquePagination,
+        PaginationBounds, PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy,
+        RequestTimeoutSource, SubscriptionFilter, SubscriptionListenCollector,
+        mcp_apps_in_memory_wire_pair,
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_RESOURCE_READ_DEPTH,
@@ -755,25 +769,27 @@ pub mod modern {
         MAX_TASK_ID_BYTES, MAX_TASK_INPUT_MAP_ENTRIES, MAX_TASK_SUBSCRIPTION_IDS,
         MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY, MCP_METHOD_HEADER,
         MCP_NAME_HEADER, MCP_PROTOCOL_VERSION_HEADER,
-        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, McpAppsDisplayMode, McpAppsLifecycleError,
-        McpAppsMetadataError, McpAppsResourceBinding, McpAppsResourceBindingError,
-        McpAppsResourceCsp, McpAppsResourceMetadata, McpAppsResourcePermission,
-        McpAppsResourcePermissions, McpAppsResultProjectionError, McpAppsToolMetadata,
-        McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle, MetadataView,
-        MissingRequiredClientCapabilityError, ModelHint, ModelPreferences, PaginatedResult,
-        ProgressMarker, ProtocolVersionError as FinalProtocolVersionError, RELATED_TASK_META_KEY,
-        RawResultEnvelope, RequestAdmissionError, RequestId, RequestVersionMetadata,
-        RequiredCapabilitiesError, ReversibleResourceTemplate, SERVER_DISCOVER_METHOD,
-        SERVER_DISCOVER_SUPPORTED_VERSIONS, SUPPORTED_FINAL_PROTOCOL_VERSIONS,
-        SchemaAdmissionError, ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
-        ServerDiscoverRequest, ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError,
-        ServerInstructions, ServerNotification, StopReason, TASK_CANCEL, TASK_GET,
-        TASK_STATUS_NOTIFICATION, TASK_SUBSCRIPTION_IDS_KEY, TASKS_EXTENSION,
-        TaskBase as FinalTaskBase, TaskDuration as FinalTaskDuration,
-        TaskInputLedger as FinalTaskInputLedger, TaskInputRequests as FinalTaskInputRequests,
-        TaskMethodRequest as FinalTaskMethodRequest, TaskRequestMeta as FinalTaskRequestMeta,
-        TaskTimestamp as FinalTaskTimestamp, TaskWireError, TemplateValue, TemplateValues,
-        TypedCompleteMembers, UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, McpAppsBridgeImplementation,
+        McpAppsDisplayMode, McpAppsLifecycleError, McpAppsMetadataError,
+        McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext, McpAppsResourceBinding,
+        McpAppsResourceBindingError, McpAppsResourceCsp, McpAppsResourceMetadata,
+        McpAppsResourcePermission, McpAppsResourcePermissions, McpAppsResultProjectionError,
+        McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle,
+        MetadataView, MissingRequiredClientCapabilityError, ModelHint, ModelPreferences,
+        PaginatedResult, ProgressMarker, ProtocolVersionError as FinalProtocolVersionError,
+        RELATED_TASK_META_KEY, RawResultEnvelope, RequestAdmissionError, RequestId,
+        RequestVersionMetadata, RequiredCapabilitiesError, ReversibleResourceTemplate,
+        SERVER_DISCOVER_METHOD, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+        SUPPORTED_FINAL_PROTOCOL_VERSIONS, SchemaAdmissionError, ServerBehavior,
+        ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+        ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
+        ServerNotification, StopReason, TASK_CANCEL, TASK_GET, TASK_STATUS_NOTIFICATION,
+        TASK_SUBSCRIPTION_IDS_KEY, TASKS_EXTENSION, TaskBase as FinalTaskBase,
+        TaskDuration as FinalTaskDuration, TaskInputLedger as FinalTaskInputLedger,
+        TaskInputRequests as FinalTaskInputRequests, TaskMethodRequest as FinalTaskMethodRequest,
+        TaskRequestMeta as FinalTaskRequestMeta, TaskTimestamp as FinalTaskTimestamp,
+        TaskWireError, TemplateValue, TemplateValues, TypedCompleteMembers,
+        UNSUPPORTED_PROTOCOL_VERSION_ERROR_CODE, UnknownResultMembers,
         UnsupportedProtocolVersionError, UpdateTaskParams as FinalUpdateTaskParams, UriTemplate,
         UriTemplateError, UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier,
         UriTemplateOperator, UriTemplatePart, ValidationError, ValidationResult,
@@ -799,14 +815,14 @@ pub mod modern {
         BoxFuture, CompletionHandler, DEFAULT_IN_MEMORY_FINAL_TASKS, DuplicateBehavior,
         ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
-        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, FinalToolOutcome, FinalToolSchemaAuthority,
-        InMemoryFinalTaskStore, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
-        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler,
-        ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
-        ToolHandler, create_context_with_progress,
+        FinalResourceReadCacheHintProvenance, FinalTaskAcceptedInput, FinalTaskInitialWork,
+        FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRuntime,
+        FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
+        FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolOutcome,
+        FinalToolSchemaAuthority, InMemoryFinalTaskStore, LifespanHooks, LoggingConfig, Middleware,
+        MiddlewareDecision, MountResult, ProgressNotificationSender, PromptHandler,
+        ResourceHandler, ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters,
+        ToolErrorKind, ToolHandler, create_context_with_progress,
     };
     pub use fastmcp_transport::{
         ModernHttpRequestAdmission, SendPermit, StreamableHttpRequestResponseStream,
@@ -957,6 +973,22 @@ pub mod modern {
             MODERN_PROTOCOL_VERSION
         }
 
+        /// Starts the closed Apps wire bridge after final discovery activated Apps.
+        ///
+        /// The wrapped client remains pinned to the modern protocol era, while
+        /// the underlying activation receipt rejects a missing or inactive Apps
+        /// negotiation before the Host is constructed.
+        pub fn mcp_apps_wire_host<'client, T>(
+            &'client mut self,
+            transport: T,
+            configuration: McpAppsWireHostConfiguration,
+        ) -> Result<McpAppsWireHost<T, McpAppsClientWirePolicy<'client>>, McpAppsHostError>
+        where
+            T: McpAppsWireBridgeTransport,
+        {
+            self.inner.mcp_apps_wire_host(transport, configuration)
+        }
+
         /// Lists one exact final page of tools without a legacy projection.
         pub fn list_tools(&mut self, cursor: Option<&str>) -> McpResult<FinalListToolsResult> {
             match self.inner.list_tools_typed(cursor)? {
@@ -1041,6 +1073,66 @@ pub mod modern {
             arguments: std::collections::HashMap<String, String>,
         ) -> McpResult<FinalGetPromptResult> {
             self.inner.get_prompt_final(name, arguments)
+        }
+
+        /// Calls one tool through final-only stdio until a terminal final result arrives.
+        ///
+        /// The existing client driver bounds continuation rounds and total
+        /// input responses using the connection's timeout policy. The responder
+        /// runs once per admitted `input_required` result; intermediate results
+        /// never escape this final-only facade.
+        pub fn call_tool_with_mrtr_retry<F>(
+            &mut self,
+            name: &str,
+            arguments: JsonValue,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            final_stdio_mrtr_result(
+                "tools/call",
+                self.inner
+                    .call_tool_with_mrtr_retry(name, arguments, respond)?,
+            )
+        }
+
+        /// Reads one resource through final-only stdio until a terminal final result arrives.
+        ///
+        /// See [`Self::call_tool_with_mrtr_retry`] for the shared bounded
+        /// continuation and responder semantics.
+        pub fn read_resource_with_mrtr_retry<F>(
+            &mut self,
+            uri: &str,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            final_stdio_mrtr_result(
+                "resources/read",
+                self.inner.read_resource_with_mrtr_retry(uri, respond)?,
+            )
+        }
+
+        /// Gets one prompt through final-only stdio until a terminal final result arrives.
+        ///
+        /// See [`Self::call_tool_with_mrtr_retry`] for the shared bounded
+        /// continuation and responder semantics.
+        pub fn get_prompt_with_mrtr_retry<F>(
+            &mut self,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            respond: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            final_stdio_mrtr_result(
+                "prompts/get",
+                self.inner
+                    .get_prompt_with_mrtr_retry(name, arguments, respond)?,
+            )
         }
 
         /// Completes a prompt or resource-template argument using final context.
@@ -1181,6 +1273,22 @@ pub mod modern {
         #[must_use]
         pub fn mcp_apps_active(&self) -> bool {
             self.inner.mcp_apps_active()
+        }
+
+        /// Starts the closed Apps wire bridge after final discovery activated Apps.
+        ///
+        /// This wrapper can only contain a modern HTTP connection. The
+        /// underlying activation receipt still rejects missing or inactive Apps
+        /// negotiation before constructing the Host.
+        pub fn mcp_apps_wire_host<'client, T>(
+            &'client mut self,
+            transport: T,
+            configuration: McpAppsWireHostConfiguration,
+        ) -> Result<McpAppsWireHost<T, McpAppsHttpClientWirePolicy<'client>>, McpAppsHostError>
+        where
+            T: McpAppsWireBridgeTransport,
+        {
+            self.inner.mcp_apps_wire_host(transport, configuration)
         }
 
         /// Calls one final tool and retains its official Tasks outcome branch.
@@ -1441,6 +1549,18 @@ pub mod modern {
         )
     }
 
+    fn final_stdio_mrtr_result(
+        method: &'static str,
+        result: fastmcp_protocol::CoreResult,
+    ) -> McpResult<FinalCoreResult> {
+        match result {
+            fastmcp_protocol::CoreResult::Final(result) => Ok(result),
+            fastmcp_protocol::CoreResult::Legacy(_) => Err(McpError::internal_error(format!(
+                "ModernOnly stdio client received a non-final {method} result"
+            ))),
+        }
+    }
+
     fn unexpected_modern_http_result(method: &'static str) -> HttpClientError {
         HttpClientError::CoreResult(McpError::internal_error(format!(
             "ModernOnly HTTP client received a non-final {method} result"
@@ -1655,12 +1775,26 @@ pub mod modern {
             self.inner.server_discovery()
         }
 
+        /// Returns application-owned final Tasks state when configured.
+        #[must_use]
+        pub fn final_task_runtime(&self) -> Option<&FinalTaskRuntime> {
+            self.inner.final_task_runtime()
+        }
+
         /// Publishes a final catalog or resource change notification.
         pub fn publish_subscription_notification(
             &self,
             notification: ServerNotification,
         ) -> McpResult<usize> {
             self.inner.publish_subscription_notification(notification)
+        }
+
+        /// Publishes one typed final Tasks status notification.
+        pub fn publish_task_status_notification(
+            &self,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<usize> {
+            self.inner.publish_task_status_notification(notification)
         }
 
         /// Binds this facade-pinned server to a caller-owned final HTTP listener.
@@ -2120,21 +2254,22 @@ pub mod prelude {
         DEFAULT_FINAL_CACHE_MAX_BYTES, DEFAULT_IN_MEMORY_FINAL_TASKS, ElicitationAction,
         ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
         FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
-        FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic, FinalResultCache,
-        FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
-        FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-        FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, FinalToolSchemaAuthority, InMemoryFinalTaskStore,
-        JsonRpcAdmissionError, JsonRpcMessage, JsonRpcResponse, MAX_FINAL_CACHE_CAPACITY,
-        MAX_FINAL_CACHE_MAX_BYTES, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH,
-        McpContextLeaseGuard, McpRequestCancellation, NoOpElicitationSender,
-        NoOpNotificationSender, NoOpSamplingSender, PendingRequests, ProgressReporter,
-        PromptHandler, RequestSender, ResourceContentItem, ResourceHandler, ResourceReadResult,
-        ResourceReader, SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole,
-        SamplingSender, SamplingStopReason, ServerCapabilityInfo, StdioRequestExecution,
-        StdioRequestExecutor, ToolCallResult, ToolCaller, ToolContentItem, ToolHandler,
-        TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, block_on,
-        decode_strict_jsonrpc_message,
+        FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic,
+        FinalResourceReadCacheHintProvenance, FinalResultCache, FinalTaskAcceptedInput,
+        FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
+        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        FinalToolSchemaAuthority, InMemoryFinalTaskStore, JsonRpcAdmissionError, JsonRpcMessage,
+        JsonRpcRequest, JsonRpcResponse, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
+        MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation,
+        NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, PendingRequests,
+        ProgressReporter, PromptHandler, Request, RequestExecution, RequestExecutor, RequestSender,
+        ResourceContentItem, ResourceHandler, ResourceReadResult, ResourceReader, ReverseRequest,
+        ReverseRequestCancellation, SamplingRequest, SamplingRequestMessage, SamplingResponse,
+        SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
+        StdioRequestExecution, StdioRequestExecutor, ToolCallResult, ToolCaller, ToolContentItem,
+        ToolHandler, Transport, TransportElicitationSender, TransportRootsProvider,
+        TransportSamplingSender, block_on, decode_strict_jsonrpc_message,
     };
 }
 

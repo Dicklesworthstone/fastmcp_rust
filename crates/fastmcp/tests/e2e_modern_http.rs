@@ -958,7 +958,10 @@ fn e2e_public_http_legacy_only_selects_legacy_and_refuses_modern_only() {
     let ClientHttpResponse::Legacy(JsonRpcMessage::Response(ping)) = response else {
         panic!("the LegacyOnly connection must retain the exact-legacy response lane");
     };
-    assert!(ping.error.is_none(), "the positive exact-legacy ping must not fail");
+    assert!(
+        ping.error.is_none(),
+        "the positive exact-legacy ping must not fail"
+    );
     assert_eq!(ping.result, Some(json!({})));
     drop(client);
     legacy_server.shutdown();

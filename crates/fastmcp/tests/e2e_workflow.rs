@@ -10,7 +10,7 @@
 //! - Resource template listing
 //! - Client info propagation
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
@@ -22,12 +22,16 @@ use std::time::{Duration, Instant};
 use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, CanonicalHttpUrl,
-    ClientHttpConnectionError, ClientProtocolPlan, Cx, FinalTask, FinalTaskInputRequests,
-    FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome,
-    McpContext, McpResult, PromptMessage, ProtocolPolicy, RequestId, ResourceContent,
-    ResourceTemplate, Role, Server, ToolHandler, auto, prompt, resource, tool,
+    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, BoxFuture, CanonicalHttpUrl,
+    ClientHttpConnectionError, ClientProtocolPlan, CompleteResult, ContentBlock, CoreResult,
+    CoreResultDiscriminatorPolicy, Cx, DecodedResult, FinalCallToolResult, FinalCoreResult,
+    FinalTask, FinalTaskInputRequests, FinalTaskInputResponses, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+    FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome, Implementation,
+    InputRequiredResult, McpContext, McpError, McpErrorCode, McpOutcome, McpResult,
+    MrtrCompletedInputs, Outcome, PromptMessage, ProtocolPolicy, RequestId, ResourceContent,
+    ResourceTemplate, ResultMeta, ResultPeerEra, Role, Server, SseLimits, ToolHandler, auto,
+    decode_peer_result, prompt, resource, tool,
 };
 use serde_json::json;
 
@@ -1263,6 +1267,102 @@ impl ApplicationTaskSupervisor for E2eFinalTaskSupervisor {
     }
 }
 
+fn state_only_mrtr_input_required() -> InputRequiredResult {
+    let wire = serde_json::json!({
+        "resultType": "input_required",
+        "requestState": "handler-forged-state",
+    })
+    .to_string();
+    let (decoded, diagnostic) =
+        decode_peer_result(&wire, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
+            .expect("state-only final input-required result decodes");
+    assert!(diagnostic.is_none());
+    let DecodedResult::InputRequired(result) = decoded else {
+        panic!("state-only final result retains the input-required branch");
+    };
+    assert!(result.input_requests().is_none());
+    result
+}
+
+fn state_only_mrtr_complete_result() -> CompleteResult<FinalCallToolResult> {
+    CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![ContentBlock::text("state-only MRTR resumed")],
+            is_error: false,
+            structured_content: None,
+        },
+        ResultMeta::server_generated(Implementation {
+            name: "state-only-mrtr-e2e".to_owned(),
+            version: "1.0.0".to_owned(),
+            title: None,
+            description: None,
+            website_url: None,
+            icons: Vec::new(),
+            additional: BTreeMap::new(),
+        }),
+    )
+}
+
+struct PublicStateOnlyMrtrTool {
+    initial_calls: Arc<std::sync::atomic::AtomicUsize>,
+    resumed_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ToolHandler for PublicStateOnlyMrtrTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "public-state-only-mrtr".to_owned(),
+            description: Some("Proves state-only MRTR over the public HTTP facade".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("legacy state-only MRTR")])
+    }
+
+    fn call_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        self.initial_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(FinalToolOutcome::InputRequired(
+            state_only_mrtr_input_required(),
+        ))
+    }
+
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _arguments: serde_json::Value,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            let Some(resume_inputs) = resume_inputs else {
+                return Outcome::Err(McpError::internal_error(
+                    "state-only MRTR resume inputs were not supplied",
+                ));
+            };
+            if !resume_inputs.responses().is_empty() {
+                return Outcome::Err(McpError::internal_error(
+                    "state-only MRTR resume unexpectedly carried input responses",
+                ));
+            }
+            self.resumed_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Outcome::Ok(FinalToolOutcome::Complete(state_only_mrtr_complete_result()))
+        })
+    }
+}
+
 struct PublicFinalTaskTool;
 
 impl ToolHandler for PublicFinalTaskTool {
@@ -1425,6 +1525,141 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         legacy_error,
         ClientHttpConnectionError::FinalTasksRequiresModern { .. }
     ));
+
+    fixture.shutdown();
+}
+
+#[test]
+fn workflow_public_http_state_only_mrtr_rejects_explicit_empty_without_consuming_state() {
+    // Reuse the existing bounded HTTP fixture's idle service owner. This
+    // server deliberately exposes no Tasks capability; the service is only
+    // responsible for the fixture lifecycle while MRTR remains ordinary
+    // final-core transport state.
+    let runtime = FinalTaskRuntime::in_memory(
+        FinalTaskRuntimeConfig::new(60_000, Some(1_000)).expect("finite fixture task policy"),
+        Arc::new(|_| {}),
+    );
+    let (input_required, _input_required_observer) = mpsc::sync_channel::<()>(1);
+    let (cancelled, _cancelled_observer) = mpsc::sync_channel::<()>(1);
+    let runner = runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                runtime: runtime.clone(),
+                input_required,
+                cancelled,
+            }),
+        )
+        .expect("bounded fixture service installs");
+    let initial_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let resumed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let server = Server::new("public-state-only-mrtr", "1.0.0")
+        .protocol_policy(ProtocolPolicy::ModernOnly)
+        .tool(PublicStateOnlyMrtrTool {
+            initial_calls: Arc::clone(&initial_calls),
+            resumed_calls: Arc::clone(&resumed_calls),
+        })
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let mut client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("public-state-only-mrtr-client", "1.0.0")
+            .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("public HTTP client selects the live modern server");
+
+    let initial = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/call",
+            json!({ "name": "public-state-only-mrtr", "arguments": {} }),
+        ),
+    )
+    .expect("the live server issues a state-only continuation");
+    let CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) = initial else {
+        panic!("the initial public HTTP result is state-only input_required");
+    };
+    assert!(
+        result.input_requests().is_none(),
+        "the real server omits inputRequests rather than manufacturing an empty map"
+    );
+    let request_state = result
+        .request_state()
+        .expect("the real state-only result carries framework-issued state")
+        .to_owned();
+
+    let explicit_empty = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/call",
+            json!({
+                "name": "public-state-only-mrtr",
+                "arguments": {},
+                "inputResponses": {},
+                "requestState": request_state,
+            }),
+        ),
+    )
+    .expect_err("only adding an explicit empty response map must reject");
+    let auto::HttpClientError::CoreResult(explicit_empty) = explicit_empty else {
+        panic!("the live server rejection remains a public core error");
+    };
+    assert_eq!(explicit_empty.code, McpErrorCode::InvalidParams);
+    assert_eq!(
+        explicit_empty.message, "Invalid MRTR input request or response map",
+        "the explicit empty map reaches the server's state-only continuation admission"
+    );
+    assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(resumed_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let completed = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/call",
+            json!({
+                "name": "public-state-only-mrtr",
+                "arguments": {},
+                "requestState": request_state,
+            }),
+        ),
+    )
+    .expect("the unchanged absent-member retry consumes the retained continuation");
+    assert!(matches!(
+        completed,
+        CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+    ));
+    assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(resumed_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let mut callback_count = 0;
+    let automatic = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_mrtr_retry_until(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "public-state-only-mrtr",
+            json!({}),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded state-only SSE limits"),
+            1 << 20,
+            |input_required| {
+                callback_count += 1;
+                assert!(input_required.input_requests().is_none());
+                assert!(input_required.request_state().is_some());
+                Ok(BTreeMap::new())
+            },
+        ),
+    )
+    .expect("the public MRTR helper sends the state-only retry without inputResponses");
+    assert!(matches!(automatic, FinalCoreResult::ToolsCall { .. }));
+    assert_eq!(callback_count, 1);
+    assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(resumed_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 
     fixture.shutdown();
 }

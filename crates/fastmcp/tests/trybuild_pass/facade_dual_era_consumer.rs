@@ -81,6 +81,79 @@ fn assert_modern_server_builder_forwarders() {
         modern::ServerBuilder::completion_handler::<DownstreamCompletionHandler>;
 }
 
+fn assert_modern_server_final_task_forwarders(
+    server: &modern::Server,
+    notification: modern::FinalTaskStatusNotification,
+) -> modern::McpResult<usize> {
+    let _: Option<&modern::FinalTaskRuntime> = server.final_task_runtime();
+    server.publish_task_status_notification(notification)
+}
+
+fn assert_mcp_apps_wire_bridge_exports<T, P>(_host: Option<fastmcp_rust::McpAppsWireHost<T, P>>)
+where
+    T: fastmcp_rust::McpAppsWireBridgeTransport,
+    P: fastmcp_rust::McpAppsWireHostPolicy,
+{
+    let _: Option<fastmcp_rust::McpAppsClientWirePolicy<'static>> = None;
+    let _: Option<fastmcp_rust::McpAppsHttpClientWirePolicy<'static>> = None;
+    let _: Option<fastmcp_rust::McpAppsInMemoryWireHostTransport> = None;
+    let _: Option<fastmcp_rust::McpAppsInMemoryWireViewTransport> = None;
+    let _: Option<fastmcp_rust::McpAppsWireHostConfiguration> = None;
+    let _: fn(
+        usize,
+    ) -> (
+        fastmcp_rust::McpAppsInMemoryWireHostTransport,
+        fastmcp_rust::McpAppsInMemoryWireViewTransport,
+    ) = fastmcp_rust::mcp_apps_in_memory_wire_pair;
+}
+
+fn assert_mcp_apps_wire_host_forwarders<T>()
+where
+    T: modern::McpAppsWireBridgeTransport + auto::McpAppsWireBridgeTransport,
+{
+    let configuration = modern::McpAppsWireHostConfiguration {
+        host_info: modern::McpAppsBridgeImplementation {
+            name: "downstream-host".to_owned(),
+            version: "1.0.0".to_owned(),
+        },
+        host_capabilities: modern::McpAppsPinnedHostCapabilities::default(),
+        host_context: modern::McpAppsPinnedHostContext::default(),
+    };
+    let _: modern::McpAppsWireHostConfiguration = configuration;
+    let _: Option<auto::McpAppsClientSettings> = None;
+    let _: for<'client> fn(
+        &'client mut modern::Client,
+        T,
+        modern::McpAppsWireHostConfiguration,
+    ) -> Result<
+        modern::McpAppsWireHost<T, modern::McpAppsClientWirePolicy<'client>>,
+        modern::McpAppsHostError,
+    > = modern::Client::mcp_apps_wire_host::<T>;
+    let _: for<'client> fn(
+        &'client mut modern::HttpClient,
+        T,
+        modern::McpAppsWireHostConfiguration,
+    ) -> Result<
+        modern::McpAppsWireHost<T, modern::McpAppsHttpClientWirePolicy<'client>>,
+        modern::McpAppsHostError,
+    > = modern::HttpClient::mcp_apps_wire_host::<T>;
+    let _: for<'client> fn(
+        &'client mut auto::Client,
+        T,
+        auto::McpAppsWireHostConfiguration,
+    ) -> Result<
+        auto::McpAppsWireHost<T, auto::McpAppsClientWirePolicy<'client>>,
+        auto::McpAppsHostError,
+    > = auto::Client::mcp_apps_wire_host::<T>;
+}
+
+fn assert_final_resource_read_cache_hint_provenance() {
+    let _: fastmcp_rust::FinalResourceReadCacheHintProvenance =
+        fastmcp_rust::FinalResourceReadCacheHintProvenance::RouterPolicy;
+    let _: modern::FinalResourceReadCacheHintProvenance =
+        modern::FinalResourceReadCacheHintProvenance::Explicit;
+}
+
 fn legacy_sampling_callback(
     _cancellation: legacy_2024::ReverseRequestCancellation,
     _params: legacy_2024::CreateMessageParams,
@@ -101,8 +174,8 @@ fn assert_legacy_reverse_callback_cancellation_export() {
     ) -> Option<&'a legacy_2024::JsonInteger> = legacy_2024::ElicitResult::get_int;
 }
 
-fn assert_reverse_request_exports(
-    executor: &fastmcp_rust::RequestExecutor,
+fn assert_reverse_request_exports<T: fastmcp_rust::Transport>(
+    executor: &fastmcp_rust::RequestExecutor<T>,
     cx: &fastmcp_rust::Cx,
     request: &fastmcp_rust::ReverseRequest,
 ) -> fastmcp_rust::McpResult<()> {
@@ -113,8 +186,8 @@ fn assert_reverse_request_exports(
     executor.respond_to_reverse_request(cx, request, fastmcp_rust::JsonValue::Null)
 }
 
-fn assert_legacy_reverse_request_exports(
-    executor: &legacy_2024::RequestExecutor,
+fn assert_legacy_reverse_request_exports<T: fastmcp_rust::Transport>(
+    executor: &legacy_2024::RequestExecutor<T>,
     cx: &legacy_2024::Cx,
     request: &legacy_2024::ReverseRequest,
 ) -> legacy_2024::McpResult<()> {
@@ -123,6 +196,20 @@ fn assert_legacy_reverse_request_exports(
     let _: &legacy_2024::ReverseRequestCancellation = request.cancellation();
     let _: Vec<legacy_2024::ReverseRequest> = executor.take_reverse_requests();
     executor.respond_to_reverse_request(cx, request, legacy_2024::JsonValue::Null)
+}
+
+fn assert_auto_reverse_request_exports<T: auto::Transport>(
+    executor: &auto::RequestExecutor<T>,
+    cx: &auto::Cx,
+    request: &auto::ReverseRequest,
+) -> auto::McpResult<()> {
+    let _: Option<auto::Request> = None;
+    let _: Option<auto::RequestExecution<T>> = None;
+    let _: &auto::JsonRpcRequest = request.request();
+    let _: &auto::RequestId = request.request_id();
+    let _: &auto::ReverseRequestCancellation = request.cancellation();
+    let _: Vec<auto::ReverseRequest> = executor.take_reverse_requests();
+    executor.respond_to_reverse_request(cx, request, auto::JsonValue::Null)
 }
 
 fn assert_root_stdio_executor_exports(
@@ -161,6 +248,19 @@ fn assert_legacy_stdio_executor_exports(
     let _: legacy_2024::ProtocolEra = executor.selected_protocol_era();
     let _: &legacy_2024::RequestId = execution.request_id();
     let _: legacy_2024::JsonRpcResponse = client.wait_multiplexed_request(cx, &mut execution)?;
+    Ok(())
+}
+
+fn assert_modern_stdio_mrtr_wrapper_exports(client: &mut modern::Client) -> modern::McpResult<()> {
+    let _: modern::FinalCoreResult = client.call_tool_with_mrtr_retry(
+        "city_lookup",
+        modern::JsonValue::Object(Default::default()),
+        |_| Ok(BTreeMap::new()),
+    )?;
+    let _: modern::FinalCoreResult = client
+        .read_resource_with_mrtr_retry("resource://cities/boston", |_| Ok(BTreeMap::new()))?;
+    let _: modern::FinalCoreResult =
+        client.get_prompt_with_mrtr_retry("city", Default::default(), |_| Ok(BTreeMap::new()))?;
     Ok(())
 }
 
@@ -234,6 +334,19 @@ mod prelude_stdio_and_http_metadata_reachability {
         Ok(())
     }
 
+    fn generic_execution_contract<T: Transport>(
+        executor: &RequestExecutor<T>,
+        cx: &Cx,
+        request: &ReverseRequest,
+    ) -> McpResult<()> {
+        let _: Option<Request> = None;
+        let _: Option<RequestExecution<T>> = None;
+        let _: &JsonRpcRequest = request.request();
+        let _: &ReverseRequestCancellation = request.cancellation();
+        let _: Vec<ReverseRequest> = executor.take_reverse_requests();
+        executor.respond_to_reverse_request(cx, request, JsonValue::Null)
+    }
+
     pub(super) fn assert_reachable() {
         let _: Option<FinalToolSchemaAuthority> = None;
         let _: Option<ModernHttpResponseKind> = None;
@@ -243,6 +356,7 @@ mod prelude_stdio_and_http_metadata_reachability {
             ModernHttpResponseStream::metadata;
         let _ = final_tool_schema_authority::<super::DownstreamFinalTaskTool>;
         let _ = stdio_contract;
+        let _ = generic_execution_contract::<fastmcp_rust::StreamableHttpTransport>;
     }
 }
 
@@ -1030,12 +1144,21 @@ fn main() {
     let _ = assert_legacy_sse_method_signatures;
     assert_completion_handler_reachability();
     assert_modern_server_builder_forwarders();
+    let _ = assert_modern_server_final_task_forwarders;
+    let _ = assert_mcp_apps_wire_bridge_exports::<
+        fastmcp_rust::McpAppsInMemoryWireHostTransport,
+        fastmcp_rust::McpAppsHttpClientWirePolicy<'static>,
+    >;
+    let _ = assert_mcp_apps_wire_host_forwarders::<fastmcp_rust::McpAppsInMemoryWireHostTransport>;
+    assert_final_resource_read_cache_hint_provenance();
     assert_legacy_reverse_callback_cancellation_export();
-    let _ = assert_reverse_request_exports;
-    let _ = assert_legacy_reverse_request_exports;
+    let _ = assert_reverse_request_exports::<fastmcp_rust::StreamableHttpTransport>;
+    let _ = assert_legacy_reverse_request_exports::<fastmcp_rust::StreamableHttpTransport>;
+    let _ = assert_auto_reverse_request_exports::<fastmcp_rust::StreamableHttpTransport>;
     let _ = assert_root_stdio_executor_exports;
     let _ = assert_auto_stdio_executor_exports;
     let _ = assert_legacy_stdio_executor_exports;
+    let _ = assert_modern_stdio_mrtr_wrapper_exports;
     let _ = assert_final_tool_schema_authority_exports::<DownstreamFinalTaskTool>;
     assert_raw_http_session_metadata_exports();
     let _ = assert_router_cache_ttl_signatures;
