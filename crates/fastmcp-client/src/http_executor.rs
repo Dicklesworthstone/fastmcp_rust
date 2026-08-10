@@ -23,8 +23,10 @@ use asupersync::http::{Body, Frame};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::extensions::{
-    ExtensionDirection, McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID,
+    McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID,
 };
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::extensions::ExtensionDirection;
 use fastmcp_protocol::methods::{
     Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET, RESOURCES_READ,
     SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
