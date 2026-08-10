@@ -49,6 +49,24 @@ fn main() {
 - Dual-stream architecture: stdout is JSON-RPC only, stderr is human output.
 - DisplayContext: automatic detection of agent vs human context.
 
+## Feature Boundaries
+
+The default feature set is protocol-free. It provides the generic console,
+banner, diagnostics, logging, status, statistics, theme, configuration, and
+test utilities without pulling `fastmcp-protocol` into the dependency graph.
+
+Protocol-aware request traffic, client information, capability tables, and
+handler rendering require one of the protocol features:
+
+- `legacy-2024-11-05` for exact legacy rendering.
+- `tasks` for Tasks rendering.
+- `apps` for Apps rendering.
+
+The remaining nonsecurity presentation features compose those protocol
+features where needed: `proxy-legacy` implies `proxy` and
+`legacy-2024-11-05`; `proxy-tasks` implies `proxy` and `tasks`; and
+`redis-tasks` implies `tasks`.
+
 ## Detection and Environment Variables
 
 Rich output is enabled when we are in a human context and not explicitly
@@ -69,7 +87,9 @@ ConsoleConfig::from_env() also supports:
 - console::FastMcpConsole: printing, renderables, rules, tables, panels
 - banner::StartupBanner: startup banner
 - tables::ToolTableRenderer / ResourceTableRenderer / PromptTableRenderer
-- handlers::HandlerRegistryRenderer: combined capabilities view
+  (requires a protocol feature)
+- handlers::HandlerRegistryRenderer: combined capabilities view (requires a
+  protocol feature)
 - logging::RichLogger / RichLoggerBuilder / RichLayer (tracing)
 - stats::ServerStats + StatsRenderer
 - config::ConsoleConfig for customization

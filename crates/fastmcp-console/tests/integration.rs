@@ -6,6 +6,8 @@
 //! - DisplayContext affecting multiple components
 //! - Config affecting all subsystems
 
+#![cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
+
 use std::time::Duration;
 
 use fastmcp_console::client::ClientInfoRenderer;
