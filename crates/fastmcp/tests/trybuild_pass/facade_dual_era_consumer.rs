@@ -150,13 +150,140 @@ async fn serve_modern_http(server: modern::Server, cx: &modern::Cx) -> modern::M
     server.serve_http(cx, "127.0.0.1:0").await
 }
 
+async fn connect_modern_http_from_configured_builder(
+    builder: modern::ClientBuilder,
+    endpoint: modern::CanonicalHttpUrl,
+    cx: &modern::Cx,
+) -> Result<modern::HttpClient, modern::HttpClientConnectError> {
+    builder.connect_http_with_cx(endpoint, cx).await
+}
+
+async fn connect_exact_legacy_http_with_explicit_context(
+    sse_endpoint: legacy_2024::CanonicalHttpUrl,
+    message_post_endpoint: legacy_2024::CanonicalHttpUrl,
+    cx: &legacy_2024::Cx,
+) -> Result<legacy_2024::HttpClient, legacy_2024::HttpClientConnectError> {
+    legacy_2024::connect_http_with_cx(sse_endpoint, message_post_endpoint, cx).await
+}
+
+fn assert_typed_facade_http_builder_exports() {
+    let _: fn(
+        modern::ClientBuilder,
+        modern::CanonicalHttpUrl,
+    ) -> Result<modern::HttpClient, modern::HttpClientConnectError> =
+        modern::ClientBuilder::connect_http;
+    let _: fn(
+        legacy_2024::CanonicalHttpUrl,
+        legacy_2024::CanonicalHttpUrl,
+    ) -> Result<legacy_2024::ClientBuilder, legacy_2024::HttpEndpointBundleError> =
+        legacy_2024::http_client_builder;
+    let _: fn(
+        legacy_2024::CanonicalHttpUrl,
+        legacy_2024::CanonicalHttpUrl,
+    ) -> Result<legacy_2024::HttpClient, legacy_2024::HttpClientConnectError> =
+        legacy_2024::connect_http;
+    let _ = connect_modern_http_from_configured_builder;
+    let _ = connect_exact_legacy_http_with_explicit_context;
+}
+
+async fn use_final_only_http_resource_and_completion_apis(
+    client: &mut modern::HttpClient,
+    cx: &modern::Cx,
+) -> Result<(), modern::HttpClientError> {
+    let _: modern::FinalListResourcesResult = client.list_resources(cx, None).await?;
+    let _: modern::FinalListResourceTemplatesResult = client
+        .list_resource_templates(cx, Some("next-page"))
+        .await?;
+    let _: modern::FinalReadResourceResult =
+        client.read_resource(cx, "resource://cities/boston").await?;
+    let _: modern::FinalCompletionResult = client
+        .complete(
+            cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::Prompt {
+                    name: "city".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "prefix".to_owned(),
+                    value: "bo".to_owned(),
+                },
+                context: Some(modern::CompletionContext::default()),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+async fn use_final_only_http_mrtr_apis(
+    client: &mut modern::HttpClient,
+    cx: &modern::Cx,
+    deadline: std::time::Instant,
+    sse_limits: modern::SseLimits,
+) -> Result<(), modern::HttpClientError> {
+    let mut tool_rounds = 0_usize;
+    let _: modern::FinalCoreResult = client
+        .call_tool_with_mrtr_retry_until(
+            cx,
+            deadline,
+            "city_lookup",
+            fastmcp_rust::JsonValue::Object(Default::default()),
+            sse_limits,
+            16 * 1024,
+            |_| {
+                tool_rounds += 1;
+                Ok(BTreeMap::new())
+            },
+        )
+        .await?;
+    let mut resource_rounds = 0_usize;
+    let _: modern::FinalCoreResult = client
+        .read_resource_with_mrtr_retry_until(
+            cx,
+            deadline,
+            "resource://cities/boston",
+            sse_limits,
+            16 * 1024,
+            |_| {
+                resource_rounds += 1;
+                Ok(BTreeMap::new())
+            },
+        )
+        .await?;
+    let mut prompt_rounds = 0_usize;
+    let _: modern::FinalCoreResult = client
+        .get_prompt_with_mrtr_retry_until(
+            cx,
+            deadline,
+            "city",
+            std::collections::HashMap::new(),
+            sse_limits,
+            16 * 1024,
+            |_| {
+                prompt_rounds += 1;
+                Ok(BTreeMap::new())
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 fn assert_client_http_and_subscription_exports() {
+    assert_typed_facade_http_builder_exports();
     let _ = modern::HttpClient::connect;
     let _ = modern::HttpClient::call_tool_outcome;
+    let _ = modern::HttpClient::list_resources;
+    let _ = modern::HttpClient::list_resource_templates;
+    let _ = modern::HttpClient::read_resource;
+    let _ = modern::HttpClient::complete;
+    let _ = modern::HttpClient::call_tool_with_mrtr_retry_until;
+    let _ = modern::HttpClient::read_resource_with_mrtr_retry_until;
+    let _ = modern::HttpClient::get_prompt_with_mrtr_retry_until;
     let _ = modern::HttpClient::listen_subscriptions;
     let _ = modern::HttpClient::get_task;
     let _ = modern::HttpClient::update_task;
     let _ = modern::HttpClient::cancel_task;
+    let _ = use_final_only_http_resource_and_completion_apis;
+    let _ = use_final_only_http_mrtr_apis;
     let _ = bind_modern_http;
     let _ = serve_modern_http;
     let _ = modern::HttpServer::serve;
@@ -239,6 +366,19 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     let _: Option<auto::SseLimits> = None;
     let _: Option<modern::HttpClient> = None;
     let _: Option<modern::HttpServer> = None;
+}
+
+fn assert_client_roots_facade_exports() {
+    let root = fastmcp_rust::ClientRoot::new("file:///workspace");
+    let named_root = fastmcp_rust::ClientRoot::with_name("file:///tmp", "temporary");
+    assert_eq!(root.name, None);
+    assert_eq!(named_root.name.as_deref(), Some("temporary"));
+
+    let _: Option<std::sync::Arc<dyn fastmcp_rust::RootsProvider>> = None;
+    let _: Option<modern::ClientRoot> = None;
+    let _: Option<std::sync::Arc<dyn modern::RootsProvider>> = None;
+    let _: Option<legacy_2024::ClientRoot> = None;
+    let _: Option<std::sync::Arc<dyn legacy_2024::RootsProvider>> = None;
 }
 
 fn assert_modern_companion_facade_exports() {
@@ -386,6 +526,8 @@ mod prelude_companion_facade_reachability {
         let _: Option<ToolCallResult> = None;
         let _: Option<std::sync::Arc<dyn ToolCaller>> = None;
         let _: Option<ToolContentItem> = None;
+        let _: Option<ClientRoot> = None;
+        let _: Option<std::sync::Arc<dyn RootsProvider>> = None;
     }
 }
 
@@ -593,7 +735,7 @@ fn assert_lossless_dual_era_product_paths() {
     let create_message = modern::FinalCreateMessageParams {
         meta: modern::OpenMetadata::default(),
         messages: Vec::new(),
-        max_tokens: 128,
+        max_tokens: modern::JsonInteger::from(128_i64),
         system_prompt: None,
         temperature: None,
         stop_sequences: None,
@@ -603,7 +745,7 @@ fn assert_lossless_dual_era_product_paths() {
         tools: Some(vec![final_tool]),
         tool_choice: Some(modern::FinalToolChoice::default()),
     };
-    assert_eq!(create_message.max_tokens, 128);
+    assert_eq!(create_message.max_tokens.as_str(), "128");
     let input_required = modern::FinalCreateMessageInputRequiredResult {
         result_type: modern::FinalInputRequiredResultType::InputRequired,
         meta: None,

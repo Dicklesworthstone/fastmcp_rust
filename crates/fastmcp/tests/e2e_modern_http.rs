@@ -9,8 +9,9 @@
 //! What this proves (and only this): the shipped dual-era HTTP server and
 //! facade clients can complete Auto classification and a round trip against
 //! each other — modern discovery plus `tools/list` over the live modern lane,
-//! then exact 2024-11-05 HTTP+SSE fallback after an eligible live modern-route
-//! refusal. It is not an aggregate MCP 2026-07-28 conformance claim.
+//! then exact 2024-11-05 HTTP+SSE fallback after a real LegacyOnly endpoint
+//! refuses the modern request. It is not an aggregate MCP 2026-07-28
+//! conformance claim.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -128,10 +129,21 @@ impl Drop for HttpServerStartupGuard {
 
 impl HttpServerFixture {
     fn spawn() -> Self {
-        Self::spawn_with_middleware(None)
+        Self::spawn_with_policy(ProtocolPolicy::Auto)
+    }
+
+    fn spawn_with_policy(protocol_policy: ProtocolPolicy) -> Self {
+        Self::spawn_with_policy_and_middleware(protocol_policy, None)
     }
 
     fn spawn_with_middleware(middleware: Option<Arc<dyn Middleware>>) -> Self {
+        Self::spawn_with_policy_and_middleware(ProtocolPolicy::Auto, middleware)
+    }
+
+    fn spawn_with_policy_and_middleware(
+        protocol_policy: ProtocolPolicy,
+        middleware: Option<Arc<dyn Middleware>>,
+    ) -> Self {
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel::<()>(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<(), String>>(1);
@@ -161,7 +173,7 @@ impl HttpServerFixture {
                     let outcome =
                         match asupersync::time::timeout(cx.now(), HTTP_SERVER_THREAD_BOUND, async {
                             let builder = Server::new("facade-http-example", "1.0.0")
-                                .protocol_policy(ProtocolPolicy::Auto);
+                                .protocol_policy(protocol_policy);
                             let server = match middleware {
                                 Some(middleware) => builder.middleware(middleware).build(),
                                 None => builder.build(),
@@ -511,10 +523,10 @@ fn plan(addr: SocketAddr, policy: ProtocolPolicy) -> ClientProtocolPlan {
     plan_with_modern_post_path(addr, policy, "/mcp")
 }
 
-/// Builds one immutable public endpoint plan while allowing the Auto probe to
+/// Builds one immutable public endpoint plan while allowing an Auto probe to
 /// target a live server route that is intentionally not mounted as modern.
-/// This lets the fallback test observe the real 404 response required by the
-/// public negotiation contract without substituting a scripted HTTP peer.
+/// This supports real 404 fallback coverage without substituting a scripted
+/// HTTP peer.
 fn plan_with_modern_post_path(
     addr: SocketAddr,
     policy: ProtocolPolicy,
@@ -855,20 +867,136 @@ fn e2e_public_http_auto_selects_modern_on_the_shipped_facade_server() {
 }
 
 #[test]
+fn e2e_public_http_modern_only_selects_modern_and_refuses_legacy_only() {
+    let modern_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
+    let cx = Cx::for_request();
+    let builder = auto::client_builder()
+        .client_info("e2e-modern-only-http-client", "1.0.0")
+        .protocol_plan(plan(modern_server.address(), ProtocolPolicy::ModernOnly));
+
+    let mut client = runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx))
+        .expect("a ModernOnly facade plan selects the real ModernOnly endpoint");
+    assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+    assert_eq!(
+        client.connection().protocol_version(),
+        Some(fastmcp_rust::modern::PROTOCOL_VERSION),
+        "the positive ModernOnly connection reports the exact modern version"
+    );
+    assert!(
+        client.server_discovery().is_some(),
+        "the positive ModernOnly connection retains modern discovery"
+    );
+    let response = runtime_block_on_bounded(
+        &cx,
+        client.request(&cx, "tools/list", json!({ "cursor": null })),
+    )
+    .expect("the selected ModernOnly connection serves tools/list");
+    let ClientHttpResponse::Modern(response) = response else {
+        panic!("the ModernOnly connection must retain the modern response lane");
+    };
+    let document = final_response_document(&cx, response);
+    assert_eq!(document["id"], json!(2));
+    assert!(
+        document.get("error").is_none(),
+        "the positive ModernOnly tools/list response must not fail: {document}"
+    );
+    assert!(
+        document["result"]["tools"].is_array(),
+        "the positive ModernOnly tools/list response carries its result: {document}"
+    );
+    drop(client);
+    modern_server.shutdown();
+
+    // This differs from the positive case only in the live server policy.
+    // A ModernOnly plan has no configured legacy fallback and must not create
+    // a client after the LegacyOnly endpoint refuses its modern request.
+    let legacy_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
+    let refusal = runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("e2e-modern-only-http-client", "1.0.0")
+            .protocol_plan(plan(legacy_server.address(), ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect_err("a ModernOnly facade plan must reject the LegacyOnly endpoint's live 400");
+    assert!(matches!(
+        refusal,
+        auto::HttpClientError::Connection(auto::ClientHttpConnectionError::Modern(
+            fastmcp_rust::ModernHttpClientError::Negotiation(
+                auto::ClientHttpNegotiationError::ModernProbeRejectedWithoutLegacyFallback {
+                    status: 400,
+                    ..
+                }
+            )
+        ))
+    ));
+    legacy_server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_only_selects_legacy_and_refuses_modern_only() {
+    let legacy_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
+    let cx = Cx::for_request();
+    let builder = auto::client_builder()
+        .client_info("e2e-legacy-only-http-client", "1.0.0")
+        .protocol_plan(plan(legacy_server.address(), ProtocolPolicy::LegacyOnly));
+
+    let mut client = runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx))
+        .expect("a LegacyOnly facade plan selects the real exact-legacy endpoint");
+    assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+    assert_eq!(
+        client.connection().protocol_version(),
+        Some(fastmcp_rust::legacy_2024::PROTOCOL_VERSION),
+        "the positive LegacyOnly connection reports the exact 2024-11-05 version"
+    );
+    assert!(
+        client.server_discovery().is_none(),
+        "the positive LegacyOnly connection cannot retain modern discovery"
+    );
+    let response = runtime_block_on_bounded(&cx, client.request(&cx, "ping", json!({})))
+        .expect("the selected LegacyOnly connection serves ping");
+    let ClientHttpResponse::Legacy(JsonRpcMessage::Response(ping)) = response else {
+        panic!("the LegacyOnly connection must retain the exact-legacy response lane");
+    };
+    assert!(ping.error.is_none(), "the positive exact-legacy ping must not fail");
+    assert_eq!(ping.result, Some(json!({})));
+    drop(client);
+    legacy_server.shutdown();
+
+    // This differs from the positive case only in the live server policy.
+    // A LegacyOnly plan has no configured modern route and must not manufacture
+    // an exact-legacy session after the ModernOnly endpoint refuses its SSE GET.
+    let modern_server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
+    let refusal = runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("e2e-legacy-only-http-client", "1.0.0")
+            .protocol_plan(plan(modern_server.address(), ProtocolPolicy::LegacyOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect_err("a LegacyOnly facade plan must reject the ModernOnly endpoint's live 400");
+    assert!(matches!(
+        refusal,
+        auto::HttpClientError::Connection(auto::ClientHttpConnectionError::Modern(
+            fastmcp_rust::ModernHttpClientError::LegacySse(
+                fastmcp_rust::LegacySseHttpClientError::SseGetRejected { status: 400 }
+            )
+        ))
+    ));
+    modern_server.shutdown();
+}
+
+#[test]
 fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
-    let server = HttpServerFixture::spawn();
+    let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::LegacyOnly);
     let cx = Cx::for_request();
 
-    // `/modern-unavailable` is a real but unmounted route on the shipped
-    // server. Its live 404 is an eligible Auto fallback signal; the complete
-    // legacy SSE and message targets remain explicitly configured.
+    // This differs from the matched Auto-modern positive only in the live
+    // server policy. The LegacyOnly endpoint returns its real modern-route
+    // refusal, after which Auto may open the configured exact-legacy routes.
     let builder = auto::client_builder()
-        .client_info("e2e-legacy-http-client", "1.0.0")
-        .protocol_plan(plan_with_modern_post_path(
-            server.address(),
-            ProtocolPolicy::Auto,
-            "/modern-unavailable",
-        ));
+        .client_info("e2e-modern-http-client", "1.0.0")
+        .protocol_plan(plan(server.address(), ProtocolPolicy::Auto));
     assert_eq!(
         builder.selected_protocol_plan().policy(),
         ProtocolPolicy::Auto

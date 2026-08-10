@@ -136,15 +136,15 @@ pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
 
 // Re-export core types
 pub use fastmcp_core::{
-    AccessToken, AuthContext, Budget, CancelledError, ClientCapabilityInfo, Cx, ElicitationAction,
-    ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender, IntoOutcome,
-    LabConfig, LabRuntime, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContext,
+    AccessToken, AuthContext, Budget, CancelledError, ClientCapabilityInfo, ClientRoot, Cx,
+    ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
+    IntoOutcome, LabConfig, LabRuntime, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContext,
     McpContextLeaseGuard, McpError, McpErrorCode, McpOutcome, McpRequestCancellation, McpResult,
     NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, Outcome, OutcomeExt,
     ProgressReporter, RegionId, ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt,
-    SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
-    SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
-    ToolContentItem, cancelled, err, ok,
+    RootsProvider, SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole,
+    SamplingSender, SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult,
+    ToolCaller, ToolContentItem, cancelled, err, ok,
 };
 pub use fastmcp_core::{
     DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
@@ -646,6 +646,7 @@ pub mod modern {
         ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
         ModernHttpSubscriptionListener,
     };
+    pub use fastmcp_client::sse::SseLimits;
     pub use fastmcp_client::{
         BoundedListPage, CachePartitionKey, CompletionContext, CompletionParams,
         CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
@@ -653,16 +654,18 @@ pub mod modern {
         FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
         FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic, FinalResultCache, FinalTask,
         FinalTaskInputResponses, FinalTaskStatusNotification, FinalToolCallOutcome,
-        FinalUpdateTaskResult, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
-        OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback,
-        RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionFilter,
-        SubscriptionListenCollector,
+        FinalUpdateTaskResult, HttpClientError, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
+        MAX_FINAL_CACHE_MAX_BYTES, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
+        MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, OpaquePagination, PaginationBounds,
+        PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
+        SubscriptionFilter, SubscriptionListenCollector,
     };
     pub use fastmcp_core::{
-        CanonicalHttpUrl, ClientCapabilityInfo, Cx, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH,
-        McpContext, McpContextLeaseGuard, McpError, McpOutcome, McpResult, NoOpNotificationSender,
-        NotificationSender, Outcome, ProgressReporter, ResourceContentItem, ResourceReadResult,
-        ResourceReader, ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
+        CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_RESOURCE_READ_DEPTH,
+        MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard, McpError, McpOutcome, McpResult,
+        NoOpNotificationSender, NotificationSender, Outcome, ProgressReporter, ResourceContentItem,
+        ResourceReadResult, ResourceReader, RootsProvider, ServerCapabilityInfo, ToolCallResult,
+        ToolCaller, ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
@@ -785,7 +788,8 @@ pub mod modern {
         HARD_MAX_MRTR_REQUEST_STATE_BYTES, HARD_MAX_MRTR_REQUEST_STATE_TTL,
         HARD_MAX_MRTR_REQUEST_STATES, HARD_MAX_MRTR_ROUNDS, MrtrCompletedInputs,
         MrtrExchangeRegistry, MrtrInputKind, MrtrInputRequest, MrtrInputRequests,
-        MrtrInputRequired, MrtrInputResponse, MrtrInputResponses, MrtrRequestState, MrtrRetry,
+        MrtrInputRequired, MrtrInputResponse, MrtrInputResponses as ServerMrtrInputResponses,
+        MrtrRequestState, MrtrRetry,
     };
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthProvider, AuthRequest, AuthorizedTaskServiceRunner,
@@ -892,6 +896,38 @@ pub mod modern {
             self.inner
                 .connect_stdio_with_cx(command, args, cx)
                 .map(Client::from_inner)
+        }
+
+        /// Connects this configured final-only builder over one final HTTP endpoint.
+        ///
+        /// The builder retains its client identity, capabilities, timeout policy,
+        /// and MCP Apps configuration; only its immutable transport plan changes.
+        pub fn connect_http(
+            self,
+            endpoint: CanonicalHttpUrl,
+        ) -> Result<HttpClient, HttpClientConnectError> {
+            let plan = modern_http_plan(endpoint).map_err(HttpClientConnectError::Plan)?;
+            self.inner
+                .protocol_plan(plan)
+                .connect_http_client()
+                .map_err(HttpClientConnectError::Connect)
+                .and_then(HttpClient::from_inner)
+        }
+
+        /// Connects this configured final-only builder over one final HTTP endpoint
+        /// with an explicit cancellation context.
+        pub async fn connect_http_with_cx(
+            self,
+            endpoint: CanonicalHttpUrl,
+            cx: &Cx,
+        ) -> Result<HttpClient, HttpClientConnectError> {
+            let plan = modern_http_plan(endpoint).map_err(HttpClientConnectError::Plan)?;
+            self.inner
+                .protocol_plan(plan)
+                .connect_http_client_with_cx(cx)
+                .await
+                .map_err(HttpClientConnectError::Connect)
+                .and_then(HttpClient::from_inner)
         }
     }
 
@@ -1059,8 +1095,8 @@ pub mod modern {
     pub enum HttpClientConnectError {
         /// The supplied endpoint cannot form the facade's fixed modern plan.
         Plan(fastmcp_protocol::protocol_policy::HttpEndpointBundleError),
-        /// The final `server/discover` probe or modern transport failed.
-        Connect(ModernHttpClientError),
+        /// The final `server/discover` lifecycle or HTTP transport failed.
+        Connect(HttpClientError),
         /// A legacy selection contradicts the facade's fixed `ModernOnly` plan.
         UnexpectedLegacySelection,
     }
@@ -1091,12 +1127,30 @@ pub mod modern {
     ///
     /// This wrapper intentionally has no generic request dispatcher, no
     /// protocol-plan setter, and no accessor for its underlying HTTP client.
-    #[derive(Clone)]
+    /// Its typed HTTP methods return only final result vocabulary.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::{legacy_2024, modern};
+    ///
+    /// fn cannot_downgrade(client: modern::HttpClient) {
+    ///     let _: legacy_2024::HttpClient = client;
+    /// }
+    /// ```
     pub struct HttpClient {
-        inner: fastmcp_client::http_executor::ModernHttpClient,
+        inner: fastmcp_client::HttpClient,
     }
 
     impl HttpClient {
+        fn from_inner(inner: fastmcp_client::HttpClient) -> Result<Self, HttpClientConnectError> {
+            if inner.selected_protocol_era()
+                == fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
+            {
+                Ok(Self { inner })
+            } else {
+                Err(HttpClientConnectError::UnexpectedLegacySelection)
+            }
+        }
+
         /// Connects to one canonical final HTTP endpoint with a fixed
         /// `ModernOnly` plan. Callers cannot supply a plan or legacy routes.
         pub async fn connect(
@@ -1105,100 +1159,250 @@ pub mod modern {
             client_info: ClientInfo,
             client_capabilities: ClientCapabilities,
         ) -> Result<Self, HttpClientConnectError> {
-            let plan = fastmcp_client::ClientProtocolPlan::http(
-                fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
-                Some(endpoint),
-                None,
-                None,
-                "fastmcp-rust-modern-facade".to_owned(),
-                "fastmcp-rust-modern-facade".to_owned(),
-                "modern-http".to_owned(),
-                0,
-                0,
-                0,
-            )
-            .map_err(HttpClientConnectError::Plan)?;
-            let outcome = fastmcp_client::http_executor::ModernHttpClient::connect(
-                cx,
-                plan,
-                client_info,
-                client_capabilities,
-            )
-            .await
-            .map_err(HttpClientConnectError::Connect)?;
-            match outcome {
-                fastmcp_client::http_executor::ModernHttpConnectOutcome::Modern(inner) => {
-                    Ok(Self { inner })
-                }
-                fastmcp_client::http_executor::ModernHttpConnectOutcome::LegacySse(_) => {
-                    Err(HttpClientConnectError::UnexpectedLegacySelection)
-                }
-            }
+            ClientBuilder::new()
+                .client_info(client_info.name, client_info.version)
+                .capabilities(client_capabilities)
+                .connect_http_with_cx(endpoint, cx)
         }
 
         /// Returns the exact final discovery response that admitted this connection.
         #[must_use]
-        pub const fn server_discovery(&self) -> &ServerDiscoverResult {
-            self.inner.server_discovery()
+        pub fn server_discovery(&self) -> &ServerDiscoverResult {
+            self.inner.server_discovery().expect(
+                "the modern facade only retains an HTTP client admitted by final server/discover",
+            )
         }
 
         /// Returns whether final discovery activated the official MCP Apps extension.
         #[must_use]
-        pub const fn mcp_apps_active(&self) -> bool {
+        pub fn mcp_apps_active(&self) -> bool {
             self.inner.mcp_apps_active()
         }
 
         /// Calls one final tool and retains its official Tasks outcome branch.
         pub async fn call_tool_outcome(
-            &self,
+            &mut self,
             cx: &Cx,
             request_id: RequestId,
             name: &str,
             arguments: JsonValue,
             maximum_response_bytes: usize,
-        ) -> Result<FinalToolCallOutcome, ModernHttpClientError> {
+        ) -> Result<FinalToolCallOutcome, HttpClientError> {
             self.inner
+                .connection()
                 .call_tool_final_outcome(cx, request_id, name, arguments, maximum_response_bytes)
+                .await
+                .map_err(HttpClientError::Connection)
+        }
+
+        /// Lists one exact final page of resources through the policy-bound HTTP client.
+        pub async fn list_resources(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> Result<FinalListResourcesResult, HttpClientError> {
+            match self
+                .inner
+                .request_final_core(cx, "resources/list", final_list_parameters(cursor))
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("resources/list")),
+            }
+        }
+
+        /// Lists one exact final page of resource templates through the policy-bound HTTP client.
+        pub async fn list_resource_templates(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> Result<FinalListResourceTemplatesResult, HttpClientError> {
+            match self
+                .inner
+                .request_final_core(
+                    cx,
+                    "resources/templates/list",
+                    final_list_parameters(cursor),
+                )
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("resources/templates/list")),
+            }
+        }
+
+        /// Reads one resource and retains its exact final cache metadata and contents.
+        pub async fn read_resource(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+        ) -> Result<FinalReadResourceResult, HttpClientError> {
+            match self
+                .inner
+                .request_final_core(cx, "resources/read", serde_json::json!({ "uri": uri }))
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("resources/read")),
+            }
+        }
+
+        /// Completes a prompt or resource-template argument using final context.
+        pub async fn complete(
+            &mut self,
+            cx: &Cx,
+            params: CompletionParams,
+        ) -> Result<FinalCompletionResult, HttpClientError> {
+            let parameters = serde_json::to_value(params).map_err(|error| {
+                HttpClientError::CoreResult(McpError::internal_error(format!(
+                    "final HTTP completion parameters could not serialize: {error}"
+                )))
+            })?;
+            match self
+                .inner
+                .request_final_core(cx, "completion/complete", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("completion/complete")),
+            }
+        }
+
+        /// Calls a tool through modern HTTP until one terminal final result arrives.
+        ///
+        /// `deadline` bounds the initial request and every continuation. The
+        /// responder runs once per admitted `input_required` result, and this
+        /// method never returns an intermediate input-required result.
+        pub async fn call_tool_with_mrtr_retry_until<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: JsonValue,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalCoreResult, HttpClientError>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            self.inner
+                .call_tool_with_mrtr_retry_until(
+                    cx,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
+                .await
+        }
+
+        /// Reads a resource through modern HTTP until one terminal final result arrives.
+        ///
+        /// See [`Self::call_tool_with_mrtr_retry_until`] for the shared
+        /// deadline and responder semantics.
+        pub async fn read_resource_with_mrtr_retry_until<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            uri: &str,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalCoreResult, HttpClientError>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            self.inner
+                .read_resource_with_mrtr_retry_until(
+                    cx,
+                    deadline,
+                    uri,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
+                .await
+        }
+
+        /// Gets a prompt through modern HTTP until one terminal final result arrives.
+        ///
+        /// See [`Self::call_tool_with_mrtr_retry_until`] for the shared
+        /// deadline and responder semantics.
+        pub async fn get_prompt_with_mrtr_retry_until<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            sse_limits: SseLimits,
+            maximum_response_bytes: usize,
+            respond: F,
+        ) -> Result<FinalCoreResult, HttpClientError>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        {
+            self.inner
+                .get_prompt_with_mrtr_retry_until(
+                    cx,
+                    deadline,
+                    name,
+                    arguments,
+                    sse_limits,
+                    maximum_response_bytes,
+                    respond,
+                )
                 .await
         }
 
         /// Opens and collects one typed final subscriptions listener.
         pub async fn listen_subscriptions(
-            &self,
+            &mut self,
             cx: &Cx,
-            request_id: RequestId,
             notifications: SubscriptionFilter,
             limits: fastmcp_client::sse::SseLimits,
-        ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError>
-        {
+        ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
             self.inner
-                .listen_subscriptions_typed(cx, request_id, notifications, limits)
+                .listen_subscriptions_typed(cx, notifications, limits)
                 .await
         }
 
         /// Reads one task through the official final Tasks extension.
         pub async fn get_task(
-            &self,
+            &mut self,
             cx: &Cx,
             request_id: RequestId,
             task_id: FinalTaskId,
             maximum_response_bytes: usize,
-        ) -> Result<FinalGetTaskResult, ModernHttpClientError> {
+        ) -> Result<FinalGetTaskResult, HttpClientError> {
             self.inner
+                .connection()
                 .get_task_final(cx, request_id, task_id, maximum_response_bytes)
                 .await
+                .map_err(HttpClientError::Connection)
         }
 
         /// Supplies responses to one input-required final task.
         pub async fn update_task(
-            &self,
+            &mut self,
             cx: &Cx,
             request_id: RequestId,
             task: &FinalTask,
             input_responses: FinalTaskInputResponses,
             maximum_response_bytes: usize,
-        ) -> Result<FinalUpdateTaskResult, ModernHttpClientError> {
+        ) -> Result<FinalUpdateTaskResult, HttpClientError> {
             self.inner
+                .connection()
                 .update_task_final(
                     cx,
                     request_id,
@@ -1207,20 +1411,54 @@ pub mod modern {
                     maximum_response_bytes,
                 )
                 .await
+                .map_err(HttpClientError::Connection)
         }
 
         /// Requests cancellation through the official final Tasks extension.
         pub async fn cancel_task(
-            &self,
+            &mut self,
             cx: &Cx,
             request_id: RequestId,
             task_id: FinalTaskId,
             maximum_response_bytes: usize,
-        ) -> Result<FinalCancelTaskResult, ModernHttpClientError> {
+        ) -> Result<FinalCancelTaskResult, HttpClientError> {
             self.inner
+                .connection()
                 .cancel_task_final(cx, request_id, task_id, maximum_response_bytes)
                 .await
+                .map_err(HttpClientError::Connection)
         }
+    }
+
+    fn final_list_parameters(cursor: Option<&str>) -> JsonValue {
+        cursor.map_or_else(
+            || serde_json::json!({}),
+            |cursor| serde_json::json!({ "cursor": cursor }),
+        )
+    }
+
+    fn unexpected_modern_http_result(method: &'static str) -> HttpClientError {
+        HttpClientError::CoreResult(McpError::internal_error(format!(
+            "ModernOnly HTTP client received a non-final {method} result"
+        )))
+    }
+
+    fn modern_http_plan(
+        endpoint: CanonicalHttpUrl,
+    ) -> Result<fastmcp_client::ClientProtocolPlan, fastmcp_protocol::protocol_policy::HttpEndpointBundleError>
+    {
+        fastmcp_client::ClientProtocolPlan::http(
+            fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+            Some(endpoint),
+            None,
+            None,
+            "fastmcp-rust-modern-facade".to_owned(),
+            "fastmcp-rust-modern-facade".to_owned(),
+            "modern-http".to_owned(),
+            0,
+            0,
+            0,
+        )
     }
 
     /// Internal registration bridge that lets the router retain an exact final
@@ -1472,12 +1710,15 @@ pub mod legacy_2024 {
         RootsRequestHandler as LegacyRootsRequestHandler,
         SamplingRequestHandler as LegacySamplingRequestHandler,
     };
-    pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpContext, McpError, McpOutcome, McpResult};
+    pub use fastmcp_core::{
+        CanonicalHttpUrl, ClientRoot, Cx, McpContext, McpError, McpOutcome, McpResult,
+        RootsProvider,
+    };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
-        LEGACY_PROTOCOL_VERSION, LegacyAdapterReceiptIssuer, LegacyClientAdapterInstalledReceipt,
-        LegacyReceiptBinding,
+        HttpEndpointBundleError, LEGACY_PROTOCOL_VERSION, LegacyAdapterReceiptIssuer,
+        LegacyClientAdapterInstalledReceipt, LegacyReceiptBinding,
         LegacyServerAdapterInstalledReceipt as PolicyServerAdapterInstalledReceipt, ProtocolEra,
         ProtocolPolicy, ProtocolVersion,
     };
@@ -1521,6 +1762,33 @@ pub mod legacy_2024 {
     };
     pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
 
+    /// Failure while constructing or connecting the exact MCP 2024-11-05 HTTP plan.
+    #[derive(Debug)]
+    pub enum HttpClientConnectError {
+        /// The supplied SSE and message endpoints cannot form an exact legacy plan.
+        Plan(fastmcp_protocol::protocol_policy::HttpEndpointBundleError),
+        /// The legacy HTTP lifecycle or transport failed.
+        Connect(HttpClientError),
+    }
+
+    impl std::fmt::Display for HttpClientConnectError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Plan(error) => error.fmt(formatter),
+                Self::Connect(error) => error.fmt(formatter),
+            }
+        }
+    }
+
+    impl std::error::Error for HttpClientConnectError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::Plan(error) => Some(error),
+                Self::Connect(error) => Some(error),
+            }
+        }
+    }
+
     /// Creates a client builder pinned to the exact MCP 2024-11-05 stdio plan.
     ///
     /// The historical root [`Client::stdio`] behavior remains unchanged; this
@@ -1528,6 +1796,63 @@ pub mod legacy_2024 {
     #[must_use]
     pub fn client_builder() -> ClientBuilder {
         ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+    }
+
+    /// Creates a client builder pinned to exact MCP 2024-11-05 HTTP+SSE.
+    ///
+    /// Callers may further configure client identity, capabilities, timeouts,
+    /// and legacy reverse callbacks before connecting with the component's
+    /// `connect_http_client` or `connect_http_client_with_cx` method.
+    pub fn http_client_builder(
+        sse_endpoint: CanonicalHttpUrl,
+        message_post_endpoint: CanonicalHttpUrl,
+    ) -> Result<ClientBuilder, fastmcp_protocol::protocol_policy::HttpEndpointBundleError> {
+        legacy_http_plan(sse_endpoint, message_post_endpoint)
+            .map(|plan| ClientBuilder::new().protocol_plan(plan))
+    }
+
+    /// Connects the default exact-2024 builder over its required SSE and
+    /// message-post endpoints using the current capability context.
+    pub fn connect_http(
+        sse_endpoint: CanonicalHttpUrl,
+        message_post_endpoint: CanonicalHttpUrl,
+    ) -> Result<HttpClient, HttpClientConnectError> {
+        http_client_builder(sse_endpoint, message_post_endpoint)
+            .map_err(HttpClientConnectError::Plan)?
+            .connect_http_client()
+            .map_err(HttpClientConnectError::Connect)
+    }
+
+    /// Connects the default exact-2024 builder over its required SSE and
+    /// message-post endpoints with an explicit cancellation context.
+    pub async fn connect_http_with_cx(
+        sse_endpoint: CanonicalHttpUrl,
+        message_post_endpoint: CanonicalHttpUrl,
+        cx: &Cx,
+    ) -> Result<HttpClient, HttpClientConnectError> {
+        http_client_builder(sse_endpoint, message_post_endpoint)
+            .map_err(HttpClientConnectError::Plan)?
+            .connect_http_client_with_cx(cx)
+            .await
+            .map_err(HttpClientConnectError::Connect)
+    }
+
+    fn legacy_http_plan(
+        sse_endpoint: CanonicalHttpUrl,
+        message_post_endpoint: CanonicalHttpUrl,
+    ) -> Result<ClientProtocolPlan, fastmcp_protocol::protocol_policy::HttpEndpointBundleError> {
+        ClientProtocolPlan::http(
+            ProtocolPolicy::LegacyOnly,
+            None,
+            Some(sse_endpoint),
+            Some(message_post_endpoint),
+            "fastmcp-rust-legacy-2024-facade".to_owned(),
+            "fastmcp-rust-legacy-2024-facade".to_owned(),
+            "legacy-2024-http-sse".to_owned(),
+            0,
+            0,
+            0,
+        )
     }
 }
 
@@ -1569,6 +1894,7 @@ pub mod prelude {
         ClientNotification,
         ClientProtocolPlan,
         ClientProtocolPlanError,
+        ClientRoot,
         ClientSession,
         CompleteResult,
         CompletionContext,
@@ -1720,6 +2046,7 @@ pub mod prelude {
         ResourceContent,
         ResultExt,
         Role,
+        RootsProvider,
         SchemaAdmissionError,
         Server,
         ServerBehavior,

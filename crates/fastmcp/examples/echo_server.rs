@@ -50,6 +50,16 @@ fn count_words(_ctx: &McpContext, text: String) -> String {
     format!("{count}")
 }
 
+/// Returns the first filesystem root exposed by the connected client.
+#[tool]
+async fn client_root_uri(ctx: &McpContext) -> McpResult<String> {
+    let roots = ctx.list_roots().await?;
+    Ok(roots
+        .first()
+        .map(|root| root.uri.clone())
+        .unwrap_or_else(|| "<no client roots>".to_string()))
+}
+
 // ============================================================================
 // Resources
 // ============================================================================
@@ -126,6 +136,7 @@ fn main() {
         .tool(Add)
         .tool(Reverse)
         .tool(CountWords)
+        .tool(ClientRootUri)
         // Register resources
         .resource(ServerInfoResource)
         .resource(CurrentTimeResource)

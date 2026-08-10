@@ -1217,11 +1217,24 @@ fn connect_modern_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult
 
 #[cfg(unix)]
 fn connect_legacy_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<Client> {
+    connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+        server_policy,
+        legacy_2024::LegacyReverseRequestHandlers::new(),
+    )
+}
+
+#[cfg(unix)]
+fn connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+    server_policy: &str,
+    handlers: legacy_2024::LegacyReverseRequestHandlers,
+) -> McpResult<Client> {
     let executable = shipped_echo_server_executable();
     let command = executable
         .to_str()
         .expect("the shipped example path is valid UTF-8");
-    let builder = legacy_2024::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
+    let builder = legacy_2024::client_builder()
+        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+        .reverse_request_handlers(handlers);
     assert_eq!(
         builder.selected_protocol_plan().policy(),
         ProtocolPolicy::LegacyOnly
@@ -1338,6 +1351,64 @@ fn e2e_public_stdio_legacy_only_round_trips_with_the_shipped_facade_server() {
         .ping()
         .expect("the explicit LegacyOnly core connection remains usable");
     client.close().expect("legacy-only stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_legacy_stdio_roots_callback_reaches_context() {
+    let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handlers = legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list({
+        let callback_calls = Arc::clone(&callback_calls);
+        move |_cancellation, _params| {
+            callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(legacy_2024::ListRootsResult::new(vec![
+                legacy_2024::Root::with_name("file:///workspace", "workspace"),
+            ]))
+        }
+    });
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+        "legacy-only",
+        handlers,
+    )
+    .expect("the roots callback is configured before exact legacy initialization");
+
+    let result = client
+        .call_tool_legacy("client_root_uri", json!({}))
+        .expect("the public stdio tool call completes");
+    assert!(!result.is_error);
+    assert!(matches!(
+        result.content.first(),
+        Some(LegacyContent::Text { text, .. }) if text == "file:///workspace"
+    ));
+    assert_eq!(
+        callback_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the tool's context authority issues exactly one roots/list callback"
+    );
+    client.close().expect("legacy roots client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_legacy_stdio_roots_without_capability_has_no_callback_authority() {
+    // This differs from the positive path only by omitting its roots callback.
+    // The builder consequently omits the roots capability before initialization.
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+        "legacy-only",
+        legacy_2024::LegacyReverseRequestHandlers::new(),
+    )
+    .expect("the exact legacy connection without roots capability initializes");
+
+    let result = client
+        .call_tool_legacy("client_root_uri", json!({}))
+        .expect("missing roots authority is an MCP tool result, not a transport failure");
+    assert!(result.is_error);
+    assert!(matches!(
+        result.content.first(),
+        Some(LegacyContent::Text { text, .. })
+            if text == "Roots not available: client does not support roots capability"
+    ));
+    client.close().expect("legacy roots client cleanup");
 }
 
 #[cfg(unix)]
