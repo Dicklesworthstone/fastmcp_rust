@@ -17078,7 +17078,7 @@ mod tests {
          IFS= read -r request || exit 1; \
          case \"$request\" in *tools/call*) ;; *) exit 1 ;; esac; \
          case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
-         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"legacy result\",\"annotations\":{\"audience\":[\"user\"]},\"_meta\":{\"io.fastmcp.legacy\":true},\"io.fastmcp.extension\":{\"kept\":true}}],\"isError\":false,\"_meta\":{\"io.fastmcp.result\":true},\"io.fastmcp.resultExtension\":{\"kept\":true}}}' ;; esac; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"legacy result\",\"annotations\":{\"audience\":[\"user\"]},\"_meta\":{\"io.fastmcp.legacy\":true},\"io.fastmcp/extension\":{\"kept\":true}}],\"isError\":false,\"_meta\":{\"io.fastmcp.result\":true},\"io.fastmcp.resultExtension\":{\"kept\":true}}}' ;; esac; \
          exec sleep 2"
     }
 
@@ -17289,7 +17289,7 @@ mod tests {
     #[test]
     fn clt_01_final_typed_client_result_positive() {
         let script = modern_typed_call_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result","annotations":{"audience":["user"]},"_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"isError":false,"structuredContent":{"answer":"typed result"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result","annotations":{"audience":["user"]},"_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"isError":false,"structuredContent":{"answer":"typed result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -17326,7 +17326,7 @@ mod tests {
         assert!(annotations.is_some());
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern client cleanup");
@@ -18116,7 +18116,7 @@ mod tests {
     fn clt_01_exact_final_conveniences_preserve_final_open_fields() {
         let script = modern_final_convenience_client_script(
             "tools/call",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"exact tool result","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"isError":false,"structuredContent":{"answer":"exact tool result"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"exact tool result","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"isError":false,"structuredContent":{"answer":"exact tool result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -18147,14 +18147,14 @@ mod tests {
         assert_eq!(text, "exact tool result");
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern tool client cleanup");
 
         let script = modern_final_convenience_client_script(
             "resources/read",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"ttlMs":7.3e1,"cacheScope":"public"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"ttlMs":7.3e1,"cacheScope":"public"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -18196,14 +18196,14 @@ mod tests {
         assert_eq!(mime_type.as_deref(), Some("text/plain"));
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern resource client cleanup");
 
         let script = modern_final_convenience_client_script(
             "prompts/get",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","description":"exact prompt","messages":[{"role":"user","content":{"type":"text","text":"exact prompt content","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}}]}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","description":"exact prompt","messages":[{"role":"user","content":{"type":"text","text":"exact prompt content","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}}]}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -18235,7 +18235,7 @@ mod tests {
         assert_eq!(text, "exact prompt content");
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern prompt client cleanup");
@@ -19309,7 +19309,7 @@ mod tests {
             "text": "representable",
             "annotations": {"audience": ["user"]},
             "_meta": {"io.fastmcp.retained": true},
-            "io.fastmcp.extension": {"retained": true},
+            "io.fastmcp/extension": {"retained": true},
         });
         let projected = final_content_to_legacy(
             serde_json::from_value::<ContentBlock>(representable.clone())
@@ -19338,12 +19338,12 @@ mod tests {
             "type": "resource",
             "annotations": {"audience": ["assistant"]},
             "_meta": {"io.fastmcp.retained": true},
-            "io.fastmcp.extension": {"retained": true},
+            "io.fastmcp/extension": {"retained": true},
             "resource": {
                 "uri": "file:///embedded.txt",
                 "text": "representable",
                 "_meta": {"io.fastmcp.retained": true},
-                "io.fastmcp.extension": {"retained": true},
+                "io.fastmcp/extension": {"retained": true},
             },
         });
         let projected = final_content_to_legacy(
@@ -19362,7 +19362,7 @@ mod tests {
             "mimeType": "audio/mpeg",
             "annotations": {"audience": ["user"]},
             "_meta": {"io.fastmcp.retained": true},
-            "io.fastmcp.extension": {"retained": true},
+            "io.fastmcp/extension": {"retained": true},
         });
         let error = final_content_to_legacy(
             serde_json::from_value::<ContentBlock>(unsupported)
@@ -19381,7 +19381,7 @@ mod tests {
             additional: std::collections::BTreeMap::from([
                 ("_meta".to_owned(), serde_json::json!({"vendor": true})),
                 (
-                    "io.fastmcp.extension".to_owned(),
+                    "io.fastmcp/extension".to_owned(),
                     serde_json::json!({"retained": true}),
                 ),
             ]),
@@ -19407,7 +19407,7 @@ mod tests {
                 )]),
             },
             additional: std::collections::BTreeMap::from([(
-                "io.fastmcp.extension".to_owned(),
+                "io.fastmcp/extension".to_owned(),
                 serde_json::json!({"retained": true}),
             )]),
         };
@@ -20265,7 +20265,7 @@ mod tests {
             panic!("the exact legacy result must retain its text content");
         };
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!({"kept": true}))
         );
         client.close().expect("legacy client cleanup");
@@ -20322,7 +20322,7 @@ mod tests {
             serde_json::json!(true)
         );
         assert_eq!(
-            encoded[0]["io.fastmcp.extension"],
+            encoded[0]["io.fastmcp/extension"],
             serde_json::json!({"kept": true})
         );
         client.close().expect("legacy client cleanup");
