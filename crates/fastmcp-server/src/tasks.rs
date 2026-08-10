@@ -3362,7 +3362,8 @@ impl FinalTaskInitialWork {
         input_requests: FinalTaskInputRequests,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        self.authority()?.require_input(input_requests, status_message)
+        self.authority()?
+            .require_input(input_requests, status_message)
     }
 
     /// Completes this task under this handoff's exact elected fence.
@@ -3484,7 +3485,8 @@ impl FinalTaskAcceptedInput {
         input_requests: FinalTaskInputRequests,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
-        self.authority()?.require_input(input_requests, status_message)
+        self.authority()?
+            .require_input(input_requests, status_message)
     }
 
     /// Completes this task under this handoff's exact elected fence.
@@ -6279,8 +6281,7 @@ mod tests {
         }
     }
 
-    struct TerminalTransitionThenFailingFinalTaskSupervisor {
-    }
+    struct TerminalTransitionThenFailingFinalTaskSupervisor {}
 
     impl ApplicationTaskSupervisor for TerminalTransitionThenFailingFinalTaskSupervisor {
         fn resume<'a>(
@@ -6320,12 +6321,10 @@ mod tests {
                     serde_json::from_value(serde_json::json!({"content": []}))
                         .expect("typed terminal task result");
                 match handoff {
-                    FinalTaskSupervisorHandoff::Initial(initial) => {
-                        initial.complete_task(result, Some("completed by elected handoff".to_owned()))
-                    }
-                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                        accepted.complete_task(result, Some("completed by elected handoff".to_owned()))
-                    }
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial
+                        .complete_task(result, Some("completed by elected handoff".to_owned())),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted
+                        .complete_task(result, Some("completed by elected handoff".to_owned())),
                 }?;
                 Ok(())
             })
@@ -6352,9 +6351,10 @@ mod tests {
                         .state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let lease = state.handoff_leases.get_mut(&task_id).expect(
-                        "the elected handoff retains its exact in-memory dispatch lease",
-                    );
+                    let lease = state
+                        .handoff_leases
+                        .get_mut(&task_id)
+                        .expect("the elected handoff retains its exact in-memory dispatch lease");
                     let replacement_fence = lease
                         .dispatch_fence
                         .expect("the supervisor is invoked only after dispatch election")
@@ -9482,6 +9482,130 @@ mod tests {
                 .expect("recovery scan after terminal transition is valid")
                 .is_none(),
             "the generation-fenced restore cannot resurrect input into the newer terminal state"
+        );
+    }
+
+    #[test]
+    fn task_03_final_elected_handoff_completion_commits_atomically() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let before = store
+            .get_task_snapshot(&task_id)
+            .expect("read task before elected completion")
+            .expect("fixture task is retained");
+        let initial = runtime
+            .recover_initial_work()
+            .expect("recover initial handoff")
+            .expect("fixture task retains initial work");
+        let runner = runtime
+            .install_task_service(1, Arc::new(FencedCompletingFinalTaskSupervisor))
+            .expect("install the elected handoff runner");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build application-owned structured runtime");
+
+        application_runtime
+            .block_on(runner.resume_handoff(
+                &Cx::for_testing(),
+                FinalTaskSupervisorHandoff::Initial(initial),
+            ))
+            .expect("the elected handoff completes the task");
+
+        let after = store
+            .get_task_snapshot(&task_id)
+            .expect("read task after elected completion")
+            .expect("completed task is retained");
+        assert!(matches!(after.task(), FinalTask::Completed { .. }));
+        assert!(
+            after.generation() > before.generation(),
+            "the fenced terminal transition advances the durable generation"
+        );
+        assert!(matches!(
+            store
+                .latest_notification(&task_id)
+                .expect("terminal notification is retained")
+                .params
+                .task,
+            FinalTask::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn task_03_final_stale_handoff_fence_rejects_identical_completion_without_mutation() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let before = store
+            .get_task_snapshot(&task_id)
+            .expect("read task before stale-fence completion")
+            .expect("fixture task is retained");
+        let notification_before = serde_json::to_value(
+            store
+                .latest_notification(&task_id)
+                .expect("fixture task retains its working notification"),
+        )
+        .expect("encode notification before stale-fence completion");
+        let initial = runtime
+            .recover_initial_work()
+            .expect("recover initial handoff")
+            .expect("fixture task retains initial work");
+        let observed_error = Arc::new(Mutex::new(None));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(StaleFenceCompletingFinalTaskSupervisor {
+                    store: Arc::clone(&store),
+                    observed_error: Arc::clone(&observed_error),
+                }),
+            )
+            .expect("install the stale-fence handoff runner");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build application-owned structured runtime");
+
+        application_runtime
+            .block_on(runner.resume_handoff(
+                &Cx::for_testing(),
+                FinalTaskSupervisorHandoff::Initial(initial),
+            ))
+            .expect(
+                "the supervisor records its stale-fence rejection without failing service control",
+            );
+
+        let error = observed_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the only changed dimension, dispatch fence, rejects completion");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        let after = store
+            .get_task_snapshot(&task_id)
+            .expect("read task after stale-fence completion")
+            .expect("fixture task remains retained");
+        assert_eq!(
+            after.generation(),
+            before.generation(),
+            "a stale fence cannot advance the durable task generation"
+        );
+        assert!(matches!(after.task(), FinalTask::Working(_)));
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .latest_notification(&task_id)
+                    .expect("stale completion preserves the notification"),
+            )
+            .expect("encode notification after stale-fence completion"),
+            notification_before,
+            "a stale fence cannot replace the durable task notification"
         );
     }
 
