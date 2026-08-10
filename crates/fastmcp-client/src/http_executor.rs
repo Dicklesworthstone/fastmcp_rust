@@ -21,12 +21,10 @@ use asupersync::http::h1::{
 };
 use asupersync::http::{Body, Frame};
 #[cfg(feature = "tasks")]
-use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
-use fastmcp_protocol::extensions::{
-    McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID,
-};
-#[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::ExtensionDirection;
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
+use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
 use fastmcp_protocol::methods::{
     Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET, RESOURCES_READ,
     SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
@@ -63,10 +61,11 @@ use crate::{
     ClientProtocolPlan, FinalToolCallOutcome, MAX_MRTR_CONTINUATION_ROUNDS,
     MAX_MRTR_INPUT_RESPONSES, MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses,
     ReverseCallbackState, ReverseRequestCancellation, ReverseRequestHandlers,
+    validate_protocol_plan_feature,
 };
 #[cfg(feature = "tasks")]
 use crate::{admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator};
-use fastmcp_core::{McpError, McpResult};
+use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
 /// Exact request headers required for a modern MCP JSON-RPC POST.
 pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
@@ -484,17 +483,33 @@ impl ModernHttpResponseStream {
         cx: &Cx,
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, ModernHttpExecutorError> {
+        let cancellation = McpRequestCancellation::new();
+        self.read_to_end_with_cancellation(cx, &cancellation, maximum_bytes)
+            .await
+    }
+
+    /// Reads a finite response body while observing one request-local
+    /// cancellation domain as well as the ambient context.
+    ///
+    /// Cancellation wins while the native body is pending: dropping the
+    /// response stream then closes the request-owned body instead of waiting
+    /// for a peer frame or cancelling sibling HTTP requests.
+    pub async fn read_to_end_with_cancellation(
+        self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, ModernHttpExecutorError> {
         let mut response = self.response;
         let mut bytes = Vec::new();
-        let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
+        let mut cancelled = std::pin::pin!(cancellation.cancelled());
 
         loop {
-            if cx.checkpoint().is_err() {
+            if cx.checkpoint().is_err() || cancellation.is_cancel_requested() {
                 return Err(ModernHttpExecutorError::Cancelled);
             }
-            let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
             let frame = poll_fn(|task_cx| {
-                if cancellation.as_mut().poll(task_cx).is_ready() {
+                if cancelled.as_mut().poll(task_cx).is_ready() {
                     return Poll::Ready(Err(()));
                 }
                 match Pin::new(&mut response.body).poll_frame(task_cx) {
@@ -516,6 +531,9 @@ impl ModernHttpResponseStream {
             };
 
             while data.has_remaining() {
+                if cancellation.is_cancel_requested() {
+                    return Err(ModernHttpExecutorError::Cancelled);
+                }
                 let chunk = data.chunk();
                 if chunk.len() > maximum_bytes.saturating_sub(bytes.len()) {
                     return Err(ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes });
@@ -1914,21 +1932,65 @@ impl ModernHttpExecutor {
         cx: &Cx,
         request: &ModernHttpRequest,
     ) -> Result<ModernHttpResponseStream, ModernHttpExecutorError> {
-        if cx.checkpoint().is_err() {
+        self.execute_with_optional_cancellation(cx, None, request)
+            .await
+    }
+
+    /// Sends one POST while allowing an owning request to abandon the native
+    /// exchange before the peer has produced response headers.
+    ///
+    /// Returning on cancellation drops the still-pending native request
+    /// future. That closes only this exchange; it does not cancel the ambient
+    /// connection context or unrelated HTTP requests.
+    pub(crate) async fn execute_with_cancellation(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: &ModernHttpRequest,
+    ) -> Result<ModernHttpResponseStream, ModernHttpExecutorError> {
+        self.execute_with_optional_cancellation(cx, Some(cancellation), request)
+            .await
+    }
+
+    async fn execute_with_optional_cancellation(
+        &self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        request: &ModernHttpRequest,
+    ) -> Result<ModernHttpResponseStream, ModernHttpExecutorError> {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(ModernHttpExecutorError::Cancelled);
         }
-        let response = self
-            .client
-            .request_streaming(
-                cx,
-                Method::Post,
-                request.target(),
-                request.headers(),
-                request.body().to_vec(),
-            )
-            .await
-            .map_err(map_transport_error)?;
-        if cx.checkpoint().is_err() {
+        let mut exchange = Box::pin(self.client.request_streaming(
+            cx,
+            Method::Post,
+            request.target(),
+            request.headers(),
+            request.body().to_vec(),
+        ));
+        let response = match cancellation {
+            Some(cancellation) => {
+                let mut cancelled = std::pin::pin!(cancellation.cancelled());
+                poll_fn(|task_cx| {
+                    if cancelled.as_mut().poll(task_cx).is_ready() {
+                        return Poll::Ready(Err(()));
+                    }
+                    match exchange.as_mut().poll(task_cx) {
+                        Poll::Ready(response) => Poll::Ready(Ok(response)),
+                        Poll::Pending => Poll::Pending,
+                    }
+                })
+                .await
+                .map_err(|()| ModernHttpExecutorError::Cancelled)?
+                .map_err(map_transport_error)?
+            }
+            None => exchange.await.map_err(map_transport_error)?,
+        };
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(ModernHttpExecutorError::Cancelled);
         }
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
@@ -1972,13 +2034,14 @@ struct ModernHttpDiscoveryState {
 /// The result of a policy-bound modern HTTP connection attempt.
 #[allow(
     clippy::large_enum_variant,
-    reason = "this public one-shot connection outcome deliberately returns direct ownership of the selected client; boxing either era would add allocation and distort its caller-facing pattern-matching API"
+    reason = "this public one-shot connection outcome deliberately returns direct ownership of the selected client; boxing the modern client would add allocation and distort its caller-facing pattern-matching API"
 )]
 pub enum ModernHttpConnectOutcome {
     /// The probe selected MCP 2026-07-28 and a modern request client is ready.
     Modern(ModernHttpClient),
     /// A recognized disposable modern refusal opened the exact configured
     /// MCP 2024-11-05 SSE GET endpoint and pinned its advertised POST route.
+    #[cfg(feature = "legacy-2024-11-05")]
     LegacySse(LegacySseHttpClient),
 }
 
@@ -1991,6 +2054,7 @@ impl ModernHttpConnectOutcome {
     pub const fn selected_era(&self) -> Option<ProtocolEra> {
         match self {
             Self::Modern(_) => Some(ProtocolEra::Modern2026),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Some(ProtocolEra::Legacy2024),
         }
     }
@@ -2000,12 +2064,14 @@ impl ModernHttpConnectOutcome {
     pub fn into_modern(self) -> Option<ModernHttpClient> {
         match self {
             Self::Modern(client) => Some(client),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => None,
         }
     }
 
     /// Returns the ready legacy SSE client when the configured legacy route
     /// was opened after a recognized auto refusal or under `LegacyOnly`.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub fn into_legacy_sse(self) -> Option<LegacySseHttpClient> {
         match self {
@@ -2135,7 +2201,19 @@ impl std::error::Error for ModernHttpMrtrError {
 ///
 /// Its fields are deliberately private so a legacy connection cannot expose
 /// crate-internal extension-admission state as part of the public API.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct LegacySseConnection {
+    client: LegacySseHttpClient,
+    negotiated_protocol_version: Option<String>,
+    client_capabilities: ClientCapabilities,
+    reverse_request_handlers: ReverseRequestHandlers,
+    cancelled_response_ids: VecDeque<RequestId>,
+    persistent_receiver: Option<LegacySsePersistentReceiver>,
+    client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+}
+
+#[cfg(not(feature = "legacy-2024-11-05"))]
+struct LegacySseConnection {
     client: LegacySseHttpClient,
     negotiated_protocol_version: Option<String>,
     client_capabilities: ClientCapabilities,
@@ -2158,6 +2236,7 @@ pub enum ClientHttpConnection {
     /// Stateless MCP 2026-07-28 POST transport.
     Modern(ModernHttpClient),
     /// Exact MCP 2024-11-05 SSE plus message POST transport.
+    #[cfg(feature = "legacy-2024-11-05")]
     LegacySse(LegacySseConnection),
 }
 
@@ -2166,6 +2245,7 @@ pub enum ClientHttpResponse {
     /// The still-live HTTP response from a stateless modern POST.
     Modern(ModernHttpResponseStream),
     /// One strict JSON-RPC response received over the exact legacy SSE stream.
+    #[cfg(feature = "legacy-2024-11-05")]
     Legacy(JsonRpcMessage),
 }
 
@@ -2175,7 +2255,14 @@ pub enum ClientHttpResponse {
 /// In particular, its cancellation operation can never emit a
 /// `notifications/cancelled` frame for a request whose POST was not accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct LegacyHttpRequestCommit {
+    request_id: RequestId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(not(feature = "legacy-2024-11-05"))]
+struct LegacyHttpRequestCommit {
     request_id: RequestId,
 }
 
@@ -2194,7 +2281,18 @@ impl LegacyHttpRequestCommit {
 /// reader. It may therefore be awaited or cancelled while sibling request
 /// handles remain live. Dropping an unfinished handle retains a bounded
 /// tombstone so the connection-owned reader drains its late terminal frame.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct LegacyHttpRequest {
+    commit: LegacyHttpRequestCommit,
+    key: CorrelationKey,
+    receiver: oneshot::Receiver<LegacyPersistentResponse>,
+    state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
+    outbound: LegacySseHttpOutbound,
+    terminal: bool,
+}
+
+#[cfg(not(feature = "legacy-2024-11-05"))]
+struct LegacyHttpRequest {
     commit: LegacyHttpRequestCommit,
     key: CorrelationKey,
     receiver: oneshot::Receiver<LegacyPersistentResponse>,
@@ -2553,6 +2651,9 @@ impl ClientHttpConnection {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Result<Self, ClientHttpConnectionError> {
+        validate_protocol_plan_feature(&protocol_plan)
+            .map_err(ModernHttpClientError::FeatureUnavailable)
+            .map_err(ClientHttpConnectionError::Modern)?;
         Self::connect_with_mcp_apps(cx, protocol_plan, client_info, client_capabilities, None).await
     }
 
@@ -2582,7 +2683,9 @@ impl ClientHttpConnection {
         mcp_apps_settings: Option<McpAppsClientSettings>,
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     ) -> Result<Self, ClientHttpConnectionError> {
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_client_capabilities = client_capabilities.clone();
+        #[cfg(feature = "legacy-2024-11-05")]
         let legacy_client_extension_runtime = client_extension_runtime.clone();
         match ModernHttpClient::connect_with_extensions(
             cx,
@@ -2596,6 +2699,7 @@ impl ClientHttpConnection {
         .map_err(ClientHttpConnectionError::Modern)?
         {
             ModernHttpConnectOutcome::Modern(client) => Ok(Self::Modern(client)),
+            #[cfg(feature = "legacy-2024-11-05")]
             ModernHttpConnectOutcome::LegacySse(client) => {
                 Ok(Self::LegacySse(LegacySseConnection {
                     client,
@@ -2615,6 +2719,7 @@ impl ClientHttpConnection {
     pub const fn selected_protocol_era(&self) -> ProtocolEra {
         match self {
             Self::Modern(_) => ProtocolEra::Modern2026,
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => ProtocolEra::Legacy2024,
         }
     }
@@ -2628,6 +2733,7 @@ impl ClientHttpConnection {
     pub fn protocol_version(&self) -> Option<&str> {
         match self {
             Self::Modern(_) => Some(MODERN_PROTOCOL_VERSION),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(LegacySseConnection {
                 negotiated_protocol_version,
                 ..
@@ -2637,6 +2743,7 @@ impl ClientHttpConnection {
 
     /// Records the exact legacy version after its `initialize` response has
     /// been validated by the high-level lifecycle.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) fn record_legacy_negotiated_protocol_version(&mut self, version: String) {
         let Self::LegacySse(LegacySseConnection {
             negotiated_protocol_version,
@@ -2657,6 +2764,7 @@ impl ClientHttpConnection {
     pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
         match self {
             Self::Modern(client) => client.protocol_plan(),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(LegacySseConnection { client, .. }) => client.protocol_plan(),
         }
     }
@@ -2669,15 +2777,18 @@ impl ClientHttpConnection {
     pub fn server_discovery(&self) -> Option<ServerDiscoverResult> {
         match self {
             Self::Modern(client) => Some(client.server_discovery()),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => None,
         }
     }
 
     /// Returns whether final discovery activated the official MCP Apps extension.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub fn mcp_apps_active(&self) -> bool {
         match self {
             Self::Modern(client) => client.mcp_apps_active(),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => false,
         }
     }
@@ -2689,6 +2800,7 @@ impl ClientHttpConnection {
     ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
         match self {
             Self::Modern(client) => client.negotiated_extensions(),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => None,
         }
     }
@@ -2700,17 +2812,20 @@ impl ClientHttpConnection {
     ) -> McpResult<()> {
         match self {
             Self::Modern(client) => client.admit_final_extension_method(extension_id, method),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(McpError::invalid_params(
                 "Final client extensions are unavailable in exact MCP 2024-11-05",
             )),
         }
     }
 
+    #[cfg(feature = "apps")]
     pub(crate) fn mcp_apps_activation_receipt(
         &self,
     ) -> Option<fastmcp_protocol::extensions::McpAppsActivationReceipt> {
         match self {
             Self::Modern(client) => client.mcp_apps_activation_receipt(),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => None,
         }
     }
@@ -2719,6 +2834,7 @@ impl ClientHttpConnection {
     ///
     /// Modern stateless HTTP bodies do not share this legacy SSE queue.
     #[must_use]
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
         match self {
             Self::Modern(_) => None,
@@ -2738,6 +2854,7 @@ impl ClientHttpConnection {
     /// Auto negotiation intentionally discovers with the caller's ordinary
     /// capabilities. Callback-derived capabilities belong only to the legacy
     /// initialize envelope selected after that discovery decision.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) fn set_legacy_client_capabilities(&mut self, capabilities: ClientCapabilities) {
         let Self::LegacySse(LegacySseConnection {
             client_capabilities,
@@ -2755,6 +2872,7 @@ impl ClientHttpConnection {
     /// receiver. Once ready, one structured child exclusively drains the SSE
     /// stream, retains bounded notifications, and services eligible reverse
     /// requests even while no ordinary client request is pending.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) fn start_legacy_receive_pump(
         &mut self,
         cx: &Cx,
@@ -2793,6 +2911,7 @@ impl ClientHttpConnection {
     /// cancel it without holding `&mut self`; the connection-owned SSE reader
     /// continues to route cancellations, reverse requests, sibling progress,
     /// and late terminal responses independently.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub async fn start_legacy_request(
         &mut self,
         cx: &Cx,
@@ -2838,6 +2957,7 @@ impl ClientHttpConnection {
     /// were retained for the legacy `initialize` request. Configure this before
     /// issuing that request: a ready [`crate::HttpClient`] has already completed
     /// initialization and therefore cannot safely change this callable surface.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub fn set_legacy_reverse_request_handlers(
         &mut self,
         handlers: ReverseRequestHandlers,
@@ -2869,13 +2989,39 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
     ) -> Result<ClientHttpResponse, ClientHttpConnectionError> {
+        self.request_with_optional_cancellation(cx, None, method, parameters, request_id)
+            .await
+    }
+
+    async fn request_with_optional_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+    ) -> Result<ClientHttpResponse, ClientHttpConnectionError> {
         let method = method.as_ref();
         match self {
-            Self::Modern(client) => client
-                .request(cx, method, parameters, Some(request_id))
-                .await
-                .map(ClientHttpResponse::Modern)
-                .map_err(ClientHttpConnectionError::Modern),
+            Self::Modern(client) => match cancellation {
+                Some(cancellation) => client
+                    .request_with_cancellation(
+                        cx,
+                        cancellation,
+                        method,
+                        parameters,
+                        Some(request_id),
+                    )
+                    .await
+                    .map(ClientHttpResponse::Modern)
+                    .map_err(ClientHttpConnectionError::Modern),
+                None => client
+                    .request(cx, method, parameters, Some(request_id))
+                    .await
+                    .map(ClientHttpResponse::Modern)
+                    .map_err(ClientHttpConnectionError::Modern),
+            },
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(LegacySseConnection {
                 client,
                 client_capabilities,
@@ -3095,13 +3241,70 @@ impl ClientHttpConnection {
         request_id: RequestId,
         maximum_response_bytes: usize,
     ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+        self.request_json_with_result_source_at_inner(
+            cx,
+            None,
+            method.as_ref(),
+            parameters,
+            request_id,
+            maximum_response_bytes,
+        )
+        .await
+    }
+
+    /// Request-local variant of [`Self::request_json_with_result_source_at`].
+    ///
+    /// The HTTP exchange and its disposable JSON body are owned by this
+    /// cancellation domain, including the wait for response headers.
+    pub(crate) async fn request_json_with_result_source_at_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: impl AsRef<str>,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+        if cancellation.is_cancel_requested() {
+            return Err(ClientHttpConnectionError::Modern(
+                ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled),
+            ));
+        }
+        self.request_json_with_result_source_at_inner(
+            cx,
+            Some(cancellation),
+            method.as_ref(),
+            parameters,
+            request_id,
+            maximum_response_bytes,
+        )
+        .await
+    }
+
+    async fn request_json_with_result_source_at_inner(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
         let response = self
-            .request(cx, method, parameters, request_id.clone())
+            .request_with_optional_cancellation(
+                cx,
+                cancellation,
+                method,
+                parameters,
+                request_id.clone(),
+            )
             .await?;
         match response {
+            #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => {
                 Ok((response, None, Instant::now()))
             }
+            #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
                 Err(ClientHttpConnectionError::UnexpectedResponseMessage { request_id })
             }
@@ -3110,12 +3313,17 @@ impl ClientHttpConnection {
                 if !matches!(kind, ModernHttpResponseKind::Json) {
                     return Err(ClientHttpConnectionError::ExpectedJsonResponse { actual: kind });
                 }
-                let body = response
-                    .read_to_end(cx, maximum_response_bytes)
-                    .await
-                    .map_err(|error| {
-                        ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
-                    })?;
+                let body = match cancellation {
+                    Some(cancellation) => {
+                        response
+                            .read_to_end_with_cancellation(cx, cancellation, maximum_response_bytes)
+                            .await
+                    }
+                    None => response.read_to_end(cx, maximum_response_bytes).await,
+                }
+                .map_err(|error| {
+                    ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
+                })?;
                 let message = decode_strict_jsonrpc_message(&body, maximum_response_bytes)
                     .map_err(ClientHttpConnectionError::ResponseAdmission)?;
                 let JsonRpcMessage::Response(response) = message else {
@@ -3165,6 +3373,7 @@ impl ClientHttpConnection {
                 .open_subscriptions_listener(cx, request_id, notifications, limits)
                 .await
                 .map_err(ClientHttpConnectionError::SubscriptionsListen),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern),
         }
     }
@@ -3204,6 +3413,7 @@ impl ClientHttpConnection {
                 .open_final_core_listener(cx, method, parameters, request_id, limits)
                 .await
                 .map_err(ClientHttpConnectionError::FinalCoreListen),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
         }
     }
@@ -3260,6 +3470,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Mrtr),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::MrtrRequiresModern),
         }
     }
@@ -3295,6 +3506,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Mrtr),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::MrtrRequiresModern),
         }
     }
@@ -3332,6 +3544,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Mrtr),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::MrtrRequiresModern),
         }
     }
@@ -3347,11 +3560,37 @@ impl ClientHttpConnection {
         arguments: serde_json::Value,
         limits: SseLimits,
     ) -> Result<ModernHttpFinalCoreListener, ClientHttpConnectionError> {
+        self.open_final_tasks_tool_call_listener_with_progress_marker(
+            cx, request_id, name, arguments, None, limits,
+        )
+        .await
+    }
+
+    /// Opens a typed final `tools/call` stream while retaining the caller's
+    /// progress token in the upstream request metadata.
+    #[cfg(feature = "tasks")]
+    pub async fn open_final_tasks_tool_call_listener_with_progress_marker(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: Option<&fastmcp_protocol::ProgressMarker>,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ClientHttpConnectionError> {
         match self {
             Self::Modern(client) => client
-                .open_final_tasks_tool_call_listener(cx, request_id, name, arguments, limits)
+                .open_final_tasks_tool_call_listener_with_progress_marker(
+                    cx,
+                    request_id,
+                    name,
+                    arguments,
+                    progress_marker,
+                    limits,
+                )
                 .await
                 .map_err(ClientHttpConnectionError::FinalCoreListen),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
         }
     }
@@ -3374,6 +3613,7 @@ impl ClientHttpConnection {
                 .get_task_final(cx, request_id, task_id, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => {
                 Err(ClientHttpConnectionError::FinalTasksRequiresModern { method: TASK_GET })
             }
@@ -3406,6 +3646,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
                 method: TASK_UPDATE,
             }),
@@ -3429,6 +3670,7 @@ impl ClientHttpConnection {
                 .cancel_task_final(cx, request_id, task_id, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
                 method: TASK_CANCEL,
             }),
@@ -3455,6 +3697,7 @@ impl ClientHttpConnection {
                 .call_tool_final_outcome(cx, request_id, name, arguments, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalToolCallRequiresModern),
         }
     }
@@ -3486,6 +3729,7 @@ impl ClientHttpConnection {
                     },
                 )
             }
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(LegacySseConnection { client, .. }) => {
                 if let Some(parameters) = parameters.as_ref() {
                     reject_final_only_legacy_request_metadata(parameters)?;
@@ -3630,6 +3874,8 @@ fn reject_final_only_legacy_request_metadata(
 /// Errors raised while connecting or issuing a policy-bound modern HTTP request.
 #[derive(Debug)]
 pub enum ModernHttpClientError {
+    /// A public constructor selected a protocol policy compiled out of this client.
+    FeatureUnavailable(McpError),
     /// The supplied plan has no configured modern HTTP POST target.
     MissingModernPostTarget,
     /// A normal modern request requires object parameters so final metadata can
@@ -3676,6 +3922,7 @@ pub enum ModernHttpClientError {
     ClientExtensionNegotiation { message: String },
     /// The configured native legacy SSE connection could not be opened or
     /// safely used after policy selected its exact endpoint bundle.
+    #[cfg(feature = "legacy-2024-11-05")]
     LegacySse(LegacySseHttpClientError),
     /// The supplied request ID is not a valid JSON-RPC correlation key.
     InvalidRequestId,
@@ -3755,6 +4002,7 @@ pub enum ModernHttpClientError {
 impl fmt::Display for ModernHttpClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FeatureUnavailable(error) => error.fmt(formatter),
             Self::MissingModernPostTarget => {
                 formatter.write_str("the protocol plan has no modern MCP POST target")
             }
@@ -3809,6 +4057,7 @@ impl fmt::Display for ModernHttpClientError {
                     "final client extension negotiation failed: {message}"
                 )
             }
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(error) => error.fmt(formatter),
             Self::InvalidRequestId => {
                 formatter.write_str("final HTTP tools/call requires a valid JSON-RPC request ID")
@@ -3894,8 +4143,10 @@ impl fmt::Display for ModernHttpClientError {
 impl std::error::Error for ModernHttpClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::FeatureUnavailable(error) => Some(error),
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
+            #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(error) => Some(error),
             Self::InvalidTasksJsonRpcResponse { error, .. } => Some(error),
             Self::InvalidJsonRpcResponse(error) => Some(error),
@@ -3948,6 +4199,8 @@ impl ModernHttpClient {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
+        validate_protocol_plan_feature(&protocol_plan)
+            .map_err(ModernHttpClientError::FeatureUnavailable)?;
         Self::connect_with_mcp_apps(cx, protocol_plan, client_info, client_capabilities, None).await
     }
 
@@ -3977,16 +4230,25 @@ impl ModernHttpClient {
         mcp_apps_settings: Option<McpAppsClientSettings>,
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
+        validate_protocol_plan_feature(&protocol_plan)
+            .map_err(ModernHttpClientError::FeatureUnavailable)?;
         if cx.checkpoint().is_err() {
             return Err(ModernHttpClientError::Executor(
                 ModernHttpExecutorError::Cancelled,
             ));
         }
         if matches!(protocol_plan.policy(), ProtocolPolicy::LegacyOnly) {
+            #[cfg(feature = "legacy-2024-11-05")]
             return LegacySseHttpClient::connect(cx, protocol_plan)
                 .await
                 .map(ModernHttpConnectOutcome::LegacySse)
                 .map_err(ModernHttpClientError::LegacySse);
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            return Err(ModernHttpClientError::FeatureUnavailable(
+                McpError::invalid_params(
+                    "MCP 2024-11-05 HTTP requires the legacy-2024-11-05 feature",
+                ),
+            ));
         }
 
         let modern_post_target = protocol_plan
@@ -4073,12 +4335,19 @@ impl ModernHttpClient {
                     executor: ModernHttpExecutor::new(),
                 }))
             }
+            #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => {
                 LegacySseHttpClient::connect(cx, protocol_plan)
                     .await
                     .map(ModernHttpConnectOutcome::LegacySse)
                     .map_err(ModernHttpClientError::LegacySse)
             }
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => Err(
+                ModernHttpClientError::FeatureUnavailable(McpError::invalid_params(
+                    "MCP 2024-11-05 HTTP requires the legacy-2024-11-05 feature",
+                )),
+            ),
         }
     }
 
@@ -4105,6 +4374,7 @@ impl ModernHttpClient {
     }
 
     /// Returns whether final discovery activated the official MCP Apps extension.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub fn mcp_apps_active(&self) -> bool {
         self.discovery_state
@@ -4116,6 +4386,7 @@ impl ModernHttpClient {
 
     /// Returns the sole Apps receipt derived by this connection's retained
     /// final discovery negotiation.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub fn mcp_apps_activation_receipt(
         &self,
@@ -4230,6 +4501,18 @@ impl ModernHttpClient {
             .map_err(ModernHttpClientError::Executor)
     }
 
+    async fn execute_post_discovery_request_with_cancellation(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: &ModernHttpRequest,
+    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
+        self.executor
+            .execute_with_cancellation(cx, cancellation, request)
+            .await
+            .map_err(ModernHttpClientError::Executor)
+    }
+
     /// Issues one modern JSON-RPC request through the native HTTP executor.
     ///
     /// The runtime overwrites the final metadata keys in `_meta` from its
@@ -4253,6 +4536,31 @@ impl ModernHttpClient {
         let request =
             self.build_post_discovery_request(cx, method, parameters, request_id, None)?;
         self.execute_post_discovery_request(cx, &request).await
+    }
+
+    async fn request_with_cancellation(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: Option<RequestId>,
+    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
+        if cancellation.is_cancel_requested() {
+            return Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::Cancelled,
+            ));
+        }
+        validate_final_method(method, request_id.is_some())?;
+        if request_id.is_none() {
+            return Err(ModernHttpClientError::ClientNotificationPostUnsupported {
+                method: method.to_owned(),
+            });
+        }
+        let request =
+            self.build_post_discovery_request(cx, method, parameters, request_id, None)?;
+        self.execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
+            .await
     }
 
     /// Calls one tool through ordinary modern HTTP and follows bounded MRTR
@@ -4582,6 +4890,24 @@ impl ModernHttpClient {
         arguments: serde_json::Value,
         limits: SseLimits,
     ) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
+        self.open_final_tasks_tool_call_listener_with_progress_marker(
+            cx, request_id, name, arguments, None, limits,
+        )
+        .await
+    }
+
+    /// Opens a typed final Tasks `tools/call` response stream with an optional
+    /// exact progress marker supplied by the caller.
+    #[cfg(feature = "tasks")]
+    pub async fn open_final_tasks_tool_call_listener_with_progress_marker(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: Option<&fastmcp_protocol::ProgressMarker>,
+        limits: SseLimits,
+    ) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
         if request_id.validate().is_err() {
             return Err(ModernHttpFinalCoreListenError::InvalidRequestId);
         }
@@ -4595,11 +4921,15 @@ impl ModernHttpClient {
             fastmcp_protocol::TASKS_EXTENSION.to_owned(),
             serde_json::json!({}),
         )]);
+        let mut parameters = serde_json::json!({ "name": name, "arguments": arguments });
+        if let Some(marker) = progress_marker {
+            parameters["_meta"] = serde_json::json!({ "progressToken": marker });
+        }
         let request = self
             .build_post_discovery_request(
                 cx,
                 TOOLS_CALL,
-                serde_json::json!({ "name": name, "arguments": arguments }),
+                parameters,
                 Some(request_id.clone()),
                 Some(&task_extensions),
             )
@@ -5093,7 +5423,20 @@ impl ModernHttpClient {
 
 /// A live MCP 2024-11-05 SSE connection with its advertised POST target
 /// pinned to the immutable legacy endpoint bundle.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct LegacySseHttpClient {
+    protocol_plan: ClientProtocolPlan,
+    configured_message_post_target: String,
+    advertised_message_post_target: String,
+    post_client: HttpClient,
+    stream: Option<LegacySseResponseStream>,
+    notifications: VecDeque<JsonRpcRequest>,
+}
+
+/// Internal exact-2024 connection state retained only so feature-off public
+/// constructors can reject legacy policy before any peer contact.
+#[cfg(not(feature = "legacy-2024-11-05"))]
+pub(crate) struct LegacySseHttpClient {
     protocol_plan: ClientProtocolPlan,
     configured_message_post_target: String,
     advertised_message_post_target: String,
@@ -5481,7 +5824,16 @@ fn legacy_sse_reverse_request_dispatch(
 /// [`ClientHttpConnection`] variant. Its state and lifecycle operations remain
 /// private to the connection so callers cannot detach or replace the reader.
 #[doc(hidden)]
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct LegacySsePersistentReceiver {
+    state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
+    task: asupersync::runtime::TaskHandle<()>,
+    outbound: LegacySseHttpOutbound,
+    reverse_callbacks: LegacySseReverseCallbackDispatcher,
+}
+
+#[cfg(not(feature = "legacy-2024-11-05"))]
+struct LegacySsePersistentReceiver {
     state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
     task: asupersync::runtime::TaskHandle<()>,
     outbound: LegacySseHttpOutbound,
@@ -5833,6 +6185,17 @@ mod legacy_target_admission_tests {
 }
 
 impl LegacySseHttpClient {
+    /// Opens the configured exact-2024 SSE GET endpoint and admits its first
+    /// `endpoint` event only when it names the immutable configured POST
+    /// resource.
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub async fn connect(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+    ) -> Result<Self, LegacySseHttpClientError> {
+        Self::connect_inner(cx, protocol_plan).await
+    }
+
     /// Opens the configured SSE GET endpoint and admits its first `endpoint`
     /// event only when it names the immutable configured POST resource: the
     /// advertised target must equal the configured one exactly, or differ
@@ -5840,7 +6203,8 @@ impl LegacySseHttpClient {
     /// component (the exact 2024-11-05 lane advertises a session-scoped
     /// message endpoint). Any scheme, authority, or path divergence remains
     /// a hard mismatch.
-    pub async fn connect(
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn connect_inner(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
     ) -> Result<Self, LegacySseHttpClientError> {
@@ -7176,6 +7540,7 @@ mod tests {
     use asupersync::http::Frame;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::{CancelKind, Cx};
+    #[cfg(feature = "apps")]
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionDescriptorRegistry, McpAppsClientSettings,
         OFFICIAL_MCP_APPS_EXTENSION_ID, official_mcp_apps_negotiation_resolver,
@@ -7192,6 +7557,8 @@ mod tests {
         ServerNotification, SubscriptionFilter,
     };
 
+    #[cfg(feature = "apps")]
+    use super::merge_client_extensions;
     use super::{
         ClientHttpConnection, ClientHttpConnectionError, LegacyPersistentResponse,
         LegacyPersistentResponseWaiter, LegacySseConnection, LegacySseHttpClientError,
@@ -7202,10 +7569,10 @@ mod tests {
         ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
         ModernHttpFinalCoreListenError, ModernHttpMrtrError, ModernHttpResponseKind,
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        decode_modern_discovery_response, merge_client_extensions,
-        reject_body_frame_after_cancellation, retire_abandoned_persistent_waiter,
-        validate_response_head,
+        decode_modern_discovery_response, reject_body_frame_after_cancellation,
+        retire_abandoned_persistent_waiter, validate_response_head,
     };
+    #[cfg(feature = "apps")]
     use crate::session::ClientExtensionRuntime;
     use crate::sse::SseLimits;
     use crate::{
@@ -7389,8 +7756,8 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "apps", feature = "tasks"))]
     #[test]
-    #[cfg(feature = "tasks")]
     fn modern_http_merges_configured_apps_and_per_call_tasks_extensions() {
         let apps = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
             .expect("valid Apps MIME settings");
@@ -7414,6 +7781,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "apps")]
     #[test]
     fn modern_http_configured_apps_settings_win_over_a_one_field_per_call_collision() {
         let apps = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
@@ -7434,6 +7802,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "apps")]
     fn generic_mcp_apps_runtime(mime_type: &str) -> Arc<ClientExtensionRuntime> {
         let mut registry = ExtensionDescriptorRegistry::new();
         let apps_id = register_official_mcp_apps_extension(&mut registry)
@@ -7452,6 +7821,7 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "apps")]
     fn assert_generic_mcp_apps_precedes_compatibility_settings(
         generic_mime_type: &str,
         compatibility_mime_type: &str,
@@ -7514,6 +7884,7 @@ mod tests {
         server.join().expect("generic Apps precedence server joins");
     }
 
+    #[cfg(feature = "apps")]
     #[test]
     fn generic_mcp_apps_registry_precedes_dedicated_compatibility_settings() {
         assert_generic_mcp_apps_precedes_compatibility_settings(
@@ -7528,6 +7899,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "apps")]
     fn assert_public_http_apps_advertisement_after_discovery(apps_active: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Apps listener");
         let address = listener.local_addr().expect("read local Apps address");
@@ -7623,11 +7995,13 @@ mod tests {
         server.join().expect("Apps negotiation server must join");
     }
 
+    #[cfg(feature = "apps")]
     #[test]
     fn public_http_connection_request_json_with_result_source_is_lossless() {
         assert_public_http_apps_advertisement_after_discovery(true);
     }
 
+    #[cfg(feature = "apps")]
     #[test]
     fn public_http_connection_omits_configured_apps_after_one_field_inactive_discovery() {
         assert_public_http_apps_advertisement_after_discovery(false);
@@ -7658,6 +8032,77 @@ mod tests {
             0,
         )
         .expect("complete local HTTP plan must be accepted")
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn feature_off_public_http_constructors_refuse_legacy_before_peer_contact() {
+        // `LegacySseHttpClient` is crate-private and its `connect` constructor
+        // is compiled out without the legacy feature. These are the remaining
+        // public HTTP connection entry points available to a downstream
+        // no-feature user.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind a peer that feature-off constructors must not contact");
+        let address = listener
+            .local_addr()
+            .expect("read feature-off no-contact listener address");
+        let legacy_sse = format!("http://{address}/legacy-sse");
+        let legacy_message = format!("http://{address}/legacy-message");
+        let protocol_plan = plan(
+            "http://127.0.0.1:9/unused-modern",
+            &legacy_sse,
+            &legacy_message,
+            ProtocolPolicy::LegacyOnly,
+        );
+        let client_info = ClientInfo {
+            name: "feature-off-direct-http".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        let cx = Cx::for_testing();
+
+        let connection_error = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            protocol_plan.clone(),
+            client_info.clone(),
+            ClientCapabilities::default(),
+        ))
+        .expect_err("direct policy-bound HTTP connection must reject before contact");
+        assert!(matches!(
+            connection_error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::FeatureUnavailable(_))
+        ));
+
+        let modern_error = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            protocol_plan.clone(),
+            client_info.clone(),
+            ClientCapabilities::default(),
+        ))
+        .expect_err("direct modern HTTP constructor must reject before contact");
+        assert!(matches!(
+            modern_error,
+            ModernHttpClientError::FeatureUnavailable(_)
+        ));
+
+        let client_error = runtime_block_on(crate::HttpClient::connect(
+            &cx,
+            protocol_plan,
+            client_info,
+            ClientCapabilities::default(),
+        ))
+        .expect_err("direct high-level HTTP constructor must reject before contact");
+        assert!(matches!(
+            client_error,
+            crate::HttpClientError::CoreResult(_)
+        ));
+
+        listener
+            .set_nonblocking(true)
+            .expect("configure feature-off no-contact listener");
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     fn read_request(stream: &mut TcpStream) -> CapturedHttpRequest {
@@ -9224,6 +9669,7 @@ mod tests {
         server.join().expect("modern SSE server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_quiet_sse_cancellation_drops_the_owned_response_body_immediately() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy SSE listener");
@@ -9884,6 +10330,7 @@ mod tests {
             .expect("absent-Tasks HTTP listener must observe no POST");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     #[cfg(feature = "tasks")]
     fn public_http_tasks_lifecycle_rejects_legacy_before_message_post() {
@@ -10025,6 +10472,7 @@ mod tests {
             .expect("malformed final subscriptions/listen server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_connection_legacy_only_posts_and_reads_exact_sse_response() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
@@ -10113,6 +10561,7 @@ mod tests {
         server.join().expect("local legacy server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_legacy_sse_connection_retains_the_exact_pending_event_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind bounded legacy listener");
@@ -10165,6 +10614,7 @@ mod tests {
         server.join().expect("bounded legacy server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_legacy_sse_connection_rejects_one_extra_pending_event() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind overflowing legacy listener");
@@ -10214,6 +10664,7 @@ mod tests {
         server.join().expect("overflowing legacy server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_connection_request_json_rejects_only_a_legacy_response_id_mismatch() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy mismatch listener");
@@ -10319,6 +10770,7 @@ mod tests {
         server.join().expect("Auto modern server joins");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Auto fallback listener");
@@ -10431,6 +10883,7 @@ mod tests {
         server.join().expect("Auto fallback server must join");
     }
 
+    #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
     fn public_http_client_legacy_only_completes_exact_legacy_lifecycle() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
@@ -10558,6 +11011,7 @@ mod tests {
         server.join().expect("legacy-only server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_client_rejects_a_wrong_legacy_initialize_wire_version() {
         let listener =
@@ -10634,6 +11088,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn wrong_version_peer_settles_after_a_planted_pre_connect_client_cancellation() {
         let listener =
@@ -10683,6 +11138,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_connection_auto_rejects_only_a_contradictory_legacy_endpoint() {
         let listener =
@@ -10729,6 +11185,7 @@ mod tests {
         server.join().expect("contradictory peer server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_legacy_request_queues_interleaved_notification_until_its_response() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
@@ -10797,6 +11254,7 @@ mod tests {
         server.join().expect("legacy request server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_request_admits_exact_combined_control_bound_and_keeps_correlation() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy control listener");
@@ -10917,6 +11375,7 @@ mod tests {
         server.join().expect("legacy control-boundary server joins");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_request_rejects_n_plus_one_combined_control_frame_without_extra_reply() {
         let listener =
@@ -11051,6 +11510,7 @@ mod tests {
         server.join().expect("legacy control-limit server joins");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_request_services_authorized_reverse_calls_and_rejects_elicitation() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy reverse listener");
@@ -11237,6 +11697,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn assert_public_high_level_http_initialize_reverse_callbacks(
         policy: ProtocolPolicy,
         configure_handlers: bool,
@@ -11453,6 +11914,7 @@ mod tests {
     /// cancellation notification: `84` owns the reverse request; `85` does
     /// not. The matching case must fence the callback POST, while the
     /// one-variable non-match must still receive the normal callback result.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn assert_public_high_level_http_reverse_callback_cancellation(cancellation_id: i64) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .expect("bind high-level legacy reverse cancellation listener");
@@ -11627,6 +12089,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_high_level_http_installs_legacy_reverse_callbacks_before_initialize() {
         assert_public_high_level_http_initialize_reverse_callbacks(
@@ -11636,6 +12099,7 @@ mod tests {
         assert_public_high_level_http_initialize_reverse_callbacks(ProtocolPolicy::Auto, true);
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_high_level_http_without_handlers_rejects_reverse_calls_during_initialize() {
         assert_public_high_level_http_initialize_reverse_callbacks(
@@ -11644,11 +12108,13 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_high_level_http_matching_reverse_callback_cancellation_fences_response_post() {
         assert_public_high_level_http_reverse_callback_cancellation(84);
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_high_level_http_nonmatching_reverse_callback_cancellation_preserves_response_post() {
         assert_public_high_level_http_reverse_callback_cancellation(85);
@@ -11690,6 +12156,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_matching_cancellation_discards_late_response_before_follow_up() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy cancellation listener");
@@ -11806,6 +12273,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn ready_legacy_tombstone_refuses_reused_id_and_routes_distinct_follow_up() {
         let listener =
@@ -11977,6 +12445,7 @@ mod tests {
         server.join().expect("ready legacy tombstone peer joins");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(
         use_ready_receive_pump: bool,
     ) {
@@ -12143,16 +12612,19 @@ mod tests {
             .expect("ready legacy accepted-POST cancellation peer joins");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_cancelled_post_tombstones_late_response_before_follow_up() {
         assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(false);
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn ready_legacy_cancelled_post_tombstones_late_response_before_follow_up() {
         assert_legacy_cancelled_post_tombstones_late_response_before_follow_up(true);
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_http_foreign_cancellation_is_retained_without_cancelling_active_request() {
         // This differs from the admitted cancellation case only in the
@@ -12281,6 +12753,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_legacy_request_rejects_only_final_metadata_without_sending_or_mutating() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
@@ -12361,6 +12834,7 @@ mod tests {
         server.join().expect("legacy negative server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_legacy_notification_rejects_only_final_metadata_without_sending_or_mutating() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
@@ -12432,6 +12906,7 @@ mod tests {
         server.join().expect("legacy notification server must join");
     }
 
+    #[cfg(feature = "apps")]
     #[test]
     fn modern_http_client_is_stateless_for_json_and_sse_posts() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stateless HTTP listener");
