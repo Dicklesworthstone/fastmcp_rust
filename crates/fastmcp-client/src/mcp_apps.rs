@@ -1164,6 +1164,24 @@ mod tests {
             .expect("selected final tools/call result decodes")
     }
 
+    fn final_resources_read_result(result: Value) -> CoreResult {
+        let params = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "uri": "file:///bridge-test"
+        });
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params))
+                .expect("final resources/read request admits its selected result algebra");
+        request
+            .decode_result(
+                &serde_json::to_string(&result).expect("selected result serializes for decoding"),
+            )
+            .expect("selected final resources/read result decodes")
+    }
+
     #[test]
     fn apps_reused_complete_tool_result_remains_bridgeable() {
         let result = final_tools_call_result(json!({
@@ -1207,6 +1225,22 @@ mod tests {
 
         let error = project_reused_core_result(McpAppsRoutedMethod::ToolsCall, result)
             .expect_err("an input-required result must not form an Apps response");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "MCP Apps bridge does not support Tasks or input-required results"
+        );
+    }
+
+    #[test]
+    fn apps_reused_resource_input_required_result_is_rejected_without_apps_serialization() {
+        let result = final_resources_read_result(json!({
+            "resultType": "input_required",
+            "requestState": "resume-bridge"
+        }));
+
+        let error = project_reused_core_result(McpAppsRoutedMethod::ResourcesRead, result)
+            .expect_err("an input-required resource result must not form an Apps response");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert_eq!(
             error.message,
