@@ -34,13 +34,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
+use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
 #[cfg(target_os = "linux")]
 use fastmcp_client::linux_process_group_has_live_member;
 use fastmcp_client::{
-    Client, ClientBuilder, ClientProtocolPlan, ListPageLimits, claude_desktop_config_path,
+    CanonicalHttpUrl, Client, ClientBuilder, ClientProtocolPlan, ListPageLimits,
+    claude_desktop_config_path,
 };
 use fastmcp_console::console::{is_credential_key, redact_free_text_credentials_with};
 use fastmcp_core::McpResult;
@@ -512,11 +514,20 @@ enum Commands {
     /// Connects to the server, lists its tools, resources, and prompts,
     /// then displays them in a formatted output.
     Inspect {
-        /// Server command or path.
-        server: String,
+        /// Server command or path. Omit when using --http-url.
+        #[arg(required_unless_present = "http_url", conflicts_with = "http_url")]
+        server: Option<String>,
+
+        /// Explicit modern Streamable HTTP MCP endpoint. Requires --protocol-policy modern-only.
+        #[arg(long, value_name = "URL")]
+        http_url: Option<String>,
 
         /// Arguments to pass to the server.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            requires = "server"
+        )]
         args: Vec<String>,
 
         /// Output format (text or FastMCP diagnostic JSON).
@@ -846,11 +857,22 @@ fn main() -> ExitCode {
         } => cmd_run(&server, &args, cwd.as_deref(), &env, protocol_policy),
         Commands::Inspect {
             server,
+            http_url,
             args,
             format,
             output,
             protocol_policy,
-        } => cmd_inspect(&server, &args, format, output.as_deref(), protocol_policy),
+        } => match (server.as_deref(), http_url.as_deref()) {
+            (Some(server), None) => {
+                cmd_inspect(server, &args, format, output.as_deref(), protocol_policy)
+            }
+            (None, Some(http_url)) => {
+                cmd_inspect_http(http_url, format, output.as_deref(), protocol_policy)
+            }
+            _ => Err(fastmcp_core::McpError::invalid_params(
+                "inspect requires exactly one server command or --http-url",
+            )),
+        },
         Commands::Install {
             name,
             server,
@@ -5178,25 +5200,247 @@ fn cmd_inspect(
     let protocol_status =
         InspectProtocolStatus::new(protocol_policy, &negotiated_protocol_version)?;
 
+    write_inspect_report(
+        &server_info,
+        &capabilities,
+        &tools,
+        &resources,
+        &resource_templates,
+        &prompts,
+        acquisition_truncated,
+        protocol_status,
+        format,
+        output,
+    )
+}
+
+/// Builds the immutable modern-only HTTP plan accepted by `inspect --http-url`.
+///
+/// A single URL can only identify the modern POST endpoint. Legacy HTTP needs
+/// separately configured SSE and message POST routes, so refusing Auto and
+/// LegacyOnly here prevents discovery or fallback probes from reaching an
+/// endpoint whose policy cannot be expressed by the command line.
+fn http_inspect_protocol_plan(
+    http_url: &str,
+    protocol_policy: CliProtocolPolicy,
+) -> McpResult<ClientProtocolPlan> {
+    if protocol_policy != CliProtocolPolicy::ModernOnly {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "--http-url requires --protocol-policy modern-only",
+        ));
+    }
+
+    let modern_post = CanonicalHttpUrl::parse(http_url).map_err(|error| {
+        fastmcp_core::McpError::invalid_params(format!("invalid --http-url: {error}"))
+    })?;
+    ClientProtocolPlan::http(
+        ProtocolPolicy::ModernOnly,
+        Some(modern_post),
+        None,
+        None,
+        "fastmcp-cli-inspect".to_owned(),
+        "fastmcp-cli-inspect".to_owned(),
+        "fastmcp-cli-inspect-http".to_owned(),
+        1,
+        1,
+        1,
+    )
+    .map_err(|error| {
+        fastmcp_core::McpError::invalid_params(format!("invalid --http-url policy plan: {error}"))
+    })
+}
+
+/// Inspects a ready modern Streamable HTTP endpoint using the policy-bound
+/// high-level client. The explicit HTTP target has already been admitted as
+/// ModernOnly, so every catalog request below must retain the final result
+/// shape; no legacy conversion or fallback probe is allowed on this path.
+fn cmd_inspect_http(
+    http_url: &str,
+    format: InspectFormat,
+    output: Option<&std::path::Path>,
+    protocol_policy: CliProtocolPolicy,
+) -> McpResult<()> {
+    let protocol_plan = http_inspect_protocol_plan(http_url, protocol_policy)?;
+    let mut client = Client::http(protocol_plan).map_err(|error| {
+        fastmcp_core::McpError::internal_error(format!(
+            "inspect could not connect to the configured HTTP endpoint: {error}"
+        ))
+    })?;
+
+    if client.selected_protocol_era() != ProtocolEra::Modern2026 {
+        return Err(fastmcp_core::McpError::internal_error(
+            "modern-only HTTP inspect selected a non-modern protocol era",
+        ));
+    }
+    let protocol_status = InspectProtocolStatus::new(protocol_policy, "2026-07-28")?;
+    let server_info = client.server_info().clone();
+    let discovery = client.server_discovery().ok_or_else(|| {
+        fastmcp_core::McpError::internal_error(
+            "modern-only HTTP inspect completed without a server/discover result",
+        )
+    })?;
+    let capabilities: fastmcp_protocol::ServerCapabilities =
+        project_final_for_inspect::<&fastmcp_protocol::ServerDiscoverCapabilities, _>(
+            discovery.capabilities(),
+            "server/discover",
+        )?;
+
+    let mut acquisition_truncated = false;
+    let tools = if capabilities.tools.is_some() {
+        let result = http_inspect_final_core_request(&mut client, "tools/list")?;
+        let fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ToolsList {
+            result,
+            ..
+        }) = result
+        else {
+            return Err(unexpected_http_inspect_result("tools/list"));
+        };
+        acquisition_truncated |= result.payload.next_cursor.is_some();
+        project_final_for_inspect(result.payload.tools, "tools/list")?
+    } else {
+        Vec::new()
+    };
+
+    let resources = if capabilities.resources.is_some() {
+        let result = http_inspect_final_core_request(&mut client, "resources/list")?;
+        let fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ResourcesList {
+            result,
+            ..
+        }) = result
+        else {
+            return Err(unexpected_http_inspect_result("resources/list"));
+        };
+        acquisition_truncated |= result.payload.next_cursor.is_some();
+        project_final_for_inspect(result.payload.resources, "resources/list")?
+    } else {
+        Vec::new()
+    };
+
+    let resource_templates = if capabilities.resources.is_some() {
+        let result = http_inspect_final_core_request(&mut client, "resources/templates/list")?;
+        let fastmcp_client::CoreResult::Final(
+            fastmcp_client::FinalCoreResult::ResourceTemplatesList { result, .. },
+        ) = result
+        else {
+            return Err(unexpected_http_inspect_result("resources/templates/list"));
+        };
+        acquisition_truncated |= result.payload.next_cursor.is_some();
+        project_final_for_inspect(
+            result.payload.resource_templates,
+            "resources/templates/list",
+        )?
+    } else {
+        Vec::new()
+    };
+
+    let prompts = if capabilities.prompts.is_some() {
+        let result = http_inspect_final_core_request(&mut client, "prompts/list")?;
+        let fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::PromptsList {
+            result,
+            ..
+        }) = result
+        else {
+            return Err(unexpected_http_inspect_result("prompts/list"));
+        };
+        acquisition_truncated |= result.payload.next_cursor.is_some();
+        project_final_for_inspect(result.payload.prompts, "prompts/list")?
+    } else {
+        Vec::new()
+    };
+
+    write_inspect_report(
+        &server_info,
+        &capabilities,
+        &tools,
+        &resources,
+        &resource_templates,
+        &prompts,
+        acquisition_truncated,
+        protocol_status,
+        format,
+        output,
+    )
+}
+
+fn http_inspect_final_core_request(
+    client: &mut fastmcp_client::HttpClient,
+    method: &'static str,
+) -> McpResult<fastmcp_client::CoreResult> {
+    fastmcp_core::runtime::block_on(async {
+        let cx = asupersync::Cx::current().ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "inspect HTTP runtime did not install a cancellation context",
+            )
+        })?;
+        client
+            .request_final_core(&cx, method, serde_json::json!({}))
+            .await
+            .map_err(|error| {
+                fastmcp_core::McpError::internal_error(format!(
+                    "inspect HTTP {method} request failed: {error}"
+                ))
+            })
+    })
+}
+
+fn unexpected_http_inspect_result(method: &str) -> fastmcp_core::McpError {
+    fastmcp_core::McpError::internal_error(format!(
+        "modern-only HTTP inspect received a non-final result for {method}",
+    ))
+}
+
+/// Projects the exact typed final catalog model only for the existing inspect
+/// renderer, which intentionally has a stable legacy-shaped display model.
+/// The HTTP client itself retains the final result until this rendering seam.
+fn project_final_for_inspect<T, U>(value: T, source: &str) -> McpResult<U>
+where
+    T: Serialize,
+    U: DeserializeOwned,
+{
+    let value = serde_json::to_value(value).map_err(|error| {
+        fastmcp_core::McpError::internal_error(format!(
+            "inspect could not serialize typed final {source} data: {error}"
+        ))
+    })?;
+    serde_json::from_value(value).map_err(|error| {
+        fastmcp_core::McpError::internal_error(format!(
+            "inspect could not render typed final {source} data: {error}"
+        ))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_inspect_report(
+    server_info: &fastmcp_protocol::ServerInfo,
+    capabilities: &fastmcp_protocol::ServerCapabilities,
+    tools: &[fastmcp_protocol::Tool],
+    resources: &[fastmcp_protocol::Resource],
+    resource_templates: &[fastmcp_protocol::ResourceTemplate],
+    prompts: &[fastmcp_protocol::Prompt],
+    acquisition_truncated: bool,
+    protocol_status: InspectProtocolStatus,
+    format: InspectFormat,
+    output: Option<&std::path::Path>,
+) -> McpResult<()> {
     // Format output
     let output_text = match format {
         InspectFormat::Text => format_inspect_text_with_truncation(
-            &server_info,
-            &capabilities,
-            &tools,
-            &resources,
-            &resource_templates,
-            &prompts,
+            server_info,
+            capabilities,
+            tools,
+            resources,
+            resource_templates,
+            prompts,
             acquisition_truncated,
             protocol_status,
         ),
         InspectFormat::Json => format_inspect_json_with_truncation(
-            &server_info,
-            &capabilities,
-            &tools,
-            &resources,
-            &resource_templates,
-            &prompts,
+            server_info,
+            capabilities,
+            tools,
+            resources,
+            resource_templates,
+            prompts,
             acquisition_truncated,
             protocol_status,
         )?,
@@ -10167,7 +10411,7 @@ mod tests {
                     output,
                     ..
                 } => {
-                    assert_eq!(server, "./server");
+                    assert_eq!(server.as_deref(), Some("./server"));
                     assert_eq!(format, InspectFormat::Text);
                     assert!(output.is_none());
                 }
@@ -10185,6 +10429,46 @@ mod tests {
                 }
                 _ => unreachable!("Expected Inspect command"),
             }
+        }
+
+        #[test]
+        fn test_inspect_command_http_url_target() {
+            let cli = Cli::try_parse_from([
+                "fastmcp",
+                "inspect",
+                "--http-url",
+                "http://127.0.0.1:8123/mcp",
+                "--protocol-policy",
+                "modern-only",
+            ])
+            .expect("HTTP inspect target parses without a stdio command");
+            match cli.command {
+                Commands::Inspect {
+                    server,
+                    http_url,
+                    args,
+                    protocol_policy,
+                    ..
+                } => {
+                    assert!(server.is_none());
+                    assert_eq!(http_url.as_deref(), Some("http://127.0.0.1:8123/mcp"));
+                    assert!(args.is_empty());
+                    assert_eq!(protocol_policy, CliProtocolPolicy::ModernOnly);
+                }
+                _ => unreachable!("Expected Inspect command"),
+            }
+        }
+
+        #[test]
+        fn http_inspect_rejects_non_modern_policy_before_plan_construction() {
+            let error =
+                http_inspect_protocol_plan("http://127.0.0.1:8123/mcp", CliProtocolPolicy::Auto)
+                    .expect_err("a single HTTP URL cannot authorize a legacy route probe");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert_eq!(
+                error.message,
+                "--http-url requires --protocol-policy modern-only"
+            );
         }
 
         #[test]

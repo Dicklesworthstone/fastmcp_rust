@@ -2,12 +2,12 @@
 
 #![cfg(unix)]
 
-#[cfg(feature = "e2e-fixture")]
-use std::io::Write;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, ExitStatus, Stdio};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -965,6 +965,63 @@ fn run_cli(args: &[&str]) -> Output {
     })
 }
 
+fn read_h1_json_request(stream: &mut TcpStream) -> (String, serde_json::Value) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set HTTP fixture read timeout");
+    let mut wire = Vec::new();
+    let mut buffer = [0_u8; 4_096];
+    let head_end = loop {
+        let read = stream.read(&mut buffer).expect("read HTTP fixture request");
+        assert!(read > 0, "HTTP client closed before a complete request");
+        wire.extend_from_slice(&buffer[..read]);
+        if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = std::str::from_utf8(&wire[..head_end])
+        .expect("HTTP fixture request head is UTF-8")
+        .to_owned();
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length").then(|| {
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("HTTP fixture content length is numeric")
+            })
+        })
+        .expect("HTTP fixture request has a content length");
+    while wire.len() < head_end + content_length {
+        let read = stream
+            .read(&mut buffer)
+            .expect("read HTTP fixture request body");
+        assert!(
+            read > 0,
+            "HTTP client closed before its complete request body"
+        );
+        wire.extend_from_slice(&buffer[..read]);
+    }
+    let body = serde_json::from_slice(&wire[head_end..head_end + content_length])
+        .expect("HTTP fixture request body is JSON-RPC");
+    (head, body)
+}
+
+fn write_h1_json_response(stream: &mut TcpStream, body: &str) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .expect("write HTTP fixture response head");
+    stream
+        .write_all(body.as_bytes())
+        .expect("write HTTP fixture response body");
+    stream.flush().expect("flush HTTP fixture response");
+}
+
 fn inspect_protocol_fixture(policy: &str, format: &str, fixture: &str) -> Output {
     run_cli(&[
         "inspect",
@@ -1129,6 +1186,134 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
         assert_eq!(json["protocol"]["era"], expected_era);
         assert_wire(&observed_protocol_wire(&json_output));
     }
+}
+
+#[test]
+fn e2e_cli_inspect_http_url_uses_live_modern_h1_and_negotiated_status_renderer() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP inspect fixture");
+    let address = listener
+        .local_addr()
+        .expect("read modern HTTP inspect fixture address");
+    let url = format!("http://{address}/mcp");
+    let fixture = std::thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept modern HTTP inspect connection");
+        let (head, request) = read_h1_json_request(&mut stream);
+        assert!(
+            head.starts_with("POST /mcp HTTP/1.1\r\n"),
+            "inspect must use the configured modern H1 POST route"
+        );
+        assert_eq!(request["id"], 1);
+        assert_eq!(request["method"], "server/discover");
+        assert_eq!(
+            request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        write_h1_json_response(
+            &mut stream,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"serverInfo":{"name":"modern-h1-inspect","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+        );
+
+        let (mut stream, _) = listener
+            .accept()
+            .expect("accept modern HTTP tools-list connection");
+        let (head, request) = read_h1_json_request(&mut stream);
+        assert!(
+            head.starts_with("POST /mcp HTTP/1.1\r\n"),
+            "inspect tools/list must retain the configured modern H1 POST route"
+        );
+        assert_eq!(request["id"], 2);
+        assert_eq!(request["method"], "tools/list");
+        assert_eq!(
+            request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        write_h1_json_response(
+            &mut stream,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"h1-tool","description":"modern H1 catalog","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#,
+        );
+    });
+
+    let output = run_cli(&[
+        "inspect",
+        "--http-url",
+        &url,
+        "--protocol-policy",
+        "modern-only",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "modern HTTP inspect should succeed, stderr: {}",
+        stderr_str(&output)
+    );
+    fixture
+        .join()
+        .expect("modern HTTP inspect fixture must complete");
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&stdout_str(&output)).expect("inspect output is diagnostic JSON");
+    assert_eq!(rendered["server"]["name"], "modern-h1-inspect");
+    assert_eq!(rendered["protocol"]["policy"], "modern-only");
+    assert_eq!(rendered["protocol"]["version"], "2026-07-28");
+    assert_eq!(rendered["protocol"]["era"], "modern-2026");
+    assert_eq!(rendered["tools"][0]["name"], "h1-tool");
+}
+
+#[test]
+fn e2e_cli_inspect_http_url_auto_policy_rejects_before_any_h1_probe() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind no-probe HTTP fixture");
+    listener
+        .set_nonblocking(true)
+        .expect("make no-probe HTTP fixture nonblocking");
+    let address = listener
+        .local_addr()
+        .expect("read no-probe HTTP fixture address");
+    let url = format!("http://{address}/mcp");
+    let probes = Arc::new(AtomicUsize::new(0));
+    let observed_probes = Arc::clone(&probes);
+    let observer = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    observed_probes.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("observe HTTP policy rejection connection: {error}"),
+            }
+        }
+    });
+
+    let output = run_cli(&[
+        "inspect",
+        "--http-url",
+        &url,
+        "--protocol-policy",
+        "auto",
+        "--format",
+        "json",
+    ]);
+    assert!(
+        !output.status.success(),
+        "changing only modern-only to auto must reject the URL target"
+    );
+    assert!(
+        stderr_str(&output).contains("--http-url requires --protocol-policy modern-only"),
+        "policy rejection must be explicit"
+    );
+    observer
+        .join()
+        .expect("no-probe HTTP observer must complete");
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        0,
+        "policy rejection must occur before any HTTP probe side effect"
+    );
 }
 
 #[test]
