@@ -5,7 +5,7 @@
 //! bounded input, configuration, and registry-state digests before asserting
 //! the exact typed refusal.
 
-use std::fmt::Debug;
+use std::fmt::{Debug, Write as _};
 
 use fastmcp_core::uri::ConfiguredResourceEndpoint;
 use fastmcp_core::{
@@ -18,11 +18,13 @@ const TRACE_HASH_MAX_BYTES: usize = 4 * 1024;
 fn digest_hex(value: impl AsRef<[u8]>) -> String {
     let digest = sha256_bounded(value.as_ref(), TRACE_HASH_MAX_BYTES)
         .expect("URI contract trace values stay within their fixed bound");
-    digest
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = digest.as_bytes();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}")
+            .expect("writing hexadecimal bytes into a String is infallible");
+    }
+    encoded
 }
 
 fn trace_case(

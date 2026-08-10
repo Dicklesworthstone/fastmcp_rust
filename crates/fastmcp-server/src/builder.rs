@@ -1124,8 +1124,8 @@ impl ServerBuilder {
                 }
                 if has_resources {
                     self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+                        .resources
+                        .get_or_insert_with(ResourcesCapability::default);
                 }
                 if has_prompts {
                     self.capabilities.prompts = Some(PromptsCapability::default());

@@ -1347,8 +1347,9 @@ pub fn decode_legacy_2024_11_05_envelope(
     value: Value,
 ) -> Result<Legacy2024Envelope, Legacy2024WireError> {
     decode_legacy_2024_11_05_envelope_classified(value).map_err(|error| match error {
-        Legacy2024EnvelopeError::Envelope(error)
-        | Legacy2024EnvelopeError::MethodParams(error) => error,
+        Legacy2024EnvelopeError::Envelope(error) | Legacy2024EnvelopeError::MethodParams(error) => {
+            error
+        }
     })
 }
 
@@ -1370,9 +1371,11 @@ pub enum Legacy2024EnvelopeError {
 pub fn decode_legacy_2024_11_05_envelope_classified(
     value: Value,
 ) -> Result<Legacy2024Envelope, Legacy2024EnvelopeError> {
-    let object = value.as_object().ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
-        "MCP 2024-11-05 requires one top-level JSON-RPC object; batch arrays are unsupported",
-    )))?;
+    let object = value.as_object().ok_or(Legacy2024EnvelopeError::Envelope(
+        Legacy2024WireError(
+            "MCP 2024-11-05 requires one top-level JSON-RPC object; batch arrays are unsupported",
+        ),
+    ))?;
     if object.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
         return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
             "jsonrpc must be exactly 2.0",
@@ -1380,16 +1383,15 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
     }
 
     if let Some(method_value) = object.get("method") {
-        let method_name = method_value.as_str().ok_or(
-            Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+        let method_name = method_value
+            .as_str()
+            .ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
                 "JSON-RPC method must be a string",
-            )),
-        )?;
-        let method = legacy_2024_11_05_method(method_name).ok_or(
-            Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
-                "method is not part of exact MCP 2024-11-05",
-            )),
-        )?;
+            )))?;
+        let method =
+            legacy_2024_11_05_method(method_name).ok_or(Legacy2024EnvelopeError::Envelope(
+                Legacy2024WireError("method is not part of exact MCP 2024-11-05"),
+            ))?;
         let params = object.get("params").cloned();
         if params.as_ref().is_some_and(|params| !params.is_object()) {
             return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
@@ -1426,11 +1428,12 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
         };
     }
 
-    let id = object.get("id").cloned().ok_or(
-        Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+    let id = object
+        .get("id")
+        .cloned()
+        .ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
             "MCP 2024-11-05 response envelopes require a non-null string or signed integer id",
-        )),
-    )?;
+        )))?;
     if !legacy_2024_request_id(&id) {
         return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
             "MCP 2024-11-05 response envelopes require a non-null string or signed integer id",

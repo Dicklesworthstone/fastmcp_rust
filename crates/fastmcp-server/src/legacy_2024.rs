@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 
+use fastmcp_protocol::methods::Legacy2024EnvelopeError;
 use fastmcp_protocol::methods::{
     COMPLETION_COMPLETE, INITIALIZE, LEGACY_2024_11_05_PROTOCOL_VERSION, LOGGING_SET_LEVEL,
     Legacy2024Capability, Legacy2024ClientCapabilities, Legacy2024Direction, Legacy2024Envelope,
@@ -21,7 +22,6 @@ use fastmcp_protocol::methods::{
     decode_legacy_2024_11_05_envelope_classified, translate_legacy_2024_result,
     validate_legacy_2024_11_05_initialize_result, validate_legacy_2024_11_05_method_params,
 };
-use fastmcp_protocol::methods::Legacy2024EnvelopeError;
 use serde_json::{Value, json};
 
 /// Maximum combined subscriptions and pending reverse requests retained by
