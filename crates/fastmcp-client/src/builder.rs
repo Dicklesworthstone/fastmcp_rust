@@ -694,6 +694,21 @@ impl ClientBuilder {
         }
     }
 
+    /// Returns the builder state for an already-selected exact-2024 connection.
+    ///
+    /// Reverse request handlers are an exact-2024 surface. Their derived
+    /// capabilities and handlers must therefore stay out of the disposable
+    /// final discovery probe and enter only after Auto has authorized its
+    /// fresh legacy connection.
+    fn legacy_builder_with_reverse_handlers(&self) -> Self {
+        let mut builder = self.clone();
+        builder.capabilities = legacy_capabilities_for_handlers(
+            &builder.capabilities,
+            &builder.reverse_request_handlers,
+        );
+        builder
+    }
+
     /// Selects an era with a disposable modern child before exposing a client.
     ///
     /// A stdio peer has one opening-frame classification, so the modern probe
@@ -706,27 +721,13 @@ impl ClientBuilder {
         cx: &Cx,
         retry_deadline: Instant,
     ) -> McpResult<Client> {
-        // A configured reverse callback is an exact-2024 capability. Do not
-        // advertise it to a final peer and then reject that peer's request at
-        // runtime; select the only compatible handshake before spawning.
-        if !self.reverse_request_handlers.is_empty() {
-            self.reverse_request_handlers
-                .validate_legacy_capabilities(&self.capabilities)?;
-            let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
-            let mut client = self.try_connect_with_protocol_plan(
-                command,
-                args,
-                cx,
-                legacy_plan,
-                false,
-                retry_deadline,
-            )?;
-            client.set_protocol_plan_after_selection(self.protocol_plan.clone());
-            return Ok(client);
-        }
-
         let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
-        match self.try_connect_with_protocol_plan(
+        // Exact-2024 reverse handlers neither advertise nor execute during a
+        // modern probe. Keep that disposable child handler-free so Auto stays
+        // modern-first regardless of local legacy callback configuration.
+        let mut modern_builder = self.clone();
+        modern_builder.reverse_request_handlers = ReverseRequestHandlers::new();
+        match modern_builder.try_connect_with_protocol_plan(
             command,
             args,
             cx,
@@ -749,7 +750,8 @@ impl ClientBuilder {
                     return Err(Self::connection_retry_elapsed_error());
                 }
                 let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
-                let mut client = self.try_connect_with_protocol_plan(
+                let legacy_builder = self.legacy_builder_with_reverse_handlers();
+                let mut client = legacy_builder.try_connect_with_protocol_plan(
                     command,
                     args,
                     cx,
