@@ -122,6 +122,7 @@ impl ProxyFinalTaskRequest {
         } = self;
         match operation {
             ProxyFinalTaskOperation::CallTool { name, arguments } => {
+                let progress_marker = ctx_progress_marker(ctx);
                 let mut listener = await_proxy_request_or_cancellation(
                     ctx,
                     Box::pin(async {
@@ -131,7 +132,7 @@ impl ProxyFinalTaskRequest {
                                 request_id,
                                 &name,
                                 arguments,
-                                ctx.progress_marker(),
+                                progress_marker.as_ref(),
                                 ProxyHttpClient::sse_limits(),
                             )
                             .await
@@ -1003,6 +1004,16 @@ pub trait ProxyBackend: Send {
 /// The handler API intentionally exposes the older closed content types. An
 /// exact legacy or final wire payload must therefore be rejected whenever
 /// projecting it would erase annotations, metadata, or extension members.
+/// Recovers the request's typed progress marker from the base-layer context.
+///
+/// `McpContext` retains the marker opaquely as wire JSON (core does not depend
+/// on the protocol crate); the proxy re-types it here to correlate and forward
+/// upstream progress frames.
+fn ctx_progress_marker(ctx: &McpContext) -> Option<fastmcp_protocol::ProgressMarker> {
+    ctx.progress_marker()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
 fn reject_lossy_proxy_projection(
     context: &str,
     annotations_present: bool,
@@ -1661,7 +1672,7 @@ impl ProxyBackend for Client {
         on_progress: FinalProgressCallback<'_>,
     ) -> McpResult<CoreResult> {
         let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
-        let expected_marker = ctx.progress_marker().cloned();
+        let expected_marker = ctx_progress_marker(ctx);
         if let Some(marker) = expected_marker.as_ref() {
             parameters["_meta"] = serde_json::json!({"progressToken": marker});
         }
@@ -1747,16 +1758,17 @@ impl ProxyBackend for Client {
                 "Proxy upstream does not admit the complete final Tasks relay surface",
             ));
         }
+        let progress_marker = ctx_progress_marker(ctx);
         let outcome = Client::call_tool_final_outcome_with_cancellation(
             self,
             ctx.cx(),
             &ctx.request_cancellation(),
             name,
             arguments,
-            ctx.progress_marker(),
+            progress_marker.as_ref(),
         )?;
         for progress in self.take_final_progress_notifications() {
-            if ctx.progress_marker() == Some(&progress.progress_token) {
+            if progress_marker.as_ref() == Some(&progress.progress_token) {
                 on_progress(progress);
             }
         }
@@ -3613,7 +3625,7 @@ impl ProxyBackend for ProxyHttpClient {
         arguments: serde_json::Value,
         on_progress: ProgressCallback<'_>,
     ) -> McpResult<CoreResult> {
-        let progress_marker = ctx.progress_marker().cloned();
+        let progress_marker = ctx_progress_marker(ctx);
         let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
         if let Some(marker) = progress_marker.as_ref() {
             parameters["_meta"] = serde_json::json!({"progressToken": marker});
@@ -3871,7 +3883,7 @@ fn forward_final_progress_to_context(
     ctx: &McpContext,
     progress: FinalProgressNotificationParams,
 ) -> McpResult<()> {
-    if ctx.progress_marker() != Some(&progress.progress_token) {
+    if ctx_progress_marker(ctx).as_ref() != Some(&progress.progress_token) {
         return Ok(());
     }
     let exact_progress = serde_json::from_str(progress.progress.as_str()).map_err(|_| {
@@ -7159,7 +7171,7 @@ mod tests {
             Cx::for_testing(),
             739,
             ProgressReporter::with_marker(
-                fastmcp_protocol::ProgressMarker::String("downstream-progress".to_owned()),
+                serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         );
@@ -7205,7 +7217,7 @@ mod tests {
             Cx::for_testing(),
             740,
             ProgressReporter::with_marker(
-                fastmcp_protocol::ProgressMarker::String("downstream-progress".to_owned()),
+                serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         );
@@ -7246,7 +7258,7 @@ mod tests {
             Cx::for_testing(),
             741,
             ProgressReporter::with_marker(
-                fastmcp_protocol::ProgressMarker::String("downstream-progress".to_owned()),
+                serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         );
@@ -7299,7 +7311,7 @@ mod tests {
             Cx::for_testing(),
             742,
             ProgressReporter::with_marker(
-                fastmcp_protocol::ProgressMarker::String("downstream-progress".to_owned()),
+                serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         );
@@ -7512,7 +7524,7 @@ mod tests {
             Cx::for_testing(),
             504,
             ProgressReporter::with_marker(
-                fastmcp_protocol::ProgressMarker::String("downstream-progress".to_owned()),
+                serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         );
@@ -7555,7 +7567,7 @@ mod tests {
             Cx::for_testing(),
             505,
             ProgressReporter::with_marker(
-                fastmcp_protocol::ProgressMarker::String("downstream-progress".to_owned()),
+                serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
         );

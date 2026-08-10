@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 use asupersync::sync::Notify;
 use asupersync::types::{CancelReason, MAX_MASK_DEPTH};
 use asupersync::{Budget, Cx, Outcome, RegionId, TaskId, Time};
-use fastmcp_protocol::ProgressMarker;
 
 #[cfg(test)]
 use asupersync::time::wall_now;
@@ -1077,7 +1076,11 @@ impl NotificationSender for NoOpNotificationSender {
 #[derive(Clone)]
 pub struct ProgressReporter {
     sender: Arc<dyn NotificationSender>,
-    marker: Option<ProgressMarker>,
+    // The request progress marker, retained opaquely as its wire JSON. Core
+    // is the base layer and does not depend on the protocol crate's typed
+    // `ProgressMarker`; callers convert at the boundary. The value round-trips
+    // losslessly for proxy-relay correlation.
+    marker: Option<serde_json::Value>,
 }
 
 impl ProgressReporter {
@@ -1094,7 +1097,7 @@ impl ProgressReporter {
     /// Proxy routes use this marker to correlate an upstream progress frame
     /// before relaying it through this request's downstream reporter.
     #[must_use]
-    pub fn with_marker(marker: ProgressMarker, sender: Arc<dyn NotificationSender>) -> Self {
+    pub fn with_marker(marker: serde_json::Value, sender: Arc<dyn NotificationSender>) -> Self {
         Self {
             sender,
             marker: Some(marker),
@@ -1103,7 +1106,7 @@ impl ProgressReporter {
 
     /// Returns the request marker owned by this reporter, when it has one.
     #[must_use]
-    pub fn marker(&self) -> Option<&ProgressMarker> {
+    pub fn marker(&self) -> Option<&serde_json::Value> {
         self.marker.as_ref()
     }
 
@@ -1746,7 +1749,7 @@ impl McpContext {
     /// A reporter without a marker cannot establish ownership of upstream
     /// progress frames and therefore must not cause proxy forwarding.
     #[must_use]
-    pub fn progress_marker(&self) -> Option<&ProgressMarker> {
+    pub fn progress_marker(&self) -> Option<&serde_json::Value> {
         self.ensure_live()
             .ok()
             .and_then(|_| self.progress_reporter.as_ref()?.marker())

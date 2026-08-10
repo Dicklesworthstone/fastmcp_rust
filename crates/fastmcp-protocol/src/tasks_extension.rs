@@ -32,7 +32,7 @@ enum WireValue {
 impl WireValue {
     fn into_json(self) -> Result<String, serde_json::Error> {
         match self {
-            Self::Raw(raw) => Ok(raw.into_string()),
+            Self::Raw(raw) => Ok(raw.get().to_owned()),
             Self::Value(value) => serde_json::to_string(&value),
         }
     }

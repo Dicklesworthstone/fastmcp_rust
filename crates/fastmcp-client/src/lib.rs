@@ -227,7 +227,6 @@ use fastmcp_protocol::{
     ServerExtensionDiscovery,
 };
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
-use fastmcp_transport::{ClientTransportRecvHalf, TransportRecvHalf, TransportSendHalf};
 
 use crate::session::mcp_apps_activation_receipt;
 

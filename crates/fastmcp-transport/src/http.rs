@@ -1538,7 +1538,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
         }
 
         // Parse headers
-        let mut headers = HashMap::new();
+        let mut headers: HashMap<String, String> = HashMap::new();
         for line in lines {
             if line.is_empty() {
                 return Err(HttpError::InvalidHeader(

@@ -426,7 +426,10 @@ where
     where
         Self: 'static,
     {
-        ProgressReporter::with_marker(self.marker.clone(), Arc::new(self))
+        ProgressReporter::with_marker(
+            serde_json::to_value(&self.marker).unwrap_or(serde_json::Value::Null),
+            Arc::new(self),
+        )
     }
 
     fn send_progress_with_serializer<E>(
