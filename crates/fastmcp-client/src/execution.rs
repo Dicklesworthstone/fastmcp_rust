@@ -97,6 +97,142 @@ const CLT_01_B_MANIFEST_ROWS: &str = concat!(
     "terminal_state terminal_reason final_delivered cancellation_committed cancellation_transport_attempts local_cancellation_event waiter_release tombstone\n",
 );
 
+/// Bounds for one multi-round model-request tool retry (MRTR) operation.
+///
+/// The caller chooses the operation's absolute deadline separately. These
+/// bounds limit only how many input-required continuations and total supplied
+/// input values that operation may admit before it sends another request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MrtrDriverLimits {
+    max_continuation_rounds: usize,
+    max_total_input_responses: usize,
+}
+
+impl MrtrDriverLimits {
+    /// Creates validated MRTR continuation bounds.
+    ///
+    /// Both bounds must be nonzero. A continuation round is one peer
+    /// `input_required` result followed by one possible caller retry.
+    pub(crate) fn new(
+        max_continuation_rounds: usize,
+        max_total_input_responses: usize,
+    ) -> McpResult<Self> {
+        if max_continuation_rounds == 0 {
+            return Err(McpError::invalid_params(
+                "MRTR continuation-round limit must be at least one",
+            ));
+        }
+        if max_total_input_responses == 0 {
+            return Err(McpError::invalid_params(
+                "MRTR total input-response limit must be at least one",
+            ));
+        }
+        Ok(Self {
+            max_continuation_rounds,
+            max_total_input_responses,
+        })
+    }
+}
+
+/// Caller-owned state for one bounded multi-round MRTR operation.
+///
+/// This type deliberately does not own transport state or spawn work. The
+/// stdio client keeps transport ownership while this driver makes the caller's
+/// cancellation context, one absolute deadline, and the continuation/input
+/// counters explicit at every retry boundary.
+#[derive(Debug)]
+pub(crate) struct MrtrDriver<'cx> {
+    cx: &'cx Cx,
+    deadline: Instant,
+    limits: MrtrDriverLimits,
+    continuation_rounds: usize,
+    total_input_responses: usize,
+}
+
+impl<'cx> MrtrDriver<'cx> {
+    /// Starts one MRTR operation using exactly the supplied caller context and
+    /// absolute deadline.
+    pub(crate) fn new(
+        cx: &'cx Cx,
+        deadline: Instant,
+        limits: MrtrDriverLimits,
+    ) -> McpResult<Self> {
+        let driver = Self {
+            cx,
+            deadline,
+            limits,
+            continuation_rounds: 0,
+            total_input_responses: 0,
+        };
+        driver.before_request()?;
+        Ok(driver)
+    }
+
+    /// Returns the operation-wide absolute deadline.
+    #[must_use]
+    pub(crate) const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
+    /// Checks caller cancellation and the operation-wide deadline before a
+    /// request can be committed.
+    pub(crate) fn before_request(&self) -> McpResult<()> {
+        if self.cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(McpError::internal_error(
+                "MRTR operation absolute deadline elapsed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Admits one peer `input_required` continuation before the callback is
+    /// invoked. This prevents a callback effect or another wire request after
+    /// the configured round bound has been reached.
+    pub(crate) fn begin_continuation(&mut self) -> McpResult<()> {
+        self.before_request()?;
+        let continuation_rounds = self
+            .continuation_rounds
+            .checked_add(1)
+            .ok_or_else(|| {
+                McpError::internal_error("MRTR continuation-round counter overflowed")
+            })?;
+        if continuation_rounds > self.limits.max_continuation_rounds {
+            return Err(McpError::invalid_params(
+                "MRTR continuation-round limit exceeded",
+            ));
+        }
+        self.continuation_rounds = continuation_rounds;
+        Ok(())
+    }
+
+    /// Admits the response entries selected for the current continuation.
+    ///
+    /// A state-only continuation supplies zero entries and is therefore
+    /// admitted as long as the caller has not exceeded the round limit.
+    pub(crate) fn admit_input_responses(
+        &mut self,
+        input_response_count: usize,
+    ) -> McpResult<()> {
+        self.before_request()?;
+        let total_input_responses = self
+            .total_input_responses
+            .checked_add(input_response_count)
+            .ok_or_else(|| {
+                McpError::internal_error("MRTR total input-response counter overflowed")
+            })?;
+        if total_input_responses > self.limits.max_total_input_responses {
+            return Err(McpError::invalid_params(
+                "MRTR total input-response limit exceeded",
+            ));
+        }
+        self.total_input_responses = total_input_responses;
+        self.before_request()
+    }
+}
+
 /// A client-authored JSON-RPC request that expects one final response.
 pub type Request = JsonRpcRequest;
 

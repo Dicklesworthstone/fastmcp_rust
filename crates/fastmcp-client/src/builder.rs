@@ -34,14 +34,15 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::extensions::McpAppsClientSettings;
-use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+use fastmcp_protocol::protocol_policy::{ProtocolPolicy, ProtocolPolicyError};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
 
 use crate::{
     ChildGuard, ChildOwnership, Client, ClientHttpConnection, ClientHttpConnectionError,
     ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientSession,
-    HttpClient, HttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
+    HttpClient, HttpClientError, ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy,
+    ReverseRequestHandlers,
     combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
 };
 
@@ -475,14 +476,29 @@ impl ClientBuilder {
         self,
         cx: &Cx,
     ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
-        ClientHttpConnection::connect_with_mcp_apps(
+        self.admit_protocol_plan_for_http()?;
+        self.validate_reverse_callback_configuration(&self.protocol_plan)
+            .map_err(|_| Self::http_policy_admission_error())?;
+        let reverse_request_handlers = self.reverse_request_handlers.clone();
+        let mut connection = ClientHttpConnection::connect_with_mcp_apps(
             cx,
             self.protocol_plan,
             self.client_info,
             self.capabilities,
             self.mcp_apps_settings,
         )
-        .await
+        .await?;
+
+        if connection.selected_protocol_era()
+            == fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
+            && !reverse_request_handlers.is_empty()
+        {
+            connection
+                .set_legacy_reverse_request_handlers(reverse_request_handlers)
+                .map_err(|_| Self::http_policy_admission_error())?;
+        }
+
+        Ok(connection)
     }
 
     /// Connects a ready high-level HTTP client using the current capability context.
@@ -502,6 +518,9 @@ impl ClientBuilder {
     /// are ready only after `initialize` and `notifications/initialized` have
     /// both completed on the admitted legacy routes.
     pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
+        self.admit_protocol_plan().map_err(HttpClientError::CoreResult)?;
+        self.validate_reverse_callback_configuration(&self.protocol_plan)
+            .map_err(HttpClientError::CoreResult)?;
         HttpClient::connect_with_mcp_apps(
             cx,
             self.protocol_plan,
@@ -546,6 +565,7 @@ impl ClientBuilder {
         // auto-initialize must never return a live client that cannot issue its
         // first protocol request.
         self.timeout_policy.validate()?;
+        self.admit_protocol_plan()?;
         let retry_policy = self.effective_connection_retry_policy()?;
         let retry_deadline = Instant::now()
             .checked_add(retry_policy.total_elapsed)
@@ -869,6 +889,40 @@ impl ClientBuilder {
             }
             ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => Ok(()),
         }
+    }
+
+    /// Admits a client policy before it can create a subprocess or issue a
+    /// transport request. `Auto` is legacy-capable because its fresh-child
+    /// fallback may select exact 2024, so it requires the same installed
+    /// legacy-adapter receipt as an explicitly legacy-only plan.
+    fn admit_protocol_plan(&self) -> McpResult<()> {
+        self.protocol_plan
+            .policy()
+            .validate_for_client(None)
+            .map(|_| ())
+            .map_err(Self::protocol_policy_error_to_mcp)
+    }
+
+    /// Admits a policy before the HTTP runtime can open its first connection.
+    fn admit_protocol_plan_for_http(&self) -> Result<(), ClientHttpConnectionError> {
+        self.protocol_plan
+            .policy()
+            .validate_for_client(None)
+            .map(|_| ())
+            .map_err(|_| Self::http_policy_admission_error())
+    }
+
+    fn protocol_policy_error_to_mcp(error: ProtocolPolicyError) -> McpError {
+        McpError::invalid_params(error.to_string())
+    }
+
+    fn http_policy_admission_error() -> ClientHttpConnectionError {
+        // The existing public HTTP connection error vocabulary has no
+        // policy-admission variant. This is the closest fail-closed outcome:
+        // no modern probe is sent and no legacy route is opened.
+        ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
+            ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly,
+        ))
     }
 
     fn initialize_timeout_policy_for_retry_deadline(

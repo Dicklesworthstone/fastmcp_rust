@@ -127,6 +127,7 @@ use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, block_on, sha256_bounded};
+use execution::{MrtrDriver, MrtrDriverLimits};
 #[cfg(test)]
 use fastmcp_protocol::common_types::JsonInteger;
 use fastmcp_protocol::common_types::{
@@ -437,11 +438,15 @@ pub enum FinalToolCallOutcome {
 /// individual embedded-request schemas.
 pub type MrtrInputResponses = BTreeMap<String, serde_json::Value>;
 
-/// Maximum input responses accepted for one bounded MRTR retry.
+/// Maximum input responses accepted for one MRTR continuation.
 ///
-/// The public retry helpers issue at most one retry. A later
-/// `input_required` result is returned to the caller rather than retried.
+/// This is an individual continuation bound. The multi-round stdio driver also
+/// limits cumulative entries across the complete MRTR operation.
 pub const MAX_MRTR_INPUT_RESPONSES: usize = 128;
+/// Maximum `input_required` continuations for one stdio MRTR operation.
+pub const MAX_MRTR_CONTINUATION_ROUNDS: usize = 4;
+/// Maximum response entries admitted across every continuation in one MRTR operation.
+pub const MAX_MRTR_TOTAL_INPUT_RESPONSES: usize = MAX_MRTR_INPUT_RESPONSES;
 
 fn mrtr_retry_parameters(
     mut parameters: serde_json::Value,
@@ -1007,6 +1012,10 @@ impl RequestDeadlines {
             McpError::internal_error("Request idle timeout exceeds the clock range")
         })?;
         Ok(())
+    }
+
+    fn cap_absolute_at(&mut self, deadline: Instant) {
+        self.absolute = self.absolute.min(deadline);
     }
 }
 
@@ -5972,10 +5981,18 @@ impl Client {
     }
 
     fn send_to_server(&self, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.send_to_server_with_cx(&self.cx, message)
+    }
+
+    fn send_to_server_with_cx(
+        &self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportError> {
         self.response_sender
             .lock()
             .map_err(|_| TransportError::Closed)?
-            .send(&self.cx, message)
+            .send(cx, message)
     }
 
     /// Verifies that the initialized server can answer an MCP ping request.
@@ -6363,8 +6380,32 @@ impl Client {
         method: &str,
         params_value: serde_json::Value,
     ) -> McpResult<ReceivedPreparedResult> {
+        let cx = self.cx.clone();
+        self.send_prepared_request_with_cx(&cx, None, method, params_value)
+    }
+
+    /// Sends one prepared request under an optional operation-wide deadline.
+    ///
+    /// Ordinary public requests retain their existing per-request deadline
+    /// behavior. Multi-round MRTR passes one immutable operation deadline so
+    /// no continuation can restart the absolute response-wait budget.
+    fn send_prepared_request_with_cx(
+        &mut self,
+        cx: &Cx,
+        operation_deadline: Option<Instant>,
+        method: &str,
+        params_value: serde_json::Value,
+    ) -> McpResult<ReceivedPreparedResult> {
         let timeout_policy = self.timeout_policy;
         timeout_policy.validate()?;
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(McpError::internal_error(
+                "MRTR operation absolute deadline elapsed",
+            ));
+        }
         let id = self.next_request_id()?;
 
         let (request_id, request) = {
@@ -6379,23 +6420,26 @@ impl Client {
         // an exact owner in the shared-channel correlation registry.
         let waiter = self.responses.register(request_id.clone())?;
 
-        if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(request)) {
+        if let Err(error) = self.send_to_server_with_cx(cx, &JsonRpcMessage::Request(request)) {
             let error = self.record_send_failure(Some(&request_id), error);
             return Err(error);
         }
         let committed_at = Instant::now();
-        let deadlines = match RequestDeadlines::start_at(timeout_policy, committed_at) {
+        let mut deadlines = match RequestDeadlines::start_at(timeout_policy, committed_at) {
             Ok(deadlines) => deadlines,
             Err(error) => {
                 return Err(self.finish_committed_request_locally(&request_id, error));
             }
         };
+        if let Some(operation_deadline) = operation_deadline {
+            deadlines.cap_absolute_at(operation_deadline);
+        }
 
         // Receive response with ID validation
         let ReceivedJsonRpcResponse {
             mut response,
             raw_result,
-        } = self.recv_response(waiter, deadlines)?;
+        } = self.recv_response_with_cx(cx, waiter, deadlines)?;
         let receipt = Instant::now();
 
         // Check for error response
@@ -6536,6 +6580,59 @@ impl Client {
             })?;
         self.last_core_result_receipt = None;
         let received = self.send_prepared_request(method, params_value)?;
+        let (result, ttl_diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &core_request,
+            &received.result,
+            received.raw_result.as_deref(),
+        )
+        .map_err(|error| self.terminate_connection(error))?;
+        self.last_core_result_receipt = Some(received.receipt);
+        if let Some(diagnostic) = ttl_diagnostic {
+            self.retain_final_cache_ttl_diagnostic(diagnostic);
+        }
+        Ok(result)
+    }
+
+    /// Sends one ordinary core request under an operation-owned caller context
+    /// and absolute deadline.
+    ///
+    /// This is intentionally separate from Tasks requests: MRTR retries carry
+    /// the exact original core parameters plus only the current continuation
+    /// fields, and must not synthesize an extension declaration.
+    fn send_typed_core_request_with_cx_until(
+        &mut self,
+        cx: &Cx,
+        operation_deadline: Instant,
+        method: &str,
+        params_value: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let params_value = self.prepare_request_parameters(params_value)?;
+        let core_request = self
+            .prepared_core_request(method, &params_value)?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Method is not a supported core request in the negotiated era",
+                )
+            })?;
+        let params_value = core_request
+            .encode_params()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "Client core request could not be encoded in the negotiated protocol era",
+                )
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Method has no parameter object in the negotiated protocol era",
+                )
+            })?;
+        self.last_core_result_receipt = None;
+        let received = self.send_prepared_request_with_cx(
+            cx,
+            Some(operation_deadline),
+            method,
+            params_value,
+        )?;
         let (result, ttl_diagnostic) = decode_core_result_with_cache_ttl_from_source(
             &core_request,
             &received.result,
@@ -7093,6 +7190,16 @@ impl Client {
     /// Receives a response from the transport, validating the response ID.
     fn recv_response(
         &mut self,
+        waiter: ResponseWaiter,
+        deadlines: RequestDeadlines,
+    ) -> McpResult<ReceivedJsonRpcResponse> {
+        let cx = self.cx.clone();
+        self.recv_response_with_cx(&cx, waiter, deadlines)
+    }
+
+    fn recv_response_with_cx(
+        &mut self,
+        cx: &Cx,
         mut waiter: ResponseWaiter,
         deadlines: RequestDeadlines,
     ) -> McpResult<ReceivedJsonRpcResponse> {
@@ -7115,7 +7222,7 @@ impl Client {
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
             let (message, received_at) =
-                match recv_child_transport(&mut self.transport, &self.cx, Some(receive_deadline)) {
+                match recv_child_transport(&mut self.transport, cx, Some(receive_deadline)) {
                     Ok(received) => received,
                     Err(TransportError::ReceiveDeadlineExceeded) => {
                         if receive_deadline < deadlines.next() && !self.transport_is_closed() {
@@ -7773,6 +7880,64 @@ impl Client {
         bounded_list_page(tools, cursor, next_cursor, limits)
     }
 
+    /// Drives one stdio MRTR operation with one caller context and one
+    /// operation-wide absolute deadline.
+    ///
+    /// Each continuation rebuilds its parameters from `original_parameters`,
+    /// adding only the latest `inputResponses` and `requestState`. This keeps
+    /// prior continuation state from leaking into a later round while every
+    /// committed retry still receives a fresh JSON-RPC request ID.
+    fn drive_mrtr_retry<F>(
+        &mut self,
+        method: &str,
+        original_parameters: serde_json::Value,
+        mut respond: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.ensure_initialized()?;
+        let cx = self.cx.clone();
+        let deadline = Instant::now()
+            .checked_add(self.timeout_policy.absolute_timeout())
+            .ok_or_else(|| {
+                McpError::internal_error("MRTR operation deadline exceeds the clock range")
+            })?;
+        let limits = MrtrDriverLimits::new(
+            MAX_MRTR_CONTINUATION_ROUNDS,
+            MAX_MRTR_TOTAL_INPUT_RESPONSES,
+        )?;
+        let mut driver = MrtrDriver::new(&cx, deadline, limits)?;
+        let mut parameters = original_parameters.clone();
+
+        loop {
+            driver.before_request()?;
+            let result = self.send_typed_core_request_with_cx_until(
+                &cx,
+                driver.deadline(),
+                method,
+                parameters,
+            )?;
+            let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
+                return Ok(result);
+            };
+
+            // Reject a peer continuation beyond the local bound before the
+            // caller callback can produce an effect or another request can be
+            // committed.
+            driver.begin_continuation()?;
+            let input_responses = respond(input_required)?;
+            let input_response_count = input_responses.len();
+            let retry_parameters = mrtr_retry_parameters(
+                original_parameters.clone(),
+                input_required,
+                input_responses,
+            )?;
+            driver.admit_input_responses(input_response_count)?;
+            parameters = retry_parameters;
+        }
+    }
+
     /// Calls a tool and returns its negotiated, method-aware core result.
     ///
     /// A modern session returns [`CoreResult::Final`] with a typed
@@ -7798,13 +7963,14 @@ impl Client {
         self.send_typed_core_request("tools/call", params)
     }
 
-    /// Calls a tool and, only when its first final result requires input,
-    /// performs one MRTR retry with caller-supplied responses.
+    /// Calls a tool and follows bounded final MRTR continuations with
+    /// caller-supplied responses.
     ///
-    /// This emits at most two requests. Exact MCP 2024-11-05 results and
-    /// final complete or Tasks results are returned without invoking
-    /// `respond`. A second `input_required` result is returned rather than
-    /// retried again.
+    /// Each continuation receives a fresh request ID and rebuilds from the
+    /// original parameters. Exact MCP 2024-11-05 results and final complete or
+    /// Tasks results return without invoking `respond`. The operation shares
+    /// one caller context, absolute deadline, continuation-round bound, and
+    /// total input-response bound.
     pub fn call_tool_with_mrtr_retry<F>(
         &mut self,
         name: &str,
@@ -7812,19 +7978,17 @@ impl Client {
         respond: F,
     ) -> McpResult<CoreResult>
     where
-        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
     {
-        let retry_parameters = serde_json::json!({
+        self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Legacy2024) {
+            return self.call_tool_typed(name, arguments);
+        }
+        let original_parameters = serde_json::json!({
             "name": name,
-            "arguments": arguments.clone(),
+            "arguments": arguments,
         });
-        let result = self.call_tool_typed(name, arguments)?;
-        let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
-            return Ok(result);
-        };
-        let retry =
-            mrtr_retry_parameters(retry_parameters, input_required, respond(input_required)?)?;
-        self.send_typed_core_request("tools/call", retry)
+        self.drive_mrtr_retry("tools/call", original_parameters, respond)
     }
 
     /// Calls a final tool with the official Tasks result surface enabled.
@@ -8600,27 +8764,25 @@ impl Client {
         )
     }
 
-    /// Reads a resource and, only when its first final result requires input,
-    /// performs one MRTR retry with caller-supplied responses.
+    /// Reads a resource and follows bounded final MRTR continuations with
+    /// caller-supplied responses.
     ///
-    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
-    /// for the terminal-result behavior.
+    /// See [`Self::call_tool_with_mrtr_retry`] for the shared bounded
+    /// continuation and terminal-result behavior.
     pub fn read_resource_with_mrtr_retry<F>(
         &mut self,
         uri: &str,
         respond: F,
     ) -> McpResult<CoreResult>
     where
-        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
     {
-        let retry_parameters = serde_json::json!({ "uri": uri });
-        let result = self.read_resource_typed(uri)?;
-        let Some(input_required) = mrtr_input_required_for_method("resources/read", &result) else {
-            return Ok(result);
-        };
-        let retry =
-            mrtr_retry_parameters(retry_parameters, input_required, respond(input_required)?)?;
-        self.send_typed_core_request("resources/read", retry)
+        self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Legacy2024) {
+            return self.read_resource_typed(uri);
+        }
+        let original_parameters = serde_json::json!({ "uri": uri });
+        self.drive_mrtr_retry("resources/read", original_parameters, respond)
     }
 
     /// Reads a resource and returns its exact MCP 2026-07-28 result payload.
@@ -8806,11 +8968,11 @@ impl Client {
         self.send_typed_core_request("prompts/get", params)
     }
 
-    /// Gets a prompt and, only when its first final result requires input,
-    /// performs one MRTR retry with caller-supplied responses.
+    /// Gets a prompt and follows bounded final MRTR continuations with
+    /// caller-supplied responses.
     ///
-    /// This emits at most two requests; see [`Self::call_tool_with_mrtr_retry`]
-    /// for the terminal-result behavior.
+    /// See [`Self::call_tool_with_mrtr_retry`] for the shared bounded
+    /// continuation and terminal-result behavior.
     pub fn get_prompt_with_mrtr_retry<F>(
         &mut self,
         name: &str,
@@ -8818,8 +8980,12 @@ impl Client {
         respond: F,
     ) -> McpResult<CoreResult>
     where
-        F: FnOnce(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
     {
+        self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Legacy2024) {
+            return self.get_prompt_typed(name, arguments);
+        }
         let mut retry_parameters = serde_json::json!({ "name": name });
         if !arguments.is_empty() {
             let parameters = retry_parameters.as_object_mut().ok_or_else(|| {
@@ -8834,13 +9000,7 @@ impl Client {
                 })?,
             );
         }
-        let result = self.get_prompt_typed(name, arguments)?;
-        let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result) else {
-            return Ok(result);
-        };
-        let retry =
-            mrtr_retry_parameters(retry_parameters, input_required, respond(input_required)?)?;
-        self.send_typed_core_request("prompts/get", retry)
+        self.drive_mrtr_retry("prompts/get", retry_parameters, respond)
     }
 
     /// Gets a prompt and returns its exact MCP 2026-07-28 result payload.
@@ -13584,6 +13744,56 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn modern_mrtr_multi_round_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("mrtr-multi-round-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r discover || exit 1; \
+             case \"$discover\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r initial || exit 1; \
+             case \"$initial\" in *'\"id\":2'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"roots\":{{\"method\":\"roots/list\"}}}},\"requestState\":\"retry-1\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r first_retry || exit 1; \
+             case \"$first_retry\" in *'\"id\":3'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'*'\"inputResponses\":{{\"roots\":{{\"roots\":[]}}}}'*'\"requestState\":\"retry-1\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"retry-2\"}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r state_only_retry || exit 1; \
+             case \"$state_only_retry\" in *'\"inputResponses\"'*) exit 1 ;; *'\"id\":4'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'*'\"requestState\":\"retry-2\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_mrtr_round_bound_client_script() -> String {
+        let discovery_response =
+            modern_discovery_response("mrtr-round-bound-modern-server", &[MODERN_PROTOCOL_VERSION]);
+        let mut rounds = String::new();
+        for request_id in 2..=(MAX_MRTR_CONTINUATION_ROUNDS + 2) {
+            let continuation_response = format!(
+                r#"{{"jsonrpc":"2.0","id":{request_id},"result":{{"resultType":"input_required","inputRequests":{{"roots":{{"method":"roots/list"}}}},"requestState":"retry-bound"}}}}"#,
+            );
+            let expected_input_responses = if request_id == 2 {
+                ""
+            } else {
+                "*'\"inputResponses\":{\"roots\":{\"roots\":[]}}'"
+            };
+            rounds.push_str(&format!(
+                "IFS= read -r request || exit 1; \
+                 case \"$request\" in *'\"id\":{request_id}'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'{expected_input_responses}*) ;; *) exit 1 ;; esac; \
+                 printf '%s\\n' '{continuation_response}'; \
+                 "
+            ));
+        }
+        format!(
+            "IFS= read -r discover || exit 1; \
+             case \"$discover\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             {rounds}exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
     fn modern_progress_client_script(call_response: &str) -> String {
         let discovery_response =
             modern_discovery_response("progress-modern-server", &[MODERN_PROTOCOL_VERSION]);
@@ -14528,6 +14738,119 @@ mod tests {
             CoreResult::Final(FinalCoreResult::PromptsGet { .. })
         ));
         client.close().expect("MRTR prompt client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_mrtr_multi_round_rebuilds_original_params_and_allows_state_only() {
+        let script = modern_mrtr_multi_round_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the multi-round MRTR client");
+
+        let mut callback_count = 0;
+        let result = client
+            .call_tool_with_mrtr_retry(
+                "retry-tool",
+                serde_json::json!({ "round": 1 }),
+                |input_required| {
+                    callback_count += 1;
+                    match callback_count {
+                        1 => {
+                            assert_eq!(input_required.request_state(), Some("retry-1"));
+                            Ok(BTreeMap::from([(
+                                "roots".to_owned(),
+                                serde_json::json!({ "roots": [] }),
+                            )]))
+                        }
+                        2 => {
+                            assert_eq!(input_required.request_state(), Some("retry-2"));
+                            assert!(
+                                input_required.input_requests().is_none(),
+                                "the second continuation is intentionally state-only"
+                            );
+                            Ok(BTreeMap::new())
+                        }
+                        _ => panic!("the completed operation must not invoke another continuation"),
+                    }
+                },
+            )
+            .expect("two input-required results continue to a public final result");
+
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+        assert_eq!(callback_count, 2);
+        client.close().expect("multi-round MRTR client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_mrtr_round_bound_rejects_one_extra_continuation_before_callback_or_send() {
+        let script = modern_mrtr_round_bound_client_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the bound MRTR client");
+
+        let mut callback_count = 0;
+        let error = client
+            .call_tool_with_mrtr_retry(
+                "retry-tool",
+                serde_json::json!({ "round": 1 }),
+                |_| {
+                    callback_count += 1;
+                    Ok(BTreeMap::from([(
+                        "roots".to_owned(),
+                        serde_json::json!({ "roots": [] }),
+                    )]))
+                },
+            )
+            .expect_err("one continuation beyond the round bound must fail locally");
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "MRTR continuation-round limit exceeded");
+        assert_eq!(callback_count, MAX_MRTR_CONTINUATION_ROUNDS);
+        client.close().expect("round-bound MRTR client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_mrtr_retry_keeps_exact_legacy_tool_behavior() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_typed_call_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy initialization succeeds before the MRTR entry point");
+
+        let mut callback_count = 0;
+        let result = client
+            .call_tool_with_mrtr_retry(
+                "echo",
+                serde_json::json!({ "text": "legacy" }),
+                |_| {
+                    callback_count += 1;
+                    Ok(BTreeMap::new())
+                },
+            )
+            .expect("legacy MRTR entry retains the one-request typed behavior");
+
+        assert!(matches!(
+            result,
+            CoreResult::Legacy(LegacyCoreResult::ToolsCall(_))
+        ));
+        assert_eq!(callback_count, 0);
+        client.close().expect("legacy MRTR client cleanup");
     }
 
     #[cfg(unix)]

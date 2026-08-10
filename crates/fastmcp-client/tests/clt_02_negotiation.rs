@@ -66,8 +66,6 @@ fn clt_02_b_planted_negative() {
     let mut negotiation = builder
         .http_negotiation()
         .expect("accepted baseline must reach the public builder admission boundary");
-    let state_before_refusal = negotiation.state();
-
     // Only the status differs from the accepted 404/empty fallback row.
     let refusal = negotiation.observe_modern_probe(HttpModernProbe {
         status: 401,
@@ -83,5 +81,10 @@ fn clt_02_b_planted_negative() {
             }
         )
     );
-    assert_eq!(negotiation.state(), state_before_refusal);
+    assert!(
+        negotiation.state().probe_dispatched(),
+        "the rejected observation still consumes the one permitted modern probe"
+    );
+    assert_eq!(negotiation.state().selected_era(), None);
+    assert!(!negotiation.state().legacy_sse_fallback_authorized());
 }
