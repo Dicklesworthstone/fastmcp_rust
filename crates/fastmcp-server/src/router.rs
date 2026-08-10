@@ -4117,16 +4117,16 @@ impl Router {
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
         let outcome =
             run_handler_in_request(&ctx, request_cx, effective_budget, "tool", |child_cx| {
-                if let Some(resume_inputs) = resume_inputs {
-                    handler.call_final_outcome_async_resuming_in_request(
-                        &ctx,
-                        child_cx,
-                        arguments,
-                        Some(resume_inputs),
-                    )
-                } else {
-                    handler.call_final_outcome_async_in_request(&ctx, child_cx, arguments)
-                }
+                // MRTR-aware handlers receive every call through the resuming
+                // hook: None marks the initial invocation, Some the admitted
+                // retry. The default resuming hook forwards to the plain
+                // final hook, so MRTR-unaware handlers are unaffected.
+                handler.call_final_outcome_async_resuming_in_request(
+                    &ctx,
+                    child_cx,
+                    arguments,
+                    resume_inputs,
+                )
             })
             .await?;
 
@@ -7960,10 +7960,13 @@ mod router_tests {
             resume_inputs: Option<&'a MrtrCompletedInputs>,
         ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             Box::pin(async move {
+                // None marks the initial invocation under the unified
+                // resuming hook; the retry must carry admitted inputs.
                 let Some(resume_inputs) = resume_inputs else {
-                    return Outcome::Err(McpError::internal_error(
-                        "state-only MRTR resume inputs were lost",
-                    ));
+                    return match self.call_final_outcome(_ctx, _arguments) {
+                        Ok(result) => Outcome::Ok(result),
+                        Err(error) => Outcome::Err(error),
+                    };
                 };
                 if !resume_inputs.responses().is_empty() {
                     return Outcome::Err(McpError::internal_error(
@@ -8020,8 +8023,13 @@ mod router_tests {
             resume_inputs: Option<&'a MrtrCompletedInputs>,
         ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             Box::pin(async move {
+                // None marks the initial invocation under the unified
+                // resuming hook; the retry must carry admitted inputs.
                 let Some(resume_inputs) = resume_inputs else {
-                    return Outcome::Err(McpError::internal_error("MRTR resume inputs were lost"));
+                    return match self.call_final_outcome(ctx, arguments) {
+                        Ok(result) => Outcome::Ok(result),
+                        Err(error) => Outcome::Err(error),
+                    };
                 };
                 match resume_inputs.roots("roots") {
                     Ok(Some(_)) => match self.call_final_outcome(ctx, arguments) {
@@ -9084,6 +9092,10 @@ mod router_tests {
     impl ToolHandler for SlowDefinitionTool {
         fn definition(&self) -> Tool {
             if self.definition_reads.fetch_add(1, Ordering::Relaxed) > 0 {
+                eprintln!(
+                    "WM-PROBE requery backtrace:\n{}",
+                    std::backtrace::Backtrace::force_capture()
+                );
                 std::thread::sleep(Duration::from_millis(15));
             }
             Tool {
