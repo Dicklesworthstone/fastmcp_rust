@@ -19726,6 +19726,7 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                             ],
                         ),
                     )
@@ -19772,6 +19773,7 @@ mod lib_unit_tests {
                                 ("Accept", "application/json"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                             ],
                         ),
                     )
@@ -22974,6 +22976,7 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                             ],
                         ),
                     )
@@ -23116,6 +23119,7 @@ mod lib_unit_tests {
                                 ("Accept", "text/event-stream"),
                                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                                 ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "live_http_mrtr"),
                                 ("MCP-Session-Id", "obsolete-modern-session"),
                             ],
                         ),
@@ -23784,6 +23788,7 @@ mod lib_unit_tests {
                         ("Accept", "application/json"),
                         ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                         ("Mcp-Method", "tools/call"),
+                        ("Mcp-Name", "http_overlap_tool"),
                     ],
                 )
             };
@@ -24532,6 +24537,7 @@ mod lib_unit_tests {
                 ("Accept", "application/json, text/event-stream"),
                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                 ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "live_modern_controlled_tool"),
             ],
         );
         let cancellation = cx.clone();
