@@ -97,7 +97,7 @@ fastmcp-rust = { version = "0.3.2", path = "crates/fastmcp" }
 fastmcp-core = { version = "0.3.2", path = "crates/fastmcp-core" }
 fastmcp-transport = { version = "0.3.2", path = "crates/fastmcp-transport" }
 fastmcp-protocol = { version = "0.3.2", path = "crates/fastmcp-protocol" }
-fastmcp-server = { version = "0.3.2", path = "crates/fastmcp-server" }
+fastmcp-server = { version = "0.3.2", path = "crates/fastmcp-server", default-features = false }
 fastmcp-client = { version = "0.3.2", path = "crates/fastmcp-client" }
 fastmcp-derive = { version = "0.3.2", path = "crates/fastmcp-macros" }
 fastmcp-console = { version = "0.3.2", path = "crates/fastmcp-console" }
