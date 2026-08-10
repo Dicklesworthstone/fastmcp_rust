@@ -164,9 +164,6 @@ pub struct ModernHttpRequest {
     method: String,
     name: Option<String>,
     authorization: Option<String>,
-    mcp_session_id: Option<String>,
-    mcp_session_epoch: Option<u64>,
-    additional_client_extensions: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 impl fmt::Debug for ModernHttpRequest {
@@ -181,10 +178,6 @@ impl fmt::Debug for ModernHttpRequest {
             .field(
                 "authorization",
                 &self.authorization.as_ref().map(|_| "<redacted>"),
-            )
-            .field(
-                "mcp_session_id",
-                &self.mcp_session_id.as_ref().map(|_| "<present>"),
             )
             .finish()
     }
@@ -219,9 +212,6 @@ impl ModernHttpRequest {
             method,
             name,
             authorization: None,
-            mcp_session_id: None,
-            mcp_session_epoch: None,
-            additional_client_extensions: None,
         })
     }
 
@@ -236,33 +226,6 @@ impl ModernHttpRequest {
         target: &fastmcp_core::CanonicalHttpUrl,
     ) -> Self {
         self.authorization = credential.authorization_for_target(target);
-        self
-    }
-
-    /// Attaches the opaque session identifier issued by a successful modern
-    /// `server/discover` response to this post-discovery request.
-    pub fn with_mcp_session_id(
-        mut self,
-        mcp_session_id: impl Into<String>,
-    ) -> Result<Self, ModernHttpExecutorError> {
-        let mcp_session_id = mcp_session_id.into();
-        if mcp_session_id.is_empty() || contains_header_control(&mcp_session_id) {
-            return Err(ModernHttpExecutorError::InvalidRequestMetadata);
-        }
-        self.mcp_session_id = Some(mcp_session_id);
-        Ok(self)
-    }
-
-    fn with_mcp_session_epoch(mut self, epoch: u64) -> Self {
-        self.mcp_session_epoch = Some(epoch);
-        self
-    }
-
-    fn with_additional_client_extensions(
-        mut self,
-        additional_client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
-    ) -> Self {
-        self.additional_client_extensions = additional_client_extensions.cloned();
         self
     }
 
@@ -307,9 +270,6 @@ impl ModernHttpRequest {
         if let Some(authorization) = &self.authorization {
             headers.push(("Authorization".to_owned(), authorization.clone()));
         }
-        if let Some(mcp_session_id) = &self.mcp_session_id {
-            headers.push(("MCP-Session-Id".to_owned(), mcp_session_id.clone()));
-        }
         headers
     }
 }
@@ -333,7 +293,6 @@ pub enum ModernHttpResponseKind {
 pub struct ModernHttpResponseMetadata {
     status: u16,
     kind: ModernHttpResponseKind,
-    mcp_session_id: Option<String>,
 }
 
 impl ModernHttpResponseMetadata {
@@ -349,12 +308,6 @@ impl ModernHttpResponseMetadata {
         self.kind
     }
 
-    /// Returns the opaque session identifier supplied by the HTTP peer, if
-    /// that response issued one.
-    #[must_use]
-    pub fn mcp_session_id(&self) -> Option<&str> {
-        self.mcp_session_id.as_deref()
-    }
 }
 
 /// A live native response stream, owned by one modern POST.
@@ -1800,6 +1753,8 @@ pub enum ModernHttpExecutorError {
     UnsupportedContentEncoding,
     /// A response repeated a header whose cardinality is fixed for MCP.
     DuplicateResponseHeader { name: &'static str },
+    /// Modern stateless HTTP forbids server-issued session state.
+    ForbiddenResponseSessionHeader,
     /// A successful response did not select JSON or SSE exactly.
     UnsupportedSuccessContentType,
     /// An API requiring a modern SSE response received another admitted kind.
@@ -1849,6 +1804,9 @@ impl fmt::Display for ModernHttpExecutorError {
             }
             Self::DuplicateResponseHeader { name } => {
                 write!(formatter, "modern MCP response repeats {name}")
+            }
+            Self::ForbiddenResponseSessionHeader => {
+                formatter.write_str("modern stateless HTTP response included MCP-Session-Id")
             }
             Self::UnsupportedSuccessContentType => {
                 formatter.write_str("modern MCP success response has unsupported content type")
@@ -1953,8 +1911,6 @@ fn native_http_client() -> HttpClient {
 pub struct ModernHttpClient {
     protocol_plan: ClientProtocolPlan,
     modern_post_target: String,
-    session_state: Arc<Mutex<ModernHttpSessionState>>,
-    session_recovery: Arc<Mutex<ModernHttpSessionRecovery>>,
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
     mcp_apps_settings: Option<McpAppsClientSettings>,
@@ -1966,24 +1922,6 @@ pub struct ModernHttpClient {
 struct ModernHttpDiscoveryState {
     mcp_apps_active: bool,
     server_discovery: ServerDiscoverResult,
-}
-
-#[derive(Debug)]
-struct ModernHttpSessionState {
-    mcp_session_id: String,
-    epoch: u64,
-}
-
-#[derive(Debug)]
-struct ModernHttpSessionRecovery {
-    failed: Option<FailedModernHttpSessionRecovery>,
-}
-
-#[derive(Debug)]
-struct FailedModernHttpSessionRecovery {
-    mcp_session_id: String,
-    epoch: u64,
-    error: Arc<ModernHttpClientError>,
 }
 
 /// The result of a policy-bound modern HTTP connection attempt.
@@ -3379,20 +3317,6 @@ pub enum ModernHttpClientError {
     },
     /// The recognized response was not the exact typed discovery reply.
     InvalidDiscoveryResponse,
-    /// A successful modern discovery response did not issue the session ID
-    /// required for every later modern HTTP POST.
-    MissingDiscoverySessionId,
-    /// A post-discovery response attempted to replace the opaque session ID
-    /// retained from discovery.
-    UnexpectedMcpSessionId,
-    SessionUnavailable,
-    /// A prior recovery attempt for this exact session generation failed.
-    ///
-    /// The shared source lets every concurrent stale caller observe the same
-    /// terminal outcome without issuing another discovery request.
-    SessionRecoveryFailed(Arc<ModernHttpClientError>),
-    SessionRecoveryWouldFallbackToLegacy,
-    SessionRecoveryRepeatedNotFound,
     /// The typed final discovery reply did not advertise the final version
     /// selected for this modern HTTP connection.
     DiscoveryDoesNotAdvertiseModernProtocol,
@@ -3534,23 +3458,6 @@ impl fmt::Display for ModernHttpClientError {
             Self::InvalidDiscoveryResponse => {
                 formatter.write_str("server/discover returned an invalid final response")
             }
-            Self::MissingDiscoverySessionId => {
-                formatter.write_str("server/discover did not issue an MCP-Session-Id")
-            }
-            Self::UnexpectedMcpSessionId => {
-                formatter.write_str("a modern HTTP response replaced the discovered MCP-Session-Id")
-            }
-            Self::SessionUnavailable => {
-                formatter.write_str("the modern HTTP session is unavailable")
-            }
-            Self::SessionRecoveryFailed(error) => {
-                write!(formatter, "modern HTTP session recovery failed: {error}")
-            }
-            Self::SessionRecoveryWouldFallbackToLegacy => {
-                formatter.write_str("modern session recovery refused legacy fallback")
-            }
-            Self::SessionRecoveryRepeatedNotFound => formatter
-                .write_str("fresh modern session replay was rejected as unknown or expired"),
             Self::DiscoveryDoesNotAdvertiseModernProtocol => {
                 formatter.write_str("server/discover did not advertise MCP 2026-07-28")
             }
@@ -3641,7 +3548,6 @@ impl std::error::Error for ModernHttpClientError {
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
             Self::LegacySse(error) => Some(error),
-            Self::SessionRecoveryFailed(error) => Some(error.as_ref()),
             Self::InvalidTasksJsonRpcResponse { error, .. } => Some(error),
             Self::InvalidJsonRpcResponse(error) => Some(error),
             Self::TypedResult(error) => Some(error),
@@ -3656,11 +3562,6 @@ impl std::error::Error for ModernHttpClientError {
             | Self::RequestEncodingFailed
             | Self::DiscoveryRejected { .. }
             | Self::InvalidDiscoveryResponse
-            | Self::MissingDiscoverySessionId
-            | Self::UnexpectedMcpSessionId
-            | Self::SessionUnavailable
-            | Self::SessionRecoveryWouldFallbackToLegacy
-            | Self::SessionRecoveryRepeatedNotFound
             | Self::DiscoveryDoesNotAdvertiseModernProtocol
             | Self::InvalidRequestId
             | Self::TasksNegotiation
@@ -3740,10 +3641,6 @@ impl ModernHttpClient {
             .await
             .map_err(ModernHttpClientError::Executor)?;
         let probe_status = probe_response.metadata().status();
-        let probe_session_id = probe_response
-            .metadata()
-            .mcp_session_id()
-            .map(str::to_owned);
         let probe_body = probe_response
             .read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
             .await
@@ -3767,21 +3664,11 @@ impl ModernHttpClient {
             ClientHttpNegotiationDecision::ModernSelected => {
                 let server_discovery =
                     admitted_discovery.ok_or(ModernHttpClientError::InvalidDiscoveryResponse)?;
-                let mcp_session_id = probe_session_id
-                    .filter(|session_id| !trim_http_ows(session_id).is_empty())
-                    .ok_or(ModernHttpClientError::MissingDiscoverySessionId)?;
                 let mcp_apps_active =
                     resolve_mcp_apps_activation(mcp_apps_settings.as_ref(), &server_discovery);
                 Ok(ModernHttpConnectOutcome::Modern(Self {
                     protocol_plan,
                     modern_post_target,
-                    session_state: Arc::new(Mutex::new(ModernHttpSessionState {
-                        mcp_session_id,
-                        epoch: 0,
-                    })),
-                    session_recovery: Arc::new(Mutex::new(ModernHttpSessionRecovery {
-                        failed: None,
-                    })),
                     client_info,
                     client_capabilities,
                     mcp_apps_settings,
@@ -3834,22 +3721,12 @@ impl ModernHttpClient {
 
     async fn build_post_discovery_request(
         &self,
-        cx: &Cx,
+        _cx: &Cx,
         method: &str,
         parameters: serde_json::Value,
         request_id: Option<RequestId>,
         additional_client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     ) -> Result<ModernHttpRequest, ModernHttpClientError> {
-        // Hold the session generation while reading discovery activation so
-        // one request cannot combine a recovered session ID with Apps
-        // metadata from the prior discovery generation. Recovery takes these
-        // locks in this same order and publishes both discovery fields before
-        // releasing the session generation.
-        let state = self
-            .session_state
-            .lock(cx)
-            .await
-            .map_err(|_| ModernHttpClientError::SessionUnavailable)?;
         let mcp_apps_active = self
             .discovery_state
             .read()
@@ -3870,11 +3747,7 @@ impl ModernHttpClient {
             request_id,
             client_extensions.as_ref(),
         )?;
-        request
-            .with_additional_client_extensions(additional_client_extensions)
-            .with_mcp_session_id(state.mcp_session_id.clone())
-            .map(|request| request.with_mcp_session_epoch(state.epoch))
-            .map_err(ModernHttpClientError::Executor)
+        Ok(request)
     }
 
     async fn rebase_post_discovery_request(
