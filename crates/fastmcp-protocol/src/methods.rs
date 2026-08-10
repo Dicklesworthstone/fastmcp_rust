@@ -1107,17 +1107,14 @@ pub fn validate_legacy_2024_11_05_method_params(
             let params = required_params_object(method, params)?;
             required_string(params, "uri", "notifications/resources/updated")
         }
-        TOOLS_LIST
-        | RESOURCES_LIST
-        | RESOURCES_TEMPLATES_LIST
-        | PROMPTS_LIST => validate_legacy_2024_cursor_params(params, method),
+        TOOLS_LIST | RESOURCES_LIST | RESOURCES_TEMPLATES_LIST | PROMPTS_LIST => {
+            validate_legacy_2024_cursor_params(params, method)
+        }
         NOTIFICATIONS_ROOTS_LIST_CHANGED
         | NOTIFICATIONS_INITIALIZED
         | NOTIFICATIONS_PROMPTS_LIST_CHANGED
         | NOTIFICATIONS_RESOURCES_LIST_CHANGED
-        | NOTIFICATIONS_TOOLS_LIST_CHANGED => {
-            validate_legacy_2024_metadata_params(params, false)
-        }
+        | NOTIFICATIONS_TOOLS_LIST_CHANGED => validate_legacy_2024_metadata_params(params, false),
         ROOTS_LIST | PING => validate_legacy_2024_metadata_params(params, true),
         INITIALIZE => validate_legacy_2024_initialize(method, params),
         _ => Err(Legacy2024WireError(
@@ -1160,7 +1157,10 @@ fn validate_legacy_2024_sampling_create_message(
         .ok_or(Legacy2024WireError(
             "sampling/createMessage requires a messages array",
         ))?;
-    if !params.get("maxTokens").is_some_and(legacy_2024_json_integer) {
+    if !params
+        .get("maxTokens")
+        .is_some_and(legacy_2024_json_integer)
+    {
         return Err(Legacy2024WireError(
             "sampling/createMessage requires integer maxTokens",
         ));
@@ -1337,11 +1337,7 @@ fn validate_legacy_2024_metadata_params(
     let meta = meta.as_object().ok_or(Legacy2024WireError(
         "exact MCP 2024-11-05 _meta must be an object",
     ))?;
-    if !permits_progress_token
-        || meta
-            .get("progressToken")
-            .is_none_or(legacy_2024_request_id)
-    {
+    if !permits_progress_token || meta.get("progressToken").is_none_or(legacy_2024_request_id) {
         Ok(())
     } else {
         Err(Legacy2024WireError(
@@ -1426,11 +1422,12 @@ pub enum Legacy2024EnvelopeError {
 pub fn decode_legacy_2024_11_05_envelope_classified(
     value: Value,
 ) -> Result<Legacy2024Envelope, Legacy2024EnvelopeError> {
-    let object = value.as_object().ok_or(Legacy2024EnvelopeError::Envelope(
-        Legacy2024WireError(
+    let object =
+        value
+            .as_object()
+            .ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
             "MCP 2024-11-05 requires one top-level JSON-RPC object; batch arrays are unsupported",
-        ),
-    ))?;
+        )))?;
     if object.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
         return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
             "jsonrpc must be exactly 2.0",
@@ -1456,11 +1453,12 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
 
         return match method.envelope {
             Legacy2024EnvelopeKind::Request => {
-                let id = object.get("id").cloned().ok_or(
-                    Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+                let id = object
+                    .get("id")
+                    .cloned()
+                    .ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
                         "MCP 2024-11-05 request envelopes require a non-null string or integer id",
-                    )),
-                )?;
+                    )))?;
                 if !legacy_2024_request_id(&id) {
                     return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
                         "MCP 2024-11-05 request envelopes require a non-null string or integer id",
@@ -1533,14 +1531,14 @@ fn legacy_2024_request_id(value: &Value) -> bool {
 }
 
 fn legacy_2024_json_integer(value: &Value) -> bool {
-    value.as_number().is_some_and(|number| {
-        JsonInteger::try_from_number(number.clone()).is_ok()
-    })
+    value
+        .as_number()
+        .is_some_and(|number| JsonInteger::try_from_number(number.clone()).is_ok())
 }
 
 fn valid_legacy_2024_error(value: &Value) -> bool {
     value.as_object().is_some_and(|error| {
-        error.get("code").is_some_and(Value::is_i64)
+        error.get("code").is_some_and(legacy_2024_json_integer)
             && error.get("message").is_some_and(Value::is_string)
     })
 }
@@ -1896,20 +1894,33 @@ mod tests {
 
     #[test]
     fn leg_01_cursor_params_positive() {
-        for method in [TOOLS_LIST, RESOURCES_LIST, RESOURCES_TEMPLATES_LIST, PROMPTS_LIST] {
+        for method in [
+            TOOLS_LIST,
+            RESOURCES_LIST,
+            RESOURCES_TEMPLATES_LIST,
+            PROMPTS_LIST,
+        ] {
             let request = json!({
                 "jsonrpc": "2.0",
                 "id": "cursor-request",
                 "method": method,
                 "params": {"cursor": "opaque-cursor"}
             });
-            assert!(decode_legacy_2024_11_05_envelope(request).is_ok(), "{method}");
+            assert!(
+                decode_legacy_2024_11_05_envelope(request).is_ok(),
+                "{method}"
+            );
         }
     }
 
     #[test]
     fn leg_01_cursor_params_planted_negative() {
-        for method in [TOOLS_LIST, RESOURCES_LIST, RESOURCES_TEMPLATES_LIST, PROMPTS_LIST] {
+        for method in [
+            TOOLS_LIST,
+            RESOURCES_LIST,
+            RESOURCES_TEMPLATES_LIST,
+            PROMPTS_LIST,
+        ] {
             let request = json!({
                 "jsonrpc": "2.0",
                 "id": "cursor-request",
@@ -1975,7 +1986,9 @@ mod tests {
             "params": {"_meta": {"progressToken": false}}
         });
         assert_eq!(
-            decode_legacy_2024_11_05_envelope(roots).unwrap_err().reason(),
+            decode_legacy_2024_11_05_envelope(roots)
+                .unwrap_err()
+                .reason(),
             "exact MCP 2024-11-05 progressToken must be a string or integer"
         );
     }
@@ -1996,7 +2009,9 @@ mod tests {
         )
         .expect("fractional maxTokens is valid JSON");
         assert_eq!(
-            decode_legacy_2024_11_05_envelope(request).unwrap_err().reason(),
+            decode_legacy_2024_11_05_envelope(request)
+                .unwrap_err()
+                .reason(),
             "sampling/createMessage requires integer maxTokens"
         );
     }
@@ -2015,6 +2030,44 @@ mod tests {
             decode_legacy_2024_11_05_envelope(json!({"jsonrpc":"2.0", "method":"notifications/initialized"})).unwrap(),
             Legacy2024Envelope::Notification { method, .. } if method.name == NOTIFICATIONS_INITIALIZED
         ));
+    }
+
+    #[test]
+    fn leg_01_error_codes_preserve_integral_exponent_and_huge_lexemes() {
+        for raw_code in ["-3.2603e4", "340282366920938463463374607431768211457"] {
+            let wire: Value = serde_json::from_str(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"error":{{"code":{raw_code},"message":"failed"}}}}"#
+            ))
+            .expect("integral error-code wire must parse");
+
+            let Legacy2024Envelope::Error { error, .. } = decode_legacy_2024_11_05_envelope(wire)
+                .expect("exact inbound error code must be admitted")
+            else {
+                panic!("error wire must decode as an error envelope");
+            };
+            assert_eq!(
+                error["code"]
+                    .as_number()
+                    .expect("error code remains a JSON number")
+                    .as_str(),
+                raw_code
+            );
+        }
+    }
+
+    #[test]
+    fn leg_01_error_codes_reject_fractional_near_miss() {
+        let wire: Value = serde_json::from_str(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603.5,"message":"failed"}}"#,
+        )
+        .expect("fractional error-code wire must parse");
+
+        assert_eq!(
+            decode_legacy_2024_11_05_envelope(wire)
+                .expect_err("fractional error code must not enter the exact envelope")
+                .reason(),
+            "MCP 2024-11-05 error envelopes require integer code and string message"
+        );
     }
 
     #[test]

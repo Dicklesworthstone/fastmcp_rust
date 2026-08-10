@@ -9,6 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use crate::common_types::JsonInteger;
+
 /// The JSON-RPC version string. Used as a static reference to avoid allocations.
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -963,8 +965,8 @@ impl JsonRpcRequest {
 /// JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JsonRpcError {
-    /// Error code.
-    pub code: i32,
+    /// Error code retained without an implementation-width bound.
+    pub code: JsonInteger,
     /// Error message.
     pub message: String,
     /// Additional error data.
@@ -1022,7 +1024,7 @@ impl UncorrelatedJsonRpcErrorResponse {
         Self {
             jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             error: JsonRpcError {
-                code,
+                code: code.into(),
                 message: message.into(),
                 data: None,
             },
@@ -1068,7 +1070,7 @@ pub fn dispose_raw_jsonrpc_failure(
                 RawJsonRpcDisposition::CorrelatedError(JsonRpcResponse::error(
                     Some(id),
                     JsonRpcError {
-                        code: -32600,
+                        code: (-32600).into(),
                         message: "Invalid Request".to_owned(),
                         data: None,
                     },
@@ -1842,7 +1844,7 @@ mod tests {
             json!({"field":"name"}),
         );
         let rpc_err: JsonRpcError = err.into();
-        assert_eq!(rpc_err.code, -32602);
+        assert_eq!(rpc_err.code.as_i32(), Some(-32602));
         assert_eq!(rpc_err.message, "bad params");
         assert_eq!(rpc_err.data, Some(json!({"field":"name"})));
     }
@@ -1850,7 +1852,7 @@ mod tests {
     #[test]
     fn jsonrpc_error_serialization() {
         let error = JsonRpcError {
-            code: -32600,
+            code: (-32600).into(),
             message: "Invalid Request".to_string(),
             data: None,
         };
@@ -1863,7 +1865,7 @@ mod tests {
     #[test]
     fn jsonrpc_error_with_data() {
         let error = JsonRpcError {
-            code: -32602,
+            code: (-32602).into(),
             message: "Invalid params".to_string(),
             data: Some(json!({"field": "name", "reason": "required"})),
         };
@@ -1873,10 +1875,33 @@ mod tests {
     }
 
     #[test]
+    fn jsonrpc_error_preserves_arbitrary_width_integer_code() {
+        let source = r#"{"code":-340282366920938463463374607431768211457,"message":"unbounded"}"#;
+        let error: JsonRpcError = serde_json::from_str(source).expect("decode arbitrary code");
+
+        assert_eq!(
+            error.code.as_str(),
+            "-340282366920938463463374607431768211457"
+        );
+        assert_eq!(
+            serde_json::to_string(&error).expect("re-encode arbitrary code"),
+            source
+        );
+    }
+
+    #[test]
+    fn jsonrpc_error_rejects_nearby_fractional_code() {
+        let source =
+            r#"{"code":-340282366920938463463374607431768211457.5,"message":"not integer"}"#;
+
+        assert!(serde_json::from_str::<JsonRpcError>(source).is_err());
+    }
+
+    #[test]
     fn jsonrpc_error_standard_codes() {
         // Parse error
         let err = JsonRpcError {
-            code: -32700,
+            code: (-32700).into(),
             message: "Parse error".to_string(),
             data: None,
         };
@@ -1884,7 +1909,7 @@ mod tests {
 
         // Method not found
         let err = JsonRpcError {
-            code: -32601,
+            code: (-32601).into(),
             message: "Method not found".to_string(),
             data: None,
         };
@@ -1892,7 +1917,7 @@ mod tests {
 
         // Internal error
         let err = JsonRpcError {
-            code: -32603,
+            code: (-32603).into(),
             message: "Internal error".to_string(),
             data: None,
         };
@@ -1949,7 +1974,7 @@ mod tests {
     #[test]
     fn response_error() {
         let error = JsonRpcError {
-            code: -32601,
+            code: (-32601).into(),
             message: "Method not found".to_string(),
             data: None,
         };
@@ -1966,7 +1991,7 @@ mod tests {
     #[test]
     fn uncorrelated_response_error_omits_id() {
         let error = JsonRpcError {
-            code: -32700,
+            code: (-32700).into(),
             message: "Parse error".to_string(),
             data: None,
         };
@@ -2028,7 +2053,7 @@ mod tests {
             jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
             result: Some(Value::Null),
             error: Some(JsonRpcError {
-                code: -32_603,
+                code: (-32_603).into(),
                 message: "failure".to_string(),
                 data: None,
             }),

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use fastmcp_protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId};
+use fastmcp_protocol::{JsonInteger, JsonRpcError, JsonRpcRequest, JsonRpcResponse, RequestId};
 use serde_json::Value;
 
 use crate::console::{
@@ -53,14 +53,19 @@ fn peer_metadata_preview(text: &str, max_chars: usize) -> String {
     truncate_to_fixed_budget(&sanitized, max_chars, source_was_truncated)
 }
 
-fn json_rpc_error_class(code: i32) -> &'static str {
-    match code {
-        -32700 => "parse-error",
-        -32600 => "invalid-request",
-        -32601 => "method-not-found",
-        -32602 => "invalid-params",
-        -32603 => "internal-error",
-        -32099..=-32000 => "server-error",
+fn json_rpc_error_class(code: &JsonInteger) -> &'static str {
+    match code.as_str() {
+        "-32700" => "parse-error",
+        "-32600" => "invalid-request",
+        "-32601" => "method-not-found",
+        "-32602" => "invalid-params",
+        "-32603" => "internal-error",
+        _ if code
+            .as_i32()
+            .is_some_and(|code| (-32099..=-32000).contains(&code)) =>
+        {
+            "server-error"
+        }
         _ => "application-error",
     }
 }
@@ -405,7 +410,7 @@ impl RequestResponseRenderer {
 
     fn render_error_preview(&self, error: &JsonRpcError, console: &FastMcpConsole) {
         let error_color = self.error_color();
-        let error_class = json_rpc_error_class(error.code);
+        let error_class = json_rpc_error_class(&error.code);
         let message = bounded_rich_text(
             &peer_metadata_preview(&error.message, PEER_ERROR_SUMMARY_MAX_CHARS),
             usize::MAX,
@@ -606,7 +611,7 @@ impl RequestResponseRenderer {
         console.print_plain(&format!(
             "  Error {} ({}): {}",
             error.code,
-            json_rpc_error_class(error.code),
+            json_rpc_error_class(&error.code),
             message
         ));
         if let Some(data) = &error.data {
@@ -641,7 +646,7 @@ mod tests {
         let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
         let console = TestConsole::new();
         let error = JsonRpcError {
-            code: -32001,
+            code: (-32001).into(),
             message: "boom".to_string(),
             data: Some(serde_json::json!({"detail": "oops"})),
         };
@@ -1192,7 +1197,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             Some(RequestId::Number(32)),
             JsonRpcError {
-                code: -32042,
+                code: (-32042).into(),
                 message: hostile_error_message(),
                 data: None,
             },
@@ -1397,7 +1402,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             Some(RequestId::Number(23)),
             JsonRpcError {
-                code: -32023,
+                code: (-32023).into(),
                 message: "[italic]literal error[/]\n\u{202e}".to_owned(),
                 data: Some(response_security_fixture(
                     "plain-error-canary",
@@ -1424,7 +1429,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             Some(RequestId::Number(24)),
             JsonRpcError {
-                code: -32024,
+                code: (-32024).into(),
                 message: "[italic]literal error[/]\n\u{202e}".to_owned(),
                 data: Some(response_security_fixture(
                     "rich-error-canary",
@@ -1527,7 +1532,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             None,
             JsonRpcError {
-                code: -32601,
+                code: (-32601).into(),
                 message: "Method not found".to_string(),
                 data: None,
             },
@@ -1550,7 +1555,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             None,
             JsonRpcError {
-                code: -32600,
+                code: (-32600).into(),
                 message: "Invalid Request".to_owned(),
                 data: None,
             },
@@ -1571,7 +1576,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             Some(RequestId::Number(10)),
             JsonRpcError {
-                code: -32000,
+                code: (-32000).into(),
                 message: "boom".to_string(),
                 data: None,
             },
@@ -1612,7 +1617,7 @@ mod tests {
         let response = JsonRpcResponse::error(
             Some(RequestId::String("abc".to_string())),
             JsonRpcError {
-                code: -32042,
+                code: (-32042).into(),
                 message: "failed".to_string(),
                 data: Some(json!({"retryable": false})),
             },
@@ -1641,7 +1646,7 @@ mod tests {
         let err = JsonRpcResponse::error(
             Some(RequestId::Number(1)),
             JsonRpcError {
-                code: -1,
+                code: (-1).into(),
                 message: "nope".to_string(),
                 data: None,
             },
@@ -1691,13 +1696,13 @@ mod tests {
 
     #[test]
     fn json_rpc_error_classes_are_fixed_from_numeric_codes() {
-        assert_eq!(json_rpc_error_class(-32700), "parse-error");
-        assert_eq!(json_rpc_error_class(-32600), "invalid-request");
-        assert_eq!(json_rpc_error_class(-32601), "method-not-found");
-        assert_eq!(json_rpc_error_class(-32602), "invalid-params");
-        assert_eq!(json_rpc_error_class(-32603), "internal-error");
-        assert_eq!(json_rpc_error_class(-32042), "server-error");
-        assert_eq!(json_rpc_error_class(7), "application-error");
+        assert_eq!(json_rpc_error_class(&(-32700).into()), "parse-error");
+        assert_eq!(json_rpc_error_class(&(-32600).into()), "invalid-request");
+        assert_eq!(json_rpc_error_class(&(-32601).into()), "method-not-found");
+        assert_eq!(json_rpc_error_class(&(-32602).into()), "invalid-params");
+        assert_eq!(json_rpc_error_class(&(-32603).into()), "internal-error");
+        assert_eq!(json_rpc_error_class(&(-32042).into()), "server-error");
+        assert_eq!(json_rpc_error_class(&(7).into()), "application-error");
     }
 
     #[test]
@@ -1746,7 +1751,7 @@ mod tests {
 
         renderer.render_error_preview_plain(
             &JsonRpcError {
-                code: -32001,
+                code: (-32001).into(),
                 message: "boom".to_string(),
                 data: Some(json!({"details": "abcdefghijklmnopqrstuvwxyz"})),
             },
@@ -1890,7 +1895,7 @@ mod tests {
 
         renderer.render_error_preview_plain(
             &JsonRpcError {
-                code: -32600,
+                code: (-32600).into(),
                 message: "Invalid Request".to_string(),
                 data: None,
             },
@@ -1900,5 +1905,20 @@ mod tests {
         console.assert_contains("Error -32600");
         console.assert_contains("Invalid Request");
         console.assert_not_contains("Data:");
+    }
+
+    #[test]
+    fn render_error_preview_plain_preserves_arbitrary_width_code() {
+        let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
+        let console = TestConsole::new();
+        let error: JsonRpcError = serde_json::from_str(
+            r#"{"code":340282366920938463463374607431768211457,"message":"unbounded"}"#,
+        )
+        .expect("decode arbitrary-width JSON-RPC error code");
+
+        renderer.render_error_preview_plain(&error, console.console());
+
+        console.assert_contains("340282366920938463463374607431768211457");
+        console.assert_contains("application-error");
     }
 }

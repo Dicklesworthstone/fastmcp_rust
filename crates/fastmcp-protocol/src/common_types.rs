@@ -67,6 +67,10 @@ pub const MAX_TRACE_FIELD_BYTES: usize = 4 * 1024;
 pub const MAX_EXACT_PROGRESS_NUMBER_BYTES: usize = 256;
 /// Largest absolute decimal exponent accepted for one final progress number.
 pub const MAX_EXACT_PROGRESS_EXPONENT_ABS: i32 = 9_999;
+/// Maximum bytes retained for one arbitrary-width JSON integer token.
+pub const MAX_JSON_INTEGER_BYTES: usize = 4 * 1024;
+/// Largest absolute decimal exponent admitted for one JSON integer token.
+pub const MAX_JSON_INTEGER_EXPONENT_ABS: i32 = 10_000;
 
 /// A schema-valid RFC 3986 URI with a required ASCII scheme.
 ///
@@ -453,17 +457,68 @@ pub struct JsonInteger(serde_json::Number);
 impl JsonInteger {
     /// Admits one JSON number only when it is a mathematical integer.
     pub fn try_from_number(value: serde_json::Number) -> Result<Self, CommonTypeError> {
-        if valid_json_integer(value.as_str()) {
-            Ok(Self(value))
-        } else {
-            Err(CommonTypeError::Invalid("JSON integer"))
-        }
+        validate_json_integer(value.as_str())?;
+        Ok(Self(value))
     }
 
     /// Returns the exact retained JSON integer spelling.
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// Returns the mathematical value when it fits the legacy signed 32-bit
+    /// error-code domain.
+    ///
+    /// Integral JSON spellings with a fractional part or exponent, such as
+    /// `-32600.0` and `-326e2`, are accepted without changing the retained
+    /// wire lexeme.
+    #[must_use]
+    pub fn as_i32(&self) -> Option<i32> {
+        json_integer_as_i32(self.as_str())
+    }
+}
+
+impl std::str::FromStr for JsonInteger {
+    type Err = CommonTypeError;
+
+    /// Parses one JSON integer token without normalizing its spelling.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        validate_json_integer(value)?;
+
+        // `validate_json_integer` verifies JSON-number grammar, bounds, and mathematical
+        // integrality before retaining the caller's exact token. serde_json's
+        // parser inserts `+` into a positive exponent, so parsing first would
+        // lose a valid lexeme such as `-326e2`.
+        Ok(Self(serde_json::Number::from_string_unchecked(
+            value.to_owned(),
+        )))
+    }
+}
+
+impl TryFrom<&str> for JsonInteger {
+    type Error = CommonTypeError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl fmt::Display for JsonInteger {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl From<i32> for JsonInteger {
+    fn from(value: i32) -> Self {
+        Self(serde_json::Number::from(value))
+    }
+}
+
+impl From<fastmcp_core::McpErrorCode> for JsonInteger {
+    fn from(value: fastmcp_core::McpErrorCode) -> Self {
+        Self::from(i32::from(value))
     }
 }
 
@@ -493,8 +548,8 @@ impl<'de> Deserialize<'de> for JsonInteger {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_json::Number::deserialize(deserializer)?;
-        Self::try_from_number(value).map_err(serde::de::Error::custom)
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        raw.get().parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -677,57 +732,157 @@ fn parse_bounded_progress_exponent(value: &str) -> Result<i32, CommonTypeError> 
     Ok(if negative { -magnitude } else { magnitude })
 }
 
-fn valid_json_integer(value: &str) -> bool {
+fn validate_json_integer(value: &str) -> Result<(), CommonTypeError> {
+    if value.len() > MAX_JSON_INTEGER_BYTES {
+        return Err(CommonTypeError::TooLong("JSON integer"));
+    }
     let (mantissa, exponent) = match value.find(|character| matches!(character, 'e' | 'E')) {
-        Some(index) => (&value[..index], parse_json_exponent(&value[index + 1..])),
-        None => (value, Some(0)),
-    };
-    let Some(exponent) = exponent else {
-        return false;
+        Some(index) => (
+            &value[..index],
+            parse_bounded_json_integer_exponent(&value[index + 1..])?,
+        ),
+        None => (value, 0),
     };
     let mantissa = mantissa.strip_prefix('-').unwrap_or(mantissa);
-    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let (whole, fraction) = match mantissa.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (mantissa, None),
+    };
     if whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || !(whole == "0"
+            || (whole.as_bytes()[0].is_ascii_digit()
+                && whole.as_bytes()[0] != b'0'
+                && whole.bytes().all(|byte| byte.is_ascii_digit())))
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
     {
-        return false;
+        return Err(CommonTypeError::Invalid("JSON integer"));
     }
+    let fraction = fraction.unwrap_or("");
     let digits = [whole, fraction].concat();
     if digits.bytes().all(|byte| byte == b'0') {
-        return true;
+        return Ok(());
     }
-    let Some(scale) = (fraction.len() as isize).checked_sub(exponent) else {
-        return false;
-    };
-    scale <= 0
+    let scale = (fraction.len() as isize)
+        .checked_sub(exponent)
+        .ok_or(CommonTypeError::TooLong("JSON integer exponent"))?;
+    if scale <= 0
         || digits
             .bytes()
             .rev()
             .take_while(|byte| *byte == b'0')
             .count()
             >= usize::try_from(scale).unwrap_or(usize::MAX)
+    {
+        Ok(())
+    } else {
+        Err(CommonTypeError::Invalid("JSON integer"))
+    }
 }
 
-fn parse_json_exponent(value: &str) -> Option<isize> {
+fn json_integer_as_i32(value: &str) -> Option<i32> {
+    let (mantissa, exponent) = match value.find(|character| matches!(character, 'e' | 'E')) {
+        Some(index) => (
+            &value[..index],
+            parse_bounded_json_integer_exponent(&value[index + 1..]).ok()?,
+        ),
+        None => (value, 0),
+    };
+    let (negative, mantissa) = match mantissa.strip_prefix('-') {
+        Some(mantissa) => (true, mantissa),
+        None => (false, mantissa),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole
+        .bytes()
+        .chain(fraction.bytes())
+        .all(|digit| digit == b'0')
+    {
+        return Some(0);
+    }
+    let scale = (fraction.len() as isize).checked_sub(exponent)?;
+    let source_length = whole.len().checked_add(fraction.len())?;
+    let retained_source_length = if scale.is_positive() {
+        source_length.saturating_sub(usize::try_from(scale).ok()?)
+    } else {
+        source_length
+    };
+    let appended_zeroes = if scale.is_negative() {
+        scale.unsigned_abs()
+    } else {
+        0
+    };
+    let maximum = if negative {
+        i64::from(i32::MAX) + 1
+    } else {
+        i64::from(i32::MAX)
+    };
+
+    let mut magnitude = 0_i64;
+    let mut saw_nonzero = false;
+    for digit in whole
+        .bytes()
+        .chain(fraction.bytes())
+        .take(retained_source_length)
+    {
+        if !saw_nonzero && digit == b'0' {
+            continue;
+        }
+        saw_nonzero = true;
+        magnitude = magnitude
+            .checked_mul(10)?
+            .checked_add(i64::from(digit - b'0'))?;
+        if magnitude > maximum {
+            return None;
+        }
+    }
+
+    if !saw_nonzero {
+        return Some(0);
+    }
+    if appended_zeroes >= 10 {
+        return None;
+    }
+    for _ in 0..appended_zeroes {
+        magnitude = magnitude.checked_mul(10)?;
+        if magnitude > maximum {
+            return None;
+        }
+    }
+
+    if negative {
+        if magnitude == i64::from(i32::MAX) + 1 {
+            Some(i32::MIN)
+        } else {
+            Some(-(magnitude as i32))
+        }
+    } else {
+        Some(magnitude as i32)
+    }
+}
+
+fn parse_bounded_json_integer_exponent(value: &str) -> Result<isize, CommonTypeError> {
     let (negative, digits) = match value.strip_prefix('-') {
         Some(digits) => (true, digits),
         None => (false, value.strip_prefix('+').unwrap_or(value)),
     };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+        return Err(CommonTypeError::Invalid("JSON integer"));
     }
-    let magnitude = digits.bytes().try_fold(0_isize, |value, byte| {
+    let magnitude = digits.bytes().try_fold(0_i32, |value, byte| {
         value
             .checked_mul(10)
-            .and_then(|value| value.checked_add(isize::from(byte - b'0')))
+            .and_then(|value| value.checked_add(i32::from(byte - b'0')))
     });
-    match (negative, magnitude) {
-        (false, Some(value)) => Some(value),
-        (true, Some(value)) => value.checked_neg(),
-        (false, None) => Some(isize::MAX),
-        (true, None) => Some(isize::MIN),
+    let Some(magnitude) = magnitude else {
+        return Err(CommonTypeError::TooLong("JSON integer exponent"));
+    };
+    if magnitude > MAX_JSON_INTEGER_EXPONENT_ABS {
+        return Err(CommonTypeError::TooLong("JSON integer exponent"));
     }
+    let exponent = isize::from(magnitude);
+    Ok(if negative { -exponent } else { exponent })
 }
 
 /// Final implementation identity.
@@ -2439,6 +2594,146 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn assert_json_integer_rejected_by_public_constructors(
+        source: &str,
+        expected: CommonTypeError,
+    ) {
+        assert_eq!(source.parse::<JsonInteger>(), Err(expected.clone()));
+        assert_eq!(JsonInteger::try_from(source), Err(expected.clone()));
+        let number = serde_json::from_str::<serde_json::Number>(source)
+            .expect("bounded test token is valid JSON");
+        assert_eq!(JsonInteger::try_from_number(number), Err(expected));
+        assert!(
+            serde_json::from_str::<JsonInteger>(source).is_err(),
+            "deserialization must apply the same admission bound"
+        );
+    }
+
+    #[test]
+    fn json_integer_bounded_i32_adapters_accept_equivalent_integral_spellings() {
+        for (source, expected) in [
+            ("-32600.0", -32_600),
+            ("-326e2", -32_600),
+            ("2147483647.0", i32::MAX),
+            ("-2147483648e0", i32::MIN),
+        ] {
+            let value = JsonInteger::try_from(source).expect("integral JSON integer");
+
+            assert_eq!(value.as_i32(), Some(expected));
+            assert_eq!(value.as_str(), source, "the input lexeme remains exact");
+            assert_eq!(
+                serde_json::to_string(&value).expect("integer serializes"),
+                source,
+                "serialization does not normalize the input lexeme"
+            );
+        }
+    }
+
+    #[test]
+    fn json_integer_bounded_i32_adapters_reject_fractional_and_out_of_range_values() {
+        for source in ["-32600.1", "2147483647.1"] {
+            assert_eq!(
+                JsonInteger::try_from(source),
+                Err(CommonTypeError::Invalid("JSON integer")),
+                "changing only the nonzero fractional digit rejects {source}"
+            );
+        }
+
+        for source in ["2147483648.0", "-2147483649e0"] {
+            let value = source
+                .parse::<JsonInteger>()
+                .expect("exact out-of-range integer");
+
+            assert_eq!(value.as_i32(), None);
+            assert_eq!(
+                value.as_str(),
+                source,
+                "the out-of-range lexeme remains exact"
+            );
+        }
+    }
+
+    #[test]
+    fn json_integer_public_constructors_enforce_token_and_exponent_bounds() {
+        let at_token_limit = "1".repeat(MAX_JSON_INTEGER_BYTES);
+        for value in [
+            at_token_limit
+                .parse::<JsonInteger>()
+                .expect("token at the retention bound parses"),
+            JsonInteger::try_from(at_token_limit.as_str())
+                .expect("TryFrom accepts token at the retention bound"),
+            JsonInteger::try_from_number(
+                serde_json::from_str::<serde_json::Number>(&at_token_limit)
+                    .expect("token at the retention bound is JSON"),
+            )
+            .expect("number constructor accepts token at the retention bound"),
+            serde_json::from_str::<JsonInteger>(&at_token_limit)
+                .expect("deserialization accepts token at the retention bound"),
+        ] {
+            assert_eq!(value.as_str(), at_token_limit);
+        }
+        assert_json_integer_rejected_by_public_constructors(
+            &format!("{at_token_limit}0"),
+            CommonTypeError::TooLong("JSON integer"),
+        );
+
+        let at_positive_exponent_limit = format!("1e{MAX_JSON_INTEGER_EXPONENT_ABS}");
+        let at_negative_exponent_limit = format!("0e-{MAX_JSON_INTEGER_EXPONENT_ABS}");
+        for source in [&at_positive_exponent_limit, &at_negative_exponent_limit] {
+            assert!(source.parse::<JsonInteger>().is_ok(), "{source}");
+            assert!(JsonInteger::try_from(source.as_str()).is_ok(), "{source}");
+            assert!(
+                JsonInteger::try_from_number(
+                    serde_json::from_str::<serde_json::Number>(source)
+                        .expect("exponent-bound token is JSON"),
+                )
+                .is_ok(),
+                "{source}"
+            );
+            assert!(
+                serde_json::from_str::<JsonInteger>(source).is_ok(),
+                "{source}"
+            );
+        }
+        assert_json_integer_rejected_by_public_constructors(
+            &format!("1e{}", MAX_JSON_INTEGER_EXPONENT_ABS + 1),
+            CommonTypeError::TooLong("JSON integer exponent"),
+        );
+        assert_json_integer_rejected_by_public_constructors(
+            &format!("0e-{}", MAX_JSON_INTEGER_EXPONENT_ABS + 1),
+            CommonTypeError::TooLong("JSON integer exponent"),
+        );
+    }
+
+    #[test]
+    fn json_integer_from_str_and_try_from_preserve_huge_lexemes() {
+        const HUGE: &str = "12345678901234567890123456789012345678901234567890";
+
+        let parsed = HUGE.parse::<JsonInteger>().expect("huge integer parses");
+        let converted = JsonInteger::try_from(HUGE).expect("huge integer converts");
+
+        assert_eq!(parsed.as_str(), HUGE);
+        assert_eq!(converted.as_str(), HUGE);
+        assert_eq!(
+            serde_json::to_string(&parsed).expect("huge integer serializes"),
+            HUGE
+        );
+        let exponent = serde_json::from_str::<JsonInteger>("-326e2")
+            .expect("integral exponent JSON token deserializes");
+        assert_eq!(exponent.as_str(), "-326e2");
+        assert_eq!(
+            serde_json::to_string(&exponent).expect("deserialized exponent serializes"),
+            "-326e2"
+        );
+        for invalid_json_number in ["01", "1."] {
+            assert_eq!(
+                JsonInteger::try_from(invalid_json_number),
+                Err(CommonTypeError::Invalid("JSON integer")),
+                "the string conversion only admits JSON number grammar"
+            );
+        }
+    }
 
     #[test]
     fn exact_nonnegative_json_numbers_preserve_lexemes_and_compare_mathematically() {

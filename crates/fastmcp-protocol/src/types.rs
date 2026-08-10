@@ -6,7 +6,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::common_types::{
-    AbsoluteUri, Annotations, ContentBlock, OpenMetadata, RawIcon, SamplingContentBlock,
+    AbsoluteUri, Annotations, ContentBlock, JsonInteger, OpenMetadata, RawIcon,
+    SamplingContentBlock,
 };
 use crate::extensions::MCP_APPS_HTML_MIME_TYPE;
 use crate::messages::{FinalCallToolResult, FinalCoreResult};
@@ -1527,7 +1528,7 @@ pub struct FinalResource {
     pub mime_type: Option<String>,
     /// Optional raw content size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<i64>,
+    pub size: Option<JsonInteger>,
     /// Optional client-facing annotations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Annotations>,
@@ -3678,6 +3679,34 @@ mod tests {
             serde_json::to_value(accepted).expect("accepted outputSchema re-encodes"),
             accepted_wire,
             "rejecting the one-field null plant cannot mutate the accepted model"
+        );
+    }
+
+    #[test]
+    fn final_resource_size_preserves_arbitrary_width_and_rejects_fractional_values() {
+        let accepted: serde_json::Value = serde_json::from_str(
+            r#"{"uri":"file:///data.bin","name":"data","size":922337203685477580812345678901234567890}"#,
+        )
+        .expect("arbitrary-width resource size wire parses");
+        let resource: FinalResource = serde_json::from_value(accepted.clone())
+            .expect("arbitrary-width final resource size is accepted");
+        assert_eq!(
+            resource.size.as_ref().map(JsonInteger::as_str),
+            Some("922337203685477580812345678901234567890")
+        );
+        assert_eq!(
+            serde_json::to_value(resource).expect("arbitrary-width final resource re-encodes"),
+            accepted,
+            "the exact integer resource size lexeme round-trips"
+        );
+
+        let planted: serde_json::Value = serde_json::from_str(
+            r#"{"uri":"file:///data.bin","name":"data","size":922337203685477580812345678901234567890.5}"#,
+        )
+        .expect("one-field fractional resource size wire parses");
+        assert!(
+            serde_json::from_value::<FinalResource>(planted).is_err(),
+            "changing only the resource size to a fractional number rejects it"
         );
     }
 

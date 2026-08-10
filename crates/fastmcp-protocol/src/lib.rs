@@ -135,9 +135,10 @@ pub use uri_template::{
     MAX_URI_TEMPLATE_BYTES, MAX_URI_TEMPLATE_COMPOSITE_ITEMS,
     MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES, MAX_URI_TEMPLATE_EXPRESSIONS, MAX_URI_TEMPLATE_PARTS,
     MAX_URI_TEMPLATE_PREFIX_LENGTH, MAX_URI_TEMPLATE_VALUE_BYTES,
-    MAX_URI_TEMPLATE_VARIABLE_NAME_BYTES, MAX_URI_TEMPLATE_VARIABLES_PER_EXPRESSION, TemplateValue,
-    TemplateValues, UriTemplate, UriTemplateError, UriTemplateExpansionLimits,
-    UriTemplateExpression, UriTemplateModifier, UriTemplateOperator, UriTemplatePart,
+    MAX_URI_TEMPLATE_VARIABLE_NAME_BYTES, MAX_URI_TEMPLATE_VARIABLES_PER_EXPRESSION,
+    ReversibleResourceTemplate, TemplateValue, TemplateValues, UriTemplate, UriTemplateError,
+    UriTemplateExpansionLimits, UriTemplateExpression, UriTemplateModifier, UriTemplateOperator,
+    UriTemplatePart,
 };
 
 // The FND-03 contract freezes unqualified `cargo test -- --exact` IDs. Keep
