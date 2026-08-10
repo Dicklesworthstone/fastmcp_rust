@@ -48,6 +48,7 @@ use crate::{
     ClientProtocolPlan, ClientSession, HttpClient, HttpClientError, ModernHttpClientError,
     ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
     combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
+    validate_protocol_plan_feature,
 };
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -995,13 +996,7 @@ impl ClientBuilder {
     /// Refuses a policy or extension that this crate build did not include,
     /// before it can resolve a command, spawn a process, or contact HTTP.
     fn validate_feature_configuration(&self) -> McpResult<()> {
-        #[cfg(not(feature = "legacy-2024-11-05"))]
-        if !matches!(self.protocol_plan.policy(), ProtocolPolicy::ModernOnly) {
-            return Err(McpError::invalid_params(format!(
-                "FeatureUnavailable: legacy-2024-11-05 is compiled out; policy {:?} requires --features legacy-2024-11-05",
-                self.protocol_plan.policy(),
-            )));
-        }
+        validate_protocol_plan_feature(&self.protocol_plan)?;
 
         #[cfg(not(feature = "apps"))]
         if self.mcp_apps_settings.is_some()
@@ -1302,6 +1297,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn builder_advertises_callbacks_before_legacy_initialize_and_dispatches_them() {
         let script = "IFS= read -r initialize || exit 1; \
@@ -1347,6 +1343,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn auto_with_reverse_handlers_keeps_a_modern_selected_connection_handler_free() {
         let script = r#"IFS= read -r discover || exit 1;
@@ -1381,6 +1378,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn auto_with_reverse_handlers_installs_them_only_after_method_not_found_fallback() {
         let script = r#"IFS= read -r first || exit 1;
@@ -1435,6 +1433,52 @@ mod tests {
         client.close().expect("Auto-legacy client cleanup");
     }
 
+    #[cfg(all(unix, not(feature = "legacy-2024-11-05")))]
+    #[test]
+    fn feature_off_builder_auto_and_legacy_refuse_before_command_resolution() {
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+            let error = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(policy))
+                .connect_stdio_with_cx(
+                    "fastmcp-client-builder-feature-off-must-not-spawn",
+                    &[],
+                    &Cx::for_testing(),
+                )
+                .expect_err("feature-off builder policy must reject before command resolution");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert!(
+                error
+                    .message
+                    .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out"),
+                "{policy:?} must fail at feature admission rather than process startup"
+            );
+        }
+
+        #[cfg(feature = "apps")]
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+            let error = ClientBuilder::new()
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                        .expect("valid Apps MIME settings"),
+                )
+                .protocol_plan(ClientProtocolPlan::stdio(policy))
+                .connect_stdio_with_cx(
+                    "fastmcp-client-builder-apps-feature-off-must-not-spawn",
+                    &[],
+                    &Cx::for_testing(),
+                )
+                .expect_err("Apps with an unavailable legacy policy must reject before startup");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert!(
+                error
+                    .message
+                    .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out"),
+                "Apps {policy:?} must fail at feature admission rather than process startup"
+            );
+        }
+    }
+
+    #[cfg(feature = "apps")]
     #[test]
     fn builder_retains_public_mcp_apps_configuration() {
         let settings = McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
@@ -1758,6 +1802,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
     fn default_builder_auto_with_configured_apps_falls_back_without_legacy_metadata_leak() {
         let script = auto_legacy_lifecycle_script(-32601);
@@ -1781,6 +1826,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
     fn default_builder_auto_rejects_invalid_params_discovery_without_legacy_fallback() {
         // This differs from the accepted default-Auto fallback fixture only in
@@ -1808,6 +1854,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
     fn public_builder_auto_with_configured_apps_rejects_only_an_unsupported_final_discovery_error()
     {
@@ -1834,6 +1881,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "apps")]
     #[test]
     fn public_builder_advertises_configured_apps_after_active_modern_discovery() {
         let script = modern_apps_lifecycle_script(true);
@@ -1854,6 +1902,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "apps")]
     #[test]
     fn public_builder_omits_configured_apps_after_one_field_inactive_modern_discovery() {
         let script = modern_apps_lifecycle_script(false);

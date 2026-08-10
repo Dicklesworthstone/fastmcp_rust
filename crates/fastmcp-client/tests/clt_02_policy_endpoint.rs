@@ -58,9 +58,13 @@ fn clt_02_a_positive() {
 
     assert_eq!(builder.selected_protocol_plan(), &plan);
     assert_eq!(plan.policy(), ProtocolPolicy::ModernOnly);
+    #[cfg(feature = "legacy-2024-11-05")]
+    let expected_default_policy = ProtocolPolicy::Auto;
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    let expected_default_policy = ProtocolPolicy::ModernOnly;
     assert_eq!(
         default_builder.selected_protocol_plan().policy(),
-        ProtocolPolicy::Auto
+        expected_default_policy
     );
     assert!(http_plan.http_endpoints().is_some());
     assert_eq!(error.code, McpErrorCode::InternalError);

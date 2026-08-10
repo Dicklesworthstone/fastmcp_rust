@@ -45,6 +45,37 @@ mod builder;
 mod cache;
 mod execution;
 pub mod http_auth;
+#[cfg_attr(
+    not(feature = "legacy-2024-11-05"),
+    doc = r#"
+Feature-off downstream consumers cannot name or open the exact-2024 SSE client.
+
+```compile_fail
+use fastmcp_client::LegacySseHttpClient;
+
+let _ = LegacySseHttpClient::connect;
+```
+
+```compile_fail
+use fastmcp_client::http_executor::LegacySseHttpClient;
+
+let _ = LegacySseHttpClient::connect;
+```
+
+```compile_fail
+use fastmcp_client::http_executor::{ClientHttpConnection, ModernHttpConnectOutcome};
+
+let _ = ClientHttpConnection::LegacySse;
+let _ = ModernHttpConnectOutcome::LegacySse;
+```
+
+```compile_fail
+use fastmcp_client::HttpClient;
+
+let _ = HttpClient::take_legacy_notification;
+```
+"#
+)]
 pub mod http_executor;
 #[cfg(feature = "apps")]
 pub mod mcp_apps;
@@ -70,6 +101,11 @@ pub use fastmcp_core::CanonicalHttpUrl;
 pub use fastmcp_protocol::common_types::LoggingLevel;
 #[cfg(feature = "apps")]
 pub use fastmcp_protocol::extensions::McpAppsClientSettings;
+// The public re-export is feature-gated, while the client keeps this type
+// internally to reject configuration that names Apps when that feature is
+// absent. Keep the private name available in feature-off builds.
+#[cfg(not(feature = "apps"))]
+use fastmcp_protocol::extensions::McpAppsClientSettings;
 pub use fastmcp_protocol::protocol_policy::{
     HttpEndpointBundle, HttpEndpointBundleError, HttpModernProbe, HttpProbeBody, ProtocolEra,
     ProtocolPolicy, ProtocolVersion,
@@ -90,10 +126,13 @@ pub use fastmcp_protocol::{
     LegacyCoreResult, ListRootsParams, ListRootsResult, ReadResourceResult, SubscriptionFilter,
 };
 pub use http_executor::{
-    ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, LegacyHttpRequest,
-    LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError, ModernHttpClient,
+    ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, ModernHttpClient,
     ModernHttpClientError, ModernHttpResponseStream, ModernHttpSubscriptionListenCollector,
     ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+};
+#[cfg(feature = "legacy-2024-11-05")]
+pub use http_executor::{
+    LegacyHttpRequest, LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError,
 };
 /// Experimental caller-upgraded async WebSocket composition.
 ///
@@ -849,6 +888,10 @@ fn legacy_log_level(level: LoggingLevel) -> LogLevel {
 
 const DEFAULT_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(feature = "legacy-2024-11-05")]
+const DEFAULT_STDIO_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const DEFAULT_STDIO_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::ModernOnly;
 const MAX_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_CLIENT_ABSOLUTE_TIMEOUT: Duration = Duration::from_mins(15);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -3201,6 +3244,25 @@ pub(crate) fn admit_auto_legacy_fallback(cx: &Cx) -> McpResult<()> {
     cx.checkpoint().map_err(|_| McpError::request_cancelled())
 }
 
+/// Refuses a protocol plan that selects a feature compiled out of this client.
+///
+/// Public constructors call this before resolving a subprocess, allocating a
+/// request ID, spawning a receive task, or contacting an HTTP peer.
+pub(crate) fn validate_protocol_plan_feature(protocol_plan: &ClientProtocolPlan) -> McpResult<()> {
+    #[cfg(feature = "legacy-2024-11-05")]
+    let _ = protocol_plan;
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    if !matches!(protocol_plan.policy(), ProtocolPolicy::ModernOnly) {
+        return Err(McpError::invalid_params(format!(
+            "FeatureUnavailable: legacy-2024-11-05 is compiled out; policy {:?} requires --features legacy-2024-11-05",
+            protocol_plan.policy(),
+        )));
+    }
+
+    Ok(())
+}
+
 fn validate_timeout_duration(
     timeout: Duration,
     maximum: Duration,
@@ -4666,7 +4728,6 @@ impl HttpSubscriptionListener<'_> {
     ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
         let mut notifications = Vec::new();
         #[cfg(feature = "tasks")]
-        #[cfg(feature = "tasks")]
         let mut task_notifications = Vec::new();
 
         loop {
@@ -4912,6 +4973,7 @@ impl HttpClient {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Result<Self, HttpClientError> {
+        validate_protocol_plan_feature(&protocol_plan).map_err(HttpClientError::CoreResult)?;
         Self::connect_with_mcp_apps(
             cx,
             protocol_plan,
@@ -4968,6 +5030,7 @@ impl HttpClient {
         // that request. Auto reaches this same branch only after it has
         // selected the exact legacy SSE route; modern never receives these
         // legacy method handlers.
+        #[cfg(feature = "legacy-2024-11-05")]
         if connection.selected_protocol_era() == ProtocolEra::Legacy2024 {
             reverse_request_handlers.derive_legacy_capabilities(&mut client_capabilities);
             reverse_request_handlers
@@ -4994,6 +5057,7 @@ impl HttpClient {
                     .ok_or(HttpClientError::ModernDiscoveryMissingServerInfo)?;
                 (server_info, None)
             }
+            #[cfg(feature = "legacy-2024-11-05")]
             ProtocolEra::Legacy2024 => {
                 let parameters = serde_json::to_value(InitializeParams {
                     protocol_version: PROTOCOL_VERSION.to_owned(),
@@ -5035,6 +5099,12 @@ impl HttpClient {
                     initialization.server_info,
                     Some(initialization.capabilities),
                 )
+            }
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            ProtocolEra::Legacy2024 => {
+                return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                    "MCP 2024-11-05 HTTP requires the legacy-2024-11-05 feature",
+                )));
             }
         };
 
@@ -5133,6 +5203,7 @@ impl HttpClient {
     async fn forward_mcp_apps_reused_core(
         &mut self,
         cx: &Cx,
+        cancellation: &McpRequestCancellation,
         method: fastmcp_protocol::McpAppsRoutedMethod,
         params: Option<serde_json::Value>,
     ) -> McpResult<serde_json::Value> {
@@ -5176,7 +5247,7 @@ impl HttpClient {
             }
         };
         let result = self
-            .request_final_core(cx, core_method, parameters)
+            .request_final_core_with_cancellation(cx, cancellation, core_method, parameters)
             .await
             .map_err(|error| McpError::invalid_request(error.to_string()))?;
         mcp_apps::project_reused_core_result(method, result)
@@ -5207,6 +5278,7 @@ impl HttpClient {
     }
 
     /// Returns exact legacy capabilities when the selected peer is legacy.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub const fn legacy_server_capabilities(&self) -> Option<&ServerCapabilities> {
         self.legacy_server_capabilities.as_ref()
@@ -5232,6 +5304,7 @@ impl HttpClient {
     /// Pops one exact-2024 server notification received after this HTTP client
     /// became ready. The ready legacy SSE receiver drains these independently
     /// of ordinary client requests; modern HTTP has no shared legacy stream.
+    #[cfg(feature = "legacy-2024-11-05")]
     #[must_use]
     pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
         self.connection.take_legacy_notification()
@@ -5341,10 +5414,39 @@ impl HttpClient {
         method: impl AsRef<str>,
         parameters: serde_json::Value,
     ) -> Result<CoreResult, HttpClientError> {
-        if cx.checkpoint().is_err() {
+        self.request_final_core_with_optional_cancellation(cx, None, method.as_ref(), parameters)
+            .await
+    }
+
+    #[cfg(feature = "apps")]
+    async fn request_final_core_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core_with_optional_cancellation(
+            cx,
+            Some(cancellation),
+            method,
+            parameters,
+        )
+        .await
+    }
+
+    async fn request_final_core_with_optional_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<CoreResult, HttpClientError> {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
-        let method = method.as_ref();
         let core_parameters = self.core_request_parameters(&parameters)?;
         let core_request =
             CoreRequest::decode(self.selected_protocol_era(), method, Some(&core_parameters))
@@ -5368,7 +5470,9 @@ impl HttpClient {
         if let Some(key) = key.as_ref()
             && let FinalCacheLookup::Fresh(result) = self.final_result_cache.lookup(key)
         {
-            if cx.checkpoint().is_err() {
+            if cx.checkpoint().is_err()
+                || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            {
                 return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
             }
             return Ok(result);
@@ -5378,17 +5482,32 @@ impl HttpClient {
             .as_ref()
             .map(|key| self.final_result_cache.begin_fetch(key.result_set()));
         let request_id = self.next_request_id()?;
-        let response = self
-            .connection
-            .request_json_with_result_source_at(
-                cx,
-                method,
-                parameters,
-                request_id,
-                DEFAULT_FINAL_CACHE_MAX_BYTES,
-            )
-            .await
-            .map_err(HttpClientError::Connection)?;
+        let response = match cancellation {
+            Some(cancellation) => {
+                self.connection
+                    .request_json_with_result_source_at_with_cancellation(
+                        cx,
+                        cancellation,
+                        method,
+                        parameters,
+                        request_id,
+                        DEFAULT_FINAL_CACHE_MAX_BYTES,
+                    )
+                    .await
+            }
+            None => {
+                self.connection
+                    .request_json_with_result_source_at(
+                        cx,
+                        method,
+                        parameters,
+                        request_id,
+                        DEFAULT_FINAL_CACHE_MAX_BYTES,
+                    )
+                    .await
+            }
+        }
+        .map_err(HttpClientError::Connection)?;
         let (mut response, result_source, receipt) = response;
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
@@ -5920,6 +6039,34 @@ pub struct StdioRequestExecution {
     execution: RequestExecution<SelectedStdioTransport>,
 }
 
+/// One incrementally driven final Tasks subscription on a stdio client.
+///
+/// It deliberately remains inside [`Client`]: only the client owns the
+/// connection ingress driver, so returning a borrowing listener would invite a
+/// second reader to race the request correlation registry.
+#[cfg(feature = "tasks")]
+struct LiveStdioTaskSubscription {
+    executor: StdioRequestExecutor,
+    execution: StdioRequestExecution,
+    acknowledgement_delivered: bool,
+    pending_notifications: VecDeque<FinalTaskStatusNotification>,
+    /// A failed cancellation control leaves this listener owned by the client.
+    /// Retain the exact failure so a later poll cannot pretend cancellation
+    /// committed after the upstream writer had already failed.
+    cancellation_failure: Option<McpError>,
+}
+
+/// One incrementally observed stdio Tasks subscription event.
+#[cfg(feature = "tasks")]
+pub enum StdioTaskSubscriptionEvent {
+    /// The upstream accepted the exact filter for this request.
+    Acknowledged(SubscriptionFilter),
+    /// One typed status update, in upstream arrival order.
+    Notification(FinalTaskStatusNotification),
+    /// The correlated listener reached its validated final completion result.
+    Terminal,
+}
+
 impl std::fmt::Debug for StdioRequestExecution {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -6008,6 +6155,77 @@ impl StdioRequestExecutor {
         Ok(StdioRequestExecution { execution })
     }
 
+    /// Commits one already-prepared final Tasks subscription request.
+    ///
+    /// The request remains owned by the returned handle.  Its acknowledgement
+    /// and typed task updates are routed only when the parent [`Client`]
+    /// drives the selected stdio ingress.
+    #[cfg(feature = "tasks")]
+    pub fn execute_tasks_subscription(
+        &self,
+        cx: &Cx,
+        request: JsonRpcRequest,
+    ) -> McpResult<StdioRequestExecution> {
+        let execution = self.executor.execute_tasks_subscription(cx, request)?;
+        Ok(StdioRequestExecution { execution })
+    }
+
+    /// Allocates and commits one prepared final Tasks subscription request.
+    #[cfg(feature = "tasks")]
+    pub fn execute_final_tasks_subscription(
+        &self,
+        cx: &Cx,
+        parameters: serde_json::Value,
+    ) -> McpResult<StdioRequestExecution> {
+        let id = next_stdio_request_id(&self.next_id)?;
+        let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
+        self.execute_tasks_subscription(
+            cx,
+            JsonRpcRequest::new("subscriptions/listen", Some(parameters), id),
+        )
+    }
+
+    /// Returns the filter acknowledged for an active Tasks subscription.
+    #[cfg(feature = "tasks")]
+    pub fn tasks_subscription_acknowledgement(
+        &self,
+        execution: &StdioRequestExecution,
+    ) -> McpResult<Option<SubscriptionFilter>> {
+        self.executor
+            .tasks_subscription_acknowledgement(&execution.execution)
+    }
+
+    /// Drains the typed Tasks updates already admitted for one subscription.
+    #[cfg(feature = "tasks")]
+    pub fn take_tasks_subscription_notifications(
+        &self,
+        execution: &StdioRequestExecution,
+    ) -> McpResult<Vec<FinalTaskStatusNotification>> {
+        self.executor
+            .take_tasks_subscription_notifications(&execution.execution)
+    }
+
+    /// Takes the terminal subscription response if ingress has already
+    /// delivered it.  This method never performs a transport read.
+    #[cfg(feature = "tasks")]
+    pub fn try_take_tasks_subscription_terminal(
+        &self,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<Option<SubscriptionFilter>> {
+        self.executor
+            .try_take_tasks_subscription_terminal(&mut execution.execution)
+    }
+
+    /// Sends the selected-era cancellation control for one live subscription.
+    #[cfg(feature = "tasks")]
+    pub fn cancel_tasks_subscription(
+        &self,
+        cx: &Cx,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<()> {
+        self.executor.cancel(cx, &mut execution.execution)
+    }
+
     /// Takes one already-routed final response without reading the transport.
     pub fn try_take_response(
         &self,
@@ -6063,6 +6281,24 @@ impl StdioRequestExecutor {
     fn owns_modern_subscription_cancellation(&self, notification: &JsonRpcRequest) -> bool {
         self.executor
             .owns_modern_subscription_cancellation(notification)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn owns_task_subscription_notification(&self, notification: &JsonRpcRequest) -> bool {
+        self.executor
+            .owns_task_subscription_notification(notification)
+    }
+
+    /// Returns whether an admitted selected-stdio notification belongs to a
+    /// live request owner. Every selected-stdio ingress branch must use this
+    /// common predicate so Tasks status notifications reach their listener
+    /// instead of falling through to connection-level routing.
+    fn owns_selected_stdio_notification(&self, notification: &JsonRpcRequest) -> bool {
+        let owns = self.owns_progress_notification(notification)
+            || self.owns_modern_subscription_cancellation(notification);
+        #[cfg(feature = "tasks")]
+        let owns = owns || self.owns_task_subscription_notification(notification);
+        owns
     }
 
     fn drive_frame(&self, cx: &Cx, frame: ReceivedTransportFrame) -> McpResult<()> {
@@ -6122,6 +6358,10 @@ pub struct Client {
     /// Installed only after a final stdio handshake selected its immutable
     /// peer era. Auto's disposable modern probe never reaches this field.
     multiplexed_executor: Option<StdioRequestExecutor>,
+    /// At most one live final Tasks subscription owns the sequential stdio
+    /// listener surface.  It is driven by this client's sole ingress method.
+    #[cfg(feature = "tasks")]
+    live_task_subscription: Option<LiveStdioTaskSubscription>,
     /// Capability context for cancellation.
     cx: Cx,
     /// Session state after initialization.
@@ -6336,7 +6576,7 @@ impl Client {
         Self::stdio_with_protocol_plan_with_cx(
             command,
             args,
-            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            ClientProtocolPlan::stdio(DEFAULT_STDIO_PROTOCOL_POLICY),
             cx,
         )
     }
@@ -6367,6 +6607,7 @@ impl Client {
         protocol_plan: ClientProtocolPlan,
         cx: Cx,
     ) -> McpResult<Self> {
+        validate_protocol_plan_feature(&protocol_plan)?;
         match protocol_plan.policy() {
             ProtocolPolicy::ModernOnly | ProtocolPolicy::LegacyOnly => {
                 Self::connect_stdio_with_protocol_plan_once(command, args, protocol_plan, cx)
@@ -6472,6 +6713,8 @@ impl Client {
             response_sender,
             selected_io: None,
             multiplexed_executor: None,
+            #[cfg(feature = "tasks")]
+            live_task_subscription: None,
             cx,
             session: ClientSession::new_placeholder(
                 client_info.clone(),
@@ -6620,6 +6863,8 @@ impl Client {
             response_sender,
             selected_io,
             multiplexed_executor: None,
+            #[cfg(feature = "tasks")]
+            live_task_subscription: None,
             cx,
             session,
             next_id: Arc::new(AtomicU64::new(2)), // Start at 2 since initialize used 1
@@ -6688,6 +6933,8 @@ impl Client {
             response_sender,
             selected_io: None,
             multiplexed_executor: None,
+            #[cfg(feature = "tasks")]
+            live_task_subscription: None,
             cx,
             session,
             next_id: Arc::new(AtomicU64::new(1)), // Start at 1 since initialize hasn't happened
@@ -6860,6 +7107,7 @@ impl Client {
     }
 
     /// Returns whether final discovery activated the official MCP Apps extension.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub const fn mcp_apps_active(&self) -> bool {
         self.session.mcp_apps_active()
@@ -6867,6 +7115,7 @@ impl Client {
 
     /// Starts one browser-agnostic Apps Host after successful Apps negotiation.
     /// This never alters the MCP client/server RPC dispatcher.
+    #[cfg(feature = "apps")]
     pub fn mcp_apps_host<T, P>(
         &self,
         transport: T,
@@ -6891,6 +7140,7 @@ impl Client {
     /// Starts the closed JSON-RPC Apps bridge after final discovery retained
     /// the current bilateral activation receipt. Standard-reused View methods
     /// become fresh selected-era core requests owned by this client.
+    #[cfg(feature = "apps")]
     pub fn mcp_apps_wire_host<T>(
         &mut self,
         transport: T,
@@ -7261,11 +7511,28 @@ impl Client {
     /// `drive_frame`, and leaves reverse requests plus unrelated Client
     /// traffic on their existing connection-owned paths.
     pub fn drive_multiplexed_stdio(&mut self, cx: &Cx) -> McpResult<()> {
+        self.drive_multiplexed_stdio_until(cx, None)
+    }
+
+    /// Services one shared stdio ingress turn, optionally bounding the native
+    /// receive wait. Apps forwarding uses the bounded form so its View bridge
+    /// can admit request-local cancellation between upstream receive turns.
+    fn drive_multiplexed_stdio_until(
+        &mut self,
+        cx: &Cx,
+        receive_deadline: Option<Instant>,
+    ) -> McpResult<()> {
         let executor = self.multiplexed_stdio_executor()?;
         executor
             .service(cx)
             .map_err(|error| self.terminate_connection(error))?;
-        let deadline = executor.next_pending_deadline();
+        let deadline = match (executor.next_pending_deadline(), receive_deadline) {
+            (Some(request_deadline), Some(receive_deadline)) => {
+                Some(request_deadline.min(receive_deadline))
+            }
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (None, None) => None,
+        };
         let (frame, received_at) = match self.recv_next_child_frame(cx, deadline) {
             Ok(frame) => frame,
             Err(TransportError::ReceiveDeadlineExceeded) if !self.transport_is_closed() => {
@@ -7280,6 +7547,17 @@ impl Client {
             .service_at(cx, received_at)
             .map_err(|error| self.terminate_connection(error))?;
         self.process_selected_ingress_frame(cx, frame)
+    }
+
+    /// Flushes request-owner terminal transitions without taking another
+    /// stdio receive turn. This is the cancellation commit path for a dropped
+    /// Apps forwarding handle.
+    #[cfg(feature = "apps")]
+    pub(crate) fn service_multiplexed_stdio(&mut self, cx: &Cx) -> McpResult<()> {
+        let executor = self.multiplexed_stdio_executor()?;
+        executor
+            .service(cx)
+            .map_err(|error| self.terminate_connection(error))
     }
 
     /// Verifies that the initialized server can answer an MCP ping request.
@@ -7345,8 +7623,11 @@ impl Client {
                 extensions.insert(extension_id, settings);
             }
         }
+        #[cfg(feature = "apps")]
         let advertise_mcp_apps = !self.session.generic_mcp_apps_configured()
             && (self.session.server_discovery().is_none() || self.session.mcp_apps_active());
+        #[cfg(not(feature = "apps"))]
+        let advertise_mcp_apps = false;
         if let Some(settings) = advertise_mcp_apps
             .then_some(self.session.mcp_apps_settings())
             .flatten()
@@ -7558,6 +7839,45 @@ impl Client {
             McpError::internal_error(format!("Failed to serialize final Tasks request: {error}"))
         })?;
         let result = self.send_prepared_request(method, params)?;
+        let result_source = result.raw_result.as_deref().ok_or_else(|| {
+            self.terminate_connection(McpError::invalid_request(
+                "Peer final Tasks response lost its admitted result source",
+            ))
+        })?;
+        serde_json::from_str(result_source).map_err(|_| {
+            self.terminate_connection(McpError::invalid_request(
+                "Peer response does not match the admitted final Tasks result",
+            ))
+        })
+    }
+
+    /// Sends one already-admitted final Tasks request under a request-local
+    /// cancellation domain.
+    #[cfg(feature = "tasks")]
+    fn send_final_task_request_with_cancellation<P, R>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        params: P,
+    ) -> McpResult<R>
+    where
+        P: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let params = serde_json::to_value(params).map_err(|error| {
+            McpError::internal_error(format!("Failed to serialize final Tasks request: {error}"))
+        })?;
+        let result = self.send_prepared_request_with_request_cancellation(
+            cx,
+            cancellation,
+            method,
+            params,
+            |_| {},
+        )?;
         let result_source = result.raw_result.as_deref().ok_or_else(|| {
             self.terminate_connection(McpError::invalid_request(
                 "Peer final Tasks response lost its admitted result source",
@@ -7927,9 +8247,11 @@ impl Client {
     /// Forwards one admitted Apps standard-reused method through a new
     /// client-owned selected-era core request. Apps envelope IDs and transport
     /// controls never enter this request path.
-    pub(crate) fn forward_mcp_apps_reused_core(
+    #[cfg(feature = "apps")]
+    pub(crate) async fn forward_mcp_apps_reused_core(
         &mut self,
         cx: &Cx,
+        cancellation: &McpRequestCancellation,
         method: fastmcp_protocol::McpAppsRoutedMethod,
         params: Option<serde_json::Value>,
     ) -> McpResult<serde_json::Value> {
@@ -7942,7 +8264,7 @@ impl Client {
             ));
         }
 
-        let result = match method {
+        let (core_method, parameters) = match method {
             fastmcp_protocol::McpAppsRoutedMethod::ToolsCall => {
                 let mut params: CallToolParams =
                     serde_json::from_value(params.ok_or_else(|| {
@@ -7952,7 +8274,7 @@ impl Client {
                         McpError::invalid_params("Apps tools/call parameters are invalid")
                     })?;
                 params.meta = None;
-                self.send_typed_core_request("tools/call", params)?
+                ("tools/call", serde_json::to_value(params))
             }
             fastmcp_protocol::McpAppsRoutedMethod::ResourcesRead => {
                 let mut params: ReadResourceParams =
@@ -7963,7 +8285,7 @@ impl Client {
                         McpError::invalid_params("Apps resources/read parameters are invalid")
                     })?;
                 params.meta = None;
-                self.send_typed_core_request("resources/read", params)?
+                ("resources/read", serde_json::to_value(params))
             }
             fastmcp_protocol::McpAppsRoutedMethod::ResourcesList => {
                 let params: ListResourcesParams =
@@ -7971,7 +8293,7 @@ impl Client {
                         .map_err(|_| {
                             McpError::invalid_params("Apps resources/list parameters are invalid")
                         })?;
-                self.send_typed_core_request("resources/list", params)?
+                ("resources/list", serde_json::to_value(params))
             }
             fastmcp_protocol::McpAppsRoutedMethod::ResourceTemplatesList => {
                 let params: ListResourceTemplatesParams =
@@ -7981,7 +8303,7 @@ impl Client {
                                 "Apps resources/templates/list parameters are invalid",
                             )
                         })?;
-                self.send_typed_core_request("resources/templates/list", params)?
+                ("resources/templates/list", serde_json::to_value(params))
             }
             fastmcp_protocol::McpAppsRoutedMethod::PromptsList => {
                 let params: ListPromptsParams =
@@ -7989,7 +8311,7 @@ impl Client {
                         .map_err(|_| {
                             McpError::invalid_params("Apps prompts/list parameters are invalid")
                         })?;
-                self.send_typed_core_request("prompts/list", params)?
+                ("prompts/list", serde_json::to_value(params))
             }
             _ => {
                 return Err(McpError::invalid_params(
@@ -7997,11 +8319,65 @@ impl Client {
                 ));
             }
         };
+        let parameters = parameters.map_err(|_| {
+            McpError::internal_error("Apps bridge parameters could not form a core request")
+        })?;
+        if cancellation.is_cancel_requested() {
+            return Err(McpError::request_cancelled());
+        }
+        let parameters = self.prepare_request_parameters(parameters)?;
+        let core_request = self
+            .prepared_core_request(core_method, &parameters)?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Apps method is not a supported core request in the negotiated era",
+                )
+            })?;
+        let parameters = core_request.encode_params().map_err(|_| {
+            McpError::invalid_params(
+                "Apps core request could not be encoded in the negotiated protocol era",
+            )
+        })?;
+        let executor = self.multiplexed_stdio_executor()?;
+        let mut execution = self.start_multiplexed_request(cx, core_method, parameters)?;
 
-        mcp_apps::project_reused_core_result(method, result)
+        loop {
+            if cancellation.is_cancel_requested() {
+                self.cancel_request(execution.request_id().clone(), None)?;
+                return Err(McpError::request_cancelled());
+            }
+            if let Some((mut response, raw_result)) =
+                executor.try_take_response_with_raw_result(&mut execution)?
+            {
+                let result = response
+                    .result
+                    .take()
+                    .ok_or_else(|| McpError::internal_error("No result in response"))?;
+                let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
+                    &core_request,
+                    &result,
+                    raw_result.as_deref(),
+                )
+                .map_err(|error| self.terminate_connection(error))?;
+                if let Some(diagnostic) = diagnostic {
+                    self.retain_final_cache_ttl_diagnostic(diagnostic);
+                }
+                self.last_core_result_receipt = Some(Instant::now());
+                return mcp_apps::project_reused_core_result(method, result);
+            }
+
+            // Never let this policy own the stdio receive until the response
+            // arrives. A bounded ingress turn followed by an async yield lets
+            // the outer Apps bridge poll its independent View-control receive
+            // and cancel this exact request-owned execution.
+            let receive_deadline = Instant::now()
+                .checked_add(Duration::from_millis(10))
+                .unwrap_or_else(Instant::now);
+            self.drive_multiplexed_stdio_until(cx, Some(receive_deadline))?;
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
     }
 
-    #[cfg(feature = "tasks")]
     fn send_typed_core_request_with_tasks<P: serde::Serialize>(
         &mut self,
         method: &str,
@@ -8010,9 +8386,15 @@ impl Client {
     ) -> McpResult<CoreResult> {
         let params_value = serde_json::to_value(params)
             .map_err(|e| McpError::internal_error(format!("Failed to serialize params: {e}")))?;
+        #[cfg(feature = "tasks")]
         let params_value = if declare_tasks {
             self.with_final_tasks_client_capability(params_value)?
         } else {
+            self.prepare_request_parameters(params_value)?
+        };
+        #[cfg(not(feature = "tasks"))]
+        let params_value = {
+            let _ = declare_tasks;
             self.prepare_request_parameters(params_value)?
         };
         let core_request = self
@@ -8294,8 +8676,7 @@ impl Client {
                 unreachable!("a JSON-RPC message is either a request or response")
             };
             if let Some(executor) = self.multiplexed_executor.clone()
-                && (executor.owns_progress_notification(request)
-                    || executor.owns_modern_subscription_cancellation(request))
+                && executor.owns_selected_stdio_notification(request)
             {
                 executor
                     .drive_frame(cx, frame)
@@ -8665,8 +9046,7 @@ impl Client {
                 unreachable!("a JSON-RPC message is either a request or response")
             };
             if let Some(executor) = self.multiplexed_executor.clone()
-                && (executor.owns_progress_notification(request)
-                    || executor.owns_modern_subscription_cancellation(request))
+                && executor.owns_selected_stdio_notification(request)
             {
                 let cx = self.cx.clone();
                 if let Err(error) = executor.drive_frame(&cx, frame) {
@@ -8830,8 +9210,7 @@ impl Client {
                     unreachable!("a JSON-RPC message is either a request or response")
                 };
                 if let Some(executor) = self.multiplexed_executor.clone()
-                    && (executor.owns_progress_notification(request)
-                        || executor.owns_modern_subscription_cancellation(request))
+                    && executor.owns_selected_stdio_notification(request)
                 {
                     executor
                         .drive_frame(cx, frame)
@@ -9017,8 +9396,7 @@ impl Client {
                     unreachable!("a JSON-RPC message is either a request or response")
                 };
                 if let Some(executor) = self.multiplexed_executor.clone()
-                    && (executor.owns_progress_notification(request)
-                        || executor.owns_modern_subscription_cancellation(request))
+                    && executor.owns_selected_stdio_notification(request)
                 {
                     executor
                         .drive_frame(&cx, frame)
@@ -9576,6 +9954,71 @@ impl Client {
         }
     }
 
+    /// Calls a Tasks-capable final tool under a request-local cancellation
+    /// domain, preserving an optional downstream progress token on the
+    /// admitted upstream request.
+    #[cfg(feature = "tasks")]
+    pub fn call_tool_final_outcome_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: Option<&fastmcp_protocol::ProgressMarker>,
+    ) -> McpResult<FinalToolCallOutcome> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.require_modern_final_result_session("tools/call")?;
+        let discovery = self.server_discovery().ok_or_else(|| {
+            McpError::invalid_params(
+                "Modern Tasks requires the retained final server/discover response",
+            )
+        })?;
+        admit_final_tasks_result_discriminator(discovery, OFFICIAL_TASKS_RESULT_DISCRIMINATOR)?;
+        let mut parameters = self.with_final_tasks_client_capability(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        }))?;
+        if let Some(marker) = progress_marker {
+            parameters["_meta"]["progressToken"] = serde_json::to_value(marker).map_err(|_| {
+                McpError::internal_error("Modern Tasks progress token could not be encoded")
+            })?;
+        }
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&parameters))
+            .map_err(|_| {
+                McpError::invalid_params("Modern Tasks tools/call parameters are invalid")
+            })?;
+        let received = self.send_prepared_request_with_request_cancellation(
+            cx,
+            cancellation,
+            "tools/call",
+            parameters,
+            |_| {},
+        )?;
+        let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &received.result,
+            received.raw_result.as_deref(),
+        )
+        .map_err(|error| self.terminate_connection(error))?;
+        if let Some(diagnostic) = diagnostic {
+            self.retain_final_cache_ttl_diagnostic(diagnostic);
+        }
+        match result {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolCallOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                Ok(FinalToolCallOutcome::Task(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            _ => Err(unexpected_convenience_result("tools/call")),
+        }
+    }
+
     /// Calls a tool and returns its exact MCP 2026-07-28 result payload.
     ///
     /// Unlike [`Self::call_tool`], this convenience API does not project final
@@ -9951,8 +10394,7 @@ impl Client {
                     unreachable!("a JSON-RPC message is either a request or response")
                 };
                 if let Some(executor) = self.multiplexed_executor.clone()
-                    && (executor.owns_progress_notification(request)
-                        || executor.owns_modern_subscription_cancellation(request))
+                    && executor.owns_selected_stdio_notification(request)
                 {
                     executor
                         .drive_frame(&cx, frame)
@@ -10711,10 +11153,8 @@ impl Client {
         let tasks_requested = task_subscription_ids(&requested)
             .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
             .is_some();
-        #[cfg(not(feature = "tasks"))]
-        let tasks_requested = false;
+        #[cfg(feature = "tasks")]
         if tasks_requested {
-            #[cfg(feature = "tasks")]
             self.admit_final_tasks_direction(
                 TASK_STATUS_NOTIFICATION,
                 ExtensionDirection::ServerToClient,
@@ -10772,6 +11212,182 @@ impl Client {
         self.recv_subscription_listener(waiter, &core_request, &requested, deadlines)
     }
 
+    /// Starts a real, incrementally driven final Tasks subscription on this
+    /// stdio connection.
+    ///
+    /// Unlike [`Self::listen_subscriptions_typed`], this does not collect the
+    /// stream to terminal completion.  Call
+    /// [`Self::next_final_task_subscription_event`] to let this `Client` keep
+    /// sole ownership of ingress while exposing each acknowledged Tasks update
+    /// in arrival order.
+    #[cfg(feature = "tasks")]
+    pub fn open_final_task_subscription_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<()> {
+        self.ensure_initialized()?;
+        if self.live_task_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final Tasks stdio subscription is already active on this client",
+            ));
+        }
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return Err(McpError::invalid_params(
+                "subscriptions/listen is available only for MCP 2026-07-28",
+            ));
+        }
+        let tasks_requested = task_subscription_ids(&notifications)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .is_some();
+        if !tasks_requested {
+            return Err(McpError::invalid_params(
+                "A live final Tasks subscription requires taskIds",
+            ));
+        }
+        self.admit_final_tasks_direction(
+            TASK_STATUS_NOTIFICATION,
+            ExtensionDirection::ServerToClient,
+        )?;
+        let params_value = serde_json::to_value(serde_json::json!({
+            "notifications": notifications,
+        }))
+        .map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to serialize subscriptions/listen parameters: {error}"
+            ))
+        })?;
+        let params_value = self.with_final_tasks_client_capability(params_value)?;
+        let core_request = self
+            .prepared_core_request("subscriptions/listen", &params_value)?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "subscriptions/listen is not a supported core request in the negotiated era",
+                )
+            })?;
+        let params_value = core_request
+            .encode_params()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "subscriptions/listen could not be encoded in the negotiated protocol era",
+                )
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "subscriptions/listen requires a parameter object in the negotiated protocol era",
+                )
+            })?;
+        let executor = self.multiplexed_stdio_executor()?;
+        executor.service(&self.cx)?;
+        let execution = executor.execute_final_tasks_subscription(&self.cx, params_value)?;
+        self.live_task_subscription = Some(LiveStdioTaskSubscription {
+            executor,
+            execution,
+            acknowledgement_delivered: false,
+            pending_notifications: VecDeque::new(),
+            cancellation_failure: None,
+        });
+        Ok(())
+    }
+
+    /// Commits upstream cancellation before retiring the live listener owner.
+    ///
+    /// The listener remains installed when the cancellation control cannot be
+    /// committed.  This preserves its request ownership and retains the
+    /// original transport failure instead of silently converting it into a
+    /// successful local cancellation.
+    #[cfg(feature = "tasks")]
+    fn cancel_live_final_task_subscription(&mut self, cx: &Cx) -> McpResult<()> {
+        let cancellation = {
+            let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final Tasks stdio subscription is active")
+            })?;
+            if let Some(error) = &subscription.cancellation_failure {
+                return Err(error.clone());
+            }
+            subscription
+                .executor
+                .cancel_tasks_subscription(cx, &mut subscription.execution)
+        };
+        match cancellation {
+            Ok(()) => {
+                self.live_task_subscription = None;
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(subscription) = self.live_task_subscription.as_mut() {
+                    subscription.cancellation_failure = Some(error.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Drives the sole stdio ingress reader until one live Tasks listener
+    /// event is available.
+    #[cfg(feature = "tasks")]
+    pub fn next_final_task_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<StdioTaskSubscriptionEvent> {
+        if let Some(error) = self
+            .live_task_subscription
+            .as_ref()
+            .and_then(|subscription| subscription.cancellation_failure.clone())
+        {
+            return Err(error);
+        }
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.cancel_live_final_task_subscription(cx)?;
+            return Err(McpError::request_cancelled());
+        }
+        loop {
+            let event = {
+                let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
+                    McpError::invalid_request("No live final Tasks stdio subscription is active")
+                })?;
+                if !subscription.acknowledgement_delivered
+                    && let Some(acknowledged) = subscription
+                        .executor
+                        .tasks_subscription_acknowledgement(&subscription.execution)?
+                {
+                    subscription.acknowledgement_delivered = true;
+                    Some(StdioTaskSubscriptionEvent::Acknowledged(acknowledged))
+                } else {
+                    if subscription.pending_notifications.is_empty() {
+                        subscription.pending_notifications.extend(
+                            subscription
+                                .executor
+                                .take_tasks_subscription_notifications(&subscription.execution)?,
+                        );
+                    }
+                    if let Some(notification) = subscription.pending_notifications.pop_front() {
+                        Some(StdioTaskSubscriptionEvent::Notification(notification))
+                    } else if subscription
+                        .executor
+                        .try_take_tasks_subscription_terminal(&mut subscription.execution)?
+                        .is_some()
+                    {
+                        Some(StdioTaskSubscriptionEvent::Terminal)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(event) = event {
+                if matches!(event, StdioTaskSubscriptionEvent::Terminal) {
+                    self.live_task_subscription = None;
+                }
+                return Ok(event);
+            }
+            self.drive_multiplexed_stdio(cx)?;
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_final_task_subscription(cx)?;
+                return Err(McpError::request_cancelled());
+            }
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Final Tasks extension
     // ═══════════════════════════════════════════════════════════════════════
@@ -10790,6 +11406,29 @@ impl Client {
             task_id: task_id.clone(),
         };
         let result: FinalGetTaskResult = self.send_final_task_request(TASK_GET, params)?;
+        if result.task.base().task_id != task_id {
+            return Err(self.terminate_connection(McpError::invalid_request(
+                "tasks/get response taskId does not match the requested final task",
+            )));
+        }
+        Ok(result)
+    }
+
+    /// Reads one task under a request-local cancellation domain.
+    #[cfg(feature = "tasks")]
+    pub fn get_task_final_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalGetTaskResult> {
+        self.admit_final_tasks_method(TASK_GET)?;
+        let params = FinalGetTaskParams {
+            request: self.final_task_request_meta()?,
+            task_id: task_id.clone(),
+        };
+        let result =
+            self.send_final_task_request_with_cancellation(cx, cancellation, TASK_GET, params)?;
         if result.task.base().task_id != task_id {
             return Err(self.terminate_connection(McpError::invalid_request(
                 "tasks/get response taskId does not match the requested final task",
@@ -10836,6 +11475,46 @@ impl Client {
         self.send_final_task_request(TASK_UPDATE, params)
     }
 
+    /// Updates one input-required task under a request-local cancellation
+    /// domain.
+    #[cfg(feature = "tasks")]
+    pub fn update_task_final_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        self.admit_final_tasks_method(TASK_UPDATE)?;
+        let FinalTask::InputRequired {
+            base,
+            input_requests,
+        } = task
+        else {
+            return Err(McpError::invalid_params(
+                "tasks/update requires an input_required final task",
+            ));
+        };
+        let ledger = TaskInputLedger::from_requests(input_requests).map_err(|_| {
+            McpError::invalid_params("Final task input requests are not an admitted ledger")
+        })?;
+        ledger.validate_responses(&input_responses).map_err(|_| {
+            McpError::invalid_params(
+                "tasks/update inputResponses do not match the retained task input requests",
+            )
+        })?;
+        self.send_final_task_request_with_cancellation(
+            cx,
+            cancellation,
+            TASK_UPDATE,
+            FinalUpdateTaskParams {
+                request: self.final_task_request_meta()?,
+                task_id: base.task_id.clone(),
+                input_responses,
+            },
+        )
+    }
+
     /// Requests cancellation through the negotiated official Tasks extension.
     ///
     /// The exact final acknowledgement is intentionally empty; unlike the
@@ -10848,6 +11527,26 @@ impl Client {
             task_id,
         };
         self.send_final_task_request(TASK_CANCEL, params)
+    }
+
+    /// Cancels one task under a request-local cancellation domain.
+    #[cfg(feature = "tasks")]
+    pub fn cancel_task_final_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalCancelTaskResult> {
+        self.admit_final_tasks_method(TASK_CANCEL)?;
+        self.send_final_task_request_with_cancellation(
+            cx,
+            cancellation,
+            TASK_CANCEL,
+            FinalCancelTaskParams {
+                request: self.final_task_request_meta()?,
+                task_id,
+            },
+        )
     }
 
     /// Closes the client connection and verifies bounded subprocess cleanup.
@@ -11000,6 +11699,36 @@ mod tests {
                 "{code:?} must {}authorize a legacy child",
                 if authorized { "" } else { "not " }
             );
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_http_public_surface_is_available_in_the_legacy_profile() {
+        let _: fn(&mut ClientHttpConnection) -> Option<JsonRpcRequest> =
+            ClientHttpConnection::take_legacy_notification;
+        let _: fn(&mut HttpClient) -> Option<JsonRpcRequest> = HttpClient::take_legacy_notification;
+        let _ = ModernHttpConnectOutcome::into_legacy_sse;
+        let _ = LegacySseHttpClient::connect;
+        let _ = LegacyHttpRequest::wait;
+        let _ = LegacyHttpRequestCommit::request_id;
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn feature_off_stdio_defaults_modern_and_rejects_legacy_without_contact() {
+        assert_eq!(DEFAULT_STDIO_PROTOCOL_POLICY, ProtocolPolicy::ModernOnly);
+
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+            let error = Client::stdio_with_protocol_plan_with_cx(
+                "fastmcp-client-feature-off-must-not-spawn",
+                &[],
+                ClientProtocolPlan::stdio(policy),
+                Cx::for_testing(),
+            )
+            .expect_err("feature-off legacy policies must fail before command resolution");
+
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
         }
     }
 
@@ -11319,7 +12048,7 @@ mod tests {
         .expect("modern-only HTTP cache plan is complete")
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_raw_extension_http_plan(
         sse_target: &str,
         message_target: &str,
@@ -11345,7 +12074,7 @@ mod tests {
         .expect("exact legacy raw extension HTTP plan is complete")
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn legacy_completion_http_plan(sse_target: &str, message_target: &str) -> ClientProtocolPlan {
         ClientProtocolPlan::http(
             ProtocolPolicy::LegacyOnly,
@@ -11368,7 +12097,7 @@ mod tests {
         .expect("exact legacy completion HTTP plan is complete")
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn write_legacy_http_accepted_response(stream: &mut TcpStream) {
         stream
             .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -11378,7 +12107,7 @@ mod tests {
             .expect("flush exact legacy HTTP acknowledgement");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn write_legacy_http_sse_message(stream: &mut TcpStream, message: &str) {
         let event = format!("event: message\ndata: {message}\n\n");
         write!(stream, "{:X}\r\n{event}\r\n", event.len())
@@ -11573,6 +12302,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_ext_raw_legacy_http_request_cannot_bypass_extension_admission() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind exact legacy raw peer");
@@ -11763,6 +12493,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_01_http_completion_legacy_projects_only_the_compatible_subset() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy completion peer");
@@ -11861,6 +12592,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_01_http_completion_legacy_rejects_prompt_title_before_id_or_post() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy completion peer");
@@ -13263,12 +13995,12 @@ mod tests {
             .expect("uninitialized constructor cleanup");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn make_shell_scripted_initialized_client(script: &str, timeout: Duration) -> Client {
         make_shell_scripted_initialized_client_for_version(script, timeout, PROTOCOL_VERSION)
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn make_shell_scripted_initialized_client_with_reverse_handlers(
         script: &str,
         timeout: Duration,
@@ -13353,7 +14085,657 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(feature = "apps")]
+    fn install_test_mcp_apps_activation(client: &mut Client) {
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionLocalEnablement,
+            ExtensionSettings, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
+            official_mcp_apps_negotiation_resolver, register_official_mcp_apps_extension,
+        };
+
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let id = register_official_mcp_apps_extension(&mut registry)
+            .expect("the official Apps extension registers for the real-policy test");
+        registry
+            .freeze()
+            .expect("the real-policy test freezes its Apps registry");
+        let client_discovery = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(
+                id.clone(),
+                ExtensionSettings::new(serde_json::json!({
+                    "mimeTypes": [fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE]
+                }))
+                .expect("the real-policy test uses admitted Apps client settings"),
+            )]),
+        };
+        let server_discovery = ServerExtensionDiscovery {
+            extensions: BTreeMap::from([(id.clone(), official_mcp_apps_empty_server_settings())]),
+        };
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id);
+        let mut resolver = official_mcp_apps_negotiation_resolver();
+        let receipt = registry
+            .negotiate(
+                ProtocolEra::Modern2026,
+                &local,
+                &client_discovery,
+                &server_discovery,
+                &mut resolver,
+            )
+            .expect("the real-policy test negotiates MCP Apps bilaterally")
+            .mcp_apps_activation_receipt(&registry);
+        client.session.set_mcp_apps_activation_receipt(receipt);
+        assert!(
+            client.mcp_apps_active(),
+            "the public wire-host constructor must receive its retained bilateral receipt"
+        );
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
+    fn public_mcp_apps_stdio_policy_cancellation_reaches_its_real_upstream_request() {
+        let script = "IFS= read -r request; \\
+            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \\
+            IFS= read -r cancellation; \\
+            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \\
+            IFS= read -r ping; \\
+            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \\
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"cancellation\":%s,\"ping\":%s}}\\n' \\
+              \"$request_ok\" \"$cancellation_ok\" \"$ping_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            script,
+            Duration::from_secs(2),
+            MODERN_PROTOCOL_VERSION,
+        );
+        install_test_mcp_apps_activation(&mut client);
+        let cx = Cx::for_testing();
+        let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
+        let configuration = mcp_apps::McpAppsWireHostConfiguration {
+            host_info: fastmcp_protocol::McpAppsBridgeImplementation {
+                name: "stdio-real-policy-host".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
+        };
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration)
+            .expect("the public stdio Apps policy admits its negotiated Host");
+
+        block_on(async {
+            view.send_to_host(
+                &cx,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "method": "ui/initialize",
+                    "params": {
+                        "appInfo": {"name": "view", "version": "1"},
+                        "appCapabilities": {},
+                        "protocolVersion": fastmcp_protocol::MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .expect("the real stdio policy receives the public initialize frame");
+            host.process_next(&cx)
+                .await
+                .expect("the real stdio policy commits initialize");
+            let _ = view
+                .receive_from_host(&cx)
+                .await
+                .expect("the View receives the public initialize response");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#.to_owned(),
+            )
+            .await
+            .expect("the View activates the real stdio policy");
+            host.process_next(&cx)
+                .await
+                .expect("the real stdio policy becomes active");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","id":"view-call","method":"tools/call","params":{"name":"weather","arguments":{}}}"#.to_owned(),
+            )
+            .await
+            .expect("the View commits the real forwarded request");
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
+            )
+            .await
+            .expect("the View commits the matching real cancellation");
+            host.process_next(&cx)
+                .await
+                .expect("the real stdio policy settles its cancelled request");
+        });
+        drop(host);
+
+        let evidence: serde_json::Value = client
+            .send_request("ping", serde_json::json!({}))
+            .expect("the stdio client remains usable after the Apps-owned cancellation");
+        assert_eq!(
+            evidence,
+            serde_json::json!({"request": true, "cancellation": true, "ping": true}),
+            "the real subprocess saw the Apps request, its exact cancellation, and one later request"
+        );
+        client.close().expect("real stdio Apps policy cleanup");
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
+    fn public_mcp_apps_stdio_policy_wrong_id_cancellation_emits_no_cancel_frame() {
+        let script = "IFS= read -r request; \\
+            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \\
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}'; \\
+            IFS= read -r follow_up; \\
+            case \"$follow_up\" in *'\"method\":\"notifications/cancelled\"'*) no_cancellation=false; ping_ok=false;; *'\"method\":\"ping\"'*'\"id\":3'*) no_cancellation=true; ping_ok=true;; *) no_cancellation=true; ping_ok=false;; esac; \\
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"noCancellation\":%s,\"ping\":%s}}\\n' \\
+              \"$request_ok\" \"$no_cancellation\" \"$ping_ok\"; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client_for_version(
+            script,
+            Duration::from_secs(2),
+            MODERN_PROTOCOL_VERSION,
+        );
+        install_test_mcp_apps_activation(&mut client);
+        let cx = Cx::for_testing();
+        let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
+        let configuration = mcp_apps::McpAppsWireHostConfiguration {
+            host_info: fastmcp_protocol::McpAppsBridgeImplementation {
+                name: "stdio-real-policy-wrong-id-host".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
+        };
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration)
+            .expect("the public stdio Apps policy admits its negotiated Host");
+
+        block_on(async {
+            view.send_to_host(
+                &cx,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "method": "ui/initialize",
+                    "params": {
+                        "appInfo": {"name": "view", "version": "1"},
+                        "appCapabilities": {},
+                        "protocolVersion": fastmcp_protocol::MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .expect("the real stdio policy receives the public initialize frame");
+            host.process_next(&cx)
+                .await
+                .expect("the real stdio policy commits initialize");
+            let _ = view
+                .receive_from_host(&cx)
+                .await
+                .expect("the View receives the public initialize response");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#.to_owned(),
+            )
+            .await
+            .expect("the View activates the real stdio policy");
+            host.process_next(&cx)
+                .await
+                .expect("the real stdio policy becomes active");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","id":"view-call","method":"tools/call","params":{"name":"weather","arguments":{}}}"#.to_owned(),
+            )
+            .await
+            .expect("the View commits the real forwarded request");
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
+            )
+            .await
+            .expect("the View commits the one-field wrong cancellation");
+            let first_result = host.process_next(&cx).await;
+            match first_result {
+                Err(mcp_apps::McpAppsHostError::Bridge(
+                    fastmcp_protocol::McpAppsBridgeError::UnknownCorrelation,
+                )) => {}
+                Ok(()) => match host.process_next(&cx).await {
+                    Err(mcp_apps::McpAppsHostError::Bridge(
+                        fastmcp_protocol::McpAppsBridgeError::UnknownCorrelation,
+                    )) => {}
+                    result => panic!(
+                        "the deferred one-variable wrong cancellation must yield UnknownCorrelation; result={result:?}"
+                    ),
+                },
+                result => panic!(
+                    "the one-variable wrong cancellation must yield UnknownCorrelation; result={result:?}"
+                ),
+            }
+            let response: serde_json::Value = serde_json::from_str(
+                &view
+                    .receive_from_host(&cx)
+                    .await
+                    .expect("the live request returns one normal View response"),
+            )
+            .expect("the normal View response is JSON-RPC");
+            assert_eq!(response["id"], "view-call");
+            assert_eq!(response["result"]["content"], serde_json::json!([]));
+        });
+        drop(host);
+
+        let evidence: serde_json::Value = client
+            .send_request("ping", serde_json::json!({}))
+            .expect("the stdio client remains usable after the inert Apps cancellation");
+        assert_eq!(
+            evidence,
+            serde_json::json!({"request": true, "noCancellation": true, "ping": true}),
+            "a wrong View ID must not emit an upstream stdio cancellation frame"
+        );
+        client.close().expect("real stdio Apps wrong-ID cleanup");
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
+    fn public_mcp_apps_http_policy_cancellation_drops_the_real_request_before_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind the real Apps HTTP cancellation listener");
+        let address = listener
+            .local_addr()
+            .expect("read the real Apps HTTP cancellation address");
+        let (post_accepted_sender, post_accepted_receiver) = std::sync::mpsc::sync_channel(1);
+        let (request_dropped_sender, request_dropped_receiver) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut discovery, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP discovery request");
+            let discovery_request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(discovery_request["id"], 1);
+            assert_eq!(discovery_request["method"], "server/discover");
+            let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+                &fastmcp_protocol::ServerBehaviorRegistry::default(),
+                BTreeMap::from([(
+                    fastmcp_protocol::extensions::OFFICIAL_MCP_APPS_EXTENSION_ID.to_owned(),
+                    serde_json::json!({}),
+                )]),
+            )
+            .expect("the real Apps HTTP discovery declares valid server settings");
+            let discovery_result = ServerDiscoverResult::new(
+                capabilities,
+                ServerInfo {
+                    name: "apps-http-cancellation-server".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                None,
+                fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+            );
+            let mut discovery_response = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 1,
+                "result": discovery_result,
+            });
+            discovery_response["result"]["supportedVersions"] =
+                serde_json::json!([MODERN_PROTOCOL_VERSION]);
+            write_http_cache_test_response(
+                &mut discovery,
+                "application/json",
+                serde_json::to_string(&discovery_response)
+                    .expect("the real Apps HTTP discovery response serializes")
+                    .as_bytes(),
+            );
+
+            let (mut tool_call, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP tool request");
+            let tool_request = read_http_cache_test_request(&mut tool_call);
+            assert_eq!(tool_request["id"], 2);
+            assert_eq!(tool_request["method"], "tools/call");
+            post_accepted_sender
+                .send(())
+                .expect("allow the matching Apps cancellation after POST acceptance");
+            tool_call
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("bound the withheld-header close observation");
+            let mut probe = [0_u8; 1];
+            let dropped = match tool_call.read(&mut probe) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    false
+                }
+                Err(error) => panic!("observe the withheld-header request close: {error}"),
+            };
+            request_dropped_sender
+                .send(dropped)
+                .expect("report the real Apps request close before headers");
+        });
+
+        let cx = Cx::for_testing();
+        let target = format!("http://{address}/mcp");
+        let settings =
+            McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.to_owned()])
+                .expect("the real Apps HTTP policy uses admitted client settings");
+        let mut client = http_test_runtime_block_on(HttpClient::connect_with_mcp_apps(
+            &cx,
+            http_cache_test_plan(&target),
+            ClientInfo {
+                name: "apps-http-cancellation-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            Some(settings),
+            ReverseRequestHandlers::new(),
+        ))
+        .expect("the real HTTP client completes bilateral Apps discovery");
+        assert!(client.mcp_apps_active());
+        let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
+        let configuration = mcp_apps::McpAppsWireHostConfiguration {
+            host_info: fastmcp_protocol::McpAppsBridgeImplementation {
+                name: "http-real-policy-host".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
+        };
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration)
+            .expect("the public HTTP Apps policy admits its negotiated Host");
+
+        http_test_runtime_block_on(async {
+            view.send_to_host(
+                &cx,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "method": "ui/initialize",
+                    "params": {
+                        "appInfo": {"name": "view", "version": "1"},
+                        "appCapabilities": {},
+                        "protocolVersion": fastmcp_protocol::MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .expect("the real HTTP policy receives the public initialize frame");
+            host.process_next(&cx)
+                .await
+                .expect("the real HTTP policy commits initialize");
+            let _ = view
+                .receive_from_host(&cx)
+                .await
+                .expect("the View receives the public HTTP initialize response");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#.to_owned(),
+            )
+            .await
+            .expect("the View activates the real HTTP policy");
+            host.process_next(&cx)
+                .await
+                .expect("the real HTTP policy becomes active");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","id":"view-call","method":"tools/call","params":{"name":"weather","arguments":{}}}"#.to_owned(),
+            )
+            .await
+            .expect("the View commits the real HTTP forwarded request");
+        });
+        let cancellation_controller = std::thread::spawn(move || {
+            post_accepted_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the peer accepts the real Apps POST before cancellation");
+            let cancellation_cx = Cx::for_testing();
+            http_test_runtime_block_on(async {
+                view.send_to_host(
+                    &cancellation_cx,
+                    r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
+                )
+                .await
+                .expect("the View commits the matching real HTTP cancellation");
+            });
+        });
+        http_test_runtime_block_on(async {
+            host.process_next(&cx)
+                .await
+                .expect("the real HTTP policy settles its cancelled request");
+        });
+        cancellation_controller
+            .join()
+            .expect("matching Apps cancellation controller joins");
+        drop(host);
+        assert!(
+            request_dropped_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the real HTTP peer observes the cancelled request close"),
+            "the matching Apps cancellation must drop its real HTTP request before headers"
+        );
+        server
+            .join()
+            .expect("the real Apps HTTP cancellation server joins");
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
+    fn public_mcp_apps_http_policy_wrong_id_cancellation_keeps_the_real_withheld_header_request_live()
+     {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind the real Apps HTTP wrong-ID listener");
+        let address = listener
+            .local_addr()
+            .expect("read the real Apps HTTP wrong-ID address");
+        let (post_accepted_sender, post_accepted_receiver) = std::sync::mpsc::sync_channel(1);
+        let (wrong_id_sent_sender, wrong_id_sent_receiver) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut discovery, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP discovery request");
+            let discovery_request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(discovery_request["id"], 1);
+            assert_eq!(discovery_request["method"], "server/discover");
+            let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+                &fastmcp_protocol::ServerBehaviorRegistry::default(),
+                BTreeMap::from([(
+                    fastmcp_protocol::extensions::OFFICIAL_MCP_APPS_EXTENSION_ID.to_owned(),
+                    serde_json::json!({}),
+                )]),
+            )
+            .expect("the real Apps HTTP discovery declares valid server settings");
+            let discovery_result = ServerDiscoverResult::new(
+                capabilities,
+                ServerInfo {
+                    name: "apps-http-wrong-id-server".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                None,
+                fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+            );
+            let mut discovery_response = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 1,
+                "result": discovery_result,
+            });
+            discovery_response["result"]["supportedVersions"] =
+                serde_json::json!([MODERN_PROTOCOL_VERSION]);
+            write_http_cache_test_response(
+                &mut discovery,
+                "application/json",
+                serde_json::to_string(&discovery_response)
+                    .expect("the real Apps HTTP discovery response serializes")
+                    .as_bytes(),
+            );
+
+            let (mut tool_call, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP tool request");
+            let tool_request = read_http_cache_test_request(&mut tool_call);
+            assert_eq!(tool_request["id"], 2);
+            assert_eq!(tool_request["method"], "tools/call");
+            post_accepted_sender
+                .send(())
+                .expect("allow the one-variable wrong-ID cancellation after POST acceptance");
+            wrong_id_sent_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("wait for the wrong-ID cancellation while headers stay withheld");
+            tool_call
+                .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                .expect("bound the wrong-ID withheld-header liveness observation");
+            let mut probe = [0_u8; 1];
+            match tool_call.read(&mut probe) {
+                Ok(0) => panic!("a wrong Apps cancellation ID must not drop the real HTTP request"),
+                Ok(_) => {
+                    panic!("the client must not send bytes while response headers are withheld")
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => panic!("observe wrong-ID withheld-header request liveness: {error}"),
+            }
+            let tool_response = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 2,
+                "result": {"resultType": "complete", "content": [], "isError": false},
+            });
+            write_http_cache_test_response(
+                &mut tool_call,
+                "application/json",
+                serde_json::to_string(&tool_response)
+                    .expect("the real Apps HTTP normal body serializes")
+                    .as_bytes(),
+            );
+        });
+
+        let cx = Cx::for_testing();
+        let target = format!("http://{address}/mcp");
+        let settings =
+            McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.to_owned()])
+                .expect("the real Apps HTTP policy uses admitted client settings");
+        let mut client = http_test_runtime_block_on(HttpClient::connect_with_mcp_apps(
+            &cx,
+            http_cache_test_plan(&target),
+            ClientInfo {
+                name: "apps-http-wrong-id-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            Some(settings),
+            ReverseRequestHandlers::new(),
+        ))
+        .expect("the real HTTP client completes bilateral Apps discovery");
+        assert!(client.mcp_apps_active());
+        let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
+        let configuration = mcp_apps::McpAppsWireHostConfiguration {
+            host_info: fastmcp_protocol::McpAppsBridgeImplementation {
+                name: "http-real-policy-wrong-id-host".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            host_capabilities: fastmcp_protocol::McpAppsPinnedHostCapabilities::default(),
+            host_context: fastmcp_protocol::McpAppsPinnedHostContext::default(),
+        };
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration)
+            .expect("the public HTTP Apps policy admits its negotiated Host");
+
+        http_test_runtime_block_on(async {
+            view.send_to_host(
+                &cx,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "method": "ui/initialize",
+                    "params": {
+                        "appInfo": {"name": "view", "version": "1"},
+                        "appCapabilities": {},
+                        "protocolVersion": fastmcp_protocol::MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .expect("the real HTTP policy receives the public initialize frame");
+            host.process_next(&cx)
+                .await
+                .expect("the real HTTP policy commits initialize");
+            let _ = view
+                .receive_from_host(&cx)
+                .await
+                .expect("the View receives the public HTTP initialize response");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#.to_owned(),
+            )
+            .await
+            .expect("the View activates the real HTTP policy");
+            host.process_next(&cx)
+                .await
+                .expect("the real HTTP policy becomes active");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","id":"view-call","method":"tools/call","params":{"name":"weather","arguments":{}}}"#.to_owned(),
+            )
+            .await
+            .expect("the View commits the real HTTP forwarded request");
+        });
+        let wrong_id_controller = std::thread::spawn(move || {
+            post_accepted_receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("the peer accepts the real Apps POST before the wrong-ID control");
+            let controller_cx = Cx::for_testing();
+            let response = http_test_runtime_block_on(async {
+                view.send_to_host(
+                    &controller_cx,
+                    r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
+                )
+                .await
+                .expect("the View commits the one-variable wrong HTTP cancellation");
+                wrong_id_sent_sender.send(()).expect(
+                    "allow the peer to release headers after proving the request stayed live",
+                );
+                view.receive_from_host(&controller_cx)
+                    .await
+                    .expect("the preserved HTTP request receives its normal View response")
+            });
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("the preserved HTTP response is JSON-RPC");
+            assert_eq!(response["id"], "view-call");
+            assert_eq!(response["result"]["content"], serde_json::json!([]));
+        });
+        let result = http_test_runtime_block_on(async { host.process_next(&cx).await });
+        assert!(matches!(
+            result,
+            Err(mcp_apps::McpAppsHostError::Bridge(
+                fastmcp_protocol::McpAppsBridgeError::UnknownCorrelation
+            ))
+        ));
+        wrong_id_controller
+            .join()
+            .expect("wrong-ID Apps cancellation controller joins");
+        drop(host);
+        server
+            .join()
+            .expect("the real Apps HTTP wrong-ID server joins");
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn make_scripted_initialized_client(response: JsonRpcMessage) -> Client {
         let response_line = serde_json::to_string(&response).expect("serialize scripted response");
         assert!(
@@ -13366,7 +14748,7 @@ mod tests {
         make_shell_scripted_initialized_client(&script, Duration::from_secs(1))
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn make_peer_silent_past_deadline_client(response: JsonRpcMessage) -> Client {
         let response_line = serde_json::to_string(&response).expect("serialize scripted response");
         assert!(
@@ -13470,6 +14852,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn invalid_response_timeout_is_rejected_before_request_commit() {
         let mut client =
@@ -13512,6 +14895,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn silent_peer_timeout_is_request_local() {
         let response = JsonRpcMessage::Response(JsonRpcResponse::success(
@@ -13534,6 +14918,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn silent_peer_timeout_via_progress_api_is_request_local() {
         let response = JsonRpcMessage::Response(JsonRpcResponse::success(
@@ -13567,6 +14952,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_cancellation_rejects_non_owned_id_without_peer_contact() {
         let script = "IFS= read -r request; \
@@ -13592,6 +14978,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn request_scoped_cancellation_before_commit_makes_zero_stdio_contact() {
         let script = "IFS= read -r request; \\
@@ -13626,6 +15013,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn request_scoped_cancellation_after_commit_sends_stdio_control_for_exposed_id() {
         let script = "IFS= read -r request; IFS= read -r cancellation; IFS= read -r after; \\
@@ -13668,6 +15056,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_cancellation_tombstones_once_and_uses_bounded_control() {
         let script = "IFS= read -r first; IFS= read -r cancellation; IFS= read -r second; \
@@ -13825,6 +15214,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn oversized_public_cancellation_is_local_first_then_connection_terminal() {
         let mut client =
@@ -13856,6 +15246,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn silent_peer_timeout_has_no_progress_callback_side_effect() {
         let progress = JsonRpcMessage::Request(JsonRpcRequest::notification(
@@ -13893,6 +15284,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn exact_valid_increasing_progress_resets_only_idle() {
         let script = "IFS= read -r request; \
@@ -13925,6 +15317,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn matching_progress_does_not_reset_idle_when_policy_disables_it() {
         let script = "IFS= read -r request; \
@@ -13962,6 +15355,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn unrelated_invalid_and_nonmonotonic_progress_do_not_reset_idle() {
         let script = "IFS= read -r request; \
@@ -13999,6 +15393,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn matching_progress_never_moves_absolute_deadline() {
         let script = "IFS= read -r request; \
@@ -14036,6 +15431,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn request_timeout_keeps_connection_reusable_and_discards_late_activity() {
         let late_progress = JsonRpcMessage::Request(JsonRpcRequest::notification(
@@ -14122,6 +15518,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn in_time_server_request_response_cannot_block_request_deadline() {
         let script = "IFS= read -r request; \
@@ -14151,6 +15548,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn selected_stdio_callback_writer_completes_while_reader_waits_for_peer() {
         // The peer withholds the original response until it has read the
@@ -14200,6 +15598,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_legacy_reverse_request_handlers_remain_unchanged() {
         let script = "IFS= read -r request; \
@@ -14306,6 +15705,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn protocol_sized_reverse_callback_response_preserves_follow_up_alignment() {
         let script = "IFS= read -r request; \
@@ -14342,6 +15742,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reverse_callback_shutdown_is_bounded_and_retains_noncooperative_worker() {
         let script = "IFS= read -r request; \
@@ -14409,6 +15810,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reverse_callback_explicit_close_joins_every_observer_before_transport_teardown() {
         let script = "IFS= read -r request; \
@@ -14464,6 +15866,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn reverse_callback_drop_relies_on_region_ownership_without_cross_client_cleanup() {
         let forbidden_registry = ["REVERSE_CALLBACK", "_SHUTDOWN_QUARANTINE"].concat();
@@ -14532,6 +15935,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_legacy_reverse_callback_cancellation_is_observable_without_blocking_reader() {
         let script = "IFS= read -r request; \
@@ -14583,6 +15987,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_legacy_reverse_callback_foreign_cancellation_does_not_cancel_callback() {
         // This differs from the admitted cancellation path only by the server
@@ -14690,6 +16095,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_reverse_request_handlers_missing_handler_preserves_state() {
         let script = "IFS= read -r request; \
@@ -14739,6 +16145,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn panicked_progress_callback_cancels_and_preserves_connection_alignment() {
         let script = "IFS= read -r first; \
@@ -14788,6 +16195,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn partial_frame_timeout_is_connection_terminal() {
         let script = "printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":2'; exec sleep 2";
@@ -14817,6 +16225,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn stored_context_deadline_after_commit_is_connection_terminal() {
         let mut client =
@@ -14849,6 +16258,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn stored_context_cancellation_after_commit_is_connection_terminal() {
         let mut client =
@@ -14885,6 +16295,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn stored_context_cancellation_after_progress_commit_is_terminal() {
         let mut client =
@@ -14927,6 +16338,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn complete_late_message_routes_unrelated_response_and_retires_tombstone() {
         // The unrelated response must arrive through the real transport:
@@ -14984,6 +16396,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn complete_late_server_request_uses_bounded_control_writes() {
         let script = "IFS= read -r cancellation; IFS= read -r response; \
@@ -15038,6 +16451,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn malformed_complete_late_message_times_out_owner_and_closes_connection() {
         let mut client =
@@ -16054,6 +17468,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn negotiated_stdio_executor_clones_route_reordered_exact_result_sources() {
         let second_raw_result = r#"{"owner":"second","exact":1.20e+4}"#;
@@ -16172,7 +17587,7 @@ mod tests {
         assert_modern_multiplexed_subscription_cancellation(3);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn assert_negotiated_stdio_drop_cancellation(drop_first: bool) {
         // The peer emits its final pair immediately only after it observes the
         // cancellation control. Without that third frame, its background
@@ -16263,18 +17678,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dropped_negotiated_stdio_handle_tombstones_its_late_final_and_cancels_once() {
         assert_negotiated_stdio_drop_cancellation(true);
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn retained_negotiated_stdio_handle_does_not_emit_drop_cancellation() {
         assert_negotiated_stdio_drop_cancellation(false);
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dropping_client_fails_a_surviving_negotiated_stdio_handle() {
         let client = make_shell_scripted_initialized_client(
@@ -17130,6 +18548,7 @@ mod tests {
         // builder() is a convenience method for ClientBuilder::new()
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn client_stdio_fails_for_nonexistent_command() {
         let result = Client::stdio("definitely-not-a-real-command-xyz", &[]);
@@ -17139,7 +18558,27 @@ mod tests {
         assert!(err.message.contains("spawn"));
     }
 
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn feature_off_stdio_auto_refuses_before_command_resolution_or_spawn() {
+        let error = Client::stdio_with_cx(
+            "fastmcp-client-feature-off-must-not-spawn",
+            &[],
+            Cx::for_testing(),
+        )
+        .expect_err("the direct Auto stdio constructor must fail before resolving its command");
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(
+            error
+                .message
+                .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out"),
+            "feature-off policy admission is the observable zero-spawn result"
+        );
+    }
+
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_public_stdio_defaults_to_auto_and_retains_modern_selection() {
         let script = modern_typed_call_client_script(
@@ -17164,6 +18603,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_public_stdio_auto_reopens_one_fresh_exact_legacy_child() {
         let script = auto_discovery_refusal_client_script(-32_601);
@@ -17185,6 +18625,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_public_stdio_auto_rejects_one_non_method_not_found_refusal() {
         // Only the discovery refusal code differs from the paired fallback
@@ -17202,8 +18643,13 @@ mod tests {
     fn client_stdio_with_cx_fails_when_cancelled() {
         let cx = Cx::for_request();
         cx.set_cancel_requested(true);
-        let result = Client::stdio_with_cx("echo", &["hello"], cx);
-        // Should fail either from cancellation or from the process not speaking MCP
+        let result = Client::stdio_with_protocol_plan_with_cx(
+            "echo",
+            &["hello"],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            cx,
+        );
+        // Cancellation is admitted before command resolution in every feature profile.
         assert!(result.is_err());
     }
 
@@ -17240,6 +18686,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn direct_stdio_initialization_consumes_id_one_before_ordinary_requests() {
         let initialize_result = InitializeResult {
@@ -17683,6 +19130,65 @@ mod tests {
              printf '%s\\n' '{acknowledgement}'; \
              printf '%s\\n' '{task_notification}'; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}'"
+        )
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "tasks")]
+    fn modern_incremental_tasks_listener_client_script(
+        requested_task_id: &str,
+        notification_task_id: &str,
+        subscription_id: i64,
+    ) -> String {
+        let discovery_response = modern_tasks_discovery_response(
+            "incremental-tasks-listener-server",
+            serde_json::json!({}),
+        );
+        let acknowledgement = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"notifications":{{"taskIds":["{requested_task_id}"]}}}}}}"#
+        );
+        let task_notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"taskId":"{notification_task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#
+        );
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\\\"taskIds\\\":[\\\"{requested_task_id}\\\"]'*) ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{acknowledgement}'; \
+             printf '%s\\n' '{task_notification}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}'; \
+             exec sleep 2"
+        )
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "tasks")]
+    fn live_tasks_listener_fixture(
+        requested_task_id: &str,
+        notification_task_id: &str,
+        subscription_id: i64,
+    ) -> String {
+        let discovery_response =
+            modern_tasks_discovery_response("live-tasks-listener-server", serde_json::json!({}));
+        let acknowledgement = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"notifications":{{"taskIds":["{requested_task_id}"]}}}}}}"#
+        );
+        let task_notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{subscription_id}}},"taskId":"{notification_task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#
+        );
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *subscriptions/listen*) \
+             printf '%s\\n' '{acknowledgement}'; \
+             printf '%s\\n' '{task_notification}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' \
+             ;; *) exit 1 ;; esac; \
+             exec sleep 2"
         )
     }
 
@@ -18866,6 +20372,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_ext_raw_stdio_exact_2024_rejects_without_contact() {
         let (extension_id, registry, discovery) = raw_extension_configuration(
@@ -19198,6 +20705,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_01_mrtr_retry_keeps_exact_legacy_tool_behavior() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -19386,6 +20894,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_01_exact_final_conveniences_reject_one_field_cross_era_before_request_mutation() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -19618,6 +21127,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_log_level_preserves_exact_legacy_rpc() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -19635,6 +21145,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_01_auto_legacy_log_level_preserves_exact_rpc() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -19720,6 +21231,179 @@ mod tests {
             task_id
         );
         client.close().expect("modern Tasks client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn live_final_tasks_listener_routes_acknowledgement_status_and_terminal_through_selected_stdio()
+    {
+        let task_id = FinalTaskId::parse("task-live-73").expect("bounded task id");
+        let script = live_tasks_listener_fixture(task_id.as_str(), task_id.as_str(), 2);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern Tasks discovery initializes the live listener client");
+        let mut filter = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+            .expect("compose the exact live Tasks filter");
+        client
+            .open_final_task_subscription_listener(filter)
+            .expect("the public listener commits one selected-stdio subscription");
+
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let acknowledged = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect("public selected-stdio ingress routes the acknowledgement");
+        assert!(matches!(
+            acknowledged,
+            StdioTaskSubscriptionEvent::Acknowledged(ref filter)
+                if task_subscription_ids(filter)
+                    .expect("acknowledged Tasks filter stays valid")
+                    .as_deref()
+                    == Some([task_id.clone()].as_slice())
+        ));
+        let status = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect("public selected-stdio ingress routes the matching task status");
+        assert!(matches!(
+            status,
+            StdioTaskSubscriptionEvent::Notification(notification)
+                if notification.params.task.base().task_id == task_id
+        ));
+        assert!(matches!(
+            client
+                .next_final_task_subscription_event(&cx, &cancellation)
+                .expect("public selected-stdio ingress routes the terminal response"),
+            StdioTaskSubscriptionEvent::Terminal
+        ));
+        assert!(
+            client.live_task_subscription.is_none(),
+            "terminal completion releases only the completed live listener"
+        );
+        client.close().expect("live listener client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn live_final_tasks_listener_rejects_one_field_foreign_task_id() {
+        let requested = FinalTaskId::parse("task-live-73").expect("bounded requested task id");
+        let foreign = FinalTaskId::parse("task-live-74").expect("bounded foreign task id");
+        let script = live_tasks_listener_fixture(requested.as_str(), foreign.as_str(), 2);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern Tasks discovery initializes the foreign-task listener client");
+        let mut filter = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![requested])
+            .expect("compose the exact live Tasks filter");
+        client
+            .open_final_task_subscription_listener(filter)
+            .expect("the live listener commits before the foreign event arrives");
+
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(
+            client
+                .next_final_task_subscription_event(&cx, &cancellation)
+                .expect("the matching acknowledgement is delivered first"),
+            StdioTaskSubscriptionEvent::Acknowledged(_)
+        ));
+        let error = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect_err("one changed taskId must fail closed at selected-stdio ingress");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Tasks subscription event taskId is outside the acknowledged filter"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn live_final_tasks_listener_rejects_one_field_foreign_subscription_id() {
+        let task_id = FinalTaskId::parse("task-live-73").expect("bounded task id");
+        let script = live_tasks_listener_fixture(task_id.as_str(), task_id.as_str(), 3);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern Tasks discovery initializes the foreign-subscription listener client");
+        let mut filter = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id])
+            .expect("compose the exact live Tasks filter");
+        client
+            .open_final_task_subscription_listener(filter)
+            .expect("the live listener commits before the foreign stream arrives");
+
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let error = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect_err("a foreign subscription ID cannot acknowledge the live listener");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Tasks subscription terminated before acknowledgement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn live_final_tasks_listener_retains_owner_when_cancellation_control_cannot_commit() {
+        let task_id = FinalTaskId::parse("task-live-73").expect("bounded task id");
+        let script = live_tasks_listener_fixture(task_id.as_str(), task_id.as_str(), 2);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern Tasks discovery initializes the cancellation listener client");
+        let mut filter = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id])
+            .expect("compose the exact live Tasks filter");
+        client
+            .open_final_task_subscription_listener(filter)
+            .expect("the live listener commits before cancellation");
+
+        client
+            .close_transport()
+            .expect("test closes the upstream writer before cancellation");
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        assert!(cancellation.cancel());
+
+        let first_error = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect_err("an uncommitted upstream cancellation must be reported");
+        assert_ne!(first_error.code, McpErrorCode::RequestCancelled);
+        assert!(
+            client.live_task_subscription.is_some(),
+            "a failed cancellation must retain the live listener owner"
+        );
+        let second_error = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect_err("the retained listener must preserve its original cancellation failure");
+        assert_eq!(second_error.code, first_error.code);
+        assert_eq!(second_error.message, first_error.message);
+        assert!(
+            client.live_task_subscription.is_some(),
+            "re-observing failure must not silently discard listener ownership"
+        );
+        let _ = client.close();
     }
 
     #[cfg(unix)]
@@ -19956,6 +21640,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_subscriptions_listen_is_rejected_without_mutating_legacy_request_state() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -20699,6 +22384,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_auto_legacy_completion_losslessly_maps_compatible_input() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -20725,6 +22411,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_auto_legacy_completion_rejects_unrepresentable_context_without_sending() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21215,6 +22902,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_i_positive() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21242,6 +22930,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_ping_preserves_the_exact_legacy_request_path() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21259,6 +22948,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_server_ping_succeeds_during_public_request() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21276,6 +22966,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_resource_subscriptions_use_the_exact_legacy_request_path() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21330,6 +23021,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     #[cfg(feature = "tasks")]
     fn leg_03_final_tasks_rejects_exact_legacy_before_request_mutation() {
@@ -21351,6 +23043,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_typed_client_result_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21384,6 +23077,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_exact_legacy_tool_convenience_retains_the_pinned_result() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21442,6 +23136,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_convenience_tool_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21476,6 +23171,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_remaining_typed_list_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -21496,6 +23192,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_progress_client_result_preserves_exact_legacy_decode() {
         let script = legacy_progress_client_script(2);
@@ -21527,6 +23224,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_progress_nonmatching_token_leaves_callback_state_unchanged() {
         let script = legacy_progress_client_script(3);
@@ -21559,6 +23257,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn leg_03_completion_client_result_preserves_exact_legacy_decode() {
         let mut client = Client::stdio_with_protocol_plan_with_cx(

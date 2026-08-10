@@ -2,18 +2,24 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(feature = "legacy-2024-11-05")]
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
-use fastmcp_client::http_executor::{
-    ModernHttpClient, ModernHttpClientError, ModernHttpResponseKind,
-};
+use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpClientError};
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_client::http_executor::ModernHttpResponseKind;
+#[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_client::sse::{SseEndOfStream, SseLimits};
-use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolEra, ProtocolPolicy};
-use fastmcp_protocol::{ClientCapabilities, ClientInfo, JsonRpcMessage, JsonRpcRequest, RequestId};
+use fastmcp_client::{CanonicalHttpUrl, ClientProtocolPlan, ProtocolPolicy};
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_client::ProtocolEra;
+use fastmcp_protocol::{ClientCapabilities, ClientInfo};
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, RequestId};
 
 #[derive(Debug)]
 struct CapturedHttpRequest {
@@ -150,6 +156,7 @@ fn assert_final_metadata(request: &CapturedHttpRequest, expected_method: &str) {
     );
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 #[test]
 fn http_03_b_runtime_positive() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");

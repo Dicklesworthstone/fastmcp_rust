@@ -2075,6 +2075,65 @@ where
         Ok(subscription.notifications.drain(..).collect())
     }
 
+    /// Returns the exact filter acknowledged for one live Tasks subscription.
+    ///
+    /// The caller may poll this without reading transport ingress.  This keeps
+    /// the acknowledgement observable before the terminal response while the
+    /// connection-owned driver remains the sole reader.
+    #[cfg(feature = "tasks")]
+    pub fn tasks_subscription_acknowledgement(
+        &self,
+        execution: &RequestExecution<T>,
+    ) -> McpResult<Option<SubscriptionFilter>> {
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Subscription)
+        })?;
+        let state = self.state.borrow();
+        let subscription = state
+            .task_subscriptions
+            .get(&(execution.request_id.clone(), execution.generation))
+            .ok_or_else(|| McpError::invalid_request("Tasks subscription is no longer active"))?;
+        Ok(subscription.accepted_filter.clone())
+    }
+
+    /// Takes a terminal Tasks subscription response after its ingress was
+    /// already routed by the connection owner.
+    ///
+    /// This deliberately never reads the transport.  It is the incremental
+    /// companion to [`Self::wait_tasks_subscription`] for stdio relays that
+    /// must forward notifications as they arrive.
+    #[cfg(feature = "tasks")]
+    pub fn try_take_tasks_subscription_terminal(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<SubscriptionFilter>> {
+        self.require_modern_tasks_era()?;
+        execution.ensure_task_operation(|operation| {
+            matches!(operation, TaskExecutionOperation::Subscription)
+        })?;
+        let core_request = self.decode_final_core_request_from_execution(execution)?;
+        let key = (execution.request_id.clone(), execution.generation);
+        let Some(response) = self.try_take_response(execution)? else {
+            return Ok(None);
+        };
+        let terminal = match core_request.decode_response(&response) {
+            Ok(CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })) => Ok(()),
+            Ok(_) | Err(_) => Err(McpError::invalid_request(
+                "Tasks subscription terminal result is not a matching subscriptions/listen completion",
+            )),
+        };
+        let subscription = self
+            .state
+            .borrow_mut()
+            .task_subscriptions
+            .remove(&key)
+            .ok_or_else(|| McpError::invalid_request("Tasks subscription state is unavailable"))?;
+        terminal?;
+        subscription.accepted_filter.map(Some).ok_or_else(|| {
+            McpError::invalid_request("Tasks subscription terminated before acknowledgement")
+        })
+    }
+
     #[cfg(feature = "tasks")]
     pub fn wait_tasks_subscription(
         &self,
@@ -2114,6 +2173,20 @@ where
             accepted_filter,
             subscription.notifications.into_iter().collect(),
         ))
+    }
+
+    /// Returns whether a notification could belong to one active Tasks
+    /// subscription.  The caller must still route the frame through
+    /// [`Self::drive_frame`], which validates the exact subscription ID,
+    /// acknowledgement order, and task filter.
+    #[cfg(feature = "tasks")]
+    pub fn owns_task_subscription_notification(&self, notification: &JsonRpcRequest) -> bool {
+        notification.id.is_none()
+            && matches!(
+                notification.method.as_str(),
+                "notifications/subscriptions/acknowledged" | TASK_STATUS_NOTIFICATION
+            )
+            && !self.state.borrow().task_subscriptions.is_empty()
     }
 
     /// Returns snapshots of every active request correlation.
@@ -5128,6 +5201,35 @@ mod tests {
             expected_nested_result,
             "escaped strings, member order, and numeric spelling survive the public Tasks path"
         );
+    }
+
+    #[cfg(not(feature = "tasks"))]
+    #[test]
+    fn feature_off_executor_retains_final_raw_result_source_without_tasks_symbols() {
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","content":[],"isError":false,"opaque":{"z":1.20e+4}}"#;
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(73))
+            .expect("feature-off core request commits before frame ingress");
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":73,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("feature-off final JSON-RPC frame is admitted");
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("feature-off executor routes an ordinary final result");
+        let (_response, result_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("feature-off raw result source remains available");
+        assert_eq!(result_source.as_deref(), Some(raw_result));
     }
 
     #[test]

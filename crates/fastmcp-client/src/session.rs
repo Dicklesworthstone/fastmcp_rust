@@ -21,6 +21,11 @@ use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, ServerCapabilities, ServerDiscoverResult, ServerInfo,
 };
 
+#[cfg(feature = "legacy-2024-11-05")]
+const DEFAULT_SESSION_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const DEFAULT_SESSION_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::ModernOnly;
+
 /// Sized bridge for a caller-provided dynamic client extension-settings resolver.
 struct BoxedClientExtensionSettingsResolver(Box<dyn ExtensionSettingsCompatibilityResolver + Send>);
 
@@ -491,7 +496,7 @@ impl ClientSession {
             selected_era,
             protocol_version,
             // A peer-selected era must never rewrite the pre-connect policy.
-            protocol_plan: ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            protocol_plan: ClientProtocolPlan::stdio(DEFAULT_SESSION_PROTOCOL_POLICY),
         }
     }
 
@@ -623,6 +628,7 @@ impl ClientSession {
     }
 
     /// Returns whether MCP Apps was bilaterally activated during final discovery.
+    #[cfg(feature = "apps")]
     #[must_use]
     pub const fn mcp_apps_active(&self) -> bool {
         self.mcp_apps_activation_receipt.is_some()
@@ -780,6 +786,7 @@ pub(crate) fn resolve_mcp_apps_activation(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "apps")]
     fn apps_discovery(server_settings: serde_json::Value) -> ServerDiscoverResult {
         serde_json::from_value(serde_json::json!({
             "resultType": "complete",
@@ -798,6 +805,7 @@ mod tests {
         .expect("valid final Apps discovery reply")
     }
 
+    #[cfg(feature = "apps")]
     #[test]
     fn mcp_apps_activation_requires_html_mime_with_the_same_server_marker() {
         let discovery = apps_discovery(serde_json::json!({}));
@@ -813,6 +821,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "apps")]
     #[test]
     fn generic_apps_runtime_derives_the_same_frozen_activation_receipt() {
         let mut registry = ExtensionDescriptorRegistry::new();
@@ -926,6 +935,7 @@ mod tests {
         assert_eq!(session.protocol_version(), LEGACY_PROTOCOL_VERSION);
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn session_default_protocol_plan_remains_auto_after_era_selection() {
         let modern = test_session_with_protocol_version(MODERN_PROTOCOL_VERSION);
@@ -935,6 +945,15 @@ mod tests {
         assert_eq!(legacy.selected_era(), Some(ProtocolEra::Legacy2024));
         assert_eq!(modern.protocol_plan().policy(), ProtocolPolicy::Auto);
         assert_eq!(legacy.protocol_plan().policy(), ProtocolPolicy::Auto);
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn feature_off_session_default_protocol_plan_is_modern_only() {
+        let modern = test_session_with_protocol_version(MODERN_PROTOCOL_VERSION);
+
+        assert_eq!(modern.selected_era(), Some(ProtocolEra::Modern2026));
+        assert_eq!(modern.protocol_plan().policy(), ProtocolPolicy::ModernOnly);
     }
 
     #[test]
