@@ -4818,7 +4818,7 @@ impl HttpClient {
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
-        mut client_capabilities: ClientCapabilities,
+        client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
         reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {

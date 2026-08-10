@@ -1006,6 +1006,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         self.admission
             .complete_error(McpAppsBridgeDirection::ViewToHost, request_id)
             .map_err(McpAppsHostError::Bridge)
+            .map(|_| ())
     }
 
     async fn handle_view_notification(

@@ -1170,7 +1170,9 @@ impl ServerBuilder {
                 ));
             }
             if let Some(extension_runtime) = self.extension_runtime.as_mut() {
-                extension_runtime.install_proxy_final_tasks(Arc::clone(task_relay))?;
+                extension_runtime
+                    .install_proxy_final_tasks(Arc::clone(task_relay))
+                    .map_err(|error| fastmcp_core::McpError::invalid_request(error.to_string()))?;
             }
             self.router
                 .set_final_task_relay(Some(Arc::clone(task_relay)));

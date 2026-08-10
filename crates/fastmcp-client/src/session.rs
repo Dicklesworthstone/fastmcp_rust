@@ -196,7 +196,7 @@ impl ClientExtensionRuntime {
                 &self.local_enablement,
                 &self.client_discovery,
                 &server,
-                &mut *resolver,
+                &mut resolver,
             )
             .map_err(|error| {
                 McpError::invalid_params(format!(
