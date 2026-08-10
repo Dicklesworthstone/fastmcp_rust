@@ -120,9 +120,13 @@ const MAX_LEGACY_SSE_KEEPALIVE_LINES: usize = 64;
 /// Maximum JSON-RPC bytes accepted from one legacy `message` SSE event.
 const MAX_LEGACY_SSE_MESSAGE_BYTES: usize = 64 * 1024;
 
+/// Maximum interleaved notifications and reverse requests accepted while one
+/// legacy request waits for its correlated terminal response.
+const MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES: usize = 64;
+
 /// Maximum server notifications retained while one legacy request waits for
 /// its correlated terminal response.
-const MAX_QUEUED_LEGACY_NOTIFICATIONS: usize = 64;
+const MAX_QUEUED_LEGACY_NOTIFICATIONS: usize = MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES;
 
 /// Maximum terminal response IDs retained after server-authorized cancellation.
 ///
@@ -2082,6 +2086,20 @@ impl std::error::Error for ModernHttpMrtrError {
     }
 }
 
+/// Exact MCP 2024-11-05 connection state retained by [`ClientHttpConnection`].
+///
+/// Its fields are deliberately private so a legacy connection cannot expose
+/// crate-internal extension-admission state as part of the public API.
+pub struct LegacySseConnection {
+    client: LegacySseHttpClient,
+    negotiated_protocol_version: Option<String>,
+    client_capabilities: ClientCapabilities,
+    reverse_request_handlers: ReverseRequestHandlers,
+    cancelled_response_ids: VecDeque<RequestId>,
+    persistent_receiver: Option<LegacySsePersistentReceiver>,
+    client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+}
+
 /// A connected client HTTP transport selected by its immutable protocol plan.
 ///
 /// Auto performs the modern probe and, only for an authorized refusal, opens
@@ -2091,15 +2109,7 @@ pub enum ClientHttpConnection {
     /// Stateless MCP 2026-07-28 POST transport.
     Modern(ModernHttpClient),
     /// Exact MCP 2024-11-05 SSE plus message POST transport.
-    LegacySse {
-        client: LegacySseHttpClient,
-        negotiated_protocol_version: Option<String>,
-        client_capabilities: ClientCapabilities,
-        reverse_request_handlers: ReverseRequestHandlers,
-        cancelled_response_ids: VecDeque<RequestId>,
-        persistent_receiver: Option<LegacySsePersistentReceiver>,
-        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
-    },
+    LegacySse(LegacySseConnection),
 }
 
 /// One response returned through `ClientHttpConnection::request`.
@@ -2142,6 +2152,9 @@ pub enum ClientHttpConnectionError {
     RegisteredExtensionMethodRequiresAdmission { method: String },
     /// Too many interleaved legacy notifications accumulated before a response.
     LegacyNotificationQueueFull,
+    /// Too many interleaved legacy notifications or reverse requests arrived
+    /// before the correlated response.
+    LegacyInterleavedControlFrameLimitExceeded { limit: usize },
     /// The ready legacy SSE reader was unavailable before it could be owned by
     /// its structured receive task.
     LegacyPersistentReceiverUnavailable,
@@ -2240,6 +2253,10 @@ impl fmt::Display for ClientHttpConnectionError {
             Self::LegacyNotificationQueueFull => formatter.write_str(
                 "legacy request received too many interleaved notifications before its response",
             ),
+            Self::LegacyInterleavedControlFrameLimitExceeded { limit } => write!(
+                formatter,
+                "legacy request received more than {limit} interleaved notifications or reverse requests before its response",
+            ),
             Self::LegacyPersistentReceiverUnavailable => formatter
                 .write_str("ready legacy SSE receiver is unavailable"),
             Self::LegacyPersistentReceiverStopped => formatter
@@ -2312,6 +2329,7 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::LegacyFinalMetadata { .. }
             | Self::RegisteredExtensionMethodRequiresAdmission { .. }
             | Self::LegacyNotificationQueueFull
+            | Self::LegacyInterleavedControlFrameLimitExceeded { .. }
             | Self::LegacyPersistentReceiverUnavailable
             | Self::LegacyPersistentReceiverStopped
             | Self::LegacyPersistentResponseQueueFull
@@ -2387,15 +2405,17 @@ impl ClientHttpConnection {
         .map_err(ClientHttpConnectionError::Modern)?
         {
             ModernHttpConnectOutcome::Modern(client) => Ok(Self::Modern(client)),
-            ModernHttpConnectOutcome::LegacySse(client) => Ok(Self::LegacySse {
-                client,
-                negotiated_protocol_version: None,
-                client_capabilities: legacy_client_capabilities,
-                reverse_request_handlers: ReverseRequestHandlers::new(),
-                cancelled_response_ids: VecDeque::new(),
-                persistent_receiver: None,
-                client_extension_runtime: legacy_client_extension_runtime,
-            }),
+            ModernHttpConnectOutcome::LegacySse(client) => {
+                Ok(Self::LegacySse(LegacySseConnection {
+                    client,
+                    negotiated_protocol_version: None,
+                    client_capabilities: legacy_client_capabilities,
+                    reverse_request_handlers: ReverseRequestHandlers::new(),
+                    cancelled_response_ids: VecDeque::new(),
+                    persistent_receiver: None,
+                    client_extension_runtime: legacy_client_extension_runtime,
+                }))
+            }
         }
     }
 
@@ -2404,7 +2424,7 @@ impl ClientHttpConnection {
     pub const fn selected_protocol_era(&self) -> ProtocolEra {
         match self {
             Self::Modern(_) => ProtocolEra::Modern2026,
-            Self::LegacySse { .. } => ProtocolEra::Legacy2024,
+            Self::LegacySse(_) => ProtocolEra::Legacy2024,
         }
     }
 
@@ -2417,20 +2437,20 @@ impl ClientHttpConnection {
     pub fn protocol_version(&self) -> Option<&str> {
         match self {
             Self::Modern(_) => Some(MODERN_PROTOCOL_VERSION),
-            Self::LegacySse {
+            Self::LegacySse(LegacySseConnection {
                 negotiated_protocol_version,
                 ..
-            } => negotiated_protocol_version.as_deref(),
+            }) => negotiated_protocol_version.as_deref(),
         }
     }
 
     /// Records the exact legacy version after its `initialize` response has
     /// been validated by the high-level lifecycle.
     pub(crate) fn record_legacy_negotiated_protocol_version(&mut self, version: String) {
-        let Self::LegacySse {
+        let Self::LegacySse(LegacySseConnection {
             negotiated_protocol_version,
             ..
-        } = self
+        }) = self
         else {
             unreachable!("only a legacy initialization can record a legacy protocol version");
         };
@@ -2446,7 +2466,7 @@ impl ClientHttpConnection {
     pub const fn protocol_plan(&self) -> &ClientProtocolPlan {
         match self {
             Self::Modern(client) => client.protocol_plan(),
-            Self::LegacySse { client, .. } => client.protocol_plan(),
+            Self::LegacySse(LegacySseConnection { client, .. }) => client.protocol_plan(),
         }
     }
 
@@ -2458,7 +2478,7 @@ impl ClientHttpConnection {
     pub fn server_discovery(&self) -> Option<ServerDiscoverResult> {
         match self {
             Self::Modern(client) => Some(client.server_discovery()),
-            Self::LegacySse { .. } => None,
+            Self::LegacySse(_) => None,
         }
     }
 
@@ -2467,7 +2487,7 @@ impl ClientHttpConnection {
     pub fn mcp_apps_active(&self) -> bool {
         match self {
             Self::Modern(client) => client.mcp_apps_active(),
-            Self::LegacySse { .. } => false,
+            Self::LegacySse(_) => false,
         }
     }
 
@@ -2478,7 +2498,7 @@ impl ClientHttpConnection {
     ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
         match self {
             Self::Modern(client) => client.negotiated_extensions(),
-            Self::LegacySse { .. } => None,
+            Self::LegacySse(_) => None,
         }
     }
 
@@ -2489,7 +2509,7 @@ impl ClientHttpConnection {
     ) -> McpResult<()> {
         match self {
             Self::Modern(client) => client.admit_final_extension_method(extension_id, method),
-            Self::LegacySse { .. } => Err(McpError::invalid_params(
+            Self::LegacySse(_) => Err(McpError::invalid_params(
                 "Final client extensions are unavailable in exact MCP 2024-11-05",
             )),
         }
@@ -2500,7 +2520,7 @@ impl ClientHttpConnection {
     ) -> Option<fastmcp_protocol::extensions::McpAppsActivationReceipt> {
         match self {
             Self::Modern(client) => client.mcp_apps_activation_receipt(),
-            Self::LegacySse { .. } => None,
+            Self::LegacySse(_) => None,
         }
     }
 
@@ -2511,11 +2531,11 @@ impl ClientHttpConnection {
     pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
         match self {
             Self::Modern(_) => None,
-            Self::LegacySse {
+            Self::LegacySse(LegacySseConnection {
                 client,
                 persistent_receiver,
                 ..
-            } => persistent_receiver
+            }) => persistent_receiver
                 .as_ref()
                 .and_then(LegacySsePersistentReceiver::take_notification)
                 .or_else(|| client.take_notification()),
@@ -2528,10 +2548,10 @@ impl ClientHttpConnection {
     /// capabilities. Callback-derived capabilities belong only to the legacy
     /// initialize envelope selected after that discovery decision.
     pub(crate) fn set_legacy_client_capabilities(&mut self, capabilities: ClientCapabilities) {
-        let Self::LegacySse {
+        let Self::LegacySse(LegacySseConnection {
             client_capabilities,
             ..
-        } = self
+        }) = self
         else {
             return;
         };
@@ -2548,13 +2568,13 @@ impl ClientHttpConnection {
         &mut self,
         cx: &Cx,
     ) -> Result<(), ClientHttpConnectionError> {
-        let Self::LegacySse {
+        let Self::LegacySse(LegacySseConnection {
             client,
             client_capabilities,
             reverse_request_handlers,
             persistent_receiver,
             ..
-        } = self
+        }) = self
         else {
             return Ok(());
         };
@@ -2586,11 +2606,11 @@ impl ClientHttpConnection {
         &mut self,
         handlers: ReverseRequestHandlers,
     ) -> fastmcp_core::McpResult<()> {
-        let Self::LegacySse {
+        let Self::LegacySse(LegacySseConnection {
             client_capabilities,
             reverse_request_handlers,
             ..
-        } = self
+        }) = self
         else {
             return Err(fastmcp_core::McpError::invalid_params(
                 "exact MCP 2024-11-05 reverse request handlers require the legacy HTTP transport",
@@ -2620,7 +2640,7 @@ impl ClientHttpConnection {
                 .await
                 .map(ClientHttpResponse::Modern)
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse {
+            Self::LegacySse(LegacySseConnection {
                 client,
                 client_capabilities,
                 reverse_request_handlers,
@@ -2628,7 +2648,7 @@ impl ClientHttpConnection {
                 persistent_receiver,
                 client_extension_runtime,
                 ..
-            } => {
+            }) => {
                 if client_extension_runtime
                     .as_ref()
                     .is_some_and(|runtime| runtime.owns_method(method))
@@ -2677,6 +2697,7 @@ impl ClientHttpConnection {
                     }
                     return Err(ClientHttpConnectionError::Legacy(error));
                 }
+                let mut interleaved_control_frames = 0_usize;
                 loop {
                     let message = client
                         .next_message(cx)
@@ -2689,6 +2710,9 @@ impl ClientHttpConnection {
                     })?;
                     match message {
                         JsonRpcMessage::Request(notification) if notification.is_notification() => {
+                            admit_legacy_interleaved_control_frame(
+                                &mut interleaved_control_frames,
+                            )?;
                             if matching_legacy_request_cancellation(&notification, &request_id) {
                                 if cancelled_response_ids.len()
                                     >= MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS
@@ -2707,6 +2731,9 @@ impl ClientHttpConnection {
                             })?;
                         }
                         JsonRpcMessage::Request(server_request) => {
+                            admit_legacy_interleaved_control_frame(
+                                &mut interleaved_control_frames,
+                            )?;
                             let response = legacy_http_server_request_response(
                                 client_capabilities,
                                 reverse_request_handlers,
@@ -2901,9 +2928,7 @@ impl ClientHttpConnection {
                 .open_subscriptions_listener(cx, request_id, notifications, limits)
                 .await
                 .map_err(ClientHttpConnectionError::SubscriptionsListen),
-            Self::LegacySse { .. } => {
-                Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern)
-            }
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::SubscriptionsListenRequiresModern),
         }
     }
 
@@ -2942,7 +2967,7 @@ impl ClientHttpConnection {
                 .open_final_core_listener(cx, method, parameters, request_id, limits)
                 .await
                 .map_err(ClientHttpConnectionError::FinalCoreListen),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
         }
     }
 
@@ -2998,7 +3023,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Mrtr),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::MrtrRequiresModern),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::MrtrRequiresModern),
         }
     }
 
@@ -3033,7 +3058,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Mrtr),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::MrtrRequiresModern),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::MrtrRequiresModern),
         }
     }
 
@@ -3070,7 +3095,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Mrtr),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::MrtrRequiresModern),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::MrtrRequiresModern),
         }
     }
 
@@ -3089,7 +3114,7 @@ impl ClientHttpConnection {
                 .open_final_tasks_tool_call_listener(cx, request_id, name, arguments, limits)
                 .await
                 .map_err(ClientHttpConnectionError::FinalCoreListen),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalCoreListenRequiresModern),
         }
     }
 
@@ -3110,7 +3135,7 @@ impl ClientHttpConnection {
                 .get_task_final(cx, request_id, task_id, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse { .. } => {
+            Self::LegacySse(_) => {
                 Err(ClientHttpConnectionError::FinalTasksRequiresModern { method: TASK_GET })
             }
         }
@@ -3141,7 +3166,7 @@ impl ClientHttpConnection {
                 )
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
                 method: TASK_UPDATE,
             }),
         }
@@ -3163,7 +3188,7 @@ impl ClientHttpConnection {
                 .cancel_task_final(cx, request_id, task_id, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalTasksRequiresModern {
                 method: TASK_CANCEL,
             }),
         }
@@ -3188,7 +3213,7 @@ impl ClientHttpConnection {
                 .call_tool_final_outcome(cx, request_id, name, arguments, maximum_response_bytes)
                 .await
                 .map_err(ClientHttpConnectionError::Modern),
-            Self::LegacySse { .. } => Err(ClientHttpConnectionError::FinalToolCallRequiresModern),
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalToolCallRequiresModern),
         }
     }
 
@@ -3219,7 +3244,7 @@ impl ClientHttpConnection {
                     },
                 )
             }
-            Self::LegacySse { client, .. } => {
+            Self::LegacySse(LegacySseConnection { client, .. }) => {
                 if let Some(parameters) = parameters.as_ref() {
                     reject_final_only_legacy_request_metadata(parameters)?;
                 }
@@ -3233,6 +3258,24 @@ impl ClientHttpConnection {
             }
         }
     }
+}
+
+/// Admits one server control frame interleaved before a legacy request's
+/// correlated response. Counting both notifications and reverse requests
+/// prevents an upstream from bypassing the request-owned stream bound by
+/// alternating frame kinds.
+fn admit_legacy_interleaved_control_frame(
+    count: &mut usize,
+) -> Result<(), ClientHttpConnectionError> {
+    if *count >= MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES {
+        return Err(
+            ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
+                limit: MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES,
+            },
+        );
+    }
+    *count += 1;
+    Ok(())
 }
 
 /// Returns whether this exact legacy server cancellation is valid and owns the
@@ -6463,8 +6506,9 @@ mod tests {
 
     use super::{
         ClientHttpConnection, ClientHttpConnectionError, LegacyPersistentResponse,
-        LegacyPersistentResponseWaiter, LegacySseHttpClientError, LegacySsePersistentState,
-        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, MAX_MRTR_CONTINUATION_ROUNDS,
+        LegacyPersistentResponseWaiter, LegacySseConnection, LegacySseHttpClientError,
+        LegacySsePersistentState, MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS,
+        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, MAX_MRTR_CONTINUATION_ROUNDS,
         MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
         MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS,
         ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
@@ -8462,7 +8506,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("server exposed the live exact legacy response body");
 
-        let ClientHttpConnection::LegacySse { client, .. } = &mut connection else {
+        let ClientHttpConnection::LegacySse(LegacySseConnection { client, .. }) = &mut connection
+        else {
             panic!("LegacyOnly must retain the exact legacy SSE lane");
         };
         let wake_counter = Arc::new(CountingWake::default());
@@ -9869,6 +9914,260 @@ mod tests {
         assert_eq!(notification.method, "notifications/progress");
         assert!(connection.take_legacy_notification().is_none());
         server.join().expect("legacy request server must join");
+    }
+
+    #[test]
+    fn legacy_http_request_admits_exact_combined_control_bound_and_keeps_correlation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind legacy control listener");
+        let address = listener
+            .local_addr()
+            .expect("read legacy control listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let (mut first_post, _) = listener.accept().expect("accept bounded legacy POST");
+            let first =
+                serde_json::from_slice::<serde_json::Value>(&read_request(&mut first_post).body)
+                    .expect("bounded legacy POST remains JSON-RPC");
+            assert_eq!(first["id"], 41);
+            write_response(&mut first_post, 202, "application/json", b"");
+
+            for _ in 0..(MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES / 2) {
+                write_chunked_sse_event(
+                    &mut sse,
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n\n",
+                );
+            }
+            for index in 0..(MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES / 2) {
+                let reverse_id = 1_000_i64 + index as i64;
+                write_chunked_sse_event(
+                    &mut sse,
+                    &format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{reverse_id},\"method\":\"ping\",\"params\":{{}}}}\n\n"
+                    ),
+                );
+                let (mut reverse_reply_post, _) = listener
+                    .accept()
+                    .expect("accept bounded reverse-request reply");
+                let reverse_reply = serde_json::from_slice::<serde_json::Value>(
+                    &read_request(&mut reverse_reply_post).body,
+                )
+                .expect("bounded reverse reply remains JSON-RPC");
+                assert_eq!(reverse_reply["id"], reverse_id);
+                assert_eq!(reverse_reply["result"], serde_json::json!({}));
+                write_response(&mut reverse_reply_post, 202, "application/json", b"");
+            }
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":41,\"result\":{\"bounded\":true}}\n\n",
+            );
+
+            let (mut follow_up_post, _) = listener
+                .accept()
+                .expect("accept post-boundary follow-up request");
+            let follow_up = serde_json::from_slice::<serde_json::Value>(
+                &read_request(&mut follow_up_post).body,
+            )
+            .expect("post-boundary follow-up remains JSON-RPC");
+            assert_eq!(follow_up["id"], 42);
+            write_response(&mut follow_up_post, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"followUp\":true}}\n\n",
+            );
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/mcp",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            ClientInfo {
+                name: "legacy-control-boundary-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("legacy control-boundary connection opens");
+        let bounded = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(41),
+            4_096,
+        ))
+        .expect("the exact combined legacy control-frame bound remains admitted");
+        assert_eq!(bounded.id, Some(RequestId::Number(41)));
+
+        let mut notifications = 0;
+        while connection.take_legacy_notification().is_some() {
+            notifications += 1;
+        }
+        assert_eq!(
+            notifications,
+            MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES / 2,
+            "the admitted notification half remains available after reverse-call processing"
+        );
+
+        let follow_up = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(42),
+            4_096,
+        ))
+        .expect("the exact boundary leaves the shared legacy stream correlated for a follow-up");
+        assert_eq!(follow_up.id, Some(RequestId::Number(42)));
+        server.join().expect("legacy control-boundary server joins");
+    }
+
+    #[test]
+    fn legacy_http_request_rejects_n_plus_one_combined_control_frame_without_extra_reply() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind legacy control-limit listener");
+        let address = listener
+            .local_addr()
+            .expect("read legacy control-limit listener address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let (limit_observed_tx, limit_observed_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            let (mut first_post, _) = listener.accept().expect("accept limited legacy POST");
+            let first =
+                serde_json::from_slice::<serde_json::Value>(&read_request(&mut first_post).body)
+                    .expect("limited legacy POST remains JSON-RPC");
+            assert_eq!(first["id"], 91);
+            write_response(&mut first_post, 202, "application/json", b"");
+
+            for _ in 0..(MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES / 2) {
+                write_chunked_sse_event(
+                    &mut sse,
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n\n",
+                );
+            }
+            for index in 0..(MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES / 2) {
+                let reverse_id = 2_000_i64 + index as i64;
+                write_chunked_sse_event(
+                    &mut sse,
+                    &format!(
+                        "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{reverse_id},\"method\":\"ping\",\"params\":{{}}}}\n\n"
+                    ),
+                );
+                let (mut reverse_reply_post, _) = listener
+                    .accept()
+                    .expect("accept pre-limit reverse-request reply");
+                let reverse_reply = serde_json::from_slice::<serde_json::Value>(
+                    &read_request(&mut reverse_reply_post).body,
+                )
+                .expect("pre-limit reverse reply remains JSON-RPC");
+                assert_eq!(reverse_reply["id"], reverse_id);
+                assert_eq!(reverse_reply["result"], serde_json::json!({}));
+                write_response(&mut reverse_reply_post, 202, "application/json", b"");
+            }
+
+            let rejected_reverse_id =
+                2_000_i64 + (MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES / 2) as i64;
+            write_chunked_sse_event(
+                &mut sse,
+                &format!(
+                    "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":{rejected_reverse_id},\"method\":\"ping\",\"params\":{{}}}}\n\n"
+                ),
+            );
+            limit_observed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("client must reject the N+1 control frame before any reply is posted");
+
+            listener
+                .set_nonblocking(true)
+                .expect("make control-limit listener nonblocking");
+            let no_reply_deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < no_reply_deadline {
+                match listener.accept() {
+                    Ok((mut unexpected, _)) => {
+                        let unexpected = read_request(&mut unexpected);
+                        panic!(
+                            "N+1 reverse request must not receive a reply POST: {}",
+                            String::from_utf8_lossy(&unexpected.body)
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(LEGACY_TEST_PEER_POLL_INTERVAL);
+                    }
+                    Err(error) => panic!("accept unexpected N+1 reply: {error}"),
+                }
+            }
+            finish_chunked_sse(&mut sse);
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/mcp",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            ClientInfo {
+                name: "legacy-control-limit-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("legacy control-limit connection opens");
+        let error = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(91),
+            4_096,
+        ))
+        .expect_err("one combined control frame past the exact bound must be refused");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
+                limit: MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES
+            }
+        ));
+
+        let mut notifications = 0;
+        while connection.take_legacy_notification().is_some() {
+            notifications += 1;
+        }
+        assert_eq!(
+            notifications,
+            MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES / 2,
+            "the rejected reverse request must not mutate the already admitted notification state"
+        );
+        limit_observed_tx
+            .send(())
+            .expect("allow the peer to verify no N+1 reverse reply was posted");
+        server.join().expect("legacy control-limit server joins");
     }
 
     #[test]
