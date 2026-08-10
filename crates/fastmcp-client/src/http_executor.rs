@@ -5120,7 +5120,13 @@ fn retire_abandoned_persistent_waiter(
 }
 
 /// Structured ready-client ownership of the exact-2024 SSE receive side.
-struct LegacySsePersistentReceiver {
+/// Opaque structured owner of an exact-2024 persistent SSE receive task.
+///
+/// This type is public only because it is retained inside a public
+/// [`ClientHttpConnection`] variant. Its state and lifecycle operations remain
+/// private to the connection so callers cannot detach or replace the reader.
+#[doc(hidden)]
+pub struct LegacySsePersistentReceiver {
     state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
     task: asupersync::runtime::TaskHandle<()>,
     outbound: LegacySseHttpOutbound,
