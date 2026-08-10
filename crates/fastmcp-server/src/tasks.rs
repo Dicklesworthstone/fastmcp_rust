@@ -5646,21 +5646,43 @@ mod tests {
         }
     }
 
-    struct CancelThenCompletingFinalTaskSupervisor {
+    struct CancelThenHonoringCancellationFinalTaskSupervisor {
         runtime: FinalTaskRuntime,
+        observed_cancellation: Arc<AtomicBool>,
     }
 
-    impl ApplicationTaskSupervisor for CancelThenCompletingFinalTaskSupervisor {
+    impl ApplicationTaskSupervisor for CancelThenHonoringCancellationFinalTaskSupervisor {
         fn resume<'a>(
             &'a self,
             _cx: &'a Cx,
             handoff: FinalTaskSupervisorHandoff,
         ) -> FinalTaskSupervisorFuture<'a> {
             let runtime = self.runtime.clone();
+            let observed_cancellation = Arc::clone(&self.observed_cancellation);
             Box::pin(async move {
                 runtime
                     .cancel_task(final_task_handoff_task_id(&handoff))
-                    .expect("the elected task remains cancellable before successful completion");
+                    .expect("the elected task remains cancellable before honouring cancellation");
+                let cancellation_requested = match &handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.is_cancellation_requested()
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.is_cancellation_requested()
+                    }
+                }?;
+                observed_cancellation.store(cancellation_requested, AtomicOrdering::SeqCst);
+                if !cancellation_requested {
+                    return Err(McpError::internal_error(
+                        "the elected handoff did not observe its cancellation winner",
+                    ));
+                }
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial
+                        .honor_cancellation(Some("cancellation won the elected handoff".to_owned())),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted
+                        .honor_cancellation(Some("cancellation won the elected handoff".to_owned())),
+                }?;
                 Ok(())
             })
         }
@@ -6378,6 +6400,92 @@ mod tests {
                     }
                 }
                 .expect_err("changing only the elected fence rejects the terminal transition");
+                *observed_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                Ok(())
+            })
+        }
+    }
+
+    struct StaleGenerationCompletingFinalTaskSupervisor {
+        runtime: FinalTaskRuntime,
+        observed_error: Arc<Mutex<Option<McpError>>>,
+    }
+
+    impl ApplicationTaskSupervisor for StaleGenerationCompletingFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let runtime = self.runtime.clone();
+            let observed_error = Arc::clone(&self.observed_error);
+            Box::pin(async move {
+                let task_id = final_task_handoff_task_id(&handoff).clone();
+                runtime
+                    .require_input(
+                        &task_id,
+                        final_roots_request(),
+                        Some("newer generation won before completion".to_owned()),
+                    )
+                    .expect("the competing transition advances the durable generation");
+
+                let result: FinalTaskCallToolResult =
+                    serde_json::from_value(serde_json::json!({"content": []}))
+                        .expect("typed terminal task result");
+                let error = match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial
+                        .complete_task(result, Some("stale generation must fail".to_owned())),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted
+                        .complete_task(result, Some("stale generation must fail".to_owned())),
+                }
+                .expect_err("a stale generation cannot commit a terminal handoff");
+                *observed_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+                Ok(())
+            })
+        }
+    }
+
+    struct RepeatedTerminalHandoffSupervisor {
+        observed_error: Arc<Mutex<Option<McpError>>>,
+    }
+
+    impl ApplicationTaskSupervisor for RepeatedTerminalHandoffSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let observed_error = Arc::clone(&self.observed_error);
+            Box::pin(async move {
+                let first_result: FinalTaskCallToolResult =
+                    serde_json::from_value(serde_json::json!({"content": []}))
+                        .expect("typed first terminal task result");
+                match &handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial.complete_task(
+                        first_result,
+                        Some("first terminal handoff".to_owned()),
+                    ),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.complete_task(
+                        first_result,
+                        Some("first terminal handoff".to_owned()),
+                    ),
+                }
+                .expect("the elected handoff commits its first terminal result");
+
+                let repeated_result: FinalTaskCallToolResult =
+                    serde_json::from_value(serde_json::json!({"content": []}))
+                        .expect("typed repeated terminal task result");
+                let error = match &handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => initial
+                        .complete_task(repeated_result, Some("repeat must fail".to_owned())),
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => accepted
+                        .complete_task(repeated_result, Some("repeat must fail".to_owned())),
+                }
+                .expect_err("a terminal handoff cannot commit twice");
                 *observed_error
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
