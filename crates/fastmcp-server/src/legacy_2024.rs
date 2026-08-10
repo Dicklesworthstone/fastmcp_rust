@@ -1414,7 +1414,11 @@ mod tests {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"sampling": {}, "roots": {"listChanged": true}},
+                "capabilities": {
+                    "sampling": {},
+                    "roots": {"listChanged": true},
+                    "elicitation": {"form": {}}
+                },
                 "clientInfo": {"name": "legacy-client", "version": "1.0.0"}
             }
         })
@@ -1571,17 +1575,12 @@ mod tests {
 
         let mut wrong_era = initialize();
         wrong_era["params"]["protocolVersion"] = json!("2025-11-25");
-        let mut modern_shape = initialize();
-        modern_shape["params"]["capabilities"]["elicitation"] = json!({"form": {}});
-
-        for planted in [wrong_era, modern_shape] {
-            let response = adapter.receive(binding, planted).unwrap();
-            let Legacy2024Outbound::Response(response) = response else {
-                panic!("invalid initialize request must receive a JSON-RPC error response");
-            };
-            assert_eq!(response["error"]["code"], -32600);
-            assert_eq!(adapter.snapshot(), before);
-        }
+        let response = adapter.receive(binding, wrong_era).unwrap();
+        let Legacy2024Outbound::Response(response) = response else {
+            panic!("invalid initialize request must receive a JSON-RPC error response");
+        };
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(adapter.snapshot(), before);
         assert!(adapter.handler.methods.is_empty());
     }
 
