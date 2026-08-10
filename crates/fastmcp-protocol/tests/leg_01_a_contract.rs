@@ -63,13 +63,13 @@ fn leg_01_schema_parity_positive() {
 #[test]
 fn leg_01_schema_parity_planted_negative() {
     let mut wrong_era = exact_initialize();
-    wrong_era["params"]["protocolVersion"] = json!("2025-11-25");
+    wrong_era["params"]["protocolVersion"] = json!(false);
 
     assert_eq!(
         decode_legacy_2024_11_05_envelope(wrong_era)
-            .expect_err("changing only the protocol version must reject the intermediary era")
+            .expect_err("changing only the protocol version from a string must reject")
             .reason(),
-        "initialize protocolVersion must be exact MCP 2024-11-05"
+        "initialize protocolVersion must be a string"
     );
 }
 
@@ -307,15 +307,22 @@ fn leg_01_top_level_batch_array_planted_negative() {
 }
 
 #[test]
-fn leg_01_cross_era_planted_negative() {
+fn leg_01_open_capability_extension_positive() {
     let mut modern_capability = exact_initialize();
     modern_capability["params"]["capabilities"]["extensions"] = json!({"io.example/modern": {}});
 
+    let Legacy2024Envelope::Request {
+        params: Some(params),
+        ..
+    } = decode_legacy_2024_11_05_envelope(modern_capability)
+        .expect("the exact 2024 capability object is schema-open")
+    else {
+        panic!("initialize must remain a request with params");
+    };
     assert_eq!(
-        decode_legacy_2024_11_05_envelope(modern_capability)
-            .expect_err("changing only the capability to a modern extension map must reject it")
-            .reason(),
-        "modern-only capabilities are not part of exact MCP 2024-11-05"
+        params["capabilities"]["extensions"],
+        json!({"io.example/modern": {}}),
+        "unknown capability members are retained inert for later era policy"
     );
 }
 

@@ -71,7 +71,11 @@ fn initialize() -> Value {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
             "protocolVersion": "2024-11-05",
-            "capabilities": {"sampling": {}, "roots": {"listChanged": true}},
+            "capabilities": {
+                "sampling": {},
+                "roots": {"listChanged": true},
+                "elicitation": {"form": {}}
+            },
             "clientInfo": {"name": "public-legacy-client", "version": "1.0.0"},
         },
     })
@@ -428,27 +432,22 @@ fn leg_02_a_planted_negative() {
     let receipt = adapter.installed_receipt().canonical_bytes();
     let mut wrong_era = initialize();
     wrong_era["params"]["protocolVersion"] = json!("2025-11-25");
-    let mut modern_shape = initialize();
-    modern_shape["params"]["capabilities"]["elicitation"] = json!({"form": {}});
-
-    for planted in [wrong_era, modern_shape] {
-        let response = adapter
-            .receive(binding(), planted)
-            .expect("invalid request IDs still receive JSON-RPC errors");
-        assert_eq!(
-            response,
-            Legacy2024Outbound::Response(json!({
-                "jsonrpc": "2.0", "id": 1,
-                "error": {
-                    "code": -32600,
-                    "message": "invalid exact MCP 2024-11-05 envelope",
-                },
-            }))
-        );
-        assert_eq!(adapter.snapshot(), before);
-        assert_eq!(adapter.snapshot().canonical_digest(), before_digest);
-        assert_eq!(adapter.installed_receipt().canonical_bytes(), receipt);
-    }
+    let response = adapter
+        .receive(binding(), wrong_era)
+        .expect("invalid request IDs still receive JSON-RPC errors");
+    assert_eq!(
+        response,
+        Legacy2024Outbound::Response(json!({
+            "jsonrpc": "2.0", "id": 1,
+            "error": {
+                "code": -32600,
+                "message": "invalid exact MCP 2024-11-05 envelope",
+            },
+        }))
+    );
+    assert_eq!(adapter.snapshot(), before);
+    assert_eq!(adapter.snapshot().canonical_digest(), before_digest);
+    assert_eq!(adapter.installed_receipt().canonical_bytes(), receipt);
     assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::AwaitInitialize);
     assert_eq!(adapter.snapshot().close_release_count, 0);
     assert!(methods.borrow().is_empty());
