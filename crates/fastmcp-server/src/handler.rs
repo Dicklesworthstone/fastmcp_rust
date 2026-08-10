@@ -12,7 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use asupersync::Cx;
@@ -122,6 +122,252 @@ impl ResourceUriUsePolicy {
 // Progress Notification Sender
 // ============================================================================
 
+/// One request-owned final-progress staging runtime.
+///
+/// The runtime fixes its progress marker at construction, remembers the
+/// greatest admitted exact progress value, and retains at most one newer
+/// notification until a transport-owned rate tick or terminal response calls
+/// [`Self::flush_pending`] or [`Self::finalize`]. It intentionally does not
+/// elect the request's transport terminal: that authority remains with the
+/// outer server dispatch path.
+pub(crate) struct FinalProgressRuntime<F>
+where
+    F: Fn(JsonRpcRequest) + Send + Sync,
+{
+    marker: ProgressMarker,
+    send_fn: F,
+    state: Mutex<FinalProgressRuntimeState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalProgressRuntimePhase {
+    Open,
+    Finalizing,
+    Cancelled,
+}
+
+struct FinalProgressRuntimeState {
+    phase: FinalProgressRuntimePhase,
+    last_accepted_progress: Option<ExactNonNegativeJsonNumber>,
+    pending: Option<JsonRpcRequest>,
+}
+
+impl Default for FinalProgressRuntimeState {
+    fn default() -> Self {
+        Self {
+            phase: FinalProgressRuntimePhase::Open,
+            last_accepted_progress: None,
+            pending: None,
+        }
+    }
+}
+
+impl<F> FinalProgressRuntime<F>
+where
+    F: Fn(JsonRpcRequest) + Send + Sync,
+{
+    /// Creates an open runtime for one admitted final request marker.
+    #[must_use]
+    pub(crate) fn new(marker: ProgressMarker, send_fn: F) -> Self {
+        Self {
+            marker,
+            send_fn,
+            state: Mutex::new(FinalProgressRuntimeState::default()),
+        }
+    }
+
+    /// Creates the handler-facing reporter while retaining the runtime in the
+    /// outer request owner for later flushing or terminal finalization.
+    pub(crate) fn into_reporter(self: Arc<Self>) -> ProgressReporter
+    where
+        Self: 'static,
+    {
+        ProgressReporter::new(self)
+    }
+
+    /// Emits the newest pending progress notification, if the request remains
+    /// open. A future transport rate timer owns when to invoke this primitive.
+    ///
+    /// Returns `true` only when a queued notification was committed to the
+    /// callback. Cancellation and finalization discard no additional frames.
+    pub(crate) fn flush_pending(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase != FinalProgressRuntimePhase::Open {
+            return false;
+        }
+        self.emit_pending_locked(&mut state)
+    }
+
+    /// Claims this runtime's terminal side of the final-progress race.
+    ///
+    /// The winner flushes its one coalesced pending update before the outer
+    /// request owner writes the JSON-RPC terminal response. Returns `false`
+    /// when cancellation had already won.
+    pub(crate) fn finalize(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase != FinalProgressRuntimePhase::Open {
+            return false;
+        }
+        state.phase = FinalProgressRuntimePhase::Finalizing;
+        self.emit_pending_locked(&mut state);
+        true
+    }
+
+    /// Cancels this progress runtime and discards its coalesced notification.
+    ///
+    /// Returns `true` only when cancellation won before finalization.
+    pub(crate) fn cancel(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase != FinalProgressRuntimePhase::Open {
+            return false;
+        }
+        state.phase = FinalProgressRuntimePhase::Cancelled;
+        state.pending = None;
+        true
+    }
+
+    fn enqueue_exact(
+        &self,
+        progress: ExactNonNegativeJsonNumber,
+        total: Option<ExactNonNegativeJsonNumber>,
+        message: Option<&str>,
+    ) {
+        let params = FinalProgressNotificationParams {
+            progress_token: self.marker.clone(),
+            progress: progress.clone(),
+            total,
+            message: message.map(str::to_owned),
+            meta: None,
+            additional: BTreeMap::new(),
+        };
+        let Ok(serialized_params) = serde_json::to_value(params) else {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "final progress notification rejected; reason=serialization_failure"
+            );
+            return;
+        };
+        let notification =
+            JsonRpcRequest::notification("notifications/progress", Some(serialized_params));
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.phase != FinalProgressRuntimePhase::Open {
+            return;
+        }
+        if state
+            .last_accepted_progress
+            .as_ref()
+            .is_some_and(|last| progress <= *last)
+        {
+            log::debug!(
+                target: "fastmcp_rust::handler",
+                "final progress notification rejected; reason=non_monotonic_progress"
+            );
+            return;
+        }
+        state.last_accepted_progress = Some(progress);
+        // A newer admissible value replaces, rather than grows, the one-slot
+        // queue. The latest value is therefore what rate flush/finalization
+        // observes.
+        state.pending = Some(notification);
+    }
+
+    fn emit_pending_locked(&self, state: &mut FinalProgressRuntimeState) -> bool {
+        let Some(notification) = state.pending.take() else {
+            return false;
+        };
+        if crate::catch_extension_unwind(|| (self.send_fn)(notification)).is_err() {
+            log::error!(
+                target: "fastmcp_rust::handler",
+                "progress notification callback terminated unexpectedly; detail=panic_payload_redacted"
+            );
+        }
+        true
+    }
+}
+
+impl<F> NotificationSender for FinalProgressRuntime<F>
+where
+    F: Fn(JsonRpcRequest) + Send + Sync,
+{
+    fn send_progress_exact(
+        &self,
+        progress: serde_json::Number,
+        total: Option<serde_json::Number>,
+        message: Option<&str>,
+    ) {
+        let progress = match ExactNonNegativeJsonNumber::try_from_number(progress) {
+            Ok(progress) => progress,
+            Err(_) => {
+                log::warn!(
+                    target: "fastmcp_rust::handler",
+                    "final progress notification rejected; reason=invalid_finite_numeric_value"
+                );
+                return;
+            }
+        };
+        let total = match total {
+            Some(total) => match ExactNonNegativeJsonNumber::try_from_number(total) {
+                Ok(total) => Some(total),
+                Err(_) => {
+                    log::warn!(
+                        target: "fastmcp_rust::handler",
+                        "final progress notification rejected; reason=invalid_finite_numeric_value"
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
+        self.enqueue_exact(progress, total, message);
+    }
+
+    fn send_progress(&self, progress: f64, total: Option<f64>, message: Option<&str>) {
+        let Some(progress) = exact_finite_progress_from_f64(progress) else {
+            log::warn!(
+                target: "fastmcp_rust::handler",
+                "final progress notification rejected; reason=invalid_finite_numeric_value"
+            );
+            return;
+        };
+        let total = match total {
+            Some(total) => match exact_finite_progress_from_f64(total) {
+                Some(total) => Some(total),
+                None => {
+                    log::warn!(
+                        target: "fastmcp_rust::handler",
+                        "final progress notification rejected; reason=invalid_finite_numeric_value"
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
+        self.enqueue_exact(progress, total, message);
+    }
+}
+
+impl<F> std::fmt::Debug for FinalProgressRuntime<F>
+where
+    F: Fn(JsonRpcRequest) + Send + Sync,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FinalProgressRuntime").finish_non_exhaustive()
+    }
+}
+
 /// A notification sender that sends progress notifications via a callback.
 ///
 /// This is the server-side implementation used to send notifications back
@@ -129,8 +375,9 @@ impl ResourceUriUsePolicy {
 /// fields and serialization failures, and contains callback panics so a
 /// reporting failure cannot unwind through the request handler.
 ///
-/// This adapter does not provide monotonicity enforcement, rate limiting, or
-/// a bounded delivery queue.
+/// The exact-2024 path remains immediate. Final request-owned dispatch can
+/// instead install [`FinalProgressRuntime`] and retain its explicit flush and
+/// terminal-finalization primitives in the outer transport owner.
 pub struct ProgressNotificationSender<F>
 where
     F: Fn(JsonRpcRequest) + Send + Sync,

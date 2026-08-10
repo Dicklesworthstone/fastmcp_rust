@@ -1542,7 +1542,16 @@ fn derive_handler_context(
     );
     let mut handler_ctx = request_ctx.clone();
 
-    if let (Some(marker), Some(sender)) = (progress_marker, notification_sender) {
+    // The owned modern dispatch path may already have installed a
+    // request-scoped final-progress runtime. Preserve that reporter so its
+    // marker, monotonic high-water mark, coalescing slot, and eventual
+    // terminal finalization remain one request-owned authority.
+    let reuse_installed_final_reporter = matches!(protocol_era, ProtocolEra::Modern2026)
+        && handler_ctx.has_progress_reporter();
+
+    if let (Some(marker), Some(sender)) = (progress_marker, notification_sender)
+        && !reuse_installed_final_reporter
+    {
         let sender = sender.clone();
         let reporter = match protocol_era {
             ProtocolEra::Legacy2024 => ProgressNotificationSender::new(marker, move |request| {
