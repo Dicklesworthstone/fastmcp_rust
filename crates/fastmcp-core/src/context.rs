@@ -189,6 +189,53 @@ pub trait NotificationSender: Send + Sync {
 }
 
 // ============================================================================
+// Roots Provider
+// ============================================================================
+
+/// A filesystem root supplied by the connected client.
+///
+/// This deliberately lives in core rather than the wire crate: a handler's
+/// authority to inspect client roots must not introduce a core-to-protocol
+/// dependency cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRoot {
+    /// Root URI, normally a `file://` URI.
+    pub uri: String,
+    /// Optional human-readable display name.
+    pub name: Option<String>,
+}
+
+impl ClientRoot {
+    /// Creates an unnamed client root.
+    #[must_use]
+    pub fn new(uri: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            name: None,
+        }
+    }
+
+    /// Creates a named client root.
+    #[must_use]
+    pub fn with_name(uri: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            name: Some(name.into()),
+        }
+    }
+}
+
+/// Capability for listing filesystem roots from the connected client.
+pub trait RootsProvider: Send + Sync {
+    /// Lists the roots currently exposed by the client.
+    fn list_roots(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::McpResult<Vec<ClientRoot>>> + Send + '_>,
+    >;
+}
+
+// ============================================================================
 // Sampling Sender
 // ============================================================================
 
@@ -1176,6 +1223,8 @@ pub struct McpContext {
     sampling_sender: Option<Arc<dyn SamplingSender>>,
     /// Optional elicitation sender for user input requests.
     elicitation_sender: Option<Arc<dyn ElicitationSender>>,
+    /// Optional roots provider for filesystem boundaries exposed by the client.
+    roots_provider: Option<Arc<dyn RootsProvider>>,
     /// Optional resource reader for cross-component access.
     resource_reader: Option<Arc<dyn ResourceReader>>,
     /// Current resource read depth (to prevent infinite recursion).
@@ -1245,6 +1294,7 @@ impl std::fmt::Debug for McpContext {
             )
             .field("sampling_sender", &self.sampling_sender.is_some())
             .field("elicitation_sender", &self.elicitation_sender.is_some())
+            .field("roots_provider", &self.roots_provider.is_some())
             .field("resource_reader", &self.resource_reader.is_some())
             .field("resource_read_depth", &self.resource_read_depth)
             .field("tool_caller", &self.tool_caller.is_some())
@@ -1355,6 +1405,7 @@ impl McpContext {
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
+            roots_provider: None,
             resource_reader: None,
             resource_read_depth: 0,
             tool_caller: None,
@@ -1388,6 +1439,7 @@ impl McpContext {
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
+            roots_provider: None,
             resource_reader: None,
             resource_read_depth: 0,
             tool_caller: None,
@@ -1422,6 +1474,7 @@ impl McpContext {
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
+            roots_provider: None,
             resource_reader: None,
             resource_read_depth: 0,
             tool_caller: None,
@@ -1460,6 +1513,7 @@ impl McpContext {
             auth_state: Arc::new(AtomicU8::new(REQUEST_AUTH_UNCOMMITTED)),
             sampling_sender: None,
             elicitation_sender: None,
+            roots_provider: None,
             resource_reader: None,
             resource_read_depth: 0,
             tool_caller: None,
@@ -1498,6 +1552,15 @@ impl McpContext {
     #[must_use]
     pub fn with_elicitation(mut self, sender: Arc<dyn ElicitationSender>) -> Self {
         self.elicitation_sender = Some(sender);
+        self
+    }
+
+    /// Sets the roots provider for this context.
+    ///
+    /// This enables [`list_roots`](Self::list_roots) for the current request.
+    #[must_use]
+    pub fn with_roots_provider(mut self, provider: Arc<dyn RootsProvider>) -> Self {
+        self.roots_provider = Some(provider);
         self
     }
 
@@ -2281,10 +2344,10 @@ impl McpContext {
     /// Returns a derived context with an isolated authentication staging slot.
     ///
     /// Only budget accounting, cancellation, masking, and request identity
-    /// remain shared. Session state, nested dispatch, progress, sampling, and
-    /// elicitation are removed from the staging view so authentication code
-    /// cannot exercise handler authority and a handler cannot use this method
-    /// to forge a principal for nested dispatch.
+    /// remain shared. Session state, nested dispatch, progress, sampling,
+    /// elicitation, and roots are removed from the staging view so
+    /// authentication code cannot exercise handler authority and a handler
+    /// cannot use this method to forge a principal for nested dispatch.
     #[must_use]
     pub fn with_isolated_auth(mut self) -> Self {
         let already_committed = self.auth_state.load(Ordering::Acquire) != REQUEST_AUTH_UNCOMMITTED;
@@ -2297,6 +2360,7 @@ impl McpContext {
         self.progress_reporter = None;
         self.sampling_sender = None;
         self.elicitation_sender = None;
+        self.roots_provider = None;
         self.resource_reader = None;
         self.tool_caller = None;
         self
@@ -2676,6 +2740,38 @@ impl McpContext {
             .as_ref()
             .and_then(|s| s.get(key))
             .unwrap_or_default()
+    }
+
+    // ========================================================================
+    // Client Roots
+    // ========================================================================
+
+    /// Returns whether client roots are available in this context.
+    #[must_use]
+    pub fn can_list_roots(&self) -> bool {
+        self.ensure_live().is_ok() && self.roots_provider.is_some()
+    }
+
+    /// Lists the filesystem roots exposed by the connected client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the client did not advertise roots, the transport
+    /// cannot complete the reverse request, or this request is cancelled.
+    pub async fn list_roots(&self) -> crate::McpResult<Vec<ClientRoot>> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        let provider = self.roots_provider.as_ref().ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InvalidRequest,
+                "Roots not available: client does not support roots capability",
+            )
+        })?;
+
+        let roots = provider.list_roots().await?;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        Ok(roots)
     }
 
     // ========================================================================
@@ -4092,13 +4188,15 @@ mod tests {
         let root = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
             .with_budget_ceiling(Budget::new().with_cost_quota(2))
             .with_sampling(Arc::new(NoOpSamplingSender))
-            .with_elicitation(Arc::new(NoOpElicitationSender));
+            .with_elicitation(Arc::new(NoOpElicitationSender))
+            .with_roots_provider(Arc::new(FixedRootsProvider));
         let staged = root.clone().with_isolated_auth();
 
         assert!(staged.auth().is_none());
         assert!(!staged.has_session_state());
         assert!(!staged.can_sample());
         assert!(!staged.can_elicit());
+        assert!(!staged.can_list_roots());
         assert!(!staged.can_read_resources());
         assert!(!staged.can_call_tools());
         assert!(staged.set_auth(AuthContext::with_subject("tentative")));
@@ -5028,6 +5126,53 @@ mod tests {
         let sender = Arc::new(NoOpElicitationSender);
         let ctx = McpContext::new(cx, 1).with_elicitation(sender);
         assert!(ctx.can_elicit());
+    }
+
+    struct FixedRootsProvider;
+
+    impl RootsProvider for FixedRootsProvider {
+        fn list_roots(
+            &self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::McpResult<Vec<ClientRoot>>> + Send + '_>,
+        > {
+            Box::pin(async {
+                Ok(vec![
+                    ClientRoot::with_name("file:///workspace", "workspace"),
+                    ClientRoot::new("file:///tmp"),
+                ])
+            })
+        }
+    }
+
+    #[test]
+    fn mcp_context_roots_provider_returns_client_roots() {
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_roots_provider(Arc::new(FixedRootsProvider));
+
+        assert!(ctx.can_list_roots());
+        let roots = crate::block_on(ctx.list_roots()).expect("configured roots provider succeeds");
+        assert_eq!(
+            roots,
+            vec![
+                ClientRoot::with_name("file:///workspace", "workspace"),
+                ClientRoot::new("file:///tmp"),
+            ]
+        );
+    }
+
+    #[test]
+    fn mcp_context_without_roots_provider_rejects_without_authority() {
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+
+        assert!(!ctx.can_list_roots());
+        let error = crate::block_on(ctx.list_roots())
+            .expect_err("without only the roots provider, the context must reject the request");
+        assert_eq!(error.code, crate::McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Roots not available: client does not support roots capability"
+        );
     }
 
     #[test]

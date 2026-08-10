@@ -1139,13 +1139,14 @@ pub mod limits {
 
 pub use auth::{AccessToken, AuthContext, MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES};
 pub use context::{
-    CancelledError, ClientCapabilityInfo, ElicitationAction, ElicitationMode, ElicitationRequest,
-    ElicitationResponse, ElicitationSender, IntoOutcome, MAX_RESOURCE_READ_DEPTH,
+    CancelledError, ClientCapabilityInfo, ClientRoot, ElicitationAction, ElicitationMode,
+    ElicitationRequest, ElicitationResponse, ElicitationSender, IntoOutcome,
+    MAX_RESOURCE_READ_DEPTH,
     MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard, McpRequestCancellation,
     NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, NotificationSender,
     ProgressReporter, ResourceContentItem, ResourceReadResult, ResourceReader, SamplingRequest,
-    SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
-    ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
+    RootsProvider, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
+    SamplingStopReason, ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
 };
 pub use crypto::{
     CryptoInputTooLongError, EPHEMERAL_KEY_MATERIAL_BYTES, EphemeralKeyMaterial,
