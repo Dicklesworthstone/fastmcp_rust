@@ -10962,6 +10962,223 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn run_public_http_final_task_handle_lifecycle(
+        notification_task_id: &str,
+    ) -> (FinalTask, Option<HttpClientError>, u64) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind public final task handle listener");
+        let address = listener
+            .local_addr()
+            .expect("read public final task handle listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let notification_task_id = notification_task_id.to_owned();
+        let notification_matches_handle = notification_task_id == "task-73";
+        let (negative_done_tx, negative_done_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let discovery = modern_tasks_discovery_response(
+                "public-final-task-handle-server",
+                serde_json::json!({}),
+            );
+            let (mut probe, _) = listener
+                .accept()
+                .expect("accept final task handle discovery");
+            let probe_request = read_http_cache_test_request(&mut probe);
+            assert_eq!(probe_request["id"], 1);
+            assert_eq!(probe_request["method"], "server/discover");
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            let (mut get, _) = listener
+                .accept()
+                .expect("accept final task handle attachment");
+            let get_request = read_http_cache_test_request(&mut get);
+            assert_eq!(get_request["id"], 2);
+            assert_eq!(get_request["method"], "tasks/get");
+            assert_eq!(get_request["params"]["taskId"], "task-73");
+            assert_eq!(
+                get_request["params"]["_meta"]
+                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                serde_json::json!({})
+            );
+            write_http_cache_test_response(
+                &mut get,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"pollIntervalMs":25}}"#,
+            );
+
+            let (mut watch, _) = listener
+                .accept()
+                .expect("accept final task handle subscription");
+            let watch_request = read_http_cache_test_request(&mut watch);
+            assert_eq!(watch_request["id"], 3);
+            assert_eq!(watch_request["method"], "subscriptions/listen");
+            assert_eq!(
+                watch_request["params"]["notifications"]["taskIds"],
+                serde_json::json!(["task-73"])
+            );
+            assert_eq!(
+                watch_request["params"]["_meta"]
+                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    ["io.modelcontextprotocol/tasks"],
+                serde_json::json!({})
+            );
+            let sse = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{{\"taskIds\":[\"task-73\"]}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tasks\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"taskId\":\"{notification_task_id}\",\"status\":\"input_required\",\"createdAt\":\"2026-07-28T12:00:00Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:01Z\",\"ttlMs\":null,\"inputRequests\":{{}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}}}}}}\n\n"
+            );
+            write_http_cache_test_response(&mut watch, "text/event-stream", sse.as_bytes());
+
+            if notification_matches_handle {
+                let (mut update, _) = listener
+                    .accept()
+                    .expect("accept final task handle input submission");
+                let update_request = read_http_cache_test_request(&mut update);
+                assert_eq!(update_request["id"], 4);
+                assert_eq!(update_request["method"], "tasks/update");
+                assert_eq!(update_request["params"]["taskId"], "task-73");
+                assert_eq!(
+                    update_request["params"]["inputResponses"],
+                    serde_json::json!({})
+                );
+                write_http_cache_test_response(
+                    &mut update,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}"#,
+                );
+
+                let (mut poll, _) = listener
+                    .accept()
+                    .expect("accept final task handle poll");
+                let poll_request = read_http_cache_test_request(&mut poll);
+                assert_eq!(poll_request["id"], 5);
+                assert_eq!(poll_request["method"], "tasks/get");
+                assert_eq!(poll_request["params"]["taskId"], "task-73");
+                write_http_cache_test_response(
+                    &mut poll,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:02Z","ttlMs":null,"pollIntervalMs":25}}"#,
+                );
+            } else {
+                negative_done_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("negative task watcher completes before post assertion");
+                listener
+                    .set_nonblocking(true)
+                    .expect("make negative task listener nonblocking");
+                match listener.accept() {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Ok(_) => panic!("foreign task notification must not trigger update or poll"),
+                    Err(error) => panic!("observe negative task listener: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "public-final-task-handle-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP client completes Tasks discovery");
+        let mut handle = http_test_runtime_block_on(client.attach_final_task(
+            &cx,
+            FinalTaskId::parse("task-73").expect("bounded public task handle ID"),
+        ))
+        .expect("public HTTP task attachment admits the first snapshot");
+        assert!(matches!(handle.task(), FinalTask::Working(_)));
+        assert_eq!(handle.task().base().poll_interval_ms.as_ref().map(|value| value.as_str()), Some("25"));
+
+        let limits =
+            sse::SseLimits::new(1_024, 8_192, 8).expect("bounded final task watch limits");
+        let mut watcher = http_test_runtime_block_on(handle.watch(&cx, &mut client, limits))
+            .expect("public HTTP task watcher opens");
+        assert!(matches!(
+            http_test_runtime_block_on(watcher.next_event(&cx))
+                .expect("task watcher acknowledgement is exact"),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ));
+        let notification = http_test_runtime_block_on(watcher.next_event(&cx));
+
+        let (task, error, next_id) = if notification_matches_handle {
+            assert!(matches!(
+                notification.expect("matching task status notification is admitted"),
+                Some(FinalTaskWatchEvent::TaskUpdated(FinalTaskStatusNotification { .. }))
+            ));
+            assert!(matches!(
+                http_test_runtime_block_on(watcher.next_event(&cx))
+                    .expect("matching task watch terminates normally"),
+                Some(FinalTaskWatchEvent::Terminal { .. })
+            ));
+            drop(watcher);
+            assert!(matches!(handle.task(), FinalTask::InputRequired { .. }));
+
+            let acknowledgement = http_test_runtime_block_on(handle.resume_input(
+                &cx,
+                &mut client,
+                BTreeMap::new(),
+            ))
+            .expect("input-required task resumes with its exact empty ledger");
+            assert!(acknowledgement.meta.is_none());
+            assert!(acknowledgement.additional.is_empty());
+            assert!(matches!(
+                handle.task(),
+                FinalTask::InputRequired { .. }
+            ));
+            http_test_runtime_block_on(handle.poll(&cx, &mut client))
+                .expect("poll reconciles the acknowledged task state");
+            (
+                handle.task().clone(),
+                None,
+                client.next_id.load(Ordering::Relaxed),
+            )
+        } else {
+            let error = notification
+                .expect_err("one changed task ID rejects the watch before state mutation");
+            drop(watcher);
+            let task = handle.task().clone();
+            let next_id = client.next_id.load(Ordering::Relaxed);
+            negative_done_tx
+                .send(())
+                .expect("release negative task listener assertion");
+            (task, Some(error), next_id)
+        };
+        server
+            .join()
+            .expect("public final task handle server joins");
+        (task, error, next_id)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_final_task_handle_watches_resumes_and_polls() {
+        let (task, error, next_id) = run_public_http_final_task_handle_lifecycle("task-73");
+        assert!(error.is_none());
+        assert!(matches!(task, FinalTask::Working(_)));
+        assert_eq!(task.base().last_updated_at.as_str(), "2026-07-28T12:00:02Z");
+        assert_eq!(next_id, 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_final_task_handle_rejects_one_foreign_task_notification() {
+        let (task, error, next_id) = run_public_http_final_task_handle_lifecycle("task-74");
+        assert!(matches!(
+            error,
+            Some(HttpClientError::Connection(
+                ClientHttpConnectionError::SubscriptionsListen(
+                    http_executor::ModernHttpSubscriptionListenError::TaskEventOutsideAcceptedFilter
+                )
+            ))
+        ));
+        assert!(matches!(task, FinalTask::Working(_)));
+        assert_eq!(task.base().last_updated_at.as_str(), "2026-07-28T12:00:00Z");
+        assert_eq!(next_id, 4);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn cache_03_http_ttl_receipt_survives_later_result_routing() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind HTTP receipt listener");
