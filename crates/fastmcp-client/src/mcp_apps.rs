@@ -952,20 +952,23 @@ pub(crate) fn project_reused_core_result(
         ) => serde_json::to_value(&result.payload),
         (
             McpAppsRoutedMethod::ToolsCall,
-            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }),
-        ) => serde_json::to_value(result),
-        (
-            McpAppsRoutedMethod::ToolsCall,
-            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { .. }),
-        ) => project_input_required_core_result(&result),
+            CoreResult::Final(
+                FinalCoreResult::ToolsCallTask { .. }
+                | FinalCoreResult::ToolsCallInputRequired { .. },
+            ),
+        )
+        | (
+            McpAppsRoutedMethod::ResourcesRead,
+            CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. }),
+        ) => {
+            return Err(McpError::invalid_request(
+                "MCP Apps bridge does not support Tasks or input-required results",
+            ));
+        }
         (
             McpAppsRoutedMethod::ResourcesRead,
             CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }),
         ) => serde_json::to_value(&result.payload),
-        (
-            McpAppsRoutedMethod::ResourcesRead,
-            CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. }),
-        ) => project_input_required_core_result(&result),
         (
             McpAppsRoutedMethod::ResourcesList,
             CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }),
@@ -986,19 +989,6 @@ pub(crate) fn project_reused_core_result(
     }
     .map_err(|_| McpError::internal_error("Apps core result could not form a bridge response"))?;
     Ok(result)
-}
-
-/// Projects an admitted final `input_required` result through the protocol's
-/// owned encoder. `InputRequiredResult` intentionally is not `Serialize`:
-/// this retains its exact open members rather than manufacturing a lossy
-/// serde shape for the Apps bridge.
-fn project_input_required_core_result(result: &CoreResult) -> Result<Value, serde_json::Error> {
-    let encoded = result.encode().map_err(|_| {
-        serde_json::Error::io(std::io::Error::other(
-            "Apps input-required core result could not encode",
-        ))
-    })?;
-    serde_json::from_str(&encoded)
 }
 
 /// Concrete policy that forwards only standard-reused View methods through a
@@ -1055,17 +1045,18 @@ impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_core::block_on;
+    use fastmcp_core::{McpErrorCode, block_on};
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionLocalEnablement,
         ExtensionSettings, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
         official_mcp_apps_negotiation_resolver, register_official_mcp_apps_extension,
     };
     use fastmcp_protocol::{
-        McpAppsBridgeImplementation, McpAppsDownloadFileParams, McpAppsHostNotification,
-        McpAppsMessageParams, McpAppsMessageRole, McpAppsOpenLinkParams,
-        McpAppsProgressNotification, McpAppsToolCallParams, McpAppsToolResult,
-        McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
+        CoreRequest, FINAL_PROTOCOL_VERSION, McpAppsBridgeImplementation,
+        McpAppsDownloadFileParams, McpAppsHostNotification, McpAppsMessageParams,
+        McpAppsMessageRole, McpAppsOpenLinkParams, McpAppsProgressNotification,
+        McpAppsToolCallParams, McpAppsToolResult, McpAppsUpdateModelContextParams,
+        McpAppsViewCapabilities, ProtocolEra,
     };
     use serde_json::json;
 
@@ -1154,6 +1145,73 @@ mod tests {
             .unwrap()
             .mcp_apps_activation_receipt(&registry);
         McpAppsActivationProof::from_activation_receipt(receipt.as_ref()).unwrap()
+    }
+
+    fn final_tools_call_result(result: Value) -> CoreResult {
+        let params = json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "bridge-test"
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params))
+            .expect("final tools/call request admits its selected result algebra");
+        request
+            .decode_result(
+                &serde_json::to_string(&result).expect("selected result serializes for decoding"),
+            )
+            .expect("selected final tools/call result decodes")
+    }
+
+    #[test]
+    fn apps_reused_complete_tool_result_remains_bridgeable() {
+        let result = final_tools_call_result(json!({
+            "resultType": "complete",
+            "content": [{"type": "text", "text": "ready"}]
+        }));
+
+        assert_eq!(
+            project_reused_core_result(McpAppsRoutedMethod::ToolsCall, result)
+                .expect("ordinary complete result remains bridgeable"),
+            json!({"content": [{"type": "text", "text": "ready"}]}),
+        );
+    }
+
+    #[test]
+    fn apps_reused_task_result_is_rejected_without_apps_serialization() {
+        let result = final_tools_call_result(json!({
+            "resultType": "task",
+            "taskId": "task-bridge",
+            "status": "working",
+            "createdAt": "2026-07-28T12:00:00.000Z",
+            "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+            "ttlMs": null
+        }));
+
+        let error = project_reused_core_result(McpAppsRoutedMethod::ToolsCall, result)
+            .expect_err("a task result must not form an Apps response");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "MCP Apps bridge does not support Tasks or input-required results"
+        );
+    }
+
+    #[test]
+    fn apps_reused_input_required_result_is_rejected_without_apps_serialization() {
+        let result = final_tools_call_result(json!({
+            "resultType": "input_required",
+            "requestState": "resume-bridge"
+        }));
+
+        let error = project_reused_core_result(McpAppsRoutedMethod::ToolsCall, result)
+            .expect_err("an input-required result must not form an Apps response");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "MCP Apps bridge does not support Tasks or input-required results"
+        );
     }
 
     #[test]
