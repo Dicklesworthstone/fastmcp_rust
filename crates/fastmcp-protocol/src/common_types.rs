@@ -881,7 +881,8 @@ fn parse_bounded_json_integer_exponent(value: &str) -> Result<isize, CommonTypeE
     if magnitude > MAX_JSON_INTEGER_EXPONENT_ABS {
         return Err(CommonTypeError::TooLong("JSON integer exponent"));
     }
-    let exponent = isize::from(magnitude);
+    let exponent = isize::try_from(magnitude)
+        .map_err(|_| CommonTypeError::TooLong("JSON integer exponent"))?;
     Ok(if negative { -exponent } else { exponent })
 }
 

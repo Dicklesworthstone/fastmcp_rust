@@ -72,8 +72,10 @@ fn srv_02_a_positive() {
     assert_eq!(wire["ttlMs"], json!(60_000));
     assert_eq!(wire["cacheScope"], json!("private"));
     assert_eq!(
-        DiscoveryCacheHints::private_ttl_ms(u64::MAX).ttl_ms(),
-        u64::MAX,
+        DiscoveryCacheHints::private_ttl_ms(u64::MAX)
+            .ttl_ms()
+            .try_as_millis(),
+        Ok(u64::MAX),
         "the typed cache-hint field admits its complete nonnegative wire domain"
     );
 

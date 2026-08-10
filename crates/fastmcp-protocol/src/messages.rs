@@ -6507,6 +6507,64 @@ mod tests {
     }
 
     #[test]
+    fn final_discover_core_result_rejects_non_complete_result_algebra() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, SERVER_DISCOVER, Some(&params))
+            .expect("final server/discover request is typed");
+        let baseline = serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": [FINAL_PROTOCOL_VERSION],
+            "capabilities": {},
+            "ttlMs": 0,
+            "cacheScope": "private"
+        });
+
+        for result_type in [
+            serde_json::json!("input_required"),
+            serde_json::json!("task"),
+            serde_json::json!("com.example/deferred-discovery"),
+            Value::Null,
+        ] {
+            let mut planted = baseline.clone();
+            planted["resultType"] = result_type;
+            assert!(
+                matches!(
+                    request.decode_result(
+                        &serde_json::to_string(&planted)
+                            .expect("one-field invalid discovery result serializes"),
+                    ),
+                    Err(CoreDispatchError::InvalidResult {
+                        era: ProtocolEra::Modern2026,
+                        method: SERVER_DISCOVER,
+                    })
+                ),
+                "only complete or omission can select the modern discovery result"
+            );
+        }
+
+        let mut contradictory = baseline;
+        contradictory["requestState"] = serde_json::json!("resume-1");
+        assert!(
+            matches!(
+                request.decode_result(
+                    &serde_json::to_string(&contradictory)
+                        .expect("contradictory discovery result serializes"),
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: SERVER_DISCOVER,
+                })
+            ),
+            "a complete discriminator cannot make an input-required shape discovery"
+        );
+    }
+
+    #[test]
     fn core_dispatch_round_trips_legacy_and_final_core_payloads() {
         let final_params = serde_json::json!({
             "_meta": {

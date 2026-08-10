@@ -1422,12 +1422,11 @@ pub enum Legacy2024EnvelopeError {
 pub fn decode_legacy_2024_11_05_envelope_classified(
     value: Value,
 ) -> Result<Legacy2024Envelope, Legacy2024EnvelopeError> {
-    let object =
-        value
-            .as_object()
-            .ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+    let object = value.as_object().ok_or(Legacy2024EnvelopeError::Envelope(
+        Legacy2024WireError(
             "MCP 2024-11-05 requires one top-level JSON-RPC object; batch arrays are unsupported",
-        )))?;
+        ),
+    ))?;
     if object.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
         return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
             "jsonrpc must be exactly 2.0",

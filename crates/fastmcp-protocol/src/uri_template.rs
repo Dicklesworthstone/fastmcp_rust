@@ -2100,6 +2100,26 @@ mod tests {
     }
 
     #[test]
+    fn rfc6570_literal_percent_triplets_are_admitted_without_normalizing_bare_percent() {
+        let template = UriTemplate::parse("mcp://resource/reports%2Fdaily")
+            .expect("a complete literal percent triplet is valid RFC 6570");
+        assert_eq!(
+            template
+                .expand(&TemplateValues::new())
+                .expect("a valid literal expands unchanged"),
+            "mcp://resource/reports%2Fdaily"
+        );
+
+        assert_eq!(
+            UriTemplate::parse("mcp://resource/reports%Qdaily"),
+            Err(UriTemplateError::InvalidLiteral {
+                offset: "mcp://resource/reports".len(),
+            }),
+            "changing only the final percent triplet to a bare percent rejects rather than rewriting it"
+        );
+    }
+
+    #[test]
     fn rfc6570_literal_grammar_accepts_final_ucschar_and_rejects_nearby_exclusions() {
         let admitted = format!(
             "mcp://resource/{}",

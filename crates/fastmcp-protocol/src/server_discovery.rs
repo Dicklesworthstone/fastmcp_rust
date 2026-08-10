@@ -253,9 +253,31 @@ impl<'de> Deserialize<'de> for DiscoveryCacheScope {
     }
 }
 
-/// Locally emitted `server/discover` results use the standard complete
-/// discriminator. Peer results retain the schema-open string verbatim.
+/// The only final `server/discover` discriminator that can establish a
+/// modern session. A missing discriminator keeps the pinned compatibility
+/// path, but no other final result branch is a discovery result.
 const COMPLETE_DISCOVERY_RESULT_TYPE: &str = "complete";
+
+/// Final-result branch members that contradict a complete discovery result.
+///
+/// Discovery retains schema-open extension members, but it must never treat a
+/// continuation, task, or generic result envelope as discovery merely because
+/// it also carries the required discovery fields.
+const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 13] = [
+    "serverInfo",
+    "input",
+    "inputRequests",
+    "request",
+    "requestState",
+    "taskId",
+    "status",
+    "statusMessage",
+    "createdAt",
+    "lastUpdatedAt",
+    "pollIntervalMs",
+    "result",
+    "error",
+];
 
 /// Required final caching hints for a `server/discover` result.
 ///
@@ -606,7 +628,7 @@ impl ServerDiscoverResult {
         &self.supported_versions
     }
 
-    /// Returns the schema-open result discriminator received from the peer.
+    /// Returns the admitted final discovery discriminator.
     ///
     /// An absent peer discriminator is normalized to the compatibility default
     /// `complete`; [`Self::peer_diagnostic`] distinguishes that wire omission
@@ -701,11 +723,27 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
     {
         let wire = ServerDiscoverResultWire::deserialize(deserializer)?;
         let peer_missing_result_type = wire.result_type.0.is_none();
+        if wire
+            .result_type
+            .0
+            .as_deref()
+            .is_some_and(|result_type| result_type != COMPLETE_DISCOVERY_RESULT_TYPE)
+        {
+            return Err(D::Error::custom(
+                "server/discover resultType must be `complete`",
+            ));
+        }
+        if wire.extras.keys().any(|name| {
+            DISCOVERY_CONTRADICTORY_RESULT_MEMBERS
+                .iter()
+                .any(|forbidden| name == forbidden)
+        }) {
+            return Err(D::Error::custom(
+                "server/discover result contains a contradictory final result member",
+            ));
+        }
         Ok(Self {
-            result_type: wire
-                .result_type
-                .0
-                .unwrap_or_else(|| COMPLETE_DISCOVERY_RESULT_TYPE.to_owned()),
+            result_type: COMPLETE_DISCOVERY_RESULT_TYPE.to_owned(),
             peer_missing_result_type,
             supported_versions: wire.supported_versions,
             capabilities: wire.capabilities,
@@ -976,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn server_discover_round_trips_schema_open_result_type() {
+    fn server_discover_rejects_non_complete_result_types_and_contradictory_shapes() {
         let admitted = ServerDiscoverResult::new(
             fully_installed_capabilities(),
             ServerInfo {
@@ -988,26 +1026,45 @@ mod tests {
         );
         let unchanged_before =
             serde_json::to_vec(&admitted).expect("the admitted result has a stable wire image");
-        let mut peer_wire: Value =
+        let peer_wire: Value =
             serde_json::to_value(&admitted).expect("the admitted result encodes");
-        peer_wire["resultType"] = json!("com.example/deferred-discovery");
 
-        let decoded: ServerDiscoverResult = serde_json::from_value(peer_wire.clone())
-            .expect("a schema-open discovery resultType is retained");
-        assert_eq!(
-            decoded.result_type(),
-            "com.example/deferred-discovery",
-            "the typed API exposes the received open discriminator"
-        );
-        assert_eq!(
-            serde_json::to_value(decoded).expect("the open discriminator re-encodes"),
-            peer_wire,
-            "the schema-valid open resultType round-trips unchanged"
-        );
+        for result_type in [
+            json!("input_required"),
+            json!("task"),
+            json!("com.example/deferred-discovery"),
+            Value::Null,
+            json!(false),
+            json!({"complete": true}),
+        ] {
+            let mut planted = peer_wire.clone();
+            planted["resultType"] = result_type;
+            assert!(
+                serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
+                "only complete or absence can establish discovery"
+            );
+        }
+
+        for (name, value) in [
+            ("inputRequests", json!({"roots": {"method": "roots/list"}})),
+            ("requestState", json!("retry-1")),
+            ("taskId", json!("task-1")),
+            (
+                "serverInfo",
+                json!({"name": "wrong-location", "version": "1.0"}),
+            ),
+        ] {
+            let mut planted = peer_wire.clone();
+            planted[name] = value;
+            assert!(
+                serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
+                "complete discovery cannot carry the {name} result branch member"
+            );
+        }
         assert_eq!(
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
             unchanged_before,
-            "admitting a separate peer result cannot mutate locally admitted state"
+            "rejecting a contradictory result cannot mutate locally admitted state"
         );
     }
 
@@ -1065,14 +1122,12 @@ mod tests {
             serde_json::to_vec(&admitted).expect("the admitted result has a stable wire image");
         let admitted_wire = serde_json::to_value(&admitted).expect("the admitted result encodes");
 
-        for planted_result_type in [Value::Null, json!(false), json!({"complete": true})] {
-            let mut planted = admitted_wire.clone();
-            planted["resultType"] = planted_result_type;
-            assert!(
-                serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
-                "explicit null and wrong JSON kinds never use the absence compatibility rule"
-            );
-        }
+        let mut planted = admitted_wire.clone();
+        planted["resultType"] = Value::Null;
+        assert!(
+            serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
+            "explicit null never uses the absence compatibility rule"
+        );
         assert_eq!(
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
             unchanged_before,
