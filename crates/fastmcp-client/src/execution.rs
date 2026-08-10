@@ -1703,7 +1703,21 @@ where
                 (message, raw_result)
             }
             None => match state.transport.recv(cx) {
-                Ok(message) => (message, None),
+                // The typed Transport already decoded a real wire frame; its
+                // result value is the faithful source for that decode. A None
+                // source here would make every result-bearing response fail
+                // the source/kind consistency admission below, breaking the
+                // documented ordinary ingress shape of `Self::new`.
+                Ok(message) => {
+                    let raw_result = match typed_result_source_from_message(&message) {
+                        Ok(raw_result) => raw_result,
+                        Err(error) => {
+                            state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                            return Err(error);
+                        }
+                    };
+                    (message, raw_result)
+                }
                 Err(error) => {
                     let error = transport_error_to_mcp(error);
                     state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
@@ -3054,6 +3068,28 @@ where
         stream.push_back(notification.clone());
         Ok(true)
     }
+}
+
+/// Serializes the typed-ingress result as its retained source.
+///
+/// Used only for the ordinary [`Transport::recv`] path, where the transport
+/// decoded a real wire frame but did not retain its bytes; the serialized
+/// decoded result is the faithful source for that decode.
+fn typed_result_source_from_message(message: &JsonRpcMessage) -> McpResult<Option<String>> {
+    let JsonRpcMessage::Response(response) = message else {
+        return Ok(None);
+    };
+    response
+        .result
+        .as_ref()
+        .map(|result| {
+            serde_json::to_string(result).map_err(|_| {
+                McpError::invalid_request(
+                    "Admitted peer response could not retain its exact result source",
+                )
+            })
+        })
+        .transpose()
 }
 
 fn exact_result_source_from_admitted_frame(
@@ -4959,7 +4995,7 @@ mod tests {
             assert_eq!(rejection.id, Some(RequestId::Number(700)));
             assert_eq!(
                 rejection.error.as_ref().map(|error| error.code.clone()),
-                Some(McpErrorCode::MethodNotFound.into())
+                Some(i32::from(McpErrorCode::MethodNotFound).into())
             );
         }
 
@@ -5062,8 +5098,6 @@ mod tests {
     fn unit_task_01_executor_tool_call_preserves_completed_task_result_source() {
         let cx = Cx::for_testing();
         let raw_result = r#"{"resultType":"task","taskId":"task-escaped","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"structuredContent":{"z":1.20e+4,"message":"line\nquoted\" value"},"content":[]}}"#;
-        let typed_result: Value =
-            serde_json::from_str(raw_result).expect("exact Task source remains valid JSON");
         let executor = RequestExecutor::with_result_peer_era(
             ScriptedTransport::new(std::iter::empty()),
             ResultPeerEra::Modern,
@@ -5072,13 +5106,15 @@ mod tests {
             .execute_task_tool_call(&cx, task_tool_call_request(72))
             .expect("final tools/call commits before source-aware Task ingress");
 
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":72,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("the complete Tasks JSON-RPC frame is admitted with exact result bytes");
         executor
-            .route_response_with_raw_result(
-                &cx,
-                JsonRpcResponse::success(RequestId::Number(72), typed_result),
-                Some(raw_result.to_owned()),
-            )
-            .expect("the completed Task response is admitted with its exact source");
+            .drive_frame(&cx, frame)
+            .expect("the executor routes the Tasks result from admitted raw frame source");
         let created = executor
             .wait_task_tool_call(&cx, &mut execution)
             .expect("the public Tasks path decodes from the admitted source");

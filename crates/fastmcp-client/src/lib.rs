@@ -11626,14 +11626,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("exact legacy peer exposes its message endpoint");
 
-        let error = http_test_runtime_block_on(connection.request(
+        let Err(error) = http_test_runtime_block_on(connection.request(
             &cx,
             "example/echo",
             serde_json::json!({}),
             RequestId::Number(2),
-        ))
-        .err()
-        .expect("legacy raw request cannot bypass the registered final extension method");
+        )) else {
+            panic!("legacy raw request cannot bypass the registered final extension method");
+        };
         assert!(matches!(
             error,
             ClientHttpConnectionError::RegisteredExtensionMethodRequiresAdmission { ref method }
@@ -11981,13 +11981,13 @@ mod tests {
         let address = listener.local_addr().expect("read public MRTR address");
         let modern_target = format!("http://{address}/mcp");
         let server = std::thread::spawn(move || {
-            let (mut probe, _) = listener.accept().expect("accept public MRTR discovery");
-            let probe_request = read_http_cache_test_request(&mut probe);
-            assert_eq!(probe_request["id"], 1);
-            assert_eq!(probe_request["method"], "server/discover");
+            let (mut stream, _) = listener.accept().expect("accept public MRTR discovery");
+            let probe = read_http_cache_test_request(&mut stream);
+            assert_eq!(probe["id"], 1);
+            assert_eq!(probe["method"], "server/discover");
             let discovery =
                 modern_discovery_response("public-http-mrtr-server", &[MODERN_PROTOCOL_VERSION]);
-            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+            write_http_cache_test_response(&mut stream, "application/json", discovery.as_bytes());
 
             for (method, request_id, expected_state, next_state) in [
                 ("tools/call", 2, None, Some("tool-one")),
@@ -12140,16 +12140,16 @@ mod tests {
             .expect("read public MRTR bound address");
         let modern_target = format!("http://{address}/mcp");
         let server = std::thread::spawn(move || {
-            let (mut probe, _) = listener
+            let (mut stream, _) = listener
                 .accept()
                 .expect("accept public MRTR bound discovery");
-            let probe_request = read_http_cache_test_request(&mut probe);
-            assert_eq!(probe_request["id"], 1);
+            let probe = read_http_cache_test_request(&mut stream);
+            assert_eq!(probe["id"], 1);
             let discovery = modern_discovery_response(
                 "public-http-mrtr-bound-server",
                 &[MODERN_PROTOCOL_VERSION],
             );
-            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+            write_http_cache_test_response(&mut stream, "application/json", discovery.as_bytes());
 
             for request_id in 2..=(MAX_MRTR_CONTINUATION_ROUNDS as i64 + 2) {
                 let (mut stream, _) = listener.accept().expect("accept public MRTR bound round");
@@ -14221,7 +14221,7 @@ mod tests {
                 let sampling_calls = std::sync::Arc::clone(&sampling_calls);
                 move |_cancellation, params| {
                     sampling_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(params.max_tokens, JsonInteger::from(9_i64));
+                    assert_eq!(params.max_tokens, 9.into());
                     Ok(CreateMessageResult::text("handled", "handler-model"))
                 }
             })
@@ -18216,7 +18216,7 @@ mod tests {
          IFS= read -r request || exit 1; \
          case \"$request\" in *tools/call*) ;; *) exit 1 ;; esac; \
          case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
-         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"legacy result\",\"annotations\":{\"audience\":[\"user\"]},\"_meta\":{\"io.fastmcp.legacy\":true},\"io.fastmcp.extension\":{\"kept\":true}}],\"isError\":false,\"_meta\":{\"io.fastmcp.result\":true},\"io.fastmcp.resultExtension\":{\"kept\":true}}}' ;; esac; \
+         *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"legacy result\",\"annotations\":{\"audience\":[\"user\"]},\"_meta\":{\"io.fastmcp.legacy\":true},\"io.fastmcp/extension\":{\"kept\":true}}],\"isError\":false,\"_meta\":{\"io.fastmcp.result\":true},\"io.fastmcp.resultExtension\":{\"kept\":true}}}' ;; esac; \
          exec sleep 2"
     }
 
@@ -18427,7 +18427,7 @@ mod tests {
     #[test]
     fn clt_01_final_typed_client_result_positive() {
         let script = modern_typed_call_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result","annotations":{"audience":["user"]},"_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"isError":false,"structuredContent":{"answer":"typed result"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"typed result","annotations":{"audience":["user"]},"_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"isError":false,"structuredContent":{"answer":"typed result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -18464,7 +18464,7 @@ mod tests {
         assert!(annotations.is_some());
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern client cleanup");
@@ -19260,7 +19260,7 @@ mod tests {
     fn clt_01_exact_final_conveniences_preserve_final_open_fields() {
         let script = modern_final_convenience_client_script(
             "tools/call",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"exact tool result","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"isError":false,"structuredContent":{"answer":"exact tool result"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"exact tool result","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"isError":false,"structuredContent":{"answer":"exact tool result"}}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -19291,14 +19291,14 @@ mod tests {
         assert_eq!(text, "exact tool result");
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern tool client cleanup");
 
         let script = modern_final_convenience_client_script(
             "resources/read",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}],"ttlMs":7.3e1,"cacheScope":"public"}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","contents":[{"uri":"file:///exact.txt","text":"exact resource","mimeType":"text/plain","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}],"ttlMs":7.3e1,"cacheScope":"public"}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -19340,14 +19340,14 @@ mod tests {
         assert_eq!(mime_type.as_deref(), Some("text/plain"));
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern resource client cleanup");
 
         let script = modern_final_convenience_client_script(
             "prompts/get",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","description":"exact prompt","messages":[{"role":"user","content":{"type":"text","text":"exact prompt content","_meta":{"io.fastmcp.retained":true},"io.fastmcp.extension":"retained"}}]}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","description":"exact prompt","messages":[{"role":"user","content":{"type":"text","text":"exact prompt content","_meta":{"io.fastmcp.retained":true},"io.fastmcp/extension":"retained"}}]}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -19379,7 +19379,7 @@ mod tests {
         assert_eq!(text, "exact prompt content");
         assert!(meta.is_some());
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!("retained"))
         );
         client.close().expect("modern prompt client cleanup");
@@ -20455,7 +20455,7 @@ mod tests {
             "text": "representable",
             "annotations": {"audience": ["user"]},
             "_meta": {"io.fastmcp.retained": true},
-            "io.fastmcp.extension": {"retained": true},
+            "io.fastmcp/extension": {"retained": true},
         });
         let projected = final_content_to_legacy(
             serde_json::from_value::<ContentBlock>(representable.clone())
@@ -20484,12 +20484,12 @@ mod tests {
             "type": "resource",
             "annotations": {"audience": ["assistant"]},
             "_meta": {"io.fastmcp.retained": true},
-            "io.fastmcp.extension": {"retained": true},
+            "io.fastmcp/extension": {"retained": true},
             "resource": {
                 "uri": "file:///embedded.txt",
                 "text": "representable",
                 "_meta": {"io.fastmcp.retained": true},
-                "io.fastmcp.extension": {"retained": true},
+                "io.fastmcp/extension": {"retained": true},
             },
         });
         let projected = final_content_to_legacy(
@@ -20508,7 +20508,7 @@ mod tests {
             "mimeType": "audio/mpeg",
             "annotations": {"audience": ["user"]},
             "_meta": {"io.fastmcp.retained": true},
-            "io.fastmcp.extension": {"retained": true},
+            "io.fastmcp/extension": {"retained": true},
         });
         let error = final_content_to_legacy(
             serde_json::from_value::<ContentBlock>(unsupported)
@@ -20527,7 +20527,7 @@ mod tests {
             additional: std::collections::BTreeMap::from([
                 ("_meta".to_owned(), serde_json::json!({"vendor": true})),
                 (
-                    "io.fastmcp.extension".to_owned(),
+                    "io.fastmcp/extension".to_owned(),
                     serde_json::json!({"retained": true}),
                 ),
             ]),
@@ -20553,7 +20553,7 @@ mod tests {
                 )]),
             },
             additional: std::collections::BTreeMap::from([(
-                "io.fastmcp.extension".to_owned(),
+                "io.fastmcp/extension".to_owned(),
                 serde_json::json!({"retained": true}),
             )]),
         };
@@ -21412,7 +21412,7 @@ mod tests {
             panic!("the exact legacy result must retain its text content");
         };
         assert_eq!(
-            additional.get("io.fastmcp.extension"),
+            additional.get("io.fastmcp/extension"),
             Some(&serde_json::json!({"kept": true}))
         );
         client.close().expect("legacy client cleanup");
@@ -21469,7 +21469,7 @@ mod tests {
             serde_json::json!(true)
         );
         assert_eq!(
-            encoded[0]["io.fastmcp.extension"],
+            encoded[0]["io.fastmcp/extension"],
             serde_json::json!({"kept": true})
         );
         client.close().expect("legacy client cleanup");

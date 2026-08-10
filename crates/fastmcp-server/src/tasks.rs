@@ -7546,10 +7546,10 @@ mod tests {
                 .expect("typed terminal task result");
         match handoff {
             FinalTaskSupervisorHandoff::Initial(initial) => {
-                initial.complete_task(result, None)?;
+                let _ = initial.complete_task(result, None)?;
             }
             FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                accepted.complete_task(result, None)?;
+                let _ = accepted.complete_task(result, None)?;
             }
         }
         Ok(())

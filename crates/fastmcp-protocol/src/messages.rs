@@ -1217,7 +1217,7 @@ pub const FINAL_SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscr
 ///
 /// Every present field is an explicit opt-in. `false` and an empty resource
 /// list remain distinct from an omitted field on the wire.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionFilter {
     /// Receive prompt catalog change notifications when true.
     #[serde(
