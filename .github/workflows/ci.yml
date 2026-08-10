@@ -33,7 +33,7 @@ jobs:
           toolchain: nightly-2026-07-11
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -58,7 +58,7 @@ jobs:
         with:
           toolchain: nightly-2026-07-11
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: ${{ matrix.os }}
 
@@ -107,7 +107,7 @@ jobs:
         with:
           toolchain: nightly-2026-07-11
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Check all targets
         run: cargo check --locked --workspace --all-targets --all-features
@@ -126,7 +126,7 @@ jobs:
           toolchain: nightly-2026-07-11
           components: llvm-tools-preview
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed
@@ -210,7 +210,7 @@ jobs:
           toolchain: nightly-2026-07-11
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           key: release-${{ matrix.target }}
 
@@ -240,7 +240,7 @@ jobs:
         with:
           toolchain: nightly-2026-07-11
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Build documentation
         run: cargo doc --locked --workspace --no-deps --all-features
@@ -261,7 +261,7 @@ jobs:
         with:
           toolchain: nightly-2026-07-11
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
 
       - name: Check with pinned toolchain
         run: cargo check --locked --workspace --all-targets
