@@ -2620,12 +2620,26 @@ fn validate_inbound_typed_message(message: &JsonRpcMessage) -> McpResult<()> {
 }
 
 fn json_rpc_error_to_mcp(error: JsonRpcError) -> McpError {
-    let code = error
-        .code
-        .as_i32()
+    let peer_code = error.code;
+    let local_code = peer_code.as_i32();
+    let code = local_code
         .map(McpErrorCode::from)
         .unwrap_or(McpErrorCode::InternalError);
-    match error.data {
+    let data = if !local_code.is_some_and(|local_code| peer_code.as_str() == local_code.to_string())
+    {
+        // `McpErrorCode` is deliberately an i32 surface. Keep an unbounded
+        // or noncanonical peer JSON-RPC integer as a local diagnostic rather
+        // than truncating it, normalizing its spelling, or silently
+        // manufacturing a different custom code. Preserve the peer's own
+        // error data as a distinct value even when it is not an object.
+        Some(serde_json::json!({
+            "jsonrpcErrorCode": peer_code,
+            "jsonrpcErrorData": error.data,
+        }))
+    } else {
+        error.data
+    };
+    match data {
         Some(data) => McpError::with_data(code, error.message, data),
         None => McpError::new(code, error.message),
     }
@@ -2670,9 +2684,7 @@ fn ensure_legacy_cache_projection(
     ttl_ms: &fastmcp_protocol::CacheTtl,
     cache_scope: fastmcp_protocol::CacheScope,
 ) -> McpResult<()> {
-    if ttl_ms.try_as_millis() == Ok(0)
-        && cache_scope == fastmcp_protocol::CacheScope::Private
-    {
+    if ttl_ms.try_as_millis() == Ok(0) && cache_scope == fastmcp_protocol::CacheScope::Private {
         return Ok(());
     }
     Err(final_projection_error("cache fields"))
@@ -4215,7 +4227,6 @@ pub struct HttpClient {
     final_result_cache: FinalResultCache,
     final_cache_ttl_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
     mcp_apps_settings: Option<McpAppsClientSettings>,
-    mcp_apps_activation_receipt: Option<fastmcp_protocol::extensions::McpAppsActivationReceipt>,
 }
 
 /// Errors raised while composing a ready public HTTP client.
@@ -4390,15 +4401,24 @@ impl HttpClient {
         client_info: ClientInfo,
         client_capabilities: ClientCapabilities,
     ) -> Result<Self, HttpClientError> {
-        Self::connect_with_mcp_apps(cx, protocol_plan, client_info, client_capabilities, None).await
+        Self::connect_with_mcp_apps(
+            cx,
+            protocol_plan,
+            client_info,
+            client_capabilities,
+            None,
+            ReverseRequestHandlers::new(),
+        )
+        .await
     }
 
     pub(crate) async fn connect_with_mcp_apps(
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
-        client_capabilities: ClientCapabilities,
+        mut client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
+        reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {
         let mut connection = ClientHttpConnection::connect_with_mcp_apps(
             cx,
@@ -4410,12 +4430,26 @@ impl HttpClient {
         .await
         .map_err(HttpClientError::Connection)?;
 
+        // Legacy callbacks are part of the capability set advertised by
+        // `initialize`, so they must be installed before the lifecycle sends
+        // that request. Auto reaches this same branch only after it has
+        // selected the exact legacy SSE route; modern never receives these
+        // legacy method handlers.
+        if connection.selected_protocol_era() == ProtocolEra::Legacy2024 {
+            reverse_request_handlers.derive_legacy_capabilities(&mut client_capabilities);
+            connection.set_legacy_client_capabilities(client_capabilities.clone());
+            if !reverse_request_handlers.is_empty() {
+                connection
+                    .set_legacy_reverse_request_handlers(reverse_request_handlers)
+                    .map_err(HttpClientError::CoreResult)?;
+            }
+        }
+
         let (server_info, legacy_server_capabilities) = match connection.selected_protocol_era() {
             ProtocolEra::Modern2026 => {
                 let server_info = connection
                     .server_discovery()
-                    .and_then(ServerDiscoverResult::server_info)
-                    .cloned()
+                    .and_then(|discovery| discovery.server_info().cloned())
                     .ok_or(HttpClientError::ModernDiscoveryMissingServerInfo)?;
                 (server_info, None)
             }
@@ -4456,16 +4490,15 @@ impl HttpClient {
                     .notify(cx, "notifications/initialized", None)
                     .await
                     .map_err(HttpClientError::Connection)?;
+                connection
+                    .start_legacy_receive_pump(cx)
+                    .map_err(HttpClientError::Connection)?;
                 (
                     initialization.server_info,
                     Some(initialization.capabilities),
                 )
             }
         };
-
-        let mcp_apps_activation_receipt = connection.server_discovery().and_then(|discovery| {
-            mcp_apps_activation_receipt(mcp_apps_settings.as_ref(), discovery)
-        });
 
         Ok(Self {
             connection,
@@ -4477,7 +4510,6 @@ impl HttpClient {
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
             mcp_apps_settings,
-            mcp_apps_activation_receipt,
         })
     }
 
@@ -4490,7 +4522,15 @@ impl HttpClient {
     /// Returns whether final discovery activated the official MCP Apps extension.
     #[must_use]
     pub fn mcp_apps_active(&self) -> bool {
-        self.mcp_apps_activation_receipt.is_some()
+        self.connection.mcp_apps_active()
+    }
+
+    fn current_mcp_apps_activation_receipt(
+        &self,
+    ) -> Option<fastmcp_protocol::extensions::McpAppsActivationReceipt> {
+        self.connection.server_discovery().and_then(|discovery| {
+            mcp_apps_activation_receipt(self.mcp_apps_settings.as_ref(), &discovery)
+        })
     }
 
     /// Starts one browser-agnostic Apps Host for a negotiated modern connection.
@@ -4505,9 +4545,9 @@ impl HttpClient {
         T: McpAppsBridgeTransport,
         P: McpAppsHostPolicy,
     {
-        let activation_proof = mcp_apps::McpAppsActivationProof::from_activation_receipt(
-            self.mcp_apps_activation_receipt.as_ref(),
-        )?;
+        let activation_receipt = self.current_mcp_apps_activation_receipt();
+        let activation_proof =
+            mcp_apps::McpAppsActivationProof::from_activation_receipt(activation_receipt.as_ref())?;
         Ok(McpAppsHost::new_negotiated(
             transport,
             configuration,
@@ -4529,9 +4569,9 @@ impl HttpClient {
     where
         T: mcp_apps::McpAppsWireBridgeTransport,
     {
-        let activation_proof = mcp_apps::McpAppsActivationProof::from_activation_receipt(
-            self.mcp_apps_activation_receipt.as_ref(),
-        )?;
+        let activation_receipt = self.current_mcp_apps_activation_receipt();
+        let activation_proof =
+            mcp_apps::McpAppsActivationProof::from_activation_receipt(activation_receipt.as_ref())?;
         Ok(mcp_apps::McpAppsWireHost::new_negotiated(
             transport,
             configuration,
@@ -4624,7 +4664,7 @@ impl HttpClient {
 
     /// Returns the exact modern discovery result when the selected peer is modern.
     #[must_use]
-    pub fn server_discovery(&self) -> Option<&ServerDiscoverResult> {
+    pub fn server_discovery(&self) -> Option<ServerDiscoverResult> {
         self.connection.server_discovery()
     }
 
@@ -4637,6 +4677,14 @@ impl HttpClient {
     /// Returns mutable access to the underlying policy-bound HTTP transport.
     pub fn connection_mut(&mut self) -> &mut ClientHttpConnection {
         &mut self.connection
+    }
+
+    /// Pops one exact-2024 server notification received after this HTTP client
+    /// became ready. The ready legacy SSE receiver drains these independently
+    /// of ordinary client requests; modern HTTP has no shared legacy stream.
+    #[must_use]
+    pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
+        self.connection.take_legacy_notification()
     }
 
     /// Consumes the high-level wrapper and returns its transport.
@@ -5227,10 +5275,73 @@ struct ReceivedPreparedResult {
 /// Shared request correlation for a negotiated stdio connection.
 ///
 /// A cloneable request executor for the selected stdio session.
+#[derive(Debug)]
+struct StdioDropRetirement {
+    request_id: RequestId,
+    peer_era: ProtocolEra,
+    requested: AtomicBool,
+}
+
+/// Bounded, client-owned retirement records for cloned stdio executions.
+///
+/// `StdioRequestExecution::drop` only marks its own pre-registered record.
+/// The mutable client later drains that fixed set while it owns the response
+/// registry and the outbound writer; Drop itself never locks or writes.
+#[derive(Clone, Default, Debug)]
+struct SharedStdioDropRetirements(
+    Arc<Mutex<std::collections::HashMap<CorrelationKey, Arc<StdioDropRetirement>>>>,
+);
+
+impl SharedStdioDropRetirements {
+    fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn insert(&self, retirement: Arc<StdioDropRetirement>) -> McpResult<()> {
+        let key = retirement
+            .request_id
+            .correlation_key()
+            .map_err(|_| McpError::internal_error("Invalid JSON-RPC request ID"))?;
+        self.0
+            .lock()
+            .map_err(|_| McpError::internal_error("Stdio drop retirement registry is unavailable"))?
+            .insert(key, retirement);
+        Ok(())
+    }
+
+    fn take_requested(&self) -> McpResult<Vec<Arc<StdioDropRetirement>>> {
+        let mut retirements = self.0.lock().map_err(|_| {
+            McpError::internal_error("Stdio drop retirement registry is unavailable")
+        })?;
+        let requested = retirements
+            .iter()
+            .filter(|(_, retirement)| retirement.requested.load(Ordering::Acquire))
+            .map(|(key, retirement)| (key.clone(), Arc::clone(retirement)))
+            .collect::<Vec<_>>();
+        for (key, _) in &requested {
+            retirements.remove(key);
+        }
+        Ok(requested
+            .into_iter()
+            .map(|(_, retirement)| retirement)
+            .collect())
+    }
+
+    fn remove(&self, request_id: &RequestId) {
+        let Ok(key) = request_id.correlation_key() else {
+            return;
+        };
+        if let Ok(mut retirements) = self.0.lock() {
+            retirements.remove(&key);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StdioRequestExecutor {
     sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
     responses: SharedResponseRegistry,
+    drop_retirements: SharedStdioDropRetirements,
     peer_era: ProtocolEra,
 }
 
@@ -5248,9 +5359,8 @@ impl std::fmt::Debug for StdioRequestExecutor {
 pub struct StdioRequestExecution {
     request_id: RequestId,
     waiter: Option<ResponseWaiter>,
-    responses: SharedResponseRegistry,
-    sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
-    peer_era: ProtocolEra,
+    drop_retirement: Arc<StdioDropRetirement>,
+    drop_retirements: SharedStdioDropRetirements,
     committed_at: Instant,
     completed: bool,
 }
@@ -5268,38 +5378,12 @@ impl Drop for StdioRequestExecution {
         if self.completed {
             return;
         }
-
-        // Retirement is local and immediate: it removes the live owner even
-        // when no later client operation reaches the receive loop. Only the
-        // owner that won this tombstone transition may send its one selected-
-        // era cancellation control.
-        let retired = self
-            .responses
-            .tombstone(&self.request_id, McpError::request_cancelled())
-            .unwrap_or(false);
-        if !retired
-            || !self
-                .responses
-                .claim_cancellation_control(&self.request_id)
-                .unwrap_or(false)
-        {
-            return;
-        }
-
-        let control = match stdio_cancellation_control_message(self.peer_era, &self.request_id) {
-            Ok(control) => control,
-            Err(_) => return,
-        };
-        #[cfg(unix)]
-        {
-            if let Ok(mut sender) = self.sender.lock() {
-                let _ = sender.try_send_control_message(&control);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = control;
-        }
+        // A Drop implementation must not wait for either the shared response
+        // registry or child stdin. The mutable Client drains this request on
+        // its next owned progress point and performs the sole control write.
+        self.drop_retirement
+            .requested
+            .store(true, Ordering::Release);
     }
 }
 
@@ -5307,11 +5391,13 @@ impl StdioRequestExecutor {
     fn new(
         sender: Arc<Mutex<StdioSendHalf<ChildStdin>>>,
         responses: SharedResponseRegistry,
+        drop_retirements: SharedStdioDropRetirements,
         peer_era: ProtocolEra,
     ) -> Self {
         Self {
             sender,
             responses,
+            drop_retirements,
             peer_era,
         }
     }
@@ -5344,12 +5430,20 @@ impl StdioRequestExecutor {
             let _ = self.responses.fail(&request_id, error.clone());
             return Err(error);
         }
+        let drop_retirement = Arc::new(StdioDropRetirement {
+            request_id: request_id.clone(),
+            peer_era: self.peer_era,
+            requested: AtomicBool::new(false),
+        });
+        if let Err(error) = self.drop_retirements.insert(Arc::clone(&drop_retirement)) {
+            let _ = self.responses.fail(&request_id, error.clone());
+            return Err(error);
+        }
         Ok(StdioRequestExecution {
             request_id,
             waiter: Some(waiter),
-            responses: self.responses.clone(),
-            sender: Arc::clone(&self.sender),
-            peer_era: self.peer_era,
+            drop_retirement,
+            drop_retirements: self.drop_retirements.clone(),
             committed_at: Instant::now(),
             completed: false,
         })
@@ -5383,6 +5477,9 @@ pub struct Client {
     /// Installed only after a final stdio handshake selected its immutable
     /// peer era. Auto's disposable modern probe never reaches this field.
     multiplexed_executor: Option<StdioRequestExecutor>,
+    /// Fixed retirement records owned by the client, whose request handles
+    /// may be dropped from arbitrary caller contexts.
+    stdio_drop_retirements: SharedStdioDropRetirements,
     /// Capability context for cancellation.
     cx: Cx,
     /// Session state after initialization.
@@ -5729,6 +5826,7 @@ impl Client {
             transport: Arc::new(Mutex::new(transport)),
             response_sender,
             multiplexed_executor: None,
+            stdio_drop_retirements: SharedStdioDropRetirements::default(),
             cx,
             session: ClientSession::new_placeholder(
                 client_info.clone(),
@@ -5867,6 +5965,7 @@ impl Client {
             transport: Arc::new(Mutex::new(transport)),
             response_sender,
             multiplexed_executor: None,
+            stdio_drop_retirements: SharedStdioDropRetirements::default(),
             cx,
             session,
             next_id: AtomicU64::new(2), // Start at 2 since initialize used 1
@@ -5931,6 +6030,7 @@ impl Client {
             transport: Arc::new(Mutex::new(transport)),
             response_sender,
             multiplexed_executor: None,
+            stdio_drop_retirements: SharedStdioDropRetirements::default(),
             cx,
             session,
             next_id: AtomicU64::new(1), // Start at 1 since initialize hasn't happened
@@ -6397,8 +6497,33 @@ impl Client {
         self.multiplexed_executor = Some(StdioRequestExecutor::new(
             Arc::clone(&self.response_sender),
             self.responses.clone(),
+            self.stdio_drop_retirements.clone(),
             peer_era,
         ));
+    }
+
+    /// Drains dropped multiplexed request handles at a client-owned progress
+    /// point. This is deliberately the only place a drop retirement can lock
+    /// correlation state or touch child stdin.
+    fn flush_stdio_drop_retirements(&mut self) -> McpResult<()> {
+        for retirement in self.stdio_drop_retirements.take_requested()? {
+            let retired = self
+                .responses
+                .tombstone(&retirement.request_id, McpError::request_cancelled())?;
+            if !retired
+                || !self
+                    .responses
+                    .claim_cancellation_control(&retirement.request_id)?
+            {
+                continue;
+            }
+            let control =
+                stdio_cancellation_control_message(retirement.peer_era, &retirement.request_id)?;
+            if let Err(error) = self.send_bounded_control_message(control) {
+                return Err(self.terminate_connection(error));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the negotiated shared stdio executor.
@@ -6417,11 +6542,12 @@ impl Client {
     /// Commits one raw JSON-RPC request through the negotiated shared stdio
     /// executor without waiting for its response.
     pub fn start_multiplexed_request(
-        &self,
+        &mut self,
         cx: &Cx,
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> McpResult<StdioRequestExecution> {
+        self.flush_stdio_drop_retirements()?;
         let id = self.next_request_id()?;
         let request = JsonRpcRequest::new(
             method.into(),
@@ -6441,17 +6567,24 @@ impl Client {
         cx: &Cx,
         execution: &mut StdioRequestExecution,
     ) -> McpResult<JsonRpcResponse> {
-        if execution.completed || !self.responses.ptr_eq(&execution.responses) {
+        if execution.completed
+            || !self
+                .stdio_drop_retirements
+                .ptr_eq(&execution.drop_retirements)
+        {
             return Err(McpError::invalid_request(
                 "Multiplexed stdio execution belongs to a different client",
             ));
         }
+        self.flush_stdio_drop_retirements()?;
         let waiter = execution.waiter.take().ok_or_else(|| {
             McpError::invalid_request("Multiplexed stdio execution was already consumed")
         })?;
         execution.completed = true;
         let deadlines = RequestDeadlines::start_at(self.timeout_policy, execution.committed_at)?;
-        let response = self.recv_response_with_cx(cx, waiter, deadlines)?;
+        let response = self.recv_response_with_cx(cx, waiter, deadlines);
+        self.stdio_drop_retirements.remove(&execution.request_id);
+        let response = response?;
         if let Some(error) = response.error.clone() {
             return Err(json_rpc_error_to_mcp(error));
         }
@@ -7679,6 +7812,7 @@ impl Client {
         let expected_id = waiter.id.clone();
 
         loop {
+            self.flush_stdio_drop_retirements()?;
             if let Some(response) = waiter.try_response()? {
                 debug_assert!(
                     response
@@ -7868,50 +8002,49 @@ impl Client {
             }
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
-            let (message, received_at) =
-                match recv_shared_child_transport(
-                    &self.transport,
-                    &self.cx,
-                    Some(receive_deadline),
-                ) {
-                    Ok(received) => received,
-                    Err(TransportError::ReceiveDeadlineExceeded) => {
-                        if receive_deadline < deadlines.next() && !self.transport_is_closed() {
-                            self.drain_completed_reverse_callbacks()
-                                .map_err(|error| self.terminate_connection(error))?;
-                            continue;
-                        }
-                        let kind = deadlines
-                            .expired_at(Instant::now())
-                            .unwrap_or_else(|| deadlines.next_kind());
-                        if self.transport_is_closed() {
-                            return Err(self.finish_partial_frame_timeout(&expected_id, kind));
-                        }
-                        return Err(self.timeout_committed_request(&expected_id, kind));
+            let (message, received_at) = match recv_shared_child_transport(
+                &self.transport,
+                &self.cx,
+                Some(receive_deadline),
+            ) {
+                Ok(received) => received,
+                Err(TransportError::ReceiveDeadlineExceeded) => {
+                    if receive_deadline < deadlines.next() && !self.transport_is_closed() {
+                        self.drain_completed_reverse_callbacks()
+                            .map_err(|error| self.terminate_connection(error))?;
+                        continue;
                     }
-                    Err(TransportError::Timeout) if !self.transport_is_closed() => {
-                        return Err(self.finish_open_context_interruption(
-                            &expected_id,
-                            McpError::internal_error("Request timed out"),
-                        ));
+                    let kind = deadlines
+                        .expired_at(Instant::now())
+                        .unwrap_or_else(|| deadlines.next_kind());
+                    if self.transport_is_closed() {
+                        return Err(self.finish_partial_frame_timeout(&expected_id, kind));
                     }
-                    Err(TransportError::Cancelled) if !self.transport_is_closed() => {
-                        return Err(self.finish_open_context_interruption(
-                            &expected_id,
-                            McpError::request_cancelled(),
-                        ));
-                    }
-                    Err(TransportError::Closed) => {
-                        return Err(self.terminate_connection(
-                            subscription_listener_protocol_error(
-                                "Subscription listener reached EOF before terminal complete result",
-                            ),
-                        ));
-                    }
-                    Err(error) => {
-                        return Err(self.terminate_connection(transport_error_to_mcp(error)));
-                    }
-                };
+                    return Err(self.timeout_committed_request(&expected_id, kind));
+                }
+                Err(TransportError::Timeout) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::internal_error("Request timed out"),
+                    ));
+                }
+                Err(TransportError::Cancelled) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::request_cancelled(),
+                    ));
+                }
+                Err(TransportError::Closed) => {
+                    return Err(
+                        self.terminate_connection(subscription_listener_protocol_error(
+                            "Subscription listener reached EOF before terminal complete result",
+                        )),
+                    );
+                }
+                Err(error) => {
+                    return Err(self.terminate_connection(transport_error_to_mcp(error)));
+                }
+            };
             if let Some(kind) = deadlines.expired_at(received_at) {
                 return Err(self.finish_timeout_after_complete_message(
                     &expected_id,
@@ -8816,44 +8949,43 @@ impl Client {
             }
 
             let receive_deadline = self.reverse_callback_poll_deadline(deadlines.next());
-            let (message, received_at) =
-                match recv_shared_child_transport(
-                    &self.transport,
-                    &self.cx,
-                    Some(receive_deadline),
-                ) {
-                    Ok(received) => received,
-                    Err(TransportError::ReceiveDeadlineExceeded) => {
-                        if receive_deadline < deadlines.next() && !self.transport_is_closed() {
-                            self.drain_completed_reverse_callbacks()
-                                .map_err(|error| self.terminate_connection(error))?;
-                            continue;
-                        }
-                        let kind = deadlines
-                            .expired_at(Instant::now())
-                            .unwrap_or_else(|| deadlines.next_kind());
-                        if self.transport_is_closed() {
-                            return Err(self.finish_partial_frame_timeout(&expected_id, kind));
-                        }
-                        return Err(self.timeout_committed_request(&expected_id, kind));
+            let (message, received_at) = match recv_shared_child_transport(
+                &self.transport,
+                &self.cx,
+                Some(receive_deadline),
+            ) {
+                Ok(received) => received,
+                Err(TransportError::ReceiveDeadlineExceeded) => {
+                    if receive_deadline < deadlines.next() && !self.transport_is_closed() {
+                        self.drain_completed_reverse_callbacks()
+                            .map_err(|error| self.terminate_connection(error))?;
+                        continue;
                     }
-                    Err(TransportError::Timeout) if !self.transport_is_closed() => {
-                        return Err(self.finish_open_context_interruption(
-                            &expected_id,
-                            McpError::internal_error("Request timed out"),
-                        ));
+                    let kind = deadlines
+                        .expired_at(Instant::now())
+                        .unwrap_or_else(|| deadlines.next_kind());
+                    if self.transport_is_closed() {
+                        return Err(self.finish_partial_frame_timeout(&expected_id, kind));
                     }
-                    Err(TransportError::Cancelled) if !self.transport_is_closed() => {
-                        return Err(self.finish_open_context_interruption(
-                            &expected_id,
-                            McpError::request_cancelled(),
-                        ));
-                    }
-                    Err(error) => {
-                        let error = transport_error_to_mcp(error);
-                        return Err(self.terminate_connection(error));
-                    }
-                };
+                    return Err(self.timeout_committed_request(&expected_id, kind));
+                }
+                Err(TransportError::Timeout) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::internal_error("Request timed out"),
+                    ));
+                }
+                Err(TransportError::Cancelled) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::request_cancelled(),
+                    ));
+                }
+                Err(error) => {
+                    let error = transport_error_to_mcp(error);
+                    return Err(self.terminate_connection(error));
+                }
+            };
             if let Some(kind) = deadlines.expired_at(received_at) {
                 return Err(self.finish_timeout_after_complete_message(
                     &expected_id,
@@ -9749,6 +9881,11 @@ impl Client {
     /// cannot be established, signalling fails, or the subprocess cannot be
     /// reaped within the cleanup deadline.
     pub fn close(&mut self) -> McpResult<()> {
+        // A dropped final multiplexed execution has no later receive or send
+        // turn to drive its retirement. Drain it before failing waiters or
+        // closing child stdin so its selected-era cancellation still receives
+        // exactly one bounded control-write attempt.
+        let deferred_retirement_result = self.flush_stdio_drop_retirements();
         self.initialized.store(false, Ordering::SeqCst);
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
@@ -9782,7 +9919,10 @@ impl Client {
             }
         };
         let sticky_result = self.cleanup_error.clone().map_or(Ok(()), Err);
-        let result = combine_cleanup_results(sticky_result, retryable_process_result);
+        let result = combine_cleanup_results(
+            deferred_retirement_result,
+            combine_cleanup_results(sticky_result, retryable_process_result),
+        );
         if result.is_ok() {
             self.pending_process_cleanup_error = None;
         }
@@ -12561,7 +12701,10 @@ mod tests {
             assert!(matches!(
                 resp.error.as_ref(),
                 Some(error)
-                    if error.code == i32::from(fastmcp_core::McpErrorCode::MethodNotFound)
+                    if error.code
+                        == JsonInteger::from(i64::from(i32::from(
+                            fastmcp_core::McpErrorCode::MethodNotFound,
+                        )))
             ));
             assert_eq!(resp.id, Some(RequestId::String("req-1".to_string())));
         } else {
@@ -12596,7 +12739,9 @@ mod tests {
             let error = response.error.expect("expected invalid-request error");
             assert_eq!(
                 error.code,
-                i32::from(fastmcp_core::McpErrorCode::InvalidRequest)
+                JsonInteger::from(i64::from(i32::from(
+                    fastmcp_core::McpErrorCode::InvalidRequest,
+                )))
             );
         }
     }
@@ -12629,7 +12774,9 @@ mod tests {
             let error = resp.error.as_ref().unwrap();
             assert_eq!(
                 error.code,
-                i32::from(fastmcp_core::McpErrorCode::MethodNotFound)
+                JsonInteger::from(i64::from(i32::from(
+                    fastmcp_core::McpErrorCode::MethodNotFound,
+                )))
             );
             assert_eq!(error.message, "Method not found");
             assert!(!error.message.contains("unknown/method"));
@@ -12664,7 +12811,8 @@ mod tests {
         assert!(response.result.is_none());
         assert!(matches!(
             response.error,
-            Some(error) if error.code == i32::from(McpErrorCode::MethodNotFound)
+            Some(error)
+                if error.code == JsonInteger::from(i64::from(i32::from(McpErrorCode::MethodNotFound)))
         ));
     }
 
@@ -12763,6 +12911,45 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::ResourceForbidden);
         assert_eq!(error.message, "forbidden");
         assert_eq!(error.data, Some(serde_json::json!({"reason": "policy"})));
+    }
+
+    #[test]
+    fn json_rpc_error_conversion_retains_an_arbitrary_width_peer_code_diagnostic() {
+        let peer_code = "-999999999999999999999999999999999999999999999";
+        let error = json_rpc_error_to_mcp(JsonRpcError {
+            code: peer_code.parse().expect("huge JSON-RPC code is an integer"),
+            message: "peer rejected request".to_string(),
+            data: Some(serde_json::json!(["detail", 7])),
+        });
+
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(error.message, "peer rejected request");
+        let diagnostic = error.data.expect("wide peer code remains observable");
+        assert_eq!(diagnostic["jsonrpcErrorCode"].to_string(), peer_code);
+        assert_eq!(
+            diagnostic["jsonrpcErrorData"],
+            serde_json::json!(["detail", 7])
+        );
+    }
+
+    #[test]
+    fn json_rpc_error_conversion_retains_a_noncanonical_integer_code_spelling() {
+        let error = json_rpc_error_to_mcp(JsonRpcError {
+            code: "-326e2"
+                .parse()
+                .expect("a mathematical-integer JSON-RPC code is valid"),
+            message: "formatted peer code".to_string(),
+            data: None,
+        });
+
+        assert_eq!(error.code, McpErrorCode::Custom(-32_600));
+        assert_eq!(
+            error
+                .data
+                .expect("noncanonical code spelling remains observable")["jsonrpcErrorCode"]
+                .to_string(),
+            "-326e2"
+        );
     }
 
     #[test]
@@ -12887,10 +13074,9 @@ mod tests {
 
     #[test]
     fn client_progress_params_preserve_lossless_numeric_marker() {
-        let json = serde_json::from_str(
-            r#"{"progressToken":9007199254740993123456789,"progress":0.5}"#,
-        )
-        .expect("large mathematical-integer progress marker is valid JSON");
+        let json =
+            serde_json::from_str(r#"{"progressToken":9007199254740993123456789,"progress":0.5}"#)
+                .expect("large mathematical-integer progress marker is valid JSON");
         let params: ClientProgressParams =
             serde_json::from_value(json).expect("progress marker remains typed");
         let ProgressMarker::Number(marker) = params.marker else {
@@ -13418,7 +13604,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn dropped_multiplexed_stdio_executions_tombstone_without_followup_operations() {
+    fn dropped_multiplexed_stdio_executions_retire_at_the_next_client_progress_point() {
         let mut client = make_shell_scripted_initialized_client(
             "while IFS= read -r _; do :; done",
             Duration::from_secs(2),
@@ -13434,16 +13620,40 @@ mod tests {
             );
         }
 
-        assert_eq!(client.responses.pending_len(), 0);
-        assert_eq!(client.responses.tombstone_len(), 1_024);
-        assert_eq!(client.responses.cancellation_control_len(), 1_024);
         let final_execution = client
             .start_multiplexed_request(&cx, "ping", Some(serde_json::json!({})))
             .expect("dropped owners must not exhaust the live in-flight limit");
         assert_eq!(client.responses.pending_len(), 1);
+        assert_eq!(client.responses.tombstone_len(), 1_024);
+        assert_eq!(client.responses.cancellation_control_len(), 1_024);
         drop(final_execution);
-        assert_eq!(client.responses.pending_len(), 0);
+        assert_eq!(client.responses.pending_len(), 1);
         client.close().expect("silent-peer stdio client cleanup");
+    }
+
+    #[test]
+    fn completed_multiplexed_stdio_execution_does_not_request_drop_retirement() {
+        let (sender, receiver) = oneshot::channel();
+        let retirement = Arc::new(StdioDropRetirement {
+            request_id: RequestId::Number(91),
+            peer_era: ProtocolEra::Modern2026,
+            requested: AtomicBool::new(false),
+        });
+        let execution = StdioRequestExecution {
+            request_id: RequestId::Number(91),
+            waiter: Some(ResponseWaiter {
+                id: RequestId::Number(91),
+                receiver,
+            }),
+            drop_retirement: Arc::clone(&retirement),
+            drop_retirements: SharedStdioDropRetirements::default(),
+            committed_at: Instant::now(),
+            completed: true,
+        };
+        drop(sender);
+        drop(execution);
+
+        assert!(!retirement.requested.load(Ordering::Acquire));
     }
 
     #[cfg(unix)]
@@ -17596,10 +17806,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn clt_02_discovery_null_and_wrong_type_do_not_select_an_era() {
+    fn clt_02_discovery_non_complete_result_types_do_not_select_an_era() {
         let baseline =
             modern_discovery_response("invalid-discriminator-server", &[MODERN_PROTOCOL_VERSION]);
         for planted_result_type in [
+            serde_json::json!("input_required"),
+            serde_json::json!("task"),
+            serde_json::json!("com.example/deferred-discovery"),
             serde_json::Value::Null,
             serde_json::json!({"complete": true}),
         ] {
@@ -17616,7 +17829,32 @@ mod tests {
                 Cx::for_request(),
             )
             .err()
-            .expect("explicit null and wrong-kind discriminators reject discovery");
+            .expect("every non-complete discriminator rejects discovery");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+        }
+
+        for (member, value) in [
+            ("requestState", serde_json::json!("resume-1")),
+            (
+                "inputRequests",
+                serde_json::json!({"roots": {"method": "roots/list"}}),
+            ),
+            ("taskId", serde_json::json!("task-1")),
+        ] {
+            let mut response: serde_json::Value =
+                serde_json::from_str(&baseline).expect("baseline discovery response is JSON");
+            response["result"][member] = value;
+            let response = serde_json::to_string(&response)
+                .expect("contradictory discovery response remains JSON");
+            let script = modern_public_client_script(&response);
+            let error = Client::stdio_with_protocol_plan_with_cx(
+                "sh",
+                &["-c", script.as_str()],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                Cx::for_request(),
+            )
+            .err()
+            .expect("a contradictory final shape rejects discovery before negotiation");
             assert_eq!(error.code, McpErrorCode::InternalError);
         }
     }

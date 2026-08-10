@@ -536,7 +536,9 @@ fn reverse_callback_cancellation_rejects_stale_owner_after_same_id_reuse() {
     ]);
     let executor = RequestExecutor::new(transport);
 
-    executor.drive(&cx).expect("first reverse request is retained");
+    executor
+        .drive(&cx)
+        .expect("first reverse request is retained");
     let stale = executor
         .take_reverse_requests()
         .pop()
@@ -588,7 +590,9 @@ fn reverse_callback_owner_cannot_cross_connection_boundaries() {
     let first = RequestExecutor::new(first_transport);
     let second = RequestExecutor::new(second_transport);
 
-    first.drive(&cx).expect("first connection retains its request");
+    first
+        .drive(&cx)
+        .expect("first connection retains its request");
     second
         .drive(&cx)
         .expect("second connection retains its equal-ID request");
@@ -605,7 +609,11 @@ fn reverse_callback_owner_cannot_cross_connection_boundaries() {
         .respond_to_reverse_request(&cx, &foreign, serde_json::json!({"foreign": true}))
         .expect_err("an equal request ID from another connection is not an owner");
     assert_eq!(error.code, McpErrorCode::InvalidRequest);
-    assert_eq!(second_probe.sent_len(), 0, "foreign refusal writes no peer frame");
+    assert_eq!(
+        second_probe.sent_len(),
+        0,
+        "foreign refusal writes no peer frame"
+    );
 
     second
         .respond_to_reverse_request(&cx, &local, serde_json::json!({"local": true}))
@@ -616,13 +624,12 @@ fn reverse_callback_owner_cannot_cross_connection_boundaries() {
 #[test]
 fn reverse_callback_connection_shutdown_cancels_taken_owner() {
     let cx = Cx::for_testing();
-    let (transport, probe) = ScriptedTransport::new([Ok(JsonRpcMessage::Request(
-        JsonRpcRequest::new(
+    let (transport, probe) =
+        ScriptedTransport::new([Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
             "sampling/createMessage",
             Some(serde_json::json!({"messages": []})),
             700,
-        ),
-    ))]);
+        )))]);
     let executor = RequestExecutor::new(transport);
     executor.drive(&cx).expect("reverse request is retained");
     let reverse = executor
@@ -630,7 +637,9 @@ fn reverse_callback_connection_shutdown_cancels_taken_owner() {
         .pop()
         .expect("request crosses the public handler boundary");
 
-    executor.shutdown(&cx).expect("connection shutdown completes");
+    executor
+        .shutdown(&cx)
+        .expect("connection shutdown completes");
     assert!(
         reverse.cancellation().is_cancel_requested(),
         "a callback cannot remain live after its connection closes"
@@ -639,7 +648,11 @@ fn reverse_callback_connection_shutdown_cancels_taken_owner() {
         .respond_to_reverse_request(&cx, &reverse, serde_json::json!({"late": true}))
         .expect_err("a closed connection cannot accept a reverse response");
     assert_eq!(error.code, McpErrorCode::InternalError);
-    assert_eq!(probe.sent_len(), 0, "shutdown leaves no late response frame");
+    assert_eq!(
+        probe.sent_len(),
+        0,
+        "shutdown leaves no late response frame"
+    );
 }
 
 #[test]

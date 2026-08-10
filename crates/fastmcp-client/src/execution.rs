@@ -1864,9 +1864,9 @@ where
         request.cancellation.record_response_sent();
         let removed = state.pending_reverse_requests.remove(&key);
         debug_assert!(removed.is_some());
-        state.reverse_requests.retain(|request| {
-            !request.request_id().correlates_with(&owned_request_id)
-        });
+        state
+            .reverse_requests
+            .retain(|request| !request.request_id().correlates_with(&owned_request_id));
         Ok(())
     }
 
@@ -2335,9 +2335,9 @@ where
                     .and_then(|key| state.pending_reverse_requests.remove(key))
                 {
                     active.cancellation.cancel();
-                    state.reverse_requests.retain(|request| {
-                        !Arc::ptr_eq(&request.owner, &active.owner)
-                    });
+                    state
+                        .reverse_requests
+                        .retain(|request| !Arc::ptr_eq(&request.owner, &active.owner));
                 }
             }
             CancellationWireMessage::Modern2026 { params, .. } => {
@@ -3283,7 +3283,10 @@ mod tests {
             .error
             .as_ref()
             .expect("rejection carries an error");
-        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::MethodNotFound))
+        );
         assert_eq!(error.message, "Method not found");
     }
 
@@ -3306,14 +3309,13 @@ mod tests {
         let reverse_requests = executor.take_reverse_requests();
         assert_eq!(reverse_requests.len(), 1);
         assert_eq!(reverse_requests[0].request_id(), &RequestId::Number(700));
-        assert_eq!(reverse_requests[0].request().method, "sampling/createMessage");
+        assert_eq!(
+            reverse_requests[0].request().method,
+            "sampling/createMessage"
+        );
         assert_eq!(executor.pending_records(), pending_before);
         executor
-            .respond_to_reverse_request(
-                &cx,
-                &reverse_requests[0],
-                serde_json::json!({"ok": true}),
-            )
+            .respond_to_reverse_request(&cx, &reverse_requests[0], serde_json::json!({"ok": true}))
             .expect("legacy handler result is sent for its exact request ID");
 
         let state = executor.state.borrow();
@@ -3377,11 +3379,7 @@ mod tests {
         assert_eq!(reverse.len(), 1);
         assert_eq!(reverse[0].request_id(), &RequestId::Number(700));
         executor
-            .respond_to_reverse_request(
-                &cx,
-                &reverse[0],
-                serde_json::json!({"ok": true}),
-            )
+            .respond_to_reverse_request(&cx, &reverse[0], serde_json::json!({"ok": true}))
             .expect("reverse request receives a JSON-RPC result");
 
         let idle_before_progress = executor.pending_records()[0].idle_deadline;

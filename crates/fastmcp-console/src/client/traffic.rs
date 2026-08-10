@@ -54,18 +54,13 @@ fn peer_metadata_preview(text: &str, max_chars: usize) -> String {
 }
 
 fn json_rpc_error_class(code: &JsonInteger) -> &'static str {
-    match code.as_str() {
-        "-32700" => "parse-error",
-        "-32600" => "invalid-request",
-        "-32601" => "method-not-found",
-        "-32602" => "invalid-params",
-        "-32603" => "internal-error",
-        _ if code
-            .as_i32()
-            .is_some_and(|code| (-32099..=-32000).contains(&code)) =>
-        {
-            "server-error"
-        }
+    match code.as_i32() {
+        Some(-32700) => "parse-error",
+        Some(-32600) => "invalid-request",
+        Some(-32601) => "method-not-found",
+        Some(-32602) => "invalid-params",
+        Some(-32603) => "internal-error",
+        Some(-32099..=-32000) => "server-error",
         _ => "application-error",
     }
 }
@@ -1703,6 +1698,23 @@ mod tests {
         assert_eq!(json_rpc_error_class(&(-32603).into()), "internal-error");
         assert_eq!(json_rpc_error_class(&(-32042).into()), "server-error");
         assert_eq!(json_rpc_error_class(&(7).into()), "application-error");
+    }
+
+    #[test]
+    fn json_rpc_error_classes_use_mathematical_integer_values() {
+        for (wire_code, expected_class) in [
+            ("-32700.0", "parse-error"),
+            ("-326e2", "invalid-request"),
+            ("-32601e0", "method-not-found"),
+            ("-326020e-1", "invalid-params"),
+            ("-326030e-1", "internal-error"),
+            ("-320420e-1", "server-error"),
+        ] {
+            let code = wire_code
+                .parse::<JsonInteger>()
+                .expect("mathematically integral error code");
+            assert_eq!(json_rpc_error_class(&code), expected_class, "{wire_code}");
+        }
     }
 
     #[test]

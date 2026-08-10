@@ -57,6 +57,15 @@ const DEFAULT_CONNECTION_RETRY_ELAPSED: Duration = Duration::from_secs(120);
 /// Bounded timer slice used to observe a caller-owned context while waiting.
 const CONNECTION_RETRY_CANCEL_SLICE: Duration = Duration::from_millis(25);
 
+fn legacy_capabilities_for_handlers(
+    capabilities: &ClientCapabilities,
+    handlers: &ReverseRequestHandlers,
+) -> ClientCapabilities {
+    let mut legacy_capabilities = capabilities.clone();
+    handlers.derive_legacy_capabilities(&mut legacy_capabilities);
+    legacy_capabilities
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ConnectionRetryPolicy {
     max_attempts: u32,
@@ -347,22 +356,18 @@ impl ClientBuilder {
     #[must_use]
     pub fn capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
-        self.reverse_request_handlers
-            .derive_legacy_capabilities(&mut self.capabilities);
         self
     }
 
     /// Configures exact MCP 2024-11-05 server-to-client request handlers.
     ///
     /// The builder derives the matching legacy `sampling` and `roots`
-    /// capabilities before the initialize handshake. A client that configures
-    /// either callback is pinned to exact legacy negotiation: MCP 2026-07-28
-    /// deliberately rejects these legacy reverse request methods.
+    /// capabilities only if negotiation selects the exact legacy initialize
+    /// handshake. Auto discovery remains a modern request without these
+    /// legacy-only capability claims; a legacy fallback advertises them.
     #[must_use]
     pub fn reverse_request_handlers(mut self, handlers: ReverseRequestHandlers) -> Self {
         self.reverse_request_handlers = handlers;
-        self.reverse_request_handlers
-            .derive_legacy_capabilities(&mut self.capabilities);
         self
     }
 
@@ -480,6 +485,8 @@ impl ClientBuilder {
         self.validate_reverse_callback_configuration(&self.protocol_plan)
             .map_err(|_| Self::http_policy_admission_error())?;
         let reverse_request_handlers = self.reverse_request_handlers.clone();
+        let legacy_capabilities =
+            legacy_capabilities_for_handlers(&self.capabilities, &reverse_request_handlers);
         let mut connection = ClientHttpConnection::connect_with_mcp_apps(
             cx,
             self.protocol_plan,
@@ -493,6 +500,7 @@ impl ClientBuilder {
             == fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
             && !reverse_request_handlers.is_empty()
         {
+            connection.set_legacy_client_capabilities(legacy_capabilities);
             connection
                 .set_legacy_reverse_request_handlers(reverse_request_handlers)
                 .map_err(|_| Self::http_policy_admission_error())?;
@@ -522,12 +530,14 @@ impl ClientBuilder {
             .map_err(HttpClientError::CoreResult)?;
         self.validate_reverse_callback_configuration(&self.protocol_plan)
             .map_err(HttpClientError::CoreResult)?;
+        let reverse_request_handlers = self.reverse_request_handlers.clone();
         HttpClient::connect_with_mcp_apps(
             cx,
             self.protocol_plan,
             self.client_info,
             self.capabilities,
             self.mcp_apps_settings,
+            reverse_request_handlers,
         )
         .await
     }
