@@ -138,7 +138,7 @@ pub use bidirectional::{
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -3930,6 +3930,40 @@ fn accepted_subscription_filter(
             .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?;
     }
     Ok(accepted)
+}
+
+/// Compares the filters that this server can actually admit, rather than their
+/// raw wire shapes. In particular, disabled categories and unactivated
+/// extension members cannot make an upstream acknowledgement appear narrower;
+/// every admitted category plus the resource URI and Tasks ID sets must still
+/// match.
+fn subscription_filter_admission_matches(
+    expected: &SubscriptionFilter,
+    acknowledged: &SubscriptionFilter,
+) -> McpResult<bool> {
+    let expected = accepted_subscription_filter(expected, true)?;
+    let acknowledged = accepted_subscription_filter(acknowledged, true)?;
+    let expected_resource_subscriptions = expected
+        .resource_subscriptions
+        .as_deref()
+        .map(|uris| uris.iter().map(String::as_str).collect::<BTreeSet<_>>());
+    let acknowledged_resource_subscriptions = acknowledged
+        .resource_subscriptions
+        .as_deref()
+        .map(|uris| uris.iter().map(String::as_str).collect::<BTreeSet<_>>());
+    let expected_task_ids = task_subscription_ids(&expected)
+        .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+        .map(|task_ids| task_ids.into_iter().collect::<BTreeSet<_>>());
+    let acknowledged_task_ids = task_subscription_ids(&acknowledged)
+        .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+        .map(|task_ids| task_ids.into_iter().collect::<BTreeSet<_>>());
+    Ok(
+        expected.prompts_list_changed == acknowledged.prompts_list_changed
+            && expected_resource_subscriptions == acknowledged_resource_subscriptions
+            && expected.resources_list_changed == acknowledged.resources_list_changed
+            && expected.tools_list_changed == acknowledged.tools_list_changed
+            && expected_task_ids == acknowledged_task_ids,
+    )
 }
 
 fn subscription_metadata(
@@ -7795,12 +7829,12 @@ impl Server {
         if tasks_requested && let Some(relay) = self.final_task_relay.as_ref() {
             let mut listener = relay.open_listener(params.notifications.clone())?;
             match listener.next(request_ctx.cx())? {
-                ProxyFinalTaskListenerEvent::Acknowledged(accepted)
-                    if accepted == params.notifications => {}
-                ProxyFinalTaskListenerEvent::Acknowledged(_) => {
-                    return Err(McpError::invalid_params(
-                        "Proxy upstream narrowed the final Tasks subscription filter",
-                    ));
+                ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
+                    if !subscription_filter_admission_matches(&params.notifications, &accepted)? {
+                        return Err(McpError::invalid_params(
+                            "Proxy upstream narrowed the final Tasks subscription filter",
+                        ));
+                    }
                 }
                 ProxyFinalTaskListenerEvent::Notification(_)
                 | ProxyFinalTaskListenerEvent::Terminal => {
@@ -10363,6 +10397,7 @@ impl Server {
                                             let notification_cx = request_cx.clone();
                                             let notification_cancellation =
                                                 request_cancellation.clone();
+                                            #[cfg(test)]
                                             let notification_request_id =
                                                 request_id_to_u64(request.id.as_ref());
                                             let notification_sender: NotificationSender = Arc::new(
@@ -30376,6 +30411,81 @@ mod lib_unit_tests {
                 .entries
                 .is_empty(),
             "request completion or cancellation must release the subscription entry"
+        );
+    }
+
+    #[test]
+    fn subscription_filter_admission_matches_reordered_active_sets() {
+        let task_a =
+            fastmcp_protocol::FinalTaskId::parse("task-a").expect("bounded final task identifier");
+        let task_b =
+            fastmcp_protocol::FinalTaskId::parse("task-b").expect("bounded final task identifier");
+        let mut expected = SubscriptionFilter {
+            prompts_list_changed: Some(false),
+            resource_subscriptions: Some(vec![
+                "file:///subscriptions/a".to_owned(),
+                "file:///subscriptions/b".to_owned(),
+            ]),
+            resources_list_changed: Some(false),
+            tools_list_changed: Some(true),
+            additional: BTreeMap::from([(
+                "io.example/future-filter".to_owned(),
+                serde_json::json!({"enabled": true}),
+            )]),
+        };
+        set_task_subscription_ids(
+            &mut expected,
+            vec![task_a.clone(), task_b.clone(), task_a.clone()],
+        )
+        .expect("compose the requested Tasks selection");
+
+        let mut acknowledged = SubscriptionFilter {
+            resource_subscriptions: Some(vec![
+                "file:///subscriptions/b".to_owned(),
+                "file:///subscriptions/a".to_owned(),
+            ]),
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        set_task_subscription_ids(&mut acknowledged, vec![task_b, task_a])
+            .expect("compose the reordered Tasks acknowledgement");
+
+        assert!(
+            subscription_filter_admission_matches(&expected, &acknowledged)
+                .expect("equivalent active selections must be valid"),
+            "resource and Tasks order, inactive booleans, and unknown filters must not narrow admission"
+        );
+    }
+
+    #[test]
+    fn subscription_filter_admission_rejects_one_missing_task_id() {
+        let task_a =
+            fastmcp_protocol::FinalTaskId::parse("task-a").expect("bounded final task identifier");
+        let task_b =
+            fastmcp_protocol::FinalTaskId::parse("task-b").expect("bounded final task identifier");
+        let mut expected = SubscriptionFilter {
+            resource_subscriptions: Some(vec![
+                "file:///subscriptions/a".to_owned(),
+                "file:///subscriptions/b".to_owned(),
+            ]),
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        set_task_subscription_ids(&mut expected, vec![task_a.clone(), task_b])
+            .expect("compose the requested Tasks selection");
+
+        let mut acknowledged = expected.clone();
+        acknowledged
+            .additional
+            .remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY)
+            .expect("the acknowledgement starts from the requested Tasks selection");
+        set_task_subscription_ids(&mut acknowledged, vec![task_a])
+            .expect("remove exactly one task from the acknowledgement");
+
+        assert!(
+            !subscription_filter_admission_matches(&expected, &acknowledged)
+                .expect("well-formed narrowed Tasks selection must compare"),
+            "changing only one requested task ID must remain a rejected narrowing"
         );
     }
 
