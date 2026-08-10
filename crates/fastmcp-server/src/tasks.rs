@@ -9720,6 +9720,311 @@ mod tests {
     }
 
     #[test]
+    fn task_03_final_stale_handoff_generation_rejects_completion_without_second_mutation() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let before = store
+            .get_task_snapshot(&task_id)
+            .expect("read task before the competing generation transition")
+            .expect("fixture task is retained");
+        let initial = runtime
+            .recover_initial_work()
+            .expect("recover initial handoff")
+            .expect("fixture task retains initial work");
+        let observed_error = Arc::new(Mutex::new(None));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(StaleGenerationCompletingFinalTaskSupervisor {
+                    runtime: runtime.clone(),
+                    observed_error: Arc::clone(&observed_error),
+                }),
+            )
+            .expect("install the stale-generation handoff runner");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build application-owned structured runtime");
+
+        application_runtime
+            .block_on(runner.resume_handoff(
+                &Cx::for_testing(),
+                FinalTaskSupervisorHandoff::Initial(initial),
+            ))
+            .expect("the supervisor records its stale-generation rejection");
+
+        let error = observed_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the stale generation rejects the terminal handoff");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        let after = store
+            .get_task_snapshot(&task_id)
+            .expect("read task after stale-generation completion")
+            .expect("the competing task state remains retained");
+        assert_eq!(
+            after.generation(),
+            before
+                .generation()
+                .checked_add(1)
+                .expect("fixture generation remains representable"),
+            "the rejected stale handoff cannot add a second durable transition"
+        );
+        assert!(matches!(
+            after.task(),
+            FinalTask::InputRequired { base, input_requests }
+                if base.status_message.as_deref()
+                    == Some("newer generation won before completion")
+                    && input_requests.contains_key("roots")
+        ));
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .latest_notification(&task_id)
+                    .expect("the competing notification remains retained")
+                    .params
+                    .task,
+            )
+            .expect("encode notification after stale-generation rejection"),
+            serde_json::to_value(after.task())
+                .expect("encode competing task after stale-generation rejection"),
+            "the stale handoff cannot replace the newer task notification"
+        );
+    }
+
+    #[test]
+    fn task_03_final_repeated_terminal_handoff_is_rejected_without_second_mutation() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let before = store
+            .get_task_snapshot(&task_id)
+            .expect("read task before repeated terminal handoff")
+            .expect("fixture task is retained");
+        let initial = runtime
+            .recover_initial_work()
+            .expect("recover initial handoff")
+            .expect("fixture task retains initial work");
+        let observed_error = Arc::new(Mutex::new(None));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(RepeatedTerminalHandoffSupervisor {
+                    observed_error: Arc::clone(&observed_error),
+                }),
+            )
+            .expect("install repeated-terminal handoff runner");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build application-owned structured runtime");
+
+        application_runtime
+            .block_on(runner.resume_handoff(
+                &Cx::for_testing(),
+                FinalTaskSupervisorHandoff::Initial(initial),
+            ))
+            .expect("the repeated terminal attempt is contained by the supervisor");
+
+        let error = observed_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("the second terminal handoff is rejected");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        let after = store
+            .get_task_snapshot(&task_id)
+            .expect("read task after repeated terminal handoff")
+            .expect("the first terminal result remains retained");
+        assert_eq!(
+            after.generation(),
+            before
+                .generation()
+                .checked_add(1)
+                .expect("fixture generation remains representable"),
+            "the repeated terminal handoff cannot add a second durable transition"
+        );
+        assert!(matches!(
+            after.task(),
+            FinalTask::Completed { base, .. }
+                if base.status_message.as_deref() == Some("first terminal handoff")
+        ));
+        assert_eq!(
+            serde_json::to_value(
+                store
+                    .latest_notification(&task_id)
+                    .expect("the first terminal notification remains retained")
+                    .params
+                    .task,
+            )
+            .expect("encode notification after repeated terminal rejection"),
+            serde_json::to_value(after.task())
+                .expect("encode first terminal task after repeated rejection"),
+            "the repeated handoff cannot replace the first terminal notification"
+        );
+    }
+
+    #[test]
+    fn task_03_final_cancellation_winner_can_be_honored_by_the_elected_handoff() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let initial = runtime
+            .recover_initial_work()
+            .expect("recover initial handoff")
+            .expect("fixture task retains initial work");
+        let observed_cancellation = Arc::new(AtomicBool::new(false));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(CancelThenHonoringCancellationFinalTaskSupervisor {
+                    runtime: runtime.clone(),
+                    observed_cancellation: Arc::clone(&observed_cancellation),
+                }),
+            )
+            .expect("install cancellation-honouring handoff runner");
+        let application_runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build application-owned structured runtime");
+
+        application_runtime
+            .block_on(runner.resume_handoff(
+                &Cx::for_testing(),
+                FinalTaskSupervisorHandoff::Initial(initial),
+            ))
+            .expect("the elected handoff records the cancellation outcome");
+
+        assert!(
+            observed_cancellation.load(AtomicOrdering::SeqCst),
+            "the elected handoff observes the cancellation winner before its terminal transition"
+        );
+        let after = store
+            .get_task_snapshot(&task_id)
+            .expect("read task after honoured cancellation")
+            .expect("cancelled task remains retained");
+        assert!(matches!(
+            after.task(),
+            FinalTask::Cancelled(base)
+                if base.status_message.as_deref()
+                    == Some("cancellation won the elected handoff")
+        ));
+        assert!(
+            !runtime
+                .is_cancellation_requested(&task_id)
+                .expect("terminal cancellation outcome clears the pending intent"),
+            "the final cancellation result consumes the cooperative intent"
+        );
+    }
+
+    #[test]
+    fn task_03_final_external_store_default_fenced_transition_fails_unchanged() {
+        let inner = Arc::new(InMemoryFinalTaskStore::default());
+        let external_store = ReadinessLeaseProbeFinalTaskStore::new(Arc::clone(&inner));
+        let task = final_working_task_without_ttl("task-external-default-fence");
+        let task_id = task.base().task_id.clone();
+        inner
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                final_test_work_descriptor(),
+            )
+            .expect("external-store fixture retains the initial task and work");
+        let expected = inner
+            .get_task_snapshot(&task_id)
+            .expect("read external-store fixture snapshot")
+            .expect("external-store fixture task is retained");
+        test_take_initial_work(&inner, &expected)
+            .expect("claim external-store fixture initial handoff")
+            .expect("external-store fixture retains initial work");
+        let dispatch_fence = FinalTaskStore::begin_handoff_dispatch_for_owner_if_current(
+            &*inner,
+            &task_id,
+            expected.generation(),
+            FINAL_TASK_TEST_DIRECT_OWNER,
+        )
+        .expect("elect external-store fixture handoff")
+        .expect("external-store fixture handoff election succeeds");
+        let task_before = serde_json::to_value(expected.task())
+            .expect("encode external-store task before default rejection");
+        let notification_before = serde_json::to_value(
+            inner
+                .latest_notification(&task_id)
+                .expect("external-store fixture notification is retained"),
+        )
+        .expect("encode external-store notification before default rejection");
+        let result: FinalTaskCallToolResult =
+            serde_json::from_value(serde_json::json!({"content": []}))
+                .expect("typed terminal task result");
+        let replacement = FinalTask::Completed {
+            base: transition_terminal_final_task_base(
+                expected.task().base().clone(),
+                FinalTaskStatus::Completed,
+                Some("default fenced transition must fail".to_owned()),
+            )
+            .expect("construct terminal replacement for the external-store probe"),
+            result,
+        };
+        let error = FinalTaskStore::replace_task_and_clear_input_for_handoff_if_current(
+            &external_store,
+            &expected,
+            FINAL_TASK_TEST_DIRECT_OWNER,
+            dispatch_fence,
+            false,
+            replacement.clone(),
+            final_task_notification(&replacement),
+        )
+        .expect_err("an external store must opt into fenced handoff transitions");
+
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+        let after = inner
+            .get_task_snapshot(&task_id)
+            .expect("read external-store fixture after default rejection")
+            .expect("default rejection leaves the task retained");
+        assert_eq!(after.generation(), expected.generation());
+        assert_eq!(
+            serde_json::to_value(after.task())
+                .expect("encode external-store task after default rejection"),
+            task_before,
+            "the default fenced-transition rejection leaves the task unchanged"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                inner
+                    .latest_notification(&task_id)
+                    .expect("default rejection leaves the notification retained"),
+            )
+            .expect("encode external-store notification after default rejection"),
+            notification_before,
+            "the default fenced-transition rejection leaves the notification unchanged"
+        );
+        let state = inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.handoff_leases.get(&task_id).is_some_and(|lease| {
+                lease.generation == expected.generation()
+                    && lease.owner_id == FINAL_TASK_TEST_DIRECT_OWNER
+                    && lease.dispatch_elected
+                    && lease.dispatch_fence == Some(dispatch_fence)
+            }),
+            "the default fenced-transition rejection leaves the elected handoff lease unchanged"
+        );
+    }
+
+    #[test]
     fn task_03_final_rejected_input_preserves_supervisor_handoff_state() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
