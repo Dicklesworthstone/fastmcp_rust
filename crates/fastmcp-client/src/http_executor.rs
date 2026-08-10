@@ -10659,125 +10659,59 @@ mod tests {
     }
 
     #[test]
-    fn modern_http_client_replays_discovery_session_id_for_json_and_sse_posts() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind session replay listener");
-        let address = listener.local_addr().expect("read session replay address");
+    fn modern_http_client_is_stateless_for_json_and_sse_posts() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stateless HTTP listener");
+        let address = listener.local_addr().expect("read stateless HTTP address");
         let modern_target = format!("http://{address}/mcp");
         let server = thread::spawn(move || {
-            let (mut probe, _) = listener.accept().expect("accept session discovery probe");
-            let probe_request = read_request(&mut probe);
-            assert!(
-                !probe_request.head.contains("MCP-Session-Id:"),
-                "discovery must not send an unissued session ID"
-            );
+            let (mut discovery, _) = listener.accept().expect("accept stateless discovery");
+            let discovery = read_request(&mut discovery);
+            assert!(!discovery.head.contains("MCP-Session-Id:"));
             assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
-                    .expect("session discovery probe is JSON-RPC")["method"],
+                serde_json::from_slice::<serde_json::Value>(&discovery.body)
+                    .expect("stateless discovery is JSON-RPC")["method"],
                 SERVER_DISCOVER
             );
-            write_response_with_session_id(
-                &mut probe,
+            write_response(
+                &mut discovery,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"old-discovery","version":"1"}},"ttlMs":0,"cacheScope":"private"}}"#,
-                Some("session-replay-42"),
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"serverInfo":{"name":"stateless","version":"1"},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
-            let (mut json, _) = listener.accept().expect("accept session JSON request");
-            let json_request = read_request(&mut json);
-            assert!(
-                json_request
-                    .head
-                    .contains("MCP-Session-Id: session-replay-42"),
-                "ordinary modern JSON POST must replay the discovered session ID"
-            );
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&json_request.body)
-                    .expect("session JSON request is JSON-RPC")["method"],
-                "tools/list"
-            );
-            assert!(
-                serde_json::from_slice::<serde_json::Value>(&json_request.body)
-                    .expect("initial session JSON request is JSON-RPC")["params"]["_meta"]
-                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"]
-                    .get(OFFICIAL_MCP_APPS_EXTENSION_ID)
-                    .is_some(),
-                "the initial Apps-active discovery generation advertises Apps"
-            );
-            write_response_with_session_id(&mut json, 404, "text/plain", b"", None);
-
-            let (mut refresh, _) = listener.accept().expect("accept fresh session discovery");
-            let refresh_request = read_request(&mut refresh);
-            assert!(
-                !refresh_request.head.contains("MCP-Session-Id:"),
-                "recovery discovery must not replay the expired session ID"
-            );
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&refresh_request.body)
-                    .expect("recovery discovery is JSON-RPC")["method"],
-                SERVER_DISCOVER
-            );
-            write_response_with_session_id(
-                &mut refresh,
-                200,
-                "application/json",
-                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"recovered-discovery","version":"2"}},"ttlMs":0,"cacheScope":"private"}}"#,
-                Some("session-replay-43"),
-            );
-
-            let (mut json, _) = listener.accept().expect("accept recovered JSON replay");
-            let json_request = read_request(&mut json);
-            assert!(
-                json_request
-                    .head
-                    .contains("MCP-Session-Id: session-replay-43")
-            );
-            assert!(
-                serde_json::from_slice::<serde_json::Value>(&json_request.body)
-                    .expect("recovered JSON replay is JSON-RPC")["params"]["_meta"]
-                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"]
-                    .get(OFFICIAL_MCP_APPS_EXTENSION_ID)
-                    .is_none(),
-                "the Apps-inactive recovered discovery removes Apps before replay"
-            );
-            write_response_with_session_id(
-                &mut json,
+            let (mut json_stream, _) = listener.accept().expect("accept stateless JSON POST");
+            let json = read_request(&mut json_stream);
+            assert!(!json.head.contains("MCP-Session-Id:"));
+            let json = serde_json::from_slice::<serde_json::Value>(&json.body)
+                .expect("stateless JSON request is JSON-RPC");
+            assert_eq!(json["id"], 2);
+            assert_eq!(json["method"], "tools/list");
+            assert!(json["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                ["extensions"]
+                .get(OFFICIAL_MCP_APPS_EXTENSION_ID)
+                .is_some());
+            write_response(
+                &mut json_stream,
                 200,
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
-                None,
             );
 
-            let (mut sse, _) = listener.accept().expect("accept session SSE request");
-            let sse_request = read_request(&mut sse);
-            assert!(
-                sse_request
-                    .head
-                    .contains("MCP-Session-Id: session-replay-43"),
-                "modern SSE-opening POST must replay the discovered session ID"
-            );
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&sse_request.body)
-                    .expect("session SSE request is JSON-RPC")["method"],
-                TOOLS_CALL
-            );
-            assert!(
-                serde_json::from_slice::<serde_json::Value>(&sse_request.body)
-                    .expect("recovered SSE request is JSON-RPC")["params"]["_meta"]
-                    ["io.modelcontextprotocol/clientCapabilities"]["extensions"]
-                    .get(OFFICIAL_MCP_APPS_EXTENSION_ID)
-                    .is_none(),
-                "later fresh-generation requests keep Apps disabled"
-            );
-            write_response_with_session_id(
-                &mut sse,
+            let (mut sse_stream, _) = listener.accept().expect("accept stateless SSE POST");
+            let sse = read_request(&mut sse_stream);
+            assert!(!sse.head.contains("MCP-Session-Id:"));
+            let sse = serde_json::from_slice::<serde_json::Value>(&sse.body)
+                .expect("stateless SSE request is JSON-RPC");
+            assert_eq!(sse["id"], 3);
+            assert_eq!(sse["method"], TOOLS_CALL);
+            write_response(
+                &mut sse_stream,
                 200,
                 "text/event-stream",
                 br#"event: message
 data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}],"isError":false}}
 
 "#,
-                None,
             );
         });
 
@@ -10793,51 +10727,88 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 ProtocolPolicy::ModernOnly,
             ),
             ClientInfo {
-                name: "session-replay-client".to_owned(),
+                name: "stateless-client".to_owned(),
                 version: "1.0.0".to_owned(),
             },
             ClientCapabilities::default(),
             Some(apps),
         ))
-        .expect("session-bearing discovery selects modern HTTP")
+        .expect("stateless discovery selects modern HTTP")
         .into_modern()
         .expect("ModernOnly cannot select legacy HTTP");
-        let json_response = runtime_block_on(client.request(
+        let json = runtime_block_on(client.request(
             &cx,
             "tools/list",
             serde_json::json!({}),
             Some(RequestId::Number(2)),
         ))
-        .expect("session-bearing JSON POST succeeds");
-        let _ = runtime_block_on(json_response.read_to_end(&cx, 4_096))
-            .expect("drain session-bearing JSON response");
-        assert_eq!(
-            client
-                .server_discovery()
-                .server_info()
-                .expect("recovery discovery retains server identity")
-                .name,
-            "recovered-discovery",
-            "a successful recovery replaces the admitted discovery authority"
-        );
+        .expect("stateless JSON POST succeeds");
+        runtime_block_on(json.read_to_end(&cx, 4_096)).expect("drain stateless JSON response");
 
-        let mut sse_listener = runtime_block_on(client.open_final_tool_call_listener(
+        let mut listener = runtime_block_on(client.open_final_tool_call_listener(
             &cx,
             RequestId::Number(3),
             "echo",
             serde_json::json!({}),
-            SseLimits::new(1_024, 4_096, 4).expect("bounded session SSE limits"),
+            SseLimits::new(1_024, 4_096, 4).expect("bounded stateless SSE limits"),
         ))
-        .expect("session-bearing SSE POST opens");
+        .expect("stateless SSE POST opens");
         assert!(matches!(
-            runtime_block_on(sse_listener.next_event(&cx)),
+            runtime_block_on(listener.next_event(&cx)),
             Ok(Some(ModernHttpFinalCoreEvent::Terminal(
                 FinalCoreResult::ToolsCall { .. }
             )))
         ));
-        server.join().expect("session replay peer joins");
+        server.join().expect("stateless HTTP server joins");
     }
 
+    #[test]
+    fn modern_http_client_rejects_mcp_session_id_response_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind session-header listener");
+        let address = listener.local_addr().expect("read session-header address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept session-header discovery");
+            let discovery_request = read_request(&mut discovery);
+            assert!(!discovery_request.head.contains("MCP-Session-Id:"));
+            let body = modern_discovery_body();
+            write!(
+                discovery,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMCP-Session-Id: forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .expect("write session-header response head");
+            discovery
+                .write_all(body)
+                .expect("write session-header response body");
+            discovery.flush().expect("flush session-header response");
+        });
+
+        let cx = Cx::for_request();
+        let result = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "session-header-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ));
+        assert!(matches!(
+            result,
+            Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::ForbiddenResponseSessionHeader
+            ))
+        ));
+        server.join().expect("session-header server joins");
+    }
+
+    /*
     fn assert_final_tasks_session_recovery_revalidation(refreshed_tasks_are_admitted: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind Tasks recovery listener");
         let address = listener
@@ -11479,6 +11450,8 @@ data: {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"typ
         server.join().expect("missing-session peer joins");
     }
 
+    */
+
     #[test]
     fn ordinary_modern_http_mrtr_retries_tool_resource_and_prompt_state_only_without_tasks() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ordinary MRTR listener");
@@ -11506,10 +11479,8 @@ data: {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"typ
                 let request = read_request(&mut stream);
                 assert!(request.head.contains(&format!("Mcp-Method: {method}\r\n")));
                 assert!(
-                    request
-                        .head
-                        .contains("MCP-Session-Id: test-modern-session\r\n"),
-                    "every ordinary MRTR round must replay discovery's session ID"
+                    !request.head.contains("MCP-Session-Id:"),
+                    "every ordinary MRTR round must remain stateless"
                 );
                 let body = serde_json::from_slice::<serde_json::Value>(&request.body)
                     .expect("ordinary MRTR request is JSON-RPC");
