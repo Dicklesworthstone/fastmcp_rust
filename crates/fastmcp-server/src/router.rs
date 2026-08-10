@@ -7220,7 +7220,7 @@ mod router_tests {
     }
 
     #[test]
-    fn final_router_progress_uses_exact_numbers_and_rejects_one_smaller_total() {
+    fn final_router_progress_admits_one_smaller_total_without_replacing_an_outer_runtime() {
         let mut router = Router::new();
         router
             .add_tool(RouterProgressTool)
@@ -7297,9 +7297,84 @@ mod router_tests {
             sent.lock()
                 .expect("notification collection is not poisoned")
                 .len(),
-            1,
-            "the one-variable progress violation emits no second final notification"
+            2,
+            "a smaller total is not a final-progress violation"
         );
+        let wire = serde_json::to_string(
+            sent.lock()
+                .expect("notification collection is not poisoned")[1]
+                .params
+                .as_ref()
+                .expect("second final progress has parameters"),
+        )
+        .expect("second final progress parameters serialize");
+        assert!(wire.contains("\"progress\":12000"));
+        assert!(wire.contains("\"total\":11999"));
+    }
+
+    #[test]
+    fn final_router_preserves_an_outer_final_progress_runtime() {
+        let mut router = Router::new();
+        router
+            .add_tool(RouterProgressTool)
+            .expect("router progress tool registers for both eras");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sent_clone = Arc::clone(&sent);
+        let outer_runtime = Arc::new(crate::handler::FinalProgressRuntime::new(
+            ProgressMarker::from("outer-owned-marker"),
+            move |notification| {
+                sent_clone
+                    .lock()
+                    .expect("notification collection is not poisoned")
+                    .push(notification);
+            },
+        ));
+        let request_ctx = McpContext::with_progress(
+            cx,
+            178,
+            Arc::clone(&outer_runtime).into_reporter(),
+        );
+        let params: FinalCallToolParams = serde_json::from_value(serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "handler-supplied-marker",
+            },
+            "name": "router-progress-tool",
+            "arguments": {"total": 11999.0},
+        }))
+        .expect("final tool parameters are valid");
+        let notification_sender: NotificationSender = Arc::new(|_| {
+            panic!("router must not replace an installed final-progress runtime")
+        });
+
+        let outcome = block_on(router.handle_tools_call_final_in_request(
+            &request_ctx,
+            request_ctx.cx(),
+            params,
+            state,
+            Some(&notification_sender),
+            None,
+            None,
+        ))
+        .expect("outer final progress runtime remains usable");
+        assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
+        assert!(outer_runtime.flush_pending());
+
+        let sent = sent.lock().expect("notification collection is not poisoned");
+        assert_eq!(sent.len(), 1);
+        let wire = serde_json::to_string(
+            sent[0]
+                .params
+                .as_ref()
+                .expect("outer runtime notification has parameters"),
+        )
+        .expect("outer runtime parameters serialize");
+        assert!(wire.contains("\"progressToken\":\"outer-owned-marker\""));
+        assert!(wire.contains("\"progress\":12000"));
+        assert!(wire.contains("\"total\":11999"));
     }
 
     struct TaskCapableRouterTool {
