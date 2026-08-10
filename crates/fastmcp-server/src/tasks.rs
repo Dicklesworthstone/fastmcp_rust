@@ -4529,9 +4529,25 @@ impl AuthorizedTaskServiceRunner {
         let mut supervisor = self.supervisor.resume(cx, handoff);
         let heartbeat_interval = guard.heartbeat_interval()?;
         loop {
+            // The application callback is allowed to be pending for longer
+            // than one lease interval. The service context is nevertheless
+            // authoritative: observe its cancellation before polling more
+            // application work and before renewing durable ownership.
+            cx.checkpoint()
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
             let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
             let completed = std::future::poll_fn(|task_context| {
+                if let Err(error) = cx.checkpoint() {
+                    return std::task::Poll::Ready(Some(Err(McpError::internal_error(
+                        error.to_string(),
+                    ))));
+                }
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
+                    if let Err(error) = cx.checkpoint() {
+                        return std::task::Poll::Ready(Some(Err(McpError::internal_error(
+                            error.to_string(),
+                        ))));
+                    }
                     return std::task::Poll::Ready(Some(result));
                 }
                 if heartbeat.as_mut().poll(task_context).is_ready() {
@@ -4541,6 +4557,8 @@ impl AuthorizedTaskServiceRunner {
             })
             .await;
             let Some(result) = completed else {
+                cx.checkpoint()
+                    .map_err(|error| McpError::internal_error(error.to_string()))?;
                 if !guard.renew()? {
                     return Err(McpError::internal_error(
                         "Final task dispatch lease was lost while application work was running",
@@ -5156,6 +5174,32 @@ mod tests {
             handoff: FinalTaskSupervisorHandoff,
         ) -> FinalTaskSupervisorFuture<'a> {
             Box::pin(async move {
+                let _handoff = handoff;
+                std::future::pending::<McpResult<()>>().await
+            })
+        }
+    }
+
+    /// A pending supervisor which reports its first live poll. This makes the
+    /// cancellation-wake tests wait for the application future, rather than
+    /// merely for task admission.
+    struct SignallingPendingFinalTaskSupervisor {
+        started: Sender<()>,
+    }
+
+    impl ApplicationTaskSupervisor for SignallingPendingFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let started = self.started.clone();
+            Box::pin(async move {
+                started.try_send(()).map_err(|_| {
+                    McpError::internal_error(
+                        "live pending-supervisor test lost its start notification",
+                    )
+                })?;
                 let _handoff = handoff;
                 std::future::pending::<McpResult<()>>().await
             })
@@ -8341,6 +8385,218 @@ mod tests {
             .recover_accepted_input()
             .expect("cancelled handoff recovery scan is valid")
             .expect("cancellation drops the lease and restores the accepted input");
+        assert_eq!(restored.input_responses(), &input_responses);
+    }
+
+    #[test]
+    fn task_03_final_pending_supervisor_remains_owned_without_context_cancellation() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let task_id = create_accepted_final_input(&runtime, input_responses);
+        let accepted = runtime
+            .take_accepted_input(&task_id)
+            .expect("claim accepted input before pending supervisor start")
+            .expect("accepted input is present before the pending supervisor starts");
+        let runner = runtime
+            .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
+            .expect("install caller-owned pending service runner");
+        let cx = Cx::for_testing();
+        let pending = runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Resumed(accepted));
+        let mut pending = std::pin::pin!(pending);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            std::future::Future::poll(pending.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            runtime
+                .recover_accepted_input()
+                .expect("read pending supervisor recovery state")
+                .is_none(),
+            "without context cancellation the elected pending supervisor retains its durable lease"
+        );
+    }
+
+    #[test]
+    fn task_03_final_context_cancellation_after_pending_supervisor_start_restores_input() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let accepted = runtime
+            .take_accepted_input(&task_id)
+            .expect("claim accepted input before pending supervisor start")
+            .expect("accepted input is present before the pending supervisor starts");
+        let runner = runtime
+            .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
+            .expect("install caller-owned pending service runner");
+        let cx = Cx::for_testing();
+        let pending = runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Resumed(accepted));
+        let mut pending = std::pin::pin!(pending);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            std::future::Future::poll(pending.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        cx.cancel_with(CancelKind::User, None);
+        assert!(matches!(
+            std::future::Future::poll(pending.as_mut(), &mut context),
+            std::task::Poll::Ready(Err(_))
+        ));
+        let restored = runtime
+            .recover_accepted_input()
+            .expect("cancelled pending supervisor recovery scan is valid")
+            .expect("context cancellation restores the exact pending input handoff");
+        assert_eq!(restored.input_responses(), &input_responses);
+    }
+
+    #[test]
+    fn task_03_final_live_pending_supervisor_without_cancellation_retains_handoff() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let accepted = runtime
+            .take_accepted_input(&task_id)
+            .expect("claim accepted input before pending supervisor start")
+            .expect("accepted input is present before the pending supervisor starts");
+        let (started, mut started_receiver) = mpsc::channel(1);
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SignallingPendingFinalTaskSupervisor { started }),
+            )
+            .expect("install caller-owned pending service runner");
+        let runtime_for_task = runtime.clone();
+        let child_context = Arc::new(Mutex::new(None));
+        let child_context_for_task = Arc::clone(&child_context);
+
+        let ((), report) = asupersync::lab::run_async_under_lab(0x71_03, move |cx| async move {
+            let runner_context = Arc::clone(&child_context_for_task);
+            let mut supervisor = cx
+                .spawn(move |supervisor_cx| async move {
+                    *runner_context
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(supervisor_cx.clone());
+                    runner
+                        .resume_handoff(
+                            &supervisor_cx,
+                            FinalTaskSupervisorHandoff::Resumed(accepted),
+                        )
+                        .await
+                })
+                .expect("live runtime admits the pending supervisor");
+
+            started_receiver
+                .recv(&cx)
+                .await
+                .expect("pending supervisor reports its first live poll");
+            let supervisor_cx = child_context_for_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("the live supervisor publishes its context before polling")
+                .clone();
+            assert!(
+                !supervisor_cx.is_cancel_requested(),
+                "only the absence of Cx cancellation differs from the paired wake path"
+            );
+            assert!(
+                runtime_for_task
+                    .recover_accepted_input()
+                    .expect("read live pending-supervisor recovery state")
+                    .is_none(),
+                "without Cx cancellation the pending supervisor retains its durable lease"
+            );
+
+            // Clean up the deliberately pending supervisor after recording
+            // the unchanged state. The paired test performs this cancellation
+            // immediately instead.
+            supervisor_cx.cancel_with(CancelKind::User, None);
+            assert!(matches!(supervisor.join(&cx).await, Ok(Err(_))));
+        });
+
+        assert_eq!(
+            report.now_nanos, 0,
+            "the cleanup cancellation wakes the live task before its heartbeat timer"
+        );
+        let restored = runtime
+            .recover_accepted_input()
+            .expect("cancelled pending supervisor recovery scan is valid")
+            .expect("cleanup cancellation restores the exact pending input handoff");
+        assert_eq!(restored.input_responses(), &input_responses);
+    }
+
+    #[test]
+    fn task_03_final_live_context_cancellation_wakes_pending_supervisor() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}}))
+                .expect("typed retained roots response");
+        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let accepted = runtime
+            .take_accepted_input(&task_id)
+            .expect("claim accepted input before pending supervisor start")
+            .expect("accepted input is present before the pending supervisor starts");
+        let (started, mut started_receiver) = mpsc::channel(1);
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SignallingPendingFinalTaskSupervisor { started }),
+            )
+            .expect("install caller-owned pending service runner");
+        let child_context = Arc::new(Mutex::new(None));
+        let child_context_for_task = Arc::clone(&child_context);
+
+        let ((), report) = asupersync::lab::run_async_under_lab(0x71_04, move |cx| async move {
+            let runner_context = Arc::clone(&child_context_for_task);
+            let mut supervisor = cx
+                .spawn(move |supervisor_cx| async move {
+                    *runner_context
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(supervisor_cx.clone());
+                    runner
+                        .resume_handoff(
+                            &supervisor_cx,
+                            FinalTaskSupervisorHandoff::Resumed(accepted),
+                        )
+                        .await
+                })
+                .expect("live runtime admits the pending supervisor");
+
+            started_receiver
+                .recv(&cx)
+                .await
+                .expect("pending supervisor reports its first live poll");
+            child_context_for_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("the live supervisor publishes its context before polling")
+                .cancel_with(CancelKind::User, None);
+            assert!(matches!(supervisor.join(&cx).await, Ok(Err(_))));
+        });
+
+        assert_eq!(
+            report.now_nanos, 0,
+            "Cx cancellation wakes the live pending supervisor without waiting for a heartbeat"
+        );
+        let restored = runtime
+            .recover_accepted_input()
+            .expect("cancelled pending supervisor recovery scan is valid")
+            .expect("context cancellation restores the exact pending input handoff");
         assert_eq!(restored.input_responses(), &input_responses);
     }
 

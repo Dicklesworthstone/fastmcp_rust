@@ -1572,6 +1572,10 @@ impl ExpectedInputLedger {
     fn get(&self, key: &str) -> Option<MrtrInputKind> {
         self.kinds.get(key).copied()
     }
+
+    fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1709,7 +1713,7 @@ impl MrtrExchangeRegistry {
         request_state: &str,
         input_responses: MrtrInputResponses,
     ) -> McpResult<MrtrRetry> {
-        self.accept_at(request_state, None, input_responses, Instant::now())
+        self.accept_at(request_state, None, input_responses, false, Instant::now())
     }
 
     /// Decodes and consumes one router-admitted final `inputResponses` map.
@@ -1742,6 +1746,26 @@ impl MrtrExchangeRegistry {
         input_responses: &BTreeMap<String, serde_json::Value>,
     ) -> McpResult<MrtrRetry> {
         self.accept_wire_with_binding(request_state, Some(binding), input_responses)
+    }
+
+    /// Consumes a retry whose `inputResponses` member was absent.
+    ///
+    /// The distinct entry point preserves the final wire contract: only an
+    /// absent member can resume a state-only exchange. An explicitly present
+    /// empty map still flows through [`Self::accept_wire_bound`] and remains
+    /// invalid rather than silently becoming a state-only retry.
+    pub(crate) fn accept_state_only_bound(
+        &self,
+        request_state: &str,
+        binding: &MrtrExchangeBinding,
+    ) -> McpResult<MrtrRetry> {
+        self.accept_at(
+            request_state,
+            Some(binding),
+            MrtrInputResponses::default(),
+            true,
+            Instant::now(),
+        )
     }
 
     /// Returns the configured response-map admission ceiling so the router can
@@ -1805,7 +1829,13 @@ impl MrtrExchangeRegistry {
             return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
         }
 
-        self.accept_at(request_state, binding, typed_responses, Instant::now())
+        self.accept_at(
+            request_state,
+            binding,
+            typed_responses,
+            false,
+            Instant::now(),
+        )
     }
 
     /// Returns the number of non-expired, non-cancelled exchanges currently
@@ -1867,6 +1897,7 @@ impl MrtrExchangeRegistry {
         request_state: &str,
         binding: Option<&MrtrExchangeBinding>,
         input_responses: MrtrInputResponses,
+        state_only_retry: bool,
         now: Instant,
     ) -> McpResult<MrtrRetry> {
         if request_state.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES {
@@ -1890,6 +1921,9 @@ impl MrtrExchangeRegistry {
             } else {
                 Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR))
             };
+        }
+        if state_only_retry && (!exchange.expected.is_empty() || !exchange.requests.is_empty()) {
+            return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
         }
 
         let mut accepted_responses = exchange.responses.clone();
@@ -2505,6 +2539,50 @@ mod tests {
     }
 
     #[test]
+    fn mrtr_state_only_retry_requires_absent_input_responses() {
+        let registry = MrtrExchangeRegistry::new();
+        let binding = MrtrExchangeBinding::new(
+            "tools/call",
+            "state-only-tool".to_owned(),
+            [7; 32],
+            [9; 32],
+            None,
+        );
+        let required = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                MrtrInputRequests::default(),
+            )
+            .expect("a state-only exchange issues");
+        let wire = serde_json::to_value(&required).expect("state-only exchange serializes");
+        assert!(
+            wire.get("inputRequests").is_none(),
+            "state-only input_required omits inputRequests"
+        );
+        let request_state = mrtr_state_from_wire(&required);
+
+        let explicit_empty = registry
+            .accept_wire_bound(&request_state, &binding, &BTreeMap::new())
+            .expect_err("an explicit empty inputResponses map is not state-only");
+        assert_eq!(explicit_empty.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            registry.active_len(),
+            1,
+            "the rejected explicit map leaves the state-only exchange available"
+        );
+
+        let completed = registry
+            .accept_state_only_bound(&request_state, &binding)
+            .expect("an absent inputResponses member completes the state-only exchange");
+        let MrtrRetry::Complete(inputs) = completed else {
+            panic!("state-only retry must complete without manufacturing inputs");
+        };
+        assert!(inputs.responses().is_empty());
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
     fn mrtr_expiry_and_owning_request_cancellation_prevent_resolution() {
         let registry = MrtrExchangeRegistry::with_limits(
             16,
@@ -2529,6 +2607,7 @@ mod tests {
                 None,
                 MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())])
                     .expect("unique MRTR response map"),
+                false,
                 Instant::now() + Duration::from_millis(1),
             )
             .expect_err("expired state must fail before resolution");

@@ -918,7 +918,7 @@ impl ServerBuilder {
         prefix: &str,
         client: fastmcp_client::Client,
     ) -> Result<Self, fastmcp_core::McpError> {
-        let proxy_client = ProxyClient::from_client(client);
+        let proxy_client = ProxyClient::from_client(client)?;
         let catalog = proxy_client.catalog_typed()?;
         let (tool_count, resource_count, template_count, prompt_count) = match catalog {
             ProxyTypedCatalog {
@@ -1047,7 +1047,7 @@ impl ServerBuilder {
         self,
         client: fastmcp_client::Client,
     ) -> Result<Self, fastmcp_core::McpError> {
-        self.as_proxy_raw_with_proxy_client(ProxyClient::from_client(client))
+        self.as_proxy_raw_with_proxy_client(ProxyClient::from_client(client)?)
     }
 
     /// Registers one already-negotiated, typed upstream catalog without any

@@ -2470,8 +2470,14 @@ impl ProxyUpstreamBindingRegistry {
             protocol_plan.policy(),
             configuration_generation,
         )?;
-        let backend =
+        let mut backend =
             ProxyHttpClient::new(binding, connection, cx, client_info, client_capabilities);
+        // Selecting the legacy SSE adapter only authorizes the exact-2024
+        // lifecycle. Do not expose or cache an era binding until that
+        // lifecycle has validated the peer's exact initialize version.
+        if binding.era() == ProtocolEra::Legacy2024 {
+            backend.ensure_legacy_initialized()?;
+        }
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             backend,
             binding,
@@ -2702,10 +2708,16 @@ impl ProxyClient {
     pub fn upstream_binding_registry() -> ProxyUpstreamBindingRegistry {
         ProxyUpstreamBindingRegistry::default()
     }
-    /// Creates a proxy client from an MCP client.
-    #[must_use]
-    pub fn from_client(client: Client) -> Self {
-        Self::from_backend(client)
+    /// Creates an era-bound proxy client from an initialized MCP client.
+    ///
+    /// A client-backed proxy must retain the selected-era receipt that the
+    /// client already validated. Otherwise the ordinary builder proxy paths
+    /// would dispatch correctly through the client but lose the route-local
+    /// binding needed to reject an incompatible catalog or result later.
+    pub fn from_client(client: Client) -> McpResult<Self> {
+        let binding = binding_from_live_stdio_client(&client, 0)?;
+        let upstream_protocol_version = client.protocol_version().to_owned();
+        Self::from_backend_with_upstream_binding(client, binding, &upstream_protocol_version)
     }
 
     /// Creates a proxy client from a backend implementation.
@@ -3317,6 +3329,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use asupersync::Cx;
+    #[cfg(unix)]
+    use fastmcp_client::Client;
     #[cfg(unix)]
     use fastmcp_client::RequestTimeoutPolicy;
     use fastmcp_client::{CanonicalHttpUrl, ClientHttpConnection, ClientProtocolPlan};
@@ -4524,6 +4538,12 @@ mod tests {
             FinalToolSchemaAuthority::Upstream,
             "an exact-final catalog entry must delegate its scalar output schema upstream"
         );
+        assert!(
+            handlers[0]
+                .upstream_final_tool_schema_registration()
+                .is_some(),
+            "only an exact-final proxy handler receives the sealed upstream-schema registration"
+        );
         assert_eq!(
             serde_json::to_vec(
                 &handlers[0]
@@ -4550,6 +4570,10 @@ mod tests {
             handler.final_tool_schema_authority(),
             FinalToolSchemaAuthority::Local,
             "changing only the handler construction to legacy must not bypass local validation"
+        );
+        assert!(
+            handler.upstream_final_tool_schema_registration().is_none(),
+            "a legacy proxy handler cannot receive the sealed upstream-schema registration"
         );
         assert!(
             handler.final_definition().is_none(),
@@ -5365,6 +5389,11 @@ exec sleep 2
             super::ProxyUpstreamAdapter::LegacyHttpSse
         );
         assert_eq!(binding.policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            bindings.live_http.len(),
+            1,
+            "a legacy HTTP proxy enters the live cache only after initialize validation"
+        );
         let catalog = proxy
             .catalog()
             .expect("public proxy catalog uses legacy SSE");
@@ -5433,6 +5462,60 @@ exec sleep 2
             initialize["params"]["clientInfo"]["name"],
             "proxy-http-test-client"
         );
+    }
+
+    #[test]
+    fn proxy_outbound_http_auto_does_not_cache_legacy_binding_before_initialize_validation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind native HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read native HTTP listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message?session=invalid");
+        let expected_message_target = legacy_message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
+            let probe_request = read_http_request(&mut probe);
+            write_http_response(&mut probe, 404, "text/plain", b"");
+
+            let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
+            let sse_request = read_http_request(&mut sse);
+            let body = format!("event: endpoint\ndata: {expected_message_target}\n\n")
+                + "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2026-07-28\",\"capabilities\":{},\"serverInfo\":{\"name\":\"wrong-era-peer\",\"version\":\"1.0.0\"}}}\n\n";
+            write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+
+            let (mut initialize, _) = listener.accept().expect("accept legacy initialize POST");
+            let initialize_request = read_http_request(&mut initialize);
+            write_http_response(&mut initialize, 202, "application/json", b"");
+            (probe_request, sse_request, initialize_request)
+        });
+        let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
+        let mut bindings = ProxyClient::upstream_binding_registry();
+
+        let error = bindings
+            .connect_http_with_protocol_plan(
+                "invalid-legacy-http-backend",
+                "native-h1:invalid-legacy-http-backend",
+                101,
+                plan,
+                proxy_http_client_info(),
+                ClientCapabilities::default(),
+                Cx::for_request(),
+            )
+            .expect_err("changing only initialize.protocolVersion rejects the legacy binding");
+
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(
+            bindings.live_http.is_empty(),
+            "a failed legacy initialize must not leave an eras-bound live cache entry"
+        );
+        let (probe, sse, initialize) = server.join().expect("invalid legacy server must join");
+        assert!(probe.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+        assert!(sse.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        let initialize = serde_json::from_slice::<serde_json::Value>(&initialize.body)
+            .expect("legacy initialize remains JSON-RPC");
+        assert_eq!(initialize["method"], "initialize");
     }
 
     #[test]
@@ -6360,19 +6443,15 @@ exec sleep 2
             serde_json::json!({"content": [{"type": "text", "text": "forwarded"}]}),
         );
         let script = modern_proxy_peer_script(&discovery, &tool_result);
-        let mut bindings = ProxyClient::upstream_binding_registry();
-
-        let proxy = bindings
-            .connect_stdio_with_protocol_plan(
-                "auto-route",
-                "stdio:auto-peer",
-                2,
-                "sh",
-                &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-                Cx::for_testing(),
-            )
-            .expect("Auto retains its live modern selection");
+        let client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_testing(),
+        )
+        .expect("Auto retains its live modern selection");
+        let proxy = ProxyClient::from_client(client)
+            .expect("a builder-backed proxy retains the selected modern binding");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Modern2026);
@@ -6386,7 +6465,6 @@ exec sleep 2
                 )
                 .expect("Auto preserves ordinary final results through its live client"),
         );
-        assert_eq!(bindings.live_stdio.len(), 1);
     }
 
     #[cfg(unix)]
@@ -6484,19 +6562,15 @@ exec sleep 2
             serde_json::json!({"content": [{"type": "text", "text": "forwarded"}]}),
         );
         let script = auto_legacy_proxy_peer_script(&discovery_refusal, &initialize, &tool_result);
-        let mut bindings = ProxyClient::upstream_binding_registry();
-
-        let proxy = bindings
-            .connect_stdio_with_protocol_plan(
-                "auto-legacy-route",
-                "stdio:auto-legacy-peer",
-                3,
-                "sh",
-                &["-c", script.as_str()],
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
-                Cx::for_testing(),
-            )
-            .expect("Auto selects exact legacy only after an authorized modern refusal");
+        let client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
+            Cx::for_testing(),
+        )
+        .expect("Auto selects exact legacy only after an authorized modern refusal");
+        let proxy = ProxyClient::from_client(client)
+            .expect("a builder-backed proxy retains the selected legacy binding");
 
         let binding = proxy.upstream_binding().expect("live binding is retained");
         assert_eq!(binding.era(), ProtocolEra::Legacy2024);
@@ -6511,7 +6585,6 @@ exec sleep 2
                 )
                 .expect("Auto forwards through its selected live legacy client"),
         );
-        assert_eq!(bindings.live_stdio.len(), 1);
     }
 
     #[cfg(unix)]

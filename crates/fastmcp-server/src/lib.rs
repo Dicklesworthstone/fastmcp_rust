@@ -96,9 +96,10 @@ pub use extensions::{
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 pub use handler::{
-    BidirectionalSenders, BoxFuture, CompletionHandler, FinalToolOutcome, FinalToolSchemaAuthority,
-    ProgressNotificationSender, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    BidirectionalSenders, BoxFuture, CompletionHandler, FinalResourceReadCacheHintProvenance,
+    FinalToolOutcome, FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler,
+    ResourceHandler, ToolErrorKind, ToolHandler, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 pub use proxy::{
@@ -3910,6 +3911,16 @@ impl HttpLegacyCancellationControl {
 struct LiveHttpSession {
     session: Mutex<ServerHttpSession>,
     cancellation: HttpLegacyCancellationControl,
+    /// Reverse request correlation is intentionally outside `session`.
+    ///
+    /// SAFETY: an exact-2024 handler may synchronously wait for a
+    /// `sampling/createMessage` or `roots/list` response while its originating
+    /// POST owns the serialized session mutex. The matching response POST must
+    /// therefore route through this independently synchronized registry before
+    /// attempting session mutation. Every nonmatching response continues
+    /// through `ServerHttpSession::handle`, preserving serialized adapter and
+    /// session-state mutation.
+    legacy_pending_requests: Arc<PendingRequests>,
 }
 
 type LiveHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveHttpSession>>>>;
@@ -3927,10 +3938,67 @@ struct LiveModernHttpSession {
     expires_at: Mutex<Instant>,
     modern_connection: Arc<ModernConnection>,
     modern_dispatches: ModernHttpDispatchRegistry,
+    /// Phase one starts listener shutdown and rejects new work without
+    /// interrupting an already-enqueued terminal SSE control frame.
+    closing: AtomicBool,
+    /// Phase two owns destructive endpoint/dispatch teardown after the
+    /// listener's bounded terminal-control drain.
+    finalized: AtomicBool,
+}
+
+struct LiveModernHttpSessionRegistryState {
+    sessions: Mutex<HashMap<String, Arc<LiveModernHttpSession>>>,
+    /// Aborted session dispatches remain listener-owned until their task
+    /// completion is observed. Dropping a task handle would detach it.
+    retired_dispatches: Mutex<Vec<asupersync::runtime::TaskHandle<()>>>,
+    /// Closes admission before phase one evacuates the current map, so an
+    /// already-admitted discovery request cannot insert a fresh session into
+    /// the otherwise-empty registry during listener shutdown.
     closing: AtomicBool,
 }
 
-type LiveModernHttpSessionRegistry = Arc<Mutex<HashMap<String, Arc<LiveModernHttpSession>>>>;
+impl LiveModernHttpSessionRegistryState {
+    fn new() -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            retired_dispatches: Mutex::new(Vec::new()),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    fn retain_retired_dispatches(&self, dispatches: Vec<asupersync::runtime::TaskHandle<()>>) {
+        self.retired_dispatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(dispatches);
+    }
+
+    fn reap_retired_dispatches(&self) {
+        let mut dispatches = self
+            .retired_dispatches
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut active = Vec::with_capacity(dispatches.len());
+        for mut dispatch in std::mem::take(&mut *dispatches) {
+            match dispatch.try_join() {
+                Ok(None) => active.push(dispatch),
+                Ok(Some(())) | Err(_) => {}
+            }
+        }
+        *dispatches = active;
+    }
+
+    fn take_retired_dispatches(&self) -> Vec<asupersync::runtime::TaskHandle<()>> {
+        std::mem::take(
+            &mut *self
+                .retired_dispatches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+type LiveModernHttpSessionRegistry = Arc<LiveModernHttpSessionRegistryState>;
 
 impl LiveModernHttpSession {
     fn new(session: ServerHttpSession) -> Self {
@@ -3943,6 +4011,7 @@ impl LiveModernHttpSession {
             modern_connection,
             modern_dispatches,
             closing: AtomicBool::new(false),
+            finalized: AtomicBool::new(false),
         }
     }
 
@@ -3961,11 +4030,24 @@ impl LiveModernHttpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = now + MODERN_HTTP_SESSION_TTL;
     }
 
-    fn register_modern_dispatch(&self, dispatch: OwnedModernHttpDispatch) -> bool {
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    /// Starts listener/TTL shutdown without closing the response queues that
+    /// still own a server-elected terminal subscription frame.
+    fn begin_shutdown_invalidation(&self) {
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            self.modern_connection.disconnect();
+        }
+    }
+
+    fn register_modern_dispatch(
+        &self,
+        dispatch: OwnedModernHttpDispatch,
+    ) -> Result<(), OwnedModernHttpDispatch> {
         if self.closing.load(Ordering::Acquire) {
-            dispatch.request_cancellation.cancel();
-            dispatch.task.abort();
-            return false;
+            return Err(dispatch);
         }
         let mut dispatches = self
             .modern_dispatches
@@ -3973,20 +4055,21 @@ impl LiveModernHttpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.closing.load(Ordering::Acquire) {
             drop(dispatches);
-            dispatch.request_cancellation.cancel();
-            dispatch.task.abort();
-            return false;
+            return Err(dispatch);
         }
         dispatches.push(dispatch);
-        true
+        Ok(())
     }
 
-    fn cancel_modern_dispatch(&self, owner_generation: u64) {
-        let _ = cancel_modern_http_dispatches(
+    fn cancel_modern_dispatch(
+        &self,
+        owner_generation: u64,
+    ) -> Vec<asupersync::runtime::TaskHandle<()>> {
+        cancel_modern_http_dispatches(
             &self.server,
             &self.modern_dispatches,
             Some(owner_generation),
-        );
+        )
     }
 
     fn reap_modern_dispatches(&self) {
@@ -4004,11 +4087,13 @@ impl LiveModernHttpSession {
         *dispatches = active;
     }
 
-    fn begin_close(&self) -> Vec<asupersync::runtime::TaskHandle<()>> {
-        if self.closing.swap(true, Ordering::AcqRel) {
+    /// Performs phase two after the bounded terminal-control drain, or
+    /// immediately for TTL/peer-close teardown where no drain is required.
+    fn finish_close(&self) -> Vec<asupersync::runtime::TaskHandle<()>> {
+        self.begin_shutdown_invalidation();
+        if self.finalized.swap(true, Ordering::AcqRel) {
             return Vec::new();
         }
-        self.modern_connection.disconnect();
         let dispatches = cancel_modern_http_dispatches(&self.server, &self.modern_dispatches, None);
         match self.session.try_lock() {
             Ok(mut session) => {
@@ -4026,16 +4111,18 @@ impl LiveModernHttpSession {
     }
 }
 
-fn close_detached_modern_http_session(session: Arc<LiveModernHttpSession>) {
-    for task in session.begin_close() {
-        task.abort();
-    }
+fn close_detached_modern_http_session(
+    registry: &LiveModernHttpSessionRegistry,
+    session: Arc<LiveModernHttpSession>,
+) {
+    registry.retain_retired_dispatches(session.finish_close());
 }
 
 fn expire_live_modern_http_sessions(registry: &LiveModernHttpSessionRegistry) {
     let now = Instant::now();
     let expired = {
         let mut sessions = registry
+            .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expired_ids = sessions
@@ -4048,8 +4135,9 @@ fn expire_live_modern_http_sessions(registry: &LiveModernHttpSessionRegistry) {
             .collect::<Vec<_>>()
     };
     for session in expired {
-        close_detached_modern_http_session(session);
+        close_detached_modern_http_session(registry, session);
     }
+    registry.reap_retired_dispatches();
 }
 
 struct HttpConnectionLimiter {
@@ -4131,11 +4219,7 @@ impl HttpConnectionChildren {
         }
     }
 
-    async fn drain_terminal_controls_then_cancel_and_join(
-        &mut self,
-        cx: &Cx,
-        receipt: &FinalSubscriptionTerminationReceipt,
-    ) {
+    async fn drain_terminal_controls(&mut self, receipt: &FinalSubscriptionTerminationReceipt) {
         let deadline = Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT;
         while !receipt.is_settled() && Instant::now() < deadline {
             self.reap_finished();
@@ -4145,7 +4229,6 @@ impl HttpConnectionChildren {
             asupersync::runtime::yield_now().await;
         }
         receipt.fail_pending();
-        self.cancel_and_join(cx).await;
     }
 }
 
@@ -4183,21 +4266,40 @@ async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
     }
 }
 
-/// Revokes every retained modern HTTP session during listener shutdown.
-///
-/// Each retained [`ServerHttpSession`] owns its own MRTR continuation
-/// cancellation authority, so closing the registry makes every issued
-/// requestState invalid before the listener finishes shutting down.
-async fn close_live_modern_http_sessions(_cx: &Cx, sessions: &LiveModernHttpSessionRegistry) {
+/// Evacuates the listener-owned modern registry and invalidates every MRTR
+/// continuation before waiting for terminal SSE control frames to flush.
+fn detach_live_modern_http_sessions(
+    sessions: &LiveModernHttpSessionRegistry,
+) -> Vec<Arc<LiveModernHttpSession>> {
+    sessions.closing.store(true, Ordering::Release);
     let sessions = {
         let mut sessions = sessions
+            .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         std::mem::take(&mut *sessions)
+            .into_values()
+            .collect::<Vec<_>>()
     };
-    let mut dispatches = Vec::new();
-    for session in sessions.into_values() {
-        dispatches.extend(session.begin_close());
+    for session in &sessions {
+        session.begin_shutdown_invalidation();
+    }
+    sessions
+}
+
+/// Completes modern HTTP session teardown after the terminal-control drain.
+///
+/// Phase one already removed the sessions from admission and disconnected
+/// MRTR. This phase may now cancel live SSE dispatches without suppressing a
+/// terminal control that was granted the listener's bounded drain window.
+async fn finish_live_modern_http_sessions(
+    cx: &Cx,
+    registry: &LiveModernHttpSessionRegistry,
+    sessions: Vec<Arc<LiveModernHttpSession>>,
+) {
+    let mut dispatches = registry.take_retired_dispatches();
+    for session in sessions {
+        dispatches.extend(session.finish_close());
     }
     let deadline = Instant::now() + HTTP_TERMINAL_DRAIN_TIMEOUT;
     let mut pending = dispatches;
@@ -4214,11 +4316,27 @@ async fn close_live_modern_http_sessions(_cx: &Cx, sessions: &LiveModernHttpSess
             asupersync::runtime::yield_now().await;
         }
     }
-    for dispatch in pending {
-        // Cancellation was requested before this bounded drain. Do not let an
-        // uncooperative handler hold listener shutdown by retaining its
-        // session mutex or an unbounded join.
+    for dispatch in &pending {
         dispatch.abort();
+    }
+    for mut dispatch in pending {
+        // TaskHandle drop detaches. An aborted dispatch must remain owned
+        // until its structured completion has been observed.
+        let _ = dispatch.join(cx).await;
+    }
+}
+
+/// Joins dispatches retired concurrently with listener shutdown.
+///
+/// The reaper and connection children are joined before this runs, so no task
+/// can subsequently add another listener-owned dispatch to this queue.
+async fn join_retired_modern_http_dispatches(cx: &Cx, registry: &LiveModernHttpSessionRegistry) {
+    let dispatches = registry.take_retired_dispatches();
+    for dispatch in &dispatches {
+        dispatch.abort();
+    }
+    for mut dispatch in dispatches {
+        let _ = dispatch.join(cx).await;
     }
 }
 
@@ -4332,10 +4450,17 @@ impl BoundHttpServer {
         modern_session_reaper.abort();
         let _ = modern_session_reaper.join(cx).await;
         close_live_http_sessions(cx, &self.legacy_sessions).await;
+        // Phase one makes session IDs and their MRTR continuations terminal
+        // before any uninterruptible connection-child join can begin. Leave
+        // the SSE queues alive until the elected terminal control has had its
+        // bounded opportunity to flush.
+        let closing_modern_sessions = detach_live_modern_http_sessions(&self.modern_sessions);
         connection_children
-            .drain_terminal_controls_then_cancel_and_join(cx, &terminal_receipt)
+            .drain_terminal_controls(&terminal_receipt)
             .await;
-        close_live_modern_http_sessions(cx, &self.modern_sessions).await;
+        finish_live_modern_http_sessions(cx, &self.modern_sessions, closing_modern_sessions).await;
+        connection_children.cancel_and_join(cx).await;
+        join_retired_modern_http_dispatches(cx, &self.modern_sessions).await;
         server.cancel_active_requests(CancelKind::Shutdown, false);
         server.graceful_shutdown_returning();
         result
@@ -4389,7 +4514,7 @@ impl Server {
             listener,
             endpoint: Arc::new(endpoint),
             legacy_sessions: Arc::new(Mutex::new(HashMap::new())),
-            modern_sessions: Arc::new(Mutex::new(HashMap::new())),
+            modern_sessions: Arc::new(LiveModernHttpSessionRegistryState::new()),
             connection_limiter: Arc::new(HttpConnectionLimiter::new(max_connections)),
         })
     }
@@ -4669,12 +4794,10 @@ impl ServerHttpSession {
         {
             return None;
         }
-        let mut codec = Codec::new();
-        codec.set_max_message_size(self.server.http_config.handler_config.max_body_size);
-        match codec.decode_complete_message(&request.body) {
-            Ok(JsonRpcMessage::Response(response)) if response.validate().is_ok() => Some(response),
-            Ok(JsonRpcMessage::Response(_)) | Err(_) | Ok(JsonRpcMessage::Request(_)) => None,
-        }
+        decode_legacy_reverse_response(
+            request,
+            self.server.http_config.handler_config.max_body_size,
+        )
     }
 
     fn handle_legacy_reverse_response(
@@ -5071,6 +5194,20 @@ impl Drop for ServerHttpSession {
     }
 }
 
+/// Decodes only a strict JSON-RPC reverse response. Caller-specific legacy
+/// session identity checks remain at the ingress that owns the session.
+fn decode_legacy_reverse_response(
+    request: &HttpRequest,
+    maximum_body_size: usize,
+) -> Option<JsonRpcResponse> {
+    let mut codec = Codec::new();
+    codec.set_max_message_size(maximum_body_size);
+    match codec.decode_complete_message(&request.body) {
+        Ok(JsonRpcMessage::Response(response)) if response.validate().is_ok() => Some(response),
+        Ok(JsonRpcMessage::Response(_)) | Err(_) | Ok(JsonRpcMessage::Request(_)) => None,
+    }
+}
+
 fn legacy_origin_from_host(host: &str) -> Option<String> {
     if host.is_empty()
         || host.bytes().any(|byte| {
@@ -5309,7 +5446,7 @@ fn spawn_modern_sse_dispatch(
                 request,
                 Some(http_stream_generation),
                 cancellation.clone(),
-                Some(terminal_delivery),
+                Some(Arc::clone(&terminal_delivery)),
                 notification_sender,
             )
             .await;
@@ -5347,6 +5484,7 @@ async fn send_modern_sse_stream(
     stream: AsyncTcpStream,
     server: Arc<Server>,
     live_session: &LiveModernHttpSession,
+    modern_sessions: &LiveModernHttpSessionRegistry,
     http_stream_generation: u64,
     inbound: InboundRequestContext,
     request: JsonRpcRequest,
@@ -5360,7 +5498,7 @@ async fn send_modern_sse_stream(
 
     let dispatch = spawn_modern_sse_dispatch(
         cx,
-        server,
+        Arc::clone(&server),
         http_stream_generation,
         inbound,
         request,
@@ -5368,11 +5506,18 @@ async fn send_modern_sse_stream(
         Arc::clone(&terminal_delivery),
     )
     .map_err(|_| ())?;
-    if !live_session.register_modern_dispatch(OwnedModernHttpDispatch {
+    let dispatch = OwnedModernHttpDispatch {
         owner_generation: http_stream_generation,
         request_cancellation: request_cancellation.clone(),
         task: dispatch,
-    }) {
+    };
+    if let Err(dispatch) = live_session.register_modern_dispatch(dispatch) {
+        server
+            .final_subscriptions
+            .cancel_modern_http_owner(dispatch.owner_generation);
+        dispatch.request_cancellation.cancel();
+        dispatch.task.abort();
+        modern_sessions.retain_retired_dispatches(vec![dispatch.task]);
         return Err(());
     }
 
@@ -5425,7 +5570,8 @@ async fn send_modern_sse_stream(
 
     if result.is_err() {
         terminal_delivery.mark_failed();
-        live_session.cancel_modern_dispatch(http_stream_generation);
+        modern_sessions
+            .retain_retired_dispatches(live_session.cancel_modern_dispatch(http_stream_generation));
     }
     live_session.reap_modern_dispatches();
     result
@@ -5564,10 +5710,14 @@ fn registered_modern_http_session(
     request: &HttpRequest,
 ) -> Result<Arc<LiveModernHttpSession>, HttpResponse> {
     expire_live_modern_http_sessions(modern_sessions);
+    if modern_sessions.closing.load(Ordering::Acquire) {
+        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
+    }
     let Some(session_id) = request.header("mcp-session-id") else {
         return Err(HttpResponse::bad_request());
     };
     let session = modern_sessions
+        .sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(session_id)
@@ -5575,18 +5725,27 @@ fn registered_modern_http_session(
     let Some(session) = session else {
         return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
     };
+    // A request may retain an `Arc` across the registry evacuation. Do not
+    // renew or dispatch through that detached session during shutdown.
+    if session.is_closing() {
+        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
+    }
     let now = Instant::now();
     if session.is_expired(now) {
         let removed = modern_sessions
+            .sessions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(session_id);
         if let Some(removed) = removed {
-            close_detached_modern_http_session(removed);
+            close_detached_modern_http_session(modern_sessions, removed);
         }
         return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
     }
     session.renew(now);
+    if session.is_closing() {
+        return Err(HttpResponse::new(HttpStatus::NOT_FOUND));
+    }
     Ok(session)
 }
 
@@ -5599,6 +5758,9 @@ fn dispatch_registered_modern_http_request(
     expire_live_modern_http_sessions(modern_sessions);
     let error_request = request.clone();
     if is_modern_http_discovery_request(endpoint, &request) {
+        if modern_sessions.closing.load(Ordering::Acquire) {
+            return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
+        }
         if request.header("mcp-session-id").is_some() {
             return HttpResponse::bad_request();
         }
@@ -5622,9 +5784,12 @@ fn dispatch_registered_modern_http_request(
         }
         let accepted = {
             let mut sessions = modern_sessions
+                .sessions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if sessions.len() >= MAX_LIVE_MODERN_HTTP_SESSIONS {
+            if modern_sessions.closing.load(Ordering::Acquire)
+                || sessions.len() >= MAX_LIVE_MODERN_HTTP_SESSIONS
+            {
                 false
             } else {
                 sessions.insert(
@@ -5683,6 +5848,34 @@ fn dispatch_http_request(
         };
         if let Some(response) = session.cancellation.handle(cx, &request) {
             return response;
+        }
+        // Do not wait for the serialized session mutex when this POST is the
+        // exact response to a server-originated legacy request. The original
+        // POST can be inside an application handler synchronously awaiting
+        // this response, so waiting here would form a self-deadlock. Routing
+        // through `PendingRequests` consumes only its independently owned
+        // correlation entry; adapter/session mutation remains below.
+        if request.query.len() == 1
+            && request.query.get("session_id").map(String::as_str) == Some(session_id)
+            && request.content_type().is_some_and(|content_type| {
+                content_type
+                    .split(';')
+                    .next()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+            })
+            && let Some(response) =
+                decode_legacy_reverse_response(&request, session.cancellation.max_body_size)
+        {
+            let disposition = session
+                .legacy_pending_requests
+                .route_response_with_disposition(&response);
+            if matches!(
+                disposition,
+                bidirectional::PendingResponseDisposition::Delivered
+                    | bidirectional::PendingResponseDisposition::RetiredGeneric
+            ) {
+                return HttpResponse::new(HttpStatus::ACCEPTED);
+            }
         }
         // The connection creates this authority before queueing the blocking
         // dispatch. Direct embedding callers create it here instead. In both
@@ -5820,6 +6013,7 @@ async fn serve_http_connection(
                     stream,
                     Arc::clone(&endpoint.server),
                     &live_session,
+                    &modern_sessions,
                     next_modern_http_stream_generation(),
                     inbound,
                     request,
@@ -5914,6 +6108,7 @@ async fn serve_http_connection(
     };
     let session = Arc::new(LiveHttpSession {
         cancellation: session.cancellation_control(),
+        legacy_pending_requests: Arc::clone(&session.legacy_pending_requests),
         session: Mutex::new(session),
     });
     legacy_sessions
@@ -14286,7 +14481,10 @@ mod lib_unit_tests {
         let error = rejected
             .error
             .expect("incompatible extension settings must fail closed");
-        assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::InvalidParams))
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -14325,7 +14523,7 @@ mod lib_unit_tests {
             .dispatch_stateless(&inbound, &rejected)
             .expect("wrong-era extension request must have an error response");
         assert_eq!(
-            rejected.error.map(|error| error.code),
+            rejected.error.and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::InvalidRequest))
         );
         let mut public_rejected = extension_tasks_get_request(serde_json::json!({}));
@@ -14374,7 +14572,7 @@ mod lib_unit_tests {
             .dispatch_stateless(&inbound, &request)
             .expect("a malformed final request with an id receives an error response");
         assert_eq!(
-            response.error.map(|error| error.code),
+            response.error.and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::InvalidParams))
         );
         assert!(response.result.is_none());
@@ -14417,7 +14615,7 @@ mod lib_unit_tests {
             .dispatch_stateless(&inbound, &request)
             .expect("a malformed middleware result with an id receives an error response");
         assert_eq!(
-            response.error.map(|error| error.code),
+            response.error.and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::InternalError))
         );
         assert!(response.result.is_none());
@@ -14447,7 +14645,10 @@ mod lib_unit_tests {
         let error = response
             .error
             .expect("legacy request must not reach the extension handler");
-        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::MethodNotFound))
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -16243,7 +16444,10 @@ mod lib_unit_tests {
         let error = rejected
             .error
             .expect("removing only the Tasks declaration must reject task creation");
-        assert_eq!(error.code, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE);
+        assert_eq!(
+            error.code.as_i32(),
+            Some(MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE)
+        );
         assert_eq!(
             error.data,
             Some(serde_json::json!({
@@ -16451,7 +16655,10 @@ mod lib_unit_tests {
         let error = rejected
             .error
             .expect("changing only Tasks settings must reject the request");
-        assert_eq!(error.code, i32::from(McpErrorCode::InvalidParams));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::InvalidParams))
+        );
         assert_eq!(
             delivered
                 .lock()
@@ -16483,7 +16690,7 @@ mod lib_unit_tests {
             )
             .expect("legacy request must respond");
         assert_eq!(
-            response.error.map(|error| error.code),
+            response.error.and_then(|error| error.code.as_i32()),
             Some(i32::from(McpErrorCode::MethodNotFound))
         );
     }
@@ -16856,7 +17063,10 @@ mod lib_unit_tests {
                 .error
                 .as_ref()
                 .unwrap_or_else(|| panic!("{method} must fail closed"));
-            assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+            assert_eq!(
+                error.code.as_i32(),
+                Some(i32::from(McpErrorCode::MethodNotFound))
+            );
             assert!(response.result.is_none());
         }
     }
@@ -16871,7 +17081,10 @@ mod lib_unit_tests {
             let error = response
                 .error
                 .unwrap_or_else(|| panic!("{method} with an id must be rejected"));
-            assert_eq!(error.code, i32::from(McpErrorCode::InvalidRequest));
+            assert_eq!(
+                error.code.as_i32(),
+                Some(i32::from(McpErrorCode::InvalidRequest))
+            );
             assert!(response.result.is_none());
         }
 
@@ -16879,7 +17092,10 @@ mod lib_unit_tests {
         let error = response
             .error
             .expect("the legacy bare initialized spelling must not be routed");
-        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::MethodNotFound))
+        );
     }
 
     #[test]
@@ -17346,7 +17562,10 @@ mod lib_unit_tests {
                 )
                 .expect("request must receive an authentication error");
             let error = response.error.expect("authentication must fail");
-            assert_eq!(error.code, i32::from(McpErrorCode::ResourceForbidden));
+            assert_eq!(
+                error.code.as_i32(),
+                Some(i32::from(McpErrorCode::ResourceForbidden))
+            );
             assert_eq!(error.message, "Authentication failed");
             assert!(error.data.is_none());
         }
@@ -17545,7 +17764,10 @@ mod lib_unit_tests {
         let error = response
             .error
             .expect("response-stage cancellation must remain an error");
-        assert_eq!(error.code, i32::from(McpErrorCode::RequestCancelled));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::RequestCancelled))
+        );
         assert_eq!(error.message, "Request cancelled");
         assert!(!error.message.contains("hostile"));
     }
@@ -22237,7 +22459,8 @@ mod lib_unit_tests {
             .into_http_endpoint("http://legacy.test")
             .expect("extension server must construct the configured HTTP endpoint");
         let legacy_sessions: LiveHttpSessionRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let modern_sessions: LiveModernHttpSessionRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let modern_sessions: LiveModernHttpSessionRegistry =
+            Arc::new(LiveModernHttpSessionRegistryState::new());
 
         let response = dispatch_http_request(
             &cx,
@@ -22851,6 +23074,7 @@ mod lib_unit_tests {
                 .map_err(|error| format!("live HTTP MRTR shutdown client failed: {error:?}"))??;
             serve.map_err(|error| format!("live HTTP MRTR shutdown server failed: {error}"))?;
             if !modern_sessions
+                .sessions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty()
@@ -23311,6 +23535,7 @@ mod lib_unit_tests {
             serve.map_err(|error| format!("SSE discovery rejection server failed: {error}"))?;
             if !response.starts_with(b"HTTP/1.1 400")
                 || !modern_sessions
+                    .sessions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .is_empty()
@@ -23325,7 +23550,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_sse_discovery_mints_session_and_shutdown_cancels_registered_listen() {
+    fn live_http_shutdown_invalidates_session_before_flushing_live_sse_terminal() {
         run_live_http_test(|cx| async move {
             let bound = Server::new("live-http-listen-half-close", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
@@ -23446,6 +23671,7 @@ mod lib_unit_tests {
                     );
                 }
                 let registered_dispatch = modern_sessions
+                    .sessions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&session_id)
@@ -23466,6 +23692,27 @@ mod lib_unit_tests {
                     CancelKind::User,
                     Some("subscription graceful shutdown requested"),
                 );
+                let phase_one_deadline = Instant::now() + Duration::from_secs(2);
+                while !modern_sessions
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+                    && Instant::now() < phase_one_deadline
+                {
+                    thread::yield_now();
+                }
+                if !modern_sessions
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+                {
+                    return Err(
+                        "shutdown did not invalidate the modern session before terminal drain"
+                            .to_owned(),
+                    );
+                }
                 let mut trailing = Vec::new();
                 std::io::Read::read_to_end(&mut stream, &mut trailing)
                     .map_err(|error| format!("terminated listen stream did not close: {error}"))?;
@@ -23491,6 +23738,7 @@ mod lib_unit_tests {
                 .map_err(|_| "subscription half-close controller panicked".to_owned())??;
             serve.map_err(|error| format!("subscription half-close server failed: {error}"))?;
             if !remaining_modern_sessions
+                .sessions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .is_empty()
@@ -23901,6 +24149,237 @@ mod lib_unit_tests {
                 .map_err(|error| format!("legacy loopback client failed: {error:?}"))?;
             serve.map_err(|error| format!("legacy loopback server failed: {error}"))?;
             client
+        });
+    }
+
+    async fn live_http_legacy_reverse_response_post_probe(
+        cx: &Cx,
+        wrong_reverse_response_id: bool,
+    ) -> Result<(), String> {
+        const INITIALIZE_ID: i64 = 842;
+        const TOOL_CALL_ID: i64 = 843;
+
+        let bound = Server::new("live-http-legacy-reverse-response", "1.0.0")
+            .tool(LiveLegacyRuntimeConnectionTool)
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("legacy reverse-response HTTP bind failed: {error}"))?;
+        let address = bound
+            .local_addr()
+            .map_err(|error| format!("legacy reverse-response address failed: {error}"))?;
+        let caller_cx = cx.clone();
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                let (mut sse, session_id, mut received) =
+                    open_live_legacy_http_session(address).await?;
+                for request in [
+                    JsonRpcRequest::new(
+                        "initialize",
+                        Some(serde_json::json!({
+                            "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                            "capabilities": {"sampling": {}},
+                            "clientInfo": {
+                                "name": "legacy-reverse-response-client",
+                                "version": "1.0.0"
+                            },
+                        })),
+                        INITIALIZE_ID,
+                    ),
+                    JsonRpcRequest::notification("notifications/initialized", None),
+                ] {
+                    let body = serde_json::to_vec(&request).map_err(|error| {
+                        format!("legacy reverse-response setup did not serialize: {error}")
+                    })?;
+                    let response = live_http_exchange(
+                        address,
+                        live_http_post(&format!("/messages?session_id={session_id}"), &body, &[]),
+                    )
+                    .await?;
+                    if !response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy reverse-response setup was not accepted: {response:?}"
+                        ));
+                    }
+                }
+
+                let tool_call = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "live_legacy_runtime_connection_tool",
+                        "arguments": {"sample": true},
+                    })),
+                    TOOL_CALL_ID,
+                );
+                let tool_call_body = serde_json::to_vec(&tool_call).map_err(|error| {
+                    format!("legacy sampling tool call did not serialize: {error}")
+                })?;
+                let tool_call_request = live_http_post(
+                    &format!("/messages?session_id={session_id}"),
+                    &tool_call_body,
+                    &[],
+                );
+                let mut tool_call = client_cx
+                    .spawn(move |_tool_call_cx| async move {
+                        live_http_exchange(address, tool_call_request).await
+                    })
+                    .map_err(|error| {
+                        format!("legacy sampling tool-call POST was not admitted: {error}")
+                    })?;
+
+                read_live_http_until(&mut sse, &mut received, b"\"method\":\"sampling/createMessage\"")
+                    .await?;
+                let received_text = std::str::from_utf8(&received).map_err(|error| {
+                    format!("legacy sampling reverse request was not UTF-8: {error}")
+                })?;
+                let sampling_offset = received_text
+                    .find("\"method\":\"sampling/createMessage\"")
+                    .ok_or_else(|| "legacy sampling reverse request was not retained".to_string())?;
+                let event_start = received_text[..sampling_offset]
+                    .rfind("data: ")
+                    .ok_or_else(|| "legacy sampling reverse request omitted SSE data".to_string())?;
+                let event = &received_text[event_start + "data: ".len()..];
+                let (event, _) = event
+                    .split_once("\n\n")
+                    .ok_or_else(|| "legacy sampling reverse request was not one SSE event".to_string())?;
+                let JsonRpcMessage::Request(reverse_request) = Codec::new()
+                    .decode_complete_message(event.as_bytes())
+                    .map_err(|error| {
+                        format!("legacy sampling reverse request was not JSON-RPC: {error}")
+                    })?
+                else {
+                    return Err("legacy sampling reverse event was not a request".to_string());
+                };
+                let reverse_request_id = reverse_request
+                    .id
+                    .ok_or_else(|| "legacy sampling reverse request omitted its ID".to_string())?;
+                let response_id = if wrong_reverse_response_id {
+                    // The only behavioral change in the near-identical
+                    // negative is this correlation ID.
+                    RequestId::Number(-2)
+                } else {
+                    reverse_request_id
+                };
+                let sampling_result = serde_json::to_value(
+                    fastmcp_protocol::CreateMessageResult::text(
+                        "http-sampled-value",
+                        "legacy-http-test-model",
+                    ),
+                )
+                .map_err(|error| format!("legacy sampling response did not serialize: {error}"))?;
+                let reverse_response = JsonRpcResponse::success(response_id, sampling_result);
+                let reverse_body = serde_json::to_vec(&reverse_response).map_err(|error| {
+                    format!("legacy sampling reverse response did not serialize: {error}")
+                })?;
+                let reverse_post = live_http_post(
+                    &format!("/messages?session_id={session_id}"),
+                    &reverse_body,
+                    &[],
+                );
+                let mut reverse_post = client_cx
+                    .spawn(move |_reverse_cx| async move { live_http_exchange(address, reverse_post).await })
+                    .map_err(|error| {
+                        format!("legacy sampling reverse-response POST was not admitted: {error}")
+                    })?;
+
+                if wrong_reverse_response_id {
+                    let deadline = client_cx
+                        .now()
+                        .saturating_add_nanos(100_000_000);
+                    if asupersync::time::timeout_at(deadline, reverse_post.join(&client_cx))
+                        .await
+                        .is_ok()
+                    {
+                        return Err(
+                            "wrong-ID reverse response escaped the originating legacy session mutex"
+                                .to_string(),
+                        );
+                    }
+
+                    let cancellation = JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({
+                            "requestId": TOOL_CALL_ID,
+                            "reason": "settle wrong-ID reverse-response probe",
+                        })),
+                    );
+                    let cancellation_body = serde_json::to_vec(&cancellation).map_err(|error| {
+                        format!("legacy sampling cancellation did not serialize: {error}")
+                    })?;
+                    let cancellation_response = live_http_exchange(
+                        address,
+                        live_http_post(
+                            &format!("/messages?session_id={session_id}"),
+                            &cancellation_body,
+                            &[],
+                        ),
+                    )
+                    .await?;
+                    if !cancellation_response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy sampling cancellation was not accepted: {cancellation_response:?}"
+                        ));
+                    }
+                    let _ = tool_call.join(&client_cx).await.map_err(|error| {
+                        format!("legacy sampling cancelled tool-call POST failed: {error:?}")
+                    })??;
+                    let _ = reverse_post.join(&client_cx).await.map_err(|error| {
+                        format!("wrong-ID reverse-response POST failed after settlement: {error:?}")
+                    })??;
+                } else {
+                    let reverse_response = reverse_post.join(&client_cx).await.map_err(|error| {
+                        format!("legacy sampling reverse-response POST failed: {error:?}")
+                    })??;
+                    if !reverse_response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "matching reverse-response POST was not accepted: {reverse_response:?}"
+                        ));
+                    }
+                    let tool_call_response = tool_call.join(&client_cx).await.map_err(|error| {
+                        format!("legacy sampling tool-call POST failed: {error:?}")
+                    })??;
+                    if !tool_call_response.starts_with(b"HTTP/1.1 202") {
+                        return Err(format!(
+                            "legacy sampling tool-call POST was not accepted: {tool_call_response:?}"
+                        ));
+                    }
+                    read_live_http_until(
+                        &mut sse,
+                        &mut received,
+                        b"legacy-runtime-1-http-sampled-value",
+                    )
+                    .await?;
+                }
+
+                caller_cx.cancel_with(
+                    CancelKind::User,
+                    Some("legacy reverse-response POST probe complete"),
+                );
+                Ok::<_, String>(())
+            })
+            .map_err(|error| format!("legacy reverse-response client task was not admitted: {error}"))?;
+
+        let serve = bound.serve(cx).await;
+        client
+            .join(cx)
+            .await
+            .map_err(|error| format!("legacy reverse-response client failed: {error:?}"))??;
+        serve.map_err(|error| format!("legacy reverse-response server failed: {error}"))
+    }
+
+    #[test]
+    fn live_http_legacy_reverse_response_bypasses_the_originating_session_mutex() {
+        run_live_http_test(|cx| async move {
+            live_http_legacy_reverse_response_post_probe(&cx, false).await
+        });
+    }
+
+    #[test]
+    fn live_http_legacy_reverse_response_wrong_id_remains_blocked_until_cancellation() {
+        run_live_http_test(|cx| async move {
+            // This differs from the positive only in the reverse-response
+            // correlation ID, so it must not complete the waiting handler.
+            live_http_legacy_reverse_response_post_probe(&cx, true).await
         });
     }
 
@@ -26836,7 +27315,10 @@ mod lib_unit_tests {
         let error = rejected
             .error
             .expect("a different principal must not reuse session state");
-        assert_eq!(error.code, i32::from(McpErrorCode::ResourceForbidden));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::ResourceForbidden))
+        );
         assert!(rejected.result.is_none());
     }
 

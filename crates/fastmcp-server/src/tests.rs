@@ -1020,7 +1020,10 @@ mod router_tests {
             .expect("response");
         assert!(response.is_error(), "expected auth error");
         let error = response.error.expect("error payload");
-        assert_eq!(error.code, i32::from(McpErrorCode::ResourceForbidden));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::ResourceForbidden))
+        );
     }
 
     #[test]
@@ -1399,7 +1402,10 @@ mod router_tests {
             .error
             .as_ref()
             .expect("quarantined tasks/submit must return an error");
-        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound));
+        assert_eq!(
+            error.code.as_i32(),
+            Some(i32::from(McpErrorCode::MethodNotFound))
+        );
         assert!(response.result.is_none());
 
         let recorded = notifications.lock().expect("notifications lock poisoned");
@@ -1750,7 +1756,10 @@ mod router_tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("response recv timeout");
             let err = response.error.expect("expected error");
-            assert_eq!(err.code, i32::from(McpErrorCode::RequestCancelled));
+            assert_eq!(
+                err.code.as_i32(),
+                Some(i32::from(McpErrorCode::RequestCancelled))
+            );
         }
     }
 
@@ -1838,7 +1847,10 @@ mod router_tests {
                 .recv_timeout(Duration::from_secs(2))
                 .expect("response recv timeout");
             let err = response.error.expect("expected error");
-            assert_eq!(err.code, i32::from(McpErrorCode::RequestCancelled));
+            assert_eq!(
+                err.code.as_i32(),
+                Some(i32::from(McpErrorCode::RequestCancelled))
+            );
         }
 
         let mut by_request: HashMap<i64, Vec<&RequestEvent>> = HashMap::new();
@@ -2118,7 +2130,10 @@ mod router_tests {
         let cancellation = cancelled_response
             .error
             .expect("cancelled subscription must fail");
-        assert_eq!(cancellation.code, i32::from(McpErrorCode::RequestCancelled));
+        assert_eq!(
+            cancellation.code.as_i32(),
+            Some(i32::from(McpErrorCode::RequestCancelled))
+        );
         assert!(!cancelled_session.is_resource_subscribed(OVER_LIMIT_URI_CANARY));
 
         let cancelled_unsubscribe = fastmcp_protocol::JsonRpcRequest::new(
@@ -2144,8 +2159,8 @@ mod router_tests {
             .error
             .expect("cancelled unsubscription must fail");
         assert_eq!(
-            unsubscribe_cancellation.code,
-            i32::from(McpErrorCode::RequestCancelled)
+            unsubscribe_cancellation.code.as_i32(),
+            Some(i32::from(McpErrorCode::RequestCancelled))
         );
         assert!(cancelled_session.is_resource_subscribed(DUPLICATE_URI));
     }
@@ -2204,8 +2219,12 @@ mod router_tests {
             )
             .expect("guarded subscribe request should produce a response");
         assert_eq!(
-            subscribe_response.error.expect("subscribe must fail").code,
-            i32::from(McpErrorCode::InternalError)
+            subscribe_response
+                .error
+                .expect("subscribe must fail")
+                .code
+                .as_i32(),
+            Some(i32::from(McpErrorCode::InternalError))
         );
         assert!(!session.is_resource_subscribed(URI));
 
@@ -2235,8 +2254,9 @@ mod router_tests {
             unsubscribe_response
                 .error
                 .expect("unsubscribe must fail")
-                .code,
-            i32::from(McpErrorCode::InternalError)
+                .code
+                .as_i32(),
+            Some(i32::from(McpErrorCode::InternalError))
         );
         assert!(session.is_resource_subscribed(URI));
     }

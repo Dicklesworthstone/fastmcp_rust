@@ -3303,7 +3303,7 @@ mod tests {
             "resultType": "complete",
             "tools": [],
             "ttlMs": huge_ttl,
-            "cacheScope": "public",
+            "cacheScope": "private",
         });
 
         let delivered = middleware
@@ -3318,18 +3318,86 @@ mod tests {
             delivered["ttlMs"].to_string(),
             "922337203685477580812345678901234567890"
         );
+        assert_eq!(
+            middleware.stats().entries,
+            0,
+            "an unrepresentable private final TTL must not create a local-expiry entry"
+        );
 
         let fractional = serde_json::json!({
             "resultType": "complete",
             "tools": [],
             "ttlMs": 120_000.5,
-            "cacheScope": "public",
+            "cacheScope": "private",
         });
         let normalized = middleware
             .on_response(&ctx, &request, fractional)
             .expect("invalid cache hints are replaced by the local policy");
         assert_eq!(normalized["ttlMs"], serde_json::json!(120_000));
         assert_eq!(normalized["cacheScope"], serde_json::json!("private"));
+        assert_eq!(
+            middleware.stats().entries,
+            1,
+            "the paired representable local policy remains cacheable"
+        );
+    }
+
+    #[test]
+    fn every_final_result_with_an_unrepresentable_private_ttl_skips_local_cache_state() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ctx = test_context();
+        let huge_ttl: serde_json::Value = serde_json::from_str("18446744073709551616000")
+            .expect("arbitrary-width JSON integer fixture");
+        let methods = [
+            ("tools/list", None),
+            ("resources/list", None),
+            ("resources/templates/list", None),
+            ("prompts/list", None),
+            (
+                "resources/read",
+                Some(serde_json::json!({"uri": "file:///huge-ttl"})),
+            ),
+        ];
+
+        for (method, params) in methods {
+            let request = test_request(method, params);
+            let response = serde_json::json!({
+                "resultType": "complete",
+                "items": [],
+                "ttlMs": huge_ttl.clone(),
+                "cacheScope": "private",
+            });
+            let delivered = middleware
+                .on_response(&ctx, &request, response.clone())
+                .expect("wire-valid final result remains deliverable");
+
+            assert_eq!(delivered, response);
+            assert_eq!(
+                middleware.stats().entries,
+                0,
+                "{method} must not create a local entry for an unrepresentable TTL"
+            );
+        }
+
+        let discovery = serde_json::json!({
+            "supportedVersions": [FINAL_PROTOCOL_VERSION],
+            "capabilities": {},
+            "ttlMs": huge_ttl.clone(),
+            "cacheScope": "private",
+        });
+        let delivered = middleware
+            .on_response(
+                &ctx,
+                &final_discovery_request(FINAL_PROTOCOL_VERSION),
+                discovery.clone(),
+            )
+            .expect("wire-valid discovery result remains deliverable");
+        assert_eq!(delivered, discovery);
+        assert_eq!(
+            middleware.stats().entries,
+            0,
+            "server/discover must also skip local state for an unrepresentable TTL"
+        );
     }
 
     #[test]

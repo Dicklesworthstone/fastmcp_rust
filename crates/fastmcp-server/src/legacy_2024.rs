@@ -19,9 +19,9 @@ use fastmcp_protocol::methods::{
     NOTIFICATIONS_ROOTS_LIST_CHANGED, NOTIFICATIONS_TOOLS_LIST_CHANGED, PING, PROMPTS_GET,
     PROMPTS_LIST, RESOURCES_LIST, RESOURCES_READ, RESOURCES_SUBSCRIBE, RESOURCES_TEMPLATES_LIST,
     RESOURCES_UNSUBSCRIBE, ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_CALL, TOOLS_LIST,
-    decode_legacy_2024_11_05_client_capabilities, decode_legacy_2024_11_05_envelope,
-    decode_legacy_2024_11_05_envelope_classified, translate_legacy_2024_result,
-    validate_legacy_2024_11_05_initialize_result, validate_legacy_2024_11_05_method_params,
+    decode_legacy_2024_11_05_client_capabilities, decode_legacy_2024_11_05_envelope_classified,
+    translate_legacy_2024_result, validate_legacy_2024_11_05_initialize_result,
+    validate_legacy_2024_11_05_method_params,
 };
 use serde_json::{Value, json};
 

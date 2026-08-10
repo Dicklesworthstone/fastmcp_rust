@@ -14,8 +14,9 @@ use crate::bidirectional::{
     MrtrInputRequests, MrtrInputRequired, MrtrRetry,
 };
 use crate::handler::{
-    BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
-    FinalToolOutcome, ProgressNotificationSender, UriParams, empty_final_result_meta,
+    BidirectionalSenders, BoxFuture, DEFAULT_FINAL_RESOURCE_TTL_MS, FinalMethodOutcome,
+    FinalResourceReadCacheHintProvenance, FinalResourceUriUse, FinalToolOutcome,
+    ProgressNotificationSender, ResourceUriUsePolicy, UriParams, empty_final_result_meta,
     encode_final_complete_result,
 };
 use crate::handler::{
@@ -462,9 +463,9 @@ fn final_mrtr_binding(
 }
 
 fn handler_mrtr_input_requests(result: &InputRequiredResult) -> McpResult<MrtrInputRequests> {
-    let input_requests = result
-        .input_requests()
-        .ok_or_else(|| McpError::invalid_params("MRTR input_required requires inputRequests"))?;
+    let Some(input_requests) = result.input_requests() else {
+        return Ok(MrtrInputRequests::default());
+    };
     if input_requests.members().is_empty() {
         return Err(McpError::invalid_params(
             "MRTR inputRequests must not be empty",
@@ -661,6 +662,7 @@ struct AdmittedFinalToolRegistration {
 struct AdmittedFinalResourceRegistration {
     definition: FinalResource,
     tags: Vec<String>,
+    uri_use_policy: ResourceUriUsePolicy,
 }
 
 /// Immutable final prompt catalog data, including the legacy tag snapshot
@@ -668,6 +670,7 @@ struct AdmittedFinalResourceRegistration {
 struct AdmittedFinalPromptRegistration {
     definition: FinalPrompt,
     tags: Vec<String>,
+    uri_use_policy: ResourceUriUsePolicy,
 }
 
 impl AdmittedToolRegistration {
@@ -873,6 +876,106 @@ fn project_final_resource_catalog_entry(
     })
 }
 
+const FINAL_RESOURCE_URI_USE_REJECTED: &str =
+    "final resource URI is not admitted for this local use site";
+const FINAL_RESOURCE_URI_USE_EMISSION_REJECTED: &str =
+    "handler emitted a final resource URI that is not admitted for this local use site";
+
+fn admit_final_resource_uri(
+    policy: ResourceUriUsePolicy,
+    uri: &AbsoluteUri,
+    use_site: FinalResourceUriUse,
+) -> McpResult<()> {
+    policy
+        .admits(uri, use_site)
+        .then_some(())
+        .ok_or_else(|| McpError::invalid_params(FINAL_RESOURCE_URI_USE_REJECTED))
+}
+
+fn admit_final_resource_template_uri(
+    policy: ResourceUriUsePolicy,
+    uri_template: &str,
+) -> McpResult<()> {
+    policy
+        .admits_template(uri_template)
+        .then_some(())
+        .ok_or_else(|| McpError::invalid_params(FINAL_RESOURCE_URI_USE_REJECTED))
+}
+
+fn enforce_final_resource_uri_emission(
+    policy: ResourceUriUsePolicy,
+    uri: &AbsoluteUri,
+    use_site: FinalResourceUriUse,
+) -> McpResult<()> {
+    policy
+        .admits(uri, use_site)
+        .then_some(())
+        .ok_or_else(|| McpError::internal_error(FINAL_RESOURCE_URI_USE_EMISSION_REJECTED))
+}
+
+fn embedded_resource_uri(contents: &EmbeddedResourceContents) -> &AbsoluteUri {
+    match contents {
+        EmbeddedResourceContents::Text { uri, .. } | EmbeddedResourceContents::Blob { uri, .. } => {
+            uri
+        }
+    }
+}
+
+fn admit_final_resource_read_outcome(
+    policy: ResourceUriUsePolicy,
+    outcome: &FinalMethodOutcome<FinalReadResourceResult>,
+) -> McpResult<()> {
+    let FinalMethodOutcome::Complete(result) = outcome else {
+        return Ok(());
+    };
+    for contents in &result.payload.contents {
+        enforce_final_resource_uri_emission(
+            policy,
+            embedded_resource_uri(contents),
+            FinalResourceUriUse::ResourceReadContents,
+        )?;
+    }
+    Ok(())
+}
+
+fn admit_final_prompt_content(
+    policy: ResourceUriUsePolicy,
+    content: &fastmcp_protocol::common_types::ContentBlock,
+) -> McpResult<()> {
+    match content {
+        fastmcp_protocol::common_types::ContentBlock::ResourceLink { uri, .. } => {
+            enforce_final_resource_uri_emission(
+                policy,
+                uri,
+                FinalResourceUriUse::PromptResourceLink,
+            )
+        }
+        fastmcp_protocol::common_types::ContentBlock::Resource { resource, .. } => {
+            enforce_final_resource_uri_emission(
+                policy,
+                embedded_resource_uri(resource),
+                FinalResourceUriUse::PromptEmbeddedResource,
+            )
+        }
+        fastmcp_protocol::common_types::ContentBlock::Text { .. }
+        | fastmcp_protocol::common_types::ContentBlock::Image { .. }
+        | fastmcp_protocol::common_types::ContentBlock::Audio { .. } => Ok(()),
+    }
+}
+
+fn admit_final_prompt_outcome(
+    policy: ResourceUriUsePolicy,
+    outcome: &FinalMethodOutcome<FinalGetPromptResult>,
+) -> McpResult<()> {
+    let FinalMethodOutcome::Complete(result) = outcome else {
+        return Ok(());
+    };
+    for message in &result.payload.messages {
+        admit_final_prompt_content(policy, &message.content)?;
+    }
+    Ok(())
+}
+
 /// Freezes one resource's modern catalog entry during registration.
 ///
 /// Discovery must not call application hooks: a catalog observed by a final
@@ -880,6 +983,7 @@ fn project_final_resource_catalog_entry(
 fn admit_final_resource_definition<H: ResourceHandler + ?Sized>(
     handler: &H,
     resource: &Resource,
+    uri_use_policy: ResourceUriUsePolicy,
 ) -> McpResult<FinalResource> {
     if let Some(definition) =
         crate::catch_extension_unwind(|| handler.final_definition()).map_err(|_payload| {
@@ -891,6 +995,11 @@ fn admit_final_resource_definition<H: ResourceHandler + ?Sized>(
                 "resource exact final URI differs from its legacy definition URI",
             ));
         }
+        admit_final_resource_uri(
+            uri_use_policy,
+            &definition.uri,
+            FinalResourceUriUse::CatalogResource,
+        )?;
         return Ok(definition);
     }
     let (title, icons, annotations, meta) = crate::catch_extension_unwind(|| {
@@ -904,13 +1013,21 @@ fn admit_final_resource_definition<H: ResourceHandler + ?Sized>(
     .map_err(|_payload| {
         McpError::internal_error("resource metadata hook panicked during admission")
     })?;
-    project_final_resource_catalog_entry(resource.clone(), title, icons, annotations, meta)
+    let definition =
+        project_final_resource_catalog_entry(resource.clone(), title, icons, annotations, meta)?;
+    admit_final_resource_uri(
+        uri_use_policy,
+        &definition.uri,
+        FinalResourceUriUse::CatalogResource,
+    )?;
+    Ok(definition)
 }
 
 /// Freezes one resource template's final catalog entry during registration.
 fn admit_final_resource_template_definition<H: ResourceHandler + ?Sized>(
     handler: Option<&H>,
     template: &ResourceTemplate,
+    uri_use_policy: ResourceUriUsePolicy,
 ) -> McpResult<FinalResourceTemplate> {
     if let Some(handler) = handler {
         if let Some(definition) =
@@ -927,6 +1044,7 @@ fn admit_final_resource_template_definition<H: ResourceHandler + ?Sized>(
                     "resource exact final template differs from its legacy template URI",
                 ));
             }
+            admit_final_resource_template_uri(uri_use_policy, &definition.uri_template)?;
             return Ok(definition);
         }
     }
@@ -944,7 +1062,7 @@ fn admit_final_resource_template_definition<H: ResourceHandler + ?Sized>(
         })?,
         None => (None, None, None, None),
     };
-    Ok(FinalResourceTemplate {
+    let definition = FinalResourceTemplate {
         uri_template: template.uri_template.clone(),
         name: template.name.clone(),
         title,
@@ -953,7 +1071,9 @@ fn admit_final_resource_template_definition<H: ResourceHandler + ?Sized>(
         mime_type: template.mime_type.clone(),
         annotations,
         meta,
-    })
+    };
+    admit_final_resource_template_uri(uri_use_policy, &definition.uri_template)?;
+    Ok(definition)
 }
 
 /// Freezes one prompt's final catalog entry during registration.
@@ -1861,8 +1981,27 @@ impl Router {
 
         if let Some(template) = template {
             let (matcher, specificity) = admit_resource_template(&template.uri_template)?;
+            let uri_use_policy = if admit_final {
+                ResourceUriUsePolicy::from_client_direct_https(
+                    crate::catch_extension_unwind(|| handler.final_client_direct_https()).map_err(
+                        |_payload| {
+                            McpError::internal_error(
+                                "resource URI-use policy hook panicked during admission",
+                            )
+                        },
+                    )?,
+                )
+            } else {
+                ResourceUriUsePolicy::server_mediated()
+            };
             let final_definition = admit_final
-                .then(|| admit_final_resource_template_definition(Some(&handler), &template))
+                .then(|| {
+                    admit_final_resource_template_definition(
+                        Some(&handler),
+                        &template,
+                        uri_use_policy,
+                    )
+                })
                 .transpose()?;
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resource_templates.contains_key(&template.uri_template);
@@ -1872,6 +2011,7 @@ impl Router {
                 template: template.clone(),
                 handler: Some(boxed),
                 final_definition,
+                uri_use_policy,
                 legacy_enabled,
             };
             self.resource_templates
@@ -1881,8 +2021,21 @@ impl Router {
             }
             self.rebuild_sorted_template_keys();
         } else {
+            let uri_use_policy = if admit_final {
+                ResourceUriUsePolicy::from_client_direct_https(
+                    crate::catch_extension_unwind(|| handler.final_client_direct_https()).map_err(
+                        |_payload| {
+                            McpError::internal_error(
+                                "resource URI-use policy hook panicked during admission",
+                            )
+                        },
+                    )?,
+                )
+            } else {
+                ResourceUriUsePolicy::server_mediated()
+            };
             let final_definition = admit_final
-                .then(|| admit_final_resource_definition(&handler, &def))
+                .then(|| admit_final_resource_definition(&handler, &def, uri_use_policy))
                 .transpose()?;
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resources.contains_key(&def.uri);
@@ -1899,6 +2052,7 @@ impl Router {
                         AdmittedFinalResourceRegistration {
                             definition: final_definition,
                             tags: def.tags.clone(),
+                            uri_use_policy,
                         },
                     );
                 }
@@ -2007,9 +2161,14 @@ impl Router {
         }
 
         let (matcher, specificity) = admit_resource_template(&key)?;
+        let uri_use_policy = ResourceUriUsePolicy::server_mediated();
         let final_definition = admit_final
             .then(|| {
-                admit_final_resource_template_definition::<dyn ResourceHandler>(None, &template)
+                admit_final_resource_template_definition::<dyn ResourceHandler>(
+                    None,
+                    &template,
+                    uri_use_policy,
+                )
             })
             .transpose()?;
         let needs_rebuild = match self.resource_templates.get_mut(&key) {
@@ -2018,6 +2177,7 @@ impl Router {
                 existing.matcher = matcher;
                 existing.specificity = specificity;
                 existing.final_definition = final_definition;
+                existing.uri_use_policy = uri_use_policy;
                 existing.legacy_enabled = true;
                 false // Key already exists, order unchanged
             }
@@ -2030,6 +2190,7 @@ impl Router {
                         template,
                         handler: None,
                         final_definition,
+                        uri_use_policy,
                         legacy_enabled: true,
                     },
                 );
@@ -2149,6 +2310,19 @@ impl Router {
             }
         }
 
+        let uri_use_policy = if admit_final {
+            ResourceUriUsePolicy::from_client_direct_https(
+                crate::catch_extension_unwind(|| handler.final_client_direct_https()).map_err(
+                    |_payload| {
+                        McpError::internal_error(
+                            "prompt URI-use policy hook panicked during admission",
+                        )
+                    },
+                )?,
+            )
+        } else {
+            ResourceUriUsePolicy::server_mediated()
+        };
         let final_definition = admit_final
             .then(|| admit_final_prompt_definition(&handler, &def))
             .transpose()?;
@@ -2165,6 +2339,7 @@ impl Router {
                     AdmittedFinalPromptRegistration {
                         definition: final_definition,
                         tags: def.tags.clone(),
+                        uri_use_policy,
                     },
                 );
             }
@@ -2462,13 +2637,36 @@ impl Router {
     }
 
     fn resolve_resource(&self, uri: &str) -> Option<ResolvedResource<'_>> {
+        self.resolve_resource_for_era(uri, None)
+    }
+
+    /// Resolves a resource that is visible in one requested protocol era.
+    ///
+    /// A static resource takes precedence only when it is visible to that
+    /// era. Otherwise a resource-template instance from the requested era
+    /// must remain reachable; registrations intentionally keep the two
+    /// catalogs separate.
+    fn resolve_resource_for_era(
+        &self,
+        uri: &str,
+        era: Option<ProtocolEra>,
+    ) -> Option<ResolvedResource<'_>> {
         if let Some(handler) = self.resources.get(uri) {
-            return Some(ResolvedResource {
+            let resolved = ResolvedResource {
                 handler,
                 params: UriParams::new(),
                 final_enabled: self.final_resources.contains_key(uri),
                 legacy_enabled: !self.final_only_resources.contains(uri),
-            });
+                uri_use_policy: self
+                    .final_resources
+                    .get(uri)
+                    .map_or_else(ResourceUriUsePolicy::server_mediated, |entry| {
+                        entry.uri_use_policy
+                    }),
+            };
+            if era.is_none_or(|era| resolved.is_enabled_in(era)) {
+                return Some(resolved);
+            }
         }
 
         // Use pre-sorted template keys to avoid sorting on every lookup
@@ -2487,12 +2685,16 @@ impl Router {
                 };
                 params.insert(name, value);
             }
-            return Some(ResolvedResource {
+            let resolved = ResolvedResource {
                 handler,
                 params,
                 final_enabled: entry.final_definition.is_some(),
                 legacy_enabled: entry.legacy_enabled,
-            });
+                uri_use_policy: entry.uri_use_policy,
+            };
+            if era.is_none_or(|era| resolved.is_enabled_in(era)) {
+                return Some(resolved);
+            }
         }
 
         None
@@ -3145,6 +3347,20 @@ impl Router {
     ) -> McpResult<FinalMrtrDispatch> {
         match (request_state, input_responses) {
             (None, None) => Ok(FinalMrtrDispatch::Fresh),
+            (Some(request_state), None) => {
+                let binding = binding.ok_or_else(|| {
+                    McpError::invalid_params("MRTR retries require session state")
+                })?;
+                match self
+                    .mrtr_exchanges
+                    .accept_state_only_bound(request_state, binding)?
+                {
+                    MrtrRetry::Complete(inputs) => Ok(FinalMrtrDispatch::Resume(inputs)),
+                    MrtrRetry::InputRequired(_) => Err(McpError::internal_error(
+                        "state-only MRTR retry cannot issue further input requests",
+                    )),
+                }
+            }
             (Some(request_state), Some(input_responses)) => {
                 let binding = binding.ok_or_else(|| {
                     McpError::invalid_params("MRTR retries require session state")
@@ -3160,7 +3376,7 @@ impl Router {
                 }
             }
             _ => Err(McpError::invalid_params(
-                "final MRTR retries require both inputResponses and requestState",
+                "final MRTR inputResponses require requestState",
             )),
         }
     }
@@ -3430,8 +3646,15 @@ impl Router {
                     .as_ref()
                     .is_none_or(|filters| filters.matches(&entry.tags))
             })
-            .map(|entry| entry.definition.clone())
-            .collect();
+            .map(|entry| {
+                admit_final_resource_uri(
+                    entry.uri_use_policy,
+                    &entry.definition.uri,
+                    FinalResourceUriUse::CatalogResource,
+                )?;
+                Ok(entry.definition.clone())
+            })
+            .collect::<McpResult<Vec<_>>>()?;
         let (resources, next_cursor) =
             page_final_catalog(resources, params.cursor.as_deref(), self.list_page_size)?;
         Ok(FinalListResourcesResult {
@@ -3461,11 +3684,14 @@ impl Router {
                 entry
                     .final_definition
                     .as_ref()
-                    .map(|definition| (definition, &entry.template.tags))
+                    .map(|definition| (definition, &entry.template.tags, entry.uri_use_policy))
             })
-            .filter(|(_, tags)| filters.as_ref().is_none_or(|filters| filters.matches(tags)))
-            .map(|(definition, _)| definition.clone())
-            .collect();
+            .filter(|(_, tags, _)| filters.as_ref().is_none_or(|filters| filters.matches(tags)))
+            .map(|(definition, _, uri_use_policy)| {
+                admit_final_resource_template_uri(uri_use_policy, &definition.uri_template)?;
+                Ok(definition.clone())
+            })
+            .collect::<McpResult<Vec<_>>>()?;
         let (resource_templates, next_cursor) = page_final_catalog(
             resource_templates,
             params.cursor.as_deref(),
@@ -4047,7 +4273,7 @@ impl Router {
         }
 
         let resolved = self
-            .resolve_resource(&params.uri)
+            .resolve_resource_for_era(&params.uri, Some(ProtocolEra::Legacy2024))
             .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
         if !resolved.legacy_enabled {
             return Err(McpError::resource_not_found(&params.uri));
@@ -4131,7 +4357,7 @@ impl Router {
         }
 
         let resolved = self
-            .resolve_resource(&params.uri)
+            .resolve_resource_for_era(&params.uri, Some(ProtocolEra::Legacy2024))
             .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
         if !resolved.legacy_enabled {
             return Err(McpError::resource_not_found(&params.uri));
@@ -4224,18 +4450,25 @@ impl Router {
             ));
         }
 
-        let resolved = self.resolve_resource(uri).ok_or_else(|| {
-            McpError::with_data(
-                McpErrorCode::InvalidParams,
-                "Resource not found",
-                serde_json::json!({"uri": uri}),
-            )
-        })?;
+        let resolved = self
+            .resolve_resource_for_era(uri, Some(ProtocolEra::Modern2026))
+            .ok_or_else(|| {
+                McpError::with_data(
+                    McpErrorCode::InvalidParams,
+                    "Resource not found",
+                    serde_json::json!({"uri": uri}),
+                )
+            })?;
         if !resolved.final_enabled {
             return Err(McpError::invalid_params(
                 "resource is registered only for exact MCP 2024-11-05 dispatch",
             ));
         }
+        admit_final_resource_uri(
+            resolved.uri_use_policy,
+            &params.uri,
+            FinalResourceUriUse::ResourceReadTarget,
+        )?;
         let cache_hint_provenance = crate::catch_extension_unwind(|| {
             resolved.handler.final_resource_read_cache_hint_provenance()
         })
@@ -4286,6 +4519,7 @@ impl Router {
 
         match outcome {
             Outcome::Ok(mut result) => {
+                admit_final_resource_read_outcome(resolved.uri_use_policy, &result)?;
                 // Provenance, not equality with a wire value, determines
                 // whether router policy owns these hints. An explicit final
                 // handler may intentionally choose the same values as the
@@ -4649,7 +4883,10 @@ impl Router {
             .await?;
 
         match outcome {
-            Outcome::Ok(result) => Ok(result),
+            Outcome::Ok(result) => {
+                admit_final_prompt_outcome(final_registration.uri_use_policy, &result)?;
+                Ok(result)
+            }
             Outcome::Err(error) => Err(sanitize_handler_error(request_ctx.cx(), "prompt", error)),
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "prompt")),
@@ -5278,11 +5515,24 @@ impl Router {
                 specificity,
                 template: mounted_template,
                 handler: mounted_handler,
-                final_definition: entry.final_definition.map(|mut definition| {
-                    definition.uri_template = mounted_uri_template.clone();
-                    definition
-                }),
-                legacy_enabled: entry.legacy_enabled,
+                // A mount prefix produces a relative legacy namespace (for
+                // example, `peer/mcp://...`). It cannot preserve the exact
+                // final absolute-URI contract, so mirror static-resource
+                // mounting and expose the mounted route to legacy only.
+                final_definition: if prefix.is_none() {
+                    entry.final_definition.map(|mut definition| {
+                        definition.uri_template = mounted_uri_template.clone();
+                        definition
+                    })
+                } else {
+                    None
+                },
+                uri_use_policy: entry.uri_use_policy,
+                legacy_enabled: if prefix.is_none() {
+                    entry.legacy_enabled
+                } else {
+                    true
+                },
             };
 
             let needs_order_push = !existed
@@ -5347,11 +5597,23 @@ impl Router {
                     specificity,
                     template: mounted_template,
                     handler: mounted_handler,
-                    final_definition: entry.final_definition.map(|mut definition| {
-                        definition.uri_template = mounted_uri_template.clone();
-                        definition
-                    }),
-                    legacy_enabled: entry.legacy_enabled,
+                    // See the ordered-template path above: prefixed template
+                    // routes are legacy-only because their URI namespace is
+                    // no longer absolute for exact final resource contents.
+                    final_definition: if prefix.is_none() {
+                        entry.final_definition.map(|mut definition| {
+                            definition.uri_template = mounted_uri_template.clone();
+                            definition
+                        })
+                    } else {
+                        None
+                    },
+                    uri_use_policy: entry.uri_use_policy,
+                    legacy_enabled: if prefix.is_none() {
+                        entry.legacy_enabled
+                    } else {
+                        true
+                    },
                 };
 
                 self.resource_templates
@@ -5530,6 +5792,16 @@ struct ResolvedResource<'a> {
     params: UriParams,
     final_enabled: bool,
     legacy_enabled: bool,
+    uri_use_policy: ResourceUriUsePolicy,
+}
+
+impl ResolvedResource<'_> {
+    const fn is_enabled_in(&self, era: ProtocolEra) -> bool {
+        match era {
+            ProtocolEra::Legacy2024 => self.legacy_enabled,
+            ProtocolEra::Modern2026 => self.final_enabled,
+        }
+    }
 }
 
 /// Entry for a resource template with its matcher and optional handler.
@@ -5539,6 +5811,7 @@ pub(crate) struct ResourceTemplateEntry {
     pub(crate) template: ResourceTemplate,
     pub(crate) handler: Option<BoxedResourceHandler>,
     final_definition: Option<FinalResourceTemplate>,
+    uri_use_policy: ResourceUriUsePolicy,
     legacy_enabled: bool,
 }
 
@@ -7577,6 +7850,26 @@ mod router_tests {
         result
     }
 
+    fn state_only_input_required_result(forged_request_state: &str) -> InputRequiredResult {
+        let encoded = serde_json::json!({
+            "resultType": "input_required",
+            "requestState": forged_request_state,
+        })
+        .to_string();
+        let (decoded, diagnostic) = decode_peer_result(
+            &encoded,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("test state-only input-required result decodes");
+        assert!(diagnostic.is_none());
+        let DecodedResult::InputRequired(result) = decoded else {
+            panic!("test result is state-only input_required");
+        };
+        assert!(result.input_requests().is_none());
+        result
+    }
+
     fn router_roots_response_wire() -> serde_json::Value {
         serde_json::to_value(
             MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
@@ -7588,6 +7881,72 @@ mod router_tests {
     struct InputRequiredTool {
         legacy_calls: Arc<AtomicUsize>,
         final_calls: Arc<AtomicUsize>,
+    }
+
+    struct StateOnlyInputRequiredTool {
+        initial_calls: Arc<AtomicUsize>,
+        resumed_calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for StateOnlyInputRequiredTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "state-only-input-required-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text(
+                "legacy state-only input-required result",
+            )])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.initial_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::InputRequired(
+                state_only_input_required_result("handler-forged-state"),
+            ))
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            _ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            _arguments: serde_json::Value,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                let Some(resume_inputs) = resume_inputs else {
+                    return Outcome::Err(McpError::internal_error(
+                        "state-only MRTR resume inputs were lost",
+                    ));
+                };
+                if !resume_inputs.responses().is_empty() {
+                    return Outcome::Err(McpError::internal_error(
+                        "state-only MRTR resume unexpectedly carried inputs",
+                    ));
+                }
+                self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                    FinalCallToolResult {
+                        content: vec![ContentBlock::text("state-only resumed")],
+                        is_error: false,
+                        structured_content: None,
+                    },
+                )))
+            })
+        }
     }
 
     impl ToolHandler for InputRequiredTool {
@@ -7894,6 +8253,211 @@ mod router_tests {
                 },
                 empty_final_result_meta()?,
             ))
+        }
+
+        fn final_resource_read_cache_hint_provenance(
+            &self,
+        ) -> FinalResourceReadCacheHintProvenance {
+            FinalResourceReadCacheHintProvenance::Explicit
+        }
+    }
+
+    struct HttpsCatalogResource {
+        client_direct_https: bool,
+    }
+
+    impl ResourceHandler for HttpsCatalogResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "https://client.example.test/catalog.txt".to_owned(),
+                name: "client-direct-catalog".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn final_client_direct_https(&self) -> bool {
+            self.client_direct_https
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct ClientDirectHttpsPrompt;
+
+    impl PromptHandler for ClientDirectHttpsPrompt {
+        fn definition(&self) -> Prompt {
+            Prompt {
+                name: "client-direct-https-prompt".to_owned(),
+                description: None,
+                arguments: Vec::new(),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn final_client_direct_https(&self) -> bool {
+            true
+        }
+
+        fn get(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<PromptMessage>> {
+            Ok(Vec::new())
+        }
+
+        fn get_final(
+            &self,
+            _ctx: &McpContext,
+            _args: std::collections::HashMap<String, String>,
+        ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+            Ok(CompleteResult::new(
+                FinalGetPromptResult {
+                    description: None,
+                    messages: vec![FinalPromptMessage {
+                        role: fastmcp_protocol::Role::Assistant,
+                        content: ContentBlock::ResourceLink {
+                            icons: None,
+                            name: "client-direct-link".to_owned(),
+                            title: None,
+                            uri: AbsoluteUri::parse("https://client.example.test/prompt-link")
+                                .expect("test HTTPS URI is valid"),
+                            description: None,
+                            mime_type: Some("text/plain".to_owned()),
+                            annotations: None,
+                            size: None,
+                            meta: None,
+                            additional: BTreeMap::new(),
+                        },
+                    }],
+                },
+                empty_final_result_meta()?,
+            ))
+        }
+    }
+
+    struct MrtrHttpsEmbeddedResource {
+        initial_calls: Arc<AtomicUsize>,
+        resumed_calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceHandler for MrtrHttpsEmbeddedResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "mcp://uri-policy/mrtr".to_owned(),
+                name: "uri-policy-mrtr".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn final_client_direct_https(&self) -> bool {
+            true
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+
+        fn read_final_outcome(
+            &self,
+            _ctx: &McpContext,
+        ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+            self.initial_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalMethodOutcome::InputRequired(input_required_result(
+                "uri-policy-mrtr-state",
+            )))
+        }
+
+        fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+            &'a self,
+            _ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            _uri: &'a str,
+            _params: &'a UriParams,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+            Box::pin(async move {
+                let Some(resume_inputs) = resume_inputs else {
+                    return Outcome::Err(McpError::internal_error("MRTR resume inputs were lost"));
+                };
+                if !matches!(resume_inputs.roots("roots"), Ok(Some(_))) {
+                    return Outcome::Err(McpError::internal_error(
+                        "MRTR roots input was not preserved",
+                    ));
+                }
+                self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+                    FinalReadResourceResult {
+                        contents: vec![EmbeddedResourceContents::Text {
+                            uri: AbsoluteUri::parse("https://client.example.test/mrtr-content")
+                                .expect("test HTTPS URI is valid"),
+                            text: "must not be emitted as embedded content".to_owned(),
+                            mime_type: Some("text/plain".to_owned()),
+                            meta: None,
+                            additional: BTreeMap::new(),
+                        }],
+                        ttl_ms: CacheTtl::milliseconds(1),
+                        cache_scope: CacheScope::Private,
+                    },
+                    empty_final_result_meta().expect("empty final metadata is valid"),
+                )))
+            })
+        }
+    }
+
+    struct SentinelHintResource {
+        provenance: FinalResourceReadCacheHintProvenance,
+    }
+
+    impl ResourceHandler for SentinelHintResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///sentinel-hint-resource".to_owned(),
+                name: "sentinel-hint-resource".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+
+        fn read_final(
+            &self,
+            _ctx: &McpContext,
+        ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+            Ok(CompleteResult::new(
+                FinalReadResourceResult {
+                    contents: Vec::new(),
+                    // This is intentionally the former sentinel value. Only
+                    // the explicit provenance may preserve it.
+                    ttl_ms: CacheTtl::milliseconds(DEFAULT_FINAL_RESOURCE_TTL_MS),
+                    cache_scope: CacheScope::Private,
+                },
+                empty_final_result_meta()?,
+            ))
+        }
+
+        fn final_resource_read_cache_hint_provenance(
+            &self,
+        ) -> FinalResourceReadCacheHintProvenance {
+            self.provenance
         }
     }
 
@@ -9748,6 +10312,132 @@ mod router_tests {
                 .get_resource_template("ns/panic-template://{id}")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn prefixed_resource_template_mount_is_legacy_only_after_final_source_dispatch() {
+        struct FinalTemplateResource;
+
+        impl ResourceHandler for FinalTemplateResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "mcp://mounted/template".to_owned(),
+                    name: "mounted-template".to_owned(),
+                    description: None,
+                    mime_type: Some("text/plain".to_owned()),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(marked_template("mcp://mounted/{id}", "mounted-template"))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                unreachable!("templated reads receive their URI parameters")
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                _params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![ResourceContent {
+                    uri: uri.to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    text: Some("source-template".to_owned()),
+                    blob: None,
+                }])
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 191, Budget::INFINITE, &state);
+        let final_metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let mut source = Router::new();
+        source.add_resource(FinalTemplateResource);
+
+        let source_final_read = source
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": final_metadata.clone(),
+                        "uri": "mcp://mounted/item",
+                    })),
+                    191_i64,
+                ),
+            )
+            .expect("the unprefixed final template dispatches");
+        assert_eq!(source_final_read["contents"][0]["text"], "source-template");
+
+        let mut destination = Router::new();
+        let mounted = destination.mount_resources(source, Some("peer"));
+        assert!(mounted.is_success());
+        assert_eq!(mounted.resource_templates, 1);
+
+        let legacy_templates = destination
+            .handle_resource_templates_list(
+                &request_ctx,
+                ListResourceTemplatesParams::default(),
+                None,
+            )
+            .expect("the prefixed template remains in legacy discovery");
+        assert_eq!(
+            legacy_templates.resource_templates[0].uri_template,
+            "peer/mcp://mounted/{id}"
+        );
+        let legacy_read = destination
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: "peer/mcp://mounted/item".to_owned(),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            )
+            .expect("the prefixed template remains readable on the legacy surface");
+        assert_eq!(
+            serde_json::to_value(legacy_read).expect("legacy result serializes")["contents"][0]["text"],
+            "source-template"
+        );
+
+        let final_templates = destination
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/templates/list",
+                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                    192_i64,
+                ),
+            )
+            .expect("prefixed legacy-only templates do not break final discovery");
+        assert_eq!(final_templates["resourceTemplates"], serde_json::json!([]));
+
+        let final_error = destination
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": final_metadata,
+                        "uri": "peer/mcp://mounted/item",
+                    })),
+                    193_i64,
+                ),
+            )
+            .expect_err("the relative mounted namespace is not exposed to final dispatch");
+        assert_eq!(final_error.code, McpErrorCode::InvalidParams);
     }
 
     #[test]
@@ -12668,6 +13358,143 @@ mod router_tests {
     }
 
     #[test]
+    fn resource_template_admission_rejects_bare_literal_percent_without_catalog_mutation() {
+        let accepted = marked_template("mcp://percent/reports%2Fdaily", "percent-template");
+        let rejected = marked_template("mcp://percent/reports%Qdaily", "percent-template");
+        let mut router = Router::new();
+
+        router
+            .add_resource_template_with_behavior(accepted, crate::DuplicateBehavior::Replace)
+            .expect("a complete literal percent triplet is admitted");
+        let catalog_before = serde_json::to_vec(&router.resource_templates())
+            .expect("accepted resource-template catalog serializes");
+
+        let error = router
+            .add_resource_template_with_behavior(rejected, crate::DuplicateBehavior::Replace)
+            .expect_err("changing only the percent triplet to a bare percent is refused");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            serde_json::to_vec(&router.resource_templates())
+                .expect("rejected admission leaves the catalog serializable"),
+            catalog_before,
+            "rejected literal syntax cannot rewrite the advertised template"
+        );
+    }
+
+    #[test]
+    fn resource_resolution_skips_cross_era_static_shadows_for_matching_templates() {
+        struct ShadowTemplate {
+            label: &'static str,
+        }
+
+        impl ResourceHandler for ShadowTemplate {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "mcp://shadow/template".to_owned(),
+                    name: self.label.to_owned(),
+                    description: None,
+                    mime_type: Some("text/plain".to_owned()),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                Some(marked_template("mcp://shadow/{id}", self.label))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                unreachable!("templated reads receive their URI parameters")
+            }
+
+            fn read_with_uri(
+                &self,
+                _ctx: &McpContext,
+                uri: &str,
+                _params: &UriParams,
+            ) -> McpResult<Vec<ResourceContent>> {
+                Ok(vec![ResourceContent {
+                    uri: uri.to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    text: Some(self.label.to_owned()),
+                    blob: None,
+                }])
+            }
+        }
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 190, Budget::INFINITE, &state);
+        let uri = "mcp://shadow/item";
+
+        let mut legacy_router = Router::new();
+        legacy_router
+            .add_legacy_resource_with_behavior(
+                ShadowTemplate {
+                    label: "legacy-template",
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("legacy template registers");
+        legacy_router
+            .add_final_resource_with_behavior(
+                NamedResource::new(uri),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("final-only static resource registers");
+        let legacy_read = legacy_router
+            .handle_resources_read(
+                &request_ctx,
+                &ReadResourceParams {
+                    uri: uri.to_owned(),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            )
+            .expect("a final-only static URI cannot hide a listed legacy template");
+        assert_eq!(
+            serde_json::to_value(legacy_read).expect("legacy result serializes")["contents"][0]["text"],
+            "legacy-template"
+        );
+
+        let mut final_router = Router::new();
+        final_router
+            .add_final_resource_with_behavior(
+                ShadowTemplate {
+                    label: "final-template",
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("final template registers");
+        final_router
+            .add_legacy_resource_with_behavior(
+                NamedResource::new(uri),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("legacy-only static resource registers");
+        let final_read = final_router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "uri": uri,
+                    })),
+                    190_i64,
+                ),
+            )
+            .expect("a legacy-only static URI cannot hide a listed final template");
+        assert_eq!(final_read["contents"][0]["text"], "final-template");
+    }
+
+    #[test]
     fn completion_handler_rejects_one_field_final_metadata_in_legacy_request() {
         let mut router = Router::new();
         router.add_completion_handler(EchoCompletion);
@@ -14254,6 +15081,88 @@ mod router_tests {
     }
 
     #[test]
+    fn modern_mrtr_state_only_retry_round_trips_only_when_input_responses_are_absent() {
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let resumed_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(StateOnlyInputRequiredTool {
+                initial_calls: Arc::clone(&initial_calls),
+                resumed_calls: Arc::clone(&resumed_calls),
+            })
+            .expect("state-only tool registration succeeds");
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 144, Budget::INFINITE, &state);
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let initial = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "state-only-input-required-tool",
+                "arguments": {},
+            })),
+            144_i64,
+        );
+        let input_required = router
+            .dispatch_stateless(&request_ctx, &initial)
+            .expect("state-only handler outcome is framework-bound");
+        assert_eq!(input_required["resultType"], "input_required");
+        assert!(
+            input_required.get("inputRequests").is_none(),
+            "the framework preserves state-only input_required without an empty request map"
+        );
+        let request_state = input_required["requestState"]
+            .as_str()
+            .expect("framework output includes opaque state")
+            .to_owned();
+
+        let retry = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "name": "state-only-input-required-tool",
+                "arguments": {},
+                "requestState": request_state,
+            })),
+            145_i64,
+        );
+        assert!(
+            retry
+                .params
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|params| !params.contains_key("inputResponses")),
+            "the admitted retry keeps inputResponses absent"
+        );
+        let mut explicit_empty = retry.clone();
+        explicit_empty
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("retry parameters are an object")
+            .insert("inputResponses".to_owned(), serde_json::json!({}));
+        let empty_error = router
+            .dispatch_stateless(&request_ctx, &explicit_empty)
+            .expect_err("an explicit empty inputResponses map cannot impersonate an absent member");
+        assert_eq!(empty_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
+
+        let completed = router
+            .dispatch_stateless(&request_ctx, &retry)
+            .expect("the unchanged absent-member retry resumes exactly once");
+        assert_eq!(completed["resultType"], "complete");
+        assert_eq!(completed["content"][0]["text"], "state-only resumed");
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn modern_mrtr_retries_resume_each_method_once_and_refuse_replay_or_kind_mismatch() {
         let tool_final_calls = Arc::new(AtomicUsize::new(0));
         let resource_final_calls = Arc::new(AtomicUsize::new(0));
@@ -14890,6 +15799,202 @@ mod router_tests {
     }
 
     #[test]
+    fn public_final_resource_uri_policy_admits_client_direct_https_and_rejects_only_policy_change_without_mutation()
+     {
+        let client_direct = HttpsCatalogResource {
+            client_direct_https: true,
+        };
+        let server_mediated = HttpsCatalogResource {
+            client_direct_https: false,
+        };
+        assert_eq!(
+            client_direct.definition(),
+            server_mediated.definition(),
+            "the URI-use policy is the sole registration difference"
+        );
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 971, Budget::INFINITE, &state);
+        let final_metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+
+        let mut accepted_router = Router::new();
+        accepted_router
+            .add_resource_with_behavior(client_direct, crate::DuplicateBehavior::Replace)
+            .expect("an explicitly client-direct HTTPS catalog resource is admitted");
+        let accepted = accepted_router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/list",
+                    Some(serde_json::json!({"_meta": final_metadata.clone()})),
+                    971_i64,
+                ),
+            )
+            .expect("public final resource listing succeeds");
+        assert_eq!(
+            accepted["resources"][0]["uri"],
+            "https://client.example.test/catalog.txt"
+        );
+        let direct_read = accepted_router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": final_metadata.clone(),
+                        "uri": "https://client.example.test/catalog.txt",
+                    })),
+                    972_i64,
+                ),
+            )
+            .expect_err("client-direct HTTPS catalog entries are not MCP-read identities");
+        assert_eq!(direct_read.code, McpErrorCode::InvalidParams);
+
+        let mut rejected_router = Router::new();
+        rejected_router.add_resource(NamedResource::new("mcp://uri-policy/unchanged"));
+        let catalog_before =
+            serde_json::to_vec(&rejected_router.resources()).expect("existing catalog serializes");
+        let count_before = rejected_router.resources_count();
+        let error = rejected_router
+            .add_resource_with_behavior(server_mediated, crate::DuplicateBehavior::Replace)
+            .expect_err("changing only to server-mediated policy rejects HTTPS registration");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            rejected_router.resources_count(),
+            count_before,
+            "rejected final admission cannot add or replace a resource handler"
+        );
+        assert_eq!(
+            serde_json::to_vec(&rejected_router.resources()).expect("catalog remains serializable"),
+            catalog_before,
+            "rejected URI-use admission leaves the prior catalog unchanged"
+        );
+        let unchanged = rejected_router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/list",
+                    Some(serde_json::json!({"_meta": final_metadata})),
+                    972_i64,
+                ),
+            )
+            .expect("rejection leaves public final dispatch usable");
+        assert_eq!(unchanged["resources"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            unchanged["resources"][0]["uri"],
+            "mcp://uri-policy/unchanged"
+        );
+    }
+
+    #[test]
+    fn resource_uri_use_policy_leaves_exact_2024_resource_registration_unchanged() {
+        let mut router = Router::new();
+        router
+            .add_legacy_resource_with_behavior(
+                HttpsCatalogResource {
+                    client_direct_https: false,
+                },
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("exact-2024 registration does not consult final URI-use admission");
+
+        let cx = Cx::for_testing();
+        let request_ctx = McpContext::new(cx, 976);
+        let listed = router
+            .handle_resources_list(&request_ctx, ListResourcesParams::default(), None)
+            .expect("exact-2024 listing remains available");
+        assert_eq!(listed.resources.len(), 1);
+        assert_eq!(
+            listed.resources[0].uri,
+            "https://client.example.test/catalog.txt"
+        );
+    }
+
+    #[test]
+    fn public_final_uri_policy_rechecks_prompt_and_mrtr_resource_emissions() {
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let resumed_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_prompt(ClientDirectHttpsPrompt);
+        router.add_resource(MrtrHttpsEmbeddedResource {
+            initial_calls: Arc::clone(&initial_calls),
+            resumed_calls: Arc::clone(&resumed_calls),
+        });
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 973, Budget::INFINITE, &state);
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+
+        let prompt = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/get",
+                    Some(serde_json::json!({
+                        "_meta": metadata.clone(),
+                        "name": "client-direct-https-prompt",
+                    })),
+                    973_i64,
+                ),
+            )
+            .expect("a client-direct HTTPS resource link is emitted from the public prompt path");
+        assert_eq!(
+            prompt["messages"][0]["content"]["uri"],
+            "https://client.example.test/prompt-link"
+        );
+
+        let initial = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": metadata.clone(),
+                        "uri": "mcp://uri-policy/mrtr",
+                    })),
+                    974_i64,
+                ),
+            )
+            .expect("initial public resource request mints MRTR state");
+        assert_eq!(initial["resultType"], "input_required");
+        let request_state = initial["requestState"]
+            .as_str()
+            .expect("framework minted MRTR state")
+            .to_owned();
+        let catalog_before = serde_json::to_vec(&router.resources())
+            .expect("catalog serializes before the resumed rejection");
+        let retry = JsonRpcRequest::new(
+            "resources/read",
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "uri": "mcp://uri-policy/mrtr",
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": request_state,
+            })),
+            975_i64,
+        );
+        let error = router.dispatch_stateless(&request_ctx, &retry).expect_err(
+            "an MRTR-resumed HTTPS embedded resource remains server-mediated and is refused",
+        );
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            serde_json::to_vec(&router.resources()).expect("catalog remains serializable"),
+            catalog_before,
+            "rejected dynamic MRTR output cannot mutate registered resource state"
+        );
+    }
+
+    #[test]
     fn final_prompt_arguments_are_validated_before_handler_and_legacy_is_unchanged() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let legacy_calls = Arc::new(AtomicUsize::new(0));
@@ -15213,6 +16318,51 @@ mod router_tests {
                 if text == "direct final resource result"
                     && mime_type.as_deref() == Some("text/markdown")
         ));
+    }
+
+    #[test]
+    fn resource_read_cache_hint_provenance_controls_router_policy_not_wire_value() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 981, Budget::INFINITE, &state);
+        let request = JsonRpcRequest::new(
+            "resources/read",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "uri": "file:///sentinel-hint-resource",
+            })),
+            981_i64,
+        );
+
+        for (provenance, expected_ttl, expected_scope) in [
+            (
+                FinalResourceReadCacheHintProvenance::Explicit,
+                DEFAULT_FINAL_RESOURCE_TTL_MS,
+                "private",
+            ),
+            (
+                FinalResourceReadCacheHintProvenance::RouterPolicy,
+                17,
+                "public",
+            ),
+        ] {
+            let mut router = Router::new();
+            router.set_final_cache_hint_policy(
+                CacheTtl::milliseconds(17),
+                CacheTtl::milliseconds(23),
+                CacheScope::Public,
+            );
+            router.add_resource(SentinelHintResource { provenance });
+
+            let response = router
+                .dispatch_stateless(&request_ctx, &request)
+                .expect("final resource result dispatches");
+            assert_eq!(response["ttlMs"], expected_ttl);
+            assert_eq!(response["cacheScope"], expected_scope);
+        }
     }
 
     #[test]

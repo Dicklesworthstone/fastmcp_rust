@@ -39,6 +39,86 @@ use crate::proxy::ProxyClient;
 use crate::tasks::FinalTaskWorkDescriptor;
 
 // ============================================================================
+// Final resource URI-use admission
+// ============================================================================
+
+/// The final server emission site for one locally authored resource identity.
+///
+/// This is deliberately narrower than structural [`AbsoluteUri`] admission:
+/// a syntactically valid URI does not by itself grant authority to advertise
+/// it as a client-direct resource or embed it as server-mediated content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalResourceUriUse {
+    /// A resource identity in `resources/list`.
+    CatalogResource,
+    /// A resource-template identity in `resources/templates/list`.
+    CatalogTemplate,
+    /// The target of a locally handled `resources/read` request.
+    ResourceReadTarget,
+    /// One embedded resource identity in a `resources/read` complete result.
+    ResourceReadContents,
+    /// A `resource_link` authored in a final prompt result.
+    PromptResourceLink,
+    /// An embedded resource authored in a final prompt result.
+    PromptEmbeddedResource,
+}
+
+/// Policy governing locally authored final resource identities.
+///
+/// The default keeps every URI server-mediated. An application must opt in
+/// explicitly before an HTTPS identity can be advertised as a client-direct
+/// resource or linked from a prompt. HTTPS identities are never admitted for
+/// server-side `resources/read` handling or embedded resource payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ResourceUriUsePolicy {
+    client_direct_https: bool,
+}
+
+impl ResourceUriUsePolicy {
+    /// Creates the safe default policy for server-mediated resource identities.
+    #[must_use]
+    pub(crate) const fn server_mediated() -> Self {
+        Self {
+            client_direct_https: false,
+        }
+    }
+
+    /// Builds the policy from the public handler declaration.
+    #[must_use]
+    pub(crate) const fn from_client_direct_https(client_direct_https: bool) -> Self {
+        Self {
+            client_direct_https,
+        }
+    }
+
+    /// Returns whether one final URI is admitted at this exact local use site.
+    #[must_use]
+    pub(crate) fn admits(self, uri: &AbsoluteUri, use_site: FinalResourceUriUse) -> bool {
+        if !uri.has_scheme("https") {
+            return true;
+        }
+        self.client_direct_https
+            && matches!(
+                use_site,
+                FinalResourceUriUse::CatalogResource
+                    | FinalResourceUriUse::CatalogTemplate
+                    | FinalResourceUriUse::PromptResourceLink
+            )
+    }
+
+    /// Returns whether a final resource template is admitted at its catalog
+    /// use site. Template syntax is validated separately before this policy
+    /// check; only the RFC 3986 scheme classification is relevant here.
+    #[must_use]
+    pub(crate) fn admits_template(self, uri_template: &str) -> bool {
+        let uses_https = uri_template
+            .split_once(':')
+            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("https"));
+        !uses_https || self.client_direct_https
+    }
+}
+
+// ============================================================================
 // Progress Notification Sender
 // ============================================================================
 
@@ -838,8 +918,8 @@ pub trait ToolHandler: Send + Sync {
 
     /// Returns the legacy diagnostic label for this handler's exact-final schemas.
     ///
-    /// Ordinary and legacy-backed handlers keep local schema admission. An
-    /// The router does not use this forgeable label for admission; exact proxy
+    /// Ordinary and legacy-backed handlers keep local schema admission. The
+    /// router does not use this forgeable label for admission; exact proxy
     /// registration supplies a sealed token through
     /// [`Self::upstream_final_tool_schema_registration`] instead.
     fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
@@ -1082,6 +1162,13 @@ pub trait ToolHandler: Send + Sync {
 pub trait ResourceHandler: Send + Sync {
     /// Returns the resource definition.
     fn definition(&self) -> Resource;
+
+    /// Returns whether locally authored final resource identities may use HTTPS
+    /// at client-direct use sites. Exact MCP 2024-11-05 dispatch never consults
+    /// this declaration.
+    fn final_client_direct_https(&self) -> bool {
+        false
+    }
 
     /// Returns the resource template definition, if this resource uses a URI template.
     fn template(&self) -> Option<ResourceTemplate> {
@@ -1441,6 +1528,13 @@ pub trait ResourceHandler: Send + Sync {
 pub trait PromptHandler: Send + Sync {
     /// Returns the prompt definition.
     fn definition(&self) -> Prompt;
+
+    /// Returns whether resource links authored by this prompt's final result
+    /// may use client-direct HTTPS. Exact MCP 2024-11-05 dispatch never
+    /// consults this declaration.
+    fn final_client_direct_https(&self) -> bool {
+        false
+    }
 
     /// Returns an exact final prompt catalog definition, when this handler
     /// owns one. In particular, argument titles and absent-vs-present
@@ -2038,10 +2132,6 @@ impl ToolHandler for MountedToolHandler {
         self.inner.timeout()
     }
 
-    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
-        self.inner.final_resource_read_cache_hint_provenance()
-    }
-
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         self.inner.call(ctx, arguments)
     }
@@ -2322,6 +2412,10 @@ impl ResourceHandler for MountedResourceHandler {
         def
     }
 
+    fn final_client_direct_https(&self) -> bool {
+        self.inner.final_client_direct_https()
+    }
+
     fn template(&self) -> Option<ResourceTemplate> {
         self.mounted_template.clone()
     }
@@ -2372,6 +2466,10 @@ impl ResourceHandler for MountedResourceHandler {
 
     fn timeout(&self) -> Option<Duration> {
         self.inner.timeout()
+    }
+
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        self.inner.final_resource_read_cache_hint_provenance()
     }
 
     fn read(&self, ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
@@ -2634,6 +2732,10 @@ impl PromptHandler for MountedPromptHandler {
         let mut def = self.inner.definition();
         def.name.clone_from(&self.mounted_name);
         def
+    }
+
+    fn final_client_direct_https(&self) -> bool {
+        self.inner.final_client_direct_https()
     }
 
     fn final_title(&self) -> Option<&str> {
@@ -3778,6 +3880,12 @@ mod tests {
                 FinalToolSchemaAuthority::Upstream
             }
 
+            fn upstream_final_tool_schema_registration(
+                &self,
+            ) -> Option<UpstreamFinalToolSchemaRegistration> {
+                Some(UpstreamFinalToolSchemaRegistration::exact_proxy())
+            }
+
             fn call(
                 &self,
                 _ctx: &McpContext,
@@ -3795,6 +3903,10 @@ mod tests {
             mounted.final_tool_schema_authority(),
             FinalToolSchemaAuthority::Upstream,
             "mounting must not turn an exact-final proxy into a locally validated handler"
+        );
+        assert!(
+            mounted.upstream_final_tool_schema_registration().is_some(),
+            "mounting must retain the sealed upstream-schema registration"
         );
         assert_eq!(
             mounted
