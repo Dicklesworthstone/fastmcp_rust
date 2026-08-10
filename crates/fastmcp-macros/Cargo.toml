@@ -16,6 +16,7 @@ categories = ["development-tools::procedural-macro-helpers"]
 proc-macro = true
 
 [dependencies]
+fastmcp-protocol.workspace = true
 proc-macro2 = "=1.0.107"
 proc-macro-crate.workspace = true
 quote = "=1.0.47"

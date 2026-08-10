@@ -476,10 +476,17 @@ mod helper_tests {
     use super::{extract_template_params, to_pascal_case};
 
     #[test]
-    fn template_params_basic() {
-        let params = extract_template_params("users/{id}/posts/{post_id}")
-            .expect("simple template parameters parse");
-        assert_eq!(params, vec!["id", "post_id"]);
+    fn template_params_use_reversible_protocol_template() {
+        let params = extract_template_params("mcp://resource{/collection}/manifest{?revision}")
+            .expect("the protocol's reversible template subset parses");
+        assert_eq!(params, vec!["collection", "revision"]);
+    }
+
+    #[test]
+    fn template_params_flatten_every_variable_in_named_expression() {
+        let params = extract_template_params("mcp://resource{?collection*,revision*}")
+            .expect("the protocol's reversible multi-variable expression parses");
+        assert_eq!(params, vec!["collection", "revision"]);
     }
 
     #[test]
@@ -497,37 +504,16 @@ mod helper_tests {
     }
 
     #[test]
-    fn template_params_adjacent_braces() {
-        let params = extract_template_params("{a}{b}").expect("adjacent expressions parse");
-        assert_eq!(params, vec!["a", "b"]);
-    }
-
-    #[test]
-    fn template_params_parse_level_four_operators_varlists_and_modifiers() {
-        let params = extract_template_params(
-            "mcp://resource{/collection}{?revision,locale*}{+path:12}{#fragment}{.label}{;matrix}{&continuation}",
-        )
-        .expect("level-four template expressions parse");
+    fn template_params_reject_one_lossy_prefix_via_protocol_template() {
+        let accepted = "mcp://resource{/collection}/manifest{?revision}";
+        let rejected = "mcp://resource{/collection:3}/manifest{?revision}";
         assert_eq!(
-            params,
-            vec![
-                "collection",
-                "revision",
-                "locale",
-                "path",
-                "fragment",
-                "label",
-                "matrix",
-                "continuation",
-            ]
+            extract_template_params(accepted).expect("unmodified template is reversible"),
+            vec!["collection", "revision"]
         );
-    }
-
-    #[test]
-    fn template_params_reject_one_variable_malformed_prefix() {
-        let error = extract_template_params("mcp://resource/{item:0}")
-            .expect_err("zero-valued prefix modifier is malformed");
-        assert!(error.contains("positive decimal prefix"));
+        let error = extract_template_params(rejected)
+            .expect_err("changing only one variable to a lossy prefix is rejected");
+        assert!(error.contains("URI template cannot be reverse matched"));
     }
 
     #[test]
@@ -557,166 +543,31 @@ mod helper_tests {
     }
 }
 
-/// Extracts RFC 6570 Level 4 variable names from a URI template string.
+/// Extracts reversible RFC 6570 variable names from a URI template string.
 ///
-/// The resource macro needs Rust argument names, not expression syntax. This
-/// parser therefore removes expression operators and varspec modifiers before
-/// returning each variable name: `{?revision,locale*}` becomes `revision` and
-/// `locale`, while `{+path:12}` becomes `path`.
+/// Resource macro admission intentionally shares the protocol parser and
+/// reversible matcher compiler with Router registration. The macro needs Rust
+/// argument names, not expression syntax, so it returns every variable from
+/// each admitted reversible expression in source order.
 fn extract_template_params(uri: &str) -> Result<Vec<String>, String> {
-    let mut params = Vec::new();
-    let bytes = uri.as_bytes();
-    let mut cursor = 0;
+    let matcher = fastmcp_protocol::UriTemplate::parse(uri)
+        .map_err(|error| format!("invalid RFC 6570 URI template: {error}"))?
+        .compile_reversible()
+        .map_err(|error| format!("URI template is not reversible: {error}"))?;
 
-    while cursor < bytes.len() {
-        match bytes[cursor] {
-            b'{' => {
-                let expression_start = cursor;
-                cursor += 1;
-                let body_start = cursor;
-                while cursor < bytes.len() && bytes[cursor] != b'}' {
-                    if bytes[cursor] == b'{' {
-                        return Err(format!(
-                            "nested '{{' in URI-template expression starting at byte {expression_start}"
-                        ));
-                    }
-                    cursor += 1;
-                }
-                if cursor == bytes.len() {
-                    return Err(format!(
-                        "unterminated URI-template expression starting at byte {expression_start}"
-                    ));
-                }
-                params.extend(parse_template_expression(
-                    &uri[body_start..cursor],
-                    body_start,
-                )?);
-                cursor += 1;
-            }
-            b'}' => {
-                return Err(format!("unmatched '}}' in URI template at byte {cursor}"));
-            }
-            b'%' if cursor + 2 < bytes.len()
-                && bytes[cursor + 1].is_ascii_hexdigit()
-                && bytes[cursor + 2].is_ascii_hexdigit() =>
-            {
-                cursor += 3;
-            }
-            b'%' => {
-                return Err(format!(
-                    "invalid percent-encoding in URI template at byte {cursor}"
-                ));
-            }
-            _ => cursor += 1,
-        }
-    }
-
-    Ok(params)
-}
-
-/// Parses one RFC 6570 expression body, excluding its surrounding braces.
-fn parse_template_expression(expression: &str, byte_offset: usize) -> Result<Vec<String>, String> {
-    if expression.is_empty() {
-        return Err(format!(
-            "empty URI-template expression at byte {byte_offset}"
-        ));
-    }
-
-    let mut variable_offset = byte_offset;
-    let variable_list = match expression.as_bytes()[0] {
-        b'+' | b'#' | b'.' | b'/' | b';' | b'?' | b'&' => {
-            variable_offset += 1;
-            &expression[1..]
-        }
-        _ => expression,
-    };
-
-    if variable_list.is_empty() {
-        return Err(format!(
-            "URI-template operator at byte {byte_offset} requires a variable list"
-        ));
-    }
-
-    let mut variables = Vec::new();
-    for variable in variable_list.split(',') {
-        if variable.is_empty() {
-            return Err(format!(
-                "empty URI-template variable in expression at byte {variable_offset}"
-            ));
-        }
-        variables.push(parse_template_variable(variable, variable_offset)?);
-        variable_offset += variable.len() + 1;
-    }
-    Ok(variables)
-}
-
-/// Parses an RFC 6570 varspec and returns only its variable name.
-fn parse_template_variable(variable: &str, byte_offset: usize) -> Result<String, String> {
-    let (variable, exploded) = match variable.strip_suffix('*') {
-        Some(name) => (name, true),
-        None => (variable, false),
-    };
-
-    let (name, prefix) = match variable.rsplit_once(':') {
-        Some((name, prefix)) => (name, Some(prefix)),
-        None => (variable, None),
-    };
-
-    if exploded && prefix.is_some() {
-        return Err(format!(
-            "URI-template variable at byte {byte_offset} cannot combine ':' and '*' modifiers"
-        ));
-    }
-    if let Some(prefix) = prefix {
-        let prefix_bytes = prefix.as_bytes();
-        if prefix_bytes.len() > 4
-            || !matches!(prefix_bytes.first(), Some(b'1'..=b'9'))
-            || !prefix_bytes.iter().all(u8::is_ascii_digit)
-        {
-            return Err(format!(
-                "URI-template variable at byte {byte_offset} requires a positive decimal prefix of at most four digits"
-            ));
-        }
-    }
-
-    validate_template_variable_name(name, byte_offset)?;
-    Ok(name.to_owned())
-}
-
-/// Validates RFC 6570 `varname = varchar *( "." varchar )` syntax.
-fn validate_template_variable_name(name: &str, byte_offset: usize) -> Result<(), String> {
-    if name.is_empty() {
-        return Err(format!("empty URI-template variable at byte {byte_offset}"));
-    }
-
-    for component in name.split('.') {
-        if component.is_empty() {
-            return Err(format!(
-                "URI-template variable at byte {byte_offset} has an empty dotted name component"
-            ));
-        }
-
-        let bytes = component.as_bytes();
-        let mut cursor = 0;
-        while cursor < bytes.len() {
-            match bytes[cursor] {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' => cursor += 1,
-                b'%' if cursor + 2 < bytes.len()
-                    && bytes[cursor + 1].is_ascii_hexdigit()
-                    && bytes[cursor + 2].is_ascii_hexdigit() =>
-                {
-                    cursor += 3;
-                }
-                _ => {
-                    return Err(format!(
-                        "invalid URI-template variable name at byte {}",
-                        byte_offset + cursor
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
+    Ok(matcher
+        .template()
+        .parts()
+        .iter()
+        .flat_map(|part| match part {
+            fastmcp_protocol::UriTemplatePart::Literal(_) => Vec::new(),
+            fastmcp_protocol::UriTemplatePart::Expression(expression) => expression
+                .variables()
+                .iter()
+                .map(|variable| variable.name().to_owned())
+                .collect(),
+        })
+        .collect())
 }
 
 /// Converts a snake_case identifier to PascalCase.
@@ -2167,7 +2018,7 @@ fn generate_prompt_mrtr_outcome_methods(
     };
     let initial_invocation = if is_async {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = async move {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = async move {
                 #(#param_extractions)*
                 let result = #async_invocation;
                 #conversion
@@ -2175,7 +2026,7 @@ fn generate_prompt_mrtr_outcome_methods(
         }
     } else {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = (|| {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = (|| {
                 #(#param_extractions)*
                 let result = #sync_invocation;
                 #conversion
@@ -2184,7 +2035,7 @@ fn generate_prompt_mrtr_outcome_methods(
     };
     let resumed_invocation = if is_async {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = async move {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = async move {
                 #(#param_extractions)*
                 let #resume_name: #resume_type = resume_inputs;
                 let result = #async_invocation;
@@ -2193,7 +2044,7 @@ fn generate_prompt_mrtr_outcome_methods(
         }
     } else {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = (|| {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = (|| {
                 #(#param_extractions)*
                 let #resume_name: #resume_type = resume_inputs;
                 let result = #sync_invocation;
@@ -2214,7 +2065,7 @@ fn generate_prompt_mrtr_outcome_methods(
             ctx: &'a fastmcp_core::McpContext,
             _request_cx: &'a fastmcp_core::Cx,
             arguments: std::collections::HashMap<String, String>,
-        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>>> {
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>>> {
             Box::pin(async move {
                 let _ = ctx;
                 let _ = &arguments;
@@ -2229,7 +2080,7 @@ fn generate_prompt_mrtr_outcome_methods(
             _request_cx: &'a fastmcp_core::Cx,
             arguments: std::collections::HashMap<String, String>,
             resume_inputs: Option<&'a fastmcp_server::bidirectional::MrtrCompletedInputs>,
-        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>>> {
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>>> {
             Box::pin(async move {
                 let _ = ctx;
                 let _ = &arguments;
@@ -2440,6 +2291,55 @@ fn generate_final_resource_outcome_conversion(output: &syn::ReturnType) -> Optio
     }
 }
 
+/// Emits the canonical final resource-outcome hook for a non-resumable macro
+/// handler. Resumable handlers need a second hook that receives admitted MRTR
+/// inputs and are generated by `generate_resource_mrtr_outcome_methods`.
+fn generate_resource_final_outcome_method(
+    is_async: bool,
+    fn_name: &Ident,
+    call_args: &TokenStream2,
+    param_extractions: &[TokenStream2],
+    conversion: &TokenStream2,
+) -> TokenStream2 {
+    let invocation = if is_async {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
+                #(#param_extractions)*
+                let result = #fn_name(#call_args).await;
+                #conversion
+            }.await;
+        }
+    } else {
+        quote! {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
+                #(#param_extractions)*
+                let result = #fn_name(#call_args);
+                #conversion
+            })();
+        }
+    };
+
+    quote! {
+        fn read_final_outcome_async_with_uri_in_request<'a>(
+            &'a self,
+            ctx: &'a fastmcp_core::McpContext,
+            _request_cx: &'a fastmcp_core::Cx,
+            _uri: &'a str,
+            uri_params: &'a std::collections::HashMap<String, String>,
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>>> {
+            Box::pin(async move {
+                let _ = ctx;
+                let _ = uri_params;
+                #invocation
+                match result {
+                    Ok(value) => fastmcp_core::Outcome::Ok(value),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
+        }
+    }
+}
+
 fn generate_final_legacy_rejection(handler: &str, final_hook: &str) -> TokenStream2 {
     let message = format!("final #[{handler}] handlers must be invoked through {final_hook}");
     quote! {
@@ -2455,6 +2355,7 @@ fn generate_resource_execution_methods(
     param_extractions: &[TokenStream2],
     result_conversion: &TokenStream2,
     final_result_conversion: Option<&TokenStream2>,
+    final_outcome_conversion: Option<&TokenStream2>,
 ) -> TokenStream2 {
     let modern_request_methods = quote! {
         fn read_async_with_uri_in_request<'a>(
@@ -2485,6 +2386,16 @@ fn generate_resource_execution_methods(
             self.read_final_async_with_uri(ctx, uri, uri_params)
         }
     };
+    let final_outcome_method =
+        final_outcome_conversion.map_or_else(TokenStream2::new, |conversion| {
+            generate_resource_final_outcome_method(
+                is_async,
+                fn_name,
+                call_args,
+                param_extractions,
+                conversion,
+            )
+        });
     if !is_async {
         let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
             quote! {
@@ -2563,6 +2474,7 @@ fn generate_resource_execution_methods(
         return quote! {
             #legacy_methods
             #final_method
+            #final_outcome_method
             #modern_request_methods
         };
     }
@@ -2676,6 +2588,7 @@ fn generate_resource_execution_methods(
     quote! {
         #legacy_methods
         #final_method
+        #final_outcome_method
         #modern_request_methods
     }
 }
@@ -2685,11 +2598,11 @@ fn generate_resource_execution_methods(
 mod async_handler_expansion_tests {
     use super::{
         ToolAttrs, found_crate_path, generate_final_prompt_result_conversion,
-        generate_final_resource_result_conversion, generate_final_tool_outcome_conversion,
-        generate_final_tool_payload_projection, generate_final_tool_result_conversion,
-        generate_prompt_execution_methods, generate_resource_execution_methods,
-        generate_tool_execution_methods, generate_tool_tasks_declaration,
-        validate_final_handler_return, validate_tool_tasks_return,
+        generate_final_resource_outcome_conversion, generate_final_resource_result_conversion,
+        generate_final_tool_outcome_conversion, generate_final_tool_payload_projection,
+        generate_final_tool_result_conversion, generate_prompt_execution_methods,
+        generate_resource_execution_methods, generate_tool_execution_methods,
+        generate_tool_tasks_declaration, validate_final_handler_return, validate_tool_tasks_return,
     };
     use proc_macro_crate::FoundCrate;
     use quote::{format_ident, quote};
@@ -2723,7 +2636,7 @@ mod async_handler_expansion_tests {
     #[test]
     fn async_resource_expansion_awaits_without_runtime_reentry() {
         let fn_name = format_ident!("example_resource");
-        let tokens = generate_resource_execution_methods(
+        let generated = generate_resource_execution_methods(
             true,
             &fn_name,
             &quote! { ctx },
@@ -2731,9 +2644,10 @@ mod async_handler_expansion_tests {
             &[],
             &quote! { Ok(vec![]) },
             None,
+            None,
         );
 
-        assert_direct_async_expansion(tokens, "fn read_async_with_uri");
+        assert_direct_async_expansion(generated, "fn read_async_with_uri");
     }
 
     #[test]
@@ -2820,6 +2734,7 @@ mod async_handler_expansion_tests {
             &[],
             &quote! { Ok(vec![]) },
             Some(&resource_conversion),
+            None,
         )
         .to_string();
         assert!(
@@ -2849,6 +2764,38 @@ mod async_handler_expansion_tests {
         .to_string();
         assert!(prompt.contains("fn get_async_in_request"), "{prompt}");
         assert!(prompt.contains("fn get_final_async_in_request"), "{prompt}");
+    }
+
+    #[test]
+    fn async_final_resource_outcome_expands_the_router_outcome_hook() {
+        let resource_name = format_ident!("async_final_resource_outcome");
+        let resource_output: syn::ReturnType = syn::parse_quote!(
+            -> fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>
+        );
+        let outcome_conversion = generate_final_resource_outcome_conversion(&resource_output)
+            .expect("final resource outcome selects the final outcome hook");
+        let generated = generate_resource_execution_methods(
+            true,
+            &resource_name,
+            &quote! { ctx, collection, revision },
+            "mcp://resource{?collection*,revision*}",
+            &[
+                quote! { let collection: String = uri_params.get("collection").expect("collection").clone(); },
+                quote! { let revision: String = uri_params.get("revision").expect("revision").clone(); },
+            ],
+            &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
+            None,
+            Some(&outcome_conversion),
+        );
+
+        assert_direct_async_expansion(
+            generated.clone(),
+            "fn read_final_outcome_async_with_uri_in_request",
+        );
+        let tokens = generated.to_string();
+        assert!(tokens.contains("FinalMethodOutcome"), "{tokens}");
+        assert!(tokens.contains("collection"), "{tokens}");
+        assert!(tokens.contains("revision"), "{tokens}");
     }
 
     #[test]
@@ -3100,6 +3047,7 @@ mod async_handler_expansion_tests {
             &resource_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&resource_conversion),
+            None,
         )
         .to_string();
         let (resource_legacy_hook, resource_final_hook) = resource_tokens
@@ -3130,6 +3078,7 @@ mod async_handler_expansion_tests {
             &resource_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&resource_conversion),
+            None,
         );
         assert_direct_async_expansion(
             resource_async_tokens.clone(),
@@ -3511,7 +3460,7 @@ fn generate_resource_mrtr_outcome_methods(
 ) -> TokenStream2 {
     let initial_invocation = if is_async {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
                 #(#param_extractions)*
                 let result = #fn_name(#call_args).await;
                 #conversion
@@ -3519,7 +3468,7 @@ fn generate_resource_mrtr_outcome_methods(
         }
     } else {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
                 #(#param_extractions)*
                 let result = #fn_name(#call_args);
                 #conversion
@@ -3528,7 +3477,7 @@ fn generate_resource_mrtr_outcome_methods(
     };
     let resumed_invocation = if is_async {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
                 #(#param_extractions)*
                 let #resume_name: #resume_type = resume_inputs;
                 let result = #fn_name(#call_args).await;
@@ -3537,7 +3486,7 @@ fn generate_resource_mrtr_outcome_methods(
         }
     } else {
         quote! {
-            let result: fastmcp_core::McpResult<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
+            let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
                 #(#param_extractions)*
                 let #resume_name: #resume_type = resume_inputs;
                 let result = #fn_name(#call_args);
@@ -3559,7 +3508,7 @@ fn generate_resource_mrtr_outcome_methods(
             _request_cx: &'a fastmcp_core::Cx,
             _uri: &'a str,
             uri_params: &'a std::collections::HashMap<String, String>,
-        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>>> {
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>>> {
             Box::pin(async move {
                 let _ = ctx;
                 let _ = uri_params;
@@ -3575,7 +3524,7 @@ fn generate_resource_mrtr_outcome_methods(
             _uri: &'a str,
             uri_params: &'a std::collections::HashMap<String, String>,
             resume_inputs: Option<&'a fastmcp_server::bidirectional::MrtrCompletedInputs>,
-        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::handler::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>>> {
+        ) -> fastmcp_server::BoxFuture<'a, fastmcp_core::McpOutcome<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>>> {
             Box::pin(async move {
                 let _ = ctx;
                 let _ = uri_params;
@@ -4860,6 +4809,10 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         &param_extractions,
         &resource_result_conversion,
         final_result_conversion.as_ref(),
+        mrtr_resume_param
+            .is_none()
+            .then_some(final_outcome_conversion.as_ref())
+            .flatten(),
     );
     let mrtr_outcome_methods = match (mrtr_resume_param, final_outcome_conversion.as_ref()) {
         (Some((name, ty)), Some(conversion)) => generate_resource_mrtr_outcome_methods(
