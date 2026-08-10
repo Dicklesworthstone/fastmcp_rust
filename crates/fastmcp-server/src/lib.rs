@@ -20451,18 +20451,12 @@ mod lib_unit_tests {
                             };
                         }
                     }
-                    // A waker-immediate yield keeps this cooperative without
-                    // depending on the contended global block_on timer slot.
-                    let mut yielded = false;
-                    std::future::poll_fn(|task_cx| {
-                        if std::mem::replace(&mut yielded, true) {
-                            std::task::Poll::Ready(())
-                        } else {
-                            task_cx.waker().wake_by_ref();
-                            std::task::Poll::Pending
-                        }
-                    })
-                    .await;
+                    // A fair yield keeps this cooperative: spawned task
+                    // timers do not fire while the harness main thread owns
+                    // block_on (a timer park would freeze the tool forever),
+                    // and a hand-rolled immediate self-wake can starve
+                    // sibling tasks of the runtime.
+                    asupersync::runtime::yield_now().await;
                 }
             })
         }
@@ -24562,6 +24556,9 @@ mod lib_unit_tests {
                     CancelKind::Shutdown,
                     Some("shutdown-fence cancellation before H1 response"),
                 );
+                // The parked accept only wakes on I/O; poke the listener so
+                // the serve loop observes the shutdown cancellation.
+                let _ = std::net::TcpStream::connect(address);
             } else {
                 controller.release(REQUEST_ID as u64);
             }
