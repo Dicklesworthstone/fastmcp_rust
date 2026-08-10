@@ -24,5 +24,10 @@ sha2 = { workspace = true }
 url = { workspace = true }
 zeroize = { workspace = true }
 
+[dev-dependencies]
+# Unit tests exercise asupersync's deliberately test-only context constructors.
+# This edge is absent from the published production dependency graph.
+asupersync = { workspace = true, features = ["test-internals"] }
+
 [lints]
 workspace = true

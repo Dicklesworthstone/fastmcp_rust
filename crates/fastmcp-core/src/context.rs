@@ -1858,6 +1858,17 @@ impl McpContext {
         self.ensure_live().is_err()
     }
 
+    /// Returns the cooperative cancellation domain owned by this request.
+    ///
+    /// Long-running framework integrations may await this handle instead of
+    /// polling [`Self::is_cancelled`].  Cloning the handle never grants a way
+    /// to replace the request's cancellation authority; it observes the same
+    /// request-local transition installed before dispatch.
+    #[must_use]
+    pub fn request_cancellation(&self) -> McpRequestCancellation {
+        self.request_cancellation.clone()
+    }
+
     /// Checks terminal request liveness without charging a poll or cost unit.
     ///
     /// A finite quota that was exactly depleted is not itself a failed
@@ -3529,6 +3540,18 @@ mod tests {
         assert!(request.checkpoint().is_err());
         assert!(sibling.ensure_live().is_ok());
         assert!(!cx.is_cancel_requested());
+    }
+
+    #[test]
+    fn context_exposes_its_request_local_cancellation_handle() {
+        let cancellation = McpRequestCancellation::new();
+        let context =
+            McpContext::new(Cx::for_testing(), 1).with_request_cancellation(cancellation.clone());
+
+        let observed = context.request_cancellation();
+        assert!(observed.cancel());
+        assert!(cancellation.is_cancel_requested());
+        assert!(context.is_cancelled());
     }
 
     #[test]

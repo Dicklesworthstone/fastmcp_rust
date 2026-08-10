@@ -1182,5 +1182,8 @@ pub use uri::{
     UserinfoPolicy,
 };
 
-// Re-export key asupersync types for convenience
-pub use asupersync::{Budget, Cx, LabConfig, LabRuntime, Outcome, RegionId, Scope, TaskId};
+// Re-export production-safe asupersync types for convenience.  Lab runtime
+// internals are intentionally exposed only by the facade's `testing-lab`
+// feature, so downstream production code cannot acquire them by depending on
+// `fastmcp-core` directly.
+pub use asupersync::{Budget, Cx, Outcome, RegionId, Scope, TaskId};
