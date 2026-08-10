@@ -28,6 +28,7 @@ use fastmcp_rust::{
     ProtocolEra, ProtocolPolicy, ResourceHandler, Role, SseLimits, ToolHandler, auto, core,
     legacy_2024, modern, prompt, resource, tool,
 };
+use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
 const PUBLIC_HTTP_TOOL_NAME: &str = "public-http-e2e-tool";
@@ -288,7 +289,7 @@ impl HttpServerFixture {
                     cx.set_cancel_requested(true);
                     return Err("HTTP E2E server control receiver went away".to_owned());
                 }
-                let builder = modern::ServerBuilder::new("facade-http-example", "1.0.0")
+                let builder = ServerBuilder::new("facade-http-example", "1.0.0")
                     .protocol_policy(protocol_policy)
                     .expect("the fixture selects an available protocol policy");
                 let builder = builder

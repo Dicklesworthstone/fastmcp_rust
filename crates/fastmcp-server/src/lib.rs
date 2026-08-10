@@ -22625,6 +22625,50 @@ mod lib_unit_tests {
         }
     }
 
+    struct LiveModernHttpPeerCancellationTool {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+        observed_cancellation: Arc<AtomicBool>,
+    }
+
+    impl ToolHandler for LiveModernHttpPeerCancellationTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "live_modern_http_peer_cancellation_tool".to_owned(),
+                description: Some(
+                    "Proves ordinary modern JSON peer close reaches only its handler".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.started.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !self.release.load(Ordering::Acquire)
+                && !ctx.is_cancelled()
+                && Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            if ctx.is_cancelled() {
+                self.observed_cancellation.store(true, Ordering::Release);
+                return Err(McpError::request_cancelled());
+            }
+            if !self.release.load(Ordering::Acquire) {
+                return Err(McpError::internal_error(
+                    "ordinary modern JSON peer cancellation did not reach the handler",
+                ));
+            }
+            Ok(vec![Content::text("ordinary modern JSON request completed")])
+        }
+    }
+
     struct LiveHttpShutdownTool {
         name: &'static str,
         cooperate_with_cancellation: bool,
