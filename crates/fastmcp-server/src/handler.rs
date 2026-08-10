@@ -2038,10 +2038,6 @@ impl ToolHandler for MountedToolHandler {
         self.inner.timeout()
     }
 
-    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
-        self.inner.final_resource_read_cache_hint_provenance()
-    }
-
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         self.inner.call(ctx, arguments)
     }

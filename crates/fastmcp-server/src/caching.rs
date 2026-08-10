@@ -885,7 +885,7 @@ impl LruCache {
 }
 
 /// Cache statistics.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheStats {
     /// Number of hits from cache-eligible partitioned or standalone lookups.
     pub hits: u64,

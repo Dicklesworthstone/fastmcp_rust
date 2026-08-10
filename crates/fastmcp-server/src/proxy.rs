@@ -3335,10 +3335,11 @@ mod tests {
 
     use super::{
         MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-        ProxyClient, ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
-        ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyUpstreamAdapter,
-        ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, admit_legacy_interleaved_control_frame,
-        decode_modern_server_notification, forward_modern_progress_notification,
+        ProxyClient, ProxyFinalCatalog, ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler,
+        ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
+        ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+        admit_legacy_interleaved_control_frame, decode_modern_server_notification,
+        final_tool_legacy_fallback, forward_modern_progress_notification,
         legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
     use crate::handler::{FinalToolSchemaAuthority, PromptHandler, ToolHandler};
