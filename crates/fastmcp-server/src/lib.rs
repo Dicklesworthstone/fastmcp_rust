@@ -5650,6 +5650,16 @@ fn next_modern_http_stream_generation() -> u64 {
     }
 }
 
+fn next_live_modern_http_response_body_generation() -> u64 {
+    loop {
+        let generation =
+            NEXT_LIVE_MODERN_HTTP_RESPONSE_BODY_GENERATION.fetch_add(1, Ordering::Relaxed);
+        if generation != 0 {
+            return generation;
+        }
+    }
+}
+
 fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointResponse) -> HttpResponse {
     match response {
         ServerHttpEndpointResponse::Immediate(response) => response,
@@ -5955,6 +5965,23 @@ async fn serve_http_connection(
         };
         match response {
             Ok(Ok((inbound, request, response))) => {
+                let response_body_generation = next_live_modern_http_response_body_generation();
+                let live_session = match modern_sessions.register_response_body(
+                    response_body_generation,
+                    Arc::clone(&live_session),
+                ) {
+                    Ok(()) => live_session,
+                    Err(live_session) => {
+                        close_detached_modern_http_session(&modern_sessions, live_session);
+                        let _ = send_h1_response(
+                            cx,
+                            &mut framed,
+                            HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 let stream = framed.into_inner();
                 let _ = send_modern_sse_stream(
                     cx,
@@ -5968,6 +5995,11 @@ async fn serve_http_connection(
                     response,
                 )
                 .await;
+                if let Some(live_session) =
+                    modern_sessions.take_response_body(response_body_generation)
+                {
+                    close_detached_modern_http_session(&modern_sessions, live_session);
+                }
                 return;
             }
             Ok(Err(response)) => {
