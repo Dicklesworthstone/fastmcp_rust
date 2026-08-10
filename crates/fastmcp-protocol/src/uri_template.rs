@@ -109,9 +109,9 @@ impl From<&str> for TemplateValue {
 /// configure away the crate-level safety caps.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UriTemplateExpansionLimits {
-    max_output_bytes: usize,
-    max_composite_items: usize,
-    max_value_bytes: usize,
+    output_bytes: usize,
+    composite_items: usize,
+    value_bytes: usize,
 }
 
 impl UriTemplateExpansionLimits {
@@ -143,37 +143,37 @@ impl UriTemplateExpansionLimits {
             });
         }
         Ok(Self {
-            max_output_bytes,
-            max_composite_items,
-            max_value_bytes,
+            output_bytes: max_output_bytes,
+            composite_items: max_composite_items,
+            value_bytes: max_value_bytes,
         })
     }
 
     /// Returns the maximum output bytes permitted by this configuration.
     #[must_use]
     pub const fn max_output_bytes(self) -> usize {
-        self.max_output_bytes
+        self.output_bytes
     }
 
     /// Returns the maximum composite members inspected by this configuration.
     #[must_use]
     pub const fn max_composite_items(self) -> usize {
-        self.max_composite_items
+        self.composite_items
     }
 
     /// Returns the maximum bytes permitted in one key or value.
     #[must_use]
     pub const fn max_value_bytes(self) -> usize {
-        self.max_value_bytes
+        self.value_bytes
     }
 }
 
 impl Default for UriTemplateExpansionLimits {
     fn default() -> Self {
         Self {
-            max_output_bytes: MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES,
-            max_composite_items: MAX_URI_TEMPLATE_COMPOSITE_ITEMS,
-            max_value_bytes: MAX_URI_TEMPLATE_VALUE_BYTES,
+            output_bytes: MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES,
+            composite_items: MAX_URI_TEMPLATE_COMPOSITE_ITEMS,
+            value_bytes: MAX_URI_TEMPLATE_VALUE_BYTES,
         }
     }
 }
@@ -1399,6 +1399,8 @@ fn is_valid_literal_character(character: char) -> bool {
             | 0xC0000..=0xCFFFD
             | 0xD0000..=0xDFFFD
             | 0xE1000..=0xEFFFD
+            | 0xF0000..=0xFFFFD
+            | 0x100000..=0x10FFFD
     )
 }
 
@@ -2216,6 +2218,29 @@ mod tests {
         ));
         UriTemplate::parse("mcp://resource/encoded%27apostrophe")
             .expect("pct-encoded apostrophe remains a valid literal");
+    }
+
+    #[test]
+    fn rfc6570_literal_grammar_admits_supplementary_iprivate_ranges() {
+        for scalar in [0xF0000, 0xFFFFD, 0x100000, 0x10FFFD] {
+            let template = format!(
+                "mcp://resource/{}",
+                char::from_u32(scalar).expect("the RFC 3987 iprivate scalar is valid Unicode"),
+            );
+            UriTemplate::parse(&template)
+                .expect("RFC 6570 literals admit every supplementary iprivate endpoint");
+        }
+
+        for scalar in [0xEFFFE, 0xEFFFF, 0xFFFFE, 0x10FFFE] {
+            let template = format!(
+                "mcp://resource/{}",
+                char::from_u32(scalar).expect("the adjacent scalar is valid Unicode"),
+            );
+            assert!(matches!(
+                UriTemplate::parse(&template),
+                Err(UriTemplateError::InvalidLiteral { .. })
+            ));
+        }
     }
 
     #[test]

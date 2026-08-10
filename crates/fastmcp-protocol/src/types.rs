@@ -437,7 +437,11 @@ pub struct Resource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceTemplate {
     /// URI template (RFC 6570).
-    #[serde(rename = "uriTemplate")]
+    #[serde(
+        rename = "uriTemplate",
+        serialize_with = "serialize_resource_uri_template",
+        deserialize_with = "deserialize_resource_uri_template"
+    )]
     pub uri_template: String,
     /// Template name.
     pub name: String,
@@ -456,6 +460,24 @@ pub struct ResourceTemplate {
     /// Tags for filtering and organization.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+}
+
+fn deserialize_resource_uri_template<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    crate::UriTemplate::parse(&value)
+        .map(|_| value)
+        .map_err(D::Error::custom)
+}
+
+fn serialize_resource_uri_template<S>(value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::UriTemplate::parse(value).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_str(value)
 }
 
 /// Prompt definition.
@@ -739,16 +761,32 @@ impl McpAppsResourceCsp {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct McpAppsResourceCspWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    connect_domains: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resource_domains: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    frame_domains: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    base_uri_domains: Option<Vec<String>>,
+    #[serde(
+        rename = "connectDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    connect: Option<Vec<String>>,
+    #[serde(
+        rename = "resourceDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    resources: Option<Vec<String>>,
+    #[serde(
+        rename = "frameDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    frames: Option<Vec<String>>,
+    #[serde(
+        rename = "baseUriDomains",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    base_uris: Option<Vec<String>>,
 }
 
 impl Serialize for McpAppsResourceCsp {
@@ -764,10 +802,10 @@ impl Serialize for McpAppsResourceCsp {
         )
         .map_err(serde::ser::Error::custom)?;
         McpAppsResourceCspWire {
-            connect_domains: self.connect_domains.clone(),
-            resource_domains: self.resource_domains.clone(),
-            frame_domains: self.frame_domains.clone(),
-            base_uri_domains: self.base_uri_domains.clone(),
+            connect: self.connect_domains.clone(),
+            resources: self.resource_domains.clone(),
+            frames: self.frame_domains.clone(),
+            base_uris: self.base_uri_domains.clone(),
         }
         .serialize(serializer)
     }
@@ -779,13 +817,8 @@ impl<'de> Deserialize<'de> for McpAppsResourceCsp {
         D: serde::Deserializer<'de>,
     {
         let wire = McpAppsResourceCspWire::deserialize(deserializer)?;
-        Self::try_new(
-            wire.connect_domains,
-            wire.resource_domains,
-            wire.frame_domains,
-            wire.base_uri_domains,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::try_new(wire.connect, wire.resources, wire.frames, wire.base_uris)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1175,6 +1208,7 @@ pub fn project_final_core_tools_call_result(
         FinalCoreResult::ToolsCall { result, .. } => {
             McpAppsToolResult::from_final_call_tool_result(&result.payload)
         }
+        #[cfg(feature = "tasks")]
         FinalCoreResult::ToolsCallTask { .. } => {
             Err(McpAppsResultProjectionError::TasksUnsupported)
         }
@@ -1560,7 +1594,11 @@ impl FinalResource {
 #[serde(deny_unknown_fields)]
 pub struct FinalResourceTemplate {
     /// RFC 6570 resource URI template.
-    #[serde(rename = "uriTemplate")]
+    #[serde(
+        rename = "uriTemplate",
+        serialize_with = "serialize_final_resource_uri_template",
+        deserialize_with = "deserialize_final_resource_uri_template"
+    )]
     pub uri_template: String,
     /// Programmatic template identifier.
     pub name: String,
@@ -1582,6 +1620,27 @@ pub struct FinalResourceTemplate {
     /// Optional final metadata.
     #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<OpenMetadata>,
+}
+
+fn deserialize_final_resource_uri_template<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    crate::UriTemplate::parse(&value)
+        .map(|_| value)
+        .map_err(D::Error::custom)
+}
+
+fn serialize_final_resource_uri_template<S>(
+    value: &String,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    crate::UriTemplate::parse(value).map_err(serde::ser::Error::custom)?;
+    serializer.serialize_str(value)
 }
 
 /// Exact final prompt-argument model.
@@ -2891,6 +2950,37 @@ mod tests {
         assert_eq!(value["mimeType"], "text/plain");
     }
 
+    #[test]
+    fn resource_template_peer_admission_rejects_malformed_and_oversized_templates() {
+        let accepted_wire = json!({
+            "uriTemplate": "file://{path}",
+            "name": "File Reader"
+        });
+        let accepted: ResourceTemplate = serde_json::from_value(accepted_wire.clone())
+            .expect("a legal exact-2024 resource template remains admissible");
+        assert_eq!(
+            serde_json::to_value(accepted).expect("admitted template serializes"),
+            accepted_wire
+        );
+
+        let mut malformed = accepted_wire.clone();
+        malformed["uriTemplate"] = json!("file://{path");
+        assert!(
+            serde_json::from_value::<ResourceTemplate>(malformed).is_err(),
+            "changing only the closing brace rejects malformed peer input"
+        );
+
+        let mut oversized = accepted_wire;
+        oversized["uriTemplate"] = json!(format!(
+            "mcp://{}",
+            "x".repeat(crate::MAX_URI_TEMPLATE_BYTES)
+        ));
+        assert!(
+            serde_json::from_value::<ResourceTemplate>(oversized).is_err(),
+            "changing only the template length beyond the protocol bound rejects peer input"
+        );
+    }
+
     // ========================================================================
     // Prompt Definition Tests
     // ========================================================================
@@ -3707,6 +3797,47 @@ mod tests {
         assert!(
             serde_json::from_value::<FinalResource>(planted).is_err(),
             "changing only the resource size to a fractional number rejects it"
+        );
+    }
+
+    #[test]
+    fn final_resource_template_enforces_the_uri_template_schema_format() {
+        let accepted_wire = json!({
+            "uriTemplate": "mcp://resources/{item:3}{?cursor,labels*}",
+            "name": "resource-template"
+        });
+        let accepted: FinalResourceTemplate = serde_json::from_value(accepted_wire.clone())
+            .expect("a final RFC 6570 Level 4 resource template is admitted");
+        assert_eq!(
+            accepted.uri_template, "mcp://resources/{item:3}{?cursor,labels*}",
+            "typed final decoding preserves the accepted template spelling"
+        );
+        assert_eq!(
+            serde_json::to_value(accepted).expect("accepted template re-encodes"),
+            accepted_wire,
+            "template validation does not normalize the final wire value"
+        );
+
+        let mut planted = accepted_wire;
+        planted["uriTemplate"] = json!("mcp://resources/{item:0}");
+        assert!(
+            serde_json::from_value::<FinalResourceTemplate>(planted).is_err(),
+            "changing only the prefix modifier to RFC 6570's forbidden zero rejects the template"
+        );
+
+        let locally_invalid = FinalResourceTemplate {
+            uri_template: "mcp://resources/{item:0}".to_owned(),
+            name: "resource-template".to_owned(),
+            title: None,
+            description: None,
+            icons: None,
+            mime_type: None,
+            annotations: None,
+            meta: None,
+        };
+        assert!(
+            serde_json::to_value(locally_invalid).is_err(),
+            "direct construction cannot serialize a URI template rejected at peer admission"
         );
     }
 

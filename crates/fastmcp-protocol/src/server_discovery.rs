@@ -15,8 +15,8 @@ use serde_json::Value;
 use crate::common_types::OpenMetadata;
 use crate::result::CacheTtl;
 use crate::{
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, ResultPeerDiagnostic,
-    ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION,
+    ExtensionId, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY,
+    ResultPeerDiagnostic, ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION,
 };
 
 /// The exact JSON-RPC method for final server discovery.
@@ -481,6 +481,12 @@ fn validate_extensions(extensions: &BTreeMap<String, Value>) -> Result<(), Serve
                 maximum: MAX_DISCOVERY_EXTENSION_NAME_BYTES,
             });
         }
+        ExtensionId::parse(name.clone()).map_err(|_| {
+            ServerDiscoveryError::InvalidExtensionName {
+                length: name.len(),
+                maximum: MAX_DISCOVERY_EXTENSION_NAME_BYTES,
+            }
+        })?;
         if !value.is_object() {
             return Err(ServerDiscoveryError::InvalidCapabilityShape);
         }
@@ -853,7 +859,7 @@ mod tests {
                 ServerBehavior::PromptsList,
                 ServerBehavior::PromptsListChangedNotification,
             ]),
-            BTreeMap::from([("io.fastmcp.example".to_owned(), json!({"enabled": true}))]),
+            BTreeMap::from([("io.fastmcp/example".to_owned(), json!({"enabled": true}))]),
         )
         .expect("the bounded installed behavior registry is discoverable")
     }
@@ -909,7 +915,7 @@ mod tests {
         assert_eq!(wire["capabilities"]["prompts"]["listChanged"], json!(true));
         assert!(wire["capabilities"].get("subscriptions").is_none());
         assert_eq!(
-            wire["capabilities"]["extensions"]["io.fastmcp.example"]["enabled"],
+            wire["capabilities"]["extensions"]["io.fastmcp/example"]["enabled"],
             json!(true)
         );
 
@@ -981,7 +987,7 @@ mod tests {
             .expect("the fractional mutation is valid JSON");
         assert!(
             serde_json::from_value::<ServerDiscoverResult>(fractional).is_err(),
-            "changing only ttlMs from a huge integer to a fraction must reject"
+            "changing only ttlMs from an unbounded integer to a fraction violates the final cache schema"
         );
     }
 
@@ -1011,6 +1017,56 @@ mod tests {
             ["2024-11-05", "2026-07-28"],
             "version selection remains a negotiation-layer concern"
         );
+    }
+
+    #[test]
+    fn discovery_extensions_require_final_identifiers_on_peer_and_local_paths() {
+        let registry = ServerBehaviorRegistry::default();
+        let valid = BTreeMap::from([("com.example/".to_owned(), json!({}))]);
+        assert!(ServerDiscoverCapabilities::from_registry(&registry, valid).is_ok());
+
+        let invalid_names = [
+            "com.example",                // missing mandatory prefix delimiter
+            "com.example//name",          // more than one delimiter
+            "org.modelcontextprotocol/x", // reserved namespace misuse
+            "1com.example/name",          // invalid prefix label
+        ];
+        for name in invalid_names {
+            let extensions = BTreeMap::from([(name.to_owned(), json!({}))]);
+            assert!(
+                matches!(
+                    ServerDiscoverCapabilities::from_registry(&registry, extensions),
+                    Err(ServerDiscoveryError::InvalidExtensionName { .. })
+                ),
+                "local discovery must reject invalid extension identifier {name:?}"
+            );
+        }
+
+        let admitted = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "contract-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let unchanged_before = serde_json::to_value(&admitted).expect("admitted discovery encodes");
+        for name in invalid_names {
+            let mut peer_wire = unchanged_before.clone();
+            let mut extensions = serde_json::Map::new();
+            extensions.insert(name.to_owned(), json!({}));
+            peer_wire["capabilities"]["extensions"] = Value::Object(extensions);
+            assert!(
+                serde_json::from_value::<ServerDiscoverResult>(peer_wire).is_err(),
+                "peer discovery must reject invalid extension identifier {name:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(&admitted).expect("admitted discovery remains unchanged"),
+                unchanged_before,
+                "rejected peer extension identifiers cannot mutate locally admitted discovery state"
+            );
+        }
     }
 
     #[test]

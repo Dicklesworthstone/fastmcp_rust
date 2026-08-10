@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::de::Error as _;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 use crate::common_types::{JsonInteger, OpenMetadata};
@@ -19,6 +21,22 @@ use crate::messages::{
     FinalEmbeddedInputResponse, SubscriptionFilter,
 };
 use crate::protocol_version::FINAL_PROTOCOL_VERSION;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WireValue {
+    Raw(Box<RawValue>),
+    Value(Value),
+}
+
+impl WireValue {
+    fn into_json(self) -> Result<String, serde_json::Error> {
+        match self {
+            Self::Raw(raw) => Ok(raw.into_string()),
+            Self::Value(value) => serde_json::to_string(&value),
+        }
+    }
+}
 
 /// The negotiated Tasks extension identifier.
 pub const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
@@ -142,34 +160,43 @@ impl fmt::Display for TaskWireError {
 
 impl std::error::Error for TaskWireError {}
 
-/// A positive integer millisecond duration retaining its exact JSON spelling.
+/// A canonical positive integer millisecond duration.
+///
+/// The composed Tasks profile accepts only positive mathematical JSON
+/// integers that fit the local `u64` millisecond domain. Equivalent integral
+/// input spellings are emitted as canonical integer text.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskDuration(JsonInteger);
+pub struct TaskDuration(String);
 
 /// Failure while converting a final task duration for a bounded local runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskDurationConversionError {
-    /// The valid wire integer exceeds the local `u64` millisecond domain.
+    /// The wire value cannot be represented as a positive `u64` millisecond
+    /// duration.
     RuntimeOutOfRange,
 }
 
 impl fmt::Display for TaskDurationConversionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("task duration exceeds the local u64 millisecond runtime domain")
+        formatter
+            .write_str("task duration cannot be represented as a positive u64 millisecond duration")
     }
 }
 
 impl std::error::Error for TaskDurationConversionError {}
 
 impl TaskDuration {
-    /// Admits a positive JSON mathematical integer without narrowing it.
+    /// Admits and canonicalizes a positive JSON mathematical integer.
     pub fn from_json_integer(value: JsonInteger) -> Result<Self, TaskWireError> {
-        task_duration_is_positive(value.as_str())
-            .then_some(Self(value))
-            .ok_or(TaskWireError::Invalid("duration"))
+        let millis = task_duration_runtime_millis(value.as_str())
+            .map_err(|_| TaskWireError::Invalid("duration"))?;
+        if millis == 0 {
+            return Err(TaskWireError::Invalid("duration"));
+        }
+        Ok(Self(millis.to_string()))
     }
 
-    /// Returns the exact positive JSON-integer wire spelling.
+    /// Returns the canonical positive-integer wire spelling.
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
@@ -180,7 +207,9 @@ impl TaskDuration {
     /// This is intentionally checked: the final Tasks schema has no maximum,
     /// while local duration APIs accept at most `u64` milliseconds.
     pub fn try_as_millis(&self) -> Result<u64, TaskDurationConversionError> {
-        task_duration_runtime_millis(self.0.as_str())
+        self.0
+            .parse()
+            .map_err(|_| TaskDurationConversionError::RuntimeOutOfRange)
     }
 }
 
@@ -189,7 +218,8 @@ impl Serialize for TaskDuration {
     where
         S: Serializer,
     {
-        self.0.serialize(serializer)
+        let millis = self.try_as_millis().map_err(serde::ser::Error::custom)?;
+        serializer.serialize_u64(millis)
     }
 }
 
@@ -203,15 +233,10 @@ impl<'de> Deserialize<'de> for TaskDuration {
     }
 }
 
-fn task_duration_is_positive(lexeme: &str) -> bool {
-    !lexeme.starts_with('-')
-        && lexeme
-            .split(['e', 'E'])
-            .next()
-            .is_some_and(|mantissa| mantissa.bytes().any(|byte| matches!(byte, b'1'..=b'9')))
-}
-
 fn task_duration_runtime_millis(lexeme: &str) -> Result<u64, TaskDurationConversionError> {
+    if lexeme.starts_with('-') {
+        return Err(TaskDurationConversionError::RuntimeOutOfRange);
+    }
     let (mantissa, exponent) = match lexeme.split_once(['e', 'E']) {
         Some((mantissa, exponent)) => (mantissa, exponent),
         None => (lexeme, "0"),
@@ -249,7 +274,10 @@ fn task_duration_runtime_millis(lexeme: &str) -> Result<u64, TaskDurationConvers
         digits[..length].to_owned()
     };
     let normalized = integer_digits.trim_start_matches('0');
-    if normalized.is_empty() || normalized.len() > 20 {
+    if normalized.is_empty() {
+        return Ok(0);
+    }
+    if normalized.len() > 20 {
         return Err(TaskDurationConversionError::RuntimeOutOfRange);
     }
     normalized
@@ -313,7 +341,7 @@ impl TaskTimestamp {
         };
         if bytes.get(zone_index) == Some(&b'Z') && bytes.len() == zone_index + 1 {
             Ok(Self(value))
-        } else if matches!(bytes.get(zone_index), Some(b'+') | Some(b'-'))
+        } else if matches!(bytes.get(zone_index), Some(b'+' | b'-'))
             && bytes.len() == zone_index + 6
             && bytes[zone_index + 3] == b':'
         {
@@ -366,7 +394,9 @@ const fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if year % 400 == 0 || (year % 4 == 0 && year % 100 != 0) => 29,
+        2 if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) => {
+            29
+        }
         2 => 28,
         _ => 0,
     }
@@ -497,6 +527,74 @@ pub struct FinalTaskCallToolResult {
     pub result: FinalCallToolResult,
     pub meta: Option<OpenMetadata>,
     pub additional: BTreeMap<String, Value>,
+    /// Exact nested result object retained after peer admission. This is
+    /// intentionally private: any public-field mutation falls back to the
+    /// canonical local form instead of replaying stale peer state.
+    exact_wire: Option<String>,
+}
+
+impl FinalTaskCallToolResult {
+    fn decode_exact_wire(wire: &str) -> Result<Self, TaskWireError> {
+        let Value::Object(mut members) =
+            serde_json::from_str(wire).map_err(|_| TaskWireError::Invalid("result"))?
+        else {
+            return Err(TaskWireError::Invalid("result"));
+        };
+        if members.contains_key("resultType") {
+            return Err(TaskWireError::Invalid("result"));
+        }
+        let meta: Option<OpenMetadata> = members
+            .remove("_meta")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| TaskWireError::Invalid("result"))?;
+        if meta
+            .as_ref()
+            .is_some_and(|meta| meta.entries().contains_key(RELATED_TASK_META_KEY))
+        {
+            return Err(TaskWireError::Invalid("result"));
+        }
+        let mut result_members = Map::new();
+        for key in ["content", "isError", "structuredContent"] {
+            if let Some(value) = members.remove(key) {
+                result_members.insert(key.to_owned(), value);
+            }
+        }
+        let result = serde_json::from_value(Value::Object(result_members))
+            .map_err(|_| TaskWireError::Invalid("result"))?;
+        Ok(Self {
+            result,
+            meta,
+            additional: members.into_iter().collect(),
+            exact_wire: Some(wire.to_owned()),
+        })
+    }
+
+    fn canonical_value(&self) -> Result<Value, TaskWireError> {
+        let Value::Object(mut members) =
+            serde_json::to_value(&self.result).map_err(|_| TaskWireError::Invalid("result"))?
+        else {
+            return Err(TaskWireError::Invalid("result"));
+        };
+        if let Some(meta) = &self.meta {
+            if meta.entries().contains_key(RELATED_TASK_META_KEY) {
+                return Err(TaskWireError::Invalid("result"));
+            }
+            members.insert(
+                "_meta".to_owned(),
+                serde_json::to_value(meta).map_err(|_| TaskWireError::Invalid("result"))?,
+            );
+        }
+        for (key, value) in &self.additional {
+            if key == TASK_MISSING_RESULT_TYPE_DIAGNOSTIC {
+                continue;
+            }
+            if members.insert(key.clone(), value.clone()).is_some() {
+                return Err(TaskWireError::Invalid("result"));
+            }
+        }
+        Ok(Value::Object(members))
+    }
 }
 
 impl Serialize for FinalTaskCallToolResult {
@@ -504,30 +602,15 @@ impl Serialize for FinalTaskCallToolResult {
     where
         S: Serializer,
     {
-        let Value::Object(mut members) =
-            serde_json::to_value(&self.result).map_err(serde::ser::Error::custom)?
-        else {
-            unreachable!("tool result serializes as object")
-        };
-        if let Some(meta) = &self.meta {
-            if meta.entries().contains_key(RELATED_TASK_META_KEY) {
-                return Err(serde::ser::Error::custom(
-                    "completed task result forbids related-task metadata",
-                ));
-            }
-            members.insert(
-                "_meta".to_owned(),
-                serde_json::to_value(meta).map_err(serde::ser::Error::custom)?,
-            );
-        }
-        for (key, value) in &self.additional {
-            if members.insert(key.clone(), value.clone()).is_some() {
-                return Err(serde::ser::Error::custom(
-                    "task result additional member collides",
-                ));
+        let canonical = self.canonical_value().map_err(serde::ser::Error::custom)?;
+        if let Some(exact_wire) = &self.exact_wire {
+            if serde_json::from_str::<Value>(exact_wire).ok().as_ref() == Some(&canonical) {
+                return RawValue::from_string(exact_wire.clone())
+                    .map_err(serde::ser::Error::custom)?
+                    .serialize(serializer);
             }
         }
-        Value::Object(members).serialize(serializer)
+        canonical.serialize(serializer)
     }
 }
 
@@ -536,40 +619,10 @@ impl<'de> Deserialize<'de> for FinalTaskCallToolResult {
     where
         D: Deserializer<'de>,
     {
-        let Value::Object(mut members) = Value::deserialize(deserializer)? else {
-            return Err(D::Error::custom("completed task result must be an object"));
-        };
-        if members.contains_key("resultType") {
-            return Err(D::Error::custom(
-                "completed task result must be a flattened tools/call result",
-            ));
-        }
-        let meta: Option<OpenMetadata> = members
-            .remove("_meta")
-            .map(serde_json::from_value)
-            .transpose()
+        let wire = WireValue::deserialize(deserializer)?
+            .into_json()
             .map_err(D::Error::custom)?;
-        if meta
-            .as_ref()
-            .is_some_and(|meta| meta.entries().contains_key(RELATED_TASK_META_KEY))
-        {
-            return Err(D::Error::custom(
-                "completed task result forbids related-task metadata",
-            ));
-        }
-        let mut result_members = Map::new();
-        for key in ["content", "isError", "structuredContent"] {
-            if let Some(value) = members.remove(key) {
-                result_members.insert(key.to_owned(), value);
-            }
-        }
-        let result =
-            serde_json::from_value(Value::Object(result_members)).map_err(D::Error::custom)?;
-        Ok(Self {
-            result,
-            meta,
-            additional: members.into_iter().collect(),
-        })
+        Self::decode_exact_wire(&wire).map_err(D::Error::custom)
     }
 }
 
@@ -599,19 +652,35 @@ pub struct TaskBase {
     pub poll_interval_ms: Option<TaskDuration>,
 }
 
-/// Outer `None` marks an omitted `ttlMs` field; inner `None` is an explicit
-/// JSON null (unlimited TTL). Serde's missing-field fallback resolves through
-/// `deserialize_option`, so a bare `Option` carrier cannot tell omission from
-/// null — the `default` branch below is the only path an absent field takes.
-#[derive(Default)]
-struct RequiredTaskTtl(Option<Option<TaskDuration>>);
+/// Presence state for a required, nullable `ttlMs` member.
+///
+/// Serde routes an absent member through `Default`, while a present JSON null
+/// invokes `deserialize_option`. Keeping those states separate makes omission,
+/// unlimited TTL, and a finite TTL unambiguous at the wire boundary.
+enum RequiredTaskTtl {
+    /// The `ttlMs` member was absent.
+    Omitted,
+    /// The `ttlMs` member was present with JSON null.
+    Unlimited,
+    /// The `ttlMs` member was present with a schema-valid JSON number.
+    Limited(TaskDuration),
+}
+
+impl Default for RequiredTaskTtl {
+    fn default() -> Self {
+        Self::Omitted
+    }
+}
 
 impl<'de> Deserialize<'de> for RequiredTaskTtl {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Option::<TaskDuration>::deserialize(deserializer).map(|value| Self(Some(value)))
+        Option::<TaskDuration>::deserialize(deserializer).map(|value| match value {
+            Some(duration) => Self::Limited(duration),
+            None => Self::Unlimited,
+        })
     }
 }
 
@@ -665,9 +734,15 @@ impl<'de> Deserialize<'de> for TaskBase {
             status_message: wire.status_message.0,
             created_at: wire.created_at,
             last_updated_at: wire.last_updated_at,
-            ttl_ms: wire.ttl_ms.0.ok_or_else(|| {
-                D::Error::custom("task requires an explicit ttlMs member; use null for unlimited")
-            })?,
+            ttl_ms: match wire.ttl_ms {
+                RequiredTaskTtl::Omitted => {
+                    return Err(D::Error::custom(
+                        "task requires an explicit ttlMs member; use null for unlimited",
+                    ));
+                }
+                RequiredTaskTtl::Unlimited => None,
+                RequiredTaskTtl::Limited(duration) => Some(duration),
+            },
             poll_interval_ms: wire.poll_interval_ms.0,
         })
     }
@@ -710,33 +785,9 @@ impl Serialize for Task {
     where
         S: Serializer,
     {
-        let Value::Object(mut members) =
-            serde_json::to_value(self.base()).map_err(serde::ser::Error::custom)?
-        else {
-            unreachable!()
-        };
-        match self {
-            Self::InputRequired { input_requests, .. } => {
-                members.insert(
-                    "inputRequests".to_owned(),
-                    serde_json::to_value(input_requests).map_err(serde::ser::Error::custom)?,
-                );
-            }
-            Self::Completed { result, .. } => {
-                members.insert(
-                    "result".to_owned(),
-                    serde_json::to_value(result).map_err(serde::ser::Error::custom)?,
-                );
-            }
-            Self::Failed { error, .. } => {
-                members.insert(
-                    "error".to_owned(),
-                    serde_json::to_value(error).map_err(serde::ser::Error::custom)?,
-                );
-            }
-            Self::Working(_) | Self::Cancelled(_) => {}
-        }
-        Value::Object(members).serialize(serializer)
+        let mut map = serializer.serialize_map(None)?;
+        serialize_task_members(&mut map, self)?;
+        map.end()
     }
 }
 
@@ -745,54 +796,123 @@ impl<'de> Deserialize<'de> for Task {
     where
         D: Deserializer<'de>,
     {
-        let Value::Object(mut members) = Value::deserialize(deserializer)? else {
-            return Err(D::Error::custom("task must be an object"));
-        };
-        let status: TaskStatus = serde_json::from_value(
-            members
-                .get("status")
-                .cloned()
-                .ok_or_else(|| D::Error::custom("task requires status"))?,
-        )
-        .map_err(D::Error::custom)?;
-        let special = match status {
-            TaskStatus::InputRequired => Some(("inputRequests", members.remove("inputRequests"))),
-            TaskStatus::Completed => Some(("result", members.remove("result"))),
-            TaskStatus::Failed => Some(("error", members.remove("error"))),
-            TaskStatus::Working | TaskStatus::Cancelled => None,
-        };
-        if matches!(status, TaskStatus::Working | TaskStatus::Cancelled)
-            && (members.contains_key("inputRequests")
-                || members.contains_key("result")
-                || members.contains_key("error"))
-        {
-            return Err(D::Error::custom(
-                "task status forbids status-specific fields",
-            ));
-        }
-        let base: TaskBase =
-            serde_json::from_value(Value::Object(members)).map_err(D::Error::custom)?;
-        match (status, special) {
-            (TaskStatus::Working, _) => Ok(Self::Working(base)),
-            (TaskStatus::Cancelled, _) => Ok(Self::Cancelled(base)),
-            (TaskStatus::InputRequired, Some((_, Some(value)))) => {
-                let input_requests: TaskInputRequests =
-                    serde_json::from_value(value).map_err(D::Error::custom)?;
-                TaskInputLedger::from_requests(&input_requests).map_err(D::Error::custom)?;
-                Ok(Self::InputRequired {
-                    base,
-                    input_requests,
-                })
-            }
-            (TaskStatus::Completed, Some((_, Some(value)))) => serde_json::from_value(value)
-                .map(|result| Self::Completed { base, result })
-                .map_err(D::Error::custom),
-            (TaskStatus::Failed, Some((_, Some(value)))) => serde_json::from_value(value)
-                .map(|error| Self::Failed { base, error })
-                .map_err(D::Error::custom),
-            _ => Err(D::Error::custom("task requires status-specific field")),
-        }
+        let wire = WireValue::deserialize(deserializer)?
+            .into_json()
+            .map_err(D::Error::custom)?;
+        decode_task_wire(&wire).map_err(D::Error::custom)
     }
+}
+
+/// Decodes a standalone Task from its admitted source. Completed Tasks keep
+/// the exact nested `tools/call` result so peer member order and numeric
+/// lexemes are not reconstructed through `serde_json::Value`.
+fn decode_task_wire(wire: &str) -> Result<Task, TaskWireError> {
+    let Value::Object(mut members) =
+        serde_json::from_str(wire).map_err(|_| TaskWireError::Invalid("task"))?
+    else {
+        return Err(TaskWireError::Invalid("task"));
+    };
+    let status: TaskStatus = serde_json::from_value(
+        members
+            .get("status")
+            .cloned()
+            .ok_or(TaskWireError::Invalid("status"))?,
+    )
+    .map_err(|_| TaskWireError::Invalid("status"))?;
+    let special = match status {
+        TaskStatus::InputRequired => Some(("inputRequests", members.remove("inputRequests"))),
+        TaskStatus::Completed => Some(("result", members.remove("result"))),
+        TaskStatus::Failed => Some(("error", members.remove("error"))),
+        TaskStatus::Working | TaskStatus::Cancelled => None,
+    };
+    if matches!(status, TaskStatus::Working | TaskStatus::Cancelled)
+        && (members.contains_key("inputRequests")
+            || members.contains_key("result")
+            || members.contains_key("error"))
+    {
+        return Err(TaskWireError::Invalid("task"));
+    }
+    let base: TaskBase = serde_json::from_value(Value::Object(members))
+        .map_err(|_| TaskWireError::Invalid("task"))?;
+    match (status, special) {
+        (TaskStatus::Working, _) => Ok(Task::Working(base)),
+        (TaskStatus::Cancelled, _) => Ok(Task::Cancelled(base)),
+        (TaskStatus::InputRequired, Some((_, Some(value)))) => {
+            let input_requests = serde_json::from_value(value)
+                .map_err(|_| TaskWireError::Invalid("inputRequests"))?;
+            TaskInputLedger::from_requests(&input_requests)?;
+            Ok(Task::InputRequired {
+                base,
+                input_requests,
+            })
+        }
+        (TaskStatus::Completed, Some((_, Some(_)))) => {
+            let result =
+                FinalTaskCallToolResult::decode_exact_wire(raw_completed_task_result(wire)?.get())?;
+            Ok(Task::Completed { base, result })
+        }
+        (TaskStatus::Failed, Some((_, Some(value)))) => {
+            let error =
+                serde_json::from_value(value).map_err(|_| TaskWireError::Invalid("error"))?;
+            Ok(Task::Failed { base, error })
+        }
+        _ => Err(TaskWireError::Invalid("task")),
+    }
+}
+
+fn serialize_task_members<M>(map: &mut M, task: &Task) -> Result<(), M::Error>
+where
+    M: SerializeMap,
+{
+    let base = task.base();
+    map.serialize_entry("taskId", &base.task_id)?;
+    map.serialize_entry("status", &base.status)?;
+    if let Some(status_message) = &base.status_message {
+        map.serialize_entry("statusMessage", status_message)?;
+    }
+    map.serialize_entry("createdAt", &base.created_at)?;
+    map.serialize_entry("lastUpdatedAt", &base.last_updated_at)?;
+    map.serialize_entry("ttlMs", &base.ttl_ms)?;
+    if let Some(poll_interval_ms) = &base.poll_interval_ms {
+        map.serialize_entry("pollIntervalMs", poll_interval_ms)?;
+    }
+    match task {
+        Task::InputRequired { input_requests, .. } => {
+            map.serialize_entry("inputRequests", input_requests)?;
+        }
+        Task::Completed { result, .. } => map.serialize_entry("result", result)?,
+        Task::Failed { error, .. } => map.serialize_entry("error", error)?,
+        Task::Working(_) | Task::Cancelled(_) => {}
+    }
+    Ok(())
+}
+
+fn preserve_completed_task_result_from_wire(
+    task: &mut Task,
+    wire: &str,
+) -> Result<(), TaskWireError> {
+    if let Task::Completed { result: target, .. } = task {
+        *target =
+            FinalTaskCallToolResult::decode_exact_wire(raw_completed_task_result(wire)?.get())?;
+    }
+    Ok(())
+}
+
+/// Borrows the raw nested result member directly from an admitted Task wire
+/// object. `RawValue` retains the exact peer substring, including escaped
+/// object-member and string spellings, until the completed-result codec owns
+/// a stable copy for later lossless re-emission.
+fn raw_completed_task_result(wire: &str) -> Result<&RawValue, TaskWireError> {
+    #[derive(Deserialize)]
+    struct RawTaskResult<'a> {
+        #[serde(borrow)]
+        result: Option<&'a RawValue>,
+    }
+
+    serde_json::from_str::<RawTaskResult<'_>>(wire)
+        .map_err(|_| TaskWireError::Invalid("result"))?
+        .result
+        .ok_or(TaskWireError::Invalid("result"))
 }
 
 /// Required final request parameters shared by all task methods.
@@ -919,26 +1039,36 @@ impl Serialize for CreateTaskResult {
     where
         S: Serializer,
     {
-        let Value::Object(mut members) =
-            serde_json::to_value(&self.task).map_err(serde::ser::Error::custom)?
-        else {
-            unreachable!()
-        };
-        members.insert("resultType".to_owned(), Value::String("task".to_owned()));
+        let mut members = serializer.serialize_map(None)?;
+        members.serialize_entry("resultType", "task")?;
+        serialize_task_members(&mut members, &self.task)?;
         if let Some(meta) = &self.meta {
-            members.insert(
-                "_meta".to_owned(),
-                serde_json::to_value(meta).map_err(serde::ser::Error::custom)?,
-            );
+            members.serialize_entry("_meta", meta)?;
         }
         for (key, value) in &self.additional {
-            if members.insert(key.clone(), value.clone()).is_some() {
+            if [
+                "resultType",
+                "taskId",
+                "status",
+                "statusMessage",
+                "createdAt",
+                "lastUpdatedAt",
+                "ttlMs",
+                "pollIntervalMs",
+                "inputRequests",
+                "result",
+                "error",
+                "_meta",
+            ]
+            .contains(&key.as_str())
+            {
                 return Err(serde::ser::Error::custom(
                     "task create additional member collides",
                 ));
             }
+            members.serialize_entry(key, value)?;
         }
-        Value::Object(members).serialize(serializer)
+        members.end()
     }
 }
 impl<'de> Deserialize<'de> for CreateTaskResult {
@@ -946,19 +1076,33 @@ impl<'de> Deserialize<'de> for CreateTaskResult {
     where
         D: Deserializer<'de>,
     {
-        let Value::Object(mut members) = Value::deserialize(deserializer)? else {
-            return Err(D::Error::custom("task/create result must be an object"));
+        let wire = WireValue::deserialize(deserializer)?
+            .into_json()
+            .map_err(D::Error::custom)?;
+        Self::decode_exact_wire(&wire).map_err(D::Error::custom)
+    }
+}
+
+impl CreateTaskResult {
+    /// Decodes a Tasks `tools/call` result from its admitted source JSON.
+    ///
+    /// The nested completed-task result retains its source member order and
+    /// numeric lexemes. Callers that already retain response source must use
+    /// this entry point instead of routing through `serde_json::Value`.
+    pub(crate) fn decode_exact_wire(wire: &str) -> Result<Self, TaskWireError> {
+        let Value::Object(mut members) =
+            serde_json::from_str(wire).map_err(|_| TaskWireError::Invalid("task"))?
+        else {
+            return Err(TaskWireError::Invalid("task"));
         };
         if members.remove("resultType") != Some(Value::String("task".to_owned())) {
-            return Err(D::Error::custom(
-                "task/create result requires resultType task",
-            ));
+            return Err(TaskWireError::Invalid("resultType"));
         }
         let meta = members
             .remove("_meta")
             .map(serde_json::from_value)
             .transpose()
-            .map_err(D::Error::custom)?;
+            .map_err(|_| TaskWireError::Invalid("_meta"))?;
         let task_fields: BTreeSet<&str> = [
             "taskId",
             "status",
@@ -978,8 +1122,11 @@ impl<'de> Deserialize<'de> for CreateTaskResult {
             .filter(|(key, _)| task_fields.contains(key.as_str()))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let task = serde_json::from_value(Value::Object(task_members)).map_err(D::Error::custom)?;
+        let task = serde_json::from_value(Value::Object(task_members))
+            .map_err(|_| TaskWireError::Invalid("task"))?;
         members.retain(|key, _| !task_fields.contains(key.as_str()));
+        let mut task = task;
+        preserve_completed_task_result_from_wire(&mut task, wire)?;
         Ok(Self {
             task,
             meta,
@@ -994,6 +1141,34 @@ pub struct CompleteTaskResult {
     pub task: Task,
     pub meta: Option<OpenMetadata>,
     pub additional: BTreeMap<String, Value>,
+}
+
+/// Bounded compatibility diagnostics for peer task result envelopes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskResultPeerDiagnostic {
+    /// A final Tasks peer omitted `resultType`; it was admitted as `complete`
+    /// for compatibility, while local emission remains explicit.
+    MissingResultType,
+}
+
+const TASK_MISSING_RESULT_TYPE_DIAGNOSTIC: &str = "\0fastmcp/tasks/missing-result-type";
+
+fn result_type_diagnostic(
+    additional: &BTreeMap<String, Value>,
+) -> Option<TaskResultPeerDiagnostic> {
+    additional
+        .contains_key(TASK_MISSING_RESULT_TYPE_DIAGNOSTIC)
+        .then_some(TaskResultPeerDiagnostic::MissingResultType)
+}
+
+fn remove_complete_result_type(
+    members: &mut Map<String, Value>,
+) -> Result<Option<TaskResultPeerDiagnostic>, TaskWireError> {
+    match members.remove("resultType") {
+        None => Ok(Some(TaskResultPeerDiagnostic::MissingResultType)),
+        Some(Value::String(value)) if value == "complete" => Ok(None),
+        Some(_) => Err(TaskWireError::Invalid("resultType")),
+    }
 }
 
 /// Exact empty `complete` acknowledgement used by `tasks/update` and
@@ -1023,6 +1198,9 @@ impl Serialize for EmptyTaskResult {
             );
         }
         for (key, value) in &self.additional {
+            if key == TASK_MISSING_RESULT_TYPE_DIAGNOSTIC {
+                continue;
+            }
             if members.insert(key.clone(), value.clone()).is_some() {
                 return Err(serde::ser::Error::custom(
                     "task acknowledgement additional member collides",
@@ -1041,16 +1219,18 @@ impl<'de> Deserialize<'de> for EmptyTaskResult {
         let Value::Object(mut members) = Value::deserialize(deserializer)? else {
             return Err(D::Error::custom("task acknowledgement must be an object"));
         };
-        if members.remove("resultType") != Some(Value::String("complete".to_owned())) {
-            return Err(D::Error::custom(
-                "task acknowledgement requires resultType complete",
-            ));
-        }
+        let diagnostic = remove_complete_result_type(&mut members).map_err(D::Error::custom)?;
         let meta = members
             .remove("_meta")
             .map(serde_json::from_value)
             .transpose()
             .map_err(D::Error::custom)?;
+        if diagnostic.is_some() {
+            members.insert(
+                TASK_MISSING_RESULT_TYPE_DIAGNOSTIC.to_owned(),
+                Value::Bool(true),
+            );
+        }
         Ok(Self {
             meta,
             additional: members.into_iter().collect(),
@@ -1069,17 +1249,39 @@ impl Serialize for CompleteTaskResult {
     where
         S: Serializer,
     {
-        let create = CreateTaskResult {
-            task: self.task.clone(),
-            meta: self.meta.clone(),
-            additional: self.additional.clone(),
-        };
-        let mut value = serde_json::to_value(create).map_err(serde::ser::Error::custom)?;
-        value.as_object_mut().expect("object").insert(
-            "resultType".to_owned(),
-            Value::String("complete".to_owned()),
-        );
-        value.serialize(serializer)
+        let mut members = serializer.serialize_map(None)?;
+        members.serialize_entry("resultType", "complete")?;
+        serialize_task_members(&mut members, &self.task)?;
+        if let Some(meta) = &self.meta {
+            members.serialize_entry("_meta", meta)?;
+        }
+        for (key, value) in &self.additional {
+            if key == TASK_MISSING_RESULT_TYPE_DIAGNOSTIC {
+                continue;
+            }
+            if [
+                "resultType",
+                "taskId",
+                "status",
+                "statusMessage",
+                "createdAt",
+                "lastUpdatedAt",
+                "ttlMs",
+                "pollIntervalMs",
+                "inputRequests",
+                "result",
+                "error",
+                "_meta",
+            ]
+            .contains(&key.as_str())
+            {
+                return Err(serde::ser::Error::custom(
+                    "task complete additional member collides",
+                ));
+            }
+            members.serialize_entry(key, value)?;
+        }
+        members.end()
     }
 }
 impl<'de> Deserialize<'de> for CompleteTaskResult {
@@ -1087,20 +1289,69 @@ impl<'de> Deserialize<'de> for CompleteTaskResult {
     where
         D: Deserializer<'de>,
     {
-        let mut value = Value::deserialize(deserializer)?;
-        let Value::Object(members) = &mut value else {
+        let wire = WireValue::deserialize(deserializer)?
+            .into_json()
+            .map_err(D::Error::custom)?;
+        let Value::Object(mut members) = serde_json::from_str(&wire).map_err(D::Error::custom)?
+        else {
             return Err(D::Error::custom("task result must be an object"));
         };
-        if members.remove("resultType") != Some(Value::String("complete".to_owned())) {
-            return Err(D::Error::custom("task result requires resultType complete"));
+        let diagnostic = remove_complete_result_type(&mut members).map_err(D::Error::custom)?;
+        let meta = members
+            .remove("_meta")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?;
+        let task_fields: BTreeSet<&str> = [
+            "taskId",
+            "status",
+            "statusMessage",
+            "createdAt",
+            "lastUpdatedAt",
+            "ttlMs",
+            "pollIntervalMs",
+            "inputRequests",
+            "result",
+            "error",
+        ]
+        .into_iter()
+        .collect();
+        let task_members: Map<String, Value> = members
+            .iter()
+            .filter(|(key, _)| task_fields.contains(key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let mut task =
+            serde_json::from_value(Value::Object(task_members)).map_err(D::Error::custom)?;
+        preserve_completed_task_result_from_wire(&mut task, &wire).map_err(D::Error::custom)?;
+        members.retain(|key, _| !task_fields.contains(key.as_str()));
+        if diagnostic.is_some() {
+            members.insert(
+                TASK_MISSING_RESULT_TYPE_DIAGNOSTIC.to_owned(),
+                Value::Bool(true),
+            );
         }
-        members.insert("resultType".to_owned(), Value::String("task".to_owned()));
-        let create: CreateTaskResult = serde_json::from_value(value).map_err(D::Error::custom)?;
         Ok(Self {
-            task: create.task,
-            meta: create.meta,
-            additional: create.additional,
+            task,
+            meta,
+            additional: members.into_iter().collect(),
         })
+    }
+}
+
+impl CompleteTaskResult {
+    /// Returns the bounded compatibility diagnostic attached during peer decode.
+    #[must_use]
+    pub fn peer_diagnostic(&self) -> Option<TaskResultPeerDiagnostic> {
+        result_type_diagnostic(&self.additional)
+    }
+}
+
+impl EmptyTaskResult {
+    /// Returns the bounded compatibility diagnostic attached during peer decode.
+    #[must_use]
+    pub fn peer_diagnostic(&self) -> Option<TaskResultPeerDiagnostic> {
+        result_type_diagnostic(&self.additional)
     }
 }
 
@@ -1116,25 +1367,34 @@ impl Serialize for TaskStatusNotificationParams {
     where
         S: Serializer,
     {
-        let mut members =
-            match serde_json::to_value(&self.task).map_err(serde::ser::Error::custom)? {
-                Value::Object(members) => members,
-                _ => unreachable!(),
-            };
+        let mut members = serializer.serialize_map(None)?;
+        serialize_task_members(&mut members, &self.task)?;
         if let Some(meta) = &self.meta {
-            members.insert(
-                "_meta".to_owned(),
-                serde_json::to_value(meta).map_err(serde::ser::Error::custom)?,
-            );
+            members.serialize_entry("_meta", meta)?;
         }
         for (key, value) in &self.additional {
-            if members.insert(key.clone(), value.clone()).is_some() {
+            if [
+                "taskId",
+                "status",
+                "statusMessage",
+                "createdAt",
+                "lastUpdatedAt",
+                "ttlMs",
+                "pollIntervalMs",
+                "inputRequests",
+                "result",
+                "error",
+                "_meta",
+            ]
+            .contains(&key.as_str())
+            {
                 return Err(serde::ser::Error::custom(
                     "task notification additional member collides",
                 ));
             }
+            members.serialize_entry(key, value)?;
         }
-        Value::Object(members).serialize(serializer)
+        members.end()
     }
 }
 impl<'de> Deserialize<'de> for TaskStatusNotificationParams {
@@ -1142,7 +1402,11 @@ impl<'de> Deserialize<'de> for TaskStatusNotificationParams {
     where
         D: Deserializer<'de>,
     {
-        let Value::Object(mut members) = Value::deserialize(deserializer)? else {
+        let wire = WireValue::deserialize(deserializer)?
+            .into_json()
+            .map_err(D::Error::custom)?;
+        let Value::Object(mut members) = serde_json::from_str(&wire).map_err(D::Error::custom)?
+        else {
             return Err(D::Error::custom(
                 "task notification params must be an object",
             ));
@@ -1171,7 +1435,9 @@ impl<'de> Deserialize<'de> for TaskStatusNotificationParams {
             .filter(|(key, _)| task_keys.contains(key.as_str()))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let task = serde_json::from_value(Value::Object(task_members)).map_err(D::Error::custom)?;
+        let mut task =
+            serde_json::from_value(Value::Object(task_members)).map_err(D::Error::custom)?;
+        preserve_completed_task_result_from_wire(&mut task, &wire).map_err(D::Error::custom)?;
         members.retain(|key, _| !task_keys.contains(key.as_str()));
         Ok(Self {
             task,
@@ -1322,34 +1588,46 @@ mod tests {
             last_updated_at: TaskTimestamp::parse("2026-07-28T12:00:00.000Z").expect("timestamp"),
             ttl_ms: Some(
                 TaskDuration::from_json_integer(JsonInteger::from(1_u64))
-                    .expect("positive test duration"),
+                    .expect("nonnegative test duration"),
             ),
             poll_interval_ms: None,
         }
     }
 
     #[test]
-    fn task_duration_retains_unbounded_wire_integer_until_checked_runtime_conversion() {
-        let duration: TaskDuration = serde_json::from_str("18446744073709551616")
-            .expect("an unbounded positive final task duration is valid on the wire");
-        assert_eq!(duration.as_str(), "18446744073709551616");
-        assert_eq!(
-            serde_json::to_string(&duration).expect("unbounded duration re-encodes"),
-            "18446744073709551616"
-        );
-        assert_eq!(
-            duration.try_as_millis(),
-            Err(TaskDurationConversionError::RuntimeOutOfRange),
-            "only the bounded runtime conversion rejects the one-over-u64 duration"
-        );
-        assert!(
-            serde_json::from_str::<TaskDuration>("18446744073709551616.5").is_err(),
-            "changing only the huge duration to a fraction must reject"
-        );
-        assert!(
-            serde_json::from_str::<TaskDuration>("-18446744073709551616").is_err(),
-            "changing only the huge duration to negative must reject"
-        );
+    fn task_duration_accepts_positive_integral_spellings_and_canonicalizes_output() {
+        for input in ["1", "1.0", "1e0", "1.00e0", "18446744073709551615"] {
+            let duration: TaskDuration =
+                serde_json::from_str(input).expect("positive integral duration is admitted");
+            assert!(duration.try_as_millis().is_ok());
+            assert_eq!(
+                serde_json::to_string(&duration).expect("admitted duration serializes"),
+                duration
+                    .try_as_millis()
+                    .expect("admitted duration fits")
+                    .to_string(),
+                "accepted input {input:?} emits canonical integer text"
+            );
+        }
+    }
+
+    #[test]
+    fn task_duration_rejects_zero_negative_fractional_and_out_of_range_without_mutation() {
+        let accepted: TaskDuration =
+            serde_json::from_str("1").expect("positive boundary duration is admitted");
+        let accepted_wire = serde_json::to_string(&accepted).expect("accepted duration serializes");
+
+        for input in ["0", "-1", "1.5", "18446744073709551616"] {
+            assert!(
+                serde_json::from_str::<TaskDuration>(input).is_err(),
+                "changing only the duration value to {input:?} is rejected by the composed profile"
+            );
+            assert_eq!(
+                serde_json::to_string(&accepted).expect("accepted duration remains serializable"),
+                accepted_wire,
+                "a rejected duration mutation cannot alter accepted task state"
+            );
+        }
     }
 
     #[test]
@@ -1473,38 +1751,96 @@ mod tests {
     }
 
     #[test]
-    fn completed_task_flattens_inner_result_and_preserves_open_fields() {
-        let wire = serde_json::json!({
-            "resultType": "complete",
-            "taskId": "task-1",
-            "status": "completed",
-            "createdAt": "2026-07-28T12:00:00.000Z",
-            "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
-            "ttlMs": null,
-            "result": {
-                "content": [],
-                "x-inner": { "preserved": true }
-            },
-            "x-envelope": { "preserved": true }
-        });
+    fn completed_task_uses_exact_nested_call_tool_result_wire() {
+        let wire = r#"{"resultType":"complete","taskId":"task-1","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"x-first":1.20e+4,"content":[],"x-second":123456789012345678901234567890},"x-envelope":{"preserved":true}}"#;
+        let decoded: GetTaskResult = serde_json::from_str(wire).expect("flattened completed task");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-serialize exact nested result"),
+            wire,
+            "completed task nesting retains member order and number lexemes"
+        );
 
-        let decoded: GetTaskResult =
-            serde_json::from_value(wire.clone()).expect("flattened completed task");
-        let reencoded = serde_json::to_value(decoded).expect("reserialize completed task");
-        assert_eq!(reencoded, wire);
-        assert!(reencoded["result"].get("resultType").is_none());
-        assert_eq!(reencoded["result"]["x-inner"]["preserved"], true);
-        assert_eq!(reencoded["x-envelope"]["preserved"], true);
+        let standalone_wire = r#"{"taskId":"task-1","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"x-first":1.20e+4,"content":[],"x-second":123456789012345678901234567890}}"#;
+        let standalone: Task =
+            serde_json::from_str(standalone_wire).expect("standalone completed task");
+        assert_eq!(
+            serde_json::to_string(&standalone).expect("re-serialize standalone task"),
+            standalone_wire,
+            "the standalone Tasks ingress retains its nested result source as well"
+        );
 
-        let mut with_result_type = wire.clone();
-        with_result_type["result"]["resultType"] = serde_json::json!("complete");
-        assert!(serde_json::from_value::<GetTaskResult>(with_result_type).is_err());
+        let escaped_wire = r#"{"taskId":"task-1","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"escaped\/key":"quoted \u0022 value","content":[]}}"#;
+        let mut escaped: Task = serde_json::from_str(escaped_wire).expect("escaped completed task");
+        assert_eq!(
+            serde_json::to_string(&escaped).expect("re-serialize escaped task"),
+            escaped_wire,
+            "raw Tasks ingress retains escaped member and string spellings"
+        );
+        let Task::Completed { result, .. } = &mut escaped else {
+            panic!("escaped fixture is completed");
+        };
+        result.additional.insert(
+            "escaped/key".to_owned(),
+            Value::String("changed".to_owned()),
+        );
+        let changed = serde_json::to_string(&escaped).expect("mutated task re-serializes");
+        assert_ne!(changed, escaped_wire);
+        assert!(
+            changed.contains(r#""escaped/key":"changed""#),
+            "changing only the decoded additional value must select canonical fallback emission"
+        );
+        assert!(
+            !changed.contains(r#"escaped\/key"#),
+            "fallback emission must not replay stale escaped peer source after mutation"
+        );
 
-        let mut with_legacy_related_task = wire;
-        with_legacy_related_task["result"]["_meta"] = serde_json::json!({
-            (RELATED_TASK_META_KEY): { "taskId": "task-1" }
-        });
-        assert!(serde_json::from_value::<GetTaskResult>(with_legacy_related_task).is_err());
+        let with_result_type = wire.replace(
+            "\"x-first\":1.20e+4",
+            "\"resultType\":\"complete\",\"x-first\":1.20e+4",
+        );
+        assert!(serde_json::from_str::<GetTaskResult>(&with_result_type).is_err());
+
+        let with_legacy_related_task = wire.replace(
+            "\"content\":[]",
+            "\"content\":[],\"_meta\":{\"io.modelcontextprotocol/related-task\":{\"taskId\":\"task-1\"}}",
+        );
+        assert!(serde_json::from_str::<GetTaskResult>(&with_legacy_related_task).is_err());
+    }
+
+    #[test]
+    fn task_complete_result_type_compatibility_is_diagnosed_but_null_and_wrong_kinds_reject() {
+        let get_without_type = r#"{"taskId":"task-1","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}"#;
+        let get: GetTaskResult = serde_json::from_str(get_without_type)
+            .expect("missing get resultType defaults complete");
+        assert_eq!(
+            get.peer_diagnostic(),
+            Some(TaskResultPeerDiagnostic::MissingResultType)
+        );
+        assert_eq!(
+            serde_json::to_value(&get).expect("local get serialization")["resultType"],
+            "complete"
+        );
+
+        for input in [
+            r#"{"resultType":null}"#,
+            r#"{"resultType":false}"#,
+            r#"{"resultType":"task"}"#,
+        ] {
+            assert!(serde_json::from_str::<GetTaskResult>(input).is_err());
+            assert!(serde_json::from_str::<UpdateTaskResult>(input).is_err());
+            assert!(serde_json::from_str::<CancelTaskResult>(input).is_err());
+        }
+        for result in [
+            serde_json::from_str::<UpdateTaskResult>(r#"{}"#)
+                .expect("update omission defaults complete"),
+            serde_json::from_str::<CancelTaskResult>(r#"{}"#)
+                .expect("cancel omission defaults complete"),
+        ] {
+            assert_eq!(
+                result.peer_diagnostic(),
+                Some(TaskResultPeerDiagnostic::MissingResultType)
+            );
+        }
     }
 
     #[test]
@@ -1522,6 +1858,47 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&accepted).expect("unlimited TTL serializes"),
             wire
+        );
+
+        let mut finite_ttl = wire.clone();
+        finite_ttl["ttlMs"] = serde_json::json!(60_000);
+        let finite: GetTaskResult =
+            serde_json::from_value(finite_ttl.clone()).expect("finite TTL is valid");
+        assert_eq!(
+            serde_json::to_value(&finite).expect("finite TTL serializes"),
+            finite_ttl,
+            "a finite ttlMs remains distinct from the null unlimited-TTL state"
+        );
+
+        for (field, value) in [
+            ("ttlMs", serde_json::json!(-1.5)),
+            ("pollIntervalMs", serde_json::json!(-2.5)),
+        ] {
+            let mut signed_fractional_duration = finite_ttl.clone();
+            signed_fractional_duration[field] = value;
+            assert!(
+                serde_json::from_value::<GetTaskResult>(signed_fractional_duration).is_err(),
+                "changing only {field} to a signed fractional duration violates the positive-integer Tasks profile"
+            );
+            assert_eq!(
+                serde_json::to_value(&finite).expect("finite TTL remains serializable"),
+                finite_ttl,
+                "a rejected {field} mutation cannot alter the accepted finite-TTL baseline"
+            );
+        }
+
+        let mut non_number_ttl = finite_ttl.clone();
+        non_number_ttl["ttlMs"] = Value::String("-1.5".to_owned());
+        assert!(
+            serde_json::from_value::<GetTaskResult>(non_number_ttl).is_err(),
+            "changing only ttlMs from a number to a string violates its nullable-number schema"
+        );
+
+        let mut null_poll_interval = finite_ttl.clone();
+        null_poll_interval["pollIntervalMs"] = Value::Null;
+        assert!(
+            serde_json::from_value::<GetTaskResult>(null_poll_interval).is_err(),
+            "changing only pollIntervalMs from a number to null violates its number-only schema"
         );
 
         let mut missing_ttl = wire.clone();

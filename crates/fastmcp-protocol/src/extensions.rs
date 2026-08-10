@@ -38,16 +38,22 @@ pub const MAX_EXTENSION_ROUTING_HEADER_BYTES: usize = 256;
 pub const MAX_STDIO_CORRELATION_METHODS: usize = 32;
 
 /// Official Tasks extension identifier.
+#[cfg(feature = "tasks")]
 pub const OFFICIAL_TASKS_EXTENSION_ID: &str = "io.modelcontextprotocol/tasks";
 /// Official Tasks empty-settings schema identity for both peers.
+#[cfg(feature = "tasks")]
 pub const OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID: &str = "tasks-2026-07-28-empty-object-v1";
 /// Official Tasks empty-settings codec identity for both peers.
+#[cfg(feature = "tasks")]
 pub const OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID: &str = "tasks-2026-07-28-empty-object-v1";
 /// Official Tasks client-to-server request methods.
+#[cfg(feature = "tasks")]
 pub const OFFICIAL_TASKS_METHODS: [&str; 3] = ["tasks/get", "tasks/update", "tasks/cancel"];
 /// Official Tasks server-to-client notification method.
+#[cfg(feature = "tasks")]
 pub const OFFICIAL_TASKS_NOTIFICATION: &str = "notifications/tasks";
 /// Official Tasks `tools/call` result discriminator.
+#[cfg(feature = "tasks")]
 pub const OFFICIAL_TASKS_RESULT_DISCRIMINATOR: &str = "task";
 
 /// Official MCP Apps extension identifier.
@@ -221,6 +227,7 @@ impl ExtensionSettings {
 
 /// Returns the sole settings object admitted by the official Tasks extension.
 #[must_use]
+#[cfg(feature = "tasks")]
 pub fn official_tasks_empty_settings() -> ExtensionSettings {
     ExtensionSettings(Map::new())
 }
@@ -396,9 +403,17 @@ pub fn register_official_mcp_apps_extension(
 /// This wrapper consumes only the official Apps descriptor, so callers can
 /// compose it with their existing resolver rather than replacing it.
 #[derive(Clone, Debug)]
-pub struct McpAppsNegotiationResolver<R = OfficialTasksNegotiationResolver> {
+pub struct McpAppsNegotiationResolver<R = RejectingExtensionNegotiationResolver> {
     fallback: R,
 }
+
+/// Fallback used when no optional extension resolver is selected.
+///
+/// This keeps MCP Apps usable without compiling the Tasks extension while
+/// refusing any non-Apps descriptor rather than implicitly enabling a wire
+/// capability that the crate feature excluded.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RejectingExtensionNegotiationResolver;
 
 impl<R> McpAppsNegotiationResolver<R> {
     /// Wraps an existing resolver with the official MCP Apps settings rules.
@@ -410,6 +425,7 @@ impl<R> McpAppsNegotiationResolver<R> {
 
 /// Resolves the official Tasks descriptor when Apps and Tasks share a registry.
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(feature = "tasks")]
 pub struct OfficialTasksNegotiationResolver;
 
 /// Typed Tasks compatibility resolver that delegates every non-Tasks
@@ -418,10 +434,12 @@ pub struct OfficialTasksNegotiationResolver;
 /// This adapter preserves an inactive disposition selected by the fallback,
 /// which lets Tasks compose with bilateral capabilities such as MCP Apps.
 #[derive(Clone, Debug)]
+#[cfg(feature = "tasks")]
 pub struct TasksNegotiationResolver<R> {
     fallback: R,
 }
 
+#[cfg(feature = "tasks")]
 impl<R> TasksNegotiationResolver<R> {
     /// Wraps an existing resolver with the official Tasks settings rules.
     #[must_use]
@@ -433,10 +451,20 @@ impl<R> TasksNegotiationResolver<R> {
 /// Returns the standalone typed resolver used by the official MCP Apps descriptor.
 ///
 /// Use [`McpAppsNegotiationResolver::with_fallback`] when the registry also
-/// contains private descriptors. The default fallback resolves official Tasks.
+/// contains private descriptors. When the `tasks` feature is selected, the
+/// default helper also resolves the official Tasks descriptor.
 #[must_use]
-pub const fn official_mcp_apps_negotiation_resolver() -> McpAppsNegotiationResolver {
+#[cfg(feature = "tasks")]
+pub const fn official_mcp_apps_negotiation_resolver()
+-> McpAppsNegotiationResolver<OfficialTasksNegotiationResolver> {
     McpAppsNegotiationResolver::with_fallback(OfficialTasksNegotiationResolver)
+}
+
+/// Returns the standalone typed resolver used by the official MCP Apps descriptor.
+#[must_use]
+#[cfg(not(feature = "tasks"))]
+pub const fn official_mcp_apps_negotiation_resolver() -> McpAppsNegotiationResolver {
+    McpAppsNegotiationResolver::with_fallback(RejectingExtensionNegotiationResolver)
 }
 
 /// Resolves a bilateral MCP Apps capability without comparing asymmetric peer objects.
@@ -468,6 +496,7 @@ pub fn resolve_official_mcp_apps_settings(
     ))
 }
 
+#[cfg(feature = "tasks")]
 fn resolve_official_tasks_settings(
     descriptor: &ExtensionDescriptor,
     client: &ExtensionSettings,
@@ -675,6 +704,7 @@ pub struct ExtensionDescriptor {
 
 /// Returns the validated identifier for the official Tasks extension.
 #[must_use]
+#[cfg(feature = "tasks")]
 pub fn official_tasks_extension_id() -> ExtensionId {
     ExtensionId::parse(OFFICIAL_TASKS_EXTENSION_ID)
         .expect("the fixed official Tasks identifier satisfies the extension grammar")
@@ -688,6 +718,7 @@ pub fn official_tasks_extension_id() -> ExtensionId {
 /// [`ExtensionDescriptorRegistry::negotiate`] enforces that invariant for the
 /// two peer advertisements and the effective settings chosen by its resolver.
 #[must_use]
+#[cfg(feature = "tasks")]
 pub fn official_tasks_descriptor() -> ExtensionDescriptor {
     ExtensionDescriptor {
         id: official_tasks_extension_id(),
@@ -721,6 +752,7 @@ pub fn official_tasks_descriptor() -> ExtensionDescriptor {
 /// its one server notification, and its `tools/call` result discriminator.
 /// Registration alone does not activate the extension; normal local enablement
 /// and bilateral negotiation still apply.
+#[cfg(feature = "tasks")]
 pub fn register_official_tasks_extension(
     registry: &mut ExtensionDescriptorRegistry,
 ) -> Result<ExtensionId, ExtensionRegistryError> {
@@ -734,6 +766,7 @@ pub fn register_official_tasks_extension(
     Ok(id)
 }
 
+#[cfg(feature = "tasks")]
 fn official_tasks_method(name: &str) -> ExtensionMethodDescriptor {
     ExtensionMethodDescriptor {
         name: name.to_owned(),
@@ -1228,6 +1261,20 @@ where
     }
 }
 
+impl ExtensionSettingsCompatibilityResolver for RejectingExtensionNegotiationResolver {
+    fn resolve(
+        &mut self,
+        descriptor: &ExtensionDescriptor,
+        _client: &ExtensionSettings,
+        _server: &ExtensionSettings,
+    ) -> Result<ExtensionSettings, ExtensionNegotiationError> {
+        Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+            descriptor.id.to_string(),
+        ))
+    }
+}
+
+#[cfg(feature = "tasks")]
 impl ExtensionSettingsCompatibilityResolver for OfficialTasksNegotiationResolver {
     fn resolve(
         &mut self,
@@ -1245,6 +1292,7 @@ impl ExtensionSettingsCompatibilityResolver for OfficialTasksNegotiationResolver
     }
 }
 
+#[cfg(feature = "tasks")]
 impl<R> ExtensionSettingsCompatibilityResolver for TasksNegotiationResolver<R>
 where
     R: ExtensionSettingsCompatibilityResolver,
@@ -1679,10 +1727,14 @@ impl ExtensionDescriptorRegistry {
 
             match (client.extensions.get(id), server.extensions.get(id)) {
                 (Some(client), Some(server)) => {
-                    enforce_official_tasks_empty_settings(id, client)?;
-                    enforce_official_tasks_empty_settings(id, server)?;
+                    #[cfg(feature = "tasks")]
+                    {
+                        enforce_official_tasks_empty_settings(id, client)?;
+                        enforce_official_tasks_empty_settings(id, server)?;
+                    }
                     match resolver.resolve_with_disposition(descriptor, client, server)? {
                         ExtensionSettingsResolution::Active(effective) => {
+                            #[cfg(feature = "tasks")]
                             enforce_official_tasks_empty_settings(id, &effective)?;
                             let fingerprint =
                                 effective_settings_fingerprint(descriptor, &effective)?;
@@ -1770,6 +1822,7 @@ impl ExtensionDescriptorRegistry {
     }
 }
 
+#[cfg(feature = "tasks")]
 fn enforce_official_tasks_empty_settings(
     id: &ExtensionId,
     settings: &ExtensionSettings,
@@ -2327,6 +2380,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
     fn ext_03_final_extension_identifier_wire_grammar_one_variable_negative() {
         let official = official_tasks_extension_id();
         assert_eq!(official.as_str(), OFFICIAL_TASKS_EXTENSION_ID);
@@ -2494,6 +2548,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
     fn apps_01_typed_resolver_negotiates_apps_and_tasks_together() {
         let mut registry = ExtensionDescriptorRegistry::new();
         let tasks = register_official_tasks_extension(&mut registry)
@@ -2538,6 +2593,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
     fn apps_01_tasks_wrapper_preserves_apps_inactive_disposition() {
         let mut registry = ExtensionDescriptorRegistry::new();
         let tasks = register_official_tasks_extension(&mut registry)
@@ -2686,6 +2742,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
     fn task_01_official_tasks_public_registry_positive() {
         let mut registry = ExtensionDescriptorRegistry::new();
         let id = register_official_tasks_extension(&mut registry)
@@ -2797,6 +2854,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
     fn task_01_official_tasks_undeclared_result_discriminator_one_variable_negative() {
         let mut registry = ExtensionDescriptorRegistry::new();
         let id = register_official_tasks_extension(&mut registry)
@@ -2842,6 +2900,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tasks")]
     fn task_01_official_tasks_nonempty_client_settings_one_variable_negative() {
         let mut registry = ExtensionDescriptorRegistry::new();
         let id = register_official_tasks_extension(&mut registry)

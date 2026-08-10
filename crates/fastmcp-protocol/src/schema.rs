@@ -9,12 +9,13 @@
 //! - Property, pattern-property, dependency, property-name, and
 //!   unevaluated-property validation
 //! - Items, tuple, contains, and unevaluated-items validation for arrays
-//! - Local `$defs`/`$ref`/anchor/dynamic-reference resolution, composition,
-//!   and conditional applicators
+//! - Local `$id` resources, `$defs`/`$ref`/anchor/dynamic-reference
+//!   resolution, composition, and conditional applicators
+//! - Declared Draft 2020-12 vocabularies and bounded content annotations
 //!
 //! External references are never resolved through network or filesystem I/O.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use fastmcp_core::AbsoluteUri;
 use regex::Regex;
 use serde_json::Value;
 use std::{cmp::Ordering, collections::HashSet, fmt};
@@ -22,6 +23,17 @@ use std::{cmp::Ordering, collections::HashSet, fmt};
 /// The sole JSON Schema dialect accepted by the final core schema-admission
 /// boundary.
 pub const FINAL_JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+
+const CORE_VOCABULARY_URI: &str = "https://json-schema.org/draft/2020-12/vocab/core";
+const APPLICATOR_VOCABULARY_URI: &str = "https://json-schema.org/draft/2020-12/vocab/applicator";
+const UNEVALUATED_VOCABULARY_URI: &str = "https://json-schema.org/draft/2020-12/vocab/unevaluated";
+const VALIDATION_VOCABULARY_URI: &str = "https://json-schema.org/draft/2020-12/vocab/validation";
+const META_DATA_VOCABULARY_URI: &str = "https://json-schema.org/draft/2020-12/vocab/meta-data";
+const FORMAT_ANNOTATION_VOCABULARY_URI: &str =
+    "https://json-schema.org/draft/2020-12/vocab/format-annotation";
+const FORMAT_ASSERTION_VOCABULARY_URI: &str =
+    "https://json-schema.org/draft/2020-12/vocab/format-assertion";
+const CONTENT_VOCABULARY_URI: &str = "https://json-schema.org/draft/2020-12/vocab/content";
 
 /// Maximum nested schema applications on a single validation path.
 pub const MAX_SCHEMA_VALIDATION_DEPTH: usize = 64;
@@ -39,8 +51,8 @@ pub const MAX_SCHEMA_INSTANCE_DEPTH: usize = 64;
 pub const MAX_SCHEMA_INSTANCE_STRING_BYTES: usize = 64 * 1024;
 
 /// Maximum work units performed by one validation call, including schema
-/// applications, branch probes, regular-expression compilation and matching,
-/// and object-property annotation bookkeeping.
+/// applications, local-resource traversal, branch probes, regular-expression
+/// compilation and matching, and object-property annotation bookkeeping.
 pub const MAX_SCHEMA_VALIDATION_WORK: usize = 4_096;
 
 /// Maximum local `$ref` hops on a single validation path.
@@ -185,6 +197,7 @@ pub fn admit_final_schema(schema: Value) -> Result<AdmittedSchema, SchemaAdmissi
     let mut node_count = 0;
     validate_final_schema_node(&schema, &schema, "$", true, 0, &mut node_count)?;
     validate_unique_local_anchors(&schema, "$", 0, &mut HashSet::new())?;
+    validate_unique_local_resource_ids(&schema, "$", 0, None, &mut HashSet::new())?;
     Ok(AdmittedSchema { schema })
 }
 
@@ -265,17 +278,8 @@ fn validate_final_schema_node(
         .ok_or_else(|| SchemaAdmissionError::new(path, "schema must be an object or boolean"))?;
 
     validate_supported_schema_keywords(object, path, root)?;
-
-    if root {
-        if let Some(dialect) = object.get("$schema") {
-            if dialect.as_str() != Some(FINAL_JSON_SCHEMA_DIALECT) {
-                return Err(SchemaAdmissionError::new(
-                    format!("{path}.$schema"),
-                    "unsupported schema dialect",
-                ));
-            }
-        }
-    }
+    validate_schema_id_keyword(object, path)?;
+    validate_schema_dialect_keyword(object, root_schema, path)?;
 
     validate_local_reference_keyword(object, "$ref", root_schema, path)?;
     validate_local_reference_keyword(object, "$dynamicRef", root_schema, path)?;
@@ -337,6 +341,7 @@ fn validate_final_schema_node(
     }
     validate_pattern_keyword(object, path)?;
     validate_format_keyword(object, path)?;
+    validate_content_annotation_keywords(object, path)?;
 
     for keyword in [
         "properties",
@@ -397,6 +402,7 @@ fn validate_final_schema_node(
         "then",
         "else",
         "propertyNames",
+        "contentSchema",
     ] {
         if let Some(subschema) = object.get(keyword) {
             validate_final_schema_node(
@@ -418,6 +424,14 @@ fn validate_final_schema_node(
                     "schema array keyword must be an array",
                 )
             })?;
+            if matches!(keyword, "allOf" | "anyOf" | "oneOf")
+                && subschemas.len() > MAX_COMPOSITION_BRANCHES
+            {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "composition keyword exceeds branch limit",
+                ));
+            }
             for (index, subschema) in subschemas.iter().enumerate() {
                 validate_final_schema_node(
                     subschema,
@@ -445,13 +459,18 @@ fn validate_supported_schema_keywords(
         "$defs",
         "$dynamicAnchor",
         "$dynamicRef",
+        "$id",
         "$ref",
         "$schema",
+        "$vocabulary",
         "additionalProperties",
         "allOf",
         "anyOf",
         "const",
         "contains",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
         "default",
         "dependentRequired",
         "dependentSchemas",
@@ -502,7 +521,7 @@ fn validate_supported_schema_keywords(
             ));
         }
     }
-    if !root && object.contains_key("$schema") {
+    if !root && object.contains_key("$schema") && !object.contains_key("$id") {
         return Err(SchemaAdmissionError::new(
             format!("{path}.$schema"),
             "nested $schema is unsupported without local resource identifiers",
@@ -528,6 +547,166 @@ fn validate_supported_schema_keywords(
     validate_boolean_keywords(object, path, &["deprecated", "readOnly", "writeOnly"])
 }
 
+fn validate_schema_id_keyword(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    let Some(identifier) = object.get("$id") else {
+        return Ok(());
+    };
+    let identifier = identifier.as_str().ok_or_else(|| {
+        SchemaAdmissionError::new(format!("{path}.$id"), "schema $id must be a string")
+    })?;
+    let (identifier, fragment) = split_uri_reference_fragment(identifier);
+    if fragment.is_some_and(|fragment| !fragment.is_empty()) {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.$id"),
+            "schema $id must not contain a fragment",
+        ));
+    }
+    if !is_bounded_uri_reference(identifier) {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.$id"),
+            "schema $id must be a bounded URI reference",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schema_dialect_keyword(
+    object: &serde_json::Map<String, Value>,
+    root_schema: &Value,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    let Some(dialect) = object.get("$schema") else {
+        return Ok(());
+    };
+    let dialect = dialect.as_str().ok_or_else(|| {
+        SchemaAdmissionError::new(format!("{path}.$schema"), "unsupported schema dialect")
+    })?;
+    let dialect = AbsoluteUri::parse_with_max_bytes(dialect, MAX_SCHEMA_ASSERTION_STRING_BYTES)
+        .ok()
+        .filter(|dialect| dialect.fragment().is_none())
+        .ok_or_else(|| {
+            SchemaAdmissionError::new(
+                format!("{path}.$schema"),
+                "schema dialect must be a bounded absolute URI",
+            )
+        })?;
+    if dialect.as_str() == FINAL_JSON_SCHEMA_DIALECT {
+        return Ok(());
+    }
+    let meta_schema =
+        find_local_schema_resource(root_schema, dialect.as_str()).ok_or_else(|| {
+            SchemaAdmissionError::new(format!("{path}.$schema"), "unsupported schema dialect")
+        })?;
+    validate_meta_schema_vocabulary(meta_schema, path)?;
+    Ok(())
+}
+
+fn validate_meta_schema_vocabulary(
+    meta_schema: &Value,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    let Some(vocabularies) = meta_schema
+        .as_object()
+        .and_then(|object| object.get("$vocabulary"))
+    else {
+        return Ok(());
+    };
+    let vocabularies = vocabularies.as_object().ok_or_else(|| {
+        SchemaAdmissionError::new(
+            format!("{path}.$vocabulary"),
+            "meta-schema $vocabulary must be an object",
+        )
+    })?;
+    if vocabularies.len() > MAX_SCHEMA_ASSERTION_ENTRIES {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.$vocabulary"),
+            "meta-schema $vocabulary exceeds entry limit",
+        ));
+    }
+    if vocabularies.get(CORE_VOCABULARY_URI) == Some(&Value::Bool(false)) {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.$vocabulary"),
+            "meta-schema $vocabulary cannot disable the Draft 2020-12 core vocabulary",
+        ));
+    }
+    for (vocabulary, required) in vocabularies {
+        let vocabulary_uri =
+            AbsoluteUri::parse_with_max_bytes(vocabulary, MAX_SCHEMA_ASSERTION_STRING_BYTES)
+                .map_err(|_| {
+                    SchemaAdmissionError::new(
+                        format!("{path}.$vocabulary"),
+                        "meta-schema $vocabulary keys must be bounded absolute URIs",
+                    )
+                })?;
+        if vocabulary_uri.fragment().is_some() {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.$vocabulary"),
+                "meta-schema $vocabulary keys must not contain fragments",
+            ));
+        }
+        let required = required.as_bool().ok_or_else(|| {
+            SchemaAdmissionError::new(
+                format!("{path}.$vocabulary.{vocabulary}"),
+                "meta-schema $vocabulary values must be booleans",
+            )
+        })?;
+        if required && vocabulary == FORMAT_ASSERTION_VOCABULARY_URI {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.$vocabulary.{vocabulary}"),
+                "format assertion vocabulary is not supported",
+            ));
+        }
+        if required && !is_supported_vocabulary_uri(vocabulary) {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.$vocabulary.{vocabulary}"),
+                "required schema vocabulary is not supported",
+            ));
+        }
+    }
+    if vocabularies.get(CORE_VOCABULARY_URI) != Some(&Value::Bool(true)) {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.$vocabulary"),
+            "meta-schema $vocabulary must require the Draft 2020-12 core vocabulary",
+        ));
+    }
+    Ok(())
+}
+
+fn is_supported_vocabulary_uri(vocabulary: &str) -> bool {
+    matches!(
+        vocabulary,
+        CORE_VOCABULARY_URI
+            | APPLICATOR_VOCABULARY_URI
+            | UNEVALUATED_VOCABULARY_URI
+            | VALIDATION_VOCABULARY_URI
+            | META_DATA_VOCABULARY_URI
+            | FORMAT_ANNOTATION_VOCABULARY_URI
+            | CONTENT_VOCABULARY_URI
+    )
+}
+
+fn validate_content_annotation_keywords(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    for keyword in ["contentEncoding", "contentMediaType"] {
+        if object.get(keyword).is_some_and(|value| {
+            value.as_str().is_none_or(|value| {
+                value.is_empty() || value.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES
+            })
+        }) {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "content annotation keyword must be a bounded non-empty string",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_local_reference_keyword(
     object: &serde_json::Map<String, Value>,
     keyword: &str,
@@ -543,13 +722,7 @@ fn validate_local_reference_keyword(
             "schema reference must be a string",
         )
     })?;
-    if !is_local_reference(reference) {
-        return Err(SchemaAdmissionError::new(
-            format!("{path}.{keyword}"),
-            "external schema reference is not allowed",
-        ));
-    }
-    match resolve_local_reference(root_schema, reference) {
+    match resolve_local_reference(root_schema, object, reference) {
         Ok(target) if target.is_boolean() || target.is_object() => {
             if !is_admitted_schema_node(root_schema, target) {
                 return Err(SchemaAdmissionError::new(
@@ -562,6 +735,18 @@ fn validate_local_reference_keyword(
             return Err(SchemaAdmissionError::new(
                 format!("{path}.{keyword}"),
                 "local schema reference target must be an object or boolean",
+            ));
+        }
+        Err("external schema reference is not allowed") => {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "external schema reference is not allowed",
+            ));
+        }
+        Err("invalid local schema reference") => {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "invalid local schema reference",
             ));
         }
         Err(_) => {
@@ -615,6 +800,7 @@ fn is_admitted_schema_node(schema: &Value, target: &Value) -> bool {
         "then",
         "else",
         "propertyNames",
+        "contentSchema",
     ] {
         if object
             .get(keyword)
@@ -706,7 +892,7 @@ fn validate_unique_local_anchors(
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
             for (name, subschema) in subschemas {
-                validate_unique_local_anchors(
+                validate_unique_local_anchor_child(
                     subschema,
                     &format!("{path}.{keyword}.{name}"),
                     depth + 1,
@@ -726,9 +912,10 @@ fn validate_unique_local_anchors(
         "then",
         "else",
         "propertyNames",
+        "contentSchema",
     ] {
         if let Some(subschema) = object.get(keyword) {
-            validate_unique_local_anchors(
+            validate_unique_local_anchor_child(
                 subschema,
                 &format!("{path}.{keyword}"),
                 depth + 1,
@@ -739,11 +926,121 @@ fn validate_unique_local_anchors(
     for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_array) {
             for (index, subschema) in subschemas.iter().enumerate() {
-                validate_unique_local_anchors(
+                validate_unique_local_anchor_child(
                     subschema,
                     &format!("{path}.{keyword}[{index}]"),
                     depth + 1,
                     anchors,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_local_anchor_child(
+    schema: &Value,
+    path: &str,
+    depth: usize,
+    anchors: &mut HashSet<String>,
+) -> Result<(), SchemaAdmissionError> {
+    if schema
+        .as_object()
+        .is_some_and(|object| object.contains_key("$id"))
+    {
+        validate_unique_local_anchors(schema, path, depth, &mut HashSet::new())
+    } else {
+        validate_unique_local_anchors(schema, path, depth, anchors)
+    }
+}
+
+fn validate_unique_local_resource_ids(
+    schema: &Value,
+    path: &str,
+    depth: usize,
+    parent_base: Option<&str>,
+    identifiers: &mut HashSet<String>,
+) -> Result<(), SchemaAdmissionError> {
+    if depth >= MAX_SCHEMA_VALIDATION_DEPTH {
+        return Err(SchemaAdmissionError::new(
+            path,
+            "schema admission nesting limit exceeded",
+        ));
+    }
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    let base = object
+        .get("$id")
+        .and_then(Value::as_str)
+        .map(|identifier| {
+            resolve_resource_identifier(parent_base, identifier).ok_or_else(|| {
+                SchemaAdmissionError::new(
+                    format!("{path}.$id"),
+                    "schema $id must resolve to a bounded absolute URI",
+                )
+            })
+        })
+        .transpose()?;
+    if let Some(identifier) = &base
+        && !identifiers.insert(identifier.clone())
+    {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.$id"),
+            "duplicate local schema resource identifier",
+        ));
+    }
+    let current_base = base.as_deref().or(parent_base);
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ] {
+        if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
+            for (name, subschema) in subschemas {
+                validate_unique_local_resource_ids(
+                    subschema,
+                    &format!("{path}.{keyword}.{name}"),
+                    depth + 1,
+                    current_base,
+                    identifiers,
+                )?;
+            }
+        }
+    }
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contentSchema",
+    ] {
+        if let Some(subschema) = object.get(keyword) {
+            validate_unique_local_resource_ids(
+                subschema,
+                &format!("{path}.{keyword}"),
+                depth + 1,
+                current_base,
+                identifiers,
+            )?;
+        }
+    }
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = object.get(keyword).and_then(Value::as_array) {
+            for (index, subschema) in subschemas.iter().enumerate() {
+                validate_unique_local_resource_ids(
+                    subschema,
+                    &format!("{path}.{keyword}[{index}]"),
+                    depth + 1,
+                    current_base,
+                    identifiers,
                 )?;
             }
         }
@@ -1100,11 +1397,16 @@ fn validate_with_schema_features(
     enforce_unevaluated_properties: bool,
 ) -> ValidationResult {
     let mut errors = Vec::new();
+    let mut context = ValidationContext::new(schema, enforce_unevaluated_properties);
     let mut instance_nodes = 0;
     if !validate_instance_bounds(value, "root", 0, &mut instance_nodes, &mut errors) {
         return Err(errors);
     }
-    let mut context = ValidationContext::new(schema, enforce_unevaluated_properties);
+    if enforce_unevaluated_properties
+        && !consume_instance_preflight_work(&mut context, instance_nodes, "root", &mut errors)
+    {
+        return Err(errors);
+    }
     validate_internal(schema, value, "root", &mut errors, &mut context);
     if context.work_exhausted
         && !errors
@@ -1208,6 +1510,7 @@ fn make_strict_schema(schema: &Value) -> Value {
                 "then",
                 "else",
                 "propertyNames",
+                "contentSchema",
             ] {
                 if let Some(subschema) = obj.get(keyword) {
                     new_obj.insert(keyword.to_owned(), make_strict_schema(subschema));
@@ -1302,6 +1605,21 @@ impl<'a> ValidationContext<'a> {
             .find(|(candidate, _)| candidate == name)
             .map(|(_, schema)| schema.clone())
     }
+}
+
+fn consume_instance_preflight_work(
+    context: &mut ValidationContext<'_>,
+    nodes: usize,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+) -> bool {
+    for _ in 0..nodes {
+        if !context.consume_work() {
+            push_error(errors, path, "schema validation work limit exceeded");
+            return false;
+        }
+    }
+    true
 }
 
 fn consume_validation_work(
@@ -1554,7 +1872,7 @@ fn validate_local_reference(
     }
     let root_schema = context.root_schema;
     let resolution = if context.enforce_unevaluated_properties {
-        resolve_local_reference(root_schema, reference)
+        resolve_local_reference_with_work(root_schema, schema, reference, context)
     } else {
         resolve_legacy_local_reference(root_schema, reference)
     };
@@ -1583,7 +1901,7 @@ fn validate_dynamic_reference(
         return;
     }
     let root_schema = context.root_schema;
-    match resolve_local_reference(root_schema, reference) {
+    match resolve_local_reference_with_work(root_schema, schema, reference, context) {
         Ok(target) => {
             let dynamic_anchor = target
                 .as_object()
@@ -1599,16 +1917,93 @@ fn validate_dynamic_reference(
     context.leave_reference();
 }
 
+struct SchemaResourceScope<'a> {
+    resource: &'a Value,
+    base: Option<String>,
+}
+
 fn resolve_local_reference<'a>(
     root_schema: &'a Value,
+    source: &serde_json::Map<String, Value>,
     reference: &str,
 ) -> Result<&'a Value, &'static str> {
-    if reference == "#" {
-        return Ok(root_schema);
+    let mut uncharged = || Ok(());
+    resolve_local_reference_with_charge(root_schema, source, reference, &mut uncharged)
+}
+
+fn resolve_local_reference_with_work<'a>(
+    root_schema: &'a Value,
+    source: &serde_json::Map<String, Value>,
+    reference: &str,
+    context: &mut ValidationContext<'_>,
+) -> Result<&'a Value, &'static str> {
+    let mut charge = || {
+        if context.consume_work() {
+            Ok(())
+        } else {
+            Err("schema validation work limit exceeded")
+        }
+    };
+    resolve_local_reference_with_charge(root_schema, source, reference, &mut charge)
+}
+
+fn resolve_local_reference_with_charge<'a>(
+    root_schema: &'a Value,
+    source: &serde_json::Map<String, Value>,
+    reference: &str,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<&'a Value, &'static str> {
+    if reference.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES {
+        return Err("schema reference exceeds byte limit");
     }
-    if let Some(pointer) = reference.strip_prefix("#/") {
-        let mut target = root_schema;
+    if !is_bounded_uri_reference(reference) {
+        return Err("invalid local schema reference");
+    }
+    let source_scope = find_schema_resource_scope(root_schema, source, charge)?
+        .ok_or("unresolved local schema reference")?;
+    let (identifier, fragment) = split_uri_reference_fragment(reference);
+    let fragment = fragment
+        .map(decode_uri_fragment)
+        .transpose()
+        .ok_or("invalid local schema reference")?;
+    let resource = if identifier.is_empty() {
+        source_scope.resource
+    } else {
+        let identifier = resolve_uri_reference(source_scope.base.as_deref(), identifier)
+            .ok_or("external schema reference is not allowed")?;
+        find_local_schema_resource_with_charge(root_schema, &identifier, charge)?
+            .ok_or("external schema reference is not allowed")?
+    };
+    resolve_local_reference_fragment_with_charge(
+        resource,
+        fragment.as_deref().unwrap_or(""),
+        charge,
+    )
+}
+
+fn resolve_local_reference_fragment<'a>(
+    resource: &'a Value,
+    fragment: &str,
+) -> Result<&'a Value, &'static str> {
+    if !fragment.is_empty() && !fragment.starts_with('/') {
+        return find_resource_anchor(resource, fragment).ok_or("unresolved local schema reference");
+    }
+    let mut uncharged = || Ok(());
+    resolve_local_reference_fragment_with_charge(resource, fragment, &mut uncharged)
+}
+
+fn resolve_local_reference_fragment_with_charge<'a>(
+    resource: &'a Value,
+    fragment: &str,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<&'a Value, &'static str> {
+    if fragment.is_empty() {
+        return Ok(resource);
+    }
+    if let Some(pointer) = fragment.strip_prefix('/') {
+        let mut target = resource;
         for encoded_segment in pointer.split('/') {
+            charge()?;
             let segment = unescape_json_pointer_segment(encoded_segment)
                 .ok_or("invalid local schema reference")?;
             target = match target {
@@ -1623,10 +2018,8 @@ fn resolve_local_reference<'a>(
         }
         return Ok(target);
     }
-    if let Some(anchor) = reference.strip_prefix('#') {
-        return find_local_anchor(root_schema, anchor).ok_or("unresolved local schema reference");
-    }
-    Err("external schema reference is not allowed")
+    find_resource_anchor_with_charge(resource, fragment, charge)?
+        .ok_or("unresolved local schema reference")
 }
 
 /// The public raw validator predates anchor fragments. Keep its local-ref
@@ -1636,28 +2029,70 @@ fn resolve_legacy_local_reference<'a>(
     reference: &str,
 ) -> Result<&'a Value, &'static str> {
     if reference == "#" || reference.starts_with("#/") {
-        resolve_local_reference(root_schema, reference)
+        resolve_local_reference_fragment(root_schema, &reference[1..])
     } else {
         Err("external schema reference is not allowed")
     }
 }
 
-fn is_local_reference(reference: &str) -> bool {
-    reference == "#"
-        || reference.starts_with("#/")
-        || reference.strip_prefix('#').is_some_and(valid_anchor_name)
+fn find_schema_resource_scope<'a>(
+    root_schema: &'a Value,
+    target: &serde_json::Map<String, Value>,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<SchemaResourceScope<'a>>, &'static str> {
+    find_schema_resource_scope_inner(root_schema, target, None, root_schema, None, charge)
 }
 
-fn find_local_anchor<'a>(schema: &'a Value, anchor: &str) -> Option<&'a Value> {
-    let object = schema.as_object()?;
-    if ["$anchor", "$dynamicAnchor"].iter().any(|keyword| {
-        object
-            .get(*keyword)
-            .and_then(Value::as_str)
-            .is_some_and(|candidate| candidate == anchor)
-    }) {
-        return Some(schema);
+fn find_schema_resource_scope_inner<'a>(
+    schema: &'a Value,
+    target: &serde_json::Map<String, Value>,
+    parent_base: Option<&str>,
+    inherited_resource: &'a Value,
+    inherited_base: Option<String>,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<SchemaResourceScope<'a>>, &'static str> {
+    charge()?;
+    let Some(object) = schema.as_object() else {
+        return Ok(None);
+    };
+    let identifier = object.get("$id").and_then(Value::as_str);
+    let base = if let Some(identifier) = identifier {
+        Some(
+            resolve_resource_identifier(parent_base, identifier)
+                .ok_or("unresolved local schema reference")?,
+        )
+    } else {
+        inherited_base
+    };
+    let resource = if identifier.is_some() {
+        schema
+    } else {
+        inherited_resource
+    };
+    if std::ptr::eq(object, target) {
+        return Ok(Some(SchemaResourceScope { resource, base }));
     }
+    find_schema_child_scope(
+        schema,
+        target,
+        base.as_deref(),
+        resource,
+        base.clone(),
+        charge,
+    )
+}
+
+fn find_schema_child_scope<'a>(
+    schema: &'a Value,
+    target: &serde_json::Map<String, Value>,
+    base: Option<&str>,
+    resource: &'a Value,
+    inherited_base: Option<String>,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<SchemaResourceScope<'a>>, &'static str> {
+    let Some(object) = schema.as_object() else {
+        return Ok(None);
+    };
     for keyword in [
         "properties",
         "patternProperties",
@@ -1666,8 +2101,15 @@ fn find_local_anchor<'a>(schema: &'a Value, anchor: &str) -> Option<&'a Value> {
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
             for subschema in subschemas.values() {
-                if let Some(found) = find_local_anchor(subschema, anchor) {
-                    return Some(found);
+                if let Some(scope) = find_schema_resource_scope_inner(
+                    subschema,
+                    target,
+                    base,
+                    resource,
+                    inherited_base.clone(),
+                    charge,
+                )? {
+                    return Ok(Some(scope));
                 }
             }
         }
@@ -1683,23 +2125,442 @@ fn find_local_anchor<'a>(schema: &'a Value, anchor: &str) -> Option<&'a Value> {
         "then",
         "else",
         "propertyNames",
+        "contentSchema",
     ] {
         if let Some(subschema) = object.get(keyword)
-            && let Some(found) = find_local_anchor(subschema, anchor)
+            && let Some(scope) = find_schema_resource_scope_inner(
+                subschema,
+                target,
+                base,
+                resource,
+                inherited_base.clone(),
+                charge,
+            )?
         {
-            return Some(found);
+            return Ok(Some(scope));
         }
     }
     for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_array) {
             for subschema in subschemas {
-                if let Some(found) = find_local_anchor(subschema, anchor) {
-                    return Some(found);
+                if let Some(scope) = find_schema_resource_scope_inner(
+                    subschema,
+                    target,
+                    base,
+                    resource,
+                    inherited_base.clone(),
+                    charge,
+                )? {
+                    return Ok(Some(scope));
                 }
             }
         }
     }
-    None
+    Ok(None)
+}
+
+fn find_local_schema_resource<'a>(schema: &'a Value, identifier: &str) -> Option<&'a Value> {
+    let mut uncharged = || Ok(());
+    find_local_schema_resource_with_charge(schema, identifier, &mut uncharged)
+        .ok()
+        .flatten()
+}
+
+fn find_local_schema_resource_with_charge<'a>(
+    schema: &'a Value,
+    identifier: &str,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<&'a Value>, &'static str> {
+    find_local_schema_resource_inner(schema, identifier, None, charge)
+}
+
+fn find_local_schema_resource_inner<'a>(
+    schema: &'a Value,
+    identifier: &str,
+    parent_base: Option<&str>,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<&'a Value>, &'static str> {
+    charge()?;
+    let Some(object) = schema.as_object() else {
+        return Ok(None);
+    };
+    let base = if let Some(candidate) = object.get("$id").and_then(Value::as_str) {
+        Some(
+            resolve_resource_identifier(parent_base, candidate)
+                .ok_or("unresolved local schema reference")?,
+        )
+    } else {
+        None
+    };
+    if base.as_deref() == Some(identifier) {
+        return Ok(Some(schema));
+    }
+    let inherited_base = base.as_deref().or(parent_base);
+    find_local_schema_resource_child(schema, identifier, inherited_base, charge)
+}
+
+fn find_local_schema_resource_child<'a>(
+    schema: &'a Value,
+    identifier: &str,
+    parent_base: Option<&str>,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<&'a Value>, &'static str> {
+    let Some(object) = schema.as_object() else {
+        return Ok(None);
+    };
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ] {
+        if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
+            for subschema in subschemas.values() {
+                if let Some(found) =
+                    find_local_schema_resource_inner(subschema, identifier, parent_base, charge)?
+                {
+                    return Ok(Some(found));
+                }
+            }
+        }
+    }
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contentSchema",
+    ] {
+        if let Some(subschema) = object.get(keyword)
+            && let Some(found) =
+                find_local_schema_resource_inner(subschema, identifier, parent_base, charge)?
+        {
+            return Ok(Some(found));
+        }
+    }
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = object.get(keyword).and_then(Value::as_array) {
+            for subschema in subschemas {
+                if let Some(found) =
+                    find_local_schema_resource_inner(subschema, identifier, parent_base, charge)?
+                {
+                    return Ok(Some(found));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn split_uri_reference_fragment(reference: &str) -> (&str, Option<&str>) {
+    reference
+        .split_once('#')
+        .map_or((reference, None), |(identifier, fragment)| {
+            (identifier, Some(fragment))
+        })
+}
+
+fn decode_uri_fragment(fragment: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(fragment.len());
+    let bytes = fragment.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = *bytes.get(index + 1)?;
+        let low = *bytes.get(index + 2)?;
+        decoded.push((hex_value(high)? << 4) | hex_value(low)?);
+        index += 3;
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn resolve_resource_identifier(parent_base: Option<&str>, identifier: &str) -> Option<String> {
+    let (identifier, fragment) = split_uri_reference_fragment(identifier);
+    if fragment.is_some_and(|fragment| !fragment.is_empty()) {
+        return None;
+    }
+    resolve_uri_reference(parent_base, identifier)
+}
+
+fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Option<String> {
+    if !is_bounded_uri_reference(reference) {
+        return None;
+    }
+    if has_uri_scheme(reference) {
+        return normalize_absolute_uri_reference(reference);
+    }
+    let base = base?;
+    let base_uri =
+        AbsoluteUri::parse_with_max_bytes(base, MAX_SCHEMA_ASSERTION_STRING_BYTES).ok()?;
+    let scheme = base_uri.scheme().as_str();
+    let (base_without_query, base_query) = base
+        .split_once('?')
+        .map_or((base, None), |(value, query)| (value, Some(query)));
+    let (reference_path, reference_query) = reference
+        .split_once('?')
+        .map_or((reference, None), |(path, query)| (path, Some(query)));
+    if reference_path.starts_with("//") {
+        let resolved = format!("{scheme}:{reference}");
+        return normalize_absolute_uri_reference(&resolved);
+    }
+    let hierarchy = base_without_query
+        .strip_prefix(&format!("{scheme}:"))
+        .filter(|value| value.starts_with("//"))?;
+    let authority_end = hierarchy[2..]
+        .find('/')
+        .map_or(hierarchy.len(), |index| index + 2);
+    let origin = format!("{scheme}:{}", &hierarchy[..authority_end]);
+    let base_path = &hierarchy[authority_end..];
+    let path = if reference_path.is_empty() {
+        base_path.to_owned()
+    } else if reference_path.starts_with('/') {
+        remove_uri_dot_segments(reference_path)
+    } else {
+        let directory_end = base_path.rfind('/').map_or(0, |index| index + 1);
+        let directory = if base_path.is_empty() {
+            "/"
+        } else {
+            &base_path[..directory_end]
+        };
+        remove_uri_dot_segments(&format!("{}{}", directory, reference_path))
+    };
+    // RFC 3986 section 5.2.2 inherits the base query only when the reference
+    // has neither a path nor a query. A query-only reference replaces it, and
+    // every non-empty path starts with no query unless it declares one.
+    let query = match (reference_path.is_empty(), reference_query, base_query) {
+        (true, Some(query), _) | (false, Some(query), _) => format!("?{query}"),
+        (true, None, Some(query)) => format!("?{query}"),
+        (true, None, None) | (false, None, _) => String::new(),
+    };
+    let resolved = format!("{origin}{path}{query}");
+    AbsoluteUri::parse_with_max_bytes(&resolved, MAX_SCHEMA_ASSERTION_STRING_BYTES)
+        .ok()
+        .map(|uri| uri.as_str().to_owned())
+}
+
+fn normalize_absolute_uri_reference(reference: &str) -> Option<String> {
+    let uri = AbsoluteUri::parse_with_max_bytes(reference, MAX_SCHEMA_ASSERTION_STRING_BYTES)
+        .ok()
+        .filter(|uri| uri.fragment().is_none())?;
+    let scheme = uri.scheme().as_str();
+    let hierarchy = reference.strip_prefix(&format!("{scheme}:"))?;
+    let (hierarchy, query) = hierarchy
+        .split_once('?')
+        .map_or((hierarchy, None), |(path, query)| (path, Some(query)));
+    let normalized = if hierarchy.starts_with("//") {
+        let authority_end = hierarchy[2..]
+            .find('/')
+            .map_or(hierarchy.len(), |index| index + 2);
+        let authority = &hierarchy[..authority_end];
+        let path = remove_uri_dot_segments(&hierarchy[authority_end..]);
+        format!("{authority}{path}")
+    } else {
+        remove_uri_dot_segments(hierarchy)
+    };
+    let query = query.map_or_else(String::new, |query| format!("?{query}"));
+    let normalized = format!("{scheme}:{normalized}{query}");
+    AbsoluteUri::parse_with_max_bytes(&normalized, MAX_SCHEMA_ASSERTION_STRING_BYTES)
+        .ok()
+        .filter(|uri| uri.fragment().is_none())
+        .map(|uri| uri.as_str().to_owned())
+}
+
+fn has_uri_scheme(reference: &str) -> bool {
+    reference.find(':').is_some_and(|index| {
+        !reference[..index].contains(['/', '?']) && is_valid_uri_scheme(&reference[..index])
+    })
+}
+
+fn is_bounded_uri_reference(reference: &str) -> bool {
+    reference.len() <= MAX_SCHEMA_ASSERTION_STRING_BYTES
+        && reference.bytes().enumerate().all(|(index, byte)| {
+            if byte == b'%' {
+                return reference
+                    .as_bytes()
+                    .get(index + 1..=index + 2)
+                    .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit));
+            }
+            byte.is_ascii()
+                && byte > b' '
+                && byte != 0x7f
+                && (byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'-' | b'.'
+                            | b'_'
+                            | b'~'
+                            | b':'
+                            | b'/'
+                            | b'?'
+                            | b'#'
+                            | b'['
+                            | b']'
+                            | b'@'
+                            | b'!'
+                            | b'$'
+                            | b'&'
+                            | b'\''
+                            | b'('
+                            | b')'
+                            | b'*'
+                            | b'+'
+                            | b','
+                            | b';'
+                            | b'='
+                            | b'%'
+                    ))
+        })
+}
+
+/// Removes dot segments according to RFC 3986 section 5.2.4.
+///
+/// This is intentionally a buffer algorithm rather than a split-and-join
+/// shortcut. Empty path segments are meaningful (`/a//b` differs from
+/// `/a/b`), and the final `/.` and `/..` inputs each leave a trailing slash.
+fn remove_uri_dot_segments(path: &str) -> String {
+    let mut input = path.to_owned();
+    let mut output = String::with_capacity(path.len());
+
+    while !input.is_empty() {
+        if input.starts_with("../") {
+            input.drain(..3);
+        } else if input.starts_with("./") {
+            input.drain(..2);
+        } else if input.starts_with("/./") {
+            input.replace_range(..3, "/");
+        } else if input == "/." {
+            input.truncate(1);
+        } else if input.starts_with("/../") {
+            input.replace_range(..4, "/");
+            remove_last_uri_path_segment(&mut output);
+        } else if input == "/.." {
+            input.replace_range(..3, "/");
+            remove_last_uri_path_segment(&mut output);
+        } else if input == "." || input == ".." {
+            input.clear();
+        } else {
+            // Move the first input path segment, including its leading slash
+            // when present, from the input buffer to the output buffer.
+            let segment_end = if input.starts_with('/') {
+                input[1..].find('/').map_or(input.len(), |index| index + 1)
+            } else {
+                input.find('/').unwrap_or(input.len())
+            };
+            output.push_str(&input[..segment_end]);
+            input.drain(..segment_end);
+        }
+    }
+
+    output
+}
+
+/// Removes the last output path segment as defined by RFC 3986 section 5.2.4.
+fn remove_last_uri_path_segment(output: &mut String) {
+    if let Some(separator) = output.rfind('/') {
+        output.truncate(separator);
+    } else {
+        output.clear();
+    }
+}
+
+fn find_resource_anchor<'a>(schema: &'a Value, anchor: &str) -> Option<&'a Value> {
+    let mut uncharged = || Ok(());
+    find_resource_anchor_with_charge(schema, anchor, &mut uncharged)
+        .ok()
+        .flatten()
+}
+
+fn find_resource_anchor_with_charge<'a>(
+    schema: &'a Value,
+    anchor: &str,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<&'a Value>, &'static str> {
+    find_resource_anchor_inner(schema, anchor, true, charge)
+}
+
+fn find_resource_anchor_inner<'a>(
+    schema: &'a Value,
+    anchor: &str,
+    resource_root: bool,
+    charge: &mut dyn FnMut() -> Result<(), &'static str>,
+) -> Result<Option<&'a Value>, &'static str> {
+    charge()?;
+    let Some(object) = schema.as_object() else {
+        return Ok(None);
+    };
+    if !resource_root && object.contains_key("$id") {
+        return Ok(None);
+    }
+    if ["$anchor", "$dynamicAnchor"].iter().any(|keyword| {
+        object
+            .get(*keyword)
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate == anchor)
+    }) {
+        return Ok(Some(schema));
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ] {
+        if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
+            for subschema in subschemas.values() {
+                if let Some(found) = find_resource_anchor_inner(subschema, anchor, false, charge)? {
+                    return Ok(Some(found));
+                }
+            }
+        }
+    }
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contentSchema",
+    ] {
+        if let Some(subschema) = object.get(keyword)
+            && let Some(found) = find_resource_anchor_inner(subschema, anchor, false, charge)?
+        {
+            return Ok(Some(found));
+        }
+    }
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if let Some(subschemas) = object.get(keyword).and_then(Value::as_array) {
+            for subschema in subschemas {
+                if let Some(found) = find_resource_anchor_inner(subschema, anchor, false, charge)? {
+                    return Ok(Some(found));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn unescape_json_pointer_segment(segment: &str) -> Option<String> {
@@ -2139,7 +3000,7 @@ fn mark_evaluated_object_properties(
             push_error(errors, path, "local schema reference depth limit exceeded");
         } else {
             let root_schema = context.root_schema;
-            match resolve_local_reference(root_schema, reference) {
+            match resolve_local_reference_with_work(root_schema, schema, reference, context) {
                 Ok(target) if branch_is_valid(target, value, path, context) => {
                     if let Some(target) = target.as_object() {
                         mark_evaluated_object_properties(
@@ -2158,7 +3019,9 @@ fn mark_evaluated_object_properties(
         if !context.enter_reference() {
             push_error(errors, path, "local schema reference depth limit exceeded");
         } else {
-            let target = resolve_local_reference(context.root_schema, reference).ok();
+            let root_schema = context.root_schema;
+            let target =
+                resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
             if let Some(target) = target {
                 let dynamic_anchor = target
                     .as_object()
@@ -2606,11 +3469,13 @@ fn mark_evaluated_array_items(
     }
 
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
-        mark_reference_evaluated_array_items(reference, arr, path, evaluated, errors, context);
+        mark_reference_evaluated_array_items(
+            schema, reference, arr, path, evaluated, errors, context,
+        );
     }
     if let Some(reference) = schema.get("$dynamicRef").and_then(Value::as_str) {
         mark_dynamic_reference_evaluated_array_items(
-            reference, arr, path, evaluated, errors, context,
+            schema, reference, arr, path, evaluated, errors, context,
         );
     }
 
@@ -2648,6 +3513,7 @@ fn mark_evaluated_array_items(
 }
 
 fn mark_reference_evaluated_array_items(
+    schema: &serde_json::Map<String, Value>,
     reference: &str,
     arr: &[Value],
     path: &str,
@@ -2659,7 +3525,8 @@ fn mark_reference_evaluated_array_items(
         push_error(errors, path, "local schema reference depth limit exceeded");
         return;
     }
-    let target = resolve_local_reference(context.root_schema, reference).ok();
+    let root_schema = context.root_schema;
+    let target = resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
     if let Some(target) = target
         && branch_is_valid(target, &Value::Array(arr.to_vec()), path, context)
         && let Some(target) = target.as_object()
@@ -2670,6 +3537,7 @@ fn mark_reference_evaluated_array_items(
 }
 
 fn mark_dynamic_reference_evaluated_array_items(
+    schema: &serde_json::Map<String, Value>,
     reference: &str,
     arr: &[Value],
     path: &str,
@@ -2681,7 +3549,8 @@ fn mark_dynamic_reference_evaluated_array_items(
         push_error(errors, path, "local schema reference depth limit exceeded");
         return;
     }
-    let target = resolve_local_reference(context.root_schema, reference).ok();
+    let root_schema = context.root_schema;
+    let target = resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
     if let Some(target) = target {
         let dynamic_anchor = target
             .as_object()
@@ -2781,46 +3650,6 @@ fn validate_string(
             }
         }
     }
-
-    validate_format(schema, s, path, errors);
-}
-
-fn validate_format(
-    schema: &serde_json::Map<String, Value>,
-    value: &str,
-    path: &str,
-    errors: &mut Vec<ValidationError>,
-) {
-    let Some(format) = schema.get("format").and_then(Value::as_str) else {
-        return;
-    };
-
-    let valid = match format {
-        "byte" => BASE64_STANDARD.decode(value).is_ok(),
-        "uri" => is_valid_uri(value),
-        "uri-template" => is_valid_uri_template(value),
-        // Draft 2020-12 permits custom format names. Only the formats pinned
-        // by the final MCP schemas are assertions at this boundary.
-        _ => true,
-    };
-    if !valid {
-        push_error(
-            errors,
-            path,
-            format!("string does not match format {format:?}"),
-        );
-    }
-}
-
-fn is_valid_uri(value: &str) -> bool {
-    let Some((scheme, remainder)) = value.split_once(':') else {
-        return false;
-    };
-    is_valid_uri_scheme(scheme) && is_valid_uri_reference_segment(remainder)
-}
-
-fn is_valid_uri_template(value: &str) -> bool {
-    crate::UriTemplate::parse(value).is_ok()
 }
 
 fn is_valid_uri_scheme(scheme: &str) -> bool {
@@ -2830,56 +3659,6 @@ fn is_valid_uri_scheme(scheme: &str) -> bool {
             .iter()
             .skip(1)
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'-' | b'.'))
-}
-
-fn is_valid_uri_reference_segment(segment: &str) -> bool {
-    let bytes = segment.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                return false;
-            }
-            index += 3;
-        } else if is_valid_uri_reference_byte(bytes[index]) {
-            index += 1;
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-fn is_valid_uri_reference_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric()
-        || matches!(
-            byte,
-            b'-' | b'.'
-                | b'_'
-                | b'~'
-                | b':'
-                | b'/'
-                | b'?'
-                | b'#'
-                | b'['
-                | b']'
-                | b'@'
-                | b'!'
-                | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
-                | b'*'
-                | b'+'
-                | b','
-                | b';'
-                | b'='
-                | b'%'
-        )
 }
 
 /// A bounded, base-ten exact JSON number.
@@ -4203,13 +4982,13 @@ mod tests {
     }
 
     #[test]
-    fn admitted_schema_refuses_unsupported_vocabulary_and_raw_semantics_remain_legacy() {
+    fn admitted_schema_refuses_unknown_vocabulary_keywords_and_raw_semantics_remain_legacy() {
         let error = admit_final_schema(json!({
             "$schema": FINAL_JSON_SCHEMA_DIALECT,
-            "$id": "https://example.test/schema"
+            "unsupportedFinalKeyword": true
         }))
         .expect_err("unsupported vocabularies fail before final-schema validation");
-        assert_eq!(error.path(), "$.$id");
+        assert_eq!(error.path(), "$.unsupportedFinalKeyword");
         assert_eq!(
             error.reason(),
             "unsupported Draft 2020-12 vocabulary keyword"
@@ -4217,6 +4996,604 @@ mod tests {
 
         assert!(validate(&json!({"type": "integer"}), &json!(1.0)).is_err());
         assert!(validate(&json!({"$ref": "#named"}), &json!(true)).is_err());
+    }
+
+    #[test]
+    fn admitted_schema_accepts_declared_vocabulary_local_resources_and_content_annotations() {
+        let schema = admit_final_schema(json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "https://schemas.example.test/root",
+            "$vocabulary": {
+                CORE_VOCABULARY_URI: true,
+                APPLICATOR_VOCABULARY_URI: true,
+                VALIDATION_VOCABULARY_URI: true,
+                CONTENT_VOCABULARY_URI: true,
+                "urn:example:optional-extension": false
+            },
+            "type": "object",
+            "properties": {
+                "payload": {"$ref": "https://schemas.example.test/payload"}
+            },
+            "required": ["payload"],
+            "$defs": {
+                "payload": {
+                    "$id": "https://schemas.example.test/payload",
+                    "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                    "$vocabulary": {
+                        CORE_VOCABULARY_URI: true,
+                        CONTENT_VOCABULARY_URI: true
+                    },
+                    "type": "string",
+                    "contentEncoding": "base64",
+                    "contentMediaType": "application/json",
+                    "contentSchema": {
+                        "type": "object",
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}}
+                    }
+                }
+            }
+        }))
+        .expect("declared supported vocabularies and local resources admit");
+
+        schema
+            .validate(&json!({"payload": "this is deliberately not base64"}))
+            .expect("content annotations do not decode or validate instance strings");
+    }
+
+    #[test]
+    fn admitted_schema_rejects_duplicate_and_undeclared_local_resource_ids() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "https://schemas.example.test/root",
+            "$defs": {
+                "payload": {
+                    "$id": "https://schemas.example.test/payload",
+                    "type": "string"
+                }
+            },
+            "$ref": "https://schemas.example.test/payload"
+        });
+        admit_final_schema(accepted.clone())
+            .expect("a unique declared resource satisfies an absolute local reference");
+
+        let mut duplicate = accepted.clone();
+        duplicate["$defs"]["payload"]["$id"] = json!("https://schemas.example.test/root");
+        let duplicate_error = admit_final_schema(duplicate)
+            .expect_err("changing only the resource id to a duplicate rejects");
+        assert_eq!(duplicate_error.path(), "$.$defs.payload.$id");
+        assert_eq!(
+            duplicate_error.reason(),
+            "duplicate local schema resource identifier"
+        );
+
+        let mut undeclared = accepted;
+        undeclared["$ref"] = json!("https://schemas.example.test/not-declared");
+        let reference_error = admit_final_schema(undeclared)
+            .expect_err("undeclared URI references cannot trigger retrieval");
+        assert_eq!(reference_error.path(), "$.$ref");
+        assert_eq!(
+            reference_error.reason(),
+            "external schema reference is not allowed"
+        );
+    }
+
+    #[test]
+    fn admitted_schema_rejects_invalid_resource_id_with_a_near_identical_fixture() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "urn:example:bounded-schema",
+            "type": "string"
+        });
+        admit_final_schema(accepted.clone()).expect("a bounded absolute resource id admits");
+
+        let mut planted = accepted;
+        planted["$id"] = json!("relative-schema");
+        let error = admit_final_schema(planted)
+            .expect_err("changing only the id to a relative URI rejects");
+        assert_eq!(error.path(), "$.$id");
+        assert_eq!(
+            error.reason(),
+            "schema $id must resolve to a bounded absolute URI"
+        );
+
+        let fragmented = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "urn:example:bounded-schema#fragment",
+            "type": "string"
+        });
+        let fragment_error =
+            admit_final_schema(fragmented).expect_err("changing only the id fragment rejects");
+        assert_eq!(fragment_error.path(), "$.$id");
+        assert_eq!(
+            fragment_error.reason(),
+            "schema $id must not contain a fragment"
+        );
+    }
+
+    #[test]
+    fn ordinary_schema_vocabulary_is_ignored_and_meta_schema_vocabulary_is_a_dialect_gate() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$vocabulary": {
+                "not-a-uri": "not-a-boolean"
+            },
+            "type": "string"
+        });
+        admit_final_schema(accepted)
+            .expect("ordinary-schema $vocabulary does not select or gate a dialect");
+
+        let meta_schema = json!({
+            "$id": "https://schemas.example.test/meta",
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$vocabulary": {
+                CORE_VOCABULARY_URI: true,
+                "urn:example:unsupported": true
+            }
+        });
+        let schema = json!({
+            "$id": "https://schemas.example.test/root",
+            "$schema": "https://schemas.example.test/meta",
+            "$defs": {"meta": meta_schema},
+            "type": "string"
+        });
+        let error = admit_final_schema(schema).expect_err(
+            "only a selected meta-schema vocabulary can reject an unsupported requirement",
+        );
+        assert_eq!(error.path(), "$.$vocabulary.urn:example:unsupported");
+        assert_eq!(
+            error.reason(),
+            "required schema vocabulary is not supported"
+        );
+    }
+
+    #[test]
+    fn schema_dialect_must_be_absolute_with_a_one_value_negative() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "string"
+        });
+        admit_final_schema(accepted.clone()).expect("the canonical absolute dialect admits");
+
+        let mut planted = accepted.clone();
+        planted["$schema"] = json!("meta/validation");
+        let error = admit_final_schema(planted)
+            .expect_err("changing only the dialect to a relative identifier must reject");
+        assert_eq!(error.path(), "$.$schema");
+        assert_eq!(
+            error.reason(),
+            "schema dialect must be a bounded absolute URI"
+        );
+        assert_eq!(accepted["$schema"], json!(FINAL_JSON_SCHEMA_DIALECT));
+    }
+
+    #[test]
+    fn admitted_schema_scopes_relative_ids_anchors_and_inner_local_references() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "https://schemas.example.test/catalog/root.json",
+            "$anchor": "outer",
+            "type": "object",
+            "properties": {
+                "outer": {"$ref": "resources/outer.json#outer"}
+            },
+            "required": ["outer"],
+            "$defs": {
+                "outer": {
+                    "$id": "resources/outer.json",
+                    "$anchor": "outer",
+                    "type": "object",
+                    "properties": {
+                        "value": {"$ref": "#integer"},
+                        "nested": {"$ref": "nested.json#nested"}
+                    },
+                    "required": ["value", "nested"],
+                    "$defs": {
+                        "integer": {"$anchor": "integer", "type": "integer"},
+                        "nested": {
+                            "$id": "nested.json",
+                            "$anchor": "nested",
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        });
+        let schema = admit_final_schema(accepted.clone())
+            .expect("relative ids and resource-scoped anchors admit");
+        schema
+            .validate(&json!({"outer": {"value": 7, "nested": "ready"}}))
+            .expect("inner local and relative references resolve from the owning resource");
+
+        let mut planted = accepted;
+        planted["$defs"]["outer"]["properties"]["value"]["$ref"] = json!("#root-only");
+        let error = admit_final_schema(planted)
+            .expect_err("changing only an inner reference to an outer anchor rejects");
+        assert_eq!(error.path(), "$.$defs.outer.properties.value.$ref");
+        assert_eq!(error.reason(), "unresolved local schema reference");
+    }
+
+    #[test]
+    fn relative_resource_ids_resolve_from_authority_only_and_query_bases() {
+        for base in [
+            "https://schemas.example.test",
+            "https://schemas.example.test?catalog=bounded",
+        ] {
+            let schema = admit_final_schema(json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$id": base,
+                "$defs": {
+                    "child": {
+                        "$id": "child.json",
+                        "type": "string",
+                        "const": "ready"
+                    }
+                },
+                "$ref": "child.json"
+            }))
+            .expect("a relative child resource resolves below an authority-only base");
+            schema
+                .validate(&json!("ready"))
+                .expect("the authority-relative child reference reaches its local resource");
+        }
+    }
+
+    #[test]
+    fn rfc3986_reference_resolution_table_preserves_network_query_and_dot_boundaries() {
+        let vectors = [
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "https://schemas.example.test/a//b?absolute=1",
+                "https://schemas.example.test/a//b?absolute=1",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "/a//b",
+                "https://schemas.example.test/a//b",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "/a/.",
+                "https://schemas.example.test/a/",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "/a/..",
+                "https://schemas.example.test/",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "child/./leaf?relative=1",
+                "https://schemas.example.test/a/child/leaf?relative=1",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "child/..",
+                "https://schemas.example.test/a/",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "//authority.example.test/a//b?network=1",
+                "https://authority.example.test/a//b?network=1",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "//authority.example.test/a/.",
+                "https://authority.example.test/a/",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "//authority.example.test/a/..",
+                "https://authority.example.test/",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "?next=1",
+                "https://schemas.example.test/a/b?next=1",
+            ),
+            (
+                "https://schemas.example.test/a/b?base=1",
+                "",
+                "https://schemas.example.test/a/b?base=1",
+            ),
+        ];
+
+        for (base, reference, expected) in vectors {
+            assert_eq!(
+                resolve_uri_reference(Some(base), reference).as_deref(),
+                Some(expected),
+                "RFC 3986 resolution must retain the boundary semantics of {reference:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc3986_remove_dot_segments_table_preserves_empty_and_trailing_segments() {
+        let vectors = [
+            ("/a/b/c/./../../g", "/a/g"),
+            ("mid/content=5/../6", "mid/6"),
+            ("/a//b", "/a//b"),
+            ("/a/.", "/a/"),
+            ("/a/..", "/"),
+            ("/../", "/"),
+            ("../g", "g"),
+            ("g/./h", "g/h"),
+        ];
+
+        for (path, expected) in vectors {
+            assert_eq!(
+                remove_uri_dot_segments(path),
+                expected,
+                "RFC 3986 section 5.2.4 preserves the path boundary semantics of {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rfc3986_dot_segment_one_value_negatives_do_not_select_adjacent_resources() {
+        let cases = [
+            ("/a//b", "https://schemas.example.test/a//b", "/a/b"),
+            ("/a/.", "https://schemas.example.test/a/", "/a"),
+            ("/a/..", "https://schemas.example.test/", "/a"),
+        ];
+
+        for (reference, resource_id, planted_reference) in cases {
+            let schema = json!({
+                "$id": "https://schemas.example.test/root.json",
+                "$defs": {
+                    "target": {"$id": resource_id, "const": "ready"}
+                }
+            });
+            let root = schema
+                .as_object()
+                .expect("the dot-segment fixture remains a schema object");
+
+            let target = resolve_local_reference(&schema, root, reference)
+                .expect("the RFC 3986 vector reaches its declared local resource");
+            assert_eq!(target, &schema["$defs"]["target"]);
+            assert_eq!(
+                resolve_local_reference(&schema, root, planted_reference),
+                Err("external schema reference is not allowed"),
+                "changing only the path boundary must not select {resource_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn final_local_reference_table_preserves_network_query_and_fragment_boundaries() {
+        let schema = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "https://schemas.example.test/root?base=1",
+            "$anchor": "root",
+            "$defs": {
+                "query": {
+                    "$id": "?selected=1",
+                    "$anchor": "selected",
+                    "const": "ready"
+                },
+                "network": {
+                    "$id": "https://authority.example.test/a//b?network=1",
+                    "$anchor": "network",
+                    "const": "network"
+                }
+            }
+        });
+        let root = schema
+            .as_object()
+            .expect("the RFC boundary fixture remains a schema object");
+        let vectors = [
+            ("#root", "root"),
+            ("?selected=1#selected", "query"),
+            ("//authority.example.test/a//b?network=1#network", "network"),
+        ];
+
+        for (reference, expected_definition) in vectors {
+            let target = resolve_local_reference(&schema, root, reference)
+                .expect("the table vector resolves inside the local schema catalog");
+            assert_eq!(
+                target,
+                if expected_definition == "root" {
+                    &schema
+                } else {
+                    &schema["$defs"][expected_definition]
+                },
+                "the URI identifier and fragment boundaries select the expected resource for {reference:?}"
+            );
+        }
+
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "https://schemas.example.test/root?base=1",
+            "$defs": {"query": schema["$defs"]["query"].clone()},
+            "$ref": "?selected=1#selected"
+        });
+        admit_final_schema(accepted.clone())
+            .expect("the query and fragment boundary fixture admits")
+            .validate(&json!("ready"))
+            .expect("the query-selected anchored resource validates");
+
+        let mut planted = accepted.clone();
+        planted["$ref"] = json!("?selected=2#selected");
+        let error = admit_final_schema(planted)
+            .expect_err("changing only the query value must not select the declared resource");
+        assert_eq!(error.path(), "$.$ref");
+        assert_eq!(error.reason(), "external schema reference is not allowed");
+        assert_eq!(accepted["$ref"], json!("?selected=1#selected"));
+    }
+
+    #[test]
+    fn absolute_references_normalize_dot_segments_with_a_one_value_negative() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$id": "https://schemas.example.test/catalog/root.json",
+            "$defs": {
+                "child": {
+                    "$id": "../child.json",
+                    "const": "ready"
+                }
+            },
+            "$ref": "https://schemas.example.test/catalog/../child.json"
+        });
+        let schema = admit_final_schema(accepted.clone())
+            .expect("an absolute reference resolves after dot-segment normalization");
+        schema
+            .validate(&json!("ready"))
+            .expect("the normalized absolute reference reaches the local child resource");
+
+        let mut planted = accepted.clone();
+        planted["$ref"] = json!("https://schemas.example.test/catalog/../missing.json");
+        let error = admit_final_schema(planted)
+            .expect_err("changing only the normalized target to an undeclared resource rejects");
+        assert_eq!(error.path(), "$.$ref");
+        assert_eq!(error.reason(), "external schema reference is not allowed");
+        assert_eq!(
+            accepted["$ref"],
+            json!("https://schemas.example.test/catalog/../child.json")
+        );
+    }
+
+    #[test]
+    fn final_references_percent_decode_before_json_pointer_unescaping() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$defs": {
+                "a/b": {"const": "ready"}
+            },
+            "$ref": "#/$defs/a%7E1b"
+        });
+        let schema = admit_final_schema(accepted.clone())
+            .expect("percent decoding before ~1 decoding reaches the slash-containing definition");
+        schema
+            .validate(&json!("ready"))
+            .expect("the percent-encoded pointer token resolves");
+
+        let mut invalid_percent = accepted.clone();
+        invalid_percent["$ref"] = json!("#/$defs/a%7G1b");
+        let invalid_percent_error = admit_final_schema(invalid_percent)
+            .expect_err("changing only one percent-escape nibble must reject");
+        assert_eq!(invalid_percent_error.path(), "$.$ref");
+        assert_eq!(
+            invalid_percent_error.reason(),
+            "invalid local schema reference"
+        );
+
+        let mut invalid_utf8 = accepted.clone();
+        invalid_utf8["$ref"] = json!("#/$defs/a%FF1b");
+        let invalid_utf8_error = admit_final_schema(invalid_utf8)
+            .expect_err("changing only the pointer escape to invalid UTF-8 must reject");
+        assert_eq!(invalid_utf8_error.path(), "$.$ref");
+        assert_eq!(
+            invalid_utf8_error.reason(),
+            "invalid local schema reference"
+        );
+        assert_eq!(accepted["$ref"], json!("#/$defs/a%7E1b"));
+    }
+
+    #[test]
+    fn raw_validation_retains_its_legacy_local_reference_behavior() {
+        let legacy = json!({
+            "$defs": {
+                "ready": {"const": "ready"},
+                "a/b": {"const": "ready"}
+            },
+            "$ref": "#/$defs/ready"
+        });
+        validate(&legacy, &json!("ready"))
+            .expect("the raw validator retains ordinary legacy JSON Pointer resolution");
+
+        let mut percent_encoded = legacy.clone();
+        percent_encoded["$ref"] = json!("#/$defs/a%7E1b");
+        let errors = validate(&percent_encoded, &json!("ready"))
+            .expect_err("raw validation does not acquire final-schema percent decoding semantics");
+        assert_eq!(errors[0].message, "unresolved local schema reference");
+        assert_eq!(legacy["$ref"], json!("#/$defs/ready"));
+    }
+
+    #[test]
+    fn local_resource_resolution_charges_exact_shared_work_units() {
+        let schema = json!({
+            "$id": "https://schemas.example.test/root.json",
+            "properties": {
+                "source": {"$ref": "child.json"}
+            },
+            "$defs": {
+                "target": {
+                    "$id": "child.json",
+                    "const": "ready"
+                }
+            }
+        });
+        let source = schema["properties"]["source"]
+            .as_object()
+            .expect("the source fixture remains a schema object");
+
+        let mut exact_context = ValidationContext::new(&schema, true);
+        exact_context.remaining_work = 5;
+        let target =
+            resolve_local_reference_with_work(&schema, source, "child.json", &mut exact_context)
+                .expect("two scope visits and three resource visits fit the exact work budget");
+        assert_eq!(target, &json!({"$id": "child.json", "const": "ready"}));
+        assert_eq!(exact_context.remaining_work, 0);
+
+        let mut planted_context = ValidationContext::new(&schema, true);
+        planted_context.remaining_work = 4;
+        let error =
+            resolve_local_reference_with_work(&schema, source, "child.json", &mut planted_context)
+                .expect_err("removing one lookup work unit must reject before the target is found");
+        assert_eq!(error, "schema validation work limit exceeded");
+        assert_eq!(planted_context.remaining_work, 0);
+    }
+
+    #[test]
+    fn admitted_schema_content_annotations_have_bounded_positive_and_negative_cases() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "string",
+            "contentEncoding": "base64",
+            "contentMediaType": "application/json",
+            "contentSchema": {"type": "object"}
+        });
+        admit_final_schema(accepted.clone()).expect("bounded content annotations admit");
+
+        let mut encoding = accepted.clone();
+        encoding["contentEncoding"] = json!(true);
+        let encoding_error =
+            admit_final_schema(encoding).expect_err("changing only contentEncoding rejects");
+        assert_eq!(encoding_error.path(), "$.contentEncoding");
+        assert_eq!(
+            encoding_error.reason(),
+            "content annotation keyword must be a bounded non-empty string"
+        );
+
+        let mut media_type = accepted.clone();
+        media_type["contentMediaType"] = json!(true);
+        let media_type_error =
+            admit_final_schema(media_type).expect_err("changing only contentMediaType rejects");
+        assert_eq!(media_type_error.path(), "$.contentMediaType");
+        assert_eq!(
+            media_type_error.reason(),
+            "content annotation keyword must be a bounded non-empty string"
+        );
+
+        let mut empty_encoding = accepted.clone();
+        empty_encoding["contentEncoding"] = json!("");
+        let empty_encoding_error = admit_final_schema(empty_encoding)
+            .expect_err("changing only contentEncoding to empty rejects");
+        assert_eq!(empty_encoding_error.path(), "$.contentEncoding");
+        assert_eq!(
+            empty_encoding_error.reason(),
+            "content annotation keyword must be a bounded non-empty string"
+        );
+
+        let mut content_schema = accepted;
+        content_schema["contentSchema"] = json!("not-a-schema");
+        let content_schema_error =
+            admit_final_schema(content_schema).expect_err("changing only contentSchema rejects");
+        assert_eq!(content_schema_error.path(), "$.contentSchema");
+        assert_eq!(
+            content_schema_error.reason(),
+            "schema must be an object or boolean"
+        );
     }
 
     fn assert_admitted_annotations_accept_only_evaluated_members(schema: Value, accepted: Value) {
@@ -4490,14 +5867,14 @@ mod tests {
 
     #[test]
     fn admitted_key_annotation_bookkeeping_shares_work_limit() {
-        let accepted_schema = named_property_annotation_work_schema(1_364);
-        let accepted = object_with_null_members(1_364);
-        accepted_schema
-            .validate(&accepted)
-            .expect("1,364 property validations and annotations fit the work budget");
+        let accepted_schema = named_property_annotation_work_schema(1_023);
+        let accepted = object_with_null_members(1_023);
+        accepted_schema.validate(&accepted).expect(
+            "1,023 property validations, annotations, and preflight nodes fit the work budget",
+        );
 
-        let planted_schema = named_property_annotation_work_schema(1_365);
-        let planted = object_with_null_members(1_365);
+        let planted_schema = named_property_annotation_work_schema(1_024);
+        let planted = object_with_null_members(1_024);
         let errors = planted_schema
             .validate(&planted)
             .expect_err("adding one property must exceed the shared annotation work budget");
@@ -4506,7 +5883,7 @@ mod tests {
                 .iter()
                 .any(|error| error.message == "schema validation work limit exceeded")
         );
-        assert_eq!(accepted.as_object().unwrap().len(), 1_364);
+        assert_eq!(accepted.as_object().unwrap().len(), 1_023);
     }
 
     fn repeated_pattern_work_schema(units: usize) -> AdmittedSchema {
@@ -4528,11 +5905,13 @@ mod tests {
 
     #[test]
     fn admitted_string_pattern_compilation_and_matching_share_work_limit() {
-        repeated_pattern_work_schema(15)
+        repeated_pattern_work_schema(1)
             .validate(&json!("ready"))
-            .expect("15 bounded repeated pattern units fit the work budget");
+            .expect(
+                "one repeated pattern unit and its local-reference traversal fit the work budget",
+            );
 
-        let errors = repeated_pattern_work_schema(16)
+        let errors = repeated_pattern_work_schema(2)
             .validate(&json!("ready"))
             .expect_err("adding one repeated pattern unit must exceed the shared work budget");
         assert!(
@@ -4570,7 +5949,7 @@ mod tests {
         );
     }
 
-    fn final_schema_format_schema() -> AdmittedSchema {
+    fn final_schema_format_annotation_schema() -> AdmittedSchema {
         admit_final_schema(json!({
             "$schema": FINAL_JSON_SCHEMA_DIALECT,
             "type": "object",
@@ -4582,7 +5961,7 @@ mod tests {
             "required": ["data", "uri", "template"],
             "additionalProperties": false
         }))
-        .expect("the pinned final format family admits")
+        .expect("the final format annotations admit")
     }
 
     fn final_schema_format_instance() -> Value {
@@ -4594,52 +5973,95 @@ mod tests {
     }
 
     #[test]
-    fn final_schema_format_positive() {
-        final_schema_format_schema()
+    fn final_schema_format_annotations_are_not_assertions_by_default() {
+        final_schema_format_annotation_schema()
             .validate(&final_schema_format_instance())
-            .expect("the pinned byte, uri, and uri-template formats validate");
-    }
+            .expect("valid annotations do not reject an instance");
 
-    #[test]
-    fn final_schema_format_planted_negative() {
-        let schema = final_schema_format_schema();
-        let accepted = final_schema_format_instance();
-        let mut planted = accepted.clone();
+        let mut planted = final_schema_format_instance();
         planted["uri"] = json!("not a uri");
-
-        let errors = schema
+        final_schema_format_annotation_schema()
             .validate(&planted)
-            .expect_err("changing only the uri field to a non-URI must reject");
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].path, "root.uri");
-        assert_eq!(errors[0].message, "string does not match format \"uri\"");
-        assert_eq!(accepted, final_schema_format_instance());
+            .expect("changing only an annotated URI value does not assert by default");
     }
 
     #[test]
-    fn final_schema_uri_template_format_uses_level_four_parser() {
-        let schema = final_schema_format_schema();
-        let mut accepted = final_schema_format_instance();
-        accepted["template"] = json!("mcp://resources/{item:3}{?cursor,labels*}");
+    fn format_assertion_meta_schema_is_refused_without_full_format_support() {
+        let accepted = json!({
+            "$id": "https://schemas.example.test/root.json",
+            "$schema": "https://schemas.example.test/meta/format-assertion",
+            "$defs": {
+                "meta": {
+                    "$id": "meta/format-assertion",
+                    "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                    "$vocabulary": {
+                        CORE_VOCABULARY_URI: true,
+                        FORMAT_ANNOTATION_VOCABULARY_URI: true,
+                        FORMAT_ASSERTION_VOCABULARY_URI: false
+                    }
+                }
+            },
+            "type": "string",
+            "format": "uri"
+        });
+        let schema = admit_final_schema(accepted.clone())
+            .expect("the annotation-only format vocabulary declaration admits");
         schema
-            .validate(&accepted)
-            .expect("a valid RFC 6570 Level 4 resource template is admitted");
+            .validate(&json!("not a uri"))
+            .expect("format annotations remain non-asserting");
 
         let mut planted = accepted.clone();
-        planted["template"] = json!("mcp://resources/{item:0}{?cursor,labels*}");
-        let errors = schema
-            .validate(&planted)
-            .expect_err("changing only the positive prefix length to zero must reject");
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].path, "root.template");
+        planted["$defs"]["meta"]["$vocabulary"][FORMAT_ASSERTION_VOCABULARY_URI] = json!(true);
+        let error = admit_final_schema(planted)
+            .expect_err("enabling only format assertion must fail closed without full support");
         assert_eq!(
-            errors[0].message,
-            "string does not match format \"uri-template\""
+            error.path(),
+            "$.$vocabulary.https://json-schema.org/draft/2020-12/vocab/format-assertion"
         );
         assert_eq!(
-            accepted["template"],
-            json!("mcp://resources/{item:3}{?cursor,labels*}"),
-            "a rejected format value cannot mutate the accepted instance"
+            error.reason(),
+            "format assertion vocabulary is not supported"
+        );
+        assert_eq!(
+            accepted["$defs"]["meta"]["$vocabulary"][FORMAT_ASSERTION_VOCABULARY_URI],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn meta_schema_vocabulary_requires_the_core_vocabulary() {
+        let accepted = json!({
+            "$id": "https://schemas.example.test/root.json",
+            "$schema": "https://schemas.example.test/meta/validation",
+            "$defs": {
+                "meta": {
+                    "$id": "meta/validation",
+                    "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                    "$vocabulary": {
+                        CORE_VOCABULARY_URI: true,
+                        VALIDATION_VOCABULARY_URI: true
+                    }
+                }
+            },
+            "type": "string"
+        });
+        admit_final_schema(accepted.clone())
+            .expect("a meta-schema that requires Core remains admissible");
+
+        let mut planted = accepted.clone();
+        planted["$defs"]["meta"]["$vocabulary"] = json!({
+            VALIDATION_VOCABULARY_URI: true
+        });
+        let error = admit_final_schema(planted)
+            .expect_err("removing only the required Core vocabulary must reject");
+        assert_eq!(error.path(), "$.$vocabulary");
+        assert_eq!(
+            error.reason(),
+            "meta-schema $vocabulary must require the Draft 2020-12 core vocabulary"
+        );
+        assert_eq!(
+            accepted["$defs"]["meta"]["$vocabulary"][CORE_VOCABULARY_URI],
+            json!(true)
         );
     }
 
@@ -4672,12 +6094,16 @@ mod tests {
 
     #[test]
     fn instance_node_limit_positive_and_planted_negative() {
-        let schema = admit_final_schema(json!({"type": "array", "items": true}))
-            .expect("the bounded array schema admits");
+        let schema = admit_final_schema(Value::Bool(true)).expect("the true schema admits");
         let accepted = Value::Array(vec![Value::Null; MAX_SCHEMA_INSTANCE_NODES - 1]);
-        schema
+        let accepted_errors = schema
             .validate(&accepted)
-            .expect("the exact instance-node budget is accepted");
+            .expect_err("the exact node budget plus schema evaluation exceeds the work budget");
+        assert!(
+            accepted_errors
+                .iter()
+                .any(|error| { error.message == "schema validation work limit exceeded" })
+        );
 
         let mut planted = accepted.clone();
         planted.as_array_mut().unwrap().push(Value::Null);
@@ -4691,6 +6117,47 @@ mod tests {
         assert_eq!(errors[0].message, "instance node limit exceeded");
         assert_eq!(
             accepted.as_array().unwrap().len(),
+            MAX_SCHEMA_INSTANCE_NODES - 1
+        );
+    }
+
+    #[test]
+    fn instance_preflight_work_is_accounted_with_a_one_node_negative() {
+        let schema = admit_final_schema(Value::Bool(true)).expect("the true schema admits");
+        let accepted = Value::Array(vec![Value::Null; MAX_SCHEMA_INSTANCE_NODES - 2]);
+        schema
+            .validate(&accepted)
+            .expect("preflight plus one schema application fits the shared work budget");
+
+        let mut planted = accepted.clone();
+        planted.as_array_mut().unwrap().push(Value::Null);
+        let errors = schema
+            .validate(&planted)
+            .expect_err("adding one instance node exhausts the shared work budget");
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.message == "schema validation work limit exceeded" })
+        );
+        assert_eq!(
+            accepted
+                .as_array()
+                .expect("the baseline remains an array")
+                .len(),
+            MAX_SCHEMA_INSTANCE_NODES - 2
+        );
+    }
+
+    #[test]
+    fn raw_validation_does_not_charge_admitted_final_instance_preflight_work() {
+        let legacy_instance = Value::Array(vec![Value::Null; MAX_SCHEMA_INSTANCE_NODES - 1]);
+        validate(&Value::Bool(true), &legacy_instance)
+            .expect("raw validation retains its legacy non-preflight work accounting");
+        assert_eq!(
+            legacy_instance
+                .as_array()
+                .expect("the legacy fixture remains an array")
+                .len(),
             MAX_SCHEMA_INSTANCE_NODES - 1
         );
     }
@@ -4717,6 +6184,29 @@ mod tests {
         assert_eq!(
             accepted["allOf"].as_array().unwrap().len(),
             MAX_COMPOSITION_BRANCHES - 1
+        );
+    }
+
+    #[test]
+    fn admitted_composition_branch_limit_positive_and_planted_negative() {
+        let accepted = json!({"allOf": vec![Value::Bool(true); MAX_COMPOSITION_BRANCHES]});
+        admit_final_schema(accepted.clone()).expect("the exact composition branch limit admits");
+
+        let mut planted = accepted.clone();
+        planted["allOf"]
+            .as_array_mut()
+            .expect("the allOf fixture remains an array")
+            .push(Value::Bool(true));
+        let error = admit_final_schema(planted)
+            .expect_err("adding one composition branch beyond the bound must reject admission");
+        assert_eq!(error.path(), "$.allOf");
+        assert_eq!(error.reason(), "composition keyword exceeds branch limit");
+        assert_eq!(
+            accepted["allOf"]
+                .as_array()
+                .expect("the baseline remains an array")
+                .len(),
+            MAX_COMPOSITION_BRANCHES
         );
     }
 
@@ -4943,10 +6433,14 @@ mod tests {
             for member_index in 0..member_count {
                 let member = format!("required-{index}-{member_index}");
                 members.push(json!(member.clone()));
-                instance.insert(member, Value::Null);
+                if index == 0 {
+                    instance.insert(member, Value::Null);
+                }
             }
             dependencies.insert(trigger.clone(), Value::Array(members));
-            instance.insert(trigger, Value::Null);
+            if index == 0 {
+                instance.insert(trigger, Value::Null);
+            }
         }
         let accepted = json!({
             "$schema": FINAL_JSON_SCHEMA_DIALECT,
@@ -4991,7 +6485,7 @@ mod tests {
                 .as_object()
                 .expect("instance remains an object")
                 .len(),
-            MAX_SCHEMA_VALIDATION_WORK - 1
+            MAX_SCHEMA_ASSERTION_ENTRIES
         );
     }
 

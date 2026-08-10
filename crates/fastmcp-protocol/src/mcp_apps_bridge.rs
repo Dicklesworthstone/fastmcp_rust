@@ -1082,10 +1082,9 @@ impl McpAppsJsonRpcEnvelope {
         method: McpAppsRoutedMethod,
         result: &Value,
     ) -> Result<(), McpAppsBridgeError> {
-        use McpAppsRoutedMethod::*;
         match method {
-            Ping => validate_empty_or_omitted(Some(result)),
-            Initialize => {
+            McpAppsRoutedMethod::Ping => validate_empty_or_omitted(Some(result)),
+            McpAppsRoutedMethod::Initialize => {
                 reject_reserved_result_members(result)?;
                 let initialized: McpAppsPinnedInitializeResult =
                     serde_json::from_value(result.clone())
@@ -1097,22 +1096,36 @@ impl McpAppsJsonRpcEnvelope {
                 }
                 Ok(())
             }
-            UpdateModelContext => validate_exact_object(Some(result), &[]),
-            RequestDisplayMode => validate_display_mode_result(result),
-            ResourceTeardown | OpenLink | DownloadFile | Message => {
-                validate_forward_open_result(result)
+            McpAppsRoutedMethod::UpdateModelContext => validate_exact_object(Some(result), &[]),
+            McpAppsRoutedMethod::RequestDisplayMode => validate_display_mode_result(result),
+            McpAppsRoutedMethod::ResourceTeardown
+            | McpAppsRoutedMethod::OpenLink
+            | McpAppsRoutedMethod::DownloadFile
+            | McpAppsRoutedMethod::Message => validate_forward_open_result(result),
+            McpAppsRoutedMethod::ToolsList
+            | McpAppsRoutedMethod::ToolsCall
+            | McpAppsRoutedMethod::ResourcesList
+            | McpAppsRoutedMethod::ResourceTemplatesList
+            | McpAppsRoutedMethod::ResourcesRead
+            | McpAppsRoutedMethod::PromptsList => require_bounded(Some(result)),
+            McpAppsRoutedMethod::SamplingCreateMessageRejected => {
+                Err(McpAppsBridgeError::InvalidParams)
             }
-            ToolsList
-            | ToolsCall
-            | ResourcesList
-            | ResourceTemplatesList
-            | ResourcesRead
-            | PromptsList => require_bounded(Some(result)),
-            SamplingCreateMessageRejected => Err(McpAppsBridgeError::InvalidParams),
-            Initialized | SizeChanged | RequestTeardown | AppToolsListChanged | LoggingMessage
-            | ToolInput | ToolInputPartial | ToolResult | ToolCancelled | HostContextChanged
-            | ToolsListChanged | ResourcesListChanged | PromptsListChanged | Progress
-            | Cancelled => Err(McpAppsBridgeError::InvalidParams),
+            McpAppsRoutedMethod::Initialized
+            | McpAppsRoutedMethod::SizeChanged
+            | McpAppsRoutedMethod::RequestTeardown
+            | McpAppsRoutedMethod::AppToolsListChanged
+            | McpAppsRoutedMethod::LoggingMessage
+            | McpAppsRoutedMethod::ToolInput
+            | McpAppsRoutedMethod::ToolInputPartial
+            | McpAppsRoutedMethod::ToolResult
+            | McpAppsRoutedMethod::ToolCancelled
+            | McpAppsRoutedMethod::HostContextChanged
+            | McpAppsRoutedMethod::ToolsListChanged
+            | McpAppsRoutedMethod::ResourcesListChanged
+            | McpAppsRoutedMethod::PromptsListChanged
+            | McpAppsRoutedMethod::Progress
+            | McpAppsRoutedMethod::Cancelled => Err(McpAppsBridgeError::InvalidParams),
         }
     }
 }
@@ -1717,79 +1730,97 @@ fn route_method(
     notification: bool,
 ) -> Result<McpAppsRoutedMethod, McpAppsBridgeError> {
     use McpAppsBridgeDirection::{HostToView, ViewToHost};
-    use McpAppsRoutedMethod::*;
     let routed = match (direction, notification, method) {
-        (ViewToHost, false, "ui/initialize") => Initialize,
-        (ViewToHost, false, "ui/open-link") => OpenLink,
-        (ViewToHost, false, "ui/download-file") => DownloadFile,
-        (ViewToHost, false, "ui/message") => Message,
-        (ViewToHost, false, "ui/update-model-context") => UpdateModelContext,
-        (ViewToHost, false, "ui/request-display-mode") => RequestDisplayMode,
-        (ViewToHost, false, "tools/call") => ToolsCall,
-        (ViewToHost, false, "resources/read") => ResourcesRead,
-        (ViewToHost, false, "resources/list") => ResourcesList,
-        (ViewToHost, false, "resources/templates/list") => ResourceTemplatesList,
-        (ViewToHost, false, "prompts/list") => PromptsList,
-        (ViewToHost, false, "sampling/createMessage") => SamplingCreateMessageRejected,
-        (ViewToHost, false, "ping") => Ping,
-        (HostToView, false, "ui/resource-teardown") => ResourceTeardown,
-        (HostToView, false, "tools/list") => ToolsList,
-        (HostToView, false, "tools/call") => ToolsCall,
-        (HostToView, false, "ping") => Ping,
-        (ViewToHost, true, "ui/notifications/initialized") => Initialized,
-        (ViewToHost, true, "ui/notifications/size-changed") => SizeChanged,
-        (ViewToHost, true, "ui/notifications/request-teardown") => RequestTeardown,
-        (ViewToHost, true, "notifications/tools/list_changed") => AppToolsListChanged,
-        (ViewToHost, true, "notifications/message") => LoggingMessage,
-        (ViewToHost, true, "notifications/progress") => Progress,
-        (ViewToHost, true, "notifications/cancelled") => Cancelled,
-        (HostToView, true, "notifications/tools/list_changed") => ToolsListChanged,
-        (HostToView, true, "notifications/resources/list_changed") => ResourcesListChanged,
-        (HostToView, true, "notifications/prompts/list_changed") => PromptsListChanged,
-        (HostToView, true, "ui/notifications/tool-input") => ToolInput,
-        (HostToView, true, "ui/notifications/tool-input-partial") => ToolInputPartial,
-        (HostToView, true, "ui/notifications/tool-result") => ToolResult,
-        (HostToView, true, "ui/notifications/tool-cancelled") => ToolCancelled,
-        (HostToView, true, "ui/notifications/host-context-changed") => HostContextChanged,
-        (HostToView, true, "notifications/progress") => Progress,
-        (HostToView, true, "notifications/cancelled") => Cancelled,
+        (ViewToHost, false, "ui/initialize") => McpAppsRoutedMethod::Initialize,
+        (ViewToHost, false, "ui/open-link") => McpAppsRoutedMethod::OpenLink,
+        (ViewToHost, false, "ui/download-file") => McpAppsRoutedMethod::DownloadFile,
+        (ViewToHost, false, "ui/message") => McpAppsRoutedMethod::Message,
+        (ViewToHost, false, "ui/update-model-context") => McpAppsRoutedMethod::UpdateModelContext,
+        (ViewToHost, false, "ui/request-display-mode") => McpAppsRoutedMethod::RequestDisplayMode,
+        (ViewToHost, false, "tools/call") => McpAppsRoutedMethod::ToolsCall,
+        (ViewToHost, false, "resources/read") => McpAppsRoutedMethod::ResourcesRead,
+        (ViewToHost, false, "resources/list") => McpAppsRoutedMethod::ResourcesList,
+        (ViewToHost, false, "resources/templates/list") => {
+            McpAppsRoutedMethod::ResourceTemplatesList
+        }
+        (ViewToHost, false, "prompts/list") => McpAppsRoutedMethod::PromptsList,
+        (ViewToHost, false, "sampling/createMessage") => {
+            McpAppsRoutedMethod::SamplingCreateMessageRejected
+        }
+        (ViewToHost, false, "ping") => McpAppsRoutedMethod::Ping,
+        (HostToView, false, "ui/resource-teardown") => McpAppsRoutedMethod::ResourceTeardown,
+        (HostToView, false, "tools/list") => McpAppsRoutedMethod::ToolsList,
+        (HostToView, false, "tools/call") => McpAppsRoutedMethod::ToolsCall,
+        (HostToView, false, "ping") => McpAppsRoutedMethod::Ping,
+        (ViewToHost, true, "ui/notifications/initialized") => McpAppsRoutedMethod::Initialized,
+        (ViewToHost, true, "ui/notifications/size-changed") => McpAppsRoutedMethod::SizeChanged,
+        (ViewToHost, true, "ui/notifications/request-teardown") => {
+            McpAppsRoutedMethod::RequestTeardown
+        }
+        (ViewToHost, true, "notifications/tools/list_changed") => {
+            McpAppsRoutedMethod::AppToolsListChanged
+        }
+        (ViewToHost, true, "notifications/message") => McpAppsRoutedMethod::LoggingMessage,
+        (ViewToHost, true, "notifications/progress") => McpAppsRoutedMethod::Progress,
+        (ViewToHost, true, "notifications/cancelled") => McpAppsRoutedMethod::Cancelled,
+        (HostToView, true, "notifications/tools/list_changed") => {
+            McpAppsRoutedMethod::ToolsListChanged
+        }
+        (HostToView, true, "notifications/resources/list_changed") => {
+            McpAppsRoutedMethod::ResourcesListChanged
+        }
+        (HostToView, true, "notifications/prompts/list_changed") => {
+            McpAppsRoutedMethod::PromptsListChanged
+        }
+        (HostToView, true, "ui/notifications/tool-input") => McpAppsRoutedMethod::ToolInput,
+        (HostToView, true, "ui/notifications/tool-input-partial") => {
+            McpAppsRoutedMethod::ToolInputPartial
+        }
+        (HostToView, true, "ui/notifications/tool-result") => McpAppsRoutedMethod::ToolResult,
+        (HostToView, true, "ui/notifications/tool-cancelled") => McpAppsRoutedMethod::ToolCancelled,
+        (HostToView, true, "ui/notifications/host-context-changed") => {
+            McpAppsRoutedMethod::HostContextChanged
+        }
+        (HostToView, true, "notifications/progress") => McpAppsRoutedMethod::Progress,
+        (HostToView, true, "notifications/cancelled") => McpAppsRoutedMethod::Cancelled,
         _ => return Err(McpAppsBridgeError::InvalidMethodDirection),
     };
     Ok(routed)
 }
 
 fn method_name(method: McpAppsRoutedMethod) -> &'static str {
-    use McpAppsRoutedMethod::*;
     match method {
-        Initialize => "ui/initialize",
-        OpenLink => "ui/open-link",
-        DownloadFile => "ui/download-file",
-        Message => "ui/message",
-        UpdateModelContext => "ui/update-model-context",
-        RequestDisplayMode => "ui/request-display-mode",
-        ResourceTeardown => "ui/resource-teardown",
-        ToolsList => "tools/list",
-        ToolsCall => "tools/call",
-        ResourcesList => "resources/list",
-        ResourceTemplatesList => "resources/templates/list",
-        ResourcesRead => "resources/read",
-        PromptsList => "prompts/list",
-        SamplingCreateMessageRejected => "sampling/createMessage",
-        Ping => "ping",
-        Initialized => "ui/notifications/initialized",
-        SizeChanged => "ui/notifications/size-changed",
-        RequestTeardown => "ui/notifications/request-teardown",
-        AppToolsListChanged | ToolsListChanged => "notifications/tools/list_changed",
-        LoggingMessage => "notifications/message",
-        ToolInput => "ui/notifications/tool-input",
-        ToolInputPartial => "ui/notifications/tool-input-partial",
-        ToolResult => "ui/notifications/tool-result",
-        ToolCancelled => "ui/notifications/tool-cancelled",
-        HostContextChanged => "ui/notifications/host-context-changed",
-        ResourcesListChanged => "notifications/resources/list_changed",
-        PromptsListChanged => "notifications/prompts/list_changed",
-        Progress => "notifications/progress",
-        Cancelled => "notifications/cancelled",
+        McpAppsRoutedMethod::Initialize => "ui/initialize",
+        McpAppsRoutedMethod::OpenLink => "ui/open-link",
+        McpAppsRoutedMethod::DownloadFile => "ui/download-file",
+        McpAppsRoutedMethod::Message => "ui/message",
+        McpAppsRoutedMethod::UpdateModelContext => "ui/update-model-context",
+        McpAppsRoutedMethod::RequestDisplayMode => "ui/request-display-mode",
+        McpAppsRoutedMethod::ResourceTeardown => "ui/resource-teardown",
+        McpAppsRoutedMethod::ToolsList => "tools/list",
+        McpAppsRoutedMethod::ToolsCall => "tools/call",
+        McpAppsRoutedMethod::ResourcesList => "resources/list",
+        McpAppsRoutedMethod::ResourceTemplatesList => "resources/templates/list",
+        McpAppsRoutedMethod::ResourcesRead => "resources/read",
+        McpAppsRoutedMethod::PromptsList => "prompts/list",
+        McpAppsRoutedMethod::SamplingCreateMessageRejected => "sampling/createMessage",
+        McpAppsRoutedMethod::Ping => "ping",
+        McpAppsRoutedMethod::Initialized => "ui/notifications/initialized",
+        McpAppsRoutedMethod::SizeChanged => "ui/notifications/size-changed",
+        McpAppsRoutedMethod::RequestTeardown => "ui/notifications/request-teardown",
+        McpAppsRoutedMethod::AppToolsListChanged | McpAppsRoutedMethod::ToolsListChanged => {
+            "notifications/tools/list_changed"
+        }
+        McpAppsRoutedMethod::LoggingMessage => "notifications/message",
+        McpAppsRoutedMethod::ToolInput => "ui/notifications/tool-input",
+        McpAppsRoutedMethod::ToolInputPartial => "ui/notifications/tool-input-partial",
+        McpAppsRoutedMethod::ToolResult => "ui/notifications/tool-result",
+        McpAppsRoutedMethod::ToolCancelled => "ui/notifications/tool-cancelled",
+        McpAppsRoutedMethod::HostContextChanged => "ui/notifications/host-context-changed",
+        McpAppsRoutedMethod::ResourcesListChanged => "notifications/resources/list_changed",
+        McpAppsRoutedMethod::PromptsListChanged => "notifications/prompts/list_changed",
+        McpAppsRoutedMethod::Progress => "notifications/progress",
+        McpAppsRoutedMethod::Cancelled => "notifications/cancelled",
     }
 }
 
@@ -1797,32 +1828,44 @@ fn validate_routed_payload(
     method: McpAppsRoutedMethod,
     params: Option<&Value>,
 ) -> Result<(), McpAppsBridgeError> {
-    use McpAppsRoutedMethod::*;
     match method {
-        Ping => validate_empty_or_omitted(params),
-        Initialized | RequestTeardown | AppToolsListChanged | ToolsListChanged
-        | ResourcesListChanged | PromptsListChanged => validate_empty_or_omitted(params),
-        ResourceTeardown => validate_exact_object(params, &[]),
-        Progress => validate_progress(params),
-        Cancelled => validate_cancelled(params),
-        Initialize => validate_initialize(params),
-        OpenLink => validate_typed::<McpAppsOpenLinkParams>(params),
-        DownloadFile => validate_typed::<McpAppsDownloadFileParams>(params),
-        Message => validate_typed::<McpAppsMessageParams>(params),
-        UpdateModelContext => validate_typed::<McpAppsUpdateModelContextParams>(params),
-        RequestDisplayMode => validate_typed::<McpAppsDisplayModeParams>(params),
-        ToolsCall => validate_typed::<McpAppsToolCallParams>(params),
-        ResourcesRead => validate_typed::<McpAppsResourceReadParams>(params),
-        ResourcesList | ResourceTemplatesList | PromptsList | ToolsList => {
-            validate_list_params(params)
+        McpAppsRoutedMethod::Ping => validate_empty_or_omitted(params),
+        McpAppsRoutedMethod::Initialized
+        | McpAppsRoutedMethod::RequestTeardown
+        | McpAppsRoutedMethod::AppToolsListChanged
+        | McpAppsRoutedMethod::ToolsListChanged
+        | McpAppsRoutedMethod::ResourcesListChanged
+        | McpAppsRoutedMethod::PromptsListChanged => validate_empty_or_omitted(params),
+        McpAppsRoutedMethod::ResourceTeardown => validate_exact_object(params, &[]),
+        McpAppsRoutedMethod::Progress => validate_progress(params),
+        McpAppsRoutedMethod::Cancelled => validate_cancelled(params),
+        McpAppsRoutedMethod::Initialize => validate_initialize(params),
+        McpAppsRoutedMethod::OpenLink => validate_typed::<McpAppsOpenLinkParams>(params),
+        McpAppsRoutedMethod::DownloadFile => validate_typed::<McpAppsDownloadFileParams>(params),
+        McpAppsRoutedMethod::Message => validate_typed::<McpAppsMessageParams>(params),
+        McpAppsRoutedMethod::UpdateModelContext => {
+            validate_typed::<McpAppsUpdateModelContextParams>(params)
         }
-        SizeChanged => validate_size_changed(params),
-        LoggingMessage => validate_typed::<McpAppsLogMessageNotification>(params),
-        ToolInput | ToolInputPartial => validate_tool_input(params),
-        ToolResult => require_bounded(params),
-        ToolCancelled => validate_tool_cancelled(params),
-        HostContextChanged => validate_host_context(params),
-        SamplingCreateMessageRejected => require_bounded(params),
+        McpAppsRoutedMethod::RequestDisplayMode => {
+            validate_typed::<McpAppsDisplayModeParams>(params)
+        }
+        McpAppsRoutedMethod::ToolsCall => validate_typed::<McpAppsToolCallParams>(params),
+        McpAppsRoutedMethod::ResourcesRead => validate_typed::<McpAppsResourceReadParams>(params),
+        McpAppsRoutedMethod::ResourcesList
+        | McpAppsRoutedMethod::ResourceTemplatesList
+        | McpAppsRoutedMethod::PromptsList
+        | McpAppsRoutedMethod::ToolsList => validate_list_params(params),
+        McpAppsRoutedMethod::SizeChanged => validate_size_changed(params),
+        McpAppsRoutedMethod::LoggingMessage => {
+            validate_typed::<McpAppsLogMessageNotification>(params)
+        }
+        McpAppsRoutedMethod::ToolInput | McpAppsRoutedMethod::ToolInputPartial => {
+            validate_tool_input(params)
+        }
+        McpAppsRoutedMethod::ToolResult => require_bounded(params),
+        McpAppsRoutedMethod::ToolCancelled => validate_tool_cancelled(params),
+        McpAppsRoutedMethod::HostContextChanged => validate_host_context(params),
+        McpAppsRoutedMethod::SamplingCreateMessageRejected => require_bounded(params),
     }
 }
 

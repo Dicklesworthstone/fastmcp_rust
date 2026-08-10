@@ -6,9 +6,10 @@
 //! - Protocol version negotiation
 //! - Message serialization/deserialization
 //!
-//! MCP 2026-07-28 support is under implementation and remains unverified. The
-//! public `PROTOCOL_VERSION` is still `2024-11-05`; newer source types are not
-//! aggregate conformance or release evidence.
+//! MCP 2026-07-28 support is under implementation and remains unverified.
+//! Its core vocabulary is always available. Optional legacy, Tasks, and Apps
+//! wire surfaces require their matching crate features and are not aggregate
+//! conformance or release evidence.
 //!
 //! # MCP Protocol Overview
 //!
@@ -41,6 +42,7 @@
 pub mod common_types;
 pub mod extensions;
 mod jsonrpc;
+#[cfg(feature = "apps")]
 pub mod mcp_apps_bridge;
 mod messages;
 pub mod methods;
@@ -49,6 +51,7 @@ pub mod protocol_version;
 mod result;
 pub mod schema;
 mod server_discovery;
+#[cfg(feature = "tasks")]
 pub mod tasks_extension;
 mod types;
 pub mod uri_template;
@@ -75,15 +78,18 @@ pub use extensions::{
     MCP_APPS_TOOL_INPUT_NOTIFICATION, MCP_APPS_TOOL_INPUT_PARTIAL_NOTIFICATION,
     MCP_APPS_TOOL_RESULT_NOTIFICATION, MCP_APPS_UPDATE_MODEL_CONTEXT_METHOD, McpAppsClientSettings,
     McpAppsNegotiationResolver, OFFICIAL_MCP_APPS_EXTENSION_ID,
+    RejectingExtensionNegotiationResolver, ServerExtensionDiscovery, StdioCorrelationDescriptor,
+    official_mcp_apps_descriptor, official_mcp_apps_empty_server_settings,
+    official_mcp_apps_extension_id, official_mcp_apps_negotiation_resolver,
+    register_official_mcp_apps_extension, resolve_official_mcp_apps_settings,
+};
+#[cfg(feature = "tasks")]
+pub use extensions::{
     OFFICIAL_TASKS_EMPTY_SETTINGS_CODEC_ID, OFFICIAL_TASKS_EMPTY_SETTINGS_SCHEMA_ID,
     OFFICIAL_TASKS_EXTENSION_ID, OFFICIAL_TASKS_METHODS, OFFICIAL_TASKS_NOTIFICATION,
     OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver,
-    ServerExtensionDiscovery, StdioCorrelationDescriptor, official_mcp_apps_descriptor,
-    official_mcp_apps_empty_server_settings, official_mcp_apps_extension_id,
-    official_mcp_apps_negotiation_resolver, official_tasks_descriptor,
-    official_tasks_empty_settings, official_tasks_extension_id,
-    register_official_mcp_apps_extension, register_official_tasks_extension,
-    resolve_official_mcp_apps_settings,
+    TasksNegotiationResolver, official_tasks_descriptor, official_tasks_empty_settings,
+    official_tasks_extension_id, register_official_tasks_extension,
 };
 pub use jsonrpc::{
     ClientIngressFailureScope, CorrelationKey, JSONRPC_VERSION, JsonRpcAdmissionError,
@@ -94,6 +100,7 @@ pub use jsonrpc::{
     RawJsonRpcDisposition, RequestId, UncorrelatedJsonRpcErrorResponse, admit_raw_jsonrpc_document,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response, dispose_raw_jsonrpc_failure,
 };
+#[cfg(feature = "apps")]
 pub use mcp_apps_bridge::*;
 pub use messages::*;
 pub use methods::SERVER_DISCOVER;
@@ -118,6 +125,7 @@ pub use server_discovery::{
     ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
     ServerDiscoverResult, ServerDiscoveryError, ServerInstructionError, ServerInstructions,
 };
+#[cfg(feature = "tasks")]
 pub use tasks_extension::{
     CancelTaskParams as FinalCancelTaskParams, CancelTaskResult as FinalCancelTaskResult,
     CompleteTaskResult, CreateTaskResult, EmptyTaskResult, FinalTaskCallToolResult, FinalTaskError,

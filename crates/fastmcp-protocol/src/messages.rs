@@ -216,8 +216,6 @@ pub struct FinalListParams {
 pub enum FinalArguments<T> {
     /// The `arguments` member was not present on the wire.
     Absent,
-    /// The member was present with the explicit JSON value `null`.
-    ExplicitNull,
     /// The member was present with its admitted typed value.
     Value(T),
 }
@@ -229,18 +227,12 @@ impl<T> FinalArguments<T> {
         matches!(self, Self::Absent)
     }
 
-    /// Returns whether the arguments member was explicitly `null`.
-    #[must_use]
-    pub const fn is_explicit_null(&self) -> bool {
-        matches!(self, Self::ExplicitNull)
-    }
-
     /// Borrows the admitted argument value, if one was present.
     #[must_use]
     pub const fn as_value(&self) -> Option<&T> {
         match self {
             Self::Value(value) => Some(value),
-            Self::Absent | Self::ExplicitNull => None,
+            Self::Absent => None,
         }
     }
 
@@ -249,7 +241,7 @@ impl<T> FinalArguments<T> {
     pub fn into_value(self) -> Option<T> {
         match self {
             Self::Value(value) => Some(value),
-            Self::Absent | Self::ExplicitNull => None,
+            Self::Absent => None,
         }
     }
 }
@@ -266,7 +258,7 @@ impl<T: Serialize> Serialize for FinalArguments<T> {
         S: Serializer,
     {
         match self {
-            Self::Absent | Self::ExplicitNull => serializer.serialize_none(),
+            Self::Absent => serializer.serialize_none(),
             Self::Value(value) => value.serialize(serializer),
         }
     }
@@ -277,8 +269,11 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for FinalArguments<T> {
     where
         D: Deserializer<'de>,
     {
-        Option::<T>::deserialize(deserializer)
-            .map(|value| value.map_or(Self::ExplicitNull, Self::Value))
+        Option::<T>::deserialize(deserializer).and_then(|value| {
+            value.map(Self::Value).ok_or_else(|| {
+                serde::de::Error::custom("final arguments must be absent or an object, never null")
+            })
+        })
     }
 }
 
@@ -442,6 +437,16 @@ pub enum FinalCompletionReference {
     },
 }
 
+impl FinalCompletionReference {
+    /// Constructs a resource-template completion reference after RFC 6570
+    /// admission. The exact source spelling is retained for wire emission.
+    pub fn resource(uri: impl Into<String>) -> Result<Self, crate::UriTemplateError> {
+        let uri = uri.into();
+        crate::UriTemplate::parse(&uri)?;
+        Ok(Self::Resource { uri })
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 enum FinalCompletionReferenceWire {
@@ -469,7 +474,10 @@ impl Serialize for FinalCompletionReference {
                 name: name.clone(),
                 title: Some(title.clone()),
             },
-            Self::Resource { uri } => FinalCompletionReferenceWire::Resource { uri: uri.clone() },
+            Self::Resource { uri } => {
+                crate::UriTemplate::parse(uri).map_err(serde::ser::Error::custom)?;
+                FinalCompletionReferenceWire::Resource { uri: uri.clone() }
+            }
         };
         wire.serialize(serializer)
     }
@@ -486,7 +494,9 @@ impl<'de> Deserialize<'de> for FinalCompletionReference {
                 title: Some(title),
             } => Ok(Self::PromptWithTitle { name, title }),
             FinalCompletionReferenceWire::Prompt { name, title: None } => Ok(Self::Prompt { name }),
-            FinalCompletionReferenceWire::Resource { uri } => Ok(Self::Resource { uri }),
+            FinalCompletionReferenceWire::Resource { uri } => {
+                Self::resource(uri).map_err(serde::de::Error::custom)
+            }
         }
     }
 }
@@ -1918,6 +1928,10 @@ pub struct FinalEmbeddedUrlElicitationParams {
 
 /// A final MRTR result payload embedded in a Task, without a JSON-RPC envelope.
 #[derive(Debug, Clone, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the public Task-input response union keeps every protocol-selected payload inline; boxing only sampling would add allocation and an asymmetric dereference to an otherwise uniform typed API"
+)]
 pub enum FinalEmbeddedInputResponse {
     /// Sampling result payload.
     Sampling(FinalCreateMessageResult),
@@ -2068,6 +2082,24 @@ pub struct FinalCallToolResult {
         deserialize_with = "deserialize_present_json_value"
     )]
     pub structured_content: Option<Value>,
+}
+
+impl crate::result::CompleteResultPayload for FinalCallToolResult {
+    const KNOWN_MEMBER_NAMES: &'static [&'static str] =
+        &["content", "isError", "structuredContent"];
+
+    fn decode_known_members(
+        members: &mut crate::result::TypedCompleteMembers<'_>,
+    ) -> Result<Self, ResultDecodeError> {
+        let mut selected = serde_json::Map::new();
+        for name in Self::KNOWN_MEMBER_NAMES {
+            if let Some(value) = members.take(name)? {
+                selected.insert((*name).to_owned(), exact_json_to_serde(&value)?);
+            }
+        }
+        serde_json::from_value(Value::Object(selected))
+            .map_err(|_| ResultDecodeError::invalid_known_member("$.content"))
+    }
 }
 
 fn deserialize_present_json_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
@@ -2477,9 +2509,7 @@ impl ServerNotification {
             Self::ResourceUpdated(params) => Some(serde_json::to_string(params)),
             Self::ResourcesListChanged(params)
             | Self::ToolsListChanged(params)
-            | Self::PromptsListChanged(params) => {
-                params.as_ref().map(|params| serde_json::to_string(params))
-            }
+            | Self::PromptsListChanged(params) => params.as_ref().map(serde_json::to_string),
             Self::SubscriptionsAcknowledged(params) => Some(serde_json::to_string(params)),
         };
         let params = params
@@ -2629,6 +2659,15 @@ pub struct FinalCompletionValues {
     pub has_more: Option<bool>,
 }
 
+/// Bounded peer conformance diagnostics specific to final completion values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalCompletionPeerDiagnostic {
+    /// A peer supplied a schema-valid negative total. It is retained only for
+    /// display and compatibility; it must not control allocation, pagination,
+    /// or local result emission.
+    NegativeTotal,
+}
+
 fn deserialize_optional_final_completion_total<'de, D>(
     deserializer: D,
 ) -> Result<Option<JsonInteger>, D::Error>
@@ -2636,11 +2675,6 @@ where
     D: Deserializer<'de>,
 {
     let total = JsonInteger::deserialize(deserializer)?;
-    if final_completion_total_is_negative(&total) {
-        return Err(serde::de::Error::custom(
-            "final completion total must be a nonnegative JSON integer",
-        ));
-    }
     Ok(Some(total))
 }
 
@@ -2679,7 +2713,18 @@ pub const MAX_FINAL_COMPLETION_VALUE_BYTES: usize = 16 * 1024;
 pub const MAX_FINAL_COMPLETION_VALUES_BYTES: usize = 256 * 1024;
 
 impl FinalCompletionValues {
-    /// Validates the final-only bounds and nonnegative total invariant.
+    /// Returns the bounded compatibility diagnostic for an admitted peer
+    /// total. Locally authored values must still pass [`Self::validate`].
+    #[must_use]
+    pub fn peer_diagnostic(&self) -> Option<FinalCompletionPeerDiagnostic> {
+        self.total
+            .as_ref()
+            .filter(|total| final_completion_total_is_negative(total))
+            .map(|_| FinalCompletionPeerDiagnostic::NegativeTotal)
+    }
+
+    /// Validates the final-only bounds and nonnegative total invariant for
+    /// local provider output.
     ///
     /// Exact MCP 2024-11-05 completion values deliberately retain their
     /// schema's unconstrained signed `total`; this validation belongs only to
@@ -2999,6 +3044,7 @@ pub enum FinalCoreResult {
         diagnostic: Option<ResultPeerDiagnostic>,
     },
     /// A Tasks-backed final `tools/call` result.
+    #[cfg(feature = "tasks")]
     ToolsCallTask {
         result: crate::tasks_extension::CreateTaskResult,
     },
@@ -3053,6 +3099,10 @@ pub enum FinalCoreResult {
 
 /// Public, era-aware dispatch for core results.
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the public dual-era dispatch intentionally keeps each exhaustive typed result algebra inline; boxing one negotiated era would distort its direct pattern-matching API solely to reduce enum size"
+)]
 pub enum CoreResult {
     /// Exact MCP 2024-11-05 result vocabulary.
     Legacy(LegacyCoreResult),
@@ -3063,6 +3113,11 @@ pub enum CoreResult {
 /// Stable errors raised while selecting a typed core request or result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreDispatchError {
+    /// A selected wire capability was compiled out of this crate build.
+    FeatureUnavailable {
+        /// The exact Cargo feature required for this wire capability.
+        feature: &'static str,
+    },
     /// The selected era does not support this method.
     UnsupportedMethod { era: ProtocolEra, method: String },
     /// A request's method-specific parameters could not be decoded.
@@ -3094,6 +3149,9 @@ pub enum CoreDispatchError {
 impl std::fmt::Display for CoreDispatchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::FeatureUnavailable { feature } => {
+                write!(formatter, "the {feature:?} protocol feature is unavailable")
+            }
             Self::UnsupportedMethod { era, method } => {
                 write!(formatter, "{method} is not supported in {era:?}")
             }
@@ -3147,7 +3205,19 @@ impl CoreRequest {
         params: Option<&Value>,
     ) -> Result<Self, CoreDispatchError> {
         match era {
-            ProtocolEra::Legacy2024 => Self::decode_legacy(method, params),
+            ProtocolEra::Legacy2024 => {
+                #[cfg(feature = "legacy-2024-11-05")]
+                {
+                    Self::decode_legacy(method, params)
+                }
+                #[cfg(not(feature = "legacy-2024-11-05"))]
+                {
+                    let _ = (method, params);
+                    Err(CoreDispatchError::FeatureUnavailable {
+                        feature: "legacy-2024-11-05",
+                    })
+                }
+            }
             ProtocolEra::Modern2026 => Self::decode_final(method, params),
         }
     }
@@ -3192,7 +3262,9 @@ impl CoreRequest {
     ///
     /// This form preserves the response correlation context required by final
     /// `subscriptions/listen`: its result metadata subscription ID must equal
-    /// the enclosing JSON-RPC response ID.
+    /// the enclosing JSON-RPC response ID. This `Value`-only API is lossy for
+    /// received member order and noncanonical numeric lexemes; callers with
+    /// admitted source must use [`Self::decode_response_result`].
     pub fn decode_response(
         &self,
         response: &JsonRpcResponse,
@@ -3215,7 +3287,19 @@ impl CoreRequest {
                 method: self.method(),
             })?;
         match self {
-            Self::Legacy(request) => request.decode_result(&input).map(CoreResult::Legacy),
+            Self::Legacy(request) => {
+                #[cfg(feature = "legacy-2024-11-05")]
+                {
+                    request.decode_result(&input).map(CoreResult::Legacy)
+                }
+                #[cfg(not(feature = "legacy-2024-11-05"))]
+                {
+                    let _ = request;
+                    Err(CoreDispatchError::FeatureUnavailable {
+                        feature: "legacy-2024-11-05",
+                    })
+                }
+            }
             Self::Final(request) => request
                 .decode_result(&input, Some(response_id))
                 .map(CoreResult::Final),
@@ -3259,7 +3343,19 @@ impl CoreRequest {
             });
         }
         match self {
-            Self::Legacy(request) => request.decode_result(result_source).map(CoreResult::Legacy),
+            Self::Legacy(request) => {
+                #[cfg(feature = "legacy-2024-11-05")]
+                {
+                    request.decode_result(result_source).map(CoreResult::Legacy)
+                }
+                #[cfg(not(feature = "legacy-2024-11-05"))]
+                {
+                    let _ = request;
+                    Err(CoreDispatchError::FeatureUnavailable {
+                        feature: "legacy-2024-11-05",
+                    })
+                }
+            }
             Self::Final(request) => request
                 .decode_result(result_source, Some(response_id))
                 .map(CoreResult::Final),
@@ -3715,9 +3811,9 @@ impl FinalCoreResult {
             Self::Discover(_) => SERVER_DISCOVER,
             Self::Completion { .. } => COMPLETION_COMPLETE,
             Self::ToolsList { .. } => TOOLS_LIST,
-            Self::ToolsCall { .. }
-            | Self::ToolsCallTask { .. }
-            | Self::ToolsCallInputRequired { .. } => TOOLS_CALL,
+            Self::ToolsCall { .. } | Self::ToolsCallInputRequired { .. } => TOOLS_CALL,
+            #[cfg(feature = "tasks")]
+            Self::ToolsCallTask { .. } => TOOLS_CALL,
             Self::ResourcesList { .. } => RESOURCES_LIST,
             Self::ResourceTemplatesList { .. } => RESOURCES_TEMPLATES_LIST,
             Self::ResourcesRead { .. } | Self::ResourcesReadInputRequired { .. } => RESOURCES_READ,
@@ -3748,6 +3844,7 @@ impl FinalCoreResult {
                 result,
                 &["content", "isError", "structuredContent"],
             ),
+            #[cfg(feature = "tasks")]
             Self::ToolsCallTask { result } => encode_final_tools_call_task(result),
             Self::ToolsCallInputRequired { result, .. } => {
                 encode_final_input_required(TOOLS_CALL, result)
@@ -3804,7 +3901,7 @@ fn decode_params<T: DeserializeOwned>(
     serde_json::from_value(
         params
             .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default())),
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default())),
     )
     .map_err(|_| CoreDispatchError::InvalidParams { era, method })
 }
@@ -3904,27 +4001,34 @@ enum FinalMethodResult<T> {
 }
 
 fn decode_final_tools_call(input: &str) -> Result<FinalCoreResult, CoreDispatchError> {
-    let wire: Value =
-        serde_json::from_str(input).map_err(|_| CoreDispatchError::InvalidResult {
+    let ExactJsonValue::Object(wire) =
+        crate::result::parse_exact_json(input).map_err(|_| CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
             method: TOOLS_CALL,
         })?;
-    if wire
-        .as_object()
-        .is_some_and(|object| object.contains_key("serverInfo"))
-    {
+    if wire.get("serverInfo").is_some() {
         return Err(CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
             method: TOOLS_CALL,
         });
     }
-    if wire.get("resultType").and_then(Value::as_str) == Some("task") {
-        let result =
-            serde_json::from_value(wire).map_err(|_| CoreDispatchError::InvalidResult {
-                era: ProtocolEra::Modern2026,
-                method: TOOLS_CALL,
-            })?;
-        return Ok(FinalCoreResult::ToolsCallTask { result });
+    if matches!(
+        wire.get("resultType"),
+        Some(ExactJsonValue::String(result_type)) if result_type == "task"
+    ) {
+        #[cfg(feature = "tasks")]
+        {
+            let result = crate::tasks_extension::CreateTaskResult::decode_exact_wire(input)
+                .map_err(|_| CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })?;
+            return Ok(FinalCoreResult::ToolsCallTask { result });
+        }
+        #[cfg(not(feature = "tasks"))]
+        {
+            return Err(CoreDispatchError::FeatureUnavailable { feature: "tasks" });
+        }
     }
     decode_final_complete_or_input_required(
         TOOLS_CALL,
@@ -4110,6 +4214,7 @@ fn encode_final_input_required(
     Ok(encode_result(&DecodedResult::InputRequired(result.clone())))
 }
 
+#[cfg(feature = "tasks")]
 fn encode_final_tools_call_task(
     result: &crate::tasks_extension::CreateTaskResult,
 ) -> Result<String, CoreDispatchError> {
@@ -4566,7 +4671,6 @@ impl CancellationWireMessage {
                             era: ProtocolEra::Legacy2024,
                         }
                     })?;
-                validate_legacy_cancellation_params(&params)?;
                 Ok(Self::Legacy2024 { sender, params })
             }
             ProtocolEra::Modern2026 => {
@@ -4575,7 +4679,13 @@ impl CancellationWireMessage {
                         .map_err(|_| CancellationWireCodecError::InvalidParameters {
                             era: ProtocolEra::Modern2026,
                         })?;
-                validate_modern_cancellation_params(sender, &params)?;
+                if sender == CancellationSender::Server
+                    && !final_server_cancellation_metadata_matches_request(&params)
+                {
+                    return Err(CancellationWireCodecError::InvalidParameters {
+                        era: ProtocolEra::Modern2026,
+                    });
+                }
                 Ok(Self::Modern2026 { sender, params })
             }
         }
@@ -4606,12 +4716,13 @@ impl CancellationWireMessage {
     pub fn encode(&self) -> Result<JsonRpcRequest, CancellationWireCodecError> {
         let era = self.era();
         let params = match self {
-            Self::Legacy2024 { params, .. } => {
-                validate_legacy_cancellation_params(params)?;
-                serde_json::to_value(params)
-            }
+            Self::Legacy2024 { params, .. } => serde_json::to_value(params),
             Self::Modern2026 { sender, params } => {
-                validate_modern_cancellation_params(*sender, params)?;
+                if *sender == CancellationSender::Server
+                    && !final_server_cancellation_metadata_matches_request(params)
+                {
+                    return Err(CancellationWireCodecError::InvalidParameters { era });
+                }
                 serde_json::to_value(params)
             }
         }
@@ -4621,6 +4732,19 @@ impl CancellationWireMessage {
             Some(params),
         ))
     }
+}
+
+fn final_server_cancellation_metadata_matches_request(
+    params: &FinalCancelledNotificationParams,
+) -> bool {
+    let Some(metadata) = params.meta.as_ref() else {
+        return true;
+    };
+    let Some(subscription_id) = metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY) else {
+        return true;
+    };
+    serde_json::from_value::<RequestId>(subscription_id.clone())
+        .is_ok_and(|subscription_id| params.request_id.correlates_with(&subscription_id))
 }
 
 /// Stable refusal classes for [`CancellationWireMessage`] codec operations.
@@ -4709,19 +4833,6 @@ fn validate_cancellation_notification_envelope(
             method: request.method.clone(),
         });
     }
-    Ok(())
-}
-
-fn validate_legacy_cancellation_params(
-    _params: &CancelledParams,
-) -> Result<(), CancellationWireCodecError> {
-    Ok(())
-}
-
-fn validate_modern_cancellation_params(
-    _sender: CancellationSender,
-    _params: &FinalCancelledNotificationParams,
-) -> Result<(), CancellationWireCodecError> {
     Ok(())
 }
 
@@ -6531,7 +6642,7 @@ mod tests {
                     method: TOOLS_LIST,
                 })
             ),
-            "changing only ttlMs from a huge integer to a fraction must reject"
+            "changing only ttlMs from an unbounded integer to a fraction violates the final cache schema"
         );
     }
 
@@ -6603,7 +6714,7 @@ mod tests {
     }
 
     #[test]
-    fn final_arguments_preserve_absence_explicit_null_and_object_presence() {
+    fn final_arguments_admit_absence_and_objects_but_reject_null() {
         let meta = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
             "io.modelcontextprotocol/clientCapabilities": {}
@@ -6625,21 +6736,19 @@ mod tests {
             tool_absent,
         );
 
+        let tool_object = serde_json::json!({
+            "_meta": meta.clone(),
+            "name": "weather",
+            "arguments": {"units": "metric"}
+        });
+        assert!(
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&tool_object)).is_ok()
+        );
         let tool_null =
             serde_json::json!({"_meta": meta.clone(), "name": "weather", "arguments": null});
-        let CoreRequest::Final(FinalCoreRequest::ToolsCall(tool)) =
-            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&tool_null))
-                .expect("an explicit null reaches the final handler admission boundary")
-        else {
-            panic!("tools/call selects its final request type");
-        };
-        assert!(tool.arguments.is_explicit_null());
-        assert_eq!(
-            CoreRequest::Final(FinalCoreRequest::ToolsCall(tool))
-                .encode_params()
-                .expect("null tool arguments encode")
-                .expect("tools/call has params"),
-            tool_null,
+        assert!(
+            CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&tool_null)).is_err(),
+            "changing only final tool arguments from an object to null rejects"
         );
 
         let prompt_absent = serde_json::json!({"_meta": meta.clone(), "name": "summary"});
@@ -6652,19 +6761,9 @@ mod tests {
         assert!(prompt.arguments.is_absent());
 
         let prompt_null = serde_json::json!({"_meta": meta, "name": "summary", "arguments": null});
-        let CoreRequest::Final(FinalCoreRequest::PromptsGet(prompt)) =
-            CoreRequest::decode(ProtocolEra::Modern2026, PROMPTS_GET, Some(&prompt_null))
-                .expect("an explicit null prompt arguments member retains its presence")
-        else {
-            panic!("prompts/get selects its final request type");
-        };
-        assert!(prompt.arguments.is_explicit_null());
-        assert_eq!(
-            CoreRequest::Final(FinalCoreRequest::PromptsGet(prompt))
-                .encode_params()
-                .expect("null prompt arguments encode")
-                .expect("prompts/get has params"),
-            prompt_null,
+        assert!(
+            CoreRequest::decode(ProtocolEra::Modern2026, PROMPTS_GET, Some(&prompt_null)).is_err(),
+            "changing only final prompt arguments from absent to null rejects"
         );
     }
 
@@ -7043,6 +7142,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn final_tools_call_task_result_selects_a_disjoint_typed_branch() {
         let params = serde_json::json!({
@@ -7084,6 +7184,35 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_tools_call_task_response_uses_admitted_raw_result_source() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "long-running"
+        });
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&params))
+            .expect("final tools/call request admits the task result branch");
+        let frame = r#"{"jsonrpc":"2.0","result":{"resultType":"task","taskId":"task-1","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"x-first":1.20e+4,"content":[],"x-second":123456789012345678901234567890}},"id":91}"#;
+        let admission = crate::decode_strict_jsonrpc_response(frame.as_bytes(), frame.len())
+            .expect("bounded JSON-RPC admission retains the exact result member");
+        let result_source = admission
+            .raw_result()
+            .expect("successful response has an exact result source");
+        let decoded = request
+            .decode_response_result(admission.response(), result_source)
+            .expect("Tasks decoder consumes the admitted result source");
+        assert_eq!(
+            decoded.encode().expect("admitted task result re-encodes"),
+            result_source,
+            "response ingress preserves nested Tasks member order and numeric lexemes"
+        );
+    }
+
+    #[cfg(all(feature = "tasks", feature = "legacy-2024-11-05"))]
     #[test]
     fn final_tools_call_task_result_rejections_leave_decode_state_unchanged() {
         let call_params = serde_json::json!({
@@ -7156,7 +7285,15 @@ mod tests {
                     method: TOOLS_CALL,
                 })
             ),
-            "unlike cacheable catalog peers, Tasks reject a negative ttlMs"
+            "the composed Tasks profile rejects a negative ttlMs"
+        );
+        assert_eq!(
+            baseline.encode().expect("baseline task re-encodes"),
+            call.decode_result(&accepted_wire)
+                .expect("accepted task remains decodable")
+                .encode()
+                .expect("accepted task re-encodes"),
+            "rejected ttlMs mutation cannot alter accepted task state"
         );
 
         let list_params = serde_json::json!({
@@ -7536,7 +7673,7 @@ mod tests {
     }
 
     #[test]
-    fn final_completion_values_enforce_nonnegative_totals_and_bounded_candidates() {
+    fn final_completion_values_diagnose_negative_peer_totals_and_refuse_local_emission() {
         let accepted = serde_json::json!({
             "values": ["stable"],
             "total": 0,
@@ -7551,9 +7688,16 @@ mod tests {
 
         let mut negative_total = accepted.clone();
         negative_total["total"] = serde_json::json!(-1);
+        let admitted_negative = serde_json::from_value::<FinalCompletionValues>(negative_total)
+            .expect("a schema-valid negative peer total remains decodable");
+        assert_eq!(
+            admitted_negative.peer_diagnostic(),
+            Some(FinalCompletionPeerDiagnostic::NegativeTotal),
+            "a negative peer total has bounded compatibility diagnostics"
+        );
         assert!(
-            serde_json::from_value::<FinalCompletionValues>(negative_total.clone()).is_err(),
-            "changing only total from zero to negative is refused for final completion"
+            serde_json::to_value(&admitted_negative).is_err(),
+            "a peer-only negative total cannot be forwarded as local provider output"
         );
         assert!(
             serde_json::to_value(FinalCompletionValues {
@@ -8075,6 +8219,37 @@ mod tests {
     }
 
     #[test]
+    fn final_completion_resource_reference_requires_rfc6570_on_construction_decode_and_encode() {
+        let valid = FinalCompletionReference::resource("mcp://resources/{item}{?cursor}")
+            .expect("a valid RFC 6570 resource reference constructs");
+        assert_eq!(
+            serde_json::to_value(&valid).expect("valid resource reference serializes"),
+            serde_json::json!({"type": "ref/resource", "uri": "mcp://resources/{item}{?cursor}"})
+        );
+
+        let invalid = "mcp://resources/{item:0}";
+        assert!(
+            FinalCompletionReference::resource(invalid).is_err(),
+            "construction rejects an RFC 6570-invalid prefix modifier"
+        );
+        assert!(
+            serde_json::from_value::<FinalCompletionReference>(serde_json::json!({
+                "type": "ref/resource",
+                "uri": invalid,
+            }))
+            .is_err(),
+            "peer decode rejects the same invalid resource reference"
+        );
+        let bypass = FinalCompletionReference::Resource {
+            uri: invalid.to_owned(),
+        };
+        assert!(
+            serde_json::to_value(&bypass).is_err(),
+            "direct enum construction cannot bypass RFC 6570 admission on local emission"
+        );
+    }
+
+    #[test]
     fn final_completion_total_is_exact_and_rejects_one_field_invalid_forms() {
         let params = serde_json::json!({
             "_meta": {
@@ -8113,6 +8288,22 @@ mod tests {
                 "changing only total to {planted_total} must reject"
             );
         }
+        let negative = r#"{"resultType":"complete","completion":{"values":["production"],"total":-1,"hasMore":false}}"#;
+        let negative_result = request
+            .decode_result(negative)
+            .expect("a negative schema-valid peer total remains decodable");
+        let CoreResult::Final(FinalCoreResult::Completion { result, .. }) = negative_result else {
+            panic!("negative total remains a completion result");
+        };
+        assert_eq!(
+            result.payload.completion.peer_diagnostic(),
+            Some(FinalCompletionPeerDiagnostic::NegativeTotal),
+            "negative completion totals retain a bounded peer diagnostic"
+        );
+        assert!(
+            result.payload.completion.validate().is_err(),
+            "a negative peer total is not valid for local provider emission"
+        );
         let planted_has_more = r#"{"resultType":"complete","completion":{"values":["production"],"total":922337203685477580812345678901234567890,"hasMore":null}}"#;
         assert!(
             request.decode_result(planted_has_more).is_err(),
@@ -9230,6 +9421,44 @@ mod tests {
                 &valid_subscription_metadata,
             )
             .is_ok()
+        );
+
+        let mismatched_subscription_metadata = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": 7,
+                "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): 8},
+            })),
+        );
+        assert!(
+            matches!(
+                CancellationWireMessage::decode(
+                    ProtocolEra::Modern2026,
+                    CancellationSender::Server,
+                    &mismatched_subscription_metadata,
+                ),
+                Err(CancellationWireCodecError::InvalidParameters {
+                    era: ProtocolEra::Modern2026,
+                })
+            ),
+            "changing only the server cancellation metadata ID rejects a stream-target mismatch"
+        );
+        let locally_constructed_mismatch = CancellationWireMessage::Modern2026 {
+            sender: CancellationSender::Server,
+            params: serde_json::from_value(serde_json::json!({
+                "requestId": 7,
+                "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): 8},
+            }))
+            .expect("the individual final fields remain structurally valid"),
+        };
+        assert!(
+            matches!(
+                locally_constructed_mismatch.encode(),
+                Err(CancellationWireCodecError::InvalidParameters {
+                    era: ProtocolEra::Modern2026,
+                })
+            ),
+            "the same one-field mismatch cannot bypass ingress validation through local encoding"
         );
 
         let invalid_subscription_metadata = JsonRpcRequest::notification(

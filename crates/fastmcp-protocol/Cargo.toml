@@ -12,6 +12,12 @@ documentation = "https://docs.rs/fastmcp-protocol"
 keywords = ["mcp", "json-rpc", "protocol", "schema", "serialization"]
 categories = ["network-programming", "api-bindings"]
 
+[features]
+default = []
+legacy-2024-11-05 = []
+tasks = []
+apps = []
+
 [dependencies]
 fastmcp-core.workspace = true
 base64.workspace = true

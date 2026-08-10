@@ -776,8 +776,8 @@ impl<'de> Deserialize<'de> for CacheTtl {
     where
         D: Deserializer<'de>,
     {
-        let value = JsonInteger::deserialize(deserializer)?;
-        Self::try_from(value).map_err(serde::de::Error::custom)
+        JsonInteger::deserialize(deserializer)
+            .and_then(|value| Self::try_from(value).map_err(serde::de::Error::custom))
     }
 }
 
@@ -1334,7 +1334,10 @@ fn append_result_meta(members: &mut Vec<ExactJsonMember>, meta: &ResultMeta) {
     }
 }
 
-fn encode_exact_object(object: &ExactJsonObject) -> String {
+/// Encodes one admitted exact object without normalizing member order or JSON
+/// number lexemes. Protocol extension envelopes use this internally when a
+/// nested result must survive a typed decode/re-encode boundary unchanged.
+pub(crate) fn encode_exact_object(object: &ExactJsonObject) -> String {
     let mut output = String::from("{");
     for (index, member) in object.members.iter().enumerate() {
         if index != 0 {
@@ -1760,7 +1763,7 @@ mod tests {
         );
         assert!(
             serde_json::from_str::<CacheTtl>("18446744073709551616.5").is_err(),
-            "changing only the one-over-u64 boundary to a fraction must reject"
+            "changing only the unbounded integer TTL to a fraction violates the final integer schema"
         );
     }
 
