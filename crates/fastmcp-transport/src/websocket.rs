@@ -34,22 +34,46 @@
 //!
 //! # Cancellation behavior
 //!
-//! Operations check `cx.checkpoint()` before entering their I/O paths. The
-//! caller-provided blocking reader or writer is not made interruptible by that
-//! preflight check.
+//! The prior synchronous caller-provided `std::io` implementation is retained
+//! only as a focused test fixture. It is not part of the shipped experimental
+//! feature because an arbitrary blocking reader cannot be interrupted safely.
+//!
+//! [`AsyncWsServerTransport`] and [`AsyncWsClientTransport`] are the
+//! cancellation-safe API for owned asupersync socket I/O. The client uses
+//! asupersync's native WebSocket implementation; the server adapter owns its
+//! bounded RFC 6455 framing over the upgraded byte stream. Both poll the owned
+//! socket through the supplied [`Cx`], so cancellation preempts an idle read.
 
-use std::io::{BufReader, Read, Write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::task::Poll;
+#[cfg(test)]
+use std::{
+    io::{BufReader, Read, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use asupersync::Cx;
+use asupersync::{
+    Cx,
+    bytes::{Bytes, BytesMut},
+    codec::{Decoder, Encoder},
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::websocket::{
+        CloseCode, CloseReason, Frame, FrameCodec, Message as NativeWsMessage, Opcode, WebSocket,
+        WebSocketConfig, WsError,
+    },
+};
+#[cfg(test)]
 use fastmcp_core::{WebSocketMask, draw_websocket_mask};
 
-use crate::{
-    ClientTransportRecvHalf, Codec, ReceivedTransportFrame, Transport, TransportError,
-    TransportRecvHalf, TransportSendHalf,
-};
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+#[cfg(test)]
+use crate::{ClientTransportRecvHalf, Transport, TransportRecvHalf, TransportSendHalf};
+use crate::{Codec, ReceivedTransportFrame, TransportError};
+use fastmcp_protocol::JsonRpcMessage;
+#[cfg(test)]
+use fastmcp_protocol::{JsonRpcRequest, JsonRpcResponse};
 
 fn websocket_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     cx.checkpoint().map_err(|error| {
@@ -69,7 +93,639 @@ fn websocket_checkpoint(cx: &Cx) -> Result<(), TransportError> {
     })
 }
 
+fn native_websocket_error(cx: &Cx, error: WsError) -> TransportError {
+    match error {
+        WsError::Io(error)
+            if error.kind() == std::io::ErrorKind::Interrupted && cx.is_cancel_requested() =>
+        {
+            websocket_checkpoint(cx)
+                .err()
+                .unwrap_or(TransportError::Cancelled)
+        }
+        WsError::Io(error) => TransportError::Io(error),
+        error => websocket_invalid_data(error.to_string()),
+    }
+}
+
+fn native_websocket_close_reason(error: &WsError) -> CloseReason {
+    let code = error.as_close_code();
+    if code.is_sendable() {
+        CloseReason::new(code, None)
+    } else {
+        CloseReason::empty()
+    }
+}
+
+/// Maximum WebSocket frame and assembled-message size accepted by FastMCP.
+pub const FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
+
+fn websocket_invalid_data(message: impl Into<String>) -> TransportError {
+    TransportError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    ))
+}
+
+// A maximum-sized frame uses the 64-bit extended-length form. Client input
+// carries the 4-byte mask while server output does not.
+const FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE: usize = 14;
+const FASTMCP_WEBSOCKET_MAX_SERVER_FRAME_ENVELOPE_SIZE: usize = 10;
+const FASTMCP_WEBSOCKET_READ_CHUNK_SIZE: usize = 4096;
+const FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE: usize =
+    FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE;
+const FASTMCP_WEBSOCKET_MAX_PENDING_WRITE_BYTES: usize =
+    FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_SERVER_FRAME_ENVELOPE_SIZE;
+
+fn fastmcp_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_frame_size(FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE)
+        .max_message_size(FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE)
+        .max_pending_write_bytes(
+            FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE,
+        )
+}
+
+fn encode_native_websocket_message(
+    codec: &mut Codec,
+    message: &JsonRpcMessage,
+) -> Result<NativeWsMessage, TransportError> {
+    let bytes = match message {
+        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
+        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
+    };
+    let text = String::from_utf8(bytes).map_err(|error| {
+        TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Invalid UTF-8 in message: {error}"),
+        ))
+    })?;
+
+    Ok(NativeWsMessage::text(text.trim_end().to_owned()))
+}
+
+fn decode_native_websocket_message(
+    codec: &mut Codec,
+    message: Option<NativeWsMessage>,
+) -> Result<JsonRpcMessage, TransportError> {
+    match message {
+        Some(NativeWsMessage::Text(text)) => codec.decode_complete_message(text.as_bytes()),
+        Some(NativeWsMessage::Binary(_)) => Err(websocket_invalid_data(
+            "Binary WebSocket messages are not supported by MCP",
+        )),
+        Some(NativeWsMessage::Close(_)) | None => Err(TransportError::Closed),
+        // asupersync consumes ping/pong control frames internally before
+        // returning from recv; reaching either branch is therefore a protocol
+        // boundary violation rather than an application message.
+        Some(NativeWsMessage::Ping(_)) | Some(NativeWsMessage::Pong(_)) => Err(
+            websocket_invalid_data("Unexpected WebSocket control message after native handling"),
+        ),
+    }
+}
+
+/// Cancellation-safe client-side WebSocket transport over owned asupersync I/O.
+///
+/// Construct it from an already-upgraded owned asupersync socket. A pending
+/// [`Self::recv`] is interrupted when `cx` is cancelled, without requiring
+/// peer traffic.
+///
+/// It intentionally does not implement the synchronous or split transport
+/// traits: satisfying those APIs would require blocking an async receive or
+/// creating a runtime, either of which would lose the caller-owned `Cx`
+/// cancellation semantics this type provides.
+pub struct AsyncWsClientTransport<IO> {
+    websocket: WebSocket<IO>,
+    codec: Codec,
+    closed: bool,
+}
+
+impl<IO> AsyncWsClientTransport<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Creates a cancellation-safe client transport from an upgraded owned I/O stream.
+    #[must_use]
+    pub fn from_upgraded(io: IO) -> Self {
+        Self {
+            websocket: WebSocket::from_upgraded(io, fastmcp_websocket_config()),
+            codec: Codec::new(),
+            closed: false,
+        }
+    }
+
+    /// Sends a JSON-RPC message through the owned native WebSocket.
+    pub async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        websocket_checkpoint(cx)?;
+        let message = encode_native_websocket_message(&mut self.codec, message)?;
+        match self.websocket.send(cx, message).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let close_reason = native_websocket_close_reason(&error);
+                let error = native_websocket_error(cx, error);
+                Err(self.terminate(cx, close_reason, error).await)
+            }
+        }
+    }
+
+    /// Receives a JSON-RPC message, interrupting an idle owned-socket read on cancellation.
+    pub async fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        websocket_checkpoint(cx)?;
+        let message = match self.websocket.recv(cx).await {
+            Ok(message) => message,
+            Err(error) => {
+                let close_reason = native_websocket_close_reason(&error);
+                let error = native_websocket_error(cx, error);
+                return Err(self.terminate(cx, close_reason, error).await);
+            }
+        };
+        self.decode_or_terminate(cx, message).await
+    }
+
+    /// Closes the native WebSocket and permanently latches this transport closed.
+    pub async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.websocket
+            .close(cx, CloseReason::normal())
+            .await
+            .map_err(|error| native_websocket_error(cx, error))
+    }
+
+    async fn decode_or_terminate(
+        &mut self,
+        cx: &Cx,
+        message: Option<NativeWsMessage>,
+    ) -> Result<JsonRpcMessage, TransportError> {
+        if matches!(message, Some(NativeWsMessage::Close(_)) | None) {
+            self.closed = true;
+            return Err(TransportError::Closed);
+        }
+
+        let close_code = match &message {
+            Some(NativeWsMessage::Text(_)) => CloseCode::InvalidPayload,
+            Some(NativeWsMessage::Binary(_)) => CloseCode::Unsupported,
+            Some(NativeWsMessage::Ping(_)) | Some(NativeWsMessage::Pong(_)) => {
+                CloseCode::ProtocolError
+            }
+            Some(NativeWsMessage::Close(_)) | None => unreachable!("handled above"),
+        };
+        match decode_native_websocket_message(&mut self.codec, message) {
+            Ok(message) => Ok(message),
+            Err(error) => Err(self
+                .terminate(cx, CloseReason::new(close_code, None), error)
+                .await),
+        }
+    }
+
+    async fn terminate(
+        &mut self,
+        cx: &Cx,
+        close_reason: CloseReason,
+        error: TransportError,
+    ) -> TransportError {
+        self.closed = true;
+        let _ = self.websocket.close(cx, close_reason).await;
+        error
+    }
+}
+
+/// Cancellation-safe server-side WebSocket transport over caller-owned upgraded I/O.
+///
+/// The caller owns HTTP Upgrade validation and endpoint selection. This adapter
+/// owns RFC 6455 server-role framing after that boundary: client input must be
+/// masked, server output is unmasked, and frame, assembled-message, read-buffer,
+/// and pending-write limits are all enforced by this type.
+///
+/// It intentionally does not implement the synchronous or split transport
+/// traits for the same reason as [`AsyncWsClientTransport`].
+pub struct AsyncWsServerTransport<IO> {
+    io: IO,
+    codec: Codec,
+    frame_decoder: FrameCodec,
+    frame_encoder: FrameCodec,
+    read_buf: BytesMut,
+    write_buf: BytesMut,
+    fragment_buffer: Vec<u8>,
+    fragmented_text: bool,
+    closed: bool,
+}
+
+impl<IO> AsyncWsServerTransport<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Creates a cancellation-safe server transport from an already-upgraded I/O stream.
+    ///
+    /// This experimental byte-stream adapter performs no HTTP Upgrade, URI
+    /// connection, endpoint registration, listener startup, or handshake
+    /// authentication. Its caller must have completed HTTP Upgrade admission.
+    /// No prebuilt native WebSocket is accepted: doing so would make this
+    /// profile's resource bounds unverifiable.
+    ///
+    /// The experimental profile deliberately has no Upgrade entry point:
+    ///
+    /// ```compile_fail
+    /// use asupersync::net::tcp::VirtualTcpStream;
+    /// use fastmcp_transport::websocket::AsyncWsServerTransport;
+    ///
+    /// let _ = AsyncWsServerTransport::<VirtualTcpStream>::accept;
+    /// ```
+    #[must_use]
+    pub fn from_upgraded(io: IO) -> Self {
+        Self {
+            io,
+            codec: Codec::new(),
+            frame_decoder: FrameCodec::server()
+                .max_payload_size(FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE),
+            frame_encoder: FrameCodec::server()
+                .max_payload_size(FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE),
+            // Keep the initial per-connection allocation small. `read_more`
+            // caps its logical length before asking `BytesMut` to grow it.
+            read_buf: BytesMut::with_capacity(FASTMCP_WEBSOCKET_READ_CHUNK_SIZE),
+            write_buf: BytesMut::new(),
+            fragment_buffer: Vec::new(),
+            fragmented_text: false,
+            closed: false,
+        }
+    }
+
+    /// Sends a JSON-RPC message in one unmasked server-role text frame.
+    pub async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        websocket_checkpoint(cx)?;
+        let frame = encode_server_websocket_message(&mut self.codec, message)?;
+        if let Err(error) = self.write_frame(cx, frame).await {
+            return Err(self.terminate(cx, CloseCode::InternalError, error).await);
+        }
+        Ok(())
+    }
+
+    /// Receives one JSON-RPC text message and intentionally discards its raw source.
+    ///
+    /// Call [`Self::recv_with_source`] when a peer response's exact `result`
+    /// bytes are required by the consumer.
+    pub async fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.recv_with_source(cx)
+            .await
+            .map(ReceivedTransportFrame::into_message)
+    }
+
+    /// Receives one JSON-RPC text message with its exact admitted source.
+    ///
+    /// This preserves response `result` member order and number lexemes across
+    /// the WebSocket framing boundary while the typed [`Self::recv`] adapter
+    /// remains available to consumers that do not need that source.
+    pub async fn recv_with_source(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ReceivedTransportFrame, TransportError> {
+        if self.closed {
+            return Err(TransportError::Closed);
+        }
+        websocket_checkpoint(cx)?;
+
+        loop {
+            let frame = match self.read_frame(cx).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    self.closed = true;
+                    self.clear_fragments();
+                    return Err(TransportError::Closed);
+                }
+                Err((close_code, error)) => {
+                    let close_code = if cx.is_cancel_requested() {
+                        CloseCode::GoingAway
+                    } else {
+                        close_code
+                    };
+                    return Err(self.terminate(cx, close_code, error).await);
+                }
+            };
+
+            match frame.opcode {
+                Opcode::Text => {
+                    if self.fragmented_text {
+                        return Err(self
+                            .terminate(
+                                cx,
+                                CloseCode::ProtocolError,
+                                websocket_invalid_data(
+                                    "Received Text frame while inside fragmented message",
+                                ),
+                            )
+                            .await);
+                    }
+                    if frame.fin {
+                        return self.decode_frame_or_terminate(cx, &frame.payload).await;
+                    }
+                    if let Err(error) = self.append_fragment(&frame.payload) {
+                        return Err(self.terminate(cx, CloseCode::MessageTooBig, error).await);
+                    }
+                    self.fragmented_text = true;
+                }
+                Opcode::Continuation => {
+                    if !self.fragmented_text {
+                        return Err(self
+                            .terminate(
+                                cx,
+                                CloseCode::ProtocolError,
+                                websocket_invalid_data(
+                                    "Received Continuation frame without fragmented message",
+                                ),
+                            )
+                            .await);
+                    }
+                    if let Err(error) = self.append_fragment(&frame.payload) {
+                        return Err(self.terminate(cx, CloseCode::MessageTooBig, error).await);
+                    }
+                    if frame.fin {
+                        self.fragmented_text = false;
+                        let payload = std::mem::take(&mut self.fragment_buffer);
+                        return self.decode_frame_or_terminate(cx, &payload).await;
+                    }
+                }
+                Opcode::Binary => {
+                    return Err(self
+                        .terminate(
+                            cx,
+                            CloseCode::Unsupported,
+                            websocket_invalid_data(
+                                "Binary WebSocket messages are not supported by MCP",
+                            ),
+                        )
+                        .await);
+                }
+                Opcode::Ping => {
+                    if let Err(error) = self.write_frame(cx, Frame::pong(frame.payload)).await {
+                        return Err(self.terminate(cx, CloseCode::InternalError, error).await);
+                    }
+                }
+                Opcode::Pong => {}
+                Opcode::Close => {
+                    self.closed = true;
+                    self.clear_fragments();
+                    // A peer may use a code that is valid to receive but not
+                    // valid to send (for example, a future registered code).
+                    // Rebuild the reply through `CloseReason` so the server
+                    // role never emits an invalid Close frame.
+                    let response = server_close_response(frame.payload);
+                    let _ = self.write_frame(cx, response).await;
+                    return Err(TransportError::Closed);
+                }
+            }
+        }
+    }
+
+    /// Sends a normal Close frame and permanently latches this transport closed.
+    pub async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        self.clear_fragments();
+        self.write_frame(cx, Frame::close(Some(u16::from(CloseCode::Normal)), None))
+            .await
+    }
+
+    async fn decode_frame_or_terminate(
+        &mut self,
+        cx: &Cx,
+        payload: &[u8],
+    ) -> Result<ReceivedTransportFrame, TransportError> {
+        match ReceivedTransportFrame::admit(payload.to_vec().into_boxed_slice()) {
+            Ok(frame) => Ok(frame),
+            Err(error) => Err(self.terminate(cx, CloseCode::InvalidPayload, error).await),
+        }
+    }
+
+    async fn terminate(
+        &mut self,
+        cx: &Cx,
+        close_code: CloseCode,
+        error: TransportError,
+    ) -> TransportError {
+        self.closed = true;
+        self.clear_fragments();
+        if close_code.is_sendable() {
+            let _ = self
+                .write_frame(cx, Frame::close(Some(u16::from(close_code)), None))
+                .await;
+        }
+        error
+    }
+
+    fn clear_fragments(&mut self) {
+        self.fragment_buffer.clear();
+        self.fragmented_text = false;
+    }
+
+    fn append_fragment(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        let next_len = self
+            .fragment_buffer
+            .len()
+            .checked_add(payload.len())
+            .ok_or_else(|| websocket_invalid_data("WebSocket message length overflow"))?;
+        if next_len > FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE {
+            return Err(websocket_invalid_data(format!(
+                "WebSocket message too large: {next_len} bytes"
+            )));
+        }
+        self.fragment_buffer
+            .try_reserve_exact(payload.len())
+            .map_err(|error| {
+                websocket_invalid_data(format!("WebSocket fragment allocation failed: {error}"))
+            })?;
+        self.fragment_buffer.extend_from_slice(payload);
+        Ok(())
+    }
+
+    async fn read_frame(&mut self, cx: &Cx) -> Result<Option<Frame>, (CloseCode, TransportError)> {
+        loop {
+            websocket_checkpoint(cx).map_err(|error| (CloseCode::GoingAway, error))?;
+            match self.frame_decoder.decode(&mut self.read_buf) {
+                Ok(Some(frame)) => return Ok(Some(frame)),
+                Ok(None) => {}
+                Err(error) => {
+                    let close_code = error.as_close_code();
+                    return Err((close_code, websocket_invalid_data(error.to_string())));
+                }
+            }
+
+            let read = match self.read_more(cx).await {
+                Ok(read) => read,
+                Err(error @ TransportError::Io(_)) => {
+                    return Err((CloseCode::Abnormal, error));
+                }
+                Err(error) => return Err((CloseCode::ProtocolError, error)),
+            };
+            if read == 0 {
+                return Ok(None);
+            }
+        }
+    }
+
+    async fn read_more(&mut self, cx: &Cx) -> Result<usize, TransportError> {
+        let remaining = FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE
+            .checked_sub(self.read_buf.len())
+            .ok_or_else(|| websocket_invalid_data("WebSocket read buffer limit exceeded"))?;
+        if remaining == 0 {
+            return Err(websocket_invalid_data(
+                "WebSocket read buffer limit exceeded",
+            ));
+        }
+
+        let mut temporary = [0_u8; FASTMCP_WEBSOCKET_READ_CHUNK_SIZE];
+        let limit = temporary.len().min(remaining);
+        let read = std::future::poll_fn(|task_cx| {
+            if let Err(error) = websocket_checkpoint(cx) {
+                return Poll::Ready(Err(error));
+            }
+            let mut read_buf = ReadBuf::new(&mut temporary[..limit]);
+            match Pin::new(&mut self.io).poll_read(task_cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(TransportError::Io(error))),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await?;
+        if read > 0 {
+            self.read_buf.reserve(read);
+            self.read_buf.extend_from_slice(&temporary[..read]);
+        }
+        Ok(read)
+    }
+
+    async fn write_frame(&mut self, cx: &Cx, frame: Frame) -> Result<(), TransportError> {
+        let payload_len = frame.payload.len();
+        if payload_len > FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE {
+            return Err(websocket_invalid_data(format!(
+                "WebSocket frame too large: {payload_len} bytes"
+            )));
+        }
+        let envelope = if payload_len < 126 {
+            2
+        } else if payload_len < 65_536 {
+            4
+        } else {
+            FASTMCP_WEBSOCKET_MAX_SERVER_FRAME_ENVELOPE_SIZE
+        };
+        let encoded_len = payload_len
+            .checked_add(envelope)
+            .ok_or_else(|| websocket_invalid_data("WebSocket frame length overflow"))?;
+        if encoded_len > FASTMCP_WEBSOCKET_MAX_PENDING_WRITE_BYTES {
+            return Err(websocket_invalid_data(
+                "WebSocket pending-write limit exceeded",
+            ));
+        }
+
+        self.flush_write_buf(cx).await?;
+        // The exact checked length prevents the temporary encoding allocation
+        // from exceeding the configured pending-write bound.
+        let mut encoded = BytesMut::with_capacity(encoded_len);
+        self.frame_encoder
+            .encode(frame, &mut encoded)
+            .map_err(|error| websocket_invalid_data(error.to_string()))?;
+        if encoded.len() > FASTMCP_WEBSOCKET_MAX_PENDING_WRITE_BYTES {
+            return Err(websocket_invalid_data(
+                "WebSocket pending-write limit exceeded",
+            ));
+        }
+        self.write_encoded(cx, &mut encoded).await
+    }
+
+    async fn write_encoded(
+        &mut self,
+        cx: &Cx,
+        encoded: &mut BytesMut,
+    ) -> Result<(), TransportError> {
+        let written = std::future::poll_fn(|task_cx| {
+            if let Err(error) = websocket_checkpoint(cx) {
+                return Poll::Ready(Err(error));
+            }
+            Pin::new(&mut self.io)
+                .poll_write(task_cx, encoded)
+                .map(|result| result.map_err(TransportError::Io))
+        })
+        .await?;
+        if written == 0 {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "WebSocket write returned zero",
+            )));
+        }
+        let _ = encoded.split_to(written);
+        if !encoded.is_empty() {
+            // Move, rather than copy, the unwritten tail into the retained
+            // write buffer so a slow peer never doubles the bounded frame.
+            self.write_buf = std::mem::take(encoded);
+        }
+        self.flush_write_buf(cx).await
+    }
+
+    async fn flush_write_buf(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        while !self.write_buf.is_empty() {
+            let written = std::future::poll_fn(|task_cx| {
+                if let Err(error) = websocket_checkpoint(cx) {
+                    return Poll::Ready(Err(error));
+                }
+                Pin::new(&mut self.io)
+                    .poll_write(task_cx, &self.write_buf)
+                    .map(|result| result.map_err(TransportError::Io))
+            })
+            .await?;
+            if written == 0 {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "WebSocket write returned zero",
+                )));
+            }
+            let _ = self.write_buf.split_to(written);
+        }
+        std::future::poll_fn(|task_cx| {
+            if let Err(error) = websocket_checkpoint(cx) {
+                return Poll::Ready(Err(error));
+            }
+            Pin::new(&mut self.io)
+                .poll_flush(task_cx)
+                .map_err(TransportError::Io)
+        })
+        .await
+    }
+}
+
+fn encode_server_websocket_message(
+    codec: &mut Codec,
+    message: &JsonRpcMessage,
+) -> Result<Frame, TransportError> {
+    let mut bytes = match message {
+        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
+        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
+    };
+    // `Codec` emits one trailing newline for its NDJSON users. RFC 6455 text
+    // framing already supplies the message boundary, so remove precisely that
+    // delimiter while retaining ownership of the bounded encode allocation.
+    if bytes.last() == Some(&b'\n') {
+        let _ = bytes.pop();
+    }
+    Ok(Frame::text(Bytes::from(bytes)))
+}
+
+fn server_close_response(payload: Bytes) -> Frame {
+    CloseReason::parse(&payload)
+        .map_or_else(|_| Frame::close(None, None), |reason| reason.to_frame())
+}
+
 /// WebSocket frame types.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsFrameType {
     /// Continuation frame (for fragmented messages).
@@ -86,6 +742,7 @@ pub enum WsFrameType {
     Pong,
 }
 
+#[cfg(test)]
 impl WsFrameType {
     /// Returns the opcode for this frame type.
     fn opcode(&self) -> u8 {
@@ -114,6 +771,7 @@ impl WsFrameType {
 }
 
 /// A WebSocket frame.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct WsFrame {
     /// Frame type.
@@ -124,6 +782,7 @@ pub struct WsFrame {
     pub fin: bool,
 }
 
+#[cfg(test)]
 impl WsFrame {
     /// Creates a new text frame with the given payload.
     #[must_use]
@@ -171,13 +830,7 @@ impl WsFrame {
     }
 }
 
-fn websocket_invalid_data(message: impl Into<String>) -> TransportError {
-    TransportError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        message.into(),
-    ))
-}
-
+#[cfg(test)]
 fn validate_close_payload(payload: &[u8]) -> Result<(), TransportError> {
     if payload.len() == 1 {
         return Err(websocket_invalid_data(
@@ -200,6 +853,7 @@ fn validate_close_payload(payload: &[u8]) -> Result<(), TransportError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_outbound_frame(frame: &WsFrame) -> Result<(), TransportError> {
     if matches!(
         frame.frame_type,
@@ -230,6 +884,7 @@ fn validate_outbound_frame(frame: &WsFrame) -> Result<(), TransportError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn invalid_utf8_close_frame() -> WsFrame {
     WsFrame {
         frame_type: WsFrameType::Close,
@@ -239,6 +894,7 @@ fn invalid_utf8_close_frame() -> WsFrame {
 }
 
 /// Local endpoint role used to enforce RFC 6455 mask direction.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointRole {
     /// A server endpoint receives masked frames from a client.
@@ -247,6 +903,7 @@ enum EndpointRole {
     Client,
 }
 
+#[cfg(test)]
 impl EndpointRole {
     fn validate_peer_mask(self, masked: bool) -> Result<(), TransportError> {
         let violation = match (self, masked) {
@@ -274,12 +931,14 @@ impl EndpointRole {
 ///
 /// Reads WebSocket frames from an underlying byte stream.
 /// Handles frame parsing according to RFC 6455.
+#[cfg(test)]
 pub struct WsReader<R> {
     reader: BufReader<R>,
     max_frame_size: usize,
     endpoint_role: EndpointRole,
 }
 
+#[cfg(test)]
 impl<R: Read> WsReader<R> {
     /// Creates a new WebSocket reader for server-side use.
     ///
@@ -428,10 +1087,12 @@ impl<R: Read> WsReader<R> {
 ///
 /// Writes WebSocket frames to an underlying byte stream.
 /// Server frames are unmasked per RFC 6455.
+#[cfg(test)]
 pub struct WsWriter<W> {
     writer: W,
 }
 
+#[cfg(test)]
 impl<W: Write> WsWriter<W> {
     /// Creates a new WebSocket writer.
     pub fn new(writer: W) -> Self {
@@ -490,6 +1151,7 @@ impl<W: Write> WsWriter<W> {
 ///     _ => {}
 /// }
 /// ```
+#[cfg(test)]
 pub struct WsTransport<R, W> {
     reader: WsReader<R>,
     writer: WsWriter<W>,
@@ -500,6 +1162,7 @@ pub struct WsTransport<R, W> {
     closed: bool,
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> WsTransport<R, W> {
     /// Creates a new WebSocket transport.
     pub fn new(reader: R, writer: W) -> Self {
@@ -815,6 +1478,7 @@ impl<R: Read, W: Write> WsTransport<R, W> {
     }
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> Transport for WsTransport<R, W> {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         WsTransport::send(self, cx, message)
@@ -834,10 +1498,12 @@ impl<R: Read, W: Write> Transport for WsTransport<R, W> {
 /// Clients must mask frames per RFC 6455. This struct provides
 /// frame writing with proper masking using cryptographically secure
 /// random mask keys.
+#[cfg(test)]
 pub struct WsClientWriter<W> {
     writer: W,
 }
 
+#[cfg(test)]
 fn map_mask_draw_error<E>(error: E) -> TransportError
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -845,6 +1511,7 @@ where
     TransportError::Io(std::io::Error::other(error))
 }
 
+#[cfg(test)]
 impl<W: Write> WsClientWriter<W> {
     /// Creates a new client WebSocket writer.
     pub fn new(writer: W) -> Self {
@@ -922,6 +1589,7 @@ impl<W: Write> WsClientWriter<W> {
 ///
 /// Similar to `WsTransport` but masks outgoing frames as required
 /// for client-to-server communication per RFC 6455.
+#[cfg(test)]
 pub struct WsClientTransport<R, W> {
     reader: WsReader<R>,
     writer: WsClientWriter<W>,
@@ -932,6 +1600,7 @@ pub struct WsClientTransport<R, W> {
     closed: bool,
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> WsClientTransport<R, W> {
     /// Creates a new client WebSocket transport.
     pub fn new(reader: R, writer: W) -> Self {
@@ -1204,6 +1873,7 @@ impl<R: Read, W: Write> WsClientTransport<R, W> {
     }
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> Transport for WsClientTransport<R, W> {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         WsClientTransport::send(self, cx, message)
@@ -1218,32 +1888,38 @@ impl<R: Read, W: Write> Transport for WsClientTransport<R, W> {
     }
 }
 
+#[cfg(test)]
 trait WsFrameSink {
     fn write_ws_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError>;
 }
 
+#[cfg(test)]
 impl<W: Write> WsFrameSink for WsWriter<W> {
     fn write_ws_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
         self.write_frame(frame)
     }
 }
 
+#[cfg(test)]
 impl<W: Write> WsFrameSink for WsClientWriter<W> {
     fn write_ws_frame(&mut self, frame: &WsFrame) -> Result<(), TransportError> {
         self.write_frame(frame)
     }
 }
 
+#[cfg(test)]
 struct SplitWsWriter<F> {
     writer: F,
     closed: bool,
 }
 
+#[cfg(test)]
 struct SharedWsWriter<F> {
     inner: Arc<std::sync::Mutex<SplitWsWriter<F>>>,
     terminal: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
 impl<F> Clone for SharedWsWriter<F> {
     fn clone(&self) -> Self {
         Self {
@@ -1253,6 +1929,7 @@ impl<F> Clone for SharedWsWriter<F> {
     }
 }
 
+#[cfg(test)]
 impl<F> SharedWsWriter<F>
 where
     F: WsFrameSink,
@@ -1317,6 +1994,7 @@ where
     }
 }
 
+#[cfg(test)]
 fn send_split_message<F>(
     writer: &SharedWsWriter<F>,
     codec: &Codec,
@@ -1340,6 +2018,7 @@ where
     writer.send_frame(&WsFrame::text(text.trim_end()))
 }
 
+#[cfg(test)]
 fn terminate_split_receive<F>(
     writer: &SharedWsWriter<F>,
     fragment_buffer: &mut Vec<u8>,
@@ -1354,6 +2033,7 @@ fn terminate_split_receive<F>(
     writer.terminate();
 }
 
+#[cfg(test)]
 fn recv_split_message<R, F>(
     reader: &mut WsReader<R>,
     writer: &SharedWsWriter<F>,
@@ -1381,6 +2061,7 @@ where
     .map(ReceivedTransportFrame::into_message)
 }
 
+#[cfg(test)]
 fn recv_split_message_with_source<R, F>(
     reader: &mut WsReader<R>,
     writer: &SharedWsWriter<F>,
@@ -1507,6 +2188,7 @@ where
 }
 
 /// Independently owned server-side WebSocket ingress.
+#[cfg(test)]
 pub struct WsServerRecvHalf<R, W> {
     reader: WsReader<R>,
     writer: SharedWsWriter<WsWriter<W>>,
@@ -1517,6 +2199,7 @@ pub struct WsServerRecvHalf<R, W> {
     closed: bool,
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> TransportRecvHalf for WsServerRecvHalf<R, W> {
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         recv_split_message(
@@ -1540,11 +2223,13 @@ impl<R: Read, W: Write> TransportRecvHalf for WsServerRecvHalf<R, W> {
 }
 
 /// Independently owned server-side WebSocket egress.
+#[cfg(test)]
 pub struct WsServerSendHalf<W> {
     writer: SharedWsWriter<WsWriter<W>>,
     codec: Codec,
 }
 
+#[cfg(test)]
 impl<W: Write + Send> TransportSendHalf for WsServerSendHalf<W> {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         send_split_message(&self.writer, &self.codec, cx, message)
@@ -1556,6 +2241,7 @@ impl<W: Write + Send> TransportSendHalf for WsServerSendHalf<W> {
 }
 
 /// Independently owned client-side WebSocket ingress.
+#[cfg(test)]
 pub struct WsClientRecvHalf<R, W> {
     reader: WsReader<R>,
     writer: SharedWsWriter<WsClientWriter<W>>,
@@ -1566,6 +2252,7 @@ pub struct WsClientRecvHalf<R, W> {
     closed: bool,
 }
 
+#[cfg(test)]
 impl<R: Read, W: Write> TransportRecvHalf for WsClientRecvHalf<R, W> {
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         recv_split_message(
@@ -1588,6 +2275,7 @@ impl<R: Read, W: Write> TransportRecvHalf for WsClientRecvHalf<R, W> {
     }
 }
 
+#[cfg(test)]
 impl<R: Read + Send, W: Write + Send> ClientTransportRecvHalf for WsClientRecvHalf<R, W> {
     fn recv_with_source(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
         recv_split_message_with_source(
@@ -1604,11 +2292,13 @@ impl<R: Read + Send, W: Write + Send> ClientTransportRecvHalf for WsClientRecvHa
 }
 
 /// Independently owned client-side WebSocket egress.
+#[cfg(test)]
 pub struct WsClientSendHalf<W> {
     writer: SharedWsWriter<WsClientWriter<W>>,
     codec: Codec,
 }
 
+#[cfg(test)]
 impl<W: Write + Send> TransportSendHalf for WsClientSendHalf<W> {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         send_split_message(&self.writer, &self.codec, cx, message)
@@ -1623,8 +2313,175 @@ impl<W: Write + Send> TransportSendHalf for WsClientSendHalf<W> {
 mod tests {
     use super::*;
     use crate::CodecError;
+    use asupersync::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use asupersync::test_utils::run_test;
     use fastmcp_protocol::RequestId;
-    use std::io::Cursor;
+    use std::io::{self, Cursor};
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::{Context, Poll};
+
+    fn virtual_socket_pair() -> (
+        asupersync::net::tcp::VirtualTcpStream,
+        asupersync::net::tcp::VirtualTcpStream,
+    ) {
+        let client_addr: SocketAddr = "127.0.0.1:41001".parse().expect("client address");
+        let server_addr: SocketAddr = "127.0.0.1:41002".parse().expect("server address");
+        asupersync::net::tcp::VirtualTcpStream::pair(client_addr, server_addr)
+    }
+
+    struct ReadNotifyingIo {
+        inner: asupersync::net::tcp::VirtualTcpStream,
+        read_started: Arc<AtomicBool>,
+    }
+
+    impl ReadNotifyingIo {
+        fn new(
+            inner: asupersync::net::tcp::VirtualTcpStream,
+            read_started: Arc<AtomicBool>,
+        ) -> Self {
+            Self {
+                inner,
+                read_started,
+            }
+        }
+    }
+
+    impl AsyncRead for ReadNotifyingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.read_started.store(true, Ordering::Release);
+            Pin::new(&mut this.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ReadNotifyingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    struct ReadFailingIo {
+        write_attempted: Arc<AtomicBool>,
+    }
+
+    impl ReadFailingIo {
+        fn new(write_attempted: Arc<AtomicBool>) -> Self {
+            Self { write_attempted }
+        }
+    }
+
+    impl AsyncRead for ReadFailingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "peer reset during WebSocket receive",
+            )))
+        }
+    }
+
+    impl AsyncWrite for ReadFailingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.get_mut()
+                .write_attempted
+                .store(true, Ordering::Release);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut()
+                .write_attempted
+                .store(true, Ordering::Release);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.get_mut()
+                .write_attempted
+                .store(true, Ordering::Release);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn wait_for_idle_read(read_started: &AtomicBool) {
+        while !read_started.load(Ordering::Acquire) {
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
+    #[test]
+    fn async_websocket_native_configuration_uses_fastmcp_10_mib_limits() {
+        let config = fastmcp_websocket_config();
+        assert_eq!(config.max_frame_size, FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE);
+        assert_eq!(config.max_message_size, FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE);
+        assert_eq!(
+            config.max_pending_write_bytes,
+            FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE,
+        );
+        assert_eq!(FASTMCP_WEBSOCKET_MAX_SERVER_FRAME_ENVELOPE_SIZE, 10);
+        assert_eq!(FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE, 14);
+        assert_eq!(
+            FASTMCP_WEBSOCKET_MAX_PENDING_WRITE_BYTES,
+            FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + 10,
+        );
+        assert_eq!(
+            FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE,
+            FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + 14,
+        );
+    }
+
+    #[test]
+    fn xport_01_experimental_profile_requires_a_caller_upgraded_byte_stream() {
+        let _constructor: fn(
+            asupersync::net::tcp::VirtualTcpStream,
+        )
+            -> AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream> =
+            AsyncWsServerTransport::from_upgraded;
+    }
+
+    #[test]
+    fn async_server_close_reply_never_echoes_an_unsendable_peer_code() {
+        // RFC 6455 permits receiving unassigned codes in this range, but the
+        // same code cannot be emitted in a Close reply. The response must be
+        // an unmasked server frame with an empty close payload instead.
+        let response = server_close_response(Bytes::copy_from_slice(&2000_u16.to_be_bytes()));
+        assert_eq!(response.opcode, Opcode::Close);
+        assert!(!response.masked);
+        assert!(response.payload.is_empty());
+
+        let mut codec = FrameCodec::server();
+        let mut wire = BytesMut::new();
+        codec
+            .encode(response, &mut wire)
+            .expect("the sanitized server close reply must encode");
+        assert_eq!(wire.as_ref(), &[0x88, 0x00]);
+    }
 
     #[test]
     fn test_frame_type_opcode_roundtrip() {
@@ -2417,6 +3274,320 @@ mod tests {
     }
 
     #[test]
+    fn async_client_recv_cancellation_wakes_idle_owned_socket_read() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (client_socket, _idle_peer) = virtual_socket_pair();
+            let read_started = Arc::new(AtomicBool::new(false));
+            let client_socket = ReadNotifyingIo::new(client_socket, Arc::clone(&read_started));
+            let mut receive = cx
+                .spawn(move |task_cx| async move {
+                    let mut transport = AsyncWsClientTransport::from_upgraded(client_socket);
+                    transport.recv(&task_cx).await
+                })
+                .expect("spawn client receive task");
+
+            wait_for_idle_read(&read_started).await;
+            assert!(
+                !receive.is_finished(),
+                "idle client receive must be blocked"
+            );
+
+            // TaskHandle::abort wakes the runtime-owned cancellation waker. The
+            // peer stays idle, so completion proves cancellation preempted the
+            // owned socket read rather than being driven by inbound traffic.
+            receive.abort();
+            assert!(matches!(
+                receive.join(&cx).await,
+                Ok(Err(TransportError::Cancelled))
+            ));
+        });
+    }
+
+    #[test]
+    fn async_client_recv_without_cancellation_remains_idle() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (client_socket, _idle_peer) = virtual_socket_pair();
+            let read_started = Arc::new(AtomicBool::new(false));
+            let client_socket = ReadNotifyingIo::new(client_socket, Arc::clone(&read_started));
+            let mut receive = cx
+                .spawn(move |task_cx| async move {
+                    let mut transport = AsyncWsClientTransport::from_upgraded(client_socket);
+                    transport.recv(&task_cx).await
+                })
+                .expect("spawn client receive task");
+
+            wait_for_idle_read(&read_started).await;
+            // Near-negative: the same idle socket remains pending before the
+            // cancellation waker is requested.
+            assert!(!receive.is_finished());
+
+            receive.abort();
+            let _ = receive.join(&cx).await;
+        });
+    }
+
+    #[test]
+    fn async_server_recv_cancellation_wakes_idle_owned_socket_read() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (_idle_peer, server_socket) = virtual_socket_pair();
+            let read_started = Arc::new(AtomicBool::new(false));
+            let server_socket = ReadNotifyingIo::new(server_socket, Arc::clone(&read_started));
+            let transport = AsyncWsServerTransport::from_upgraded(server_socket);
+            let mut receive = cx
+                .spawn(move |task_cx| async move {
+                    let mut transport = transport;
+                    transport.recv(&task_cx).await
+                })
+                .expect("spawn server receive task");
+
+            wait_for_idle_read(&read_started).await;
+            assert!(
+                !receive.is_finished(),
+                "idle server receive must be blocked"
+            );
+
+            receive.abort();
+            assert!(matches!(
+                receive.join(&cx).await,
+                Ok(Err(TransportError::Cancelled))
+            ));
+        });
+    }
+
+    #[test]
+    fn async_server_recv_without_cancellation_remains_idle() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (_idle_peer, server_socket) = virtual_socket_pair();
+            let read_started = Arc::new(AtomicBool::new(false));
+            let server_socket = ReadNotifyingIo::new(server_socket, Arc::clone(&read_started));
+            let transport = AsyncWsServerTransport::from_upgraded(server_socket);
+            let mut receive = cx
+                .spawn(move |task_cx| async move {
+                    let mut transport = transport;
+                    transport.recv(&task_cx).await
+                })
+                .expect("spawn server receive task");
+
+            wait_for_idle_read(&read_started).await;
+            assert!(!receive.is_finished());
+
+            receive.abort();
+            let _ = receive.join(&cx).await;
+        });
+    }
+
+    #[test]
+    fn async_server_reassembles_masked_text_across_ping_and_replies_unmasked() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (mut peer, server_socket) = virtual_socket_pair();
+            let mut inbound = build_masked_frame(0x01, false, br#"{"jsonrpc":"2.0","method":"#);
+            inbound.extend(build_masked_frame(0x09, true, b"p"));
+            inbound.extend(build_masked_frame(
+                0x00,
+                true,
+                br#"server/fragment","id":17}"#,
+            ));
+            let mut peer_task = cx
+                .spawn(move |_task_cx| async move {
+                    peer.write_all(&inbound)
+                        .await
+                        .expect("write masked fragmented client message");
+                    let mut pong = [0_u8; 3];
+                    peer.read_exact(&mut pong)
+                        .await
+                        .expect("read unmasked server pong");
+                    pong
+                })
+                .expect("spawn raw WebSocket peer");
+
+            let mut transport = AsyncWsServerTransport::from_upgraded(server_socket);
+            let JsonRpcMessage::Request(request) =
+                transport.recv(&cx).await.expect("reassembled text message")
+            else {
+                panic!("expected fragmented client request");
+            };
+            assert_eq!(request.method, "server/fragment");
+
+            let pong = peer_task.join(&cx).await.expect("join raw WebSocket peer");
+            assert_eq!(pong, [0x8A, 0x01, b'p']);
+        });
+    }
+
+    #[test]
+    fn async_server_send_writes_one_unmasked_text_frame() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (mut peer, server_socket) = virtual_socket_pair();
+            let mut peer_task = cx
+                .spawn(move |_task_cx| async move {
+                    let mut header = [0_u8; 2];
+                    peer.read_exact(&mut header)
+                        .await
+                        .expect("read server frame header");
+                    assert_eq!(header[0], 0x81, "server output must be a final text frame");
+                    assert_eq!(header[1] & 0x80, 0, "server output must be unmasked");
+                    let payload_len = usize::from(header[1] & 0x7F);
+                    assert!(payload_len < 126, "test message must use a short frame");
+                    let mut payload = vec![0_u8; payload_len];
+                    peer.read_exact(&mut payload)
+                        .await
+                        .expect("read server text payload");
+                    payload
+                })
+                .expect("spawn raw WebSocket peer");
+
+            let mut transport = AsyncWsServerTransport::from_upgraded(server_socket);
+            transport
+                .send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(18),
+                        serde_json::json!({"server": "raw-stream"}),
+                    )),
+                )
+                .await
+                .expect("send raw server text frame");
+
+            let payload = peer_task.join(&cx).await.expect("join raw WebSocket peer");
+            let JsonRpcMessage::Response(response) = Codec::new()
+                .decode_complete_message(&payload)
+                .expect("server text payload must be JSON-RPC")
+            else {
+                panic!("expected server response");
+            };
+            assert_eq!(response.id, Some(RequestId::Number(18)));
+        });
+    }
+
+    #[test]
+    fn async_server_recv_with_source_preserves_admitted_response_bytes() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (mut peer, server_socket) = virtual_socket_pair();
+            let source = br#"{"jsonrpc":"2.0","id":19,"result":{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}}"#;
+            let inbound = build_masked_frame(0x01, true, source);
+            let mut writer = cx
+                .spawn(move |_task_cx| async move {
+                    peer.write_all(&inbound)
+                        .await
+                        .expect("write source-preserving client response");
+                })
+                .expect("spawn source-preserving client response writer");
+
+            let mut transport = AsyncWsServerTransport::from_upgraded(server_socket);
+            let received = transport
+                .recv_with_source(&cx)
+                .await
+                .expect("receive one source-preserving response");
+            assert_eq!(received.source(), source);
+            assert!(matches!(received.message(), JsonRpcMessage::Response(_)));
+
+            writer
+                .join(&cx)
+                .await
+                .expect("join source-preserving client response writer");
+        });
+    }
+
+    #[test]
+    fn async_server_abnormal_read_failure_latches_closed_without_close_frame() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let write_attempted = Arc::new(AtomicBool::new(false));
+            let mut transport = AsyncWsServerTransport::from_upgraded(ReadFailingIo::new(
+                Arc::clone(&write_attempted),
+            ));
+
+            let error = transport
+                .recv(&cx)
+                .await
+                .expect_err("peer I/O reset must be returned to the caller");
+            assert!(matches!(
+                error,
+                TransportError::Io(ref source)
+                    if source.kind() == io::ErrorKind::ConnectionReset
+            ));
+            assert!(
+                !write_attempted.load(Ordering::Acquire),
+                "RFC 6455 abnormal closure (1006) must not synthesize a Close frame"
+            );
+            assert!(matches!(
+                transport.recv(&cx).await,
+                Err(TransportError::Closed)
+            ));
+        });
+    }
+
+    #[test]
+    fn async_client_binary_message_sends_close_and_latches_terminal_state() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (client_socket, mut peer) = virtual_socket_pair();
+            let mut close_reply = cx
+                .spawn(move |_task_cx| async move {
+                    peer.write_all(&[0x88, 0x02, 0x03, 0xE8])
+                        .await
+                        .expect("write unmasked server close reply");
+                })
+                .expect("spawn client close reply");
+            let mut transport = AsyncWsClientTransport::from_upgraded(client_socket);
+
+            let error = transport
+                .decode_or_terminate(&cx, Some(NativeWsMessage::Binary(vec![0x01].into())))
+                .await
+                .expect_err("binary WebSocket message must be rejected");
+            assert!(matches!(
+                error,
+                TransportError::Io(ref source) if source.kind() == std::io::ErrorKind::InvalidData
+            ));
+            assert!(matches!(
+                transport.recv(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            close_reply
+                .join(&cx)
+                .await
+                .expect("join client close reply");
+        });
+    }
+
+    #[test]
+    fn async_server_invalid_message_sends_close_and_latches_terminal_state() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (mut peer, server_socket) = virtual_socket_pair();
+            let invalid_message = build_masked_frame(0x01, true, b"not json");
+            let mut invalid_message_writer = cx
+                .spawn(move |_task_cx| async move {
+                    peer.write_all(&invalid_message)
+                        .await
+                        .expect("write masked invalid client message");
+                })
+                .expect("spawn invalid message writer");
+            let mut transport = AsyncWsServerTransport::from_upgraded(server_socket);
+
+            let error = transport
+                .recv(&cx)
+                .await
+                .expect_err("invalid JSON-RPC text must be rejected");
+            assert!(matches!(error, TransportError::Codec(_)));
+            assert!(matches!(
+                transport.recv(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            invalid_message_writer
+                .join(&cx)
+                .await
+                .expect("join invalid message writer");
+        });
+    }
+
+    #[test]
     fn websocket_server_split_rejects_unmasked_client_frame_without_control_write() {
         let request = br#"{"jsonrpc":"2.0","method":"server/split","id":7}"#;
         let (mut recv_half, mut send_half) = WsTransport::new(
@@ -3128,28 +4299,27 @@ mod tests {
     }
 
     #[test]
-    fn websocket_mask_ownership_and_fallbacks_are_denied() {
-        let source = include_str!("websocket.rs");
-        let production = source
-            .split_once("\n#[cfg(test)]")
-            .map_or(source, |(production, _)| production);
+    fn blocking_websocket_fixture_mask_ownership_and_fallbacks_are_denied() {
+        let blocking_fixture = include_str!("websocket.rs");
 
-        assert_eq!(production.matches("draw_websocket_mask()").count(), 1);
+        assert_eq!(blocking_fixture.matches("draw_websocket_mask()").count(), 1);
         assert_eq!(
-            production.matches(".map_err(map_mask_draw_error)").count(),
+            blocking_fixture
+                .matches(".map_err(map_mask_draw_error)")
+                .count(),
             1
         );
-        assert!(!production.contains("getrandom::"));
-        assert!(!production.contains("draw_security_identifier"));
+        assert!(!blocking_fixture.contains("getrandom::"));
+        assert!(!blocking_fixture.contains("draw_security_identifier"));
 
-        let writer_impl_start = production
+        let writer_impl_start = blocking_fixture
             .find("impl<W: Write> WsClientWriter<W> {")
             .expect("client writer implementation marker");
-        let writer_impl_end = production[writer_impl_start..]
+        let writer_impl_end = blocking_fixture[writer_impl_start..]
             .find("/// Client-side WebSocket transport.")
             .map(|offset| writer_impl_start + offset)
             .expect("client writer implementation end marker");
-        let writer_impl = &production[writer_impl_start..writer_impl_end];
+        let writer_impl = &blocking_fixture[writer_impl_start..writer_impl_end];
         let mask_decl = writer_impl
             .lines()
             .find(|line| line.contains("fn generate_mask()"))

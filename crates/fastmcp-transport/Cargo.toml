@@ -12,6 +12,15 @@ documentation = "https://docs.rs/fastmcp-transport"
 keywords = ["mcp", "transport", "stdio", "sse", "websocket"]
 categories = ["network-programming"]
 
+[features]
+# Exact MCP 2024-11-05 adapters remain opt-in so an embedding that ships only
+# final transport surfaces does not retain the legacy SSE/HTTP route family.
+legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05"]
+
+# Nonstandard embedding-only profile. This intentionally does not provide an
+# HTTP Upgrade listener, URI connector, or blocking byte-stream API.
+websocket-experimental = []
+
 [dependencies]
 fastmcp-core.workspace = true
 fastmcp-protocol.workspace = true
@@ -22,6 +31,10 @@ serde_json.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["event", "fs", "std"] }
+
+[dev-dependencies]
+# Test-only context construction; transport production APIs receive `&Cx`.
+asupersync = { workspace = true, features = ["test-internals"] }
 
 [lints]
 workspace = true

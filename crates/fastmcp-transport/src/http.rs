@@ -50,6 +50,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
+#[cfg(feature = "legacy-2024-11-05")]
 use std::net::{Shutdown, TcpStream};
 use std::sync::{
     Arc, Mutex, TryLockError,
@@ -68,9 +69,11 @@ use fastmcp_protocol::{
     JsonRpcResponseAdmission, RequestId, decode_strict_jsonrpc_response,
 };
 
+#[cfg(feature = "legacy-2024-11-05")]
+use crate::sse::SseEvent;
 use crate::sse::{
     ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError,
-    ModernSsePushError, SseEvent,
+    ModernSsePushError,
 };
 use crate::{Codec, CodecError, Transport, TransportError};
 
@@ -537,9 +540,11 @@ impl HttpRequest {
 /// derives a `/sse` or `/messages` route and never adds modern session headers.
 /// TLS, credential, redirect, and origin policy are intentionally owned by the
 /// corresponding security and adapter layers rather than this transport slice.
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Debug, Default)]
 pub struct LegacySseHttpPostSink;
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseHttpPostSink {
     /// Creates a concrete legacy SSE message-POST sink.
     #[must_use]
@@ -548,6 +553,7 @@ impl LegacySseHttpPostSink {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl crate::sse::LegacySsePostSink for LegacySseHttpPostSink {
     fn post(
         &mut self,
@@ -572,6 +578,7 @@ impl crate::sse::LegacySsePostSink for LegacySseHttpPostSink {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_sse_http_post_target(endpoint: &str) -> Result<(&str, &str), TransportError> {
     let authority_and_target = endpoint.strip_prefix("http://").ok_or_else(|| {
         TransportError::Io(std::io::Error::new(
@@ -1558,7 +1565,19 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
                 )));
             }
             let normalized_name = name.to_ascii_lowercase();
-            if headers
+            if normalized_name == "accept" {
+                // `Accept` is a list-valued HTTP field. Preserve every field
+                // line in wire order by joining with the list delimiter before
+                // reducing it into `HttpRequest`'s one-value map. MCP binding
+                // headers deliberately do not use this path: duplicated
+                // singletons must remain an admission failure.
+                if let Some(previous) = headers.get_mut(&normalized_name) {
+                    previous.push(',');
+                    previous.push_str(value);
+                } else {
+                    headers.insert(normalized_name, value.to_string());
+                }
+            } else if headers
                 .insert(normalized_name.clone(), value.to_string())
                 .is_some()
             {
@@ -2556,7 +2575,6 @@ impl StreamableHttpResponseStream {
     /// notifications or terminal response. Dropping it requests cancellation
     /// through the paired guard; request handlers retain that guard and
     /// checkpoint it before committing further work or writes.
-    #[must_use]
     pub fn for_request(
         &self,
         request_id: RequestId,
@@ -3723,6 +3741,7 @@ impl Transport for StreamableHttpTransport {
 
 /// Configuration for one endpoint that serves modern Streamable HTTP and
 /// exact MCP 2024-11-05 SSE clients side by side.
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Debug, Clone)]
 pub struct DualEraHttpEndpointConfig {
     /// GET route for the legacy SSE event stream.
@@ -3735,6 +3754,7 @@ pub struct DualEraHttpEndpointConfig {
     pub legacy_request_capacity: usize,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl DualEraHttpEndpointConfig {
     /// Creates a configuration with bounded defaults for the two legacy routes.
     #[must_use]
@@ -3753,6 +3773,7 @@ impl DualEraHttpEndpointConfig {
 }
 
 /// Failure while constructing or operating a [`DualEraHttpEndpoint`].
+#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Debug)]
 pub enum DualEraHttpEndpointError {
     /// The endpoint configuration does not provide disjoint, valid routes.
@@ -3767,6 +3788,7 @@ pub enum DualEraHttpEndpointError {
     Closed,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl std::fmt::Display for DualEraHttpEndpointError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3784,26 +3806,31 @@ impl std::fmt::Display for DualEraHttpEndpointError {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl std::error::Error for DualEraHttpEndpointError {}
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl From<HttpError> for DualEraHttpEndpointError {
     fn from(error: HttpError) -> Self {
         Self::Http(error)
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl From<TransportError> for DualEraHttpEndpointError {
     fn from(error: TransportError) -> Self {
         Self::Transport(error)
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl From<CodecError> for DualEraHttpEndpointError {
     fn from(error: CodecError) -> Self {
         Self::Transport(TransportError::Codec(error))
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl From<HttpSessionError> for DualEraHttpEndpointError {
     fn from(error: HttpSessionError) -> Self {
         Self::Session(error)
@@ -3816,11 +3843,13 @@ impl From<HttpSessionError> for DualEraHttpEndpointError {
 /// legacy routes remain explicit and disjoint: one GET opens the SSE stream,
 /// while the exact POST URI advertised in its first event is the only ingress
 /// for legacy client requests.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct DualEraHttpEndpoint {
     handler: Arc<HttpRequestHandler>,
     config: DualEraHttpEndpointConfig,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl DualEraHttpEndpoint {
     /// Validates a dual-era endpoint configuration.
     ///
@@ -3895,6 +3924,7 @@ impl DualEraHttpEndpoint {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn validate_dual_era_path(label: &str, path: &str) -> Result<(), DualEraHttpEndpointError> {
     if !path.starts_with('/')
         || path.len() == 1
@@ -3909,6 +3939,7 @@ fn validate_dual_era_path(label: &str, path: &str) -> Result<(), DualEraHttpEndp
     Ok(())
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn validate_legacy_http_origin(origin: &str) -> Result<(), DualEraHttpEndpointError> {
     let Some(authority) = origin.strip_prefix("http://") else {
         return Err(DualEraHttpEndpointError::InvalidConfiguration(
@@ -3929,6 +3960,7 @@ fn validate_legacy_http_origin(origin: &str) -> Result<(), DualEraHttpEndpointEr
     Ok(())
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn sse_http_response(body: Vec<u8>) -> HttpResponse {
     HttpResponse::new(HttpStatus::OK)
         .with_header("content-type", "text/event-stream")
@@ -3938,10 +3970,12 @@ fn sse_http_response(body: Vec<u8>) -> HttpResponse {
         .with_body(body)
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn method_rejection(allowed: &str) -> HttpResponse {
     HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED).with_header("allow", allowed)
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 fn legacy_post_has_modern_binding_headers(request: &HttpRequest) -> bool {
     [
         "mcp-protocol-version",
@@ -3954,6 +3988,7 @@ fn legacy_post_has_modern_binding_headers(request: &HttpRequest) -> bool {
 }
 
 /// The externally renderable result of one [`DualEraHttpSession`] request.
+#[cfg(feature = "legacy-2024-11-05")]
 pub enum DualEraHttpEndpointResponse {
     /// A complete HTTP response, including legacy POST responses.
     Immediate(HttpResponse),
@@ -3966,6 +4001,7 @@ pub enum DualEraHttpEndpointResponse {
 }
 
 /// One admitted modern JSON response awaiting its matching JSON-RPC response.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct DualEraHttpJsonResponse {
     handler: Arc<HttpRequestHandler>,
     responses: StreamableHttpResponseStream,
@@ -3973,6 +4009,7 @@ pub struct DualEraHttpJsonResponse {
     origin: Option<String>,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl DualEraHttpJsonResponse {
     /// Tries to render the one response bound to this modern request.
     ///
@@ -3990,12 +4027,14 @@ impl DualEraHttpJsonResponse {
 }
 
 /// One finite modern SSE response body bound to its exact JSON-RPC request.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct DualEraHttpSseResponse {
     response: HttpResponse,
     body: StreamableHttpRequestResponseStream,
     codec: Codec,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl DualEraHttpSseResponse {
     /// Returns the HTTP status and headers to send before the finite SSE body.
     #[must_use]
@@ -4071,6 +4110,7 @@ impl DualEraHttpSseResponse {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 struct LegacySseLiveMessage {
     data: String,
 }
@@ -4080,6 +4120,7 @@ struct LegacySseLiveMessage {
 /// The stream starts with its endpoint event. Subsequent server messages arrive
 /// only through the session that admitted this stream. Waiting for them checks
 /// the caller context between bounded nonblocking channel polls.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct DualEraHttpLegacySseResponse {
     response: HttpResponse,
     initial_events: VecDeque<SseEvent>,
@@ -4089,6 +4130,7 @@ pub struct DualEraHttpLegacySseResponse {
     poll_interval: Duration,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl DualEraHttpLegacySseResponse {
     /// Returns the HTTP status and headers to send before the live SSE body.
     #[must_use]
@@ -4169,6 +4211,7 @@ impl DualEraHttpLegacySseResponse {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for DualEraHttpLegacySseResponse {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
@@ -4177,6 +4220,7 @@ impl Drop for DualEraHttpLegacySseResponse {
 }
 
 /// A session combining modern Streamable HTTP with exact legacy SSE/POST flow.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct DualEraHttpSession {
     handler: Arc<HttpRequestHandler>,
     legacy_sse_path: String,
@@ -4195,6 +4239,7 @@ pub struct DualEraHttpSession {
     closed: bool,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl DualEraHttpSession {
     /// Returns the opaque session value required by the advertised legacy POST URI.
     #[must_use]
@@ -4348,6 +4393,18 @@ impl DualEraHttpSession {
             .trim()
             .eq_ignore_ascii_case("application/json")
             || legacy_post_has_modern_binding_headers(&request)
+        {
+            return Ok(DualEraHttpEndpointResponse::Immediate(
+                HttpResponse::bad_request(),
+            ));
+        }
+        // The exact legacy POST route is not a second content-coding policy.
+        // Its caller-owned endpoint consumes the already-decoded JSON bytes,
+        // just like the modern route; accepting a coded body here would make
+        // the same raw request cross an era boundary with different admission
+        // semantics.
+        if let Some(coding) = request.header("content-encoding")
+            && !is_identity_content_coding(coding)
         {
             return Ok(DualEraHttpEndpointResponse::Immediate(
                 HttpResponse::bad_request(),
@@ -4549,6 +4606,7 @@ impl DualEraHttpSession {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl Drop for DualEraHttpSession {
     fn drop(&mut self) {
         self.close();
@@ -5485,6 +5543,102 @@ X-Checksum: abc123\r\n\
                 Err(HttpError::InvalidHeader(_))
             ));
         }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn public_modern_listener_wire(duplicate_mcp_method: bool) -> Vec<u8> {
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "weather",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                }
+            })),
+            2_501_i64,
+        );
+        let body = serde_json::to_vec(&request).expect("modern listener request serializes");
+        let repeated_method = duplicate_mcp_method.then_some("Mcp-Method: tools/call\r\n");
+        format!(
+            "POST /mcp HTTP/1.1\r\n\
+Content-Type: application/json\r\n\
+Accept: text/event-stream\r\n\
+Accept: application/json\r\n\
+MCP-Protocol-Version: 2026-07-28\r\n\
+Mcp-Method: tools/call\r\n\
+{}\
+Mcp-Name: weather\r\n\
+Content-Length: {}\r\n\
+\r\n",
+            repeated_method.unwrap_or(""),
+            body.len(),
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body)
+        .collect()
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_listener_preserves_two_accept_lines_and_admits_the_request() {
+        use std::io::Cursor;
+
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let mut listener =
+            HttpTransport::new(Cursor::new(public_modern_listener_wire(false)), Vec::new());
+
+        let request = listener
+            .read_request()
+            .expect("the public HTTP listener admits repeated Accept fields");
+        assert_eq!(
+            request.header("accept"),
+            Some("text/event-stream,application/json"),
+            "both list-valued Accept field lines remain visible to response selection"
+        );
+        let response = session
+            .handle(&Cx::for_testing(), request)
+            .expect("the parsed request reaches the public modern endpoint");
+        assert!(matches!(
+            response,
+            DualEraHttpEndpointResponse::ModernJson(_)
+        ));
+        assert_eq!(
+            session
+                .recv_modern_request(&Cx::for_testing())
+                .expect("accepted listener request reaches downstream dispatch")
+                .id,
+            Some(RequestId::Number(2_501))
+        );
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_listener_rejects_duplicate_singleton_mcp_method_without_downstream_state() {
+        use std::io::Cursor;
+
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        // This differs from the admitted listener wire only by one repeated
+        // singleton MCP binding header.
+        let mut listener =
+            HttpTransport::new(Cursor::new(public_modern_listener_wire(true)), Vec::new());
+
+        let error = listener
+            .read_request()
+            .expect_err("duplicate Mcp-Method must fail before endpoint admission");
+        assert!(matches!(
+            error,
+            HttpError::InvalidHeader(detail) if detail == "duplicate header: mcp-method"
+        ));
+        assert!(listener.closed, "a refused listener request is terminal");
+        assert_eq!(
+            session.modern_transport.pending_requests(),
+            0,
+            "the duplicate singleton leaves downstream dispatch state unchanged"
+        );
     }
 
     #[test]
@@ -8214,6 +8368,7 @@ X-Checksum: abc123\r\n\
         assert_eq!(response.status, HttpStatus::METHOD_NOT_ALLOWED);
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn dual_era_modern_sse_request(id: i64) -> HttpRequest {
         let request = JsonRpcRequest::new(
             "tools/call",
@@ -8235,6 +8390,7 @@ X-Checksum: abc123\r\n\
             .with_body(serde_json::to_vec(&request).expect("modern request serializes"))
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn dual_era_endpoint() -> DualEraHttpEndpoint {
         let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
             base_path: "/mcp".to_string(),
@@ -8310,6 +8466,7 @@ X-Checksum: abc123\r\n\
         assert!(matches!(error, HttpError::ProtocolAdmission(_)));
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_modern_h1_sse_delivers_every_request_owned_event_before_terminal() {
         let endpoint = dual_era_endpoint();
@@ -8394,6 +8551,7 @@ X-Checksum: abc123\r\n\
         assert!(response.is_finished());
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_modern_h1_sse_disconnect_cancels_and_rejects_the_later_effect() {
         let endpoint = dual_era_endpoint();
@@ -8449,6 +8607,7 @@ X-Checksum: abc123\r\n\
         ));
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_endpoint_composes_fresh_legacy_sse_with_modern_request_bodies() {
         let endpoint = dual_era_endpoint();
@@ -8652,6 +8811,7 @@ X-Checksum: abc123\r\n\
         assert!(session.take_legacy_request().is_none());
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_endpoint_ignores_last_event_id_and_starts_a_fresh_legacy_stream() {
         let cx = Cx::for_testing();
@@ -8741,6 +8901,7 @@ X-Checksum: abc123\r\n\
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_endpoint_streams_legacy_response_after_advertised_post() {
         let endpoint = dual_era_endpoint();
@@ -8805,6 +8966,7 @@ X-Checksum: abc123\r\n\
         ));
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_endpoint_recovers_live_capacity_after_queue_rejection() {
         let handler = HttpRequestHandler::with_config(HttpHandlerConfig {
@@ -8864,6 +9026,7 @@ X-Checksum: abc123\r\n\
         assert!(recovered_event.id.is_none());
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_endpoint_rejects_only_wrong_session_legacy_post_without_mutation() {
         let endpoint = dual_era_endpoint();
@@ -8915,6 +9078,54 @@ X-Checksum: abc123\r\n\
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_legacy_post_admits_identity_but_rejects_gzip_without_queue_mutation() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let codec = Codec::new();
+        let request = JsonRpcRequest::new("ping", Some(serde_json::json!({"value": 11})), 74_i64);
+        let identity = HttpRequest::new(HttpMethod::Post, "/legacy/messages")
+            .with_header("content-type", "application/json")
+            .with_header("content-encoding", "identity")
+            .with_query("session_id", session.session_id())
+            .with_body(
+                codec
+                    .encode_request(&request)
+                    .expect("legacy request serializes"),
+            );
+        let mut gzip = identity.clone();
+        // Planted forbidden dimension: only the content coding changes.
+        gzip.headers
+            .insert("content-encoding".to_owned(), "gzip".to_owned());
+
+        let rejected = session
+            .handle(&cx, gzip)
+            .expect("unsupported legacy content coding is an HTTP rejection");
+        let DualEraHttpEndpointResponse::Immediate(rejected) = rejected else {
+            panic!("coded legacy POST cannot allocate a response stream");
+        };
+        assert_eq!(rejected.status, HttpStatus::BAD_REQUEST);
+        assert!(session.take_legacy_request().is_none());
+
+        let admitted = session
+            .handle(&cx, identity)
+            .expect("the otherwise identical identity-coded POST is admitted");
+        let DualEraHttpEndpointResponse::Immediate(admitted) = admitted else {
+            panic!("identity-coded legacy POST has an immediate acceptance response");
+        };
+        assert_eq!(admitted.status, HttpStatus::ACCEPTED);
+        assert_eq!(
+            session
+                .take_legacy_request()
+                .expect("rejected coding left the legacy request queue unchanged")
+                .id,
+            Some(RequestId::Number(74))
+        );
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn dual_era_endpoint_rejects_only_the_wrong_legacy_sse_method_without_mutation() {
         let endpoint = dual_era_endpoint();

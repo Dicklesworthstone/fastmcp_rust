@@ -142,7 +142,7 @@ fn recv_memory_message(
     cx: &Cx,
 ) -> Result<JsonRpcMessage, TransportError> {
     recv_memory_source(receiver, closed, poll_interval, cx)
-        .and_then(|source| ReceivedTransportFrame::admit(source))
+        .and_then(ReceivedTransportFrame::admit)
         .map(ReceivedTransportFrame::into_message)
 }
 
@@ -831,9 +831,11 @@ mod tests {
             .expect("memory receive retains the committed source");
 
         assert_eq!(received.source(), expected);
+        let JsonRpcMessage::Response(actual_response) = received.message() else {
+            panic!("the committed response source must retain its response variant");
+        };
         assert_eq!(
-            received.message(),
-            &JsonRpcMessage::Response(response),
+            actual_response, &response,
             "typed message is derived from the one committed source document"
         );
     }

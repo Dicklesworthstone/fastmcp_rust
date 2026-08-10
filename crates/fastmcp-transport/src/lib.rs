@@ -3,7 +3,8 @@
 //! This crate provides transport implementations for MCP communication:
 //! - **Stdio**: Standard input/output (primary transport)
 //! - **SSE**: Server-Sent Events (HTTP-based streaming)
-//! - **WebSocket**: Bidirectional web sockets
+//! - **WebSocket (experimental)**: Caller-upgraded async composition, enabled
+//!   only by the `websocket-experimental` feature
 //! - **HTTP**: Request/response and streamable-HTTP building blocks
 //! - **Memory**: In-process transport for tests and embedding
 //!
@@ -46,7 +47,19 @@ pub mod http;
 pub mod memory;
 pub mod sse;
 mod stdio;
-pub mod websocket;
+#[cfg(feature = "websocket-experimental")]
+#[path = "websocket.rs"]
+mod websocket_impl;
+
+/// Experimental caller-upgraded asynchronous WebSocket composition.
+///
+/// This module intentionally contains only cancellation-aware client and
+/// server adapters. It neither parses `ws://`/`wss://` URIs nor performs an
+/// HTTP Upgrade; callers supply already-upgraded asupersync byte streams.
+#[cfg(feature = "websocket-experimental")]
+pub mod websocket {
+    pub use super::websocket_impl::{AsyncWsClientTransport, AsyncWsServerTransport};
+}
 
 pub use async_io::{AsyncLineReader, AsyncStdin, AsyncStdout};
 
@@ -65,15 +78,6 @@ pub use http::{
 pub use memory::{MemoryRecvHalf, MemorySendHalf};
 pub use sse::{ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError};
 pub use stdio::{AsyncStdioTransport, StdioRecvHalf, StdioSendHalf, StdioTransport};
-/// Public WebSocket ownership halves for caller-owned full-duplex lifecycles.
-///
-/// `WsTransport::into_split` and `WsClientTransport::into_split` return these
-/// handles. The receive half owns ingress plus control-frame replies; the send
-/// half exclusively owns application egress.
-pub use websocket::{
-    WsClientRecvHalf, WsClientSendHalf, WsClientTransport, WsServerRecvHalf, WsServerSendHalf,
-    WsTransport,
-};
 
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
@@ -1017,6 +1021,25 @@ mod tests {
             handler.admit_modern_request(&request).is_ok(),
             "the planted negative changes only the response representation"
         );
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn stripped_graph_retains_modern_http_and_sse_surfaces() {
+        let _: Option<super::http::HttpRequestHandler> = None;
+        let _: Option<super::http::ModernHttpRequestAdmission> = None;
+        let _: Option<super::http::StreamableHttpTransport> = None;
+        let _: Option<super::sse::ModernSseDecoder> = None;
+        let _: Option<super::memory::MemoryTransport> = None;
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_feature_exposes_only_the_opt_in_adapter_surface() {
+        let _: Option<super::http::LegacySseHttpPostSink> = None;
+        let _: Option<super::http::DualEraHttpEndpoint> = None;
+        let _: Option<super::sse::LegacySseMessagePost> = None;
+        let _: Option<super::sse::LegacySseClientTransport<std::io::Empty, ()>> = None;
     }
 
     #[test]

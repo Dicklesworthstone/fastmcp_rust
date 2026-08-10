@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy-2024-11-05")]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, mpsc};
