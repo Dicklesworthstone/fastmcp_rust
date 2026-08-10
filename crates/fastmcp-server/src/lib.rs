@@ -1479,6 +1479,11 @@ struct DispatchQueueStateInner {
     dispatching: HashSet<CorrelationKey>,
     cancelled: HashSet<CorrelationKey>,
     modern_cancellations: HashMap<u64, McpRequestCancellation>,
+    /// The subset of [`Self::modern_cancellations`] belonging to id-less
+    /// (notification) children. These have no response to commit, so shutdown
+    /// cancels them before the pre-stop drain window instead of waiting it
+    /// out on their behalf.
+    uncorrelated_modern_cancellations: HashSet<u64>,
     next_modern_cancellation_id: u64,
     queued_bytes: usize,
     modern_in_flight: usize,
@@ -1593,7 +1598,11 @@ impl DispatchQueueState {
     /// child. This covers notifications as well as correlated requests: the
     /// latter are also indexed by `Server::active_requests`, while a
     /// notification has no wire id to index there.
-    fn register_modern_cancellation(&self, cancellation: McpRequestCancellation) -> u64 {
+    fn register_modern_cancellation(
+        &self,
+        cancellation: McpRequestCancellation,
+        correlated: bool,
+    ) -> u64 {
         let mut inner = self
             .inner
             .lock()
@@ -1607,6 +1616,11 @@ impl DispatchQueueState {
                 .modern_cancellations
                 .insert(cancellation_id, cancellation);
             debug_assert!(previous.is_none());
+            if !correlated {
+                inner
+                    .uncorrelated_modern_cancellations
+                    .insert(cancellation_id);
+            }
         }
         cancellation_id
     }
@@ -1617,6 +1631,29 @@ impl DispatchQueueState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.modern_cancellations.remove(&cancellation_id);
+        inner
+            .uncorrelated_modern_cancellations
+            .remove(&cancellation_id);
+    }
+
+    /// Cancels id-less (notification) modern children ahead of the pre-stop
+    /// drain: the drain window exists to let response commits finish, and a
+    /// notification has no response to protect.
+    fn cancel_uncorrelated_modern_children(&self) {
+        let cancellations = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner
+                .uncorrelated_modern_cancellations
+                .iter()
+                .filter_map(|id| inner.modern_cancellations.get(id).cloned())
+                .collect::<Vec<_>>()
+        };
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
     }
 
     /// Reserves one bounded modern request slot before it is submitted to the
@@ -1847,7 +1884,8 @@ impl ModernDispatchReservation {
                 )
             },
         );
-        let cancellation_id = queue.register_modern_cancellation(cancellation.clone());
+        let cancellation_id =
+            queue.register_modern_cancellation(cancellation.clone(), request_id.is_some());
         Self {
             queue,
             request_id,
@@ -9507,6 +9545,9 @@ impl Server {
             }
         }
 
+        // Notification children have no response commit to protect, so they
+        // are cancelled before the drain windows instead of being waited out.
+        queue_state.cancel_uncorrelated_modern_children();
         if drain_modern_before_stop
             && !queue_state.wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
         {
@@ -19455,6 +19496,81 @@ mod lib_unit_tests {
         fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
             self.control.call(ctx)
         }
+
+        // The request-owned modern dispatch polls this handler on the
+        // runtime's async worker, so a controlled tool that parks must be
+        // COOPERATIVE: a synchronous condvar wait inside poll would
+        // monopolize the single current_thread worker and starve every other
+        // request-owned task (the exact strand the overlap tests then
+        // misreport as lost dispatches).
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            request_cx: &'a Cx,
+            _arguments: serde_json::Value,
+        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                let request_id = ctx.request_id();
+                {
+                    let mut state = self
+                        .control
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.active += 1;
+                    state.max_active = state.max_active.max(state.active);
+                    state.started.insert(request_id);
+                    self.control.changed.notify_all();
+                }
+                loop {
+                    if ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
+                        let mut state = self
+                            .control
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.active = state.active.saturating_sub(1);
+                        state.cancelled.insert(request_id);
+                        self.control.changed.notify_all();
+                        return fastmcp_core::Outcome::Cancelled(asupersync::CancelReason::user(
+                            "request cancellation observed by controlled modern tool",
+                        ));
+                    }
+                    {
+                        let mut state = self
+                            .control
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if state.release_all || state.released.contains(&request_id) {
+                            state.active = state.active.saturating_sub(1);
+                            self.control.changed.notify_all();
+                            drop(state);
+                            return match crate::handler::promote_legacy_tool_content(vec![
+                                Content::text(format!("modern request {request_id}")),
+                            ]) {
+                                Ok(result) => fastmcp_core::Outcome::Ok(
+                                    FinalToolOutcome::Complete(result),
+                                ),
+                                Err(error) => fastmcp_core::Outcome::Err(error),
+                            };
+                        }
+                    }
+                    // A waker-immediate yield keeps this cooperative without
+                    // depending on the contended global block_on timer slot.
+                    let mut yielded = false;
+                    std::future::poll_fn(|task_cx| {
+                        if std::mem::replace(&mut yielded, true) {
+                            std::task::Poll::Ready(())
+                        } else {
+                            task_cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+            })
+        }
     }
 
     struct LiveModernControlledDiscoveryMiddleware {
@@ -22508,6 +22624,7 @@ mod lib_unit_tests {
                         "arguments": {},
                         "_meta": {
                             MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                         },
                     })),
                     id,
@@ -23022,6 +23139,7 @@ mod lib_unit_tests {
                 "arguments": {},
                 "_meta": {
                     MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
                 },
             })),
             REQUEST_ID,
@@ -25313,7 +25431,15 @@ mod lib_unit_tests {
         use std::collections::VecDeque;
         use std::sync::atomic::AtomicUsize;
 
+        // A malformed OPENING frame is a fatal era-security rejection under
+        // Auto, so the recoverable-parse-error contract is probed on an
+        // already negotiated connection.
         let steps = Arc::new(Mutex::new(VecDeque::from([
+            Ok(exact_legacy_initialize_request(32, serde_json::json!("1.0.0"))),
+            Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/initialized",
+                None,
+            ))),
             Err(TransportError::Codec(fastmcp_transport::CodecError::Json(
                 serde_json::from_str::<serde_json::Value>("{")
                     .expect_err("fixture must be invalid JSON"),
@@ -25351,14 +25477,22 @@ mod lib_unit_tests {
             )
             .expect("clean transport closure after a recoverable codec error must succeed");
 
-        assert_eq!(receive_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(receive_calls.load(Ordering::Relaxed), 4);
         let sent = sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let [JsonRpcMessage::Response(response)] = sent.as_slice() else {
-            panic!("expected one uncorrelated parse-error response");
+        // The initialize response races worker shutdown and is incidental;
+        // the contract is exactly one uncorrelated parse-error reply.
+        let parse_errors: Vec<&JsonRpcResponse> = sent
+            .iter()
+            .filter_map(|message| match message {
+                JsonRpcMessage::Response(response) if response.id.is_none() => Some(response),
+                _ => None,
+            })
+            .collect();
+        let [response] = parse_errors.as_slice() else {
+            panic!("expected exactly one uncorrelated parse-error response");
         };
-        assert!(response.id.is_none());
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(-32700)
@@ -25374,7 +25508,15 @@ mod lib_unit_tests {
         let invalid = fastmcp_transport::Codec::new()
             .decode_complete_message(br#"{"jsonrpc":"2.1","method":"tools/list","id":"safe-id"}"#)
             .expect_err("wrong JSON-RPC version must be invalid");
+        // A malformed OPENING frame is a fatal era-security rejection under
+        // Auto, so the correlation contract is probed on an already
+        // negotiated connection.
         let steps = Arc::new(Mutex::new(VecDeque::from([
+            Ok(exact_legacy_initialize_request(31, serde_json::json!("1.0.0"))),
+            Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/initialized",
+                None,
+            ))),
             Err(TransportError::Codec(invalid)),
             Err(TransportError::Closed),
         ])));
@@ -25409,10 +25551,22 @@ mod lib_unit_tests {
         let sent = sent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let [JsonRpcMessage::Response(response)] = sent.as_slice() else {
-            panic!("expected one invalid-request response");
+        // The initialize response races worker shutdown and is incidental;
+        // the contract is exactly one reply correlated to the proven id.
+        let correlated: Vec<&JsonRpcResponse> = sent
+            .iter()
+            .filter_map(|message| match message {
+                JsonRpcMessage::Response(response)
+                    if response.id == Some(RequestId::String("safe-id".to_string())) =>
+                {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .collect();
+        let [response] = correlated.as_slice() else {
+            panic!("expected exactly one response correlated to the proven unique id");
         };
-        assert_eq!(response.id, Some(RequestId::String("safe-id".to_string())));
         assert_eq!(
             response.error.as_ref().map(|error| error.code),
             Some(i32::from(McpErrorCode::InvalidRequest))
