@@ -24053,7 +24053,10 @@ mod lib_unit_tests {
             &serde_json::to_vec(&request)
                 .map_err(|error| format!("shutdown-fence request did not serialize: {error}"))?,
             &[
-                ("Accept", "application/json"),
+                // Streamable HTTP POSTs must accept both JSON and SSE; the
+                // server still commits this exchange as an ordinary non-SSE
+                // JSON response.
+                ("Accept", "application/json, text/event-stream"),
                 ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
                 ("Mcp-Method", "tools/call"),
             ],
