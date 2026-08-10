@@ -23,10 +23,11 @@ use crate::handler::{
     CompletionHandler, FinalProxyPromptHandler, FinalProxyResourceHandler,
     FinalProxyResourceTemplateHandler,
 };
+#[cfg(test)]
+use crate::proxy::ProxyFinalCatalog;
 use crate::proxy::{
-    ProxyFinalCatalog, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
-    ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
-    ProxyTypedCatalog,
+    ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog, ProxyResourceHandler,
+    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyTypedCatalog,
 };
 #[cfg(test)]
 use crate::tasks::SharedTaskManager;

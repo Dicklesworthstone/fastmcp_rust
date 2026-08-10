@@ -281,9 +281,9 @@ fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
 fn facade_only_typed_proxy_catalogs_compile_for_legacy_and_final_eras() {
     use fastmcp_rust::{
         CoreResult, FinalPrompt, FinalResource, FinalResourceTemplate, FinalTool, JsonValue,
-        McpContext, McpResult, Prompt, ProtocolEra, ProxyClient, ProxyPromptCatalog,
-        ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
-        Resource, ResourceTemplate, Tool,
+        McpContext, McpResult, Prompt, ProtocolEra, ProxyClient, ProxyFinalCatalog,
+        ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+        ProxyTypedCatalog, Resource, ResourceTemplate, Tool,
     };
 
     let legacy = ProxyTypedCatalog {
@@ -298,10 +298,13 @@ fn facade_only_typed_proxy_catalogs_compile_for_legacy_and_final_eras() {
     );
 
     let final_catalog = ProxyTypedCatalog {
-        tools: ProxyToolCatalog::Final(Vec::<FinalTool>::new()),
-        resources: ProxyResourceCatalog::Final(Vec::<FinalResource>::new()),
-        resource_templates: ProxyResourceTemplateCatalog::Final(Vec::<FinalResourceTemplate>::new()),
-        prompts: ProxyPromptCatalog::Final(Vec::<FinalPrompt>::new()),
+        tools: ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::<FinalTool>::new())),
+        resources: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::<FinalResource>::new())),
+        resource_templates: ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(Vec::<
+            FinalResourceTemplate,
+        >::new(
+        ))),
+        prompts: ProxyPromptCatalog::Final(ProxyFinalCatalog::new(Vec::<FinalPrompt>::new())),
     };
     assert_eq!(
         final_catalog
@@ -1189,7 +1192,10 @@ fn facade_final_tool_outcome_rejects_task_without_declared_capability() {
     let error = response
         .error
         .expect("missing task capability returns the final capability error");
-    assert_eq!(error.code, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE);
+    assert_eq!(
+        error.code,
+        MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE.into()
+    );
     assert_eq!(
         error.data,
         Some(json!({

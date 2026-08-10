@@ -425,13 +425,13 @@ pub use fastmcp_server::{
     FinalToolSchemaAuthority, HttpServerConfig, InMemoryFinalTaskStore, InboundRequestContext,
     InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
     PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
-    ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog,
-    ProxyToolCatalog, ProxyTypedCatalog, RequestSender, ResourceHandler, Router, Server,
-    ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse, ServerHttpSession, ServerStats,
-    Session, StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
-    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog,
+    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, RequestSender,
+    ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse,
+    ServerHttpSession, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, TagFilters,
+    TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use fastmcp_server::{
     DuplicateBehavior, LifespanHooks, LoggingConfig, ServerExtensionConfigurationError,
@@ -1259,11 +1259,12 @@ pub mod modern {
                 .client_info(client_info.name, client_info.version)
                 .capabilities(client_capabilities)
                 .connect_http_with_cx(endpoint, cx)
+                .await
         }
 
         /// Returns the exact final discovery response that admitted this connection.
         #[must_use]
-        pub fn server_discovery(&self) -> &ServerDiscoverResult {
+        pub fn server_discovery(&self) -> ServerDiscoverResult {
             self.inner.server_discovery().expect(
                 "the modern facade only retains an HTTP client admitted by final server/discover",
             )
@@ -2182,6 +2183,7 @@ pub mod prelude {
         ProxyBackend,
         ProxyCatalog,
         ProxyClient,
+        ProxyFinalCatalog,
         ProxyPromptCatalog,
         ProxyResourceCatalog,
         ProxyResourceTemplateCatalog,
