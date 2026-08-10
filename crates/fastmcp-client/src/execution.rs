@@ -1647,7 +1647,21 @@ where
                 (message, raw_result)
             }
             None => match state.transport.recv(cx) {
-                Ok(message) => (message, None),
+                // The typed Transport already decoded a real wire frame; its
+                // result value is the faithful source for that decode. A None
+                // source here would make every result-bearing response fail
+                // the source/kind consistency admission below, breaking the
+                // documented ordinary ingress shape of `Self::new`.
+                Ok(message) => {
+                    let raw_result = match typed_result_source_from_message(&message) {
+                        Ok(raw_result) => raw_result,
+                        Err(error) => {
+                            state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                            return Err(error);
+                        }
+                    };
+                    (message, raw_result)
+                }
                 Err(error) => {
                     let error = transport_error_to_mcp(error);
                     state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
@@ -2972,6 +2986,28 @@ where
         stream.push_back(notification.clone());
         Ok(true)
     }
+}
+
+/// Serializes the typed-ingress result as its retained source.
+///
+/// Used only for the ordinary [`Transport::recv`] path, where the transport
+/// decoded a real wire frame but did not retain its bytes; the serialized
+/// decoded result is the faithful source for that decode.
+fn typed_result_source_from_message(message: &JsonRpcMessage) -> McpResult<Option<String>> {
+    let JsonRpcMessage::Response(response) = message else {
+        return Ok(None);
+    };
+    response
+        .result
+        .as_ref()
+        .map(|result| {
+            serde_json::to_string(result).map_err(|_| {
+                McpError::invalid_request(
+                    "Admitted peer response could not retain its exact result source",
+                )
+            })
+        })
+        .transpose()
 }
 
 fn exact_result_source_from_admitted_frame(

@@ -7133,7 +7133,10 @@ impl Client {
     /// Returns an error when initialization, transport, envelope validation,
     /// or the server's ping response fails.
     pub fn ping(&mut self) -> McpResult<()> {
-        self.require_legacy_exact_result_session("ping")?;
+        // Ping exists in both protocol eras; send_request supplies modern
+        // request metadata and final-result validation when the negotiated
+        // era is MCP 2026-07-28.
+        self.ensure_initialized()?;
         let _: serde_json::Value = self.send_request("ping", serde_json::json!({}))?;
         Ok(())
     }
