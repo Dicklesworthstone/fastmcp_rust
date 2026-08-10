@@ -44,7 +44,7 @@ serde_yaml = { version = "=0.9.34" }
 log = { version = "=0.4.33" }
 
 # Opaque cursor encoding for pagination
-base64 = { version = "=0.22.1" }
+base64 = { version = "=0.23.1" }
 # FND-01 ROOT-SEMVER (facade evidence / future gates; CLI must not depend on this)
 semver = { version = "=1.0.28" }
 # FND-01 ROOT-FLATE2 (facade evidence / supply archive paths)

@@ -165,7 +165,7 @@ checksum = "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
- "base64",
+ "base64 0.22.1",
  "bincode-next",
  "chacha20poly1305",
  "crc32fast",
@@ -252,6 +252,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -996,7 +1002,7 @@ dependencies = [
 name = "fastmcp-protocol"
 version = "0.3.2"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "fastmcp-core",
  "regex",
  "serde",
@@ -1032,7 +1038,7 @@ version = "0.3.2"
 dependencies = [
  "argon2",
  "asupersync",
- "base64",
+ "base64 0.23.1",
  "cap-fs-ext",
  "cap-std",
  "chrono",
@@ -2128,7 +2134,7 @@ version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "092791278e026273c1b65bbdcfbba3a300f2994c896bd01ab01da613c29c46f1"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "indexmap",
  "quick-xml",
  "serde",
