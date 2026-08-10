@@ -6636,11 +6636,14 @@ fn h1_response(mut response: HttpResponse) -> Http1Response {
     h1
 }
 
-async fn send_h1_response(
+async fn send_h1_response<T>(
     cx: &Cx,
-    framed: &mut Framed<AsyncTcpStream, Http1Codec>,
+    framed: &mut Framed<T, Http1Codec>,
     response: HttpResponse,
-) -> Result<(), ()> {
+) -> Result<(), ()>
+where
+    T: asupersync::io::AsyncWrite + Unpin,
+{
     // The listener's shutdown cancellation owns every ordinary H1 connection.
     // Unlike SSE terminal controls, an immediate response has no protected
     // drain phase and must never begin a new wire write after cancellation.
@@ -7162,6 +7165,16 @@ fn dispatch_modern_http_request(
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
 ) -> HttpResponse {
+    dispatch_modern_http_request_with_cancellation(cx, endpoint, modern_sessions, request, None)
+}
+
+fn dispatch_modern_http_request_with_cancellation(
+    cx: &Cx,
+    endpoint: &ServerHttpEndpoint,
+    modern_sessions: &LiveModernHttpSessionRegistry,
+    request: HttpRequest,
+    request_cancellation: Option<McpRequestCancellation>,
+) -> HttpResponse {
     let error_request = request.clone();
     if request.header("mcp-session-id").is_some() {
         return HttpResponse::bad_request();
@@ -7172,7 +7185,7 @@ fn dispatch_modern_http_request(
         Err(_) => return HttpResponse::internal_error(),
     };
     session
-        .handle(cx, request)
+        .handle_with_modern_request_cancellation(cx, request, request_cancellation)
         .map(|response| http_endpoint_response_to_static(cx, response))
         .unwrap_or_else(|error| {
             http_endpoint_error_response(
@@ -7181,6 +7194,73 @@ fn dispatch_modern_http_request(
                 endpoint.server.http_config.handler_config.max_body_size,
             )
         })
+}
+
+/// Dispatches one ordinary modern JSON request while its connection owns the
+/// cancellation authority. The request has already been fully decoded, so
+/// later peer EOF (or unexpected bytes) means the peer no longer owns this
+/// response body and must cancel only this handler.
+async fn serve_modern_json_http_connection(
+    cx: &Cx,
+    stream: AsyncTcpStream,
+    endpoint: Arc<ServerHttpEndpoint>,
+    modern_sessions: LiveModernHttpSessionRegistry,
+    request: HttpRequest,
+) {
+    let (mut peer_reader, writer) = stream.into_split();
+    let request_cancellation = McpRequestCancellation::new();
+    let peer_cancellation = request_cancellation.clone();
+    let mut peer_watch = match cx.spawn(move |peer_cx| async move {
+        let mut probe = [0_u8; 1];
+        match peer_reader.read(&mut probe).await {
+            // The listener reads exactly one H1 request. EOF or any later
+            // byte abandons this request's response body, never another
+            // request on a separate connection.
+            Ok(_) => {
+                peer_cancellation.cancel();
+            }
+            Err(_) if !peer_cx.is_cancel_requested() => {
+                peer_cancellation.cancel();
+            }
+            Err(_) => {}
+        }
+    }) {
+        Ok(peer_watch) => peer_watch,
+        Err(_) => return,
+    };
+
+    let request_endpoint = Arc::clone(&endpoint);
+    let request_modern_sessions = Arc::clone(&modern_sessions);
+    let dispatch_cancellation = request_cancellation.clone();
+    let mut dispatch = match cx.spawn_blocking(move |request_cx| {
+        dispatch_modern_http_request_with_cancellation(
+            &request_cx,
+            &request_endpoint,
+            &request_modern_sessions,
+            request,
+            Some(dispatch_cancellation),
+        )
+    }) {
+        Ok(dispatch) => dispatch,
+        Err(_) => {
+            request_cancellation.cancel();
+            peer_watch.abort();
+            let _ = peer_watch.join(cx).await;
+            return;
+        }
+    };
+    let response = match dispatch.join(cx).await {
+        Ok(response) => response,
+        Err(_) => HttpResponse::internal_error(),
+    };
+    peer_watch.abort();
+    let _ = peer_watch.join(cx).await;
+
+    let mut response_framed = Framed::new(
+        writer,
+        Http1Codec::new().max_body_size(endpoint.server.http_config.handler_config.max_body_size),
+    );
+    let _ = send_h1_response(cx, &mut response_framed, response).await;
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -7438,6 +7518,13 @@ async fn serve_http_connection(
             }
         }
     }
+    if request.method == HttpMethod::Post
+        && request.path == endpoint.server.http_config.handler_config.base_path
+    {
+        let stream = framed.into_inner();
+        serve_modern_json_http_connection(cx, stream, endpoint, modern_sessions, request).await;
+        return;
+    }
     if !is_legacy_sse {
         // Admit correlated legacy work before it enters the bounded blocking
         // dispatch queue. The captured guard keeps this exact authority alive
@@ -7681,6 +7768,14 @@ async fn serve_modern_http_connection(
                 return;
             }
         }
+    }
+
+    if request.method == HttpMethod::Post
+        && request.path == endpoint.server.http_config.handler_config.base_path
+    {
+        let stream = framed.into_inner();
+        serve_modern_json_http_connection(cx, stream, endpoint, modern_sessions, request).await;
+        return;
     }
 
     let response = if request.method == HttpMethod::Post
