@@ -1,0 +1,5 @@
+error: unknown attribute
+ --> tests/trybuild/tool_apps_ui_unsupported.rs:3:8
+  |
+3 | #[tool(ui(resource_uri = "ui://weather/dashboard"))]
+  |        ^^

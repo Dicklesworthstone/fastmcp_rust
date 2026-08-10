@@ -22,7 +22,23 @@ const TRYBUILD_WORKER_ENV: &str = "FASTMCP_TRYBUILD_BOUNDED_WORKER";
 fn compile_fail_tests() {
     if std::env::var_os(TRYBUILD_WORKER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
         let tests = trybuild::TestCases::new();
-        tests.compile_fail("tests/trybuild/*.rs");
+        tests.compile_fail("tests/trybuild/prompt_*.rs");
+        tests.compile_fail("tests/trybuild/resource_*.rs");
+        tests.compile_fail("tests/trybuild/tool_apps_ui_unsupported.rs");
+        tests.compile_fail("tests/trybuild/tool_invalid_timeout.rs");
+        tests.compile_fail("tests/trybuild/tool_typed_return.rs");
+        tests.compile_fail("tests/trybuild/tool_unknown_attr.rs");
+        tests.compile_fail("tests/trybuild/tool_zero_timeout.rs");
+        #[cfg(feature = "tasks")]
+        {
+            tests.compile_fail("tests/trybuild/tool_tasks_incompatible_return.rs");
+            tests.compile_fail("tests/trybuild/tool_tasks_facade_outcome_required.rs");
+            tests.pass("tests/trybuild_pass/tool_tasks_enabled.rs");
+        }
+        #[cfg(not(feature = "tasks"))]
+        tests.compile_fail("tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs");
+        tests.compile_fail("tests/trybuild/websocket/*.rs");
+        #[cfg(feature = "legacy-2024-11-05")]
         tests.pass("tests/trybuild_pass/facade_dual_era_consumer.rs");
         return;
     }
@@ -118,6 +134,94 @@ mcp = {{ package = "fastmcp-rust", path = "{facade_path}" }}
     assert!(
         status.success(),
         "facade-only consumer failed to compile with status {status}",
+    );
+}
+
+/// Compile a real downstream package that enables the Tasks macro directly
+/// from `fastmcp-derive`, without a `fastmcp-rust` facade dependency.
+#[test]
+fn direct_derive_tasks_consumer_compiles() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("facade crate must be nested beneath the workspace");
+    let target_dir = cargo_target_dir(manifest_dir);
+    let fixture_root = target_dir.join("direct-derive-tasks-consumer");
+    let fixture_src = fixture_root.join("src");
+    fs::create_dir_all(&fixture_src).expect("create direct-derive consumer source directory");
+
+    let derive_path = toml_path(&workspace_root.join("crates/fastmcp-macros"));
+    let core_path = toml_path(&workspace_root.join("crates/fastmcp-core"));
+    let protocol_path = toml_path(&workspace_root.join("crates/fastmcp-protocol"));
+    let server_path = toml_path(&workspace_root.join("crates/fastmcp-server"));
+    fs::write(
+        fixture_root.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "fastmcp-direct-derive-tasks-consumer"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+fastmcp-derive = {{ path = "{derive_path}", features = ["tasks"] }}
+fastmcp-core = {{ path = "{core_path}" }}
+fastmcp-protocol = {{ path = "{protocol_path}", features = ["tasks"] }}
+fastmcp-server = {{ path = "{server_path}" }}
+serde_json = "=1.0.151"
+"#,
+        ),
+    )
+    .expect("write direct-derive consumer manifest");
+    fs::write(fixture_src.join("lib.rs"), DIRECT_DERIVE_TASKS_CONSUMER)
+        .expect("write direct-derive consumer source");
+
+    let fixture_manifest = fixture_root.join("Cargo.toml");
+    let fixture_target_dir = target_dir.join("direct-derive-tasks-consumer-target");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut lock_command = Command::new(&cargo);
+    lock_command
+        .arg("generate-lockfile")
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(&fixture_manifest)
+        .env("CARGO_TARGET_DIR", &fixture_target_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let lock_status = run_bounded(
+        lock_command,
+        "direct-derive Tasks consumer offline lock generation",
+        COMPILE_DEADLINE,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        lock_status.success(),
+        "direct-derive Tasks consumer lock generation failed with {lock_status}"
+    );
+
+    let mut check_command = Command::new(cargo);
+    check_command
+        .arg("check")
+        .arg("--locked")
+        .arg("--offline")
+        .arg("--manifest-path")
+        .arg(&fixture_manifest)
+        .env("CARGO_TARGET_DIR", &fixture_target_dir)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let status = run_bounded(
+        check_command,
+        "direct-derive Tasks consumer locked offline check",
+        COMPILE_DEADLINE,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+
+    assert!(
+        status.success(),
+        "direct-derive Tasks consumer failed to compile with status {status}",
     );
 }
 
@@ -578,6 +682,11 @@ fn facade_tool(count: u64) -> String {
     count.to_string()
 }
 
+#[tool]
+fn renamed_facade_final_task_tool() -> mcp::FinalToolOutcome {
+    unreachable!("the renamed-facade probe compiles a final tool outcome without Tasks opt-in")
+}
+
 #[resource(uri = "facade://status")]
 fn facade_resource() -> String {
     "ready".to_string()
@@ -635,12 +744,55 @@ fn assert_generated_surface() -> McpResult<()> {
     fn prompt_handler<T: PromptHandler>(_: T) {}
 
     tool_handler(FacadeTool);
+    tool_handler(RenamedFacadeFinalTaskTool);
     resource_handler(FacadeResourceResource);
     resource_handler(FacadeMrtrResumableResourceResource);
     prompt_handler(FacadePromptPrompt);
     prompt_handler(FacadeMrtrResumablePromptPrompt);
     let _ = ToolInput::json_schema();
     Ok(())
+}
+
+fn assert_renamed_facade_sealed_builders() {
+    let _: fn(modern::ServerBuilder) -> McpResult<modern::Server> =
+        modern::ServerBuilder::try_build;
+    let _: fn(legacy_2024::ServerBuilder) -> McpResult<legacy_2024::Server> =
+        legacy_2024::ServerBuilder::try_build;
+
+    let modern_client = modern::client_builder()
+        .max_retries(2)
+        .retry_delay_ms(5)
+        .working_dir(".")
+        .env("FACADE_TEST", "1")
+        .envs([("FACADE_TEST_TWO", "2")])
+        .inherit_env(false)
+        .auto_initialize(true)
+        .owned_process_group(false);
+    assert_eq!(modern_client.protocol_policy(), modern::ModernOnly);
+
+    let modern_server = modern::server_builder("modern-facade", "1.0")
+        .without_stats()
+        .request_timeout(1)
+        .list_page_size(1)
+        .mask_error_details(true)
+        .strict_input_validation(true)
+        .resource_subscriptions()
+        .instructions("renamed facade modern server")
+        .without_banner()
+        .build();
+    let _: modern::Server = modern_server;
+
+    let legacy_server = legacy_2024::server_builder("legacy-facade", "1.0")
+        .without_stats()
+        .request_timeout(1)
+        .list_page_size(1)
+        .mask_error_details(true)
+        .strict_input_validation(true)
+        .resource_subscriptions()
+        .instructions("renamed facade legacy server")
+        .without_banner()
+        .build();
+    let _: legacy_2024::Server = legacy_server;
 }
 
 fn assert_dual_era_facade_surface() {
@@ -681,7 +833,6 @@ fn assert_dual_era_facade_surface() {
     let _: Option<modern::FinalCallToolParams> = None;
     let _: Option<modern::FinalReadResourceParams> = None;
     let _: Option<modern::FinalGetPromptParams> = None;
-    let _: Option<modern::FinalSetLogLevelParams> = None;
     let _: Option<modern::FinalEmptyParams> = None;
     let _: Option<modern::FinalListToolsResult> = None;
     let _: Option<modern::FinalCallToolResult> = None;
@@ -728,8 +879,6 @@ fn assert_dual_era_facade_surface() {
     assert_eq!(modern::DEFAULT_MAX_MRTR_ROUNDS, 8);
     let _: Option<legacy_2024::CallToolParams> = None;
     let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
-    let _: Option<legacy_2024::LegacySseHttpClient> = None;
-    let _: Option<legacy_2024::LegacySseHttpClientError> = None;
     let legacy_completion = legacy_2024::LegacyCompletionParams {
         reference: legacy_2024::LegacyCompletionReference::Resource {
             uri: "resource://cities".to_owned(),
@@ -755,21 +904,6 @@ fn assert_dual_era_facade_surface() {
     assert_eq!(modern::client_builder().protocol_policy(), modern::ModernOnly);
 }
 
-fn assert_legacy_sse_method_signatures(
-    cx: &legacy_2024::Cx,
-    plan: legacy_2024::ClientProtocolPlan,
-    client: &mut legacy_2024::LegacySseHttpClient,
-) {
-    let message = legacy_2024::JsonRpcMessage::Request(legacy_2024::JsonRpcRequest::new(
-        "initialize",
-        None,
-        legacy_2024::RequestId::Number(1),
-    ));
-    let _connect = legacy_2024::LegacySseHttpClient::connect(cx, plan);
-    let _send = client.send(cx, &message);
-    let _next_message = client.next_message(cx);
-}
-
 fn assert_prelude_dual_era_surface() {
     use mcp::prelude::*;
 
@@ -784,21 +918,22 @@ fn assert_prelude_dual_era_surface() {
     let _: Option<legacy_2024::CallToolParams> = None;
     let _: Option<legacy_2024::LegacyCompletionParams> = None;
     let _: Option<legacy_2024::LegacyCompletionResult> = None;
-    let _: Option<legacy_2024::LegacySseHttpClient> = None;
+}
+"#;
 
-    fn assert_legacy_sse_method_signatures_from_prelude(
-        cx: &legacy_2024::Cx,
-        plan: legacy_2024::ClientProtocolPlan,
-        client: &mut legacy_2024::LegacySseHttpClient,
-    ) {
-        let message = legacy_2024::JsonRpcMessage::Request(legacy_2024::JsonRpcRequest::new(
-            "initialize",
-            None,
-            legacy_2024::RequestId::Number(1),
-        ));
-        let _connect = legacy_2024::LegacySseHttpClient::connect(cx, plan);
-        let _send = client.send(cx, &message);
-        let _next_message = client.next_message(cx);
-    }
+const DIRECT_DERIVE_TASKS_CONSUMER: &str = r#"
+use fastmcp_derive::tool;
+use fastmcp_server::ToolHandler;
+
+#[tool(tasks)]
+fn direct_derive_tasks_opt_in() -> fastmcp_server::FinalToolOutcome {
+    unreachable!("compile-only direct fastmcp-derive Tasks consumer")
+}
+
+fn assert_tool_handler<T: ToolHandler>(_: T) {}
+
+fn direct_derive_tasks_opt_in_declares_tasks() {
+    assert_tool_handler(DirectDeriveTasksOptIn);
+    assert!(DirectDeriveTasksOptIn.declares_final_tasks());
 }
 "#;

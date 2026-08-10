@@ -15,9 +15,9 @@
 //! **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
 //! The primary public surface is [`modern`], which names the exact
 //! `2026-07-28` vocabulary. Exact `2024-11-05` access is explicit through
-//! [`legacy_2024`]. The root-level [`PROTOCOL_VERSION`] remains available for
+//! `legacy_2024`. The root-level `PROTOCOL_VERSION` remains available for
 //! existing exact-2024 consumers while they move to that module; it is not the
-//! default selected by [`auto::client_builder`].
+//! default selected by `auto::client_builder`.
 //! Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly
 //! (`rust-version = "1.99"`). Do not assume JWT/OIDC production readiness,
 //! Redis Tasks, Apps media rendering, or aggregate release-gate evidence from
@@ -62,7 +62,7 @@
 //! pieces you need for day-to-day server and client development so that most
 //! applications can depend on a single crate and write
 //! `use fastmcp_rust::prelude::*;`. New code should name its policy explicitly
-//! through [`modern`], [`auto`], or [`legacy_2024`] rather than inferring an
+//! through `modern`, `auto`, or `legacy_2024` rather than inferring an
 //! era from the historical root re-exports.
 //!
 //! Concretely, `fastmcp_rust` glues together:
@@ -113,17 +113,68 @@ pub mod __private {
     pub use serde_json;
 }
 
-/// Re-export the runtime package used by the facade's public `Cx` and lab
-/// types. This keeps deterministic macro and handler tests on a facade-only
-/// dependency path.
+/// Re-export the runtime package used by the facade's deterministic lab
+/// helpers. Production callers receive `Cx` directly from this facade and do
+/// not need a test-internals runtime dependency.
+#[cfg(feature = "testing-lab")]
 pub use asupersync;
+
+/// Curated supported client namespace for advanced consumers.
+///
+/// The root, `modern`, and `legacy_2024` exports are the ergonomic API.
+/// This namespace intentionally mirrors only the client surface selected by
+/// the facade. It is not a crate alias: in particular, enabling a dependency's
+/// `websocket-experimental` feature cannot expose that caller-upgraded
+/// experimental transport through `fastmcp_rust::client`.
+pub mod client {
+    pub use crate::{
+        BearerBindingError, BoundBearerCredential, ConfigError, ConfigLoader, HttpEndpointConfig,
+        HttpEndpointConfigError, MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT,
+        MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, McpConfig, ModernHttpClient,
+        ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor,
+        ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
+        ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
+        ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, ServerConfig,
+        SseEndOfStream, SseLimits, SseParseError, claude_desktop_config_path, default_config_paths,
+        validate_response_head,
+    };
+    pub use crate::{
+        BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
+        ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
+        ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
+        ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
+        CompletionContext, CompletionParams, CompletionReference, DEFAULT_FINAL_CACHE_CAPACITY,
+        DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason, ExecutionTerminalRecord,
+        ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey,
+        FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
+        FinalCacheTtlDiagnostic, FinalResultCache, FinalTask, FinalTaskHandle,
+        FinalTaskInputResponses, FinalTaskStatusNotification, FinalTaskWatch, FinalTaskWatchEvent,
+        FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient, HttpClientError,
+        HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
+        MAX_FINAL_CACHE_MAX_BYTES, McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost,
+        McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
+        McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
+        McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
+        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
+        McpAppsWireHostPolicy, OpaquePagination, PaginationBounds, PendingRequestRecord,
+        ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
+        RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
+        StdioRequestExecutor, SubscriptionFilter, SubscriptionListenCollector,
+        mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
+    };
+    /// Exact-2024 client staging is present only with the legacy adapter.
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub use crate::{
+        LegacyHttpRequest, LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError,
+    };
+    pub use fastmcp_client::{http_auth, http_executor, mcp_apps, mcp_config, sse};
+}
 
 /// Complete component namespaces for advanced consumers.
 ///
-/// The root, [`modern`], and [`legacy_2024`] exports are the ergonomic API.
-/// These namespaces retain every implemented public item without requiring an
-/// application to name a FastMCP component crate directly.
-pub use fastmcp_client as client;
+/// The remaining component namespaces retain their implemented public items
+/// without requiring an application to name a FastMCP component crate directly.
 pub use fastmcp_core as core;
 pub use fastmcp_derive as derive;
 pub use fastmcp_protocol as protocol;
@@ -134,17 +185,20 @@ pub use fastmcp_server as server;
 /// to name FastMCP's transitive serialization crate to implement an adapter.
 pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
 
+#[cfg(feature = "testing-lab")]
+pub use asupersync::{LabConfig, LabRuntime};
+
 // Re-export core types
 pub use fastmcp_core::{
     AccessToken, AuthContext, Budget, CancelledError, ClientCapabilityInfo, ClientRoot, Cx,
     ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
-    IntoOutcome, LabConfig, LabRuntime, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContext,
-    McpContextLeaseGuard, McpError, McpErrorCode, McpOutcome, McpRequestCancellation, McpResult,
-    NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, Outcome, OutcomeExt,
-    ProgressReporter, RegionId, ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt,
-    RootsProvider, SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole,
-    SamplingSender, SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult,
-    ToolCaller, ToolContentItem, cancelled, err, ok,
+    IntoOutcome, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard,
+    McpError, McpErrorCode, McpOutcome, McpRequestCancellation, McpResult, NoOpElicitationSender,
+    NoOpNotificationSender, NoOpSamplingSender, Outcome, OutcomeExt, ProgressReporter, RegionId,
+    ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt, RootsProvider,
+    SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
+    SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
+    ToolContentItem, cancelled, err, ok,
 };
 pub use fastmcp_core::{
     DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
@@ -378,7 +432,9 @@ pub use fastmcp_protocol::{
 /// Historical exact-2024 protocol constant retained for existing consumers.
 ///
 /// New exact-2024 code should import [`legacy_2024::PROTOCOL_VERSION`]; new
-/// modern code should import [`modern::PROTOCOL_VERSION`].
+/// modern code should import [`modern::PROTOCOL_VERSION`]. This constant is
+/// unavailable in the deliberately stripped ModernOnly profile.
+#[cfg(feature = "legacy-2024-11-05")]
 pub use fastmcp_protocol::PROTOCOL_VERSION;
 
 /// Immutable protocol-policy primitives shared by the explicit era modules.
@@ -410,9 +466,23 @@ pub use fastmcp_transport::{
     Transport, TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
 };
 
-// Re-export transport modules
-pub use fastmcp_transport as transport;
-pub use fastmcp_transport::{event_store, http, memory, websocket};
+/// Curated transport diagnostics exposed by the facade.
+///
+/// The facade intentionally does not re-export the blocking WebSocket module:
+/// already-upgraded async WebSocket adaptation remains a lower-crate concern.
+///
+/// ```compile_fail
+/// use fastmcp_rust::transport::websocket;
+/// ```
+pub mod transport {
+    pub use fastmcp_transport::{
+        MemoryRecvHalf, MemorySendHalf, ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits,
+        ModernSseParseError, TransportError,
+    };
+    pub use fastmcp_transport::{http, memory, sse};
+}
+
+pub use fastmcp_transport::{event_store, http, memory};
 
 // Re-export server types
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
@@ -424,18 +494,19 @@ pub use fastmcp_server::{
     FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore, FinalTaskSupervisorFuture,
     FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolOutcome,
-    FinalToolSchemaAuthority, HttpServerConfig, InMemoryFinalTaskStore, InboundRequestContext,
-    InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
-    PendingRequests, ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog,
-    ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog,
-    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
-    ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, RequestSender,
-    ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint, ServerHttpEndpointResponse,
-    ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
-    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
-    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
+    HttpShutdownSettlement, InMemoryFinalTaskStore, InboundRequestContext, InboundRequestTransport,
+    Middleware, MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+    ProgressNotificationSender, PromptHandler, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
+    ProxyClient, ProxyFinalCatalog, ProxyFinalTaskListener, ProxyFinalTaskListenerEvent,
+    ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+    ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+    RequestSender, ResourceHandler, Router, Server, ServerBuilder, ServerHttpEndpoint,
+    ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
+    ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, TagFilters,
+    TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 
 /// Proxy-backend legacy progress callback.
@@ -493,17 +564,23 @@ pub use fastmcp_client::{
     mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
 };
 
+/// Exact-2024 HTTP request staging is available only with its adapter profile.
+#[cfg(feature = "legacy-2024-11-05")]
+pub use fastmcp_client::{LegacyHttpRequest, LegacyHttpRequestCommit};
+
 // Public client HTTP execution and configuration surfaces.
 pub use fastmcp_client::http_auth;
 pub use fastmcp_client::http_auth::{BearerBindingError, BoundBearerCredential};
+/// Exact-2024 SSE client support is available only with its adapter profile.
+#[cfg(feature = "legacy-2024-11-05")]
+pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClientError};
 pub use fastmcp_client::http_executor::{
-    LegacySseHttpClient, LegacySseHttpClientError, MAX_MODERN_HTTP_PROBE_BODY_BYTES,
-    MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, ModernHttpClient,
-    ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor, ModernHttpExecutorError,
-    ModernHttpRequest, ModernHttpResponseKind, ModernHttpResponseMetadata,
-    ModernHttpResponseStream, ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
-    ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
-    ModernHttpSubscriptionListener, validate_response_head,
+    MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
+    MODERN_MCP_CONTENT_TYPE, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpRequest, ModernHttpResponseKind,
+    ModernHttpResponseMetadata, ModernHttpResponseStream, ModernHttpSseResponseStream,
+    ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
+    ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, validate_response_head,
 };
 pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
@@ -521,6 +598,11 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 /// The returned client builder captures [`ProtocolPolicy::Auto`] before any
 /// subprocess or HTTP side effect. The caller may replace that immutable plan
 /// with an explicit plan before connecting.
+///
+/// ```compile_fail
+/// use fastmcp_rust::auto::connect_websocket_with_cx;
+/// ```
+#[cfg(feature = "legacy-2024-11-05")]
 pub mod auto {
     pub use fastmcp_client::http_executor::{
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
@@ -582,7 +664,7 @@ pub mod auto {
 /// transport senders, policy-reset APIs, dual-era HTTP connectors, or the
 /// era-less server dispatcher. Use the root exports for intentionally
 /// unqualified integration seams, or
-/// [`legacy_2024`](crate::legacy_2024) for exact-2024 APIs.
+/// `legacy_2024` for exact-2024 APIs.
 ///
 /// ```compile_fail
 /// use fastmcp_rust::modern::{ClientBuilder, ProtocolPolicy};
@@ -623,6 +705,16 @@ pub mod auto {
 ///
 /// let server = ServerBuilder::new("final-only", "1.0.0").build();
 /// let _ = server.dispatch_request;
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::modern::ServerBuilder;
+///
+/// let _ = ServerBuilder::new("final-only", "1.0.0").resource_subscriptions();
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::modern::connect_websocket_with_cx;
 /// ```
 ///
 /// ```compile_fail
@@ -825,19 +917,20 @@ pub mod modern {
     pub use fastmcp_server::providers::McpAppsUiResource;
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthProvider, AuthRequest, AuthorizedTaskServiceRunner,
-        BoxFuture, CompletionHandler, DEFAULT_IN_MEMORY_FINAL_TASKS, DuplicateBehavior,
-        ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
+        BannerStyle, BoxFuture, CompletionHandler, ConsoleConfig, DEFAULT_IN_MEMORY_FINAL_TASKS,
+        DuplicateBehavior, ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
         FinalMethodOutcome, FinalProgressCallback, FinalResourceReadCacheHintProvenance,
         FinalTaskAcceptedInput, FinalTaskInitialWork, FinalTaskNotificationEmitter,
         FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, FinalToolOutcome, FinalToolSchemaAuthority,
+        HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
         InMemoryFinalTaskStore, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
         MountResult, ProgressNotificationSender, PromptHandler, ProxyUpstreamAdapter,
         ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, ResourceHandler,
         ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
-        ToolHandler, create_context_with_progress,
+        ToolHandler, TrafficVerbosity, create_context_with_progress,
     };
     pub use fastmcp_transport::http::{
         StreamableHttpRequestIngress, StreamableHttpRequestResponseMessage,
@@ -894,6 +987,36 @@ pub mod modern {
             }
         }
 
+        /// Sets the bounded connection retry count without changing the
+        /// final-only protocol selection.
+        #[must_use]
+        pub fn max_retries(self, retries: u32) -> Self {
+            Self {
+                inner: self.inner.max_retries(retries),
+            }
+        }
+
+        /// Sets the connection retry delay without changing the final-only
+        /// protocol selection.
+        #[must_use]
+        pub fn retry_delay_ms(self, delay: u64) -> Self {
+            Self {
+                inner: self.inner.retry_delay_ms(delay),
+            }
+        }
+
+        /// Sets a validated bounded connection retry policy.
+        pub fn connection_retry_policy(
+            self,
+            max_attempts: u32,
+            retry_delay: std::time::Duration,
+            total_elapsed: std::time::Duration,
+        ) -> McpResult<Self> {
+            self.inner
+                .connection_retry_policy(max_attempts, retry_delay, total_elapsed)
+                .map(|inner| Self { inner })
+        }
+
         /// Configures final discovery capabilities.
         #[must_use]
         pub fn capabilities(self, capabilities: ClientCapabilities) -> Self {
@@ -910,11 +1033,72 @@ pub mod modern {
             }
         }
 
+        /// Installs final-only client extension settings before connection.
+        pub fn extension_registry<F, R>(
+            self,
+            descriptors: ExtensionDescriptorRegistry,
+            client_discovery: ClientExtensionDiscovery,
+            resolver_factory: F,
+        ) -> McpResult<Self>
+        where
+            F: Fn() -> R + Send + Sync + 'static,
+            R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+        {
+            self.inner
+                .extension_registry(descriptors, client_discovery, resolver_factory)
+                .map(|inner| Self { inner })
+        }
+
+        /// Sets the working directory for the final-only stdio subprocess.
+        #[must_use]
+        pub fn working_dir(self, path: impl Into<std::path::PathBuf>) -> Self {
+            Self {
+                inner: self.inner.working_dir(path),
+            }
+        }
+
         /// Adds one environment variable to the final-only stdio subprocess.
         #[must_use]
         pub fn env(self, key: impl Into<String>, value: impl Into<String>) -> Self {
             Self {
                 inner: self.inner.env(key, value),
+            }
+        }
+
+        /// Adds several environment variables to the final-only stdio subprocess.
+        #[must_use]
+        pub fn envs<I, K, V>(self, vars: I) -> Self
+        where
+            I: IntoIterator<Item = (K, V)>,
+            K: Into<String>,
+            V: Into<String>,
+        {
+            Self {
+                inner: self.inner.envs(vars),
+            }
+        }
+
+        /// Selects whether the final-only subprocess inherits the parent environment.
+        #[must_use]
+        pub fn inherit_env(self, inherit: bool) -> Self {
+            Self {
+                inner: self.inner.inherit_env(inherit),
+            }
+        }
+
+        /// Defers final discovery until the first client operation.
+        #[must_use]
+        pub fn auto_initialize(self, enabled: bool) -> Self {
+            Self {
+                inner: self.inner.auto_initialize(enabled),
+            }
+        }
+
+        /// Selects private process-group ownership for the final-only child.
+        #[must_use]
+        pub fn owned_process_group(self, enabled: bool) -> Self {
+            Self {
+                inner: self.inner.owned_process_group(enabled),
             }
         }
 
@@ -990,6 +1174,20 @@ pub mod modern {
         #[must_use]
         pub const fn protocol_version(&self) -> &'static str {
             MODERN_PROTOCOL_VERSION
+        }
+
+        /// Returns the exact final discovery result that admitted this client.
+        ///
+        /// When construction deferred discovery, this performs that required
+        /// modern lifecycle step before returning. The sealed modern facade
+        /// can never return a legacy initialization result here.
+        pub fn server_discovery(&mut self) -> McpResult<&ServerDiscoverResult> {
+            self.inner.ensure_initialized()?;
+            self.inner.server_discovery().ok_or_else(|| {
+                McpError::internal_error(
+                    "ModernOnly client completed initialization without server/discover",
+                )
+            })
         }
 
         /// Starts the closed Apps wire bridge after final discovery activated Apps.
@@ -1178,6 +1376,40 @@ pub mod modern {
         #[must_use]
         pub fn take_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
             self.inner.take_final_progress_notifications()
+        }
+
+        /// Drains every admitted final server notification received outside a
+        /// request-owned subscription listener.
+        ///
+        /// The component client keeps progress in a distinct typed queue to
+        /// preserve its exact numeric representation. Reconstituting the
+        /// [`ServerNotification::Progress`] branch here gives facade callers
+        /// one exhaustive final server-notification surface.
+        #[must_use]
+        pub fn take_server_notifications(&mut self) -> Vec<ServerNotification> {
+            let mut notifications = self.inner.take_final_server_notifications();
+            notifications.extend(
+                self.inner
+                    .take_final_progress_notifications()
+                    .into_iter()
+                    .map(ServerNotification::Progress),
+            );
+            notifications
+        }
+
+        /// Sends the typed final wire cancellation notification for one
+        /// client-owned live request.
+        ///
+        /// The inner client verifies ownership and atomically tombstones the
+        /// request before committing the fixed final notification. This
+        /// facade exposes no arbitrary notification writer and therefore
+        /// cannot cross into the legacy protocol era.
+        pub fn cancel_request(
+            &mut self,
+            request_id: RequestId,
+            reason: Option<String>,
+        ) -> McpResult<()> {
+            self.inner.cancel_request(request_id, reason)
         }
 
         /// Reads one task through the official final Tasks extension.
@@ -1885,6 +2117,85 @@ pub mod modern {
             ModernOnly
         }
 
+        /// Sets duplicate-registration behavior without changing the modern-only policy.
+        #[must_use]
+        pub fn on_duplicate(self, behavior: DuplicateBehavior) -> Self {
+            Self {
+                inner: self.inner.on_duplicate(behavior),
+            }
+        }
+
+        /// Installs an authentication provider without changing the modern-only policy.
+        #[must_use]
+        pub fn auth_provider<P: AuthProvider + 'static>(self, provider: P) -> Self {
+            Self {
+                inner: self.inner.auth_provider(provider),
+            }
+        }
+
+        /// Disables statistics collection.
+        #[must_use]
+        pub fn without_stats(self) -> Self {
+            Self {
+                inner: self.inner.without_stats(),
+            }
+        }
+
+        /// Sets the server-owned request deadline in seconds.
+        #[must_use]
+        pub fn request_timeout(self, seconds: u64) -> Self {
+            Self {
+                inner: self.inner.request_timeout(seconds),
+            }
+        }
+
+        /// Sets the bounded number of in-flight server-to-client requests.
+        pub fn max_bidirectional_requests_per_connection(self, maximum: usize) -> McpResult<Self> {
+            self.inner
+                .max_bidirectional_requests_per_connection(maximum)
+                .map(|inner| Self { inner })
+        }
+
+        /// Sets the final catalog page size.
+        #[must_use]
+        pub fn list_page_size(self, page_size: usize) -> Self {
+            Self {
+                inner: self.inner.list_page_size(page_size),
+            }
+        }
+
+        /// Enables or disables internal-error detail masking.
+        #[must_use]
+        pub fn mask_error_details(self, enabled: bool) -> Self {
+            Self {
+                inner: self.inner.mask_error_details(enabled),
+            }
+        }
+
+        /// Selects internal-error masking from the launch environment.
+        #[must_use]
+        pub fn auto_mask_errors(self) -> Self {
+            Self {
+                inner: self.inner.auto_mask_errors(),
+            }
+        }
+
+        /// Enables or disables strict tool-input validation.
+        #[must_use]
+        pub fn strict_input_validation(self, enabled: bool) -> Self {
+            Self {
+                inner: self.inner.strict_input_validation(enabled),
+            }
+        }
+
+        /// Installs era-neutral middleware without exposing a legacy dispatcher.
+        #[must_use]
+        pub fn middleware<M: Middleware + 'static>(self, middleware: M) -> Self {
+            Self {
+                inner: self.inner.middleware(middleware),
+            }
+        }
+
         /// Installs the official MCP Apps discovery marker.
         pub fn mcp_apps(self) -> Result<Self, ServerExtensionConfigurationError> {
             self.inner.mcp_apps().map(|inner| Self { inner })
@@ -1898,6 +2209,17 @@ pub mod modern {
         pub fn mcp_apps_ui_resource(self, resource: McpAppsUiResource) -> McpResult<Self> {
             self.inner
                 .mcp_apps_ui_resource(resource)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers one final-only tool carrying typed MCP Apps UI metadata.
+        ///
+        /// This requires [`Self::mcp_apps`] and a previously registered linked
+        /// [`McpAppsUiResource`]. The tool is absent from exact MCP 2024-11-05
+        /// discovery and dispatch.
+        pub fn mcp_apps_tool<H: ToolHandler + 'static>(self, handler: H) -> McpResult<Self> {
+            self.inner
+                .mcp_apps_tool(handler)
                 .map(|inner| Self { inner })
         }
 
@@ -2005,12 +2327,67 @@ pub mod modern {
             }
         }
 
+        /// Sets the server instructions returned through final discovery.
+        #[must_use]
+        pub fn instructions(self, instructions: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.instructions(instructions),
+            }
+        }
+
+        /// Sets the console configuration without changing the modern-only policy.
+        #[must_use]
+        pub fn with_console_config(self, config: ConsoleConfig) -> Self {
+            Self {
+                inner: self.inner.with_console_config(config),
+            }
+        }
+
+        /// Selects a console banner style.
+        #[must_use]
+        pub fn with_banner(self, style: BannerStyle) -> Self {
+            Self {
+                inner: self.inner.with_banner(style),
+            }
+        }
+
+        /// Disables the startup banner.
+        #[must_use]
+        pub fn without_banner(self) -> Self {
+            Self {
+                inner: self.inner.without_banner(),
+            }
+        }
+
+        /// Sets request/response traffic logging verbosity.
+        #[must_use]
+        pub fn with_traffic_logging(self, verbosity: TrafficVerbosity) -> Self {
+            Self {
+                inner: self.inner.with_traffic_logging(verbosity),
+            }
+        }
+
         /// Builds a server with no facade-exposed legacy dispatcher.
         #[must_use]
         pub fn build(self) -> Server {
-            Server {
-                inner: self.inner.build(),
+            self.try_build()
+                .unwrap_or_else(|error| panic!("ModernOnly facade server build rejected: {error}"))
+        }
+
+        /// Builds a final-only server after validating the reserved launch policy.
+        pub fn try_build(self) -> McpResult<Server> {
+            let inner = self
+                .inner
+                .try_build()
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            if inner.protocol_policy()
+                != fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly
+            {
+                return Err(McpError::invalid_request(
+                    "ModernOnly facade server rejected a conflicting reserved launch policy",
+                ));
             }
+            Ok(Server { inner })
         }
     }
 
@@ -2034,7 +2411,11 @@ pub mod modern {
         }
 
         /// Serves final HTTP requests until the caller-owned context is cancelled.
-        pub async fn serve(self, cx: &Cx) -> McpResult<()> {
+        ///
+        /// The returned shutdown outcome retains any child that did not
+        /// cooperate with the bounded listener drain, so the caller can settle
+        /// it explicitly rather than losing ownership at shutdown.
+        pub async fn serve(self, cx: &Cx) -> McpResult<HttpServerShutdown> {
             self.inner.serve(cx).await
         }
     }
@@ -2076,7 +2457,11 @@ pub mod modern {
         }
 
         /// Binds and serves this facade-pinned server over final HTTP.
-        pub async fn serve_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<()> {
+        pub async fn serve_http(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+        ) -> McpResult<HttpServerShutdown> {
             self.inner.serve_http(cx, addr).await
         }
 
@@ -2105,20 +2490,34 @@ pub mod modern {
 /// intentionally disjoint from [`modern`]; selecting between the two remains
 /// the responsibility of the immutable policy and the transport-specific
 /// negotiation layer.
+///
+/// ```compile_fail
+/// use fastmcp_rust::legacy_2024;
+///
+/// let _ = legacy_2024::LegacySseHttpClient::connect;
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::legacy_2024::ElicitRequestParams;
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::legacy_2024::FinalTaskId;
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_rust::legacy_2024::connect_websocket_with_cx;
+/// ```
+#[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024 {
-    pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClientError};
     pub use fastmcp_client::{
-        ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
         CreateMessageParams as LegacyCreateMessageParams,
-        CreateMessageResult as LegacyCreateMessageResult,
-        ElicitRequestParams as LegacyElicitRequestParams, ElicitResult as LegacyElicitResult,
-        HttpClientError, ListRootsParams as LegacyListRootsParams,
-        ListRootsResult as LegacyListRootsResult, Request, RequestExecution, RequestExecutor,
+        CreateMessageResult as LegacyCreateMessageResult, HttpClientError,
+        ListRootsParams as LegacyListRootsParams, ListRootsResult as LegacyListRootsResult,
         RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation,
         ReverseRequestHandlers as LegacyReverseRequestHandlers,
         RootsRequestHandler as LegacyRootsRequestHandler,
-        SamplingRequestHandler as LegacySamplingRequestHandler, StdioRequestExecution,
-        StdioRequestExecutor,
+        SamplingRequestHandler as LegacySamplingRequestHandler,
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientRoot, Cx, McpContext, McpError, McpOutcome, McpResult,
@@ -2126,21 +2525,16 @@ pub mod legacy_2024 {
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::JsonInteger;
-    pub use fastmcp_protocol::methods;
     pub use fastmcp_protocol::protocol_policy::{
         HttpEndpointBundleError, LEGACY_PROTOCOL_VERSION, LegacyAdapterReceiptIssuer,
         LegacyClientAdapterInstalledReceipt, LegacyReceiptBinding,
-        LegacyServerAdapterInstalledReceipt as PolicyServerAdapterInstalledReceipt, ProtocolEra,
-        ProtocolPolicy, ProtocolVersion,
+        LegacyServerAdapterInstalledReceipt as PolicyServerAdapterInstalledReceipt, ProtocolPolicy,
     };
     pub use fastmcp_protocol::{
         CallToolParams, CallToolResult, CancellationSender, CancellationWireCodecError,
         CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo, CompletionValues,
-        CreateMessageParams, CreateMessageResult, ElicitAction, ElicitCompleteNotificationParams,
-        ElicitContentValue, ElicitMode, ElicitRequestFormParams, ElicitRequestParams,
-        ElicitRequestUrlParams, ElicitRequestedSchema, ElicitResult, ElicitationCapability,
-        ElicitationRequiredErrorData, FormElicitationCapability, GetPromptParams, GetPromptResult,
-        Icon, IncludeContext, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
+        CreateMessageParams, CreateMessageResult, GetPromptParams, GetPromptResult, Icon,
+        IncludeContext, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
         JsonRpcResponse, LegacyCompletionArgument, LegacyCompletionParams,
         LegacyCompletionReference, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
         LegacyCoreResult, LegacyEmptyResult, LegacyMetadata, LegacyOpaqueMetadata,
@@ -2152,9 +2546,8 @@ pub mod legacy_2024 {
         ReadResourceResult, RequestId, RequestMeta, Resource, ResourceContent, ResourceTemplate,
         ResourceUpdatedNotificationParams, ResourcesCapability, Root, RootsCapability,
         SamplingCapability, SamplingContent, SamplingMessage, ServerCapabilities, ServerInfo,
-        SetLogLevelParams, SubscribeResourceParams, TaskId, TaskInfo, TaskResult, TaskStatus,
-        TaskStatusNotificationParams, TasksCapability, Tool, ToolAnnotations, ToolsCapability,
-        UnsubscribeResourceParams, UrlElicitationCapability,
+        SetLogLevelParams, SubscribeResourceParams, Tool, ToolAnnotations, ToolsCapability,
+        UnsubscribeResourceParams,
     };
     pub use fastmcp_server::legacy_2024::{
         LEGACY_2024_MAX_ADAPTER_RESERVATIONS, Legacy2024AdapterError, Legacy2024Handler,
@@ -2166,12 +2559,184 @@ pub mod legacy_2024 {
         legacy_2024_a_digest_preimage, legacy_2024_b_digest_preimage,
     };
     pub use fastmcp_server::{
-        CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
+        AuthProvider, BannerStyle, CompletionHandler, ConsoleConfig, DuplicateBehavior,
+        HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, Middleware,
+        PromptHandler, ResourceHandler, ServerLaunchPolicyError, ToolErrorKind, ToolHandler,
+        TrafficVerbosity,
     };
     pub use fastmcp_transport::sse::{
         LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, LegacySseServerTransport,
     };
     pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
+
+    /// The exact client-originated legacy notification exposed by this
+    /// facade.
+    ///
+    /// `notifications/roots/list_changed` is capability-gated by the
+    /// client's advertised `roots.listChanged` value. Its sealed HTTP
+    /// operation is available on [`HttpClient::roots_list_changed`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ClientNotification {
+        /// `notifications/roots/list_changed`.
+        RootsListChanged,
+    }
+
+    impl ClientNotification {
+        /// Returns the exact legacy method literal.
+        #[must_use]
+        pub const fn method(self) -> &'static str {
+            match self {
+                Self::RootsListChanged => methods::NOTIFICATIONS_ROOTS_LIST_CHANGED,
+            }
+        }
+
+        /// Encodes this notification without exposing a generic wire writer.
+        #[must_use]
+        pub fn encode(self) -> JsonRpcRequest {
+            JsonRpcRequest::notification(self.method(), None)
+        }
+    }
+
+    /// Typed exact-2024 notifications that a server may originate.
+    ///
+    /// The enum deliberately excludes `notifications/roots/list_changed`:
+    /// that method is client-to-server only in the pinned 2024 schema.
+    #[derive(Debug, Clone)]
+    pub enum ServerNotification {
+        /// `notifications/cancelled`.
+        Cancelled(CancelledParams),
+        /// `notifications/progress`.
+        Progress(ProgressParams),
+        /// `notifications/message`.
+        Message(LogMessageParams),
+        /// `notifications/prompts/list_changed`.
+        PromptsListChanged,
+        /// `notifications/resources/list_changed`.
+        ResourcesListChanged,
+        /// `notifications/resources/updated`.
+        ResourceUpdated(ResourceUpdatedNotificationParams),
+        /// `notifications/tools/list_changed`.
+        ToolsListChanged,
+    }
+
+    impl ServerNotification {
+        /// Decodes one exact legacy server notification from an admitted
+        /// JSON-RPC notification envelope.
+        ///
+        /// The pinned legacy envelope parser validates the JSON-RPC shape and
+        /// method parameters before this direction-specific projection.
+        pub fn decode(request: &JsonRpcRequest) -> McpResult<Self> {
+            let wire = serde_json::to_value(request).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Legacy notification could not be represented: {error}"
+                ))
+            })?;
+            let envelope = fastmcp_protocol::methods::decode_legacy_2024_11_05_envelope(wire)
+                .map_err(|error| {
+                    McpError::invalid_params(format!(
+                        "Invalid MCP 2024-11-05 notification: {error}"
+                    ))
+                })?;
+            let fastmcp_protocol::methods::Legacy2024Envelope::Notification { method, params } =
+                envelope
+            else {
+                return Err(McpError::invalid_params(
+                    "MCP 2024-11-05 server notification requires a notification envelope",
+                ));
+            };
+
+            match method.name {
+                methods::NOTIFICATIONS_CANCELLED => {
+                    decode_legacy_server_notification_params(params, method.name)
+                        .map(Self::Cancelled)
+                }
+                methods::NOTIFICATIONS_PROGRESS => {
+                    decode_legacy_server_notification_params(params, method.name)
+                        .map(Self::Progress)
+                }
+                methods::NOTIFICATIONS_MESSAGE => {
+                    decode_legacy_server_notification_params(params, method.name).map(Self::Message)
+                }
+                methods::NOTIFICATIONS_PROMPTS_LIST_CHANGED => Ok(Self::PromptsListChanged),
+                methods::NOTIFICATIONS_RESOURCES_LIST_CHANGED => Ok(Self::ResourcesListChanged),
+                methods::NOTIFICATIONS_RESOURCES_UPDATED => {
+                    decode_legacy_server_notification_params(params, method.name)
+                        .map(Self::ResourceUpdated)
+                }
+                methods::NOTIFICATIONS_TOOLS_LIST_CHANGED => Ok(Self::ToolsListChanged),
+                _ => Err(McpError::invalid_params(
+                    "notification direction is not server-to-client in exact MCP 2024-11-05",
+                )),
+            }
+        }
+
+        /// Returns the exact legacy method literal.
+        #[must_use]
+        pub const fn method(&self) -> &'static str {
+            match self {
+                Self::Cancelled(_) => methods::NOTIFICATIONS_CANCELLED,
+                Self::Progress(_) => methods::NOTIFICATIONS_PROGRESS,
+                Self::Message(_) => methods::NOTIFICATIONS_MESSAGE,
+                Self::PromptsListChanged => methods::NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+                Self::ResourcesListChanged => methods::NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+                Self::ResourceUpdated(_) => methods::NOTIFICATIONS_RESOURCES_UPDATED,
+                Self::ToolsListChanged => methods::NOTIFICATIONS_TOOLS_LIST_CHANGED,
+            }
+        }
+    }
+
+    fn decode_legacy_server_notification_params<T>(
+        params: Option<serde_json::Value>,
+        method: &str,
+    ) -> McpResult<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let params = params.ok_or_else(|| {
+            McpError::invalid_params(format!(
+                "MCP 2024-11-05 {method} requires notification parameters"
+            ))
+        })?;
+        serde_json::from_value(params).map_err(|_| {
+            McpError::invalid_params(format!(
+                "MCP 2024-11-05 {method} notification parameters are invalid"
+            ))
+        })
+    }
+
+    /// Exact MCP 2024-11-05 method vocabulary.
+    ///
+    /// This intentionally does not re-export the mixed-era protocol methods
+    /// module: final discovery and subscription constants cannot be named from
+    /// the LegacyOnly facade.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::legacy_2024;
+    ///
+    /// let _ = legacy_2024::methods::SERVER_DISCOVER;
+    /// ```
+    pub mod methods {
+        pub use fastmcp_protocol::methods::{
+            COMPLETION_COMPLETE, INITIALIZE, LEGACY_2024_11_05_METHODS,
+            LEGACY_2024_11_05_PROTOCOL_VERSION, LEGACY_2024_11_05_SCHEMA_JSON,
+            LEGACY_2024_11_05_SCHEMA_SHA256, LOGGING_SET_LEVEL, Legacy2024Capability,
+            Legacy2024Direction, Legacy2024Envelope, Legacy2024EnvelopeError,
+            Legacy2024EnvelopeKind, Legacy2024ListChangedCapability, Legacy2024Method,
+            Legacy2024ResourcesCapability, Legacy2024ResultDisposition, Legacy2024ResultKind,
+            Legacy2024ServerCapabilities, Legacy2024WireError, NOTIFICATIONS_CANCELLED,
+            NOTIFICATIONS_INITIALIZED, NOTIFICATIONS_MESSAGE, NOTIFICATIONS_PROGRESS,
+            NOTIFICATIONS_PROMPTS_LIST_CHANGED, NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+            NOTIFICATIONS_RESOURCES_UPDATED, NOTIFICATIONS_ROOTS_LIST_CHANGED,
+            NOTIFICATIONS_TOOLS_LIST_CHANGED, PING, PROMPTS_GET, PROMPTS_LIST, RESOURCES_LIST,
+            RESOURCES_READ, RESOURCES_SUBSCRIBE, RESOURCES_TEMPLATES_LIST, RESOURCES_UNSUBSCRIBE,
+            ROOTS_LIST, SAMPLING_CREATE_MESSAGE, TOOLS_CALL, TOOLS_LIST,
+            classify_legacy_2024_result, decode_legacy_2024_11_05_client_capabilities,
+            decode_legacy_2024_11_05_envelope, decode_legacy_2024_11_05_envelope_classified,
+            decode_legacy_2024_11_05_server_capabilities, legacy_2024_11_05_method,
+            legacy_2024_11_05_schema, translate_legacy_2024_result,
+            validate_legacy_2024_11_05_initialize_result, validate_legacy_2024_11_05_method_params,
+        };
+    }
 
     /// Failure while constructing or connecting the exact MCP 2024-11-05 HTTP plan.
     #[derive(Debug)]
@@ -2200,12 +2765,295 @@ pub mod legacy_2024 {
         }
     }
 
+    /// An exact MCP 2024-11-05 server builder.
+    ///
+    /// It forwards only configuration and exact-2024 registration methods;
+    /// callers cannot reset its policy or register a final-only component
+    /// through this namespace.
+    pub struct ServerBuilder {
+        inner: fastmcp_server::ServerBuilder,
+    }
+
+    impl ServerBuilder {
+        /// Creates a builder permanently pinned to exact MCP 2024-11-05.
+        #[must_use]
+        pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+            Self {
+                inner: fastmcp_server::ServerBuilder::new(name, version)
+                    .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly),
+            }
+        }
+
+        /// Returns the sole policy admitted by this builder.
+        #[must_use]
+        pub const fn protocol_policy(&self) -> ProtocolPolicy {
+            ProtocolPolicy::LegacyOnly
+        }
+
+        /// Sets duplicate-registration behavior.
+        #[must_use]
+        pub fn on_duplicate(self, behavior: DuplicateBehavior) -> Self {
+            Self {
+                inner: self.inner.on_duplicate(behavior),
+            }
+        }
+
+        /// Installs an authentication provider.
+        #[must_use]
+        pub fn auth_provider<P: AuthProvider + 'static>(self, provider: P) -> Self {
+            Self {
+                inner: self.inner.auth_provider(provider),
+            }
+        }
+
+        /// Disables statistics collection.
+        #[must_use]
+        pub fn without_stats(self) -> Self {
+            Self {
+                inner: self.inner.without_stats(),
+            }
+        }
+
+        /// Sets the server-owned request deadline in seconds.
+        #[must_use]
+        pub fn request_timeout(self, seconds: u64) -> Self {
+            Self {
+                inner: self.inner.request_timeout(seconds),
+            }
+        }
+
+        /// Sets the bounded number of in-flight server-to-client requests.
+        pub fn max_bidirectional_requests_per_connection(self, maximum: usize) -> McpResult<Self> {
+            self.inner
+                .max_bidirectional_requests_per_connection(maximum)
+                .map(|inner| Self { inner })
+        }
+
+        /// Sets the exact-2024 catalog page size.
+        #[must_use]
+        pub fn list_page_size(self, page_size: usize) -> Self {
+            Self {
+                inner: self.inner.list_page_size(page_size),
+            }
+        }
+
+        /// Enables or disables internal-error detail masking.
+        #[must_use]
+        pub fn mask_error_details(self, enabled: bool) -> Self {
+            Self {
+                inner: self.inner.mask_error_details(enabled),
+            }
+        }
+
+        /// Selects internal-error masking from the launch environment.
+        #[must_use]
+        pub fn auto_mask_errors(self) -> Self {
+            Self {
+                inner: self.inner.auto_mask_errors(),
+            }
+        }
+
+        /// Enables or disables strict tool-input validation.
+        #[must_use]
+        pub fn strict_input_validation(self, enabled: bool) -> Self {
+            Self {
+                inner: self.inner.strict_input_validation(enabled),
+            }
+        }
+
+        /// Installs era-neutral middleware.
+        #[must_use]
+        pub fn middleware<M: Middleware + 'static>(self, middleware: M) -> Self {
+            Self {
+                inner: self.inner.middleware(middleware),
+            }
+        }
+
+        /// Registers an exact-2024-only tool handler.
+        #[must_use]
+        pub fn tool<H: ToolHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.legacy_tool(handler),
+            }
+        }
+
+        /// Registers an exact-2024-only resource handler.
+        #[must_use]
+        pub fn resource<H: ResourceHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.legacy_resource(handler),
+            }
+        }
+
+        /// Advertises resource-subscription support for registered resources.
+        #[must_use]
+        pub fn resource_subscriptions(self) -> Self {
+            Self {
+                inner: self.inner.resource_subscriptions(),
+            }
+        }
+
+        /// Registers an exact-2024 resource template.
+        #[must_use]
+        pub fn resource_template(self, template: ResourceTemplate) -> Self {
+            Self {
+                inner: self.inner.legacy_resource_template(template),
+            }
+        }
+
+        /// Registers an exact-2024-only prompt handler.
+        #[must_use]
+        pub fn prompt<H: PromptHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.legacy_prompt(handler),
+            }
+        }
+
+        /// Registers the exact-2024 completion handler.
+        #[must_use]
+        pub fn completion_handler<H: CompletionHandler + 'static>(self, handler: H) -> Self {
+            Self {
+                inner: self.inner.legacy_completion_handler(handler),
+            }
+        }
+
+        /// Sets server instructions.
+        #[must_use]
+        pub fn instructions(self, instructions: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.instructions(instructions),
+            }
+        }
+
+        /// Sets the console configuration.
+        #[must_use]
+        pub fn with_console_config(self, config: ConsoleConfig) -> Self {
+            Self {
+                inner: self.inner.with_console_config(config),
+            }
+        }
+
+        /// Selects a console banner style.
+        #[must_use]
+        pub fn with_banner(self, style: BannerStyle) -> Self {
+            Self {
+                inner: self.inner.with_banner(style),
+            }
+        }
+
+        /// Disables the startup banner.
+        #[must_use]
+        pub fn without_banner(self) -> Self {
+            Self {
+                inner: self.inner.without_banner(),
+            }
+        }
+
+        /// Sets request/response traffic logging verbosity.
+        #[must_use]
+        pub fn with_traffic_logging(self, verbosity: TrafficVerbosity) -> Self {
+            Self {
+                inner: self.inner.with_traffic_logging(verbosity),
+            }
+        }
+
+        /// Builds an exact-2024 server.
+        #[must_use]
+        pub fn build(self) -> Server {
+            self.try_build()
+                .unwrap_or_else(|error| panic!("LegacyOnly facade server build rejected: {error}"))
+        }
+
+        /// Builds an exact-2024 server after validating launch policy input.
+        pub fn try_build(self) -> McpResult<Server> {
+            let inner = self
+                .inner
+                .try_build()
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            if inner.protocol_policy()
+                != fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly
+            {
+                return Err(McpError::invalid_request(
+                    "LegacyOnly facade server rejected a conflicting reserved launch policy",
+                ));
+            }
+            Ok(Server { inner })
+        }
+    }
+
+    /// A server built by the exact-2024 facade.
+    pub struct Server {
+        inner: fastmcp_server::Server,
+    }
+
+    /// A bound exact-2024 HTTP+SSE server lifecycle.
+    ///
+    /// This wrapper can arise only from a [`Server`] built by the
+    /// [`legacy_2024`] facade. Its inner listener is intentionally private so
+    /// callers cannot change the preselected `LegacyOnly` protocol policy.
+    pub struct HttpServer {
+        inner: fastmcp_server::BoundHttpServer,
+    }
+
+    impl HttpServer {
+        /// Returns the address selected for this exact legacy listener.
+        pub fn local_addr(&self) -> McpResult<std::net::SocketAddr> {
+            self.inner.local_addr()
+        }
+
+        /// Serves only the exact MCP 2024-11-05 HTTP+SSE routes until the
+        /// caller-owned context is cancelled.
+        pub async fn serve(self, cx: &Cx) -> McpResult<HttpServerShutdown> {
+            self.inner.serve(cx).await
+        }
+    }
+
+    impl Server {
+        /// Runs this exact-2024 server over stdio.
+        pub fn run_stdio(self) -> ! {
+            self.inner.run_stdio()
+        }
+
+        /// Binds this `LegacyOnly` server to the exact 2024 HTTP+SSE route
+        /// pair on a caller-owned context.
+        pub async fn bind_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<HttpServer> {
+            self.inner
+                .bind_http(cx, addr)
+                .await
+                .map(|inner| HttpServer { inner })
+        }
+
+        /// Binds and serves this `LegacyOnly` server over the exact 2024
+        /// HTTP+SSE transport.
+        pub async fn serve_http(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+        ) -> McpResult<HttpServerShutdown> {
+            self.inner.serve_http(cx, addr).await
+        }
+    }
+
+    /// Creates a server builder pinned to exact MCP 2024-11-05.
+    #[must_use]
+    pub fn server_builder(name: impl Into<String>, version: impl Into<String>) -> ServerBuilder {
+        ServerBuilder::new(name, version)
+    }
+
     /// A sealed exact-2024 stdio client.
     ///
     /// The root client now defaults to bounded `Auto` selection. This wrapper
-    /// keeps associated constructors in the legacy namespace from silently
-    /// selecting a modern peer while retaining access to the established
-    /// instance methods through deref.
+    /// keeps both construction and callable operations in the exact legacy
+    /// vocabulary, so a facade-only consumer cannot reach final methods by
+    /// dereferencing an otherwise legacy-selected connection.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::{JsonValue, legacy_2024};
+    ///
+    /// fn cannot_call_final(client: &mut legacy_2024::Client) {
+    ///     let _ = client.call_tool_final("tool", JsonValue::Null);
+    /// }
+    /// ```
     pub struct Client {
         inner: fastmcp_client::Client,
     }
@@ -2220,7 +3068,7 @@ pub mod legacy_2024 {
             fastmcp_client::Client::stdio_with_protocol_plan(
                 command,
                 args,
-                ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
             )
             .map(Self::from_inner)
         }
@@ -2230,7 +3078,7 @@ pub mod legacy_2024 {
             fastmcp_client::Client::stdio_with_protocol_plan_with_cx(
                 command,
                 args,
-                ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
                 cx,
             )
             .map(Self::from_inner)
@@ -2241,33 +3089,190 @@ pub mod legacy_2024 {
         pub fn builder() -> ClientBuilder {
             ClientBuilder::new()
         }
-    }
 
-    impl std::ops::Deref for Client {
-        type Target = fastmcp_client::Client;
-
-        fn deref(&self) -> &Self::Target {
-            &self.inner
+        /// Ensures the exact legacy initialization lifecycle has completed.
+        pub fn ensure_initialized(&mut self) -> McpResult<()> {
+            self.inner.ensure_initialized()
         }
-    }
 
-    impl std::ops::DerefMut for Client {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.inner
+        /// Returns whether the exact legacy initialization lifecycle completed.
+        #[must_use]
+        pub fn is_initialized(&self) -> bool {
+            self.inner.is_initialized()
+        }
+
+        /// Returns the negotiated exact MCP 2024-11-05 version.
+        #[must_use]
+        pub fn protocol_version(&self) -> &str {
+            self.inner.protocol_version()
+        }
+
+        /// Returns the initialized server identity.
+        #[must_use]
+        pub fn server_info(&self) -> &ServerInfo {
+            self.inner.server_info()
+        }
+
+        /// Returns the initialized exact-2024 server capabilities.
+        #[must_use]
+        pub fn server_capabilities(&self) -> &ServerCapabilities {
+            self.inner.server_capabilities()
+        }
+
+        /// Sends `notifications/roots/list_changed` on this exact-2024 stdio
+        /// connection.
+        ///
+        /// This requires the client to have advertised `roots.listChanged`
+        /// during initialization. The sealed facade intentionally offers no
+        /// modern equivalent.
+        pub fn roots_list_changed(&mut self) -> McpResult<()> {
+            self.inner.roots_list_changed()
+        }
+
+        /// Direction-checks one exact legacy server notification supplied by
+        /// a caller-owned ingress adapter.
+        ///
+        /// This is useful for stdio integrations that retain server
+        /// notifications alongside ordinary request dispatch while preserving
+        /// the facade's exact typed notification vocabulary.
+        pub fn decode_server_notification(
+            notification: &JsonRpcRequest,
+        ) -> McpResult<ServerNotification> {
+            ServerNotification::decode(notification)
+        }
+
+        /// Installs exact-2024 reverse request handlers.
+        pub fn set_reverse_request_handlers(
+            &mut self,
+            handlers: LegacyReverseRequestHandlers,
+        ) -> McpResult<()> {
+            self.inner.set_reverse_request_handlers(handlers)
+        }
+
+        /// Sends the exact-2024 `ping` request.
+        pub fn ping(&mut self) -> McpResult<()> {
+            self.inner.ping()
+        }
+
+        /// Lists exact-2024 tools.
+        pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+            self.inner.list_tools()
+        }
+
+        /// Calls one exact-2024 tool without final-result projection.
+        pub fn call_tool(&mut self, name: &str, arguments: JsonValue) -> McpResult<CallToolResult> {
+            self.inner.call_tool_legacy(name, arguments)
+        }
+
+        /// Lists exact-2024 resources.
+        pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+            self.inner.list_resources()
+        }
+
+        /// Lists exact-2024 resource templates.
+        pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+            self.inner.list_resource_templates()
+        }
+
+        /// Reads one exact-2024 resource.
+        pub fn read_resource(&mut self, uri: &str) -> McpResult<ReadResourceResult> {
+            self.inner.read_resource_legacy(uri)
+        }
+
+        /// Starts an exact-2024 resource subscription.
+        pub fn subscribe_resource(&mut self, uri: &str) -> McpResult<()> {
+            self.inner.subscribe_resource_legacy(uri)
+        }
+
+        /// Ends an exact-2024 resource subscription.
+        pub fn unsubscribe_resource(&mut self, uri: &str) -> McpResult<()> {
+            self.inner.unsubscribe_resource_legacy(uri)
+        }
+
+        /// Lists exact-2024 prompts.
+        pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+            self.inner.list_prompts()
+        }
+
+        /// Gets one exact-2024 prompt.
+        pub fn get_prompt(
+            &mut self,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<GetPromptResult> {
+            self.inner.get_prompt_legacy(name, arguments)
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument.
+        pub fn complete(
+            &mut self,
+            params: LegacyCompletionParams,
+        ) -> McpResult<LegacyCompletionResult> {
+            let reference = match params.reference {
+                LegacyCompletionReference::Prompt { name } => {
+                    fastmcp_client::CompletionReference::Prompt { name }
+                }
+                LegacyCompletionReference::Resource { uri } => {
+                    fastmcp_client::CompletionReference::Resource { uri }
+                }
+            };
+            let result = self.inner.complete(fastmcp_client::CompletionParams {
+                reference,
+                argument: fastmcp_client::CompletionArgument {
+                    name: params.argument.name,
+                    value: params.argument.value,
+                },
+                context: None,
+            })?;
+            match result {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                fastmcp_protocol::CoreResult::Final(_) => Err(McpError::internal_error(
+                    "LegacyOnly facade received a final completion result",
+                )),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected completion result",
+                )),
+            }
+        }
+
+        /// Sends the exact-2024 cancellation notification for one live request.
+        pub fn cancel_request(
+            &mut self,
+            request_id: RequestId,
+            reason: Option<String>,
+        ) -> McpResult<()> {
+            self.inner.cancel_request(request_id, reason)
+        }
+
+        /// Sends exact-2024 `logging/setLevel`.
+        pub fn set_log_level(&mut self, level: LogLevel) -> McpResult<()> {
+            self.inner.set_log_level(level)
+        }
+
+        /// Closes the exact legacy client and its owned subprocess resources.
+        pub fn close(&mut self) -> McpResult<()> {
+            self.inner.close()
         }
     }
 
     /// A builder sealed to exact MCP 2024-11-05.
     ///
-    /// This wrapper intentionally has no `protocol_plan` mutator: callers
+    /// This wrapper intentionally has no raw protocol-plan surface: callers
     /// that need modern or Auto negotiation must select the root, `modern`,
     /// or `auto` namespace explicitly.
     ///
     /// ```compile_fail
     /// use fastmcp_rust::{legacy_2024, ProtocolPolicy};
     ///
-    /// let _ = legacy_2024::ClientBuilder::new()
-    ///     .protocol_plan(legacy_2024::ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
+    /// let _ = legacy_2024::ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::legacy_2024;
+    ///
+    /// let _ = legacy_2024::ProtocolEra::Modern2026;
     /// ```
     #[derive(Clone)]
     pub struct ClientBuilder {
@@ -2282,10 +3287,9 @@ pub mod legacy_2024 {
         /// Creates an exact-2024 stdio builder.
         #[must_use]
         pub fn new() -> Self {
-            Self::from_inner(
-                fastmcp_client::ClientBuilder::new()
-                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly)),
-            )
+            Self::from_inner(fastmcp_client::ClientBuilder::new().protocol_plan(
+                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            ))
         }
 
         /// Sets the legacy client identity.
@@ -2377,22 +3381,20 @@ pub mod legacy_2024 {
             Self::from_inner(self.inner.owned_process_group(enabled))
         }
 
-        /// Returns the sealed exact-2024 plan.
+        /// Returns the sole policy admitted by this builder.
         #[must_use]
-        pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
-            self.inner.selected_protocol_plan()
+        pub const fn protocol_policy(&self) -> ProtocolPolicy {
+            ProtocolPolicy::LegacyOnly
         }
 
         /// Connects the sealed exact-2024 stdio plan.
         ///
-        /// The returned root client has already completed an immutable legacy
-        /// selection; no Auto negotiation occurs in this entry point.
-        pub fn connect_stdio(
-            self,
-            command: &str,
-            args: &[&str],
-        ) -> McpResult<fastmcp_client::Client> {
-            self.inner.connect_stdio(command, args)
+        /// The returned facade client has already completed an immutable
+        /// legacy selection; no Auto negotiation occurs in this entry point.
+        pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
+            self.inner
+                .connect_stdio(command, args)
+                .map(Client::from_inner)
         }
 
         /// Connects the sealed exact-2024 stdio plan with `cx`.
@@ -2401,25 +3403,23 @@ pub mod legacy_2024 {
             command: &str,
             args: &[&str],
             cx: &Cx,
-        ) -> McpResult<fastmcp_client::Client> {
-            self.inner.connect_stdio_with_cx(command, args, cx)
+        ) -> McpResult<Client> {
+            self.inner
+                .connect_stdio_with_cx(command, args, cx)
+                .map(Client::from_inner)
         }
 
-        /// Connects the sealed exact-2024 HTTP+SSE plan.
-        pub fn connect_http(
-            self,
-        ) -> Result<fastmcp_client::ClientHttpConnection, fastmcp_client::ClientHttpConnectionError>
-        {
-            self.inner.connect_http()
+        /// Connects and initializes the sealed exact-2024 HTTP+SSE plan.
+        pub fn connect_http(self) -> Result<HttpClient, HttpClientError> {
+            self.inner.connect_http_client().map(HttpClient::from_inner)
         }
 
-        /// Connects the sealed exact-2024 HTTP+SSE plan with `cx`.
-        pub async fn connect_http_with_cx(
-            self,
-            cx: &Cx,
-        ) -> Result<fastmcp_client::ClientHttpConnection, fastmcp_client::ClientHttpConnectionError>
-        {
-            self.inner.connect_http_with_cx(cx).await
+        /// Connects and initializes the sealed exact-2024 HTTP+SSE plan with `cx`.
+        pub async fn connect_http_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
+            self.inner
+                .connect_http_client_with_cx(cx)
+                .await
+                .map(HttpClient::from_inner)
         }
 
         /// Connects a ready exact-2024 HTTP client.
@@ -2440,6 +3440,18 @@ pub mod legacy_2024 {
     }
 
     /// A ready HTTP client produced only by a sealed exact-2024 plan.
+    ///
+    /// This wrapper intentionally withholds its mutable transport and generic
+    /// request dispatcher. Its methods name only exact-2024 requests and
+    /// reject an unexpected final result before it reaches the caller.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::legacy_2024;
+    ///
+    /// fn cannot_reach_transport(client: &mut legacy_2024::HttpClient) {
+    ///     let _ = client.connection_mut();
+    /// }
+    /// ```
     pub struct HttpClient {
         inner: fastmcp_client::HttpClient,
     }
@@ -2448,19 +3460,340 @@ pub mod legacy_2024 {
         fn from_inner(inner: fastmcp_client::HttpClient) -> Self {
             Self { inner }
         }
-    }
 
-    impl std::ops::Deref for HttpClient {
-        type Target = fastmcp_client::HttpClient;
-
-        fn deref(&self) -> &Self::Target {
-            &self.inner
+        fn unexpected_result(method: &'static str) -> HttpClientError {
+            HttpClientError::CoreResult(McpError::internal_error(format!(
+                "LegacyOnly facade received an unexpected result for {method}"
+            )))
         }
-    }
 
-    impl std::ops::DerefMut for HttpClient {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.inner
+        fn encode_params<T: serde::Serialize>(params: T) -> Result<JsonValue, HttpClientError> {
+            serde_json::to_value(params).map_err(|error| {
+                HttpClientError::CoreResult(McpError::invalid_params(format!(
+                    "LegacyOnly facade could not encode legacy request parameters: {error}"
+                )))
+            })
+        }
+
+        async fn request_legacy_core(
+            &mut self,
+            cx: &Cx,
+            method: &'static str,
+            parameters: JsonValue,
+        ) -> Result<LegacyCoreResult, HttpClientError> {
+            match self
+                .inner
+                .request_final_core(cx, method, parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(result) => Ok(result),
+                fastmcp_protocol::CoreResult::Final(_) => {
+                    Err(HttpClientError::CoreResult(McpError::internal_error(
+                        format!("LegacyOnly facade received a final result for {method}"),
+                    )))
+                }
+            }
+        }
+
+        async fn request_legacy_empty(
+            &mut self,
+            cx: &Cx,
+            method: &'static str,
+            parameters: JsonValue,
+        ) -> Result<(), HttpClientError> {
+            let response = self.inner.request(cx, method, parameters).await?;
+            let fastmcp_client::ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) =
+                response
+            else {
+                return Err(Self::unexpected_result(method));
+            };
+            if let Some(error) = response.error {
+                return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                    error.message,
+                )));
+            }
+            let result = response
+                .result
+                .ok_or_else(|| Self::unexpected_result(method))?;
+            serde_json::from_value::<LegacyEmptyResult>(result)
+                .map(|_| ())
+                .map_err(|_| Self::unexpected_result(method))
+        }
+
+        /// Returns the sole policy admitted by this HTTP client.
+        #[must_use]
+        pub const fn protocol_policy(&self) -> ProtocolPolicy {
+            ProtocolPolicy::LegacyOnly
+        }
+
+        /// Returns the negotiated exact-2024 version after initialization.
+        #[must_use]
+        pub fn protocol_version(&self) -> Option<&str> {
+            self.inner.connection().protocol_version()
+        }
+
+        /// Returns the exact legacy server identity admitted at initialization.
+        #[must_use]
+        pub fn server_info(&self) -> &ServerInfo {
+            self.inner.server_info()
+        }
+
+        /// Returns the exact-2024 server capabilities admitted at initialization.
+        #[must_use]
+        pub fn server_capabilities(&self) -> &ServerCapabilities {
+            self.inner.legacy_server_capabilities().expect(
+                "LegacyOnly facade only retains HTTP clients admitted by exact legacy initialization",
+            )
+        }
+
+        /// Pops one exact-2024 server notification retained by the legacy SSE stream.
+        pub fn take_notification(&mut self) -> Option<JsonRpcRequest> {
+            self.inner.take_legacy_notification()
+        }
+
+        /// Pops and direction-checks one typed exact-2024 server notification
+        /// retained by the legacy SSE stream.
+        ///
+        /// This preserves the sealed HTTP client's fixed legacy transport
+        /// plan while avoiding a raw JSON-RPC envelope at the application
+        /// boundary. Use [`Self::take_notification`] only when inspecting a
+        /// malformed peer frame is specifically required.
+        pub fn take_server_notification(&mut self) -> McpResult<Option<ServerNotification>> {
+            self.inner
+                .take_legacy_notification()
+                .map(|notification| ServerNotification::decode(&notification))
+                .transpose()
+        }
+
+        /// Sends the capability-gated exact-2024 roots-change notification.
+        ///
+        /// The caller must have advertised `roots.listChanged` during legacy
+        /// initialization. The sealed client writes only this exact client
+        /// notification; it exposes no generic notification escape hatch.
+        pub async fn roots_list_changed(&mut self, cx: &Cx) -> Result<(), HttpClientError> {
+            if self.inner.selected_protocol_era()
+                != fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
+            {
+                return Err(HttpClientError::CoreResult(McpError::method_not_found(
+                    methods::NOTIFICATIONS_ROOTS_LIST_CHANGED,
+                )));
+            }
+            if !self
+                .inner
+                .client_capabilities()
+                .roots
+                .as_ref()
+                .is_some_and(|roots| roots.list_changed)
+            {
+                return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                    "MCP 2024-11-05 roots/list_changed requires advertised roots.listChanged",
+                )));
+            }
+            self.inner
+                .notify(cx, ClientNotification::RootsListChanged.method(), None)
+                .await
+        }
+
+        /// Sends exact-2024 `ping`.
+        pub async fn ping(&mut self, cx: &Cx) -> Result<(), HttpClientError> {
+            match self
+                .request_legacy_core(cx, methods::PING, serde_json::json!({}))
+                .await?
+            {
+                LegacyCoreResult::Ping(_) => Ok(()),
+                _ => Err(Self::unexpected_result(methods::PING)),
+            }
+        }
+
+        /// Lists one exact-2024 tools page.
+        pub async fn list_tools(
+            &mut self,
+            cx: &Cx,
+            params: ListToolsParams,
+        ) -> Result<ListToolsResult, HttpClientError> {
+            match self
+                .request_legacy_core(cx, methods::TOOLS_LIST, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::ToolsList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::TOOLS_LIST)),
+            }
+        }
+
+        /// Calls one exact-2024 tool.
+        pub async fn call_tool(
+            &mut self,
+            cx: &Cx,
+            params: CallToolParams,
+        ) -> Result<CallToolResult, HttpClientError> {
+            match self
+                .request_legacy_core(cx, methods::TOOLS_CALL, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::ToolsCall(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::TOOLS_CALL)),
+            }
+        }
+
+        /// Lists one exact-2024 resources page.
+        pub async fn list_resources(
+            &mut self,
+            cx: &Cx,
+            params: ListResourcesParams,
+        ) -> Result<ListResourcesResult, HttpClientError> {
+            match self
+                .request_legacy_core(cx, methods::RESOURCES_LIST, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::ResourcesList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::RESOURCES_LIST)),
+            }
+        }
+
+        /// Lists one exact-2024 resource-templates page.
+        pub async fn list_resource_templates(
+            &mut self,
+            cx: &Cx,
+            params: ListResourceTemplatesParams,
+        ) -> Result<ListResourceTemplatesResult, HttpClientError> {
+            match self
+                .request_legacy_core(
+                    cx,
+                    methods::RESOURCES_TEMPLATES_LIST,
+                    Self::encode_params(params)?,
+                )
+                .await?
+            {
+                LegacyCoreResult::ResourceTemplatesList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::RESOURCES_TEMPLATES_LIST)),
+            }
+        }
+
+        /// Reads one exact-2024 resource.
+        pub async fn read_resource(
+            &mut self,
+            cx: &Cx,
+            params: ReadResourceParams,
+        ) -> Result<ReadResourceResult, HttpClientError> {
+            match self
+                .request_legacy_core(cx, methods::RESOURCES_READ, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::ResourcesRead(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::RESOURCES_READ)),
+            }
+        }
+
+        /// Starts one exact-2024 resource subscription.
+        pub async fn subscribe_resource(
+            &mut self,
+            cx: &Cx,
+            params: SubscribeResourceParams,
+        ) -> Result<(), HttpClientError> {
+            self.request_legacy_empty(
+                cx,
+                methods::RESOURCES_SUBSCRIBE,
+                Self::encode_params(params)?,
+            )
+            .await
+        }
+
+        /// Ends one exact-2024 resource subscription.
+        pub async fn unsubscribe_resource(
+            &mut self,
+            cx: &Cx,
+            params: UnsubscribeResourceParams,
+        ) -> Result<(), HttpClientError> {
+            self.request_legacy_empty(
+                cx,
+                methods::RESOURCES_UNSUBSCRIBE,
+                Self::encode_params(params)?,
+            )
+            .await
+        }
+
+        /// Lists one exact-2024 prompts page.
+        pub async fn list_prompts(
+            &mut self,
+            cx: &Cx,
+            params: ListPromptsParams,
+        ) -> Result<ListPromptsResult, HttpClientError> {
+            match self
+                .request_legacy_core(cx, methods::PROMPTS_LIST, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::PromptsList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::PROMPTS_LIST)),
+            }
+        }
+
+        /// Gets one exact-2024 prompt.
+        pub async fn get_prompt(
+            &mut self,
+            cx: &Cx,
+            params: GetPromptParams,
+        ) -> Result<GetPromptResult, HttpClientError> {
+            match self
+                .request_legacy_core(cx, methods::PROMPTS_GET, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::PromptsGet(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::PROMPTS_GET)),
+            }
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument.
+        pub async fn complete(
+            &mut self,
+            cx: &Cx,
+            params: LegacyCompletionParams,
+        ) -> Result<LegacyCompletionResult, HttpClientError> {
+            match self
+                .request_legacy_core(
+                    cx,
+                    methods::COMPLETION_COMPLETE,
+                    Self::encode_params(params)?,
+                )
+                .await?
+            {
+                LegacyCoreResult::Completion(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::COMPLETION_COMPLETE)),
+            }
+        }
+
+        /// Sends exact-2024 `logging/setLevel`.
+        pub async fn set_log_level(
+            &mut self,
+            cx: &Cx,
+            level: LogLevel,
+        ) -> Result<(), HttpClientError> {
+            match self
+                .request_legacy_core(
+                    cx,
+                    methods::LOGGING_SET_LEVEL,
+                    Self::encode_params(SetLogLevelParams { level })?,
+                )
+                .await?
+            {
+                LegacyCoreResult::SetLogLevel(_) => Ok(()),
+                _ => Err(Self::unexpected_result(methods::LOGGING_SET_LEVEL)),
+            }
+        }
+
+        /// Sends the exact-2024 cancellation notification for one live request.
+        pub async fn cancel_request(
+            &mut self,
+            cx: &Cx,
+            request_id: RequestId,
+            reason: Option<String>,
+        ) -> Result<(), HttpClientError> {
+            self.inner
+                .notify(
+                    cx,
+                    methods::NOTIFICATIONS_CANCELLED,
+                    Some(Self::encode_params(CancelledParams { request_id, reason })?),
+                )
+                .await
         }
     }
 
@@ -2533,7 +3866,8 @@ pub mod legacy_2024 {
 // REL-QUAR-00 release-quarantine evidence surface
 pub mod release_quarantine;
 
-// Testing module
+// Testing helpers are opt-in and do not widen the production facade.
+#[cfg(any(feature = "testing", feature = "testing-lab"))]
 pub mod testing;
 
 /// Prelude module for convenient imports.
@@ -2646,10 +3980,13 @@ pub mod prelude {
         HttpError,
         HttpHandlerConfig,
         HttpMethod,
+        HttpNonquiescentShutdown,
         HttpRequest,
         HttpRequestHandler,
         HttpResponse,
         HttpServerConfig,
+        HttpServerShutdown,
+        HttpShutdownSettlement,
         HttpStatus,
         HttpSubscriptionListener,
         // Server
@@ -2724,6 +4061,8 @@ pub mod prelude {
         ProxyCatalogCacheHint,
         ProxyClient,
         ProxyFinalCatalog,
+        ProxyFinalTaskListener,
+        ProxyFinalTaskListenerEvent,
         ProxyProgressCallback,
         ProxyPromptCatalog,
         ProxyResourceCatalog,
@@ -2781,10 +4120,8 @@ pub mod prelude {
         ValidationError,
         ValidationResult,
         admit_final_schema,
-        auto,
         cancelled,
         err,
-        legacy_2024,
         modern,
         official_tasks_descriptor,
         official_tasks_empty_settings,
@@ -2823,6 +4160,8 @@ pub mod prelude {
         ToolHandler, Transport, TransportElicitationSender, TransportRootsProvider,
         TransportSamplingSender, block_on, decode_strict_jsonrpc_message,
     };
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub use crate::{auto, legacy_2024};
 }
 
 #[cfg(test)]
@@ -2852,7 +4191,6 @@ mod tests {
         let _: Option<super::serde_json::Value> = None;
 
         let _: Option<super::legacy_2024::InitializeParams> = None;
-        let _: Option<super::legacy_2024::TaskInfo> = None;
         let _: Option<super::modern::FinalCallToolParams> = None;
     }
 
@@ -2991,7 +4329,6 @@ mod tests {
         let _: Option<modern::HttpClient> = None;
         let _: Option<modern::MrtrExchangeRegistry> = None;
         let _: Option<legacy_2024::CallToolParams> = None;
-        let _: Option<legacy_2024::LegacySseHttpClient> = None;
         let _: Option<HttpClient> = None;
         let _: Option<HttpClientError> = None;
     }
@@ -3194,7 +4531,6 @@ mod tests {
         let _: Option<legacy_2024::InitializeParams> = None;
         let _: Option<legacy_2024::CallToolParams> = None;
         let _: Option<legacy_2024::Legacy2024Lifecycle> = None;
-        let _: Option<legacy_2024::LegacySseHttpClient> = None;
         let _: Option<legacy_2024::LegacySseMessagePost> = None;
     }
 
@@ -3317,7 +4653,6 @@ mod tests {
             super::DEFAULT_MAX_MRTR_ROUNDS
         );
         let _: Option<legacy_2024::Legacy2024LiveServerLifecycle<(), ()>> = None;
-        let _: Option<legacy_2024::LegacySseHttpClientError> = None;
     }
 
     #[test]
@@ -3397,8 +4732,15 @@ mod tests {
             modern::SubscriptionFilter,
         ) -> modern::McpResult<modern::SubscriptionListenCollector> =
             modern::Client::listen_subscriptions;
+        let _: for<'a> fn(
+            &'a mut modern::Client,
+        ) -> modern::McpResult<&'a modern::ServerDiscoverResult> = modern::Client::server_discovery;
         let _: fn(&mut modern::Client) -> Vec<modern::FinalProgressNotificationParams> =
             modern::Client::take_progress_notifications;
+        let _: fn(&mut modern::Client) -> Vec<modern::ServerNotification> =
+            modern::Client::take_server_notifications;
+        let _: fn(&mut modern::Client, modern::RequestId, Option<String>) -> modern::McpResult<()> =
+            modern::Client::cancel_request;
         let _: fn(
             &mut modern::Client,
             modern::FinalTaskId,
@@ -3424,7 +4766,7 @@ mod tests {
         async fn serve_modern_http(
             server: modern::Server,
             cx: &modern::Cx,
-        ) -> modern::McpResult<()> {
+        ) -> modern::McpResult<modern::HttpServerShutdown> {
             server.serve_http(cx, "127.0.0.1:0").await
         }
 
@@ -3523,7 +4865,7 @@ mod tests {
         );
         let legacy_builder = legacy_2024::client_builder();
         assert_eq!(
-            legacy_builder.selected_protocol_plan().policy(),
+            legacy_builder.protocol_policy(),
             legacy_2024::ProtocolPolicy::LegacyOnly
         );
         let _: fn(&str, &[&str]) -> McpResult<legacy_2024::Client> = legacy_2024::Client::stdio;
@@ -3540,10 +4882,7 @@ mod tests {
         use super::{ClientBuilder as RootClientBuilder, ProtocolPolicy, auto, legacy_2024};
 
         let legacy = legacy_2024::Client::builder();
-        assert_eq!(
-            legacy.selected_protocol_plan().policy(),
-            ProtocolPolicy::LegacyOnly
-        );
+        assert_eq!(legacy.protocol_policy(), ProtocolPolicy::LegacyOnly);
         let _: fn(&str, &[&str]) -> super::McpResult<legacy_2024::Client> =
             legacy_2024::Client::stdio;
         let _: fn(&str, &[&str], super::Cx) -> super::McpResult<legacy_2024::Client> =
@@ -3559,6 +4898,187 @@ mod tests {
             auto::client_builder().selected_protocol_plan().policy(),
             ProtocolPolicy::Auto
         );
+    }
+
+    #[test]
+    fn legacy_facade_client_and_http_wrappers_expose_only_exact_operations() {
+        use super::{Cx, McpResult, legacy_2024};
+
+        let _: fn(&mut legacy_2024::Client) -> McpResult<()> =
+            legacy_2024::Client::ensure_initialized;
+        let _: fn(&legacy_2024::Client) -> bool = legacy_2024::Client::is_initialized;
+        let _: fn(&mut legacy_2024::Client) -> McpResult<()> = legacy_2024::Client::ping;
+        let _: fn(
+            &mut legacy_2024::Client,
+            &str,
+            legacy_2024::JsonValue,
+        ) -> McpResult<legacy_2024::CallToolResult> = legacy_2024::Client::call_tool;
+        let _: fn(&mut legacy_2024::Client) -> McpResult<Vec<legacy_2024::Resource>> =
+            legacy_2024::Client::list_resources;
+        let _: fn(&mut legacy_2024::Client, &str) -> McpResult<legacy_2024::ReadResourceResult> =
+            legacy_2024::Client::read_resource;
+        let _: fn(&mut legacy_2024::Client) -> McpResult<Vec<legacy_2024::Prompt>> =
+            legacy_2024::Client::list_prompts;
+        let _: fn(
+            &mut legacy_2024::Client,
+            &str,
+            std::collections::HashMap<String, String>,
+        ) -> McpResult<legacy_2024::GetPromptResult> = legacy_2024::Client::get_prompt;
+        let _: fn(
+            &mut legacy_2024::Client,
+            legacy_2024::LegacyCompletionParams,
+        ) -> McpResult<legacy_2024::LegacyCompletionResult> = legacy_2024::Client::complete;
+        let _: fn(
+            &mut legacy_2024::Client,
+            legacy_2024::RequestId,
+            Option<String>,
+        ) -> McpResult<()> = legacy_2024::Client::cancel_request;
+        let _: fn(&mut legacy_2024::Client) -> McpResult<()> =
+            legacy_2024::Client::roots_list_changed;
+        let _: fn(&legacy_2024::JsonRpcRequest) -> McpResult<legacy_2024::ServerNotification> =
+            legacy_2024::Client::decode_server_notification;
+        let _: fn(&mut legacy_2024::Client) -> McpResult<()> = legacy_2024::Client::close;
+        let _: fn(legacy_2024::ClientBuilder, &str, &[&str]) -> McpResult<legacy_2024::Client> =
+            legacy_2024::ClientBuilder::connect_stdio;
+
+        fn legacy_builder_connects_http(builder: legacy_2024::ClientBuilder) {
+            let _: Result<legacy_2024::HttpClient, legacy_2024::HttpClientError> =
+                builder.connect_http();
+        }
+
+        fn legacy_builder_connects_http_with_cx(builder: legacy_2024::ClientBuilder, cx: &Cx) {
+            std::mem::drop(builder.connect_http_with_cx(cx));
+        }
+
+        fn legacy_http_requests(client: &mut legacy_2024::HttpClient, cx: &Cx) {
+            std::mem::drop(client.ping(cx));
+            std::mem::drop(client.list_tools(cx, legacy_2024::ListToolsParams::default()));
+            std::mem::drop(client.call_tool(
+                cx,
+                legacy_2024::CallToolParams {
+                    name: "tool".to_owned(),
+                    arguments: None,
+                    meta: None,
+                },
+            ));
+            std::mem::drop(client.list_resources(cx, legacy_2024::ListResourcesParams::default()));
+            std::mem::drop(
+                client.list_resource_templates(
+                    cx,
+                    legacy_2024::ListResourceTemplatesParams::default(),
+                ),
+            );
+            std::mem::drop(client.read_resource(
+                cx,
+                legacy_2024::ReadResourceParams {
+                    uri: "test://resource".to_owned(),
+                    meta: None,
+                },
+            ));
+            std::mem::drop(client.subscribe_resource(
+                cx,
+                legacy_2024::SubscribeResourceParams {
+                    uri: "test://resource".to_owned(),
+                },
+            ));
+            std::mem::drop(client.unsubscribe_resource(
+                cx,
+                legacy_2024::UnsubscribeResourceParams {
+                    uri: "test://resource".to_owned(),
+                },
+            ));
+            std::mem::drop(client.list_prompts(cx, legacy_2024::ListPromptsParams::default()));
+            std::mem::drop(client.get_prompt(
+                cx,
+                legacy_2024::GetPromptParams {
+                    name: "prompt".to_owned(),
+                    arguments: None,
+                    meta: None,
+                },
+            ));
+            std::mem::drop(client.complete(
+                cx,
+                legacy_2024::LegacyCompletionParams {
+                    reference: legacy_2024::LegacyCompletionReference::Prompt {
+                        name: "prompt".to_owned(),
+                    },
+                    argument: legacy_2024::LegacyCompletionArgument {
+                        name: "argument".to_owned(),
+                        value: "value".to_owned(),
+                    },
+                },
+            ));
+            std::mem::drop(client.set_log_level(cx, legacy_2024::LogLevel::Info));
+            std::mem::drop(client.cancel_request(cx, legacy_2024::RequestId::Number(1), None));
+            std::mem::drop(client.roots_list_changed(cx));
+        }
+
+        let _: fn(legacy_2024::ClientBuilder) = legacy_builder_connects_http;
+        let _: fn(legacy_2024::ClientBuilder, &Cx) = legacy_builder_connects_http_with_cx;
+        let _: fn(&mut legacy_2024::HttpClient, &Cx) = legacy_http_requests;
+        let _: fn(&legacy_2024::HttpClient) -> Option<&str> =
+            legacy_2024::HttpClient::protocol_version;
+        let _: fn(
+            &mut legacy_2024::HttpClient,
+        ) -> McpResult<Option<legacy_2024::ServerNotification>> =
+            legacy_2024::HttpClient::take_server_notification;
+        let _: fn(legacy_2024::ClientNotification) -> legacy_2024::JsonRpcRequest =
+            legacy_2024::ClientNotification::encode;
+        let _: fn(&legacy_2024::JsonRpcRequest) -> McpResult<legacy_2024::ServerNotification> =
+            legacy_2024::ServerNotification::decode;
+
+        async fn bind_legacy_http(
+            server: legacy_2024::Server,
+            cx: &Cx,
+        ) -> McpResult<legacy_2024::HttpServer> {
+            server.bind_http(cx, "127.0.0.1:0").await
+        }
+
+        async fn serve_legacy_http(
+            server: legacy_2024::Server,
+            cx: &Cx,
+        ) -> McpResult<legacy_2024::HttpServerShutdown> {
+            server.serve_http(cx, "127.0.0.1:0").await
+        }
+
+        let _ = bind_legacy_http;
+        let _ = serve_legacy_http;
+        let _: Option<legacy_2024::HttpServer> = None;
+    }
+
+    #[test]
+    fn legacy_facade_notifications_are_typed_and_direction_checked() {
+        use super::{JsonRpcRequest, JsonValue, legacy_2024};
+
+        let roots_changed = legacy_2024::ClientNotification::RootsListChanged.encode();
+        assert_eq!(
+            roots_changed.method,
+            legacy_2024::methods::NOTIFICATIONS_ROOTS_LIST_CHANGED
+        );
+        assert!(roots_changed.id.is_none());
+        assert!(roots_changed.params.is_none());
+
+        let message = JsonRpcRequest::notification(
+            legacy_2024::methods::NOTIFICATIONS_MESSAGE,
+            Some(serde_json::json!({
+                "level": "info",
+                "data": {"event": "catalog-refresh"},
+            })),
+        );
+        let notification = legacy_2024::ServerNotification::decode(&message)
+            .expect("exact server log notification must decode");
+        assert!(matches!(
+            notification,
+            legacy_2024::ServerNotification::Message(_)
+        ));
+
+        let wrong_direction = JsonRpcRequest::notification(
+            legacy_2024::methods::NOTIFICATIONS_ROOTS_LIST_CHANGED,
+            None,
+        );
+        assert!(legacy_2024::ServerNotification::decode(&wrong_direction).is_err());
+
+        let _: JsonValue = serde_json::json!({"checked": true});
     }
 
     #[test]
@@ -3665,8 +5185,6 @@ mod tests {
         let _: Option<legacy_2024::LegacyCreateMessageResult> = None;
         let _: Option<legacy_2024::LegacyListRootsParams> = None;
         let _: Option<legacy_2024::LegacyListRootsResult> = None;
-        let _: Option<legacy_2024::LegacyElicitRequestParams> = None;
-        let _: Option<legacy_2024::LegacyElicitResult> = None;
     }
 
     #[test]
@@ -3701,8 +5219,6 @@ mod tests {
         let _: Option<legacy_2024::LegacyCreateMessageResult> = None;
         let _: Option<legacy_2024::LegacyListRootsParams> = None;
         let _: Option<legacy_2024::LegacyListRootsResult> = None;
-        let _: Option<legacy_2024::LegacyElicitRequestParams> = None;
-        let _: Option<legacy_2024::LegacyElicitResult> = None;
 
         // The intentionally unqualified integration surface retains legacy
         // reverse-JSON-RPC machinery; `modern` compile-fail docs above lock
@@ -3785,13 +5301,8 @@ mod tests {
         let _ = requires_split_halves::<prelude::MemoryRecvHalf, prelude::MemorySendHalf>;
         let _: Option<transport::MemoryRecvHalf> = None;
         let _: Option<transport::MemorySendHalf> = None;
-        let _: Option<transport::websocket::WsFrame> = None;
         let _: Option<transport::sse::SseEvent> = None;
         let _: Option<&dyn Transport> = None;
-        let _ = requires_split_halves::<
-            transport::websocket::WsServerRecvHalf<Cursor<Vec<u8>>, Vec<u8>>,
-            transport::websocket::WsServerSendHalf<Vec<u8>>,
-        >;
     }
 
     #[test]
@@ -3865,13 +5376,17 @@ mod tests {
     }
 
     #[test]
-    fn modern_reexports_final_proxy_progress_and_binding_surface() {
+    fn facade_reexports_final_proxy_listener_and_modern_progress_binding_surface() {
         use super::{
-            FinalProgressCallback, ProxyUpstreamAdapter, ProxyUpstreamBinding,
-            ProxyUpstreamBindingRegistry, modern,
+            FinalProgressCallback, ProxyBackend, ProxyFinalTaskListener,
+            ProxyFinalTaskListenerEvent, ProxyUpstreamAdapter, ProxyUpstreamBinding,
+            ProxyUpstreamBindingRegistry, modern, prelude,
         };
 
         let _: Option<FinalProgressCallback<'_>> = None;
+        let _: Option<Box<dyn ProxyBackend>> = None;
+        let _: Option<Box<dyn ProxyFinalTaskListener>> = None;
+        let _: Option<ProxyFinalTaskListenerEvent> = None;
         let _: Option<ProxyUpstreamAdapter> = None;
         let _: Option<ProxyUpstreamBinding> = None;
         let _: Option<ProxyUpstreamBindingRegistry> = None;
@@ -3880,6 +5395,10 @@ mod tests {
         let _: Option<modern::ProxyUpstreamAdapter> = None;
         let _: Option<modern::ProxyUpstreamBinding> = None;
         let _: Option<modern::ProxyUpstreamBindingRegistry> = None;
+
+        let _: Option<Box<dyn prelude::ProxyBackend>> = None;
+        let _: Option<Box<dyn prelude::ProxyFinalTaskListener>> = None;
+        let _: Option<prelude::ProxyFinalTaskListenerEvent> = None;
     }
 
     #[test]
@@ -3901,7 +5420,8 @@ mod tests {
         use super::prelude::{
             BoundHttpServer, Client, DualEraHttpEndpoint, DualEraHttpEndpointConfig,
             DualEraHttpEndpointError, FinalCallToolResult, FinalGetPromptResult,
-            FinalReadResourceResult, FinalToolCallOutcome, JsonValue, McpResult, ModernHttpClient,
+            FinalReadResourceResult, FinalToolCallOutcome, HttpNonquiescentShutdown,
+            HttpServerShutdown, HttpShutdownSettlement, JsonValue, McpResult, ModernHttpClient,
             ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpSubscriptionListenCollector,
             ModernHttpSubscriptionListenError, ServerHttpEndpoint, ServerHttpEndpointResponse,
             ServerHttpSession, SseLimits, SubscriptionListenCollector, auto,
@@ -3929,6 +5449,9 @@ mod tests {
         let _: Option<ServerHttpSession> = None;
         let _: Option<ServerHttpEndpointResponse> = None;
         let _: Option<BoundHttpServer> = None;
+        let _: Option<HttpServerShutdown> = None;
+        let _: Option<HttpNonquiescentShutdown> = None;
+        let _: Option<HttpShutdownSettlement> = None;
         let _: Option<DualEraHttpEndpoint> = None;
         let _: Option<DualEraHttpEndpointConfig> = None;
         let _: Option<DualEraHttpEndpointError> = None;

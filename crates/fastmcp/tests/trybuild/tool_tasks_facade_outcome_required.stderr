@@ -1,0 +1,5 @@
+error: #[tool(tasks)] requires a canonical FinalToolOutcome return type: fastmcp_rust::FinalToolOutcome, Result<fastmcp_rust::FinalToolOutcome, E>, or McpResult<fastmcp_rust::FinalToolOutcome>
+ --> tests/trybuild/tool_tasks_facade_outcome_required.rs:6:4
+  |
+6 | fn renamed_facade_final_task_tool()
+  |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

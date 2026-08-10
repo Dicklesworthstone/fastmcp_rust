@@ -7,9 +7,9 @@ use fastmcp_rust::{
     SubscriptionFilter, auto, legacy_2024, modern, prompt, resource, tool,
 };
 
-#[tool(tasks)]
+#[tool]
 fn downstream_final_task_tool() -> fastmcp_rust::FinalToolOutcome {
-    unreachable!("the downstream macro probe only compiles the task opt-in")
+    unreachable!("the downstream macro probe compiles a final tool outcome without Tasks opt-in")
 }
 
 #[resource(uri = "facade://mrtr-resumable-resource")]
@@ -50,10 +50,18 @@ fn facade_mrtr_resumable_prompt(
     )
 }
 
-fn assert_task_opt_in_macro_surface() {
-    assert!(fastmcp_rust::ToolHandler::declares_final_tasks(
+fn assert_task_feature_isolated_macro_surface() {
+    assert!(!fastmcp_rust::ToolHandler::declares_final_tasks(
         &DownstreamFinalTaskTool
     ));
+}
+
+fn assert_curated_client_namespace_surface() {
+    let _: Option<fastmcp_rust::client::ClientBuilder> = None;
+    let _: Option<fastmcp_rust::client::ClientProtocolPlan> = None;
+    let _: Option<fastmcp_rust::client::SseLimits> = None;
+    let _: Option<fastmcp_rust::client::http_executor::ModernHttpClient> = None;
+    let _: Option<fastmcp_rust::client::mcp_config::McpConfig> = None;
 }
 
 fn assert_resumable_resource_and_prompt_macro_surface() {
@@ -302,12 +310,6 @@ fn assert_legacy_reverse_callback_cancellation_export() {
     let _: Option<fastmcp_rust::ReverseRequestCancellation> = None;
     let _: legacy_2024::ProgressMarker =
         legacy_2024::ProgressMarker::Number(legacy_2024::JsonInteger::from(7_i64));
-    let _: legacy_2024::ElicitContentValue =
-        legacy_2024::ElicitContentValue::Int(legacy_2024::JsonInteger::from(9_i64));
-    let _: for<'a, 'b> fn(
-        &'a legacy_2024::ElicitResult,
-        &'b str,
-    ) -> Option<&'a legacy_2024::JsonInteger> = legacy_2024::ElicitResult::get_int;
 }
 
 fn assert_reverse_request_exports<T: fastmcp_rust::Transport>(
@@ -322,16 +324,9 @@ fn assert_reverse_request_exports<T: fastmcp_rust::Transport>(
     executor.respond_to_reverse_request(cx, request, fastmcp_rust::JsonValue::Null)
 }
 
-fn assert_legacy_reverse_request_exports<T: fastmcp_rust::Transport>(
-    executor: &legacy_2024::RequestExecutor<T>,
-    cx: &legacy_2024::Cx,
-    request: &legacy_2024::ReverseRequest,
-) -> legacy_2024::McpResult<()> {
-    let _: &legacy_2024::JsonRpcRequest = request.request();
-    let _: &legacy_2024::RequestId = request.request_id();
-    let _: &legacy_2024::ReverseRequestCancellation = request.cancellation();
-    let _: Vec<legacy_2024::ReverseRequest> = executor.take_reverse_requests();
-    executor.respond_to_reverse_request(cx, request, legacy_2024::JsonValue::Null)
+fn assert_legacy_http_request_commit_receipt(request: &fastmcp_rust::LegacyHttpRequest) {
+    let receipt: &fastmcp_rust::LegacyHttpRequestCommit = request.commit_receipt();
+    let _: &fastmcp_rust::RequestId = receipt.request_id();
 }
 
 fn assert_auto_reverse_request_exports<T: auto::Transport>(
@@ -371,19 +366,6 @@ fn assert_auto_stdio_executor_exports(
     let _: auto::ProtocolEra = executor.selected_protocol_era();
     let _: &auto::RequestId = execution.request_id();
     let _: auto::JsonRpcResponse = client.wait_multiplexed_request(cx, &mut execution)?;
-    Ok(())
-}
-
-fn assert_legacy_stdio_executor_exports(
-    client: &mut legacy_2024::Client,
-    cx: &legacy_2024::Cx,
-) -> legacy_2024::McpResult<()> {
-    let executor: legacy_2024::StdioRequestExecutor = client.multiplexed_stdio_executor()?;
-    let mut execution: legacy_2024::StdioRequestExecution =
-        client.start_multiplexed_request(cx, "ping", None)?;
-    let _: legacy_2024::ProtocolEra = executor.selected_protocol_era();
-    let _: &legacy_2024::RequestId = execution.request_id();
-    let _: legacy_2024::JsonRpcResponse = client.wait_multiplexed_request(cx, &mut execution)?;
     Ok(())
 }
 
@@ -539,7 +521,10 @@ async fn bind_modern_http(
     server.bind_http(cx, "127.0.0.1:0").await
 }
 
-async fn serve_modern_http(server: modern::Server, cx: &modern::Cx) -> modern::McpResult<()> {
+async fn serve_modern_http(
+    server: modern::Server,
+    cx: &modern::Cx,
+) -> modern::McpResult<modern::HttpServerShutdown> {
     server.serve_http(cx, "127.0.0.1:0").await
 }
 
@@ -762,7 +747,7 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     );
     let legacy_builder = legacy_2024::client_builder();
     assert_eq!(
-        legacy_builder.selected_protocol_plan().policy(),
+        legacy_builder.protocol_policy(),
         legacy_2024::ProtocolPolicy::LegacyOnly
     );
     let _: fn(&str, &[&str]) -> fastmcp_rust::McpResult<legacy_2024::Client> =
@@ -979,21 +964,6 @@ mod prelude_final_typed_and_http_reachability {
             auto::ProtocolPolicy::Auto
         );
     }
-}
-
-fn assert_legacy_sse_method_signatures(
-    cx: &legacy_2024::Cx,
-    plan: legacy_2024::ClientProtocolPlan,
-    client: &mut legacy_2024::LegacySseHttpClient,
-) {
-    let message = legacy_2024::JsonRpcMessage::Request(legacy_2024::JsonRpcRequest::new(
-        "initialize",
-        None,
-        legacy_2024::RequestId::Number(1),
-    ));
-    let _connect = legacy_2024::LegacySseHttpClient::connect(cx, plan);
-    let _send = client.send(cx, &message);
-    let _next_message = client.next_message(cx);
 }
 
 fn assert_dual_era_completion_exports() {
@@ -1299,9 +1269,9 @@ mod prelude_directional_notification_reachability {
 }
 
 fn main() {
-    assert_task_opt_in_macro_surface();
+    assert_curated_client_namespace_surface();
+    assert_task_feature_isolated_macro_surface();
     assert_resumable_resource_and_prompt_macro_surface();
-    let _ = assert_legacy_sse_method_signatures;
     assert_completion_handler_reachability();
     assert_modern_mrtr_resource_and_prompt_handler_exports();
     assert_modern_server_builder_forwarders();
@@ -1314,11 +1284,10 @@ fn main() {
     assert_final_resource_read_cache_hint_provenance();
     assert_legacy_reverse_callback_cancellation_export();
     let _ = assert_reverse_request_exports::<fastmcp_rust::StreamableHttpTransport>;
-    let _ = assert_legacy_reverse_request_exports::<fastmcp_rust::StreamableHttpTransport>;
+    let _ = assert_legacy_http_request_commit_receipt;
     let _ = assert_auto_reverse_request_exports::<fastmcp_rust::StreamableHttpTransport>;
     let _ = assert_root_stdio_executor_exports;
     let _ = assert_auto_stdio_executor_exports;
-    let _ = assert_legacy_stdio_executor_exports;
     let _ = assert_modern_stdio_mrtr_wrapper_exports;
     let _ = assert_final_tool_schema_authority_exports::<DownstreamFinalTaskTool>;
     assert_raw_http_session_metadata_exports();

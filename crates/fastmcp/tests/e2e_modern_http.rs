@@ -22,9 +22,10 @@ use asupersync::CancelKind;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 use fastmcp_rust::{
-    CanonicalHttpUrl, ClientHttpResponse, ClientProtocolPlan, Cx, JsonRpcMessage, JsonRpcRequest,
-    McpContext, McpError, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
-    ModernHttpResponseStream, ProtocolEra, ProtocolPolicy, Server, SseLimits, auto,
+    CanonicalHttpUrl, ClientHttpResponse, ClientProtocolPlan, Cx, HttpServerShutdown,
+    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpResult, Middleware,
+    MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, ProtocolEra,
+    ProtocolPolicy, Server, SseLimits, auto,
 };
 use serde_json::json;
 
@@ -203,9 +204,19 @@ impl HttpServerFixture {
                                 );
                                 return Err("HTTP E2E startup receiver went away".to_owned());
                             }
-                            bound.serve(&cx).await.map_err(|error| {
-                                format!("facade HTTP server stopped unexpectedly: {error}")
-                            })
+                            bound
+                                .serve(&cx)
+                                .await
+                                .map_err(|error| {
+                                    format!("facade HTTP server stopped unexpectedly: {error}")
+                                })
+                                .and_then(|shutdown| match shutdown {
+                                    HttpServerShutdown::Quiescent => Ok(()),
+                                    HttpServerShutdown::Nonquiescent(mut shutdown) => Err(format!(
+                                        "facade HTTP server stopped nonquiescently: {:?}",
+                                        shutdown.poll_settlement()
+                                    )),
+                                })
                         })
                         .await
                         {

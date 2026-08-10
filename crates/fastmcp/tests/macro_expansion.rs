@@ -21,21 +21,26 @@
 #![allow(clippy::enum_variant_names)]
 #![allow(dead_code)]
 
-use fastmcp_rust::asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
+use asupersync::conformance::{ConformanceTarget, LabRuntimeTarget};
+use asupersync::{LabConfig, LabRuntime};
 use fastmcp_rust::serde_json::json;
+#[cfg(feature = "tasks")]
 use fastmcp_rust::{
-    ApplicationTaskSupervisor, CacheScope, CacheTtl, CompleteResult, Content, ContentBlock, Cx,
-    EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult,
-    FinalPromptMessage, FinalReadResourceResult, FinalTaskRuntime, FinalTaskRuntimeConfig,
-    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    FinalToolOutcome, Implementation, InboundRequestContext, InboundRequestTransport,
-    InputRequiredResult, JsonRpcRequest, JsonSchema, LabConfig, LabRuntime,
-    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MODERN_PROTOCOL_VERSION, McpContext, McpError,
-    McpOutcome, McpResult, Outcome, PromptHandler, PromptMessage, ResourceContent, ResourceHandler,
-    ResultMeta, Role, Server, ToolHandler, prompt, resource, tool,
+    ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+};
+use fastmcp_rust::{
+    CacheScope, CacheTtl, CompleteResult, Content, ContentBlock, Cx, EmbeddedResourceContents,
+    FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage,
+    FinalReadResourceResult, FinalTaskWorkDescriptor, FinalToolOutcome, Implementation,
+    InboundRequestContext, InboundRequestTransport, InputRequiredResult, JsonRpcRequest,
+    JsonSchema, MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, Outcome,
+    PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role, Server,
+    ToolHandler, prompt, resource, tool,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+#[cfg(feature = "tasks")]
 use std::task::Poll;
 
 fn test_ctx() -> McpContext {
@@ -91,7 +96,8 @@ mod facade_only_macro_compile_proofs {
         format!("hello, {name}")
     }
 
-    #[tool(tasks)]
+    #[cfg_attr(feature = "tasks", tool(tasks))]
+    #[cfg_attr(not(feature = "tasks"), tool)]
     fn facade_only_final_task_tool() -> fastmcp_rust::FinalToolOutcome {
         fastmcp_rust::FinalToolOutcome::Complete(CompleteResult::new(
             FinalCallToolResult {
@@ -123,7 +129,10 @@ mod facade_only_macro_compile_proofs {
             FacadeOnlyLegacyTool.definition().name,
             "facade_only_legacy_tool"
         );
-        assert!(FacadeOnlyFinalTaskTool.declares_final_tasks());
+        assert_eq!(
+            FacadeOnlyFinalTaskTool.declares_final_tasks(),
+            cfg!(feature = "tasks")
+        );
         assert_eq!(
             FacadeOnlyResourceResource.definition().uri,
             "facade://macro-proof"
@@ -1003,8 +1012,10 @@ fn facade_final_inbound() -> InboundRequestContext {
     InboundRequestContext::new(Cx::for_testing(), 64, InboundRequestTransport::Memory)
 }
 
+#[cfg(feature = "tasks")]
 struct NoopFinalTaskSupervisor;
 
+#[cfg(feature = "tasks")]
 impl ApplicationTaskSupervisor for NoopFinalTaskSupervisor {
     fn resume<'a>(
         &'a self,
@@ -1015,7 +1026,8 @@ impl ApplicationTaskSupervisor for NoopFinalTaskSupervisor {
     }
 }
 
-#[tool(tasks)]
+#[cfg_attr(feature = "tasks", tool(tasks))]
+#[cfg_attr(not(feature = "tasks"), tool)]
 fn final_tool_outcome_direct(mode: String) -> fastmcp_rust::FinalToolOutcome {
     final_tool_outcome(&mode)
 }
@@ -1047,9 +1059,10 @@ async fn final_tool_outcome_async_input_required(
 #[test]
 fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
     let ctx = test_ctx();
-    assert!(
+    assert_eq!(
         FinalToolOutcomeDirect.declares_final_tasks(),
-        "the explicit tasks opt-in declares final Tasks support"
+        cfg!(feature = "tasks"),
+        "the explicit Tasks opt-in is only emitted when its macro feature is enabled"
     );
     assert!(
         !FinalToolOutcomeResult.declares_final_tasks(),
@@ -1125,6 +1138,7 @@ fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
     assert_eq!(result["requestState"], "retry-state");
 }
 
+#[cfg(feature = "tasks")]
 #[test]
 fn facade_final_tool_outcome_creates_task_through_modern_wire() {
     let runtime = FinalTaskRuntime::in_memory(
@@ -1160,8 +1174,9 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
     assert_eq!(result["statusMessage"], "queued");
 }
 
+#[cfg(feature = "tasks")]
 #[test]
-fn facade_final_tool_outcome_rejects_task_without_declared_capability() {
+fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
     let runtime = FinalTaskRuntime::in_memory(
         FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
         std::sync::Arc::new(|_| {}),
@@ -1204,6 +1219,30 @@ fn facade_final_tool_outcome_rejects_task_without_declared_capability() {
             },
         }))
     );
+}
+
+#[cfg(not(feature = "tasks"))]
+#[test]
+fn facade_final_tool_outcome_rejects_undeclared_task_before_router_admission() {
+    let ctx = test_ctx();
+    let outcome = run_outcome(async move {
+        FinalToolOutcomeDirect
+            .call_final_outcome_async(&ctx, json!({"mode": "create-task"}))
+            .await
+    });
+
+    match outcome {
+        Outcome::Err(error) => {
+            assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "tool returned CreateTask without declaring final Tasks capability"
+            );
+        }
+        Outcome::Ok(_) | Outcome::Cancelled(_) | Outcome::Panicked(_) => {
+            panic!("undeclared CreateTask must be rejected before router admission");
+        }
+    }
 }
 
 #[test]

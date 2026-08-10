@@ -2,12 +2,13 @@
 //!
 //! This module provides utilities for writing comprehensive tests without mocks:
 //!
-//! - [`TestContext`]: Wrapper around a runtime-provided `Cx` with helper methods
 //! - [`TestServer`]: Builder for creating test servers with real handlers
-//! - [`TestClient`]: Client for in-process testing with MemoryTransport
 //! - Assertion helpers for validating JSON-RPC and MCP compliance
 //! - Timing utilities for performance measurements
 //! - [`fixtures`]: Test data generators for tools, resources, prompts, and messages
+//!
+//! With the `testing-lab` feature, [`lab`] also exposes deterministic-runtime
+//! helpers such as `TestContext`, `TestClient`, and `LabRuntime`.
 //!
 //! # Example
 //!
@@ -16,31 +17,27 @@
 //!
 //! #[test]
 //! fn test_tool_call() {
-//!     let ctx = TestContext::new();
-//!
 //!     // Create a test server with real handlers
 //!     let (router, client_transport, server_transport) = TestServer::builder()
 //!         .build();
 //!
 //!     // Create a test client
-//!     let mut client = TestClient::new(client_transport);
-//!     client.initialize().unwrap();
-//!
-//!     // Call tool and verify
-//!     let result = client.call_tool("my_tool", json!({"arg": "value"}));
-//!     assert!(result.is_ok());
 //! }
 //! ```
 //!
 //! # Design Philosophy
 //!
 //! - **No mocks**: All tests use real implementations via MemoryTransport
-//! - **Deterministic**: Uses asupersync Lab runtime for reproducibility
+//! - **Production-faithful by default**: ordinary helpers require only public
+//!   production APIs
+//! - **Lab isolation**: deterministic runtime helpers require `testing-lab`
 //! - **Comprehensive logging**: Built-in trace support for debugging
 //! - **Resource cleanup**: Automatic cleanup of spawned tasks
 
 mod assertions;
+#[cfg(feature = "testing-lab")]
 mod client;
+#[cfg(feature = "testing-lab")]
 mod context;
 pub mod fixtures;
 mod server;
@@ -48,11 +45,20 @@ mod timing;
 mod trace;
 
 pub use assertions::*;
-pub use client::*;
-pub use context::*;
 pub use server::*;
 pub use timing::*;
 pub use trace::*;
+
+/// Deterministic test helpers, available only with `testing-lab`.
+///
+/// This is the sole facade path that exposes lab runtime configuration and
+/// helpers that obtain a runtime-installed context on the caller's behalf.
+#[cfg(feature = "testing-lab")]
+pub mod lab {
+    pub use super::client::*;
+    pub use super::context::*;
+    pub use crate::{LabConfig, LabRuntime};
+}
 
 /// Prelude for convenient imports in tests.
 ///
@@ -63,10 +69,6 @@ pub mod prelude {
     pub use super::{
         // Timing
         Stopwatch,
-        // Client
-        TestClient,
-        // Context
-        TestContext,
         // Server
         TestServer,
         TestServerBuilder,
@@ -93,6 +95,9 @@ pub mod prelude {
         is_trace_enabled,
         measure_duration,
     };
+
+    #[cfg(feature = "testing-lab")]
+    pub use super::lab::{LabConfig, LabRuntime, TestClient, TestContext};
 
     // Re-export commonly used types
     pub use crate::{

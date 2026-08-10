@@ -27,8 +27,8 @@ use fastmcp_rust::{
     CoreResultDiscriminatorPolicy, Cx, DecodedResult, FinalCallToolResult, FinalCoreResult,
     FinalTask, FinalTaskInputRequests, FinalTaskInputResponses, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-    FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome, Implementation,
-    InputRequiredResult, McpContext, McpError, McpErrorCode, McpOutcome, McpResult,
+    FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome, HttpServerShutdown,
+    Implementation, InputRequiredResult, McpContext, McpError, McpErrorCode, McpOutcome, McpResult,
     MrtrCompletedInputs, Outcome, PromptMessage, ProtocolPolicy, RequestId, ResourceContent,
     ResourceTemplate, ResultMeta, ResultPeerEra, Role, Server, SseLimits, ToolHandler, auto,
     decode_peer_result, prompt, resource, tool,
@@ -1006,7 +1006,15 @@ impl FinalTasksHttpFixture {
                                         }
                                     }
                                     match serving.as_mut().poll(task_context) {
-                                        Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                                        Poll::Ready(Ok(HttpServerShutdown::Quiescent)) => {
+                                            Poll::Ready(Ok(()))
+                                        }
+                                        Poll::Ready(Ok(HttpServerShutdown::Nonquiescent(
+                                            mut shutdown,
+                                        ))) => Poll::Ready(Err(format!(
+                                            "final Tasks E2E server stopped nonquiescently: {:?}",
+                                            shutdown.poll_settlement()
+                                        ))),
                                         Poll::Ready(Err(error)) => Poll::Ready(Err(format!(
                                             "final Tasks E2E server stopped: {error}"
                                         ))),

@@ -13,6 +13,56 @@ keywords = ["mcp", "json-rpc", "async", "ai", "protocol"]
 categories = ["network-programming", "api-bindings", "development-tools"]
 exclude = ["tests/fnd_01_dependency_evidence.rs.*"]
 
+[features]
+default = ["legacy-2024-11-05"]
+
+# Canonical nonsecurity facade graph (plan 25.10).  The facade owns these
+# forwarding equations; component crates own the implementation behind them.
+legacy-2024-11-05 = [
+    "fastmcp-protocol/legacy-2024-11-05",
+    "fastmcp-transport/legacy-2024-11-05",
+    "fastmcp-server/legacy-2024-11-05",
+    "fastmcp-client/legacy-2024-11-05",
+    "fastmcp-console/legacy-2024-11-05",
+]
+tasks = [
+    "fastmcp-protocol/tasks",
+    "fastmcp-server/tasks",
+    "fastmcp-client/tasks",
+    "fastmcp-derive/tasks",
+    "fastmcp-console/tasks",
+]
+apps = [
+    "fastmcp-protocol/apps",
+    "fastmcp-server/apps",
+    "fastmcp-client/apps",
+    "fastmcp-console/apps",
+]
+proxy = ["fastmcp-server/proxy", "fastmcp-console/proxy"]
+proxy-legacy = [
+    "proxy",
+    "legacy-2024-11-05",
+    "fastmcp-server/proxy-legacy",
+    "fastmcp-console/proxy-legacy",
+]
+proxy-tasks = [
+    "proxy",
+    "tasks",
+    "fastmcp-server/proxy-tasks",
+    "fastmcp-console/proxy-tasks",
+]
+websocket-experimental = [
+    "fastmcp-transport/websocket-experimental",
+    "fastmcp-server/websocket-experimental",
+    "fastmcp-client/websocket-experimental",
+    "fastmcp-console/websocket-experimental",
+]
+
+# `testing` remains production-faithful.  Deterministic runtime internals are
+# deliberately available only through the opt-in lab profile.
+testing = []
+testing-lab = ["testing", "asupersync/test-internals"]
+
 [dependencies]
 fastmcp-core.workspace = true
 fastmcp-protocol.workspace = true
@@ -20,12 +70,19 @@ fastmcp-transport.workspace = true
 fastmcp-server.workspace = true
 fastmcp-client.workspace = true
 fastmcp-derive.workspace = true
+# Console rendering is activated only by a facade profile that forwards to it.
+# Keeping the dependency optional preserves the core ModernOnly graph when
+# consumers select `--no-default-features`.
+fastmcp-console = { workspace = true, optional = true }
 asupersync.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 trybuild.workspace = true
+# Internal facade tests may exercise deterministic lab behavior without making
+# it part of the facade's default public dependency graph.
+asupersync = { workspace = true, features = ["test-internals"] }
 # FND-01 FACADE-*-DEV evidence surface (exact root pins; no JWT/Redis)
 flate2 = { workspace = true }
 sha2 = { workspace = true }

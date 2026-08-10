@@ -1,0 +1,5 @@
+error[E0432]: unresolved import `fastmcp_rust::legacy_2024::WebSocketClient`
+ --> tests/trybuild/websocket/legacy_wrapper_escape.rs:1:5
+  |
+1 | use fastmcp_rust::legacy_2024::WebSocketClient;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `WebSocketClient` in `legacy_2024`

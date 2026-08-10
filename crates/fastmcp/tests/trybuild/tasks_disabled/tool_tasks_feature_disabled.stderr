@@ -1,0 +1,17 @@
+error: #[tool(tasks)] requires the fastmcp-derive `tasks` feature; enable fastmcp-rust's `tasks` feature or fastmcp-derive's `tasks` feature
+ --> tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs:3:8
+  |
+3 | #[tool(tasks)]
+  |        ^^^^^
+
+error: #[tool(tasks)] requires the fastmcp-derive `tasks` feature; enable fastmcp-rust's `tasks` feature or fastmcp-derive's `tasks` feature
+ --> tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs:8:8
+  |
+8 | #[tool(tasks = true)]
+  |        ^^^^^
+
+error: #[tool(tasks)] requires the fastmcp-derive `tasks` feature; enable fastmcp-rust's `tasks` feature or fastmcp-derive's `tasks` feature
+  --> tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs:13:8
+   |
+13 | #[tool(tasks())]
+   |        ^^^^^
