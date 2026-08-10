@@ -988,6 +988,7 @@ fn body_mcp_name(request: &JsonRpcRequest) -> Option<&str> {
     let parameter_name = match request.method.as_str() {
         "tools/call" | "prompts/get" => "name",
         "resources/read" => "uri",
+        "tasks/get" | "tasks/update" | "tasks/cancel" => "taskId",
         _ => return None,
     };
     request
@@ -8242,6 +8243,71 @@ X-Checksum: abc123\r\n\
         let config =
             DualEraHttpEndpointConfig::new("/legacy/sse", "/legacy/messages", "http://legacy.test");
         DualEraHttpEndpoint::new(handler, config).expect("dual-era endpoint configuration is valid")
+    }
+
+    fn task_lifecycle_http_request(method: &str, mcp_name: Option<&str>) -> HttpRequest {
+        let mut parameters = serde_json::json!({
+            "taskId": "task-73",
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                }
+            }
+        });
+        if method == "tasks/update" {
+            parameters
+                .as_object_mut()
+                .expect("task parameters remain an object")
+                .insert("inputResponses".to_owned(), serde_json::json!({}));
+        }
+        let json_rpc = JsonRpcRequest::new(method, Some(parameters), 73_i64);
+        let mut request = HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "application/json")
+            .with_header("MCP-Protocol-Version", "2026-07-28")
+            .with_header("Mcp-Method", method);
+        if let Some(mcp_name) = mcp_name {
+            request = request.with_header("Mcp-Name", mcp_name);
+        }
+        request.with_body(serde_json::to_vec(&json_rpc).expect("task request serializes"))
+    }
+
+    fn task_lifecycle_handler() -> HttpRequestHandler {
+        HttpRequestHandler::with_config(HttpHandlerConfig {
+            base_path: "/mcp".to_owned(),
+            ..HttpHandlerConfig::default()
+        })
+    }
+
+    #[test]
+    fn modern_transport_admits_task_lifecycle_task_id_mcp_name_mirrors() {
+        let handler = task_lifecycle_handler();
+        for method in ["tasks/get", "tasks/update", "tasks/cancel"] {
+            let admitted = handler
+                .admit_modern_request(&task_lifecycle_http_request(method, Some("task-73")))
+                .expect("matching Tasks taskId/Mcp-Name must admit before dispatch");
+            assert_eq!(admitted.request().method, method);
+        }
+    }
+
+    #[test]
+    fn modern_transport_rejects_task_lifecycle_mismatched_mcp_name_before_dispatch() {
+        let error = task_lifecycle_handler()
+            .admit_modern_request(&task_lifecycle_http_request(
+                "tasks/get",
+                Some("task-other"),
+            ))
+            .expect_err("changing only Mcp-Name must reject before Tasks dispatch");
+        assert!(matches!(error, HttpError::ProtocolAdmission(_)));
+    }
+
+    #[test]
+    fn modern_transport_rejects_task_lifecycle_missing_mcp_name_before_dispatch() {
+        let error = task_lifecycle_handler()
+            .admit_modern_request(&task_lifecycle_http_request("tasks/get", None))
+            .expect_err("removing only Mcp-Name must reject before Tasks dispatch");
+        assert!(matches!(error, HttpError::ProtocolAdmission(_)));
     }
 
     #[test]

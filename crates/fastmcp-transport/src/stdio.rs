@@ -63,8 +63,8 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use crate::async_io::{AsyncLineReader, AsyncStdout, BoundedLineReadError};
 use crate::{
-    Codec, CodecError, SendPermit, Transport, TransportError, TransportRecvHalf, TransportSendHalf,
-    TwoPhaseTransport,
+    ClientTransportRecvHalf, Codec, CodecError, ReceivedTransportFrame, SendPermit, Transport,
+    TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
 };
 
 #[cfg(unix)]
@@ -872,6 +872,23 @@ impl<R: Read> TransportRecvHalf for StdioRecvHalf<R> {
     fn close(&mut self) -> Result<(), TransportError> {
         self.terminal.store(true, Ordering::Release);
         self.transport.close()
+    }
+}
+
+impl<R: Read + Send> ClientTransportRecvHalf for StdioRecvHalf<R> {
+    fn recv_with_source(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        self.recv(cx)?;
+        let source = self
+            .last_received_frame()
+            .ok_or_else(|| {
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stdio receive completed without an admitted source frame",
+                ))
+            })?
+            .to_vec()
+            .into_boxed_slice();
+        ReceivedTransportFrame::admit(source)
     }
 }
 
@@ -2409,6 +2426,25 @@ mod tests {
             panic!("expected split output response");
         };
         assert_eq!(response.id, Some(fastmcp_protocol::RequestId::Number(1)));
+    }
+
+    #[test]
+    fn stdio_split_client_ingress_preserves_exact_final_result_source() {
+        let source = br#"{"jsonrpc":"2.0","id":41,"result":{"resultType":"complete","opaque":{"decimal":1.20e+4}}}"#;
+        let mut input = source.to_vec();
+        input.push(b'\n');
+        let transport = StdioTransport::new(Cursor::new(input), Vec::new());
+        let (mut recv_half, _send_half) = transport.into_split();
+
+        let received = recv_half
+            .recv_with_source(&Cx::for_testing())
+            .expect("split stdio ingress retains its admitted frame");
+
+        assert_eq!(received.source(), source);
+        let JsonRpcMessage::Response(response) = received.message() else {
+            panic!("final source must accompany the typed response");
+        };
+        assert_eq!(response.id, Some(fastmcp_protocol::RequestId::Number(41)));
     }
 
     #[cfg(unix)]

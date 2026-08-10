@@ -59,7 +59,10 @@ use std::time::Duration;
 use asupersync::{Cx, channel::mpsc};
 use fastmcp_protocol::JsonRpcMessage;
 
-use crate::{Codec, Transport, TransportError, TransportRecvHalf, TransportSendHalf};
+use crate::{
+    ClientTransportRecvHalf, Codec, MAX_CLIENT_TRANSPORT_SOURCE_BYTES, ReceivedTransportFrame,
+    Transport, TransportError, TransportRecvHalf, TransportSendHalf,
+};
 
 /// Default timeout for recv operations when polling for cancellation.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -76,7 +79,7 @@ fn normalize_poll_interval(interval: Duration) -> Duration {
 }
 
 fn send_memory_message(
-    sender: &mut Option<mpsc::Sender<JsonRpcMessage>>,
+    sender: &mut Option<mpsc::Sender<MemoryQueuedMessage>>,
     codec: &Codec,
     closed: &mut bool,
     cx: &Cx,
@@ -92,18 +95,28 @@ fn send_memory_message(
     }
 
     // Count-bounded channels are not byte-bounded. Serialize through the
-    // codec's bounded sink before cloning so directly constructed typed values
-    // cannot retain an arbitrarily large payload in the queue.
-    let validated_frame = match message {
+    // codec's bounded sink, then enforce the fixed client-ingress ceiling
+    // before cloning so directly constructed typed values cannot retain an
+    // arbitrarily large payload in the queue.
+    let encoded_frame = match message {
         JsonRpcMessage::Request(request) => codec.encode_request(request)?,
         JsonRpcMessage::Response(response) => codec.encode_response(response)?,
     };
-    drop(validated_frame);
+    let source = encoded_frame
+        .strip_suffix(b"\n")
+        .expect("codec encodings always retain their NDJSON delimiter");
+    if source.len() > MAX_CLIENT_TRANSPORT_SOURCE_BYTES {
+        return Err(TransportError::Codec(crate::CodecError::MessageTooLarge(
+            source.len(),
+        )));
+    }
+    let source = source.to_vec().into_boxed_slice();
+    let queued = MemoryQueuedMessage { source };
 
     match sender
         .as_ref()
         .ok_or(TransportError::Closed)?
-        .try_send(message.clone())
+        .try_send(queued)
     {
         Ok(()) => Ok(()),
         Err(mpsc::SendError::Disconnected(_)) => {
@@ -123,11 +136,22 @@ fn send_memory_message(
 }
 
 fn recv_memory_message(
-    receiver: &mut mpsc::Receiver<JsonRpcMessage>,
+    receiver: &mut mpsc::Receiver<MemoryQueuedMessage>,
     closed: &mut bool,
     poll_interval: Duration,
     cx: &Cx,
 ) -> Result<JsonRpcMessage, TransportError> {
+    recv_memory_source(receiver, closed, poll_interval, cx)
+        .and_then(|source| ReceivedTransportFrame::admit(source))
+        .map(ReceivedTransportFrame::into_message)
+}
+
+fn recv_memory_source(
+    receiver: &mut mpsc::Receiver<MemoryQueuedMessage>,
+    closed: &mut bool,
+    poll_interval: Duration,
+    cx: &Cx,
+) -> Result<Box<[u8]>, TransportError> {
     if *closed {
         return Err(TransportError::Closed);
     }
@@ -141,15 +165,7 @@ fn recv_memory_message(
     loop {
         let recv_result = receiver.try_recv();
         match recv_result {
-            Ok(message) => {
-                message.validate().map_err(|_| {
-                    TransportError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid typed JSON-RPC message",
-                    ))
-                })?;
-                return Ok(message);
-            }
+            Ok(frame) => return Ok(frame.source),
             Err(mpsc::RecvError::Empty) => {
                 // Check for cancellation between polls.
                 if cx.is_cancel_requested() {
@@ -166,7 +182,10 @@ fn recv_memory_message(
     }
 }
 
-fn close_memory_receiver(receiver: &mut Option<mpsc::Receiver<JsonRpcMessage>>, closed: &mut bool) {
+fn close_memory_receiver(
+    receiver: &mut Option<mpsc::Receiver<MemoryQueuedMessage>>,
+    closed: &mut bool,
+) {
     *closed = true;
     let Some(mut receiver) = receiver.take() else {
         return;
@@ -177,6 +196,16 @@ fn close_memory_receiver(receiver: &mut Option<mpsc::Receiver<JsonRpcMessage>>, 
     // receivers that want to finish draining. A transport close is a hard
     // terminal boundary, so release those potentially large messages now.
     while receiver.try_recv().is_ok() {}
+}
+
+/// One bounded memory queue entry with the source committed by its sender.
+///
+/// Memory endpoints do not accept raw wire input, so this source is the
+/// canonical bounded encoding that the sender committed from its typed value.
+/// The receiver derives its typed message from this one source document, so a
+/// later serialization cannot fabricate a distinct final result source.
+struct MemoryQueuedMessage {
+    source: Box<[u8]>,
 }
 
 /// In-memory transport using channels for message passing.
@@ -198,9 +227,9 @@ fn close_memory_receiver(receiver: &mut Option<mpsc::Receiver<JsonRpcMessage>>, 
 /// cancellation mechanism.
 pub struct MemoryTransport {
     /// Channel for sending messages to the peer.
-    sender: Option<mpsc::Sender<JsonRpcMessage>>,
+    sender: Option<mpsc::Sender<MemoryQueuedMessage>>,
     /// Channel for receiving messages from the peer.
-    receiver: mpsc::Receiver<JsonRpcMessage>,
+    receiver: mpsc::Receiver<MemoryQueuedMessage>,
     /// Codec for typed validation and serialized-size admission.
     codec: Codec,
     /// Whether the transport has been closed.
@@ -223,7 +252,10 @@ impl MemoryTransport {
     ///
     /// This is an internal constructor. Use [`create_memory_transport_pair`]
     /// to create a connected pair of transports.
-    fn new(sender: mpsc::Sender<JsonRpcMessage>, receiver: mpsc::Receiver<JsonRpcMessage>) -> Self {
+    fn new(
+        sender: mpsc::Sender<MemoryQueuedMessage>,
+        receiver: mpsc::Receiver<MemoryQueuedMessage>,
+    ) -> Self {
         Self {
             sender: Some(sender),
             receiver,
@@ -308,7 +340,7 @@ impl Transport for MemoryTransport {
 /// closing it releases the underlying receiver, so the peer's matching send
 /// half observes a terminal channel on its next send attempt.
 pub struct MemoryRecvHalf {
-    receiver: Option<mpsc::Receiver<JsonRpcMessage>>,
+    receiver: Option<mpsc::Receiver<MemoryQueuedMessage>>,
     closed: bool,
     poll_interval: Duration,
 }
@@ -346,13 +378,25 @@ impl TransportRecvHalf for MemoryRecvHalf {
     }
 }
 
+impl ClientTransportRecvHalf for MemoryRecvHalf {
+    fn recv_with_source(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        if self.is_closed() {
+            return Err(TransportError::Closed);
+        }
+
+        let receiver = self.receiver.as_mut().ok_or(TransportError::Closed)?;
+        let source = recv_memory_source(receiver, &mut self.closed, self.poll_interval, cx)?;
+        ReceivedTransportFrame::admit(source)
+    }
+}
+
 /// Independently owned bounded memory egress.
 ///
 /// This send half is symmetric for client and server endpoints. It checks the
 /// caller context before the nonblocking channel commit, retaining the exact
 /// cancellation contract of [`MemoryTransport::send`].
 pub struct MemorySendHalf {
-    sender: Option<mpsc::Sender<JsonRpcMessage>>,
+    sender: Option<mpsc::Sender<MemoryQueuedMessage>>,
     codec: Codec,
     closed: bool,
 }
@@ -570,6 +614,81 @@ mod tests {
     }
 
     #[test]
+    fn memory_send_enforces_fixed_client_ingress_source_boundary_before_queueing() {
+        let cx = Cx::for_testing();
+        let template = JsonRpcRequest::new(
+            "ingress/ceiling",
+            Some(serde_json::json!({"payload": ""})),
+            41_i64,
+        );
+        let template_size = serde_json::to_vec(&template)
+            .expect("template request serializes")
+            .len();
+        let exact_payload_size = MAX_CLIENT_TRANSPORT_SOURCE_BYTES - template_size;
+        let exact = JsonRpcRequest::new(
+            "ingress/ceiling",
+            Some(serde_json::json!({"payload": "x".repeat(exact_payload_size)})),
+            41_i64,
+        );
+        assert_eq!(
+            serde_json::to_vec(&exact)
+                .expect("exact-limit request serializes")
+                .len(),
+            MAX_CLIENT_TRANSPORT_SOURCE_BYTES
+        );
+
+        let (mut client, mut server) = MemoryTransportBuilder::new()
+            .max_message_size(MAX_CLIENT_TRANSPORT_SOURCE_BYTES + 1)
+            .build();
+        client
+            .send_request(&cx, &exact)
+            .expect("the fixed ingress limit admits exactly N source bytes");
+        let JsonRpcMessage::Request(received) = server
+            .recv(&cx)
+            .expect("the peer receives the exact-limit queued request")
+        else {
+            panic!("the exact-limit source must derive a request");
+        };
+        assert_eq!(received.id, Some(RequestId::Number(41)));
+        drop(received);
+        drop(exact);
+
+        let one_past = JsonRpcRequest::new(
+            "ingress/ceiling",
+            Some(serde_json::json!({"payload": "x".repeat(exact_payload_size + 1)})),
+            41_i64,
+        );
+        assert_eq!(
+            serde_json::to_vec(&one_past)
+                .expect("N-plus-one request serializes")
+                .len(),
+            MAX_CLIENT_TRANSPORT_SOURCE_BYTES + 1
+        );
+        let error = client
+            .send_request(&cx, &one_past)
+            .expect_err("N-plus-one source bytes must reject before queueing");
+        assert!(matches!(
+            error,
+            TransportError::Codec(crate::CodecError::MessageTooLarge(size))
+                if size == MAX_CLIENT_TRANSPORT_SOURCE_BYTES + 1
+        ));
+        assert_eq!(server.receiver.len(), 0);
+        assert!(!client.is_closed());
+
+        client
+            .send_request(&cx, &JsonRpcRequest::new("after-limit", None, 42_i64))
+            .expect("the rejected oversized source leaves the sender usable");
+        let JsonRpcMessage::Request(received) = server
+            .recv(&cx)
+            .expect("the peer remains usable after the rejected source")
+        else {
+            panic!("post-rejection peer traffic must retain request direction");
+        };
+        assert_eq!(received.method, "after-limit");
+        assert_eq!(received.id, Some(RequestId::Number(42)));
+    }
+
+    #[test]
     fn memory_send_rejects_invalid_typed_message_before_queueing() {
         let (mut client, server) = MemoryTransportBuilder::new().max_message_size(1024).build();
         let cx = Cx::for_testing();
@@ -682,6 +801,41 @@ mod tests {
             panic!("expected response");
         };
         assert_eq!(received.id, Some(RequestId::Number(2)));
+    }
+
+    #[test]
+    fn split_halves_preserve_committed_frame_source() {
+        let (client, server) = create_memory_transport_pair();
+        let (mut client_recv, _client_send) = client.into_split();
+        let (_server_recv, mut server_send) = server.into_split();
+        let cx = Cx::for_testing();
+        let response = JsonRpcResponse::success(
+            RequestId::Number(7),
+            serde_json::json!({
+                "resultType": "complete",
+                "opaque": {"origin": "memory"}
+            }),
+        );
+        let expected = Codec::new()
+            .encode_response(&response)
+            .expect("response fits the default memory codec limit");
+        let expected = expected
+            .strip_suffix(b"\n")
+            .expect("codec source includes an NDJSON delimiter");
+
+        server_send
+            .send(&cx, &JsonRpcMessage::Response(response.clone()))
+            .expect("memory sender commits one bounded source document");
+        let received = client_recv
+            .recv_with_source(&cx)
+            .expect("memory receive retains the committed source");
+
+        assert_eq!(received.source(), expected);
+        assert_eq!(
+            received.message(),
+            &JsonRpcMessage::Response(response),
+            "typed message is derived from the one committed source document"
+        );
     }
 
     #[test]

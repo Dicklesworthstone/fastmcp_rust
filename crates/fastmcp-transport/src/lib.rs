@@ -62,6 +62,7 @@ pub use http::{
     ModernHttpSseCollectorError, StreamableHttpRequestCancellation,
     StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
 };
+pub use memory::{MemoryRecvHalf, MemorySendHalf};
 pub use sse::{ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits, ModernSseParseError};
 pub use stdio::{AsyncStdioTransport, StdioRecvHalf, StdioSendHalf, StdioTransport};
 /// Public WebSocket ownership halves for caller-owned full-duplex lifecycles.
@@ -76,6 +77,14 @@ pub use websocket::{
 
 use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
+
+/// Absolute source-retention ceiling for one client-ingress JSON-RPC document.
+///
+/// Every [`ClientTransportRecvHalf`] implementation, including third-party
+/// implementations, must create a [`ReceivedTransportFrame`] through
+/// [`ReceivedTransportFrame::admit`]. This fixed ceiling prevents a transport
+/// from passing an arbitrarily large raw-result sidecar to client decoding.
+pub const MAX_CLIENT_TRANSPORT_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Transport trait for context-aware message passing.
 ///
@@ -162,6 +171,73 @@ pub trait TransportRecvHalf {
 
     /// Closes the receive half.
     fn close(&mut self) -> Result<(), TransportError>;
+}
+
+/// One decoded inbound message paired with its exact transport source.
+///
+/// The source excludes transport framing such as a terminating NDJSON newline,
+/// but otherwise retains the complete JSON document exactly as admitted. Client
+/// result decoders use it to preserve JSON-number lexemes and member order that
+/// the typed [`JsonRpcMessage`] representation cannot reconstruct.
+#[derive(Clone, Debug)]
+pub struct ReceivedTransportFrame {
+    message: JsonRpcMessage,
+    source: Box<[u8]>,
+}
+
+impl ReceivedTransportFrame {
+    /// Strictly admits one bounded source document and derives its typed message.
+    ///
+    /// This is intentionally the only constructor: callers cannot pair a
+    /// typed message with a different raw source whose member order or number
+    /// lexemes would later be treated as peer input.
+    pub fn admit(source: impl Into<Box<[u8]>>) -> Result<Self, TransportError> {
+        let source = source.into();
+        if source.len() > MAX_CLIENT_TRANSPORT_SOURCE_BYTES {
+            return Err(TransportError::Codec(CodecError::MessageTooLarge(
+                source.len(),
+            )));
+        }
+
+        let mut codec = Codec::new();
+        codec.set_max_message_size(MAX_CLIENT_TRANSPORT_SOURCE_BYTES);
+        let message = codec.decode_complete_message(&source)?;
+        Ok(Self { message, source })
+    }
+
+    /// Returns the typed JSON-RPC message.
+    #[must_use]
+    pub const fn message(&self) -> &JsonRpcMessage {
+        &self.message
+    }
+
+    /// Returns the exact admitted JSON document without transport framing.
+    #[must_use]
+    pub fn source(&self) -> &[u8] {
+        &self.source
+    }
+
+    /// Splits the typed message from its owned admitted source.
+    #[must_use]
+    pub fn into_parts(self) -> (JsonRpcMessage, Box<[u8]>) {
+        (self.message, self.source)
+    }
+
+    /// Returns the typed message and discards its retained source.
+    #[must_use]
+    pub fn into_message(self) -> JsonRpcMessage {
+        self.message
+    }
+}
+
+/// Client ingress that preserves the source needed by negotiated result decoding.
+///
+/// This extends the ordinary typed receive half without selecting a protocol
+/// policy or performing any negotiation. A caller must construct it only after
+/// its connection factory has chosen one immutable peer era.
+pub trait ClientTransportRecvHalf: TransportRecvHalf + Send {
+    /// Receives one typed message with its exact bounded admitted JSON source.
+    fn recv_with_source(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError>;
 }
 
 /// Independently owned send half of a full-duplex MCP transport.
@@ -419,8 +495,8 @@ pub trait TwoPhaseTransport: Transport {
 mod tests {
     use super::{
         Codec, CodecError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
-        HttpResponseRepresentation, SendPermit, StreamableHttpTransport, Transport, TransportError,
-        TwoPhaseTransport,
+        HttpResponseRepresentation, MAX_CLIENT_TRANSPORT_SOURCE_BYTES, ReceivedTransportFrame,
+        SendPermit, StreamableHttpTransport, Transport, TransportError, TwoPhaseTransport,
     };
     use asupersync::Cx;
     use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
@@ -541,6 +617,32 @@ mod tests {
             "receive deadline should not be closed",
         )?;
         Ok(())
+    }
+
+    #[test]
+    fn received_transport_frame_derives_message_from_its_exact_bounded_source() {
+        let source = br#"{"jsonrpc":"2.0","id":73,"result":{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}}"#;
+        let frame = ReceivedTransportFrame::admit(source.to_vec().into_boxed_slice())
+            .expect("one bounded response source is strictly admitted");
+
+        assert_eq!(frame.source(), source);
+        let JsonRpcMessage::Response(response) = frame.message() else {
+            panic!("the admitted response source must derive a response message");
+        };
+        assert_eq!(response.id, Some(RequestId::Number(73)));
+    }
+
+    #[test]
+    fn received_transport_frame_rejects_source_above_the_fixed_hard_ceiling() {
+        let source = vec![b' '; MAX_CLIENT_TRANSPORT_SOURCE_BYTES + 1].into_boxed_slice();
+        let error = ReceivedTransportFrame::admit(source)
+            .expect_err("third-party ingress cannot retain a source beyond the hard ceiling");
+
+        assert!(matches!(
+            error,
+            TransportError::Codec(CodecError::MessageTooLarge(size))
+                if size == MAX_CLIENT_TRANSPORT_SOURCE_BYTES + 1
+        ));
     }
 
     #[test]

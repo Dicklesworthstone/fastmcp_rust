@@ -45,7 +45,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use asupersync::Cx;
 use fastmcp_core::{WebSocketMask, draw_websocket_mask};
 
-use crate::{Codec, Transport, TransportError, TransportRecvHalf, TransportSendHalf};
+use crate::{
+    ClientTransportRecvHalf, Codec, ReceivedTransportFrame, Transport, TransportError,
+    TransportRecvHalf, TransportSendHalf,
+};
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
 fn websocket_checkpoint(cx: &Cx) -> Result<(), TransportError> {
@@ -1365,6 +1368,33 @@ where
     R: Read,
     F: WsFrameSink,
 {
+    recv_split_message_with_source(
+        reader,
+        writer,
+        codec,
+        fragment_buffer,
+        fragmented_text,
+        max_message_size,
+        closed,
+        cx,
+    )
+    .map(ReceivedTransportFrame::into_message)
+}
+
+fn recv_split_message_with_source<R, F>(
+    reader: &mut WsReader<R>,
+    writer: &SharedWsWriter<F>,
+    codec: &Codec,
+    fragment_buffer: &mut Vec<u8>,
+    fragmented_text: &mut bool,
+    max_message_size: usize,
+    closed: &mut bool,
+    cx: &Cx,
+) -> Result<ReceivedTransportFrame, TransportError>
+where
+    R: Read,
+    F: WsFrameSink,
+{
     loop {
         if *closed || writer.is_closed() {
             return Err(TransportError::Closed);
@@ -1388,7 +1418,8 @@ where
                     ));
                 }
                 if frame.fin {
-                    if let Err(error) = std::str::from_utf8(&frame.payload) {
+                    let source = frame.payload.into_boxed_slice();
+                    if let Err(error) = std::str::from_utf8(&source) {
                         *closed = true;
                         fragment_buffer.clear();
                         *fragmented_text = false;
@@ -1397,9 +1428,10 @@ where
                             "Invalid UTF-8 in WebSocket text message: {error}"
                         )));
                     }
-                    return codec
-                        .decode_complete_message(&frame.payload)
-                        .map_err(Into::into);
+                    codec
+                        .decode_complete_message(&source)
+                        .map_err(TransportError::Codec)?;
+                    return ReceivedTransportFrame::admit(source);
                 }
 
                 *fragmented_text = true;
@@ -1429,9 +1461,9 @@ where
                 }
                 fragment_buffer.extend(frame.payload);
                 if frame.fin {
-                    let payload = std::mem::take(fragment_buffer);
+                    let source = std::mem::take(fragment_buffer).into_boxed_slice();
                     *fragmented_text = false;
-                    if let Err(error) = std::str::from_utf8(&payload) {
+                    if let Err(error) = std::str::from_utf8(&source) {
                         *closed = true;
                         fragment_buffer.clear();
                         *fragmented_text = false;
@@ -1440,7 +1472,10 @@ where
                             "Invalid UTF-8 in WebSocket text message: {error}"
                         )));
                     }
-                    return codec.decode_complete_message(&payload).map_err(Into::into);
+                    codec
+                        .decode_complete_message(&source)
+                        .map_err(TransportError::Codec)?;
+                    return ReceivedTransportFrame::admit(source);
                 }
             }
             WsFrameType::Binary => {
@@ -1550,6 +1585,21 @@ impl<R: Read, W: Write> TransportRecvHalf for WsClientRecvHalf<R, W> {
         self.fragment_buffer.clear();
         self.fragmented_text = false;
         self.writer.close_with_frame(WsFrame::close())
+    }
+}
+
+impl<R: Read + Send, W: Write + Send> ClientTransportRecvHalf for WsClientRecvHalf<R, W> {
+    fn recv_with_source(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+        recv_split_message_with_source(
+            &mut self.reader,
+            &self.writer,
+            &self.codec,
+            &mut self.fragment_buffer,
+            &mut self.fragmented_text,
+            self.max_message_size,
+            &mut self.closed,
+            cx,
+        )
     }
 }
 
@@ -2181,6 +2231,26 @@ mod tests {
             panic!("expected request");
         };
         assert_eq!(request.method, "empty-first");
+    }
+
+    #[test]
+    fn websocket_client_split_ingress_preserves_fragmented_final_result_source() {
+        let source = br#"{"jsonrpc":"2.0","id":52,"result":{"resultType":"complete","opaque":{"decimal":1.20e+4}}}"#;
+        let split = source.len() / 2;
+        let mut input = build_unmasked_frame(0x01, false, &source[..split]);
+        input.extend(build_unmasked_frame(0x00, true, &source[split..]));
+        let (mut recv_half, _send_half) =
+            WsClientTransport::new(Cursor::new(input), Vec::new()).into_split();
+
+        let received = recv_half
+            .recv_with_source(&Cx::for_testing())
+            .expect("fragmented client ingress retains one complete source document");
+
+        assert_eq!(received.source(), source);
+        let JsonRpcMessage::Response(response) = received.message() else {
+            panic!("final source must accompany the typed response");
+        };
+        assert_eq!(response.id, Some(RequestId::Number(52)));
     }
 
     #[test]
