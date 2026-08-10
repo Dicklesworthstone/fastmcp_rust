@@ -5147,8 +5147,8 @@ mod tests {
 
     #[test]
     fn mcp_context_roots_provider_returns_client_roots() {
-        let ctx = McpContext::new(Cx::for_testing(), 1)
-            .with_roots_provider(Arc::new(FixedRootsProvider));
+        let ctx =
+            McpContext::new(Cx::for_testing(), 1).with_roots_provider(Arc::new(FixedRootsProvider));
 
         assert!(ctx.can_list_roots());
         let roots = crate::block_on(ctx.list_roots()).expect("configured roots provider succeeds");
