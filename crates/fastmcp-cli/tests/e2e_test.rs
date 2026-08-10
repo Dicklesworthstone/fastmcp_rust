@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, ExitStatus, Stdio};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,14 @@ const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const PROCESS_CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
+const FORBIDDEN_CONTACT_WORK_CAP: usize = 16;
+const FORBIDDEN_CONTACT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const FORBIDDEN_CONTACT_FINAL_QUIET_INTERVAL: Duration = Duration::from_millis(20);
+const FORBIDDEN_CONTACT_FINAL_DRAIN_DEADLINE: Duration = Duration::from_millis(250);
+const FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE: Duration = Duration::from_millis(500);
+const LOOPBACK_FIXTURE_DEADLINE: Duration = Duration::from_secs(2);
+const LOOPBACK_FIXTURE_ACK_DEADLINE: Duration = Duration::from_millis(2500);
+const LOOPBACK_FIXTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STATIC_MCP_SERVER_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/static_mcp_server.sh"
@@ -965,14 +973,67 @@ fn run_cli(args: &[&str]) -> Output {
     })
 }
 
-fn read_h1_json_request(stream: &mut TcpStream) -> (String, serde_json::Value) {
+fn fixture_wait(deadline: Instant, context: &str) -> Duration {
+    let wait = deadline.saturating_duration_since(Instant::now());
+    assert!(
+        !wait.is_zero(),
+        "loopback fixture deadline elapsed while {context}"
+    );
+    wait.min(LOOPBACK_FIXTURE_POLL_INTERVAL)
+}
+
+fn accept_h1_fixture_connection(
+    listener: &TcpListener,
+    deadline: Instant,
+    context: &str,
+) -> TcpStream {
+    listener
+        .set_nonblocking(true)
+        .expect("make loopback fixture listener nonblocking");
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => return stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::park_timeout(fixture_wait(deadline, context));
+            }
+            Err(error) => panic!("{context}: accept loopback HTTP connection: {error}"),
+        }
+    }
+}
+
+fn read_h1_fixture_chunk(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    context: &str,
+) -> usize {
+    loop {
+        stream
+            .set_read_timeout(Some(fixture_wait(deadline, context)))
+            .expect("set loopback fixture read timeout");
+        match stream.read(buffer) {
+            Ok(read) => return read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => panic!("{context}: read loopback HTTP request: {error}"),
+        }
+    }
+}
+
+fn configure_h1_fixture_write(stream: &TcpStream, deadline: Instant, context: &str) {
     stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set HTTP fixture read timeout");
+        .set_write_timeout(Some(fixture_wait(deadline, context)))
+        .expect("set loopback fixture write timeout");
+}
+
+fn read_h1_json_request(stream: &mut TcpStream, deadline: Instant) -> (String, serde_json::Value) {
     let mut wire = Vec::new();
     let mut buffer = [0_u8; 4_096];
     let head_end = loop {
-        let read = stream.read(&mut buffer).expect("read HTTP fixture request");
+        let read = read_h1_fixture_chunk(stream, &mut buffer, deadline, "read HTTP request head");
         assert!(read > 0, "HTTP client closed before a complete request");
         wire.extend_from_slice(&buffer[..read]);
         if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
@@ -995,9 +1056,7 @@ fn read_h1_json_request(stream: &mut TcpStream) -> (String, serde_json::Value) {
         })
         .expect("HTTP fixture request has a content length");
     while wire.len() < head_end + content_length {
-        let read = stream
-            .read(&mut buffer)
-            .expect("read HTTP fixture request body");
+        let read = read_h1_fixture_chunk(stream, &mut buffer, deadline, "read HTTP request body");
         assert!(
             read > 0,
             "HTTP client closed before its complete request body"
@@ -1009,10 +1068,25 @@ fn read_h1_json_request(stream: &mut TcpStream) -> (String, serde_json::Value) {
     (head, body)
 }
 
-fn write_h1_json_response(stream: &mut TcpStream, body: &str) {
+fn write_h1_json_response(stream: &mut TcpStream, deadline: Instant, body: &str) {
+    write_h1_json_response_with_status(stream, deadline, 200, body);
+}
+
+fn write_h1_json_response_with_status(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    status: u16,
+    body: &str,
+) {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        _ => "Test Response",
+    };
+    configure_h1_fixture_write(stream, deadline, "write HTTP JSON response");
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .expect("write HTTP fixture response head");
@@ -1020,6 +1094,530 @@ fn write_h1_json_response(stream: &mut TcpStream, body: &str) {
         .write_all(body.as_bytes())
         .expect("write HTTP fixture response body");
     stream.flush().expect("flush HTTP fixture response");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn read_h1_request_head(stream: &mut TcpStream, deadline: Instant) -> String {
+    let mut wire = Vec::new();
+    let mut buffer = [0_u8; 4_096];
+    while !wire.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = read_h1_fixture_chunk(stream, &mut buffer, deadline, "read HTTP request head");
+        assert!(read > 0, "HTTP client closed before its request head");
+        wire.extend_from_slice(&buffer[..read]);
+    }
+    std::str::from_utf8(&wire)
+        .expect("HTTP fixture request head is UTF-8")
+        .to_owned()
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn write_h1_empty_response(stream: &mut TcpStream, deadline: Instant, status: u16) {
+    let reason = match status {
+        202 => "Accepted",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Test Response",
+    };
+    configure_h1_fixture_write(stream, deadline, "write empty HTTP response");
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write empty HTTP fixture response head");
+    stream.flush().expect("flush empty HTTP fixture response");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn begin_h1_chunked_sse(stream: &mut TcpStream, deadline: Instant) {
+    configure_h1_fixture_write(stream, deadline, "write chunked SSE response");
+    stream
+        .write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+        )
+        .expect("write chunked legacy SSE response head");
+    stream
+        .flush()
+        .expect("flush chunked legacy SSE response head");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn write_h1_chunked_sse_event(stream: &mut TcpStream, deadline: Instant, event: &str) {
+    configure_h1_fixture_write(stream, deadline, "write chunked SSE event");
+    write!(stream, "{:X}\r\n{event}\r\n", event.len()).expect("write chunked legacy SSE event");
+    stream.flush().expect("flush chunked legacy SSE event");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn serve_legacy_http_inspect_bundle(
+    listener: TcpListener,
+    deadline: Instant,
+    modern_probe_status: Option<u16>,
+    advertised_message_target: String,
+) {
+    if let Some(status) = modern_probe_status {
+        let mut modern =
+            accept_h1_fixture_connection(&listener, deadline, "accept modern HTTP probe");
+        let (head, request) = read_h1_json_request(&mut modern, deadline);
+        assert!(
+            head.starts_with("POST /mcp HTTP/1.1\r\n"),
+            "Auto must contact the configured modern POST endpoint first"
+        );
+        assert_eq!(request["id"], 1);
+        assert_eq!(request["method"], "server/discover");
+        write_h1_empty_response(&mut modern, deadline, status);
+    }
+
+    let mut sse = accept_h1_fixture_connection(&listener, deadline, "accept legacy SSE GET");
+    let sse_head = read_h1_request_head(&mut sse, deadline);
+    assert!(
+        sse_head.starts_with("GET /legacy-sse HTTP/1.1\r\n"),
+        "the first legacy contact must use the configured SSE endpoint"
+    );
+    assert!(
+        !sse_head.contains("MCP-Protocol-Version:"),
+        "the exact legacy SSE GET must not carry final headers"
+    );
+    begin_h1_chunked_sse(&mut sse, deadline);
+    write_h1_chunked_sse_event(
+        &mut sse,
+        deadline,
+        &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+    );
+
+    for (expected_method, response) in [
+        (
+            "initialize",
+            Some(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"legacy-h1-inspect","version":"1.0.0"}}}"#,
+            ),
+        ),
+        ("notifications/initialized", None),
+        (
+            "tools/list",
+            Some(
+                r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"legacy-h1-tool","description":"legacy H1 catalog","inputSchema":{"type":"object"}}]}}"#,
+            ),
+        ),
+    ] {
+        let mut message = accept_h1_fixture_connection(
+            &listener,
+            deadline,
+            "accept configured legacy message POST",
+        );
+        let (head, request) = read_h1_json_request(&mut message, deadline);
+        assert!(
+            head.starts_with("POST /legacy-message HTTP/1.1\r\n"),
+            "legacy request must retain the configured message POST endpoint"
+        );
+        assert_eq!(request["method"], expected_method);
+        assert!(
+            request
+                .get("params")
+                .and_then(serde_json::Value::as_object)
+                .is_none_or(|params| !params.contains_key("_meta")),
+            "legacy wire must not carry final metadata"
+        );
+        write_h1_empty_response(&mut message, deadline, 202);
+        if let Some(response) = response {
+            write_h1_chunked_sse_event(
+                &mut sse,
+                deadline,
+                &format!("event: message\ndata: {response}\n\n"),
+            );
+        }
+    }
+}
+
+struct LoopbackFixture {
+    completion: mpsc::Receiver<Result<(), String>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for LoopbackFixture {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        // Fixture I/O has a finite deadline. Even an assertion failure in the
+        // owning test must retain and join the worker rather than detach it.
+        let _ = self.completion.recv_timeout(LOOPBACK_FIXTURE_ACK_DEADLINE);
+        let _ = worker.join();
+    }
+}
+
+fn spawn_loopback_fixture<F>(context: &'static str, fixture: F) -> LoopbackFixture
+where
+    F: FnOnce(Instant) + Send + 'static,
+{
+    spawn_loopback_fixture_with_deadline(context, LOOPBACK_FIXTURE_DEADLINE, fixture)
+}
+
+fn spawn_loopback_fixture_with_deadline<F>(
+    context: &'static str,
+    timeout: Duration,
+    fixture: F,
+) -> LoopbackFixture
+where
+    F: FnOnce(Instant) + Send + 'static,
+{
+    let (completed, completion) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let deadline = Instant::now() + timeout;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture(deadline)))
+            .map_err(|_| format!("{context} panicked"));
+        // This acknowledgement is the worker's final action. Once the
+        // bounded receipt arrives, joining cannot wait on fixture work.
+        let _ = completed.send(result);
+    });
+    LoopbackFixture {
+        completion,
+        worker: Some(worker),
+    }
+}
+
+fn wait_for_loopback_fixture(mut fixture: LoopbackFixture, context: &str) {
+    let completion = fixture
+        .completion
+        .recv_timeout(LOOPBACK_FIXTURE_ACK_DEADLINE)
+        .unwrap_or_else(|error| panic!("{context} did not acknowledge completion: {error}"));
+    fixture
+        .worker
+        .take()
+        .expect("loopback fixture worker must be retained until joined")
+        .join()
+        .unwrap_or_else(|_| panic!("{context} worker must join after completion acknowledgement"));
+    completion.unwrap_or_else(|error| panic!("{context} failed: {error}"));
+}
+
+#[test]
+fn loopback_fixture_timeout_acknowledges_before_settled_join() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback timeout fixture");
+    let started = Instant::now();
+    let mut fixture = spawn_loopback_fixture_with_deadline(
+        "loopback timeout fixture",
+        Duration::from_millis(30),
+        move |deadline| {
+            let _ =
+                accept_h1_fixture_connection(&listener, deadline, "accept absent loopback client");
+        },
+    );
+
+    let completion = fixture
+        .completion
+        .recv_timeout(Duration::from_millis(250))
+        .expect("timed-out loopback fixture must acknowledge completion");
+    fixture
+        .worker
+        .take()
+        .expect("timed-out loopback fixture worker must be retained until joined")
+        .join()
+        .expect("timed-out loopback fixture must join after acknowledgement");
+    assert!(
+        completion.is_err(),
+        "absent loopback client must fail the fixture"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "absent loopback client must fail within the fixture deadline"
+    );
+}
+
+#[test]
+fn loopback_fixture_drop_joins_an_abandoned_bounded_worker() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let worker_completed = Arc::clone(&completed);
+    let fixture = spawn_loopback_fixture_with_deadline(
+        "abandoned loopback fixture",
+        Duration::from_millis(250),
+        move |_| {
+            std::thread::park_timeout(Duration::from_millis(40));
+            worker_completed.store(true, Ordering::SeqCst);
+        },
+    );
+
+    drop(fixture);
+    assert!(
+        completed.load(Ordering::SeqCst),
+        "dropping a fixture must join its bounded worker instead of detaching it"
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn inspect_http_bundle(
+    policy: &str,
+    modern_url: &str,
+    legacy_sse_url: &str,
+    legacy_message_url: &str,
+) -> Output {
+    run_cli(&[
+        "inspect",
+        "--http-url",
+        modern_url,
+        "--legacy-sse-url",
+        legacy_sse_url,
+        "--legacy-message-url",
+        legacy_message_url,
+        "--protocol-policy",
+        policy,
+        "--format",
+        "json",
+    ])
+}
+
+struct ForbiddenHttpContactObserver {
+    shutdown: Option<mpsc::Sender<()>>,
+    completion: Option<mpsc::Receiver<Result<(), String>>>,
+    observer: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ForbiddenHttpContactObserver {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.recv_timeout(FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE);
+        }
+        if let Some(observer) = self.observer.take() {
+            let _ = observer.join();
+        }
+    }
+}
+
+struct ForbiddenContactFinalDrainControl {
+    started: mpsc::Sender<()>,
+    permit: mpsc::Receiver<()>,
+}
+
+fn observer_shutdown_requested(shutdown_requested: &mpsc::Receiver<()>) -> bool {
+    matches!(
+        shutdown_requested.try_recv(),
+        Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+    )
+}
+
+fn drain_forbidden_http_contacts_after_shutdown(
+    listener: &TcpListener,
+    contacts: &AtomicUsize,
+    context: &str,
+    shutdown_requested: &mpsc::Receiver<()>,
+) -> Result<(), String> {
+    let final_deadline = Instant::now() + FORBIDDEN_CONTACT_FINAL_DRAIN_DEADLINE;
+    let mut quiet_deadline = Instant::now() + FORBIDDEN_CONTACT_FINAL_QUIET_INTERVAL;
+
+    loop {
+        for _ in 0..FORBIDDEN_CONTACT_WORK_CAP {
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    contacts.fetch_add(1, Ordering::SeqCst);
+                    quiet_deadline = Instant::now() + FORBIDDEN_CONTACT_FINAL_QUIET_INTERVAL;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    return Err(format!(
+                        "observe forbidden {context} contact during shutdown: {error}"
+                    ));
+                }
+            }
+        }
+
+        let now = Instant::now();
+        if now >= quiet_deadline || now >= final_deadline {
+            return Ok(());
+        }
+        let wait = quiet_deadline
+            .min(final_deadline)
+            .saturating_duration_since(now)
+            .min(FORBIDDEN_CONTACT_POLL_INTERVAL);
+        match shutdown_requested.recv_timeout(wait) {
+            Ok(())
+            | Err(mpsc::RecvTimeoutError::Disconnected)
+            | Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn observe_forbidden_http_contacts(
+    listener: TcpListener,
+    contacts: Arc<AtomicUsize>,
+    context: &'static str,
+    shutdown_requested: &mpsc::Receiver<()>,
+    final_drain_control: Option<ForbiddenContactFinalDrainControl>,
+) -> Result<(), String> {
+    'observe: loop {
+        if observer_shutdown_requested(shutdown_requested) {
+            break;
+        }
+
+        for _ in 0..FORBIDDEN_CONTACT_WORK_CAP {
+            if observer_shutdown_requested(shutdown_requested) {
+                break 'observe;
+            }
+            match listener.accept() {
+                Ok((_stream, _)) => {
+                    contacts.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(format!("observe forbidden {context} contact: {error}")),
+            }
+        }
+
+        match shutdown_requested.recv_timeout(FORBIDDEN_CONTACT_POLL_INTERVAL) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+
+    if let Some(control) = final_drain_control {
+        control
+            .started
+            .send(())
+            .map_err(|_| format!("forbidden {context} final drain control was dropped"))?;
+        control
+            .permit
+            .recv_timeout(FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE)
+            .map_err(|error| {
+                format!("forbidden {context} final drain was not permitted: {error}")
+            })?;
+    }
+    drain_forbidden_http_contacts_after_shutdown(&listener, &contacts, context, shutdown_requested)
+}
+
+fn spawn_forbidden_http_contact_observer(
+    listener: TcpListener,
+    contacts: Arc<AtomicUsize>,
+    context: &'static str,
+) -> ForbiddenHttpContactObserver {
+    spawn_forbidden_http_contact_observer_with_final_drain_control(
+        listener, contacts, context, None,
+    )
+}
+
+fn spawn_forbidden_http_contact_observer_with_final_drain_control(
+    listener: TcpListener,
+    contacts: Arc<AtomicUsize>,
+    context: &'static str,
+    final_drain_control: Option<ForbiddenContactFinalDrainControl>,
+) -> ForbiddenHttpContactObserver {
+    listener
+        .set_nonblocking(true)
+        .expect("make forbidden HTTP observer nonblocking");
+    let (shutdown, shutdown_requested) = mpsc::channel();
+    let (completed, completion) = mpsc::channel();
+    let observer = std::thread::spawn(move || {
+        let result = observe_forbidden_http_contacts(
+            listener,
+            contacts,
+            context,
+            &shutdown_requested,
+            final_drain_control,
+        );
+        // The final drain has completed before this final worker action.
+        let _ = completed.send(result);
+    });
+    ForbiddenHttpContactObserver {
+        shutdown: Some(shutdown),
+        completion: Some(completion),
+        observer: Some(observer),
+    }
+}
+
+fn stop_forbidden_http_contact_observer(mut observer: ForbiddenHttpContactObserver, context: &str) {
+    let shutdown_result = observer
+        .shutdown
+        .take()
+        .expect("forbidden HTTP observer shutdown sender must be retained")
+        .send(());
+    let completion = observer
+        .completion
+        .take()
+        .expect("forbidden HTTP observer completion receiver must be retained")
+        .recv_timeout(FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE)
+        .unwrap_or_else(|error| {
+            panic!("forbidden {context} observer did not acknowledge shutdown: {error}")
+        });
+    observer
+        .observer
+        .take()
+        .expect("forbidden HTTP observer worker must be retained until joined")
+        .join()
+        .unwrap_or_else(|_| panic!("forbidden {context} observer must complete"));
+    shutdown_result.unwrap_or_else(|_| panic!("signal forbidden {context} observer shutdown"));
+    completion.unwrap_or_else(|error| panic!("forbidden {context} observer failed: {error}"));
+}
+
+#[test]
+fn forbidden_contact_observer_caps_continuous_contacts_and_drains_shutdown_queue() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind observer helper fixture");
+    let address = listener
+        .local_addr()
+        .expect("read observer helper fixture address");
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let (final_drain_started, final_drain_started_at) = mpsc::channel();
+    let (permit_final_drain, final_drain_permit) = mpsc::channel();
+    let mut observer = spawn_forbidden_http_contact_observer_with_final_drain_control(
+        listener,
+        Arc::clone(&contacts),
+        "observer helper fixture",
+        Some(ForbiddenContactFinalDrainControl {
+            started: final_drain_started,
+            permit: final_drain_permit,
+        }),
+    );
+
+    let continuous_contact_count = FORBIDDEN_CONTACT_WORK_CAP * 2;
+    let continuous_contacts = (0..continuous_contact_count)
+        .map(|_| {
+            TcpStream::connect_timeout(&address, FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE)
+                .expect("queue continuous observer contact")
+        })
+        .collect::<Vec<_>>();
+    observer
+        .shutdown
+        .as_ref()
+        .expect("observer helper shutdown sender must be retained")
+        .send(())
+        .expect("signal observer helper shutdown");
+    final_drain_started_at
+        .recv_timeout(FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE)
+        .expect("observer helper must acknowledge final-drain start");
+    let shutdown_continuous_contact_count = FORBIDDEN_CONTACT_WORK_CAP * 2;
+    let shutdown_continuous_contacts = (0..shutdown_continuous_contact_count)
+        .map(|_| {
+            TcpStream::connect_timeout(&address, FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE)
+                .expect("queue continuous observer contact during shutdown")
+        })
+        .collect::<Vec<_>>();
+    let queued_at_shutdown =
+        TcpStream::connect_timeout(&address, FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE)
+            .expect("queue observer contact after shutdown acknowledgement");
+    permit_final_drain
+        .send(())
+        .expect("permit observer helper final drain");
+
+    let completion = observer
+        .completion
+        .take()
+        .expect("observer helper completion receiver must be retained")
+        .recv_timeout(FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE)
+        .expect("observer helper must acknowledge shutdown completion");
+    observer
+        .observer
+        .take()
+        .expect("observer helper worker must be retained until joined")
+        .join()
+        .expect("observer helper must join after completion acknowledgement");
+    completion.expect("observer helper final drain must succeed");
+    assert_eq!(
+        contacts.load(Ordering::SeqCst),
+        continuous_contact_count + shutdown_continuous_contact_count + 1,
+        "the capped observer must count continuous contacts and the contact queued at shutdown"
+    );
+    drop((
+        continuous_contacts,
+        shutdown_continuous_contacts,
+        queued_at_shutdown,
+    ));
 }
 
 fn inspect_protocol_fixture(policy: &str, format: &str, fixture: &str) -> Output {
@@ -1121,6 +1719,7 @@ fn e2e_test_json_report_against_static_protocol_fixture() {
     assert!(json.get("total_duration_ms").is_some());
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 #[test]
 fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
     for (case_name, policy, fixture, expected_version, expected_era, assert_wire) in [
@@ -1189,17 +1788,19 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
 }
 
 #[test]
-fn e2e_cli_inspect_http_url_uses_live_modern_h1_and_negotiated_status_renderer() {
+fn e2e_cli_inspect_http_bundle_modern_only_uses_live_modern_h1_and_negotiated_status_renderer() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP inspect fixture");
     let address = listener
         .local_addr()
         .expect("read modern HTTP inspect fixture address");
     let url = format!("http://{address}/mcp");
-    let fixture = std::thread::spawn(move || {
-        let (mut stream, _) = listener
-            .accept()
-            .expect("accept modern HTTP inspect connection");
-        let (head, request) = read_h1_json_request(&mut stream);
+    let fixture = spawn_loopback_fixture("modern HTTP inspect fixture", move |deadline| {
+        let mut stream = accept_h1_fixture_connection(
+            &listener,
+            deadline,
+            "accept modern HTTP inspect connection",
+        );
+        let (head, request) = read_h1_json_request(&mut stream, deadline);
         assert!(
             head.starts_with("POST /mcp HTTP/1.1\r\n"),
             "inspect must use the configured modern H1 POST route"
@@ -1212,13 +1813,16 @@ fn e2e_cli_inspect_http_url_uses_live_modern_h1_and_negotiated_status_renderer()
         );
         write_h1_json_response(
             &mut stream,
+            deadline,
             r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"serverInfo":{"name":"modern-h1-inspect","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
         );
 
-        let (mut stream, _) = listener
-            .accept()
-            .expect("accept modern HTTP tools-list connection");
-        let (head, request) = read_h1_json_request(&mut stream);
+        let mut stream = accept_h1_fixture_connection(
+            &listener,
+            deadline,
+            "accept modern HTTP tools-list connection",
+        );
+        let (head, request) = read_h1_json_request(&mut stream, deadline);
         assert!(
             head.starts_with("POST /mcp HTTP/1.1\r\n"),
             "inspect tools/list must retain the configured modern H1 POST route"
@@ -1231,6 +1835,7 @@ fn e2e_cli_inspect_http_url_uses_live_modern_h1_and_negotiated_status_renderer()
         );
         write_h1_json_response(
             &mut stream,
+            deadline,
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"h1-tool","description":"modern H1 catalog","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}"#,
         );
     });
@@ -1249,9 +1854,7 @@ fn e2e_cli_inspect_http_url_uses_live_modern_h1_and_negotiated_status_renderer()
         "modern HTTP inspect should succeed, stderr: {}",
         stderr_str(&output)
     );
-    fixture
-        .join()
-        .expect("modern HTTP inspect fixture must complete");
+    wait_for_loopback_fixture(fixture, "modern HTTP inspect fixture");
 
     let rendered: serde_json::Value =
         serde_json::from_str(&stdout_str(&output)).expect("inspect output is diagnostic JSON");
@@ -1262,37 +1865,268 @@ fn e2e_cli_inspect_http_url_uses_live_modern_h1_and_negotiated_status_renderer()
     assert_eq!(rendered["tools"][0]["name"], "h1-tool");
 }
 
+#[cfg(not(feature = "legacy-2024-11-05"))]
 #[test]
-fn e2e_cli_inspect_http_url_auto_policy_rejects_before_any_h1_probe() {
+fn e2e_cli_no_default_auto_and_legacy_only_refuse_before_http_contact() {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind no-default feature-unavailable observer");
+    let address = listener
+        .local_addr()
+        .expect("read no-default feature-unavailable observer address");
+    let url = format!("http://{address}/mcp");
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let observer = spawn_forbidden_http_contact_observer(
+        listener,
+        Arc::clone(&contacts),
+        "no-default feature-unavailable HTTP",
+    );
+
+    for policy in ["auto", "legacy-only"] {
+        let output = run_cli(&[
+            "inspect",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            policy,
+            "--format",
+            "json",
+        ]);
+        assert!(
+            !output.status.success(),
+            "a no-default-features CLI must refuse {policy} before HTTP contact"
+        );
+        let stderr = stderr_str(&output);
+        assert!(
+            stderr.contains("FeatureUnavailable") && stderr.contains("legacy-2024-11-05"),
+            "the no-default-features refusal for {policy} must name the compiled-out feature: {stderr}"
+        );
+    }
+
+    stop_forbidden_http_contact_observer(observer, "no-default feature-unavailable HTTP");
+    assert_eq!(
+        contacts.load(Ordering::SeqCst),
+        0,
+        "Auto and LegacyOnly must fail before contacting the configured HTTP endpoint"
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_auto_keeps_modern_after_discovery_when_application_post_fails() {
+    let modern_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind Auto modern application fixture");
+    let modern_address = modern_listener
+        .local_addr()
+        .expect("read Auto modern application fixture address");
+    let legacy_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind forbidden Auto legacy observer");
+    let legacy_address = legacy_listener
+        .local_addr()
+        .expect("read forbidden Auto legacy observer address");
+    let modern_url = format!("http://{modern_address}/mcp");
+    let legacy_sse_url = format!("http://{legacy_address}/legacy-sse");
+    let legacy_message_url = format!("http://{legacy_address}/legacy-message");
+    let legacy_contacts = Arc::new(AtomicUsize::new(0));
+    let legacy_observer = spawn_forbidden_http_contact_observer(
+        legacy_listener,
+        Arc::clone(&legacy_contacts),
+        "Auto legacy",
+    );
+    let modern_fixture = spawn_loopback_fixture(
+        "Auto modern application fixture",
+        move |deadline| {
+            let mut discovery = accept_h1_fixture_connection(
+                &modern_listener,
+                deadline,
+                "accept Auto modern discovery POST",
+            );
+            let (head, request) = read_h1_json_request(&mut discovery, deadline);
+            assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], "server/discover");
+            assert_eq!(
+                request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            write_h1_json_response(
+                &mut discovery,
+                deadline,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"serverInfo":{"name":"auto-modern-h1-inspect","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+
+            let mut application = accept_h1_fixture_connection(
+                &modern_listener,
+                deadline,
+                "accept Auto modern tools-list POST",
+            );
+            let (head, request) = read_h1_json_request(&mut application, deadline);
+            assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tools/list");
+            assert_eq!(
+                request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+                "2026-07-28"
+            );
+            write_h1_empty_response(&mut application, deadline, 500);
+        },
+    );
+
+    let output = inspect_http_bundle("auto", &modern_url, &legacy_sse_url, &legacy_message_url);
+    assert!(
+        !output.status.success(),
+        "an application POST failure after modern discovery must fail instead of downgrading"
+    );
+    wait_for_loopback_fixture(modern_fixture, "Auto modern application fixture");
+    stop_forbidden_http_contact_observer(legacy_observer, "Auto legacy");
+    assert_eq!(
+        legacy_contacts.load(Ordering::SeqCst),
+        0,
+        "a modern-selected Auto connection must not contact either configured legacy endpoint after an application failure"
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_auto_uses_authorized_legacy_fallback() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Auto legacy HTTP fixture");
+    let address = listener
+        .local_addr()
+        .expect("read Auto legacy HTTP fixture address");
+    let modern_url = format!("http://{address}/mcp");
+    let legacy_sse_url = format!("http://{address}/legacy-sse");
+    let legacy_message_url = format!("http://{address}/legacy-message");
+    let fixture_message_url = legacy_message_url.clone();
+    let fixture = spawn_loopback_fixture("Auto legacy HTTP fixture", move |deadline| {
+        serve_legacy_http_inspect_bundle(listener, deadline, Some(404), fixture_message_url);
+    });
+
+    let output = inspect_http_bundle("auto", &modern_url, &legacy_sse_url, &legacy_message_url);
+    assert!(
+        output.status.success(),
+        "Auto must use the configured legacy bundle after its authorized modern refusal: {}",
+        stderr_str(&output)
+    );
+    wait_for_loopback_fixture(fixture, "Auto legacy HTTP fixture");
+    let rendered: serde_json::Value =
+        serde_json::from_str(&stdout_str(&output)).expect("Auto inspect output is diagnostic JSON");
+    assert_eq!(rendered["server"]["name"], "legacy-h1-inspect");
+    assert_eq!(rendered["protocol"]["policy"], "auto");
+    assert_eq!(rendered["protocol"]["version"], "2024-11-05");
+    assert_eq!(rendered["protocol"]["era"], "legacy-2024");
+    assert_eq!(rendered["tools"][0]["name"], "legacy-h1-tool");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_auto_rejects_recognized_discovery_error_without_legacy_contact() {
+    let modern_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind recognized-refusal modern fixture");
+    let modern_address = modern_listener
+        .local_addr()
+        .expect("read recognized-refusal modern fixture address");
+    let legacy_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind recognized-refusal legacy observer");
+    let legacy_address = legacy_listener
+        .local_addr()
+        .expect("read recognized-refusal legacy observer address");
+    let modern_url = format!("http://{modern_address}/mcp");
+    let legacy_sse_url = format!("http://{legacy_address}/legacy-sse");
+    let legacy_message_url = format!("http://{legacy_address}/legacy-message");
+    let legacy_contacts = Arc::new(AtomicUsize::new(0));
+    let legacy_observer = spawn_forbidden_http_contact_observer(
+        legacy_listener,
+        Arc::clone(&legacy_contacts),
+        "recognized-refusal legacy",
+    );
+    let modern_fixture =
+        spawn_loopback_fixture("recognized-refusal modern fixture", move |deadline| {
+            let mut modern = accept_h1_fixture_connection(
+                &modern_listener,
+                deadline,
+                "accept recognized-refusal modern discovery POST",
+            );
+            let (head, request) = read_h1_json_request(&mut modern, deadline);
+            assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], "server/discover");
+            write_h1_json_response_with_status(
+                &mut modern,
+                deadline,
+                404,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+            );
+        });
+
+    let output = inspect_http_bundle("auto", &modern_url, &legacy_sse_url, &legacy_message_url);
+    assert!(
+        !output.status.success(),
+        "a recognized discovery error at the same 404 as the fallback-positive case must not downgrade"
+    );
+    wait_for_loopback_fixture(modern_fixture, "recognized-refusal modern fixture");
+    stop_forbidden_http_contact_observer(legacy_observer, "recognized-refusal legacy");
+    assert_eq!(
+        legacy_contacts.load(Ordering::SeqCst),
+        0,
+        "a recognized modern discovery error must not contact either configured legacy endpoint"
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_legacy_only_skips_modern_contact() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind LegacyOnly HTTP fixture");
+    let address = listener
+        .local_addr()
+        .expect("read LegacyOnly HTTP fixture address");
+    let modern_url = format!("http://{address}/mcp");
+    let legacy_sse_url = format!("http://{address}/legacy-sse");
+    let legacy_message_url = format!("http://{address}/legacy-message");
+    let fixture_message_url = legacy_message_url.clone();
+    let fixture = spawn_loopback_fixture("LegacyOnly HTTP fixture", move |deadline| {
+        serve_legacy_http_inspect_bundle(listener, deadline, None, fixture_message_url);
+    });
+
+    let output = inspect_http_bundle(
+        "legacy-only",
+        &modern_url,
+        &legacy_sse_url,
+        &legacy_message_url,
+    );
+    assert!(
+        output.status.success(),
+        "LegacyOnly must use the configured legacy bundle directly: {}",
+        stderr_str(&output)
+    );
+    wait_for_loopback_fixture(fixture, "LegacyOnly HTTP fixture");
+    let rendered: serde_json::Value = serde_json::from_str(&stdout_str(&output))
+        .expect("LegacyOnly inspect output is diagnostic JSON");
+    assert_eq!(rendered["protocol"]["policy"], "legacy-only");
+    assert_eq!(rendered["protocol"]["version"], "2024-11-05");
+    assert_eq!(rendered["protocol"]["era"], "legacy-2024");
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_rejects_incomplete_auto_without_contact() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind no-probe HTTP fixture");
-    listener
-        .set_nonblocking(true)
-        .expect("make no-probe HTTP fixture nonblocking");
     let address = listener
         .local_addr()
         .expect("read no-probe HTTP fixture address");
     let url = format!("http://{address}/mcp");
+    let legacy_sse_url = format!("http://{address}/legacy-sse");
     let probes = Arc::new(AtomicUsize::new(0));
-    let observed_probes = Arc::clone(&probes);
-    let observer = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < deadline {
-            match listener.accept() {
-                Ok((_stream, _)) => {
-                    observed_probes.fetch_add(1, Ordering::SeqCst);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("observe HTTP policy rejection connection: {error}"),
-            }
-        }
-    });
+    let observer = spawn_forbidden_http_contact_observer(
+        listener,
+        Arc::clone(&probes),
+        "HTTP policy rejection",
+    );
 
     let output = run_cli(&[
         "inspect",
         "--http-url",
         &url,
+        "--legacy-sse-url",
+        &legacy_sse_url,
         "--protocol-policy",
         "auto",
         "--format",
@@ -1300,19 +2134,135 @@ fn e2e_cli_inspect_http_url_auto_policy_rejects_before_any_h1_probe() {
     ]);
     assert!(
         !output.status.success(),
-        "changing only modern-only to auto must reject the URL target"
+        "an incomplete Auto bundle must not infer its missing legacy message endpoint"
     );
     assert!(
-        stderr_str(&output).contains("--http-url requires --protocol-policy modern-only"),
-        "policy rejection must be explicit"
+        stderr_str(&output).contains("requires a configured legacy message POST target"),
+        "the incomplete-bundle rejection must be explicit"
     );
-    observer
-        .join()
-        .expect("no-probe HTTP observer must complete");
+    stop_forbidden_http_contact_observer(observer, "HTTP policy rejection");
     assert_eq!(
         probes.load(Ordering::SeqCst),
         0,
-        "policy rejection must occur before any HTTP probe side effect"
+        "incomplete-bundle rejection must occur before any HTTP side effect"
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_rejects_mismatched_legacy_message_endpoint() {
+    let sse_listener = TcpListener::bind("127.0.0.1:0").expect("bind mismatch SSE fixture");
+    let sse_address = sse_listener
+        .local_addr()
+        .expect("read mismatch SSE fixture address");
+    let configured_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind configured message observer");
+    let configured_address = configured_listener
+        .local_addr()
+        .expect("read configured message observer address");
+    let advertised_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind advertised message observer");
+    let advertised_address = advertised_listener
+        .local_addr()
+        .expect("read advertised message observer address");
+    let configured_contacts = Arc::new(AtomicUsize::new(0));
+    let advertised_contacts = Arc::new(AtomicUsize::new(0));
+    let configured_observer = spawn_forbidden_http_contact_observer(
+        configured_listener,
+        Arc::clone(&configured_contacts),
+        "configured message",
+    );
+    let advertised_observer = spawn_forbidden_http_contact_observer(
+        advertised_listener,
+        Arc::clone(&advertised_contacts),
+        "advertised message",
+    );
+    let fixture = spawn_loopback_fixture("mismatch legacy SSE fixture", move |deadline| {
+        let mut sse =
+            accept_h1_fixture_connection(&sse_listener, deadline, "accept mismatch legacy SSE GET");
+        let head = read_h1_request_head(&mut sse, deadline);
+        assert!(head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+        begin_h1_chunked_sse(&mut sse, deadline);
+        write_h1_chunked_sse_event(
+            &mut sse,
+            deadline,
+            &format!("event: endpoint\ndata: http://{advertised_address}/legacy-message\n\n"),
+        );
+    });
+    let modern_url = format!("http://{sse_address}/mcp");
+    let legacy_sse_url = format!("http://{sse_address}/legacy-sse");
+    let configured_message_url = format!("http://{configured_address}/legacy-message");
+
+    let output = inspect_http_bundle(
+        "legacy-only",
+        &modern_url,
+        &legacy_sse_url,
+        &configured_message_url,
+    );
+    assert!(
+        !output.status.success(),
+        "changing only the SSE-advertised message target must reject the bundle"
+    );
+    wait_for_loopback_fixture(fixture, "mismatch legacy SSE fixture");
+    stop_forbidden_http_contact_observer(configured_observer, "configured message");
+    stop_forbidden_http_contact_observer(advertised_observer, "advertised message");
+    assert_eq!(
+        configured_contacts.load(Ordering::SeqCst),
+        0,
+        "a mismatched legacy endpoint must not contact the configured message route"
+    );
+    assert_eq!(
+        advertised_contacts.load(Ordering::SeqCst),
+        0,
+        "a mismatched legacy endpoint must not contact the advertised foreign route"
+    );
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_inspect_http_bundle_auto_rejects_unauthorized_fallback_without_legacy_contact() {
+    let modern_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind unauthorized modern fixture");
+    let modern_address = modern_listener
+        .local_addr()
+        .expect("read unauthorized modern fixture address");
+    let legacy_listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind unauthorized legacy observer");
+    let legacy_address = legacy_listener
+        .local_addr()
+        .expect("read unauthorized legacy observer address");
+    let modern_url = format!("http://{modern_address}/mcp");
+    let legacy_sse_url = format!("http://{legacy_address}/legacy-sse");
+    let legacy_message_url = format!("http://{legacy_address}/legacy-message");
+    let legacy_contacts = Arc::new(AtomicUsize::new(0));
+    let modern_fixture = spawn_loopback_fixture("unauthorized modern fixture", move |deadline| {
+        let mut modern = accept_h1_fixture_connection(
+            &modern_listener,
+            deadline,
+            "accept unauthorized modern probe",
+        );
+        let (head, request) = read_h1_json_request(&mut modern, deadline);
+        assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+        assert_eq!(request["method"], "server/discover");
+        write_h1_empty_response(&mut modern, deadline, 500);
+    });
+    let legacy_observer = spawn_forbidden_http_contact_observer(
+        legacy_listener,
+        Arc::clone(&legacy_contacts),
+        "unauthorized legacy",
+    );
+
+    let output = inspect_http_bundle("auto", &modern_url, &legacy_sse_url, &legacy_message_url);
+    assert!(
+        !output.status.success(),
+        "changing only the authorized 404 refusal to an ordinary 500 must not downgrade"
+    );
+    wait_for_loopback_fixture(modern_fixture, "unauthorized modern fixture");
+    stop_forbidden_http_contact_observer(legacy_observer, "unauthorized legacy");
+    assert_eq!(
+        legacy_contacts.load(Ordering::SeqCst),
+        0,
+        "an unauthorized modern failure must not contact a legacy endpoint"
     );
 }
 
@@ -1570,6 +2520,7 @@ fn e2e_cli_inspect_modern_only_planted_negative_never_falls_back_to_legacy() {
     assert_no_legacy_initialize(&wire);
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 #[test]
 fn e2e_cli_inspect_auto_planted_negative_rejects_unauthorized_discovery_failure() {
     let output = inspect_protocol_fixture(
@@ -1705,11 +2656,15 @@ exec /bin/sh "$1"
     let reader = std::thread::spawn(move || {
         let mut line = String::new();
         let result = BufReader::new(stderr).read_line(&mut line);
+        // Sending the completed payload is this worker's final action.
         let _ = marker_sender.send((result, line));
     });
     let (read_result, marker) = marker_receiver
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_else(|error| panic!("owner-death fixture did not report its PID: {error}"));
+    reader
+        .join()
+        .expect("stderr marker reader must join after its final acknowledgement");
     read_result.expect("read owner-death PID marker");
     let target_pid = marker
         .trim()
@@ -1725,8 +2680,6 @@ exec /bin/sh "$1"
         .wait_until(Duration::from_secs(5))
         .unwrap_or_else(|error| panic!("reap fastmcp CLI owner: {error:?}"));
     assert!(!owner_status.success(), "killed CLI owner cannot succeed");
-    reader.join().expect("stderr marker reader");
-
     let deadline = Instant::now() + PROCESS_CLEANUP_DEADLINE;
     loop {
         match std::fs::read_to_string(format!("/proc/{target_pid}/stat")) {

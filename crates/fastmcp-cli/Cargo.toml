@@ -26,6 +26,66 @@ bench = false
 doc = false
 
 [features]
+# Ordinary CLI builds retain the exact legacy adapter so their immutable
+# protocol-policy default is Auto. A --no-default-features build is the
+# ModernOnly CLI profile; it keeps unavailable policy spellings diagnostic but
+# cannot link legacy transport code.
+default = ["legacy-2024-11-05"]
+legacy-2024-11-05 = [
+    "fastmcp-protocol/legacy-2024-11-05",
+    "fastmcp-transport/legacy-2024-11-05",
+    "fastmcp-client/legacy-2024-11-05",
+    "fastmcp-console/legacy-2024-11-05",
+    "fastmcp-server?/legacy-2024-11-05",
+]
+tasks = [
+    "fastmcp-protocol/tasks",
+    "fastmcp-client/tasks",
+    "fastmcp-console/tasks",
+    "fastmcp-server?/tasks",
+]
+apps = [
+    "fastmcp-protocol/apps",
+    "fastmcp-client/apps",
+    "fastmcp-console/apps",
+    "fastmcp-server?/apps",
+]
+safe-icon-rendering = ["fastmcp-client/safe-icon-rendering"]
+builtin-auth-server = [
+    "dep:fastmcp-server",
+    "fastmcp-server/builtin-auth-server",
+    "fastmcp-console/builtin-auth-server",
+]
+proxy = ["dep:fastmcp-server", "fastmcp-server/proxy", "fastmcp-console/proxy"]
+proxy-legacy = [
+    "proxy",
+    "legacy-2024-11-05",
+    "fastmcp-server/proxy-legacy",
+    "fastmcp-console/proxy-legacy",
+]
+proxy-tasks = [
+    "proxy",
+    "tasks",
+    "fastmcp-server/proxy-tasks",
+    "fastmcp-console/proxy-tasks",
+]
+websocket-experimental = [
+    "fastmcp-transport/websocket-experimental",
+    "fastmcp-client/websocket-experimental",
+    "fastmcp-console/websocket-experimental",
+    "fastmcp-server?/websocket-experimental",
+]
+redis-tasks = [
+    "tasks",
+    "dep:fastmcp-server",
+    "fastmcp-server/redis-tasks",
+    "fastmcp-console/redis-tasks",
+]
+jwt-resource-auth = [
+    "dep:fastmcp-server",
+    "fastmcp-server/jwt-resource-auth",
+    "fastmcp-console/jwt-resource-auth",
+]
 # Internal opt-in used only to compile the framework-backed CLI E2E fixture.
 # Cargo features are public, so `--all-features` also exposes the deliberately
 # conspicuous fixture binary; default builds and installs include only `fastmcp`.
@@ -38,6 +98,7 @@ fastmcp-core = { workspace = true }
 fastmcp-protocol = { workspace = true }
 fastmcp-console = { workspace = true }
 fastmcp-transport = { workspace = true }
+fastmcp-server = { workspace = true, optional = true }
 fastmcp-rust = { workspace = true, optional = true }
 
 # Runtime

@@ -7,9 +7,9 @@
 //! - `test` - Exercise a local server with per-request idle/absolute timeouts
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
-//! CLI uses the workspace's current `2024-11-05` protocol implementation;
-//! inspect output and examples are not aggregate conformance or release
-//! evidence.
+//! CLI builds with default features include the exact `2024-11-05` adapter;
+//! `--no-default-features` is ModernOnly. Inspect output and examples are not
+//! aggregate conformance or release evidence.
 //!
 //! # Role in the System
 //!
@@ -53,6 +53,9 @@ const MAX_TEST_ABSOLUTE_TIMEOUT_SECS: u64 = 15 * 60;
 const CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: &str = "fastmcpCleanupUnverified";
 const CLIENT_CLEANUP_DURATION_MS_DATA_KEY: &str = "cleanupDurationMs";
 const FASTMCP_PROTOCOL_POLICY_ENV: &str = "FASTMCP_PROTOCOL_POLICY";
+const LEGACY_PROTOCOL_POLICY_FEATURE: &str = "legacy-2024-11-05";
+const LEGACY_PROTOCOL_POLICY_ENABLED: bool = cfg!(feature = "legacy-2024-11-05");
+#[cfg(feature = "legacy-2024-11-05")]
 const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
     "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
@@ -65,9 +68,21 @@ const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
     "examples, redact secrets and peer-controlled terminal text, and preserve nonzero ",
     "failures rather than fabricating an empty catalog or selection."
 );
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
+    "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
+    "This --no-default-features build executes ModernOnly only. Auto and LegacyOnly remain ",
+    "parseable only to report that legacy-2024-11-05 is unavailable before contact. MCP ",
+    "2025-11-25 is unsupported: it has no alias, compatibility profile, route, or diagnostic ",
+    "selection. Help, inspect output, and examples are not conformance, runtime-readiness, ",
+    "maturity, or release evidence. Machine-readable diagnostics are separate from human-facing ",
+    "examples, redact secrets and peer-controlled terminal text, and preserve nonzero failures ",
+    "rather than fabricating an empty catalog or selection."
+);
 /// Independently authored consumer contract for the normalized rendered
 /// status stanza. This is intentionally not derived from `after_help`: a
 /// change to producer text must fail admission until this contract is reviewed.
+#[cfg(feature = "legacy-2024-11-05")]
 const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
     "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
@@ -80,6 +95,8 @@ const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
     "examples, redact secrets and peer-controlled terminal text, and preserve nonzero ",
     "failures rather than fabricating an empty catalog or selection."
 );
+#[cfg(not(feature = "legacy-2024-11-05"))]
+const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = CLI_PROTOCOL_STATUS_HELP;
 /// Independently authored normalized root-help frame. Root help is a public
 /// documentation boundary: support claims may appear only in the exact
 /// provisional status stanza, never in a free-form prefix.
@@ -104,9 +121,9 @@ enum CliDocumentationRefusal {
     ExpectedDisplayHelp,
     ProtocolStatusIsNotProvisional,
     UnexpectedPublicProtocolVersion,
-    ModernOnlyIsNotExecutable,
-    AutoIsNotExecutable,
-    LegacyOnlyIsNotExecutable,
+    ModernOnlyAvailabilityMismatch,
+    AutoAvailabilityMismatch,
+    LegacyOnlyAvailabilityMismatch,
     Mcp2025IsNotUnsupported,
     AggregateClaimTreatedAsEvidence,
     MissingStatusStanza,
@@ -127,12 +144,14 @@ impl CliDocumentationRefusal {
             Self::UnexpectedPublicProtocolVersion => {
                 "DOC-01 CLI contract has an unexpected public protocol version"
             }
-            Self::ModernOnlyIsNotExecutable => {
-                "DOC-01 CLI contract must keep ModernOnly executable"
+            Self::ModernOnlyAvailabilityMismatch => {
+                "DOC-01 CLI contract has an invalid ModernOnly availability declaration"
             }
-            Self::AutoIsNotExecutable => "DOC-01 CLI contract must keep Auto executable",
-            Self::LegacyOnlyIsNotExecutable => {
-                "DOC-01 CLI contract must keep LegacyOnly executable"
+            Self::AutoAvailabilityMismatch => {
+                "DOC-01 CLI contract has an invalid Auto availability declaration"
+            }
+            Self::LegacyOnlyAvailabilityMismatch => {
+                "DOC-01 CLI contract has an invalid LegacyOnly availability declaration"
             }
             Self::Mcp2025IsNotUnsupported => {
                 "DOC-01 CLI contract must keep MCP 2025-11-25 unsupported"
@@ -176,8 +195,8 @@ const CLI_DOCUMENTATION_CONTRACT: CliDocumentationContract = CliDocumentationCon
     protocol_2026_under_implementation: true,
     public_protocol_version: "2024-11-05",
     modern_only_executable: true,
-    auto_executable: true,
-    legacy_only_executable: true,
+    auto_executable: LEGACY_PROTOCOL_POLICY_ENABLED,
+    legacy_only_executable: LEGACY_PROTOCOL_POLICY_ENABLED,
     mcp_2025_unsupported: true,
     aggregate_claims_are_evidence: false,
 };
@@ -223,13 +242,13 @@ fn validate_cli_documentation_contract(
         return Err(CliDocumentationRefusal::UnexpectedPublicProtocolVersion);
     }
     if !contract.modern_only_executable {
-        return Err(CliDocumentationRefusal::ModernOnlyIsNotExecutable);
+        return Err(CliDocumentationRefusal::ModernOnlyAvailabilityMismatch);
     }
-    if !contract.auto_executable {
-        return Err(CliDocumentationRefusal::AutoIsNotExecutable);
+    if contract.auto_executable != LEGACY_PROTOCOL_POLICY_ENABLED {
+        return Err(CliDocumentationRefusal::AutoAvailabilityMismatch);
     }
-    if !contract.legacy_only_executable {
-        return Err(CliDocumentationRefusal::LegacyOnlyIsNotExecutable);
+    if contract.legacy_only_executable != LEGACY_PROTOCOL_POLICY_ENABLED {
+        return Err(CliDocumentationRefusal::LegacyOnlyAvailabilityMismatch);
     }
     if !contract.mcp_2025_unsupported {
         return Err(CliDocumentationRefusal::Mcp2025IsNotUnsupported);
@@ -370,8 +389,8 @@ fn doc_01_b_positive() {
         protocol_2026_under_implementation: true,
         public_protocol_version: "2024-11-05",
         modern_only_executable: true,
-        auto_executable: true,
-        legacy_only_executable: true,
+        auto_executable: LEGACY_PROTOCOL_POLICY_ENABLED,
+        legacy_only_executable: LEGACY_PROTOCOL_POLICY_ENABLED,
         mcp_2025_unsupported: true,
         aggregate_claims_are_evidence: false,
     };
@@ -504,8 +523,8 @@ enum Commands {
         #[arg(long, short = 'e')]
         env: Vec<String>,
 
-        /// Protocol-policy selection for the launched server (auto, modern-only, legacy-only).
-        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        /// Protocol-policy selection for the launched server.
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
         protocol_policy: CliProtocolPolicy,
     },
 
@@ -514,13 +533,21 @@ enum Commands {
     /// Connects to the server, lists its tools, resources, and prompts,
     /// then displays them in a formatted output.
     Inspect {
-        /// Server command or path. Omit when using --http-url.
-        #[arg(required_unless_present = "http_url", conflicts_with = "http_url")]
+        /// Server command or path. Omit when using explicit HTTP endpoints.
+        #[arg(conflicts_with_all = ["http_url", "legacy_sse_url", "legacy_message_url"])]
         server: Option<String>,
 
-        /// Explicit modern Streamable HTTP MCP endpoint. Requires --protocol-policy modern-only.
+        /// Explicit modern Streamable HTTP MCP POST endpoint.
         #[arg(long, value_name = "URL")]
         http_url: Option<String>,
+
+        /// Explicit MCP 2024-11-05 SSE GET endpoint (requires the legacy feature).
+        #[arg(long, value_name = "URL")]
+        legacy_sse_url: Option<String>,
+
+        /// Explicit MCP 2024-11-05 message POST endpoint (requires the legacy feature).
+        #[arg(long, value_name = "URL")]
+        legacy_message_url: Option<String>,
 
         /// Arguments to pass to the server.
         #[arg(
@@ -538,8 +565,8 @@ enum Commands {
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
 
-        /// Protocol-policy selection for the client connection (auto, modern-only, legacy-only).
-        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        /// Protocol-policy selection for the client connection.
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
         protocol_policy: CliProtocolPolicy,
     },
 
@@ -569,8 +596,8 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Protocol-policy selection for the installed FastMCP server (auto, modern-only, legacy-only).
-        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        /// Protocol-policy selection for the installed FastMCP server.
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
         protocol_policy: CliProtocolPolicy,
     },
 
@@ -678,8 +705,8 @@ enum Commands {
         #[arg(long, short = 'e')]
         env: Vec<String>,
 
-        /// Protocol-policy selection for the launched server (auto, modern-only, legacy-only).
-        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::Auto)]
+        /// Protocol-policy selection for the launched server.
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
         protocol_policy: CliProtocolPolicy,
 
         /// Show detailed output.
@@ -688,16 +715,46 @@ enum Commands {
     },
 }
 
-/// Explicit dual-era selection for the executable CLI paths.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+impl Commands {
+    const fn protocol_policy(&self) -> Option<CliProtocolPolicy> {
+        match self {
+            Self::Run {
+                protocol_policy, ..
+            }
+            | Self::Inspect {
+                protocol_policy, ..
+            }
+            | Self::Install {
+                protocol_policy, ..
+            }
+            | Self::Dev {
+                protocol_policy, ..
+            } => Some(*protocol_policy),
+            Self::List { .. } | Self::Test { .. } => None,
+        }
+    }
+}
+
+/// Explicit protocol-policy input. The legacy spellings remain parseable in a
+/// ModernOnly build so the CLI can issue an actionable pre-contact refusal.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum CliProtocolPolicy {
     /// Probe modern support and fall back only for an admitted legacy refusal.
-    #[default]
     Auto,
     /// Require the current modern protocol path.
     ModernOnly,
     /// Require the exact 2024-11-05 legacy protocol path.
     LegacyOnly,
+}
+
+impl Default for CliProtocolPolicy {
+    fn default() -> Self {
+        if LEGACY_PROTOCOL_POLICY_ENABLED {
+            Self::Auto
+        } else {
+            Self::ModernOnly
+        }
+    }
 }
 
 impl CliProtocolPolicy {
@@ -718,6 +775,33 @@ impl CliProtocolPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliProtocolPolicyRefusal {
+    LegacyFeatureUnavailable { policy: CliProtocolPolicy },
+}
+
+impl CliProtocolPolicyRefusal {
+    fn diagnostic(self) -> String {
+        match self {
+            Self::LegacyFeatureUnavailable { policy } => format!(
+                "FeatureUnavailable: {} is compiled out; policy {} requires --features {}",
+                LEGACY_PROTOCOL_POLICY_FEATURE,
+                policy.server_launch_value(),
+                LEGACY_PROTOCOL_POLICY_FEATURE,
+            ),
+        }
+    }
+}
+
+fn validate_cli_protocol_policy(policy: CliProtocolPolicy) -> McpResult<()> {
+    if LEGACY_PROTOCOL_POLICY_ENABLED || matches!(policy, CliProtocolPolicy::ModernOnly) {
+        return Ok(());
+    }
+
+    let refusal = CliProtocolPolicyRefusal::LegacyFeatureUnavailable { policy };
+    Err(fastmcp_core::McpError::invalid_params(refusal.diagnostic()))
+}
+
 /// The immutable policy selected by the CLI and the exact protocol revision
 /// negotiated by an inspect connection. Both values are emitted together so
 /// consumers never have to infer a legacy or modern result from a version
@@ -730,6 +814,7 @@ struct InspectProtocolStatus {
 
 impl InspectProtocolStatus {
     fn new(policy: CliProtocolPolicy, version: &str) -> McpResult<Self> {
+        validate_cli_protocol_policy(policy)?;
         let version = ProtocolVersion::parse(version).map_err(|_| {
             fastmcp_core::McpError::internal_error(
                 "inspect received an unsupported negotiated protocol version",
@@ -750,13 +835,17 @@ impl InspectProtocolStatus {
     const fn era_name(self) -> &'static str {
         match self.version.era() {
             ProtocolEra::Modern2026 => "modern-2026",
+            #[cfg(feature = "legacy-2024-11-05")]
             ProtocolEra::Legacy2024 => "legacy-2024",
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            _ => "legacy-compiled-out",
         }
     }
 }
 
-fn client_builder_for_protocol_policy(policy: CliProtocolPolicy) -> ClientBuilder {
-    Client::builder().protocol_plan(ClientProtocolPlan::stdio(policy.protocol_policy()))
+fn client_builder_for_protocol_policy(policy: CliProtocolPolicy) -> McpResult<ClientBuilder> {
+    validate_cli_protocol_policy(policy)?;
+    Ok(Client::builder().protocol_plan(ClientProtocolPlan::stdio(policy.protocol_policy())))
 }
 
 fn apply_protocol_policy_to_server_launch(command: &mut Command, policy: CliProtocolPolicy) {
@@ -847,92 +936,107 @@ fn main() -> ExitCode {
     };
     // FND-01: no eager crates.io update checks (CLI-NO-UREQ / CLI-NO-SEMVER).
 
-    let result = match cli.command {
-        Commands::Run {
-            server,
-            args,
-            cwd,
-            env,
-            protocol_policy,
-        } => cmd_run(&server, &args, cwd.as_deref(), &env, protocol_policy),
-        Commands::Inspect {
-            server,
-            http_url,
-            args,
-            format,
-            output,
-            protocol_policy,
-        } => match (server.as_deref(), http_url.as_deref()) {
-            (Some(server), None) => {
-                cmd_inspect(server, &args, format, output.as_deref(), protocol_policy)
-            }
-            (None, Some(http_url)) => {
-                cmd_inspect_http(http_url, format, output.as_deref(), protocol_policy)
-            }
-            _ => Err(fastmcp_core::McpError::invalid_params(
-                "inspect requires exactly one server command or --http-url",
-            )),
-        },
-        Commands::Install {
-            name,
-            server,
-            args,
-            cwd,
-            target,
-            dry_run,
-            protocol_policy,
-        } => cmd_install(
-            &name,
-            &server,
-            &args,
-            cwd.as_deref(),
-            target,
-            dry_run,
-            protocol_policy,
-        ),
-        Commands::List {
-            target,
-            config,
-            format,
-            verbose,
-        } => cmd_list(target, config, format, verbose),
-        Commands::Test {
-            server,
-            args,
-            idle_timeout,
-            absolute_timeout,
-            verbose,
-            json,
-        } => cmd_test(
-            &server,
-            &args,
-            idle_timeout,
-            absolute_timeout,
-            verbose,
-            json,
-        ),
-        Commands::Dev {
-            target,
-            reload_dirs,
-            reload_patterns,
-            no_reload,
-            debounce,
-            clear,
-            env,
-            protocol_policy,
-            verbose,
-        } => cmd_dev(DevConfig {
-            target,
-            reload_dirs,
-            reload_patterns,
-            no_reload,
-            debounce_ms: debounce,
-            clear,
-            env,
-            protocol_policy,
-            verbose,
-        }),
-    };
+    let selected_protocol_policy = cli.command.protocol_policy();
+    let result = selected_protocol_policy
+        .map_or(Ok(()), validate_cli_protocol_policy)
+        .and_then(|()| match cli.command {
+            Commands::Run {
+                server,
+                args,
+                cwd,
+                env,
+                protocol_policy,
+            } => cmd_run(&server, &args, cwd.as_deref(), &env, protocol_policy),
+            Commands::Inspect {
+                server,
+                http_url,
+                legacy_sse_url,
+                legacy_message_url,
+                args,
+                format,
+                output,
+                protocol_policy,
+            } => match server.as_deref() {
+                Some(server) => {
+                    cmd_inspect(server, &args, format, output.as_deref(), protocol_policy)
+                }
+                None if http_url.is_some()
+                    || legacy_sse_url.is_some()
+                    || legacy_message_url.is_some() =>
+                {
+                    cmd_inspect_http(
+                        http_url.as_deref(),
+                        legacy_sse_url.as_deref(),
+                        legacy_message_url.as_deref(),
+                        format,
+                        output.as_deref(),
+                        protocol_policy,
+                    )
+                }
+                None => Err(fastmcp_core::McpError::invalid_params(
+                    "inspect requires a server command or explicit HTTP endpoints",
+                )),
+            },
+            Commands::Install {
+                name,
+                server,
+                args,
+                cwd,
+                target,
+                dry_run,
+                protocol_policy,
+            } => cmd_install(
+                &name,
+                &server,
+                &args,
+                cwd.as_deref(),
+                target,
+                dry_run,
+                protocol_policy,
+            ),
+            Commands::List {
+                target,
+                config,
+                format,
+                verbose,
+            } => cmd_list(target, config, format, verbose),
+            Commands::Test {
+                server,
+                args,
+                idle_timeout,
+                absolute_timeout,
+                verbose,
+                json,
+            } => cmd_test(
+                &server,
+                &args,
+                idle_timeout,
+                absolute_timeout,
+                verbose,
+                json,
+            ),
+            Commands::Dev {
+                target,
+                reload_dirs,
+                reload_patterns,
+                no_reload,
+                debounce,
+                clear,
+                env,
+                protocol_policy,
+                verbose,
+            } => cmd_dev(DevConfig {
+                target,
+                reload_dirs,
+                reload_patterns,
+                no_reload,
+                debounce_ms: debounce,
+                clear,
+                env,
+                protocol_policy,
+                verbose,
+            }),
+        });
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1016,6 +1120,7 @@ fn dev_launch_environment(
     mut env_vars: HashMap<String, String>,
     protocol_policy: CliProtocolPolicy,
 ) -> McpResult<HashMap<String, String>> {
+    validate_cli_protocol_policy(protocol_policy)?;
     reject_reserved_protocol_policy_environment(&env_vars)?;
     env_vars.insert(
         FASTMCP_PROTOCOL_POLICY_ENV.to_owned(),
@@ -1044,6 +1149,7 @@ fn cmd_run(
     env_vars: &[String],
     protocol_policy: CliProtocolPolicy,
 ) -> McpResult<()> {
+    validate_cli_protocol_policy(protocol_policy)?;
     let env_vars = parse_environment_assignments(env_vars)?;
     reject_reserved_protocol_policy_environment(&env_vars)?;
     let mut cmd = Command::new(server);
@@ -5146,11 +5252,12 @@ fn cmd_inspect(
     output: Option<&std::path::Path>,
     protocol_policy: CliProtocolPolicy,
 ) -> McpResult<()> {
+    validate_cli_protocol_policy(protocol_policy)?;
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     // Connect to the server
     let mut client =
-        client_builder_for_protocol_policy(protocol_policy).connect_stdio(server, &args_refs)?;
+        client_builder_for_protocol_policy(protocol_policy)?.connect_stdio(server, &args_refs)?;
     let negotiated_protocol_version = client.protocol_version().to_owned();
 
     // Gather server information
@@ -5214,30 +5321,34 @@ fn cmd_inspect(
     )
 }
 
-/// Builds the immutable modern-only HTTP plan accepted by `inspect --http-url`.
+/// Builds the immutable, explicit HTTP endpoint plan accepted by `inspect`.
 ///
-/// A single URL can only identify the modern POST endpoint. Legacy HTTP needs
-/// separately configured SSE and message POST routes, so refusing Auto and
-/// LegacyOnly here prevents discovery or fallback probes from reaching an
-/// endpoint whose policy cannot be expressed by the command line.
+/// Every supplied route is parsed independently and passed unchanged to the
+/// client's negotiation authority. This command never derives a legacy route
+/// from the modern URL, a discovery response, or an endpoint event.
 fn http_inspect_protocol_plan(
-    http_url: &str,
+    http_url: Option<&str>,
+    legacy_sse_url: Option<&str>,
+    legacy_message_url: Option<&str>,
     protocol_policy: CliProtocolPolicy,
 ) -> McpResult<ClientProtocolPlan> {
-    if protocol_policy != CliProtocolPolicy::ModernOnly {
-        return Err(fastmcp_core::McpError::invalid_params(
-            "--http-url requires --protocol-policy modern-only",
-        ));
+    validate_cli_protocol_policy(protocol_policy)?;
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    if legacy_sse_url.is_some() || legacy_message_url.is_some() {
+        return Err(fastmcp_core::McpError::invalid_params(format!(
+            "FeatureUnavailable: {} is compiled out; --legacy-sse-url and --legacy-message-url are unavailable",
+            LEGACY_PROTOCOL_POLICY_FEATURE,
+        )));
     }
-
-    let modern_post = CanonicalHttpUrl::parse(http_url).map_err(|error| {
-        fastmcp_core::McpError::invalid_params(format!("invalid --http-url: {error}"))
-    })?;
+    let modern_post = parse_http_inspect_endpoint(http_url, "--http-url")?;
+    let legacy_sse = parse_http_inspect_endpoint(legacy_sse_url, "--legacy-sse-url")?;
+    let legacy_message_post =
+        parse_http_inspect_endpoint(legacy_message_url, "--legacy-message-url")?;
     ClientProtocolPlan::http(
-        ProtocolPolicy::ModernOnly,
-        Some(modern_post),
-        None,
-        None,
+        protocol_policy.protocol_policy(),
+        modern_post,
+        legacy_sse,
+        legacy_message_post,
         "fastmcp-cli-inspect".to_owned(),
         "fastmcp-cli-inspect".to_owned(),
         "fastmcp-cli-inspect-http".to_owned(),
@@ -5246,107 +5357,56 @@ fn http_inspect_protocol_plan(
         1,
     )
     .map_err(|error| {
-        fastmcp_core::McpError::invalid_params(format!("invalid --http-url policy plan: {error}"))
+        fastmcp_core::McpError::invalid_params(format!("invalid HTTP endpoint bundle: {error}"))
     })
 }
 
-/// Inspects a ready modern Streamable HTTP endpoint using the policy-bound
-/// high-level client. The explicit HTTP target has already been admitted as
-/// ModernOnly, so every catalog request below must retain the final result
-/// shape; no legacy conversion or fallback probe is allowed on this path.
+fn parse_http_inspect_endpoint(
+    endpoint: Option<&str>,
+    flag: &str,
+) -> McpResult<Option<CanonicalHttpUrl>> {
+    endpoint
+        .map(|endpoint| {
+            CanonicalHttpUrl::parse(endpoint).map_err(|error| {
+                fastmcp_core::McpError::invalid_params(format!("invalid {flag}: {error}"))
+            })
+        })
+        .transpose()
+}
+
+/// Inspects an explicit, policy-bound HTTP endpoint bundle through the
+/// shipped dual-era client.
 fn cmd_inspect_http(
-    http_url: &str,
+    http_url: Option<&str>,
+    legacy_sse_url: Option<&str>,
+    legacy_message_url: Option<&str>,
     format: InspectFormat,
     output: Option<&std::path::Path>,
     protocol_policy: CliProtocolPolicy,
 ) -> McpResult<()> {
-    let protocol_plan = http_inspect_protocol_plan(http_url, protocol_policy)?;
+    validate_cli_protocol_policy(protocol_policy)?;
+    let protocol_plan = http_inspect_protocol_plan(
+        http_url,
+        legacy_sse_url,
+        legacy_message_url,
+        protocol_policy,
+    )?;
     let mut client = Client::http(protocol_plan).map_err(|error| {
         fastmcp_core::McpError::internal_error(format!(
-            "inspect could not connect to the configured HTTP endpoint: {error}"
+            "inspect could not connect to the configured HTTP endpoint bundle: {error}"
         ))
     })?;
 
-    if client.selected_protocol_era() != ProtocolEra::Modern2026 {
-        return Err(fastmcp_core::McpError::internal_error(
-            "modern-only HTTP inspect selected a non-modern protocol era",
-        ));
-    }
-    let protocol_status = InspectProtocolStatus::new(protocol_policy, "2026-07-28")?;
-    let server_info = client.server_info().clone();
-    let discovery = client.server_discovery().ok_or_else(|| {
+    let negotiated_version = client.connection().protocol_version().ok_or_else(|| {
         fastmcp_core::McpError::internal_error(
-            "modern-only HTTP inspect completed without a server/discover result",
+            "HTTP inspect completed without a negotiated protocol version",
         )
     })?;
-    let capabilities: fastmcp_protocol::ServerCapabilities =
-        project_final_for_inspect::<&fastmcp_protocol::ServerDiscoverCapabilities, _>(
-            discovery.capabilities(),
-            "server/discover",
-        )?;
-
-    let mut acquisition_truncated = false;
-    let tools = if capabilities.tools.is_some() {
-        let result = http_inspect_final_core_request(&mut client, "tools/list")?;
-        let fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ToolsList {
-            result,
-            ..
-        }) = result
-        else {
-            return Err(unexpected_http_inspect_result("tools/list"));
-        };
-        acquisition_truncated |= result.payload.next_cursor.is_some();
-        project_final_for_inspect(result.payload.tools, "tools/list")?
-    } else {
-        Vec::new()
-    };
-
-    let resources = if capabilities.resources.is_some() {
-        let result = http_inspect_final_core_request(&mut client, "resources/list")?;
-        let fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ResourcesList {
-            result,
-            ..
-        }) = result
-        else {
-            return Err(unexpected_http_inspect_result("resources/list"));
-        };
-        acquisition_truncated |= result.payload.next_cursor.is_some();
-        project_final_for_inspect(result.payload.resources, "resources/list")?
-    } else {
-        Vec::new()
-    };
-
-    let resource_templates = if capabilities.resources.is_some() {
-        let result = http_inspect_final_core_request(&mut client, "resources/templates/list")?;
-        let fastmcp_client::CoreResult::Final(
-            fastmcp_client::FinalCoreResult::ResourceTemplatesList { result, .. },
-        ) = result
-        else {
-            return Err(unexpected_http_inspect_result("resources/templates/list"));
-        };
-        acquisition_truncated |= result.payload.next_cursor.is_some();
-        project_final_for_inspect(
-            result.payload.resource_templates,
-            "resources/templates/list",
-        )?
-    } else {
-        Vec::new()
-    };
-
-    let prompts = if capabilities.prompts.is_some() {
-        let result = http_inspect_final_core_request(&mut client, "prompts/list")?;
-        let fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::PromptsList {
-            result,
-            ..
-        }) = result
-        else {
-            return Err(unexpected_http_inspect_result("prompts/list"));
-        };
-        acquisition_truncated |= result.payload.next_cursor.is_some();
-        project_final_for_inspect(result.payload.prompts, "prompts/list")?
-    } else {
-        Vec::new()
-    };
+    let protocol_status = InspectProtocolStatus::new(protocol_policy, negotiated_version)?;
+    let server_info = client.server_info().clone();
+    let capabilities = http_inspect_capabilities(&client)?;
+    let (acquisition_truncated, tools, resources, resource_templates, prompts) =
+        http_inspect_catalogs(&mut client, &capabilities)?;
 
     write_inspect_report(
         &server_info,
@@ -5362,7 +5422,90 @@ fn cmd_inspect_http(
     )
 }
 
-fn http_inspect_final_core_request(
+fn http_inspect_capabilities(
+    client: &fastmcp_client::HttpClient,
+) -> McpResult<fastmcp_protocol::ServerCapabilities> {
+    match client.selected_protocol_era() {
+        ProtocolEra::Modern2026 => {
+            let discovery = client.server_discovery().ok_or_else(|| {
+                fastmcp_core::McpError::internal_error(
+                    "modern HTTP inspect completed without a server/discover result",
+                )
+            })?;
+            project_final_for_inspect::<&fastmcp_protocol::ServerDiscoverCapabilities, _>(
+                discovery.capabilities(),
+                "server/discover",
+            )
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        ProtocolEra::Legacy2024 => client.legacy_server_capabilities().cloned().ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "legacy HTTP inspect completed without initialize capabilities",
+            )
+        }),
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        _ => Err(fastmcp_core::McpError::invalid_params(format!(
+            "FeatureUnavailable: {} is compiled out; legacy HTTP inspection cannot run",
+            LEGACY_PROTOCOL_POLICY_FEATURE,
+        ))),
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn http_inspect_catalogs(
+    client: &mut fastmcp_client::HttpClient,
+    capabilities: &fastmcp_protocol::ServerCapabilities,
+) -> McpResult<(
+    bool,
+    Vec<fastmcp_protocol::Tool>,
+    Vec<fastmcp_protocol::Resource>,
+    Vec<fastmcp_protocol::ResourceTemplate>,
+    Vec<fastmcp_protocol::Prompt>,
+)> {
+    let mut acquisition_truncated = false;
+    let tools = if capabilities.tools.is_some() {
+        let (items, truncated) =
+            http_inspect_tools_result(http_inspect_core_request(client, "tools/list")?)?;
+        acquisition_truncated |= truncated;
+        items
+    } else {
+        Vec::new()
+    };
+    let resources = if capabilities.resources.is_some() {
+        let (items, truncated) =
+            http_inspect_resources_result(http_inspect_core_request(client, "resources/list")?)?;
+        acquisition_truncated |= truncated;
+        items
+    } else {
+        Vec::new()
+    };
+    let resource_templates = if capabilities.resources.is_some() {
+        let (items, truncated) = http_inspect_resource_templates_result(
+            http_inspect_core_request(client, "resources/templates/list")?,
+        )?;
+        acquisition_truncated |= truncated;
+        items
+    } else {
+        Vec::new()
+    };
+    let prompts = if capabilities.prompts.is_some() {
+        let (items, truncated) =
+            http_inspect_prompts_result(http_inspect_core_request(client, "prompts/list")?)?;
+        acquisition_truncated |= truncated;
+        items
+    } else {
+        Vec::new()
+    };
+    Ok((
+        acquisition_truncated,
+        tools,
+        resources,
+        resource_templates,
+        prompts,
+    ))
+}
+
+fn http_inspect_core_request(
     client: &mut fastmcp_client::HttpClient,
     method: &'static str,
 ) -> McpResult<fastmcp_client::CoreResult> {
@@ -5383,9 +5526,87 @@ fn http_inspect_final_core_request(
     })
 }
 
+fn http_inspect_tools_result(
+    result: fastmcp_client::CoreResult,
+) -> McpResult<(Vec<fastmcp_protocol::Tool>, bool)> {
+    match result {
+        #[cfg(feature = "legacy-2024-11-05")]
+        fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ToolsList(result)) => {
+            Ok((result.tools, result.next_cursor.is_some()))
+        }
+        fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ToolsList {
+            result,
+            ..
+        }) => Ok((
+            project_final_for_inspect(result.payload.tools, "tools/list")?,
+            result.payload.next_cursor.is_some(),
+        )),
+        _ => Err(unexpected_http_inspect_result("tools/list")),
+    }
+}
+
+fn http_inspect_resources_result(
+    result: fastmcp_client::CoreResult,
+) -> McpResult<(Vec<fastmcp_protocol::Resource>, bool)> {
+    match result {
+        #[cfg(feature = "legacy-2024-11-05")]
+        fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::ResourcesList(
+            result,
+        )) => Ok((result.resources, result.next_cursor.is_some())),
+        fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::ResourcesList {
+            result,
+            ..
+        }) => Ok((
+            project_final_for_inspect(result.payload.resources, "resources/list")?,
+            result.payload.next_cursor.is_some(),
+        )),
+        _ => Err(unexpected_http_inspect_result("resources/list")),
+    }
+}
+
+fn http_inspect_resource_templates_result(
+    result: fastmcp_client::CoreResult,
+) -> McpResult<(Vec<fastmcp_protocol::ResourceTemplate>, bool)> {
+    match result {
+        #[cfg(feature = "legacy-2024-11-05")]
+        fastmcp_client::CoreResult::Legacy(
+            fastmcp_client::LegacyCoreResult::ResourceTemplatesList(result),
+        ) => Ok((result.resource_templates, result.next_cursor.is_some())),
+        fastmcp_client::CoreResult::Final(
+            fastmcp_client::FinalCoreResult::ResourceTemplatesList { result, .. },
+        ) => Ok((
+            project_final_for_inspect(
+                result.payload.resource_templates,
+                "resources/templates/list",
+            )?,
+            result.payload.next_cursor.is_some(),
+        )),
+        _ => Err(unexpected_http_inspect_result("resources/templates/list")),
+    }
+}
+
+fn http_inspect_prompts_result(
+    result: fastmcp_client::CoreResult,
+) -> McpResult<(Vec<fastmcp_protocol::Prompt>, bool)> {
+    match result {
+        #[cfg(feature = "legacy-2024-11-05")]
+        fastmcp_client::CoreResult::Legacy(fastmcp_client::LegacyCoreResult::PromptsList(
+            result,
+        )) => Ok((result.prompts, result.next_cursor.is_some())),
+        fastmcp_client::CoreResult::Final(fastmcp_client::FinalCoreResult::PromptsList {
+            result,
+            ..
+        }) => Ok((
+            project_final_for_inspect(result.payload.prompts, "prompts/list")?,
+            result.payload.next_cursor.is_some(),
+        )),
+        _ => Err(unexpected_http_inspect_result("prompts/list")),
+    }
+}
+
 fn unexpected_http_inspect_result(method: &str) -> fastmcp_core::McpError {
     fastmcp_core::McpError::internal_error(format!(
-        "modern-only HTTP inspect received a non-final result for {method}",
+        "HTTP inspect received an unexpected selected-era result for {method}",
     ))
 }
 
@@ -5945,6 +6166,7 @@ fn cmd_install(
     dry_run: bool,
     protocol_policy: CliProtocolPolicy,
 ) -> McpResult<()> {
+    validate_cli_protocol_policy(protocol_policy)?;
     let config = generate_server_config(name, server, args, cwd, protocol_policy)?;
 
     match target {
@@ -6211,6 +6433,7 @@ fn generate_server_config(
     cwd: Option<&Path>,
     protocol_policy: CliProtocolPolicy,
 ) -> McpResult<(String, McpServerConfig)> {
+    validate_cli_protocol_policy(protocol_policy)?;
     if name.trim().is_empty() {
         return Err(fastmcp_core::McpError::invalid_params(
             "Install server name cannot be empty or whitespace",
@@ -10170,8 +10393,8 @@ mod tests {
     }
 
     fn make_test_protocol_status() -> InspectProtocolStatus {
-        InspectProtocolStatus::new(CliProtocolPolicy::Auto, "2026-07-28")
-            .expect("the modern exact version is admitted under Auto")
+        InspectProtocolStatus::new(CliProtocolPolicy::default(), "2026-07-28")
+            .expect("the default policy admits the modern exact version")
     }
 
     // ============================================================================
@@ -10196,7 +10419,7 @@ mod tests {
                     assert!(args.is_empty());
                     assert!(cwd.is_none());
                     assert!(env.is_empty());
-                    assert_eq!(protocol_policy, CliProtocolPolicy::Auto);
+                    assert_eq!(protocol_policy, CliProtocolPolicy::default());
                 }
                 _ => unreachable!("Expected Run command"),
             }
@@ -10249,13 +10472,13 @@ mod tests {
         }
 
         #[test]
-        fn protocol_policy_defaults_to_auto_for_run_and_inspect() {
+        fn protocol_policy_defaults_match_the_compiled_profile() {
             let run = Cli::try_parse_from(["fastmcp", "run", "./server"])
                 .expect("run policy defaults to auto");
             match run.command {
                 Commands::Run {
                     protocol_policy, ..
-                } => assert_eq!(protocol_policy, CliProtocolPolicy::Auto),
+                } => assert_eq!(protocol_policy, CliProtocolPolicy::default()),
                 _ => unreachable!("Expected Run command"),
             }
 
@@ -10264,11 +10487,113 @@ mod tests {
             match inspect.command {
                 Commands::Inspect {
                     protocol_policy, ..
-                } => assert_eq!(protocol_policy, CliProtocolPolicy::Auto),
+                } => assert_eq!(protocol_policy, CliProtocolPolicy::default()),
                 _ => unreachable!("Expected Inspect command"),
             }
         }
 
+        #[test]
+        fn cli_manifest_forwards_the_server_profiles_now_defined_by_its_dependencies() {
+            let manifest = include_str!("../Cargo.toml");
+            let value = toml::from_str::<toml::Value>(manifest)
+                .expect("the CLI manifest must remain valid TOML");
+            let features = value
+                .get("features")
+                .and_then(toml::Value::as_table)
+                .expect("the CLI manifest must declare its feature table");
+
+            for (feature, expected) in [
+                (
+                    "builtin-auth-server",
+                    [
+                        "dep:fastmcp-server",
+                        "fastmcp-server/builtin-auth-server",
+                        "fastmcp-console/builtin-auth-server",
+                    ]
+                    .as_slice(),
+                ),
+                (
+                    "jwt-resource-auth",
+                    [
+                        "dep:fastmcp-server",
+                        "fastmcp-server/jwt-resource-auth",
+                        "fastmcp-console/jwt-resource-auth",
+                    ]
+                    .as_slice(),
+                ),
+            ] {
+                let actual = features
+                    .get(feature)
+                    .and_then(toml::Value::as_array)
+                    .unwrap_or_else(|| panic!("CLI manifest must define {feature}"))
+                    .iter()
+                    .map(|value| value.as_str().expect("feature entries must be strings"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual, expected,
+                    "CLI {feature} equation must match plan section 25.10"
+                );
+            }
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn cli_legacy_feature_keeps_auto_as_the_public_default() {
+            assert_eq!(CliProtocolPolicy::default(), CliProtocolPolicy::Auto);
+            assert_eq!(
+                validate_cli_protocol_policy(CliProtocolPolicy::Auto),
+                Ok(())
+            );
+            assert_eq!(
+                validate_cli_protocol_policy(CliProtocolPolicy::LegacyOnly),
+                Ok(())
+            );
+        }
+
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        #[test]
+        fn cli_without_legacy_is_modern_only_and_refuses_legacy_before_contact() {
+            assert_eq!(CliProtocolPolicy::default(), CliProtocolPolicy::ModernOnly);
+            assert_eq!(
+                validate_cli_protocol_policy(CliProtocolPolicy::ModernOnly),
+                Ok(())
+            );
+
+            for policy in [CliProtocolPolicy::Auto, CliProtocolPolicy::LegacyOnly] {
+                let error = validate_cli_protocol_policy(policy).expect_err(
+                    "a compiled-out policy must fail before any client or child launch",
+                );
+                assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+                assert!(error.message.contains("FeatureUnavailable"));
+                assert!(error.message.contains(LEGACY_PROTOCOL_POLICY_FEATURE));
+            }
+
+            let parsed = Cli::try_parse_from([
+                "fastmcp",
+                "run",
+                "--protocol-policy",
+                "auto",
+                "must-not-spawn",
+            ])
+            .expect("compiled-out policy names remain parseable for diagnostics");
+            let policy = parsed
+                .command
+                .protocol_policy()
+                .expect("run owns a protocol-policy selection");
+            assert_eq!(policy, CliProtocolPolicy::Auto);
+            assert!(validate_cli_protocol_policy(policy).is_err());
+
+            let error = http_inspect_protocol_plan(
+                Some("http://127.0.0.1:8123/mcp"),
+                None,
+                None,
+                CliProtocolPolicy::Auto,
+            )
+            .expect_err("Auto must fail before the HTTP client can contact the endpoint");
+            assert!(error.message.contains("FeatureUnavailable"));
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
         #[test]
         fn protocol_policy_choices_route_to_shipped_builders() {
             for (argument, expected) in [
@@ -10293,6 +10618,7 @@ mod tests {
                 assert_eq!(protocol_policy.protocol_policy(), expected);
                 assert_eq!(
                     client_builder_for_protocol_policy(protocol_policy)
+                        .expect("default CLI profile admits every configured policy")
                         .selected_protocol_plan()
                         .policy(),
                     expected
@@ -10308,6 +10634,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "legacy-2024-11-05")]
         #[test]
         fn inspect_protocol_status_renders_each_supported_selection_exactly() {
             let server_info = make_test_server_info();
@@ -10339,6 +10666,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "legacy-2024-11-05")]
         #[test]
         fn inspect_protocol_status_rejects_only_cross_policy_or_unsupported_versions() {
             for (policy, accepted_version, rejected_version) in [
@@ -10459,15 +10787,40 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "legacy-2024-11-05")]
         #[test]
-        fn http_inspect_rejects_non_modern_policy_before_plan_construction() {
-            let error =
-                http_inspect_protocol_plan("http://127.0.0.1:8123/mcp", CliProtocolPolicy::Auto)
-                    .expect_err("a single HTTP URL cannot authorize a legacy route probe");
-            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+        fn http_inspect_accepts_an_explicit_auto_endpoint_bundle() {
+            let plan = http_inspect_protocol_plan(
+                Some("http://127.0.0.1:8123/mcp"),
+                Some("http://127.0.0.1:8123/sse"),
+                Some("http://127.0.0.1:8123/messages"),
+                CliProtocolPolicy::Auto,
+            )
+            .expect("an explicit Auto bundle must construct");
+            assert_eq!(plan.modern_post_target(), Some("http://127.0.0.1:8123/mcp"));
+            assert_eq!(plan.legacy_sse_target(), Some("http://127.0.0.1:8123/sse"));
             assert_eq!(
-                error.message,
-                "--http-url requires --protocol-policy modern-only"
+                plan.legacy_message_post_target(),
+                Some("http://127.0.0.1:8123/messages")
+            );
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        #[test]
+        fn http_inspect_rejects_an_incomplete_auto_endpoint_bundle() {
+            let error = http_inspect_protocol_plan(
+                Some("http://127.0.0.1:8123/mcp"),
+                Some("http://127.0.0.1:8123/sse"),
+                None,
+                CliProtocolPolicy::Auto,
+            )
+            .expect_err("Auto must not infer a missing legacy message route");
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
+            assert!(
+                error
+                    .message
+                    .contains("requires a configured legacy message POST target"),
+                "the rejection must name the missing explicit endpoint"
             );
         }
 
@@ -10505,7 +10858,7 @@ mod tests {
                     assert_eq!(server, "./server");
                     assert_eq!(target, InstallTarget::Claude);
                     assert!(!dry_run);
-                    assert_eq!(protocol_policy, CliProtocolPolicy::Auto);
+                    assert_eq!(protocol_policy, CliProtocolPolicy::default());
                 }
                 _ => unreachable!("Expected Install command"),
             }
@@ -10700,7 +11053,7 @@ mod tests {
                     assert!(!no_reload);
                     assert_eq!(debounce, 100);
                     assert!(!clear);
-                    assert_eq!(protocol_policy, CliProtocolPolicy::Auto);
+                    assert_eq!(protocol_policy, CliProtocolPolicy::default());
                     assert!(!verbose);
                 }
                 _ => unreachable!("Expected Dev command"),
@@ -10885,7 +11238,7 @@ mod tests {
                 "command",
                 &arguments,
                 None,
-                CliProtocolPolicy::Auto,
+                CliProtocolPolicy::default(),
             )
             .err()
             .expect("oversized argument list must be rejected");
@@ -10896,18 +11249,19 @@ mod tests {
         #[test]
         fn generate_server_config_rejects_blank_names_and_commands() {
             let blank_name =
-                generate_server_config("  ", "server", &[], None, CliProtocolPolicy::Auto)
+                generate_server_config("  ", "server", &[], None, CliProtocolPolicy::default())
                     .err()
                     .expect("blank server name must be rejected");
             assert!(blank_name.message.contains("name"));
 
             let blank_command =
-                generate_server_config("server", "\t", &[], None, CliProtocolPolicy::Auto)
+                generate_server_config("server", "\t", &[], None, CliProtocolPolicy::default())
                     .err()
                     .expect("blank server command must be rejected");
             assert!(blank_command.message.contains("command"));
         }
 
+        #[cfg(feature = "legacy-2024-11-05")]
         #[test]
         fn install_policy_serializes_in_flat_client_configs() {
             for (policy, expected) in [
@@ -10930,6 +11284,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "legacy-2024-11-05")]
         #[test]
         fn install_policy_serializes_in_cline_transport_config() {
             for (policy, expected) in [
@@ -10990,6 +11345,7 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "legacy-2024-11-05")]
         #[test]
         fn install_merge_preserves_environment_in_cline_transport_shapes() {
             let (_, config) = generate_server_config(
