@@ -4,22 +4,24 @@
 //! in-memory pair below). This module never renders HTML and never routes Apps
 //! messages through MCP client/server RPC.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::{CoreResult, FinalCoreResult};
 use asupersync::Cx;
 use asupersync::channel::mpsc::{self, Receiver, Sender};
+use asupersync::combinator::select::{Either, Select};
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::{
     MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeAdmission,
     McpAppsBridgeDirection, McpAppsBridgeError, McpAppsBridgeImplementation,
-    McpAppsBridgeLifecycle, McpAppsBridgeRequestId, McpAppsDisplayModeParams,
-    McpAppsHostCapabilities, McpAppsHostContext, McpAppsHostIdAllocator, McpAppsHostNotification,
-    McpAppsHostRequest, McpAppsHostResponse, McpAppsHostToView, McpAppsInitializeParams,
-    McpAppsInitializeResult, McpAppsJsonRpcEnvelope, McpAppsJsonRpcError, McpAppsJsonRpcRequestId,
-    McpAppsOperationResult, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
-    McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult, McpAppsResourceTeardownParams,
+    McpAppsBridgeLifecycle, McpAppsBridgeRequestId, McpAppsCancelledControlParams,
+    McpAppsControlDisposition, McpAppsDisplayModeParams, McpAppsHostCapabilities,
+    McpAppsHostContext, McpAppsHostIdAllocator, McpAppsHostNotification, McpAppsHostRequest,
+    McpAppsHostResponse, McpAppsHostToView, McpAppsInitializeParams, McpAppsInitializeResult,
+    McpAppsJsonRpcEnvelope, McpAppsJsonRpcError, McpAppsJsonRpcRequestId, McpAppsOperationResult,
+    McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext, McpAppsPinnedInitializeParams,
+    McpAppsPinnedInitializeResult, McpAppsProgressControlParams, McpAppsResourceTeardownParams,
     McpAppsRoutedMethod, McpAppsViewLifecycle, McpAppsViewNotification, McpAppsViewRequest,
     McpAppsViewResponse, McpAppsViewToHost,
 };
@@ -711,6 +713,33 @@ pub trait McpAppsWireHostPolicy {
         Ok(())
     }
 
+    /// Observes progress for one exact Host-originated View request.
+    ///
+    /// The bridge calls this only after its negotiated lifecycle and the
+    /// request's `_meta.progressToken` bind the notification to `request_id`.
+    /// A token from another View or an already-completed request is rejected
+    /// before this hook can run.
+    async fn progress(
+        &mut self,
+        _request_id: &McpAppsJsonRpcRequestId,
+        _params: &McpAppsProgressControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        Ok(())
+    }
+
+    /// Observes one exact View-originated request cancellation.
+    ///
+    /// Returning success commits the bridge-side cancellation by releasing
+    /// that request correlation. An absent-ID cancellation remains the
+    /// protocol's explicit inert no-op and never reaches this hook.
+    async fn cancelled(
+        &mut self,
+        _request_id: &McpAppsJsonRpcRequestId,
+        _params: &McpAppsCancelledControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        Ok(())
+    }
+
     async fn approve_view_teardown(&mut self) -> bool {
         false
     }
@@ -732,6 +761,9 @@ pub struct McpAppsWireHost<T, P> {
     next_host_id: McpAppsHostIdAllocator,
     configuration: McpAppsWireHostConfiguration,
     policy: P,
+    /// Frames received while an admitted View request is still executing.
+    /// They are replayed through normal admission once that request resolves.
+    deferred_view_frames: VecDeque<String>,
 }
 
 impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T, P> {
@@ -749,6 +781,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             next_host_id: McpAppsHostIdAllocator::default(),
             configuration,
             policy,
+            deferred_view_frames: VecDeque::new(),
         }
     }
 
@@ -758,8 +791,16 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     }
 
     /// Receives, decodes, and atomically admits exactly one View frame.
+    ///
+    /// A View request remains request-owned while its policy work is pending:
+    /// this method concurrently receives one matching cancellation and drops
+    /// that work before committing the cancellation disposition. Other frames
+    /// are deferred and replayed after the request reaches a terminal result.
     pub async fn process_next(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
-        let frame = self.transport.receive_from_view(cx).await?;
+        let frame = match self.deferred_view_frames.pop_front() {
+            Some(frame) => frame,
+            None => self.transport.receive_from_view(cx).await?,
+        };
         let was_closing = self.admission.lifecycle() == McpAppsBridgeLifecycle::Closing;
         let envelope = self
             .admission
@@ -790,9 +831,73 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         method: McpAppsRoutedMethod,
         params: Option<Value>,
     ) -> Result<(), McpAppsHostError> {
-        let result = self
-            .dispatch_view_request(cx, method, params.as_ref())
-            .await;
+        let mut execution = Box::pin(Self::dispatch_view_request(
+            &mut self.policy,
+            &self.configuration,
+            cx,
+            method,
+            params.as_ref(),
+        ));
+        let mut deferred_error = None;
+        loop {
+            let mut incoming = Box::pin(self.transport.receive_from_view(cx));
+            let selected = Select::new(&mut execution, &mut incoming)
+                .await
+                .map_err(|error| McpAppsHostError::Transport(error.to_string()))?;
+            match selected {
+                Either::Left(result) => {
+                    drop(incoming);
+                    drop(execution);
+                    let completion = self.finish_view_request(cx, id, method, result).await;
+                    return match (completion, deferred_error) {
+                        (Err(error), _) => Err(error),
+                        (Ok(()), Some(error)) => Err(error),
+                        (Ok(()), None) => Ok(()),
+                    };
+                }
+                Either::Right(frame) => {
+                    drop(incoming);
+                    let frame = frame?;
+                    match Self::matching_view_cancellation(&self.admission, &id, &frame) {
+                        Ok(Some(params)) => {
+                            // Dropping the request-owned dispatch future is
+                            // its cancellation boundary. No response may race
+                            // the committed `notifications/cancelled` control.
+                            drop(execution);
+                            self.commit_view_cancellation(&id, &params).await?;
+                            return Ok(());
+                        }
+                        Ok(None) => {
+                            if self.deferred_view_frames.len() >= MAX_MCP_APPS_BRIDGE_IN_FLIGHT {
+                                drop(execution);
+                                self.admission
+                                    .complete_error(McpAppsBridgeDirection::ViewToHost, &id)
+                                    .map_err(McpAppsHostError::Bridge)?;
+                                return Err(McpAppsHostError::Bridge(
+                                    McpAppsBridgeError::TooManyInFlight,
+                                ));
+                            }
+                            self.deferred_view_frames.push_back(frame);
+                        }
+                        Err(error) => {
+                            // The malformed or unmatched control cannot affect
+                            // the live request. Surface it only after that
+                            // request has reached a terminal state.
+                            deferred_error.get_or_insert(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn finish_view_request(
+        &mut self,
+        cx: &Cx,
+        id: McpAppsJsonRpcRequestId,
+        method: McpAppsRoutedMethod,
+        result: Result<Value, McpAppsHostError>,
+    ) -> Result<(), McpAppsHostError> {
         match result {
             Ok(result) => {
                 McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
@@ -828,7 +933,8 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     }
 
     async fn dispatch_view_request(
-        &mut self,
+        policy: &mut P,
+        configuration: &McpAppsWireHostConfiguration,
         cx: &Cx,
         method: McpAppsRoutedMethod,
         params: Option<&Value>,
@@ -836,7 +942,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         match method {
             McpAppsRoutedMethod::Initialize => {
                 let params: McpAppsPinnedInitializeParams = decode_params(params)?;
-                serde_json::to_value(self.policy.initialize(&params, &self.configuration).await)
+                serde_json::to_value(policy.initialize(&params, configuration).await)
                     .map_err(|error| McpAppsHostError::Transport(error.to_string()))
             }
             McpAppsRoutedMethod::Ping => Ok(json!({})),
@@ -846,13 +952,13 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 .ok_or(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams)),
             McpAppsRoutedMethod::OpenLink
             | McpAppsRoutedMethod::DownloadFile
-            | McpAppsRoutedMethod::Message => self.policy.operation(method, params).await,
+            | McpAppsRoutedMethod::Message => policy.operation(method, params).await,
             method @ (McpAppsRoutedMethod::ToolsCall
             | McpAppsRoutedMethod::ResourcesRead
             | McpAppsRoutedMethod::ResourcesList
             | McpAppsRoutedMethod::ResourceTemplatesList
             | McpAppsRoutedMethod::PromptsList) => {
-                self.policy
+                policy
                     .dispatch_reused_request(cx, method, params.cloned())
                     .await
             }
@@ -862,12 +968,77 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         }
     }
 
+    fn matching_view_cancellation(
+        admission: &McpAppsBridgeAdmission,
+        request_id: &McpAppsJsonRpcRequestId,
+        frame: &str,
+    ) -> Result<Option<McpAppsCancelledControlParams>, McpAppsHostError> {
+        let McpAppsJsonRpcEnvelope::Notification {
+            method: McpAppsRoutedMethod::Cancelled,
+            params,
+        } = McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, frame)
+            .map_err(McpAppsHostError::Bridge)?
+        else {
+            return Ok(None);
+        };
+        let disposition = admission
+            .admit_control(
+                McpAppsBridgeDirection::ViewToHost,
+                McpAppsRoutedMethod::Cancelled,
+                params.as_ref(),
+            )
+            .map_err(McpAppsHostError::Bridge)?;
+        let McpAppsControlDisposition::Bound(bound_id) = disposition else {
+            return Ok(None);
+        };
+        if &bound_id != request_id {
+            return Ok(None);
+        }
+        decode_params(params.as_ref()).map(Some)
+    }
+
+    async fn commit_view_cancellation(
+        &mut self,
+        request_id: &McpAppsJsonRpcRequestId,
+        params: &McpAppsCancelledControlParams,
+    ) -> Result<(), McpAppsHostError> {
+        self.policy.cancelled(request_id, params).await?;
+        self.admission
+            .complete_error(McpAppsBridgeDirection::ViewToHost, request_id)
+            .map_err(McpAppsHostError::Bridge)
+    }
+
     async fn handle_view_notification(
         &mut self,
         cx: &Cx,
         method: McpAppsRoutedMethod,
         params: Option<Value>,
     ) -> Result<(), McpAppsHostError> {
+        match method {
+            McpAppsRoutedMethod::Progress => {
+                let disposition = self
+                    .admission
+                    .admit_control(McpAppsBridgeDirection::ViewToHost, method, params.as_ref())
+                    .map_err(McpAppsHostError::Bridge)?;
+                if let McpAppsControlDisposition::Bound(request_id) = disposition {
+                    let params = decode_params(params.as_ref())?;
+                    self.policy.progress(&request_id, &params).await?;
+                }
+                return Ok(());
+            }
+            McpAppsRoutedMethod::Cancelled => {
+                let disposition = self
+                    .admission
+                    .admit_control(McpAppsBridgeDirection::ViewToHost, method, params.as_ref())
+                    .map_err(McpAppsHostError::Bridge)?;
+                if let McpAppsControlDisposition::Bound(request_id) = disposition {
+                    let params = decode_params(params.as_ref())?;
+                    self.commit_view_cancellation(&request_id, &params).await?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         self.policy.notification(method, params.as_ref()).await?;
         if method == McpAppsRoutedMethod::RequestTeardown
             && self.policy.approve_view_teardown().await
@@ -875,6 +1046,55 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             self.begin_teardown(cx).await?;
         }
         Ok(())
+    }
+
+    /// Sends one active-phase Host-to-View request with an independent bridge
+    /// correlation. `ui/resource-teardown` has stricter lifecycle handling,
+    /// so callers must use [`Self::begin_teardown`] for that request.
+    ///
+    /// An optional progress token is bound before the frame commits. A View's
+    /// matching `notifications/progress` is delivered to
+    /// [`McpAppsWireHostPolicy::progress`] with this returned request ID.
+    pub async fn send_host_request(
+        &mut self,
+        cx: &Cx,
+        request: McpAppsHostRequest,
+        progress_token: Option<McpAppsJsonRpcRequestId>,
+    ) -> Result<McpAppsJsonRpcRequestId, McpAppsHostError> {
+        if self.admission.lifecycle() != McpAppsBridgeLifecycle::Active {
+            return Err(McpAppsHostError::Bridge(
+                McpAppsBridgeError::InvalidLifecycle,
+            ));
+        }
+        let (method, params) = wire_host_request_parts(request)?;
+        let id = self
+            .next_host_id
+            .allocate()
+            .map_err(McpAppsHostError::Bridge)?;
+        let envelope = McpAppsJsonRpcEnvelope::Request {
+            id: id.clone(),
+            method,
+            params,
+            progress_token: progress_token.clone(),
+        };
+        let frame = envelope
+            .encode(McpAppsBridgeDirection::HostToView)
+            .map_err(McpAppsHostError::Bridge)?;
+        self.admission
+            .admit_request(
+                McpAppsBridgeDirection::HostToView,
+                id.clone(),
+                method,
+                progress_token,
+            )
+            .map_err(McpAppsHostError::Bridge)?;
+        let sent = self.transport.send_to_view(cx, frame).await;
+        if sent.is_err() {
+            self.admission
+                .complete_error(McpAppsBridgeDirection::HostToView, &id)
+                .map_err(McpAppsHostError::Bridge)?;
+        }
+        sent.map(|()| id)
     }
 
     /// Starts a Host-approved teardown. A failed carrier send restores the
@@ -926,6 +1146,28 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             .map_err(McpAppsHostError::Bridge)?;
         self.transport.send_to_view(cx, frame).await
     }
+}
+
+fn wire_host_request_parts(
+    request: McpAppsHostRequest,
+) -> Result<(McpAppsRoutedMethod, Option<Value>), McpAppsHostError> {
+    match request {
+        McpAppsHostRequest::ToolsList(params) => encode_wire_host_request_params(params)
+            .map(|params| (McpAppsRoutedMethod::ToolsList, Some(params))),
+        McpAppsHostRequest::CallTool(params) => encode_wire_host_request_params(params)
+            .map(|params| (McpAppsRoutedMethod::ToolsCall, Some(params))),
+        McpAppsHostRequest::Ping(params) => encode_wire_host_request_params(params)
+            .map(|params| (McpAppsRoutedMethod::Ping, Some(params))),
+        McpAppsHostRequest::ResourceTeardown(_) => Err(McpAppsHostError::Bridge(
+            McpAppsBridgeError::InvalidLifecycle,
+        )),
+    }
+}
+
+fn encode_wire_host_request_params<T: serde::Serialize>(
+    value: T,
+) -> Result<Value, McpAppsHostError> {
+    serde_json::to_value(value).map_err(|error| McpAppsHostError::Transport(error.to_string()))
 }
 
 fn decode_params<T: serde::de::DeserializeOwned>(
@@ -1044,6 +1286,8 @@ impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use fastmcp_core::{McpErrorCode, block_on};
     use fastmcp_protocol::extensions::{
@@ -1172,9 +1416,8 @@ mod tests {
             },
             "uri": "file:///bridge-test"
         });
-        let request =
-            CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params))
-                .expect("final resources/read request admits its selected result algebra");
+        let request = CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", Some(&params))
+            .expect("final resources/read request admits its selected result algebra");
         request
             .decode_result(
                 &serde_json::to_string(&result).expect("selected result serializes for decoding"),
@@ -1575,6 +1818,83 @@ mod tests {
         }
     }
 
+    struct ControlRecordingWirePolicy {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl McpAppsWireHostPolicy for ControlRecordingWirePolicy {
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _method: McpAppsRoutedMethod,
+            _params: Option<Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            Ok(json!({"forwarded": true}))
+        }
+
+        async fn progress(
+            &mut self,
+            request_id: &McpAppsJsonRpcRequestId,
+            _params: &McpAppsProgressControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            self.events
+                .lock()
+                .expect("test policy events lock")
+                .push(format!("progress:{request_id:?}"));
+            Ok(())
+        }
+
+        async fn cancelled(
+            &mut self,
+            request_id: &McpAppsJsonRpcRequestId,
+            _params: &McpAppsCancelledControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            self.events
+                .lock()
+                .expect("test policy events lock")
+                .push(format!("cancelled:{request_id:?}"));
+            Ok(())
+        }
+    }
+
+    struct YieldOnceCancellationWirePolicy {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl McpAppsWireHostPolicy for YieldOnceCancellationWirePolicy {
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _method: McpAppsRoutedMethod,
+            _params: Option<Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            let mut yielded = false;
+            std::future::poll_fn(move |task| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    task.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            Ok(json!({"forwarded": true}))
+        }
+
+        async fn cancelled(
+            &mut self,
+            request_id: &McpAppsJsonRpcRequestId,
+            _params: &McpAppsCancelledControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            self.events
+                .lock()
+                .expect("test policy events lock")
+                .push(format!("cancelled:{request_id:?}"));
+            Ok(())
+        }
+    }
+
     fn wire_configuration() -> McpAppsWireHostConfiguration {
         McpAppsWireHostConfiguration {
             host_info: app(),
@@ -1696,6 +2016,408 @@ mod tests {
                 Err(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))
             ));
             assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+        });
+    }
+
+    #[test]
+    fn closed_wire_host_request_initiation_binds_matching_progress_before_completion() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                wire_configuration(),
+                ControlRecordingWirePolicy {
+                    events: Arc::clone(&events),
+                },
+                activation_proof(),
+            );
+            host.admission = active_wire_admission();
+            let token = McpAppsJsonRpcRequestId::string("host-progress".to_owned())
+                .expect("bounded progress token");
+            let request_id = host
+                .send_host_request(
+                    &cx,
+                    McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()),
+                    Some(token.clone()),
+                )
+                .await
+                .expect("active Host may initiate a View ping");
+            let request = view
+                .receive_from_host(&cx)
+                .await
+                .expect("View receives the Host request");
+            assert!(matches!(
+                McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::HostToView, &request),
+                Ok(McpAppsJsonRpcEnvelope::Request {
+                    id,
+                    method: McpAppsRoutedMethod::Ping,
+                    progress_token: Some(progress_token),
+                    ..
+                }) if id == request_id && progress_token == token
+            ));
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"host-progress","progress":1.0}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("View progress reaches Host");
+            host.process_next(&cx)
+                .await
+                .expect("bound View progress is delivered to the policy");
+            assert_eq!(
+                events.lock().expect("test policy events lock").as_slice(),
+                ["progress:Number(1)"],
+                "the progress disposition must select the Host-owned request ID"
+            );
+
+            view.send_to_host(
+                &cx,
+                serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": {}}).to_string(),
+            )
+            .await
+            .expect("View response reaches Host");
+            host.process_next(&cx)
+                .await
+                .expect("matching View response completes the Host request");
+        });
+    }
+
+    #[test]
+    fn closed_wire_process_next_cancels_the_real_live_view_request_without_a_response() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                wire_configuration(),
+                YieldOnceCancellationWirePolicy {
+                    events: Arc::clone(&events),
+                },
+                activation_proof(),
+            );
+
+            view.send_to_host(
+                &cx,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "method": "ui/initialize",
+                    "params": {
+                        "appInfo": {"name": "view", "version": "1"},
+                        "appCapabilities": {},
+                        "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .expect("View initialize reaches the public Host runtime");
+            host.process_next(&cx)
+                .await
+                .expect("Host commits initialize response");
+            let _ = view
+                .receive_from_host(&cx)
+                .await
+                .expect("View receives initialize response");
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#.to_owned(),
+            )
+            .await
+            .expect("View initialized notification reaches Host");
+            host.process_next(&cx)
+                .await
+                .expect("Host becomes active through the public lifecycle");
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","id":"view-call","method":"tools/call","params":{"name":"weather","arguments":{}}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("View request reaches Host");
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("matching View cancellation reaches the same live runtime");
+            host.process_next(&cx)
+                .await
+                .expect("process_next receives cancellation while request policy work is live");
+            assert_eq!(
+                events.lock().expect("test policy events lock").as_slice(),
+                ["cancelled:String(\"view-call\")"]
+            );
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","id":"after-cancel","method":"ping","params":{}}"#.to_owned(),
+            )
+            .await
+            .expect("View sends a later request after cancellation");
+            host.process_next(&cx)
+                .await
+                .expect("Host remains usable after cancellation");
+            assert!(matches!(
+                McpAppsJsonRpcEnvelope::decode(
+                    McpAppsBridgeDirection::HostToView,
+                    &view
+                        .receive_from_host(&cx)
+                        .await
+                        .expect("the first post-cancel response is available"),
+                ),
+                Ok(McpAppsJsonRpcEnvelope::Response {
+                    id: McpAppsJsonRpcRequestId::String(id),
+                    result,
+                }) if id == "after-cancel" && result == json!({})
+            ));
+        });
+    }
+
+    #[test]
+    fn closed_wire_one_variable_wrong_cancellation_preserves_the_real_live_view_request() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                wire_configuration(),
+                YieldOnceCancellationWirePolicy {
+                    events: Arc::clone(&events),
+                },
+                activation_proof(),
+            );
+
+            view.send_to_host(
+                &cx,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": "initialize",
+                    "method": "ui/initialize",
+                    "params": {
+                        "appInfo": {"name": "view", "version": "1"},
+                        "appCapabilities": {},
+                        "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION,
+                    },
+                })
+                .to_string(),
+            )
+            .await
+            .expect("View initialize reaches the public Host runtime");
+            host.process_next(&cx)
+                .await
+                .expect("Host commits initialize response");
+            let _ = view
+                .receive_from_host(&cx)
+                .await
+                .expect("View receives initialize response");
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"ui/notifications/initialized"}"#.to_owned(),
+            )
+            .await
+            .expect("View initialized notification reaches Host");
+            host.process_next(&cx)
+                .await
+                .expect("Host becomes active through the public lifecycle");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","id":"view-call","method":"tools/call","params":{"name":"weather","arguments":{}}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("View request reaches Host");
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("only the cancellation request ID changes");
+            assert!(matches!(
+                host.process_next(&cx).await,
+                Err(McpAppsHostError::Bridge(
+                    McpAppsBridgeError::UnknownCorrelation
+                ))
+            ));
+            assert!(events.lock().expect("test policy events lock").is_empty());
+            assert!(matches!(
+                McpAppsJsonRpcEnvelope::decode(
+                    McpAppsBridgeDirection::HostToView,
+                    &view
+                        .receive_from_host(&cx)
+                        .await
+                        .expect("the preserved request still receives its response"),
+                ),
+                Ok(McpAppsJsonRpcEnvelope::Response {
+                    id: McpAppsJsonRpcRequestId::String(id),
+                    result,
+                }) if id == "view-call" && result == json!({"forwarded": true})
+            ));
+        });
+    }
+
+    #[test]
+    fn closed_wire_one_variable_wrong_progress_token_preserves_the_host_request() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                wire_configuration(),
+                ControlRecordingWirePolicy {
+                    events: Arc::clone(&events),
+                },
+                activation_proof(),
+            );
+            host.admission = active_wire_admission();
+            let request_id = host
+                .send_host_request(
+                    &cx,
+                    McpAppsHostRequest::Ping(fastmcp_protocol::McpAppsPingParams::default()),
+                    Some(
+                        McpAppsJsonRpcRequestId::string("host-progress".to_owned())
+                            .expect("bounded progress token"),
+                    ),
+                )
+                .await
+                .expect("active Host may initiate a View ping");
+            let _ = view
+                .receive_from_host(&cx)
+                .await
+                .expect("View receives the Host request");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"other-progress","progress":1.0}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("near-identical View progress reaches Host");
+            assert!(matches!(
+                host.process_next(&cx).await,
+                Err(McpAppsHostError::Bridge(
+                    McpAppsBridgeError::UnknownProgressToken
+                ))
+            ));
+            assert!(events.lock().expect("test policy events lock").is_empty());
+
+            view.send_to_host(
+                &cx,
+                serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": {}}).to_string(),
+            )
+            .await
+            .expect("matching View response reaches Host");
+            host.process_next(&cx)
+                .await
+                .expect("wrong progress cannot complete the Host request");
+        });
+    }
+
+    #[test]
+    fn closed_wire_cancelled_control_releases_only_the_bound_view_request() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                wire_configuration(),
+                ControlRecordingWirePolicy {
+                    events: Arc::clone(&events),
+                },
+                activation_proof(),
+            );
+            host.admission = active_wire_admission();
+            let request_id = McpAppsJsonRpcRequestId::string("view-call".to_owned())
+                .expect("bounded View request ID");
+            host.admission
+                .admit_request(
+                    McpAppsBridgeDirection::ViewToHost,
+                    request_id.clone(),
+                    McpAppsRoutedMethod::ToolsCall,
+                    None,
+                )
+                .expect("test View request is live before its cancellation");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("View cancellation reaches Host");
+            host.process_next(&cx)
+                .await
+                .expect("bound cancellation reaches policy and releases the request");
+
+            assert_eq!(
+                events.lock().expect("test policy events lock").as_slice(),
+                ["cancelled:String(\"view-call\")"]
+            );
+            assert_eq!(
+                host.admission
+                    .complete_error(McpAppsBridgeDirection::ViewToHost, &request_id),
+                Err(McpAppsBridgeError::UnknownCorrelation),
+                "a bound cancellation must release its exact live correlation"
+            );
+        });
+    }
+
+    #[test]
+    fn closed_wire_one_variable_wrong_cancelled_id_preserves_the_live_request() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                wire_configuration(),
+                ControlRecordingWirePolicy {
+                    events: Arc::clone(&events),
+                },
+                activation_proof(),
+            );
+            host.admission = active_wire_admission();
+            let request_id = McpAppsJsonRpcRequestId::string("view-call".to_owned())
+                .expect("bounded View request ID");
+            host.admission
+                .admit_request(
+                    McpAppsBridgeDirection::ViewToHost,
+                    request_id.clone(),
+                    McpAppsRoutedMethod::ToolsCall,
+                    None,
+                )
+                .expect("test View request is live before the near-identical control");
+
+            view.send_to_host(
+                &cx,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#
+                    .to_owned(),
+            )
+            .await
+            .expect("near-identical cancellation reaches Host");
+            assert!(matches!(
+                host.process_next(&cx).await,
+                Err(McpAppsHostError::Bridge(
+                    McpAppsBridgeError::UnknownCorrelation
+                ))
+            ));
+            assert!(events.lock().expect("test policy events lock").is_empty());
+            host.admission
+                .complete_error(McpAppsBridgeDirection::ViewToHost, &request_id)
+                .expect("the unmatched control preserves the original correlation");
         });
     }
 

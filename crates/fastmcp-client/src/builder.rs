@@ -29,21 +29,25 @@ use std::collections::HashMap;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
-use fastmcp_protocol::extensions::McpAppsClientSettings;
+use fastmcp_protocol::extensions::{
+    ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
+    McpAppsClientSettings,
+};
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
 
 use crate::{
-    ChildGuard, ChildOwnership, Client, ClientHttpConnection, ClientHttpConnectionError,
-    ClientHttpNegotiation, ClientHttpNegotiationError, ClientProtocolPlan, ClientSession,
-    HttpClient, HttpClientError, ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy,
-    ReverseRequestHandlers, combine_operation_with_cleanup, is_cleanup_unverified,
-    resolve_stdio_command,
+    ChildGuard, ChildOwnership, Client, ClientExtensionRuntime, ClientHttpConnection,
+    ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationError,
+    ClientProtocolPlan, ClientSession, HttpClient, HttpClientError, ModernHttpClientError,
+    ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
+    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
 };
 
 /// The maximum number of connection attempts admitted by the client retry policy.
@@ -157,6 +161,8 @@ pub struct ClientBuilder {
     reverse_request_handlers: ReverseRequestHandlers,
     /// Optional official MCP Apps client settings for final discovery.
     mcp_apps_settings: Option<McpAppsClientSettings>,
+    /// Frozen generic final extension descriptors, local settings, and resolver.
+    client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     /// Whether to defer initialization until first use.
     auto_initialize: bool,
     /// Whether the subprocess must be isolated in an owned Unix process group.
@@ -186,6 +192,10 @@ impl std::fmt::Debug for ClientBuilder {
                 &!self.reverse_request_handlers.is_empty(),
             )
             .field("mcp_apps_configured", &self.mcp_apps_settings.is_some())
+            .field(
+                "client_extension_registry_configured",
+                &self.client_extension_runtime.is_some(),
+            )
             .field("auto_initialize", &self.auto_initialize)
             .field("owned_process_group", &self.owned_process_group)
             .finish()
@@ -222,6 +232,7 @@ impl ClientBuilder {
             capabilities: ClientCapabilities::default(),
             reverse_request_handlers: ReverseRequestHandlers::new(),
             mcp_apps_settings: None,
+            client_extension_runtime: None,
             auto_initialize: false,
             owned_process_group: false,
             protocol_plan: ClientProtocolPlan::stdio(
@@ -382,6 +393,41 @@ impl ClientBuilder {
         self
     }
 
+    /// Installs a final-only client extension registry and its local discovery settings.
+    ///
+    /// The builder validates every local settings owner and freezes the
+    /// descriptor registry before any connection exists. The resolver factory
+    /// is invoked once for every discovery connection or retry, and must
+    /// return an independent resolver instance rather than a shared mutable
+    /// handle. A resolver itself is intentionally not accepted: `Clone` does
+    /// not prove that `Arc<Mutex<_>>`-backed state is isolated. A successful modern
+    /// `server/discover` then produces one retained bilateral extension set;
+    /// [`Client::request_final_extension`](crate::Client::request_final_extension)
+    /// and its HTTP counterpart admit only client-to-server methods from that
+    /// set. Exact MCP 2024-11-05 never negotiates or exposes this surface.
+    pub fn extension_registry<F, R>(
+        mut self,
+        descriptors: ExtensionDescriptorRegistry,
+        client_discovery: ClientExtensionDiscovery,
+        resolver_factory: F,
+    ) -> McpResult<Self>
+    where
+        F: Fn() -> R + Send + Sync + 'static,
+        R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+    {
+        if self.client_extension_runtime.is_some() {
+            return Err(McpError::invalid_params(
+                "Client extension registry is already configured",
+            ));
+        }
+        self.client_extension_runtime = Some(Arc::new(ClientExtensionRuntime::new(
+            descriptors,
+            client_discovery,
+            resolver_factory,
+        )?));
+        Ok(self)
+    }
+
     /// Enables auto-initialization mode.
     ///
     /// When enabled, the client defers the MCP initialization handshake until
@@ -481,17 +527,20 @@ impl ClientBuilder {
         self,
         cx: &Cx,
     ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
-        self.validate_reverse_callback_configuration(&self.protocol_plan)
+        let builder = self.selected_legacy_builder_with_reverse_handlers();
+        builder
+            .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(|_| Self::http_policy_admission_error())?;
-        let reverse_request_handlers = self.reverse_request_handlers.clone();
+        let reverse_request_handlers = builder.reverse_request_handlers.clone();
         let legacy_capabilities =
-            legacy_capabilities_for_handlers(&self.capabilities, &reverse_request_handlers);
-        let mut connection = ClientHttpConnection::connect_with_mcp_apps(
+            legacy_capabilities_for_handlers(&builder.capabilities, &reverse_request_handlers);
+        let mut connection = ClientHttpConnection::connect_with_extensions(
             cx,
-            self.protocol_plan,
-            self.client_info,
-            self.capabilities,
-            self.mcp_apps_settings,
+            builder.protocol_plan,
+            builder.client_info,
+            builder.capabilities,
+            builder.mcp_apps_settings,
+            builder.client_extension_runtime,
         )
         .await?;
 
@@ -525,15 +574,18 @@ impl ClientBuilder {
     /// are ready only after `initialize` and `notifications/initialized` have
     /// both completed on the admitted legacy routes.
     pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
-        self.validate_reverse_callback_configuration(&self.protocol_plan)
+        let builder = self.selected_legacy_builder_with_reverse_handlers();
+        builder
+            .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(HttpClientError::CoreResult)?;
-        let reverse_request_handlers = self.reverse_request_handlers.clone();
-        HttpClient::connect_with_mcp_apps(
+        let reverse_request_handlers = builder.reverse_request_handlers.clone();
+        HttpClient::connect_with_extensions(
             cx,
-            self.protocol_plan,
-            self.client_info,
-            self.capabilities,
-            self.mcp_apps_settings,
+            builder.protocol_plan,
+            builder.client_info,
+            builder.capabilities,
+            builder.mcp_apps_settings,
+            builder.client_extension_runtime,
             reverse_request_handlers,
         )
         .await
@@ -681,15 +733,25 @@ impl ClientBuilder {
         retry_deadline: Instant,
     ) -> McpResult<Client> {
         match self.protocol_plan.policy() {
-            ProtocolPolicy::ModernOnly | ProtocolPolicy::LegacyOnly => self
-                .try_connect_with_protocol_plan(
+            ProtocolPolicy::ModernOnly => self.try_connect_with_protocol_plan(
+                command,
+                args,
+                cx,
+                self.protocol_plan.clone(),
+                self.auto_initialize,
+                retry_deadline,
+            ),
+            ProtocolPolicy::LegacyOnly => {
+                let legacy_builder = self.legacy_builder_with_reverse_handlers();
+                legacy_builder.try_connect_with_protocol_plan(
                     command,
                     args,
                     cx,
                     self.protocol_plan.clone(),
                     self.auto_initialize,
                     retry_deadline,
-                ),
+                )
+            }
             ProtocolPolicy::Auto => self.try_connect_auto(command, args, cx, retry_deadline),
         }
     }
@@ -707,6 +769,18 @@ impl ClientBuilder {
             &builder.reverse_request_handlers,
         );
         builder
+    }
+
+    /// Applies callback-derived capabilities only when the immutable plan has
+    /// already selected exact MCP 2024-11-05.
+    ///
+    /// This is intentionally distinct from Auto: a modern discovery probe
+    /// must remain free of legacy reverse-request capability claims.
+    fn selected_legacy_builder_with_reverse_handlers(&self) -> Self {
+        match self.protocol_plan.policy() {
+            ProtocolPolicy::LegacyOnly => self.legacy_builder_with_reverse_handlers(),
+            ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => self.clone(),
+        }
     }
 
     /// Selects an era with a disposable modern child before exposing a client.
@@ -977,6 +1051,7 @@ impl ClientBuilder {
             fastmcp_protocol::ServerCapabilities::default(),
         )
         .with_mcp_apps_settings(self.mcp_apps_settings.clone())
+        .with_client_extension_runtime(self.client_extension_runtime.clone())
         .with_protocol_plan(protocol_plan);
 
         let mut client = Client::from_parts_uninitialized_with_ownership(
@@ -1107,7 +1182,10 @@ mod tests {
             .with_roots_list(|_cancellation, _params| {
                 Ok(fastmcp_protocol::ListRootsResult::new(Vec::new()))
             });
-        let builder = ClientBuilder::new().reverse_request_handlers(handlers);
+        let builder = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+            .reverse_request_handlers(handlers);
+        let builder = builder.selected_legacy_builder_with_reverse_handlers();
 
         assert!(builder.capabilities.sampling.is_some());
         assert_eq!(
@@ -1119,9 +1197,7 @@ mod tests {
             Some(false)
         );
         builder
-            .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
-                ProtocolPolicy::LegacyOnly,
-            ))
+            .validate_reverse_callback_configuration(builder.selected_protocol_plan())
             .expect("derived callbacks and advertised legacy capabilities agree");
     }
 
