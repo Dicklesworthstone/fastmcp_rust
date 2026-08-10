@@ -55,6 +55,15 @@ pub const MAX_PATTERN_PROPERTIES: usize = 64;
 /// Maximum UTF-8 bytes in one locally compiled pattern-property expression.
 pub const MAX_PATTERN_PROPERTY_BYTES: usize = 4 * 1024;
 
+/// Maximum UTF-8 bytes in one locally compiled `pattern` expression.
+pub const MAX_PATTERN_BYTES: usize = 4 * 1024;
+
+/// Maximum entries accepted by one final-schema assertion payload.
+pub const MAX_SCHEMA_ASSERTION_ENTRIES: usize = 64;
+
+/// Maximum UTF-8 bytes in one final-schema assertion string.
+pub const MAX_SCHEMA_ASSERTION_STRING_BYTES: usize = 4 * 1024;
+
 /// Maximum validation errors retained for one public `validate` call.
 pub const MAX_VALIDATION_ERRORS: usize = 64;
 
@@ -314,11 +323,16 @@ fn validate_final_schema_node(
     validate_boolean_keywords(object, path, &["uniqueItems"])?;
     validate_enum_keyword(object, path)?;
     if let Some(value) = object.get("const") {
-        validate_exact_equality_value(value, &format!("{path}.const"))?;
+        validate_exact_equality_value(value, &format!("{path}.const"), depth + 1, node_count)?;
     }
     if let Some(values) = object.get("enum").and_then(Value::as_array) {
         for (index, value) in values.iter().enumerate() {
-            validate_exact_equality_value(value, &format!("{path}.enum[{index}]"))?;
+            validate_exact_equality_value(
+                value,
+                &format!("{path}.enum[{index}]"),
+                depth + 1,
+                node_count,
+            )?;
         }
     }
     validate_pattern_keyword(object, path)?;
@@ -535,13 +549,96 @@ fn validate_local_reference_keyword(
             "external schema reference is not allowed",
         ));
     }
-    if resolve_local_reference(root_schema, reference).is_err() {
-        return Err(SchemaAdmissionError::new(
-            format!("{path}.{keyword}"),
-            "unresolved local schema reference",
-        ));
+    match resolve_local_reference(root_schema, reference) {
+        Ok(target) if target.is_boolean() || target.is_object() => {
+            if !is_admitted_schema_node(root_schema, target) {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "local schema reference target is not an admitted schema node",
+                ));
+            }
+        }
+        Ok(_) => {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "local schema reference target must be an object or boolean",
+            ));
+        }
+        Err(_) => {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "unresolved local schema reference",
+            ));
+        }
     }
     Ok(())
+}
+
+/// Returns whether `target` occupies a schema-valued location in the final
+/// schema document. Annotation values can be objects too, but are never
+/// schemas merely by shape.
+fn is_admitted_schema_node(schema: &Value, target: &Value) -> bool {
+    if std::ptr::eq(schema, target) {
+        return true;
+    }
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "dependentSchemas",
+    ] {
+        if object
+            .get(keyword)
+            .and_then(Value::as_object)
+            .is_some_and(|subschemas| {
+                subschemas
+                    .values()
+                    .any(|subschema| is_admitted_schema_node(subschema, target))
+            })
+        {
+            return true;
+        }
+    }
+
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+    ] {
+        if object
+            .get(keyword)
+            .is_some_and(|subschema| is_admitted_schema_node(subschema, target))
+        {
+            return true;
+        }
+    }
+
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        if object
+            .get(keyword)
+            .and_then(Value::as_array)
+            .is_some_and(|subschemas| {
+                subschemas
+                    .iter()
+                    .any(|subschema| is_admitted_schema_node(subschema, target))
+            })
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn validate_anchor_keyword(
@@ -693,29 +790,80 @@ fn validate_string_array_keyword(
                 "dependentRequired must be an object",
             )
         })?;
-        if dependencies.values().all(|required| {
-            required
-                .as_array()
-                .is_some_and(|members| members.iter().all(Value::is_string))
-        }) {
-            return Ok(());
+        if dependencies.len() > MAX_SCHEMA_ASSERTION_ENTRIES {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.{keyword}"),
+                "dependentRequired exceeds entry limit",
+            ));
         }
-        return Err(SchemaAdmissionError::new(
-            format!("{path}.{keyword}"),
-            "dependentRequired values must be arrays of strings",
-        ));
+        let mut validation_work = dependencies.len();
+        for (trigger, required) in dependencies {
+            if trigger.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "dependentRequired string exceeds byte limit",
+                ));
+            }
+            let members = required.as_array().ok_or_else(|| {
+                SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "dependentRequired values must be arrays of strings",
+                )
+            })?;
+            if members.len() > MAX_SCHEMA_ASSERTION_ENTRIES {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "dependentRequired values exceed entry limit",
+                ));
+            }
+            validation_work = validation_work.checked_add(members.len()).ok_or_else(|| {
+                SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "dependentRequired exceeds validation work budget",
+                )
+            })?;
+            if validation_work >= MAX_SCHEMA_VALIDATION_WORK {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "dependentRequired exceeds validation work budget",
+                ));
+            }
+            if members.iter().any(|member| {
+                member
+                    .as_str()
+                    .is_none_or(|member| member.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES)
+            }) {
+                return Err(SchemaAdmissionError::new(
+                    format!("{path}.{keyword}"),
+                    "dependentRequired values must be bounded strings",
+                ));
+            }
+        }
+        return Ok(());
     }
-    if value
-        .as_array()
-        .is_some_and(|members| members.iter().all(Value::is_string))
-    {
-        Ok(())
-    } else {
-        Err(SchemaAdmissionError::new(
+    let members = value.as_array().ok_or_else(|| {
+        SchemaAdmissionError::new(
             format!("{path}.{keyword}"),
             "schema string-array keyword must be an array of strings",
-        ))
+        )
+    })?;
+    if members.len() > MAX_SCHEMA_ASSERTION_ENTRIES {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.{keyword}"),
+            "required exceeds entry limit",
+        ));
     }
+    if members.iter().any(|member| {
+        member
+            .as_str()
+            .is_none_or(|member| member.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES)
+    }) {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.{keyword}"),
+            "schema string-array keyword must contain bounded strings",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_nonnegative_integer_keywords(
@@ -724,7 +872,10 @@ fn validate_nonnegative_integer_keywords(
     keywords: &[&str],
 ) -> Result<(), SchemaAdmissionError> {
     for keyword in keywords {
-        if object.get(*keyword).is_some_and(|value| !value.is_u64()) {
+        if object.get(*keyword).is_some_and(|value| {
+            ExactDecimal::from_value(value)
+                .is_none_or(|number| number.negative || !number.is_integer())
+        }) {
             return Err(SchemaAdmissionError::new(
                 format!("{path}.{keyword}"),
                 "schema count keyword must be a nonnegative integer",
@@ -776,14 +927,22 @@ fn validate_enum_keyword(
     object: &serde_json::Map<String, Value>,
     path: &str,
 ) -> Result<(), SchemaAdmissionError> {
-    if object
-        .get("enum")
-        .is_some_and(|value| !value.as_array().is_some_and(|values| !values.is_empty()))
-    {
-        return Err(SchemaAdmissionError::new(
-            format!("{path}.enum"),
-            "enum must be a nonempty array",
-        ));
+    if let Some(value) = object.get("enum") {
+        let values = value.as_array().ok_or_else(|| {
+            SchemaAdmissionError::new(format!("{path}.enum"), "enum must be a nonempty array")
+        })?;
+        if values.is_empty() {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.enum"),
+                "enum must be a nonempty array",
+            ));
+        }
+        if values.len() > MAX_SCHEMA_ASSERTION_ENTRIES {
+            return Err(SchemaAdmissionError::new(
+                format!("{path}.enum"),
+                "enum exceeds entry limit",
+            ));
+        }
     }
     Ok(())
 }
@@ -791,7 +950,25 @@ fn validate_enum_keyword(
 /// Refuses an admitted equality assertion that the bounded final validator
 /// could not compare reflexively. This applies to `const` and every `enum`
 /// member, including numbers nested inside arrays or objects.
-fn validate_exact_equality_value(value: &Value, path: &str) -> Result<(), SchemaAdmissionError> {
+fn validate_exact_equality_value(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    node_count: &mut usize,
+) -> Result<(), SchemaAdmissionError> {
+    if depth >= MAX_SCHEMA_VALIDATION_DEPTH {
+        return Err(SchemaAdmissionError::new(
+            path,
+            "schema admission nesting limit exceeded",
+        ));
+    }
+    *node_count += 1;
+    if *node_count > MAX_SCHEMA_ADMISSION_NODES {
+        return Err(SchemaAdmissionError::new(
+            path,
+            "schema admission node limit exceeded",
+        ));
+    }
     match value {
         Value::Number(number) if ExactDecimal::from_number(number).is_none() => {
             Err(SchemaAdmissionError::new(
@@ -799,15 +976,34 @@ fn validate_exact_equality_value(value: &Value, path: &str) -> Result<(), Schema
                 "const or enum value exceeds exact numeric equality bound",
             ))
         }
+        Value::String(string) if string.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES => Err(
+            SchemaAdmissionError::new(path, "schema assertion string exceeds byte limit"),
+        ),
         Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
-                validate_exact_equality_value(value, &format!("{path}[{index}]"))?;
+                validate_exact_equality_value(
+                    value,
+                    &format!("{path}[{index}]"),
+                    depth + 1,
+                    node_count,
+                )?;
             }
             Ok(())
         }
         Value::Object(values) => {
             for (name, value) in values {
-                validate_exact_equality_value(value, &format!("{path}.{name}"))?;
+                if name.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES {
+                    return Err(SchemaAdmissionError::new(
+                        path,
+                        "schema assertion string exceeds byte limit",
+                    ));
+                }
+                validate_exact_equality_value(
+                    value,
+                    &format!("{path}.{name}"),
+                    depth + 1,
+                    node_count,
+                )?;
             }
             Ok(())
         }
@@ -825,6 +1021,12 @@ fn validate_pattern_keyword(
     let pattern = pattern.as_str().ok_or_else(|| {
         SchemaAdmissionError::new(format!("{path}.pattern"), "pattern must be a string")
     })?;
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.pattern"),
+            "pattern exceeds byte limit",
+        ));
+    }
     if Regex::new(pattern).is_ok() {
         Ok(())
     } else {
@@ -1274,13 +1476,22 @@ fn validate_internal(
     if let Some(enum_val) = schema_obj.get("enum") {
         if let Some(enum_arr) = enum_val.as_array() {
             let matches = if context.enforce_unevaluated_properties {
-                enum_arr
-                    .iter()
-                    .any(|candidate| json_schema_equal(candidate, value))
+                let mut matches = false;
+                for candidate in enum_arr {
+                    match json_schema_equal_with_work(candidate, value, path, errors, context) {
+                        Some(true) => {
+                            matches = true;
+                            break;
+                        }
+                        Some(false) => {}
+                        None => break,
+                    }
+                }
+                matches
             } else {
                 enum_arr.contains(value)
             };
-            if !matches {
+            if !matches && !context.work_exhausted {
                 push_error(errors, path, format!("value must be one of: {enum_arr:?}"));
             }
         }
@@ -1289,11 +1500,11 @@ fn validate_internal(
     // Check const constraint
     if let Some(const_val) = schema_obj.get("const") {
         let matches = if context.enforce_unevaluated_properties {
-            json_schema_equal(value, const_val)
+            json_schema_equal_with_work(value, const_val, path, errors, context)
         } else {
-            value == const_val
+            Some(value == const_val)
         };
-        if !matches {
+        if matches == Some(false) {
             push_error(errors, path, format!("value must equal {const_val}"));
         }
     }
@@ -1714,6 +1925,9 @@ fn validate_object(
     // Check required fields
     if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
         for req in required {
+            if !consume_validation_work(context, path, errors) {
+                return;
+            }
             if let Some(req_name) = req.as_str() {
                 if !obj.contains_key(req_name) {
                     push_error(errors, path, format!("missing required field: {req_name}"));
@@ -1800,30 +2014,27 @@ fn validate_object(
         validate_unevaluated_properties(schema, value, obj, path, errors, context);
     }
 
-    // Check minProperties/maxProperties
-    if let Some(min) = schema
-        .get("minProperties")
-        .and_then(serde_json::Value::as_u64)
+    // Admitted final schemas preserve arbitrary-width count bounds; raw
+    // validation retains its historical u64-only behavior.
+    if let Some(min) = schema.get("minProperties")
+        && count_compare_to_schema_bound(obj.len(), min, context.enforce_unevaluated_properties)
+            == Some(Ordering::Less)
     {
-        if (obj.len() as u64) < min {
-            push_error(
-                errors,
-                path,
-                format!("object must have at least {min} properties"),
-            );
-        }
+        push_error(
+            errors,
+            path,
+            format!("object must have at least {min} properties"),
+        );
     }
-    if let Some(max) = schema
-        .get("maxProperties")
-        .and_then(serde_json::Value::as_u64)
+    if let Some(max) = schema.get("maxProperties")
+        && count_compare_to_schema_bound(obj.len(), max, context.enforce_unevaluated_properties)
+            == Some(Ordering::Greater)
     {
-        if (obj.len() as u64) > max {
-            push_error(
-                errors,
-                path,
-                format!("object must have at most {max} properties"),
-            );
-        }
+        push_error(
+            errors,
+            path,
+            format!("object must have at most {max} properties"),
+        );
     }
 }
 
@@ -2096,11 +2307,17 @@ fn validate_dependencies(
 ) {
     if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object) {
         for (trigger, required) in dependent_required {
+            if !consume_validation_work(context, path, errors) {
+                return;
+            }
             if !obj.contains_key(trigger) {
                 continue;
             }
             if let Some(required) = required.as_array() {
                 for required_property in required {
+                    if !consume_validation_work(context, path, errors) {
+                        return;
+                    }
                     if let Some(required_property) = required_property.as_str() {
                         if !obj.contains_key(required_property) {
                             push_error(
@@ -2166,20 +2383,23 @@ fn validate_array(
         }
     }
 
-    // Check minItems/maxItems
-    if let Some(min) = schema.get("minItems").and_then(serde_json::Value::as_u64) {
-        if (arr.len() as u64) < min {
-            push_error(
-                errors,
-                path,
-                format!("array must have at least {min} items"),
-            );
-        }
+    // Admitted final schemas preserve arbitrary-width count bounds; raw
+    // validation retains its historical u64-only behavior.
+    if let Some(min) = schema.get("minItems")
+        && count_compare_to_schema_bound(arr.len(), min, context.enforce_unevaluated_properties)
+            == Some(Ordering::Less)
+    {
+        push_error(
+            errors,
+            path,
+            format!("array must have at least {min} items"),
+        );
     }
-    if let Some(max) = schema.get("maxItems").and_then(serde_json::Value::as_u64) {
-        if (arr.len() as u64) > max {
-            push_error(errors, path, format!("array must have at most {max} items"));
-        }
+    if let Some(max) = schema.get("maxItems")
+        && count_compare_to_schema_bound(arr.len(), max, context.enforce_unevaluated_properties)
+            == Some(Ordering::Greater)
+    {
+        push_error(errors, path, format!("array must have at most {max} items"));
     }
 
     // Check uniqueItems
@@ -2198,7 +2418,12 @@ fn validate_array(
                     if !consume_validation_work(context, path, errors) {
                         return;
                     }
-                    if json_schema_equal(previous, item) {
+                    let Some(equal) =
+                        json_schema_equal_with_work(previous, item, path, errors, context)
+                    else {
+                        return;
+                    };
+                    if equal {
                         push_error(
                             errors,
                             &format!("{path}[{index}]"),
@@ -2231,26 +2456,39 @@ fn validate_array(
                 matches += 1;
             }
         }
-        let minimum = schema
-            .get("minContains")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        let maximum = schema.get("maxContains").and_then(Value::as_u64);
-        if (matches as u64) < minimum {
+        let below_minimum = if context.enforce_unevaluated_properties {
+            schema.get("minContains").map_or(matches == 0, |minimum| {
+                count_compare_to_schema_bound(matches, minimum, true) == Some(Ordering::Less)
+            })
+        } else {
+            let minimum = schema
+                .get("minContains")
+                .and_then(Value::as_u64)
+                .unwrap_or(1);
+            (matches as u64) < minimum
+        };
+        if below_minimum {
+            let minimum = schema
+                .get("minContains")
+                .map_or_else(|| "1".to_owned(), |minimum| minimum.to_string());
             push_error(
                 errors,
                 path,
                 format!("array must contain at least {minimum} matching items"),
             );
         }
-        if let Some(maximum) = maximum {
-            if (matches as u64) > maximum {
-                push_error(
-                    errors,
-                    path,
-                    format!("array must contain at most {maximum} matching items"),
-                );
-            }
+        if let Some(maximum) = schema.get("maxContains")
+            && count_compare_to_schema_bound(
+                matches,
+                maximum,
+                context.enforce_unevaluated_properties,
+            ) == Some(Ordering::Greater)
+        {
+            push_error(
+                errors,
+                path,
+                format!("array must contain at most {maximum} matching items"),
+            );
         }
     }
 
@@ -2345,14 +2583,15 @@ fn mark_evaluated_array_items(
                     .map(|_| index)
             })
             .collect();
-        let minimum = schema
+        let meets_minimum = schema
             .get("minContains")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
-        let maximum = schema.get("maxContains").and_then(Value::as_u64);
-        if (matches.len() as u64) >= minimum
-            && maximum.is_none_or(|maximum| (matches.len() as u64) <= maximum)
-        {
+            .map_or(matches.len() >= 1, |minimum| {
+                count_compare_to_schema_bound(matches.len(), minimum, true) != Some(Ordering::Less)
+            });
+        let within_maximum = schema.get("maxContains").is_none_or(|maximum| {
+            count_compare_to_schema_bound(matches.len(), maximum, true) != Some(Ordering::Greater)
+        });
+        if meets_minimum && within_maximum {
             evaluated.extend(matches);
         }
     }
@@ -2490,25 +2729,28 @@ fn validate_string(
     errors: &mut Vec<ValidationError>,
     context: &mut ValidationContext<'_>,
 ) {
-    // Check minLength/maxLength
+    // Admitted final schemas preserve arbitrary-width count bounds; raw
+    // validation retains its historical u64-only behavior.
     let len = s.chars().count();
-    if let Some(min) = schema.get("minLength").and_then(serde_json::Value::as_u64) {
-        if (len as u64) < min {
-            push_error(
-                errors,
-                path,
-                format!("string must be at least {min} characters"),
-            );
-        }
+    if let Some(min) = schema.get("minLength")
+        && count_compare_to_schema_bound(len, min, context.enforce_unevaluated_properties)
+            == Some(Ordering::Less)
+    {
+        push_error(
+            errors,
+            path,
+            format!("string must be at least {min} characters"),
+        );
     }
-    if let Some(max) = schema.get("maxLength").and_then(serde_json::Value::as_u64) {
-        if (len as u64) > max {
-            push_error(
-                errors,
-                path,
-                format!("string must be at most {max} characters"),
-            );
-        }
+    if let Some(max) = schema.get("maxLength")
+        && count_compare_to_schema_bound(len, max, context.enforce_unevaluated_properties)
+            == Some(Ordering::Greater)
+    {
+        push_error(
+            errors,
+            path,
+            format!("string must be at most {max} characters"),
+        );
     }
 
     // Check pattern (JSON Schema semantics: pattern matches if any substring matches).
@@ -2794,6 +3036,24 @@ impl ExactDecimal {
     }
 }
 
+/// Compares an in-memory collection count with a schema number exactly.
+///
+/// Count keywords are admitted as mathematical nonnegative integers. Retain
+/// that exact decimal representation here rather than silently dropping a
+/// bound that does not fit in `u64`.
+fn count_compare_to_schema_bound(
+    count: usize,
+    bound: &Value,
+    admitted_final: bool,
+) -> Option<Ordering> {
+    if !admitted_final {
+        return bound.as_u64().map(|bound| (count as u64).cmp(&bound));
+    }
+    let count = ExactDecimal::parse(&count.to_string())?;
+    let bound = ExactDecimal::from_value(bound)?;
+    Some(count.compare(&bound))
+}
+
 fn compare_digit_strings(left: &str, right: &str) -> Ordering {
     let shared_length = left.len().max(right.len());
     for index in 0..shared_length {
@@ -2902,27 +3162,49 @@ fn trim_decimal_integer(value: &mut String) {
     }
 }
 
-fn json_schema_equal(left: &Value, right: &Value) -> bool {
+/// Compares final-schema values while charging every recursive equality step.
+fn json_schema_equal_with_work(
+    left: &Value,
+    right: &Value,
+    path: &str,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'_>,
+) -> Option<bool> {
+    if !consume_validation_work(context, path, errors) {
+        return None;
+    }
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => ExactDecimal::from_number(left)
-            .zip(ExactDecimal::from_number(right))
-            .is_some_and(|(left, right)| left.compare(&right) == Ordering::Equal),
+        (Value::Number(left), Value::Number(right)) => Some(
+            ExactDecimal::from_number(left)
+                .zip(ExactDecimal::from_number(right))
+                .is_some_and(|(left, right)| left.compare(&right) == Ordering::Equal),
+        ),
         (Value::Array(left), Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| json_schema_equal(left, right))
+            if left.len() != right.len() {
+                return Some(false);
+            }
+            for (left, right) in left.iter().zip(right) {
+                if !json_schema_equal_with_work(left, right, path, errors, context)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
         }
         (Value::Object(left), Value::Object(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, left)| {
-                    right
-                        .get(key)
-                        .is_some_and(|right| json_schema_equal(left, right))
-                })
+            if left.len() != right.len() {
+                return Some(false);
+            }
+            for (key, left) in left {
+                let Some(right) = right.get(key) else {
+                    return Some(false);
+                };
+                if !json_schema_equal_with_work(left, right, path, errors, context)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
         }
-        _ => left == right,
+        _ => Some(left == right),
     }
 }
 
@@ -3489,6 +3771,260 @@ mod tests {
             .expect_err("changing only the integer below the exact boundary must reject");
         assert!(errors.iter().any(|error| error.path == "root"));
         assert_eq!(accepted, json!(9007199254740993_u64));
+    }
+
+    #[test]
+    fn admitted_final_string_lengths_above_u64_are_lossless_positive() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"string","minLength":1,"maxLength":{BOUND}}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let schema = admit_final_schema(accepted_schema.clone())
+            .expect("a mathematical string-length count above u64 admits");
+        let accepted = json!("x");
+
+        schema
+            .validate(&accepted)
+            .expect("the exact upper string-length bound accepts the smaller instance");
+        assert_eq!(
+            schema.schema()["maxLength"]
+                .as_number()
+                .expect("admitted maxLength remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted_schema["minLength"], json!(1));
+        assert_eq!(accepted, json!("x"));
+    }
+
+    #[test]
+    fn admitted_final_string_lengths_above_u64_are_lossless_planted_negative() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"string","minLength":1,"maxLength":{BOUND}}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let mut planted_schema = accepted_schema.clone();
+        planted_schema["minLength"] = planted_schema["maxLength"].clone();
+        let accepted = json!("x");
+
+        let errors = admit_final_schema(planted_schema)
+            .expect("the mathematical string-length lower bound admits")
+            .validate(&accepted)
+            .expect_err("changing only minLength to the exact large bound must reject");
+        assert!(errors.iter().any(|error| {
+            error.path == "root"
+                && error.message == format!("string must be at least {BOUND} characters")
+        }));
+        assert_eq!(accepted_schema["minLength"], json!(1));
+        assert_eq!(
+            accepted_schema["maxLength"]
+                .as_number()
+                .expect("baseline maxLength remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted, json!("x"));
+    }
+
+    #[test]
+    fn admitted_final_item_counts_above_u64_are_lossless_positive() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"array","minItems":1,"maxItems":{BOUND}}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let schema = admit_final_schema(accepted_schema.clone())
+            .expect("a mathematical item count above u64 admits");
+        let accepted = json!([null]);
+
+        schema
+            .validate(&accepted)
+            .expect("the exact upper item-count bound accepts the smaller instance");
+        assert_eq!(
+            schema.schema()["maxItems"]
+                .as_number()
+                .expect("admitted maxItems remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted_schema["minItems"], json!(1));
+        assert_eq!(accepted, json!([null]));
+    }
+
+    #[test]
+    fn admitted_final_item_counts_above_u64_are_lossless_planted_negative() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"array","minItems":1,"maxItems":{BOUND}}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let mut planted_schema = accepted_schema.clone();
+        planted_schema["minItems"] = planted_schema["maxItems"].clone();
+        let accepted = json!([null]);
+
+        let errors = admit_final_schema(planted_schema)
+            .expect("the mathematical item-count lower bound admits")
+            .validate(&accepted)
+            .expect_err("changing only minItems to the exact large bound must reject");
+        assert!(errors.iter().any(|error| {
+            error.path == "root"
+                && error.message == format!("array must have at least {BOUND} items")
+        }));
+        assert_eq!(accepted_schema["minItems"], json!(1));
+        assert_eq!(
+            accepted_schema["maxItems"]
+                .as_number()
+                .expect("baseline maxItems remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted, json!([null]));
+    }
+
+    #[test]
+    fn arbitrary_width_count_comparisons_are_final_only_and_raw_remains_legacy() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"array","minItems":1,"maxItems":{BOUND}}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let mut planted_schema = accepted_schema.clone();
+        planted_schema["minItems"] = planted_schema["maxItems"].clone();
+        let instance = json!([null]);
+
+        validate(&planted_schema, &instance)
+            .expect("raw validation retains its legacy u64-only count behavior");
+        validate_strict(&planted_schema, &instance)
+            .expect("raw strict validation retains its legacy u64-only count behavior");
+        let errors = admit_final_schema(planted_schema)
+            .expect("the arbitrary-width final count admits")
+            .validate(&instance)
+            .expect_err("the same final count remains mathematically enforced");
+        assert!(errors.iter().any(|error| {
+            error.path == "root"
+                && error.message == format!("array must have at least {BOUND} items")
+        }));
+        assert_eq!(accepted_schema["minItems"], json!(1));
+        assert_eq!(
+            accepted_schema["maxItems"]
+                .as_number()
+                .expect("baseline maxItems remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(instance, json!([null]));
+    }
+
+    #[test]
+    fn admitted_final_property_counts_above_u64_are_lossless_positive() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"object","minProperties":1,"maxProperties":{BOUND}}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let schema = admit_final_schema(accepted_schema.clone())
+            .expect("a mathematical property count above u64 admits");
+        let accepted = json!({"ready": null});
+
+        schema
+            .validate(&accepted)
+            .expect("the exact upper property-count bound accepts the smaller instance");
+        assert_eq!(
+            schema.schema()["maxProperties"]
+                .as_number()
+                .expect("admitted maxProperties remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted_schema["minProperties"], json!(1));
+        assert_eq!(accepted, json!({"ready": null}));
+    }
+
+    #[test]
+    fn admitted_final_property_counts_above_u64_are_lossless_planted_negative() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"object","minProperties":1,"maxProperties":{BOUND}}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let mut planted_schema = accepted_schema.clone();
+        planted_schema["minProperties"] = planted_schema["maxProperties"].clone();
+        let accepted = json!({"ready": null});
+
+        let errors = admit_final_schema(planted_schema)
+            .expect("the mathematical property-count lower bound admits")
+            .validate(&accepted)
+            .expect_err("changing only minProperties to the exact large bound must reject");
+        assert!(errors.iter().any(|error| {
+            error.path == "root"
+                && error.message == format!("object must have at least {BOUND} properties")
+        }));
+        assert_eq!(accepted_schema["minProperties"], json!(1));
+        assert_eq!(
+            accepted_schema["maxProperties"]
+                .as_number()
+                .expect("baseline maxProperties remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted, json!({"ready": null}));
+    }
+
+    #[test]
+    fn admitted_final_contains_counts_above_u64_are_lossless_positive() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"array","contains":{{"const":"ready"}},"minContains":1,"maxContains":{BOUND},"unevaluatedItems":false}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let schema = admit_final_schema(accepted_schema.clone())
+            .expect("a mathematical contains count above u64 admits");
+        let accepted = json!(["ready"]);
+
+        schema
+            .validate(&accepted)
+            .expect("the exact upper contains bound retains the successful item annotation");
+        assert_eq!(
+            schema.schema()["maxContains"]
+                .as_number()
+                .expect("admitted maxContains remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted_schema["minContains"], json!(1));
+        assert_eq!(accepted, json!(["ready"]));
+    }
+
+    #[test]
+    fn admitted_final_contains_counts_above_u64_are_lossless_planted_negative() {
+        const BOUND: &str = "184467440737095516160e-1";
+        let accepted_schema: Value = serde_json::from_str(&format!(
+            r#"{{"$schema":"{FINAL_JSON_SCHEMA_DIALECT}","type":"array","contains":{{"const":"ready"}},"minContains":1,"maxContains":{BOUND},"unevaluatedItems":false}}"#
+        ))
+        .expect("the arbitrary-precision count schema parses");
+        let mut planted_schema = accepted_schema.clone();
+        planted_schema["minContains"] = planted_schema["maxContains"].clone();
+        let accepted = json!(["ready"]);
+
+        let errors = admit_final_schema(planted_schema)
+            .expect("the mathematical contains lower bound admits")
+            .validate(&accepted)
+            .expect_err("changing only minContains to the exact large bound must reject");
+        assert!(errors.iter().any(|error| {
+            error.path == "root"
+                && error.message == format!("array must contain at least {BOUND} matching items")
+        }));
+        assert_eq!(accepted_schema["minContains"], json!(1));
+        assert_eq!(
+            accepted_schema["maxContains"]
+                .as_number()
+                .expect("baseline maxContains remains numeric")
+                .as_str(),
+            BOUND
+        );
+        assert_eq!(accepted, json!(["ready"]));
     }
 
     #[test]
@@ -4206,6 +4742,289 @@ mod tests {
             errors[0].message,
             "external schema reference is not allowed"
         );
+    }
+
+    #[test]
+    fn admitted_local_reference_target_membership_positive_and_planted_negative() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$defs": {"always": true},
+            "default": {"annotation": "object"},
+            "$ref": "#/$defs/always"
+        });
+        let schema = admit_final_schema(accepted.clone())
+            .expect("a local reference to a boolean schema admits");
+        let instance = json!({"any": "value"});
+
+        schema
+            .validate(&instance)
+            .expect("the referenced true schema accepts the instance");
+
+        let mut planted = accepted.clone();
+        planted["$ref"] = json!("#/default");
+        let error = admit_final_schema(planted)
+            .expect_err("changing only the target to a non-schema annotation must reject");
+        assert_eq!(error.path(), "$.$ref");
+        assert_eq!(
+            error.reason(),
+            "local schema reference target is not an admitted schema node"
+        );
+        assert_eq!(accepted["$ref"], json!("#/$defs/always"));
+        assert_eq!(instance, json!({"any": "value"}));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_target_membership_positive_and_planted_negative() {
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "$defs": {"always": true},
+            "default": {"annotation": "object"},
+            "$dynamicRef": "#/$defs/always"
+        });
+        let schema = admit_final_schema(accepted.clone())
+            .expect("a local dynamic reference to a boolean schema admits");
+        let instance = json!({"any": "value"});
+
+        schema
+            .validate(&instance)
+            .expect("the dynamically referenced true schema accepts the instance");
+
+        let mut planted = accepted.clone();
+        planted["$dynamicRef"] = json!("#/default");
+        let error = admit_final_schema(planted)
+            .expect_err("changing only the dynamic target to a non-schema annotation must reject");
+        assert_eq!(error.path(), "$.$dynamicRef");
+        assert_eq!(
+            error.reason(),
+            "local schema reference target is not an admitted schema node"
+        );
+        assert_eq!(accepted["$dynamicRef"], json!("#/$defs/always"));
+        assert_eq!(instance, json!({"any": "value"}));
+    }
+
+    #[test]
+    fn admitted_enum_entry_limit_positive_and_planted_negative() {
+        let values: Vec<Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES)
+            .map(|index| json!(format!("value-{index}")))
+            .collect();
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "enum": values
+        });
+        let schema =
+            admit_final_schema(accepted.clone()).expect("the exact enum entry budget admits");
+        let instance = json!("value-0");
+
+        schema
+            .validate(&instance)
+            .expect("the first bounded enum value validates");
+
+        let mut planted = accepted.clone();
+        planted["enum"]
+            .as_array_mut()
+            .expect("enum remains an array")
+            .push(json!("value-over-limit"));
+        let error = admit_final_schema(planted)
+            .expect_err("adding one enum member beyond the limit must reject");
+        assert_eq!(error.path(), "$.enum");
+        assert_eq!(error.reason(), "enum exceeds entry limit");
+        assert_eq!(
+            accepted["enum"]
+                .as_array()
+                .expect("enum remains an array")
+                .len(),
+            MAX_SCHEMA_ASSERTION_ENTRIES
+        );
+        assert_eq!(instance, json!("value-0"));
+    }
+
+    #[test]
+    fn admitted_required_entry_limit_positive_and_planted_negative() {
+        let members: Vec<Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES)
+            .map(|index| json!(format!("field-{index}")))
+            .collect();
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "required": members
+        });
+        let schema =
+            admit_final_schema(accepted.clone()).expect("the exact required-entry budget admits");
+        let instance = object_with_null_members(MAX_SCHEMA_ASSERTION_ENTRIES);
+
+        schema
+            .validate(&instance)
+            .expect("every required property at the entry limit is present");
+
+        let mut planted = accepted.clone();
+        planted["required"]
+            .as_array_mut()
+            .expect("required remains an array")
+            .push(json!("field-over-limit"));
+        let error = admit_final_schema(planted)
+            .expect_err("adding one required member beyond the limit must reject");
+        assert_eq!(error.path(), "$.required");
+        assert_eq!(error.reason(), "required exceeds entry limit");
+        assert_eq!(
+            accepted["required"]
+                .as_array()
+                .expect("required remains an array")
+                .len(),
+            MAX_SCHEMA_ASSERTION_ENTRIES
+        );
+        assert_eq!(
+            instance
+                .as_object()
+                .expect("instance remains an object")
+                .len(),
+            MAX_SCHEMA_ASSERTION_ENTRIES
+        );
+    }
+
+    #[test]
+    fn admitted_dependent_required_entry_limit_positive_and_planted_negative() {
+        let members: Vec<Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES)
+            .map(|index| json!(format!("field-{index}")))
+            .collect();
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "dependentRequired": {"trigger": members}
+        });
+        let schema = admit_final_schema(accepted.clone())
+            .expect("the exact dependent-required entry budget admits");
+        let mut instance = object_with_null_members(MAX_SCHEMA_ASSERTION_ENTRIES);
+        instance["trigger"] = Value::Null;
+
+        schema
+            .validate(&instance)
+            .expect("every bounded dependent requirement is present");
+
+        let mut planted = accepted.clone();
+        planted["dependentRequired"]["trigger"]
+            .as_array_mut()
+            .expect("dependent-required members remain an array")
+            .push(json!("field-over-limit"));
+        let error = admit_final_schema(planted)
+            .expect_err("adding one dependent requirement beyond the limit must reject");
+        assert_eq!(error.path(), "$.dependentRequired");
+        assert_eq!(
+            error.reason(),
+            "dependentRequired values exceed entry limit"
+        );
+        assert_eq!(
+            accepted["dependentRequired"]["trigger"]
+                .as_array()
+                .expect("baseline members remain an array")
+                .len(),
+            MAX_SCHEMA_ASSERTION_ENTRIES
+        );
+        assert_eq!(
+            instance
+                .as_object()
+                .expect("instance remains an object")
+                .len(),
+            MAX_SCHEMA_ASSERTION_ENTRIES + 1
+        );
+    }
+
+    #[test]
+    fn admitted_dependent_required_work_budget_includes_root_overhead() {
+        let mut dependencies = serde_json::Map::new();
+        let mut instance = serde_json::Map::new();
+        for index in 0..MAX_SCHEMA_ASSERTION_ENTRIES {
+            let member_count = if index + 1 == MAX_SCHEMA_ASSERTION_ENTRIES {
+                MAX_SCHEMA_ASSERTION_ENTRIES - 2
+            } else {
+                MAX_SCHEMA_ASSERTION_ENTRIES - 1
+            };
+            let trigger = format!("trigger-{index}");
+            let mut members = Vec::with_capacity(member_count);
+            for member_index in 0..member_count {
+                let member = format!("required-{index}-{member_index}");
+                members.push(json!(member.clone()));
+                instance.insert(member, Value::Null);
+            }
+            dependencies.insert(trigger.clone(), Value::Array(members));
+            instance.insert(trigger, Value::Null);
+        }
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "dependentRequired": dependencies
+        });
+        let instance = Value::Object(instance);
+
+        admit_final_schema(accepted.clone())
+            .expect("the exact dependentRequired payload plus root work budget admits")
+            .validate(&instance)
+            .expect("the exact dependentRequired work budget validates");
+
+        let mut planted = accepted.clone();
+        planted["dependentRequired"]["trigger-0"]
+            .as_array_mut()
+            .expect("planted dependent requirements remain an array")
+            .push(json!("required-over-budget"));
+        let error = admit_final_schema(planted)
+            .expect_err("one extra dependent requirement beyond root-inclusive work must reject");
+        assert_eq!(error.path(), "$.dependentRequired");
+        assert_eq!(
+            error.reason(),
+            "dependentRequired exceeds validation work budget"
+        );
+        assert_eq!(
+            accepted["dependentRequired"]
+                .as_object()
+                .expect("baseline dependencies remain an object")
+                .len(),
+            MAX_SCHEMA_ASSERTION_ENTRIES
+        );
+        assert_eq!(
+            accepted["dependentRequired"]["trigger-0"]
+                .as_array()
+                .expect("baseline dependency members remain an array")
+                .len(),
+            MAX_SCHEMA_ASSERTION_ENTRIES - 1
+        );
+        assert_eq!(
+            instance
+                .as_object()
+                .expect("instance remains an object")
+                .len(),
+            MAX_SCHEMA_VALIDATION_WORK - 1
+        );
+    }
+
+    #[test]
+    fn admitted_pattern_byte_limit_positive_and_planted_negative() {
+        let pattern = "a".repeat(MAX_PATTERN_BYTES);
+        let accepted = json!({
+            "$schema": FINAL_JSON_SCHEMA_DIALECT,
+            "type": "string",
+            "pattern": pattern
+        });
+        let schema =
+            admit_final_schema(accepted.clone()).expect("the exact pattern byte budget admits");
+        let instance = json!("a".repeat(MAX_PATTERN_BYTES));
+
+        schema
+            .validate(&instance)
+            .expect("the bounded exact-length pattern matches the instance");
+
+        let mut planted = accepted.clone();
+        planted["pattern"] = json!(format!("{}a", accepted["pattern"].as_str().unwrap()));
+        let error = admit_final_schema(planted)
+            .expect_err("adding one pattern byte beyond the limit must reject");
+        assert_eq!(error.path(), "$.pattern");
+        assert_eq!(error.reason(), "pattern exceeds byte limit");
+        assert_eq!(
+            accepted["pattern"]
+                .as_str()
+                .expect("baseline pattern remains a string")
+                .len(),
+            MAX_PATTERN_BYTES
+        );
+        assert_eq!(instance, json!("a".repeat(MAX_PATTERN_BYTES)));
     }
 
     #[test]
