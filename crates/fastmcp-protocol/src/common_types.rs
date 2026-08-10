@@ -467,6 +467,16 @@ impl JsonInteger {
         self.0.as_str()
     }
 
+    /// Returns the retained number for direct `Value::Number` construction.
+    ///
+    /// Embedding a `JsonInteger` through `json!`/`to_value` re-parses the
+    /// number and canonicalizes its spelling; building the `Value` from this
+    /// accessor keeps the retained lexeme.
+    #[must_use]
+    pub fn to_number(&self) -> serde_json::Number {
+        self.0.clone()
+    }
+
     /// Returns the mathematical value when it fits the legacy signed 32-bit
     /// error-code domain.
     ///
@@ -543,19 +553,71 @@ impl Serialize for JsonInteger {
     }
 }
 
+/// serde_json's private raw-value newtype token (stable: serde_json is
+/// pinned exactly).
+const SERDE_JSON_RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+/// serde_json's private arbitrary-precision number map key (stable: pinned).
+const SERDE_JSON_NUMBER_TOKEN: &str = "$serde_json::private::Number";
+
 impl<'de> Deserialize<'de> for JsonInteger {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        // Not RawValue: raw capture cannot survive serde's buffered Content
-        // replay, so a RawValue-based decode fails inside every untagged
-        // context - most critically the JsonRpcMessage enum, where it made
-        // this crate unable to parse error responses it had itself encoded.
-        // An arbitrary-precision Number replays through buffering and keeps
-        // the parser's number spelling.
-        let number = serde_json::Number::deserialize(deserializer)?;
-        Self::try_from_number(number).map_err(serde::de::Error::custom)
+        // A plain Box<RawValue> decode preserves the wire lexeme but cannot
+        // survive serde's buffered Content replay, which every untagged
+        // context uses - most critically the JsonRpcMessage enum, where it
+        // made this crate unable to parse error responses it had itself
+        // encoded. Requesting the raw-value newtype directly and accepting
+        // BOTH magic map spellings keeps the exact lexeme on the direct
+        // parser path while still decoding through buffered replay (whose
+        // parser-canonicalized number spelling is the best available there).
+        struct JsonIntegerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for JsonIntegerVisitor {
+            type Value = JsonInteger;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a mathematically integral JSON number")
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<JsonInteger, E> {
+                Ok(JsonInteger::from(value))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<JsonInteger, E> {
+                Ok(JsonInteger::from(value))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<JsonInteger, E> {
+                serde_json::Number::from_f64(value)
+                    .ok_or_else(|| E::custom("JSON integer must be finite"))
+                    .and_then(|number| JsonInteger::try_from_number(number).map_err(E::custom))
+            }
+
+            fn visit_newtype_struct<D2>(self, deserializer: D2) -> Result<JsonInteger, D2::Error>
+            where
+                D2: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<JsonInteger, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let Some(key) = map.next_key::<std::borrow::Cow<'_, str>>()? else {
+                    return Err(serde::de::Error::custom("JSON integer cannot be an object"));
+                };
+                if key != SERDE_JSON_RAW_VALUE_TOKEN && key != SERDE_JSON_NUMBER_TOKEN {
+                    return Err(serde::de::Error::custom("JSON integer cannot be an object"));
+                }
+                let lexeme = map.next_value::<std::borrow::Cow<'_, str>>()?;
+                lexeme.parse().map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(SERDE_JSON_RAW_VALUE_TOKEN, JsonIntegerVisitor)
     }
 }
 

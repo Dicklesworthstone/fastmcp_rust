@@ -940,7 +940,10 @@ where
                 LEGACY_2024_11_05_PROTOCOL_VERSION.to_owned(),
             ))
         {
-            return Err(Legacy2024AdapterError::invalid_params(
+            // A different protocol era is an envelope-class rejection, in
+            // line with the frozen taxonomy where every initialize
+            // era-security failure stays -32600.
+            return Err(Legacy2024AdapterError::invalid_request(
                 "initialize protocolVersion must be exact MCP 2024-11-05",
             ));
         }
@@ -1221,10 +1224,19 @@ fn success_response(id: Value, result: Value) -> Value {
 }
 
 fn error_response(id: Value, error: Legacy2024AdapterError) -> Value {
-    json!({
-        "jsonrpc": "2.0", "id": id,
-        "error": {"code": error.code(), "message": error.message()},
-    })
+    // Built without json!: embedding a JsonInteger through the macro
+    // re-parses the number and canonicalizes its retained spelling.
+    let mut error_object = serde_json::Map::new();
+    error_object.insert("code".to_owned(), Value::Number(error.code().to_number()));
+    error_object.insert(
+        "message".to_owned(),
+        Value::String(error.message().to_owned()),
+    );
+    let mut response = serde_json::Map::new();
+    response.insert("jsonrpc".to_owned(), Value::String("2.0".to_owned()));
+    response.insert("id".to_owned(), id);
+    response.insert("error".to_owned(), Value::Object(error_object));
+    Value::Object(response)
 }
 
 fn response_id_from_wire(wire: &Value) -> Option<Value> {
@@ -1696,6 +1708,15 @@ mod tests {
                 r#"{{"jsonrpc":"2.0","id":{raw_id},"method":"tools/list","params":false}}"#
             ))
             .expect("integral request-id wire must parse");
+            // serde_json canonicalizes exponent spellings while parsing the
+            // wire ("7e2" arrives as "7e+2"); the adapter's obligation is to
+            // echo the parsed id without any further precision or lexeme
+            // loss, which keeps beyond-u64 integers exact.
+            let parsed_id = wire["id"]
+                .as_number()
+                .expect("request ID parses as a JSON number")
+                .as_str()
+                .to_owned();
             let response = adapter
                 .receive(binding, wire)
                 .expect("a valid request ID must receive the pre-admission error response");
@@ -1708,7 +1729,7 @@ mod tests {
                     .as_number()
                     .expect("response ID remains a JSON number")
                     .as_str(),
-                raw_id
+                parsed_id
             );
             assert_eq!(response["error"]["code"], -32600);
         }
