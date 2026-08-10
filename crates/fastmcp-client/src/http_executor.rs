@@ -3750,241 +3750,15 @@ impl ModernHttpClient {
         Ok(request)
     }
 
-    async fn rebase_post_discovery_request(
-        &self,
-        cx: &Cx,
-        request: ModernHttpRequest,
-    ) -> Result<ModernHttpRequest, ModernHttpClientError> {
-        let state = self
-            .session_state
-            .lock(cx)
-            .await
-            .map_err(|_| ModernHttpClientError::SessionUnavailable)?;
-        let discovery = self
-            .discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        revalidate_rebased_client_extensions(&discovery.server_discovery, &request)?;
-        let client_extensions = merge_client_extensions(
-            discovery
-                .mcp_apps_active
-                .then_some(self.mcp_apps_settings.as_ref())
-                .flatten(),
-            request.additional_client_extensions.as_ref(),
-        );
-        let mut wire: serde_json::Value = serde_json::from_slice(&request.body)
-            .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
-        let extensions = wire
-            .get_mut("params")
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|parameters| parameters.get_mut("_meta"))
-            .and_then(serde_json::Value::as_object_mut)
-            .and_then(|metadata| {
-                metadata.get_mut(fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY)
-            })
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or(ModernHttpClientError::RequestEncodingFailed)?;
-        match client_extensions {
-            Some(client_extensions) => {
-                extensions.insert(
-                    "extensions".to_owned(),
-                    serde_json::Value::Object(client_extensions.into_iter().collect()),
-                );
-            }
-            None => {
-                extensions.remove("extensions");
-            }
-        }
-        let mut request = request;
-        request.body =
-            serde_json::to_vec(&wire).map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
-        request
-            .with_mcp_session_id(state.mcp_session_id.clone())
-            .map(|request| request.with_mcp_session_epoch(state.epoch))
-            .map_err(ModernHttpClientError::Executor)
-    }
-
     async fn execute_post_discovery_request(
         &self,
         cx: &Cx,
         request: &ModernHttpRequest,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
-        let response = self
-            .executor
+        self.executor
             .execute(cx, request)
             .await
-            .map_err(ModernHttpClientError::Executor)?;
-        if is_defined_stale_session_response(&response) {
-            let observed_session_id = request
-                .mcp_session_id
-                .as_deref()
-                .ok_or(ModernHttpClientError::SessionUnavailable)?
-                .to_owned();
-            let observed_epoch = request
-                .mcp_session_epoch
-                .ok_or(ModernHttpClientError::SessionUnavailable)?;
-            drop(response);
-            self.refresh_expired_session(cx, &observed_session_id, observed_epoch)
-                .await?;
-            let replay = self
-                .rebase_post_discovery_request(cx, request.clone())
-                .await?;
-            let response = self
-                .executor
-                .execute(cx, &replay)
-                .await
-                .map_err(ModernHttpClientError::Executor)?;
-            if is_defined_stale_session_response(&response) {
-                drop(response);
-                return Err(ModernHttpClientError::SessionRecoveryRepeatedNotFound);
-            }
-            return self.validate_response_session_id(&replay, response);
-        }
-        self.validate_response_session_id(request, response)
-    }
-
-    fn validate_response_session_id(
-        &self,
-        request: &ModernHttpRequest,
-        response: ModernHttpResponseStream,
-    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
-        if response
-            .metadata()
-            .mcp_session_id()
-            .is_some_and(|session_id| request.mcp_session_id.as_deref() != Some(session_id))
-        {
-            return Err(ModernHttpClientError::UnexpectedMcpSessionId);
-        }
-        Ok(response)
-    }
-
-    async fn refresh_expired_session(
-        &self,
-        cx: &Cx,
-        observed_session_id: &str,
-        observed_epoch: u64,
-    ) -> Result<(), ModernHttpClientError> {
-        let mut recovery = self
-            .session_recovery
-            .lock(cx)
-            .await
-            .map_err(|_| ModernHttpClientError::SessionUnavailable)?;
-        {
-            let state = self
-                .session_state
-                .lock(cx)
-                .await
-                .map_err(|_| ModernHttpClientError::SessionUnavailable)?;
-            if state.mcp_session_id != observed_session_id || state.epoch != observed_epoch {
-                return Ok(());
-            }
-        }
-        if let Some(failure) = recovery.failed.as_ref().filter(|failure| {
-            failure.mcp_session_id == observed_session_id && failure.epoch == observed_epoch
-        }) {
-            return Err(ModernHttpClientError::SessionRecoveryFailed(Arc::clone(
-                &failure.error,
-            )));
-        }
-
-        match self
-            .refresh_expired_session_once(cx, observed_session_id, observed_epoch)
-            .await
-        {
-            Ok(()) => {
-                recovery.failed = None;
-                Ok(())
-            }
-            Err(error) if refresh_failure_is_caller_local(&error) => Err(error),
-            Err(error) => {
-                let error = Arc::new(error);
-                recovery.failed = Some(FailedModernHttpSessionRecovery {
-                    mcp_session_id: observed_session_id.to_owned(),
-                    epoch: observed_epoch,
-                    error: Arc::clone(&error),
-                });
-                Err(ModernHttpClientError::SessionRecoveryFailed(error))
-            }
-        }
-    }
-
-    /// Performs the one recovery discovery exchange while the caller holds
-    /// the generation-scoped recovery coordinator.
-    async fn refresh_expired_session_once(
-        &self,
-        cx: &Cx,
-        observed_session_id: &str,
-        observed_epoch: u64,
-    ) -> Result<(), ModernHttpClientError> {
-        let request = build_modern_request_with_extensions(
-            &self.modern_post_target,
-            &self.client_info,
-            &self.client_capabilities,
-            SERVER_DISCOVER,
-            serde_json::json!({}),
-            Some(RequestId::Number(1)),
-            mcp_apps_client_extensions(self.mcp_apps_settings.as_ref()).as_ref(),
-        )?;
-        let response = self
-            .executor
-            .execute(cx, &request)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
-        let status = response.metadata().status();
-        let session_id = response.metadata().mcp_session_id().map(str::to_owned);
-        let body = response
-            .read_to_end(cx, MAX_MODERN_HTTP_PROBE_BODY_BYTES)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
-        let probe_body_kind = classify_modern_probe_body(&body);
-        // Recovery is a fresh discovery attempt, so it has the same strict
-        // result admission boundary as initial connection establishment.
-        let admitted_discovery = matches!(probe_body_kind, HttpProbeBody::RecognizedModernJsonRpc)
-            .then(|| decode_modern_discovery_response(&body))
-            .transpose()?;
-        let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
-            .map_err(ModernHttpClientError::Negotiation)?;
-        match negotiation
-            .observe_modern_probe(HttpModernProbe {
-                status,
-                body: probe_body_kind,
-            })
-            .map_err(ModernHttpClientError::Negotiation)?
-        {
-            ClientHttpNegotiationDecision::ModernSelected => {}
-            ClientHttpNegotiationDecision::LegacySseFallbackAuthorized => {
-                return Err(ModernHttpClientError::SessionRecoveryWouldFallbackToLegacy);
-            }
-        }
-        let admitted_discovery =
-            admitted_discovery.ok_or(ModernHttpClientError::InvalidDiscoveryResponse)?;
-        let session_id = session_id
-            .filter(|value| !trim_http_ows(value).is_empty())
-            .ok_or(ModernHttpClientError::MissingDiscoverySessionId)?;
-        let mut state = self
-            .session_state
-            .lock(cx)
-            .await
-            .map_err(|_| ModernHttpClientError::SessionUnavailable)?;
-        if state.mcp_session_id == observed_session_id && state.epoch == observed_epoch {
-            // This is one recovery generation: retain neither a fresh session
-            // with stale discovery authority nor a fresh discovery with the
-            // expired session. Failed/retracted recovery reaches neither
-            // assignment because all admission completed above.
-            let mcp_apps_active =
-                resolve_mcp_apps_activation(self.mcp_apps_settings.as_ref(), &admitted_discovery);
-            *self
-                .discovery_state
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = ModernHttpDiscoveryState {
-                mcp_apps_active,
-                server_discovery: admitted_discovery,
-            };
-            state.mcp_session_id = session_id;
-            state.epoch = state.epoch.saturating_add(1);
-        }
-        Ok(())
+            .map_err(ModernHttpClientError::Executor)
     }
 
     /// Issues one modern JSON-RPC request through the native HTTP executor.
@@ -4749,15 +4523,8 @@ impl ModernHttpClient {
         if request_id.validate().is_err() {
             return Err(ModernHttpClientError::InvalidTasksRequestId { method });
         }
-        // The task wire envelope was typed before this call, but extension
-        // activation and the session generation must be snapshotted together
-        // at the native POST boundary. A recovery cannot therefore pair a
-        // fresh session ID with stale Apps metadata or stale Tasks admission.
-        let state = self
-            .session_state
-            .lock(cx)
-            .await
-            .map_err(|_| ModernHttpClientError::SessionUnavailable)?;
+        // Discovery fixes the extension authority for the connected client;
+        // every Tasks POST is otherwise independent and stateless.
         let discovery = self
             .discovery_state
             .read()
@@ -4777,13 +4544,12 @@ impl ModernHttpClient {
             ExtensionDirection::ClientToServer,
         )
         .map_err(|_| ModernHttpClientError::TasksMethodNegotiation { method })?;
-        let additional_client_extensions = client_extensions.clone();
         let client_extensions = merge_client_extensions(
             discovery
                 .mcp_apps_active
                 .then_some(self.mcp_apps_settings.as_ref())
                 .flatten(),
-            Some(&additional_client_extensions),
+            Some(client_extensions),
         )
         .ok_or(ModernHttpClientError::TasksRequestEncoding { method })?;
         let request = build_modern_tasks_request(
@@ -4795,12 +4561,6 @@ impl ModernHttpClient {
             request_id.clone(),
             &client_extensions,
         )?;
-        let request = request
-            .with_additional_client_extensions(Some(&additional_client_extensions))
-            .with_mcp_session_id(state.mcp_session_id.clone())
-            .map(|request| request.with_mcp_session_epoch(state.epoch))
-            .map_err(ModernHttpClientError::Executor)?;
-        drop(state);
         let response = self.execute_post_discovery_request(cx, &request).await?;
         let body = response
             .read_to_end(cx, maximum_response_bytes)
@@ -4850,58 +4610,6 @@ impl ModernHttpClient {
             .ok_or(ModernHttpClientError::TasksResultMissing { method })?;
         serde_json::from_str(result_source)
             .map_err(|_| ModernHttpClientError::TasksResultDecode { method })
-    }
-}
-
-/// Revalidates extension state retained for a stale-session replay against the
-/// fresh discovery authority. A replay is a new request for the recovered
-/// generation, not permission to retain an extension withdrawn by that
-/// generation's discovery response.
-fn revalidate_rebased_client_extensions(
-    discovery: &ServerDiscoverResult,
-    request: &ModernHttpRequest,
-) -> Result<(), ModernHttpClientError> {
-    let Some(additional_extensions) = request.additional_client_extensions.as_ref() else {
-        return Ok(());
-    };
-    if !additional_extensions.contains_key(fastmcp_protocol::TASKS_EXTENSION) {
-        return Ok(());
-    }
-
-    match request.method.as_str() {
-        TOOLS_CALL => {
-            admit_final_tasks_result_discriminator(discovery, OFFICIAL_TASKS_RESULT_DISCRIMINATOR)
-                .map_err(|_| ModernHttpClientError::TasksNegotiation)
-        }
-        SUBSCRIPTIONS_LISTEN => admit_final_tasks_discovery_surface(
-            discovery,
-            TASK_STATUS_NOTIFICATION,
-            ExtensionDirection::ServerToClient,
-        )
-        .map_err(|_| ModernHttpClientError::TasksNegotiation),
-        TASK_GET => admit_final_tasks_discovery_surface(
-            discovery,
-            TASK_GET,
-            ExtensionDirection::ClientToServer,
-        )
-        .map_err(|_| ModernHttpClientError::TasksMethodNegotiation { method: TASK_GET }),
-        TASK_UPDATE => admit_final_tasks_discovery_surface(
-            discovery,
-            TASK_UPDATE,
-            ExtensionDirection::ClientToServer,
-        )
-        .map_err(|_| ModernHttpClientError::TasksMethodNegotiation {
-            method: TASK_UPDATE,
-        }),
-        TASK_CANCEL => admit_final_tasks_discovery_surface(
-            discovery,
-            TASK_CANCEL,
-            ExtensionDirection::ClientToServer,
-        )
-        .map_err(|_| ModernHttpClientError::TasksMethodNegotiation {
-            method: TASK_CANCEL,
-        }),
-        _ => Err(ModernHttpClientError::TasksNegotiation),
     }
 }
 
@@ -6428,8 +6136,12 @@ pub fn validate_response_head(
     headers: &[(String, String)],
 ) -> Result<ModernHttpResponseMetadata, ModernHttpExecutorError> {
     validate_content_encoding(headers)?;
-    let mcp_session_id =
-        single_header(headers, "mcp-session-id", "MCP-Session-Id")?.map(str::to_owned);
+    if headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
+    {
+        return Err(ModernHttpExecutorError::ForbiddenResponseSessionHeader);
+    }
     if (300..400).contains(&status) {
         return Err(ModernHttpExecutorError::Redirect { status });
     }
@@ -6450,11 +6162,7 @@ pub fn validate_response_head(
     } else {
         ModernHttpResponseKind::HttpFailure
     };
-    Ok(ModernHttpResponseMetadata {
-        status,
-        kind,
-        mcp_session_id,
-    })
+    Ok(ModernHttpResponseMetadata { status, kind })
 }
 
 fn validate_content_encoding(headers: &[(String, String)]) -> Result<(), ModernHttpExecutorError> {
@@ -6487,22 +6195,6 @@ fn validate_content_encoding(headers: &[(String, String)]) -> Result<(), ModernH
     } else {
         Err(ModernHttpExecutorError::UnsupportedContentEncoding)
     }
-}
-
-fn is_defined_stale_session_response(response: &ModernHttpResponseStream) -> bool {
-    response.metadata().status() == 404
-        && response.metadata().kind() == ModernHttpResponseKind::HttpFailure
-        && response.metadata().mcp_session_id().is_none()
-}
-
-/// A cancelled caller did not establish anything about the peer session, so
-/// its local cancellation must not poison the shared recovery outcome.
-fn refresh_failure_is_caller_local(error: &ModernHttpClientError) -> bool {
-    matches!(
-        error,
-        ModernHttpClientError::SessionUnavailable
-            | ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled)
-    )
 }
 
 fn single_header<'a>(
@@ -6930,34 +6622,15 @@ mod tests {
     }
 
     fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
-        write_response_with_session_id(
-            stream,
-            status,
-            content_type,
-            body,
-            Some("test-modern-session"),
-        );
-    }
-
-    fn write_response_with_session_id(
-        stream: &mut TcpStream,
-        status: u16,
-        content_type: &str,
-        body: &[u8],
-        mcp_session_id: Option<&str>,
-    ) {
         let reason = match status {
             200 => "OK",
             202 => "Accepted",
             404 => "Not Found",
             _ => "Test Response",
         };
-        let mcp_session_header = mcp_session_id
-            .map(|session_id| format!("MCP-Session-Id: {session_id}\r\n"))
-            .unwrap_or_default();
         write!(
             stream,
-            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n{mcp_session_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .expect("write native HTTP response head");
@@ -9283,12 +8956,11 @@ mod tests {
                 &request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"];
             assert!(capabilities.get("sampling").is_none());
             assert!(capabilities.get("roots").is_none());
-            write_response_with_session_id(
+            write_response(
                 &mut probe,
                 200,
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"serverInfo":{"name":"modern","version":"1"},"ttlMs":0,"cacheScope":"private"}}"#,
-                Some("modern-session"),
             );
         });
 
@@ -9337,13 +9009,7 @@ mod tests {
                     .head
                     .contains("MCP-Protocol-Version: 2026-07-28\r\n")
             );
-            write_response_with_session_id(
-                &mut probe,
-                404,
-                "text/plain",
-                b"",
-                Some("must-not-leak-into-legacy"),
-            );
+            write_response(&mut probe, 404, "text/plain", b"");
 
             let (mut sse, _) = listener.accept().expect("accept fresh legacy SSE GET");
             let sse_request = read_request(&mut sse);
