@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_client::{
-    ExecutionTerminalReason, ExecutionTerminalState, OpaquePagination, PaginationBounds, Request,
-    RequestExecutor, RequestTimeoutPolicy, clt_01_a_manifest_digest, clt_01_b_manifest_digest,
+    ExecutionTerminalReason, ExecutionTerminalState, OpaquePagination, PaginationBounds,
+    ProtocolEra, Request, RequestExecutor, RequestTimeoutPolicy, clt_01_a_manifest_digest,
+    clt_01_b_manifest_digest,
 };
 use fastmcp_core::McpErrorCode;
-use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
+use fastmcp_protocol::{DecodedResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
 use fastmcp_transport::{Transport, TransportError};
 
 #[derive(Debug, Default)]
@@ -98,11 +99,144 @@ impl Transport for ScriptedTransport {
 }
 
 fn request(id: i64) -> Request {
+    request_with_progress_marker(id, serde_json::json!(id))
+}
+
+fn request_with_progress_marker(id: i64, progress_marker: serde_json::Value) -> Request {
+    JsonRpcRequest::new(
+        "tools/call",
+        Some(serde_json::json!({
+            "id": id,
+            "_meta": {"progressToken": progress_marker},
+        })),
+        id,
+    )
+}
+
+fn request_without_progress_marker(id: i64) -> Request {
     JsonRpcRequest::new("tools/call", Some(serde_json::json!({"id": id})), id)
 }
 
 fn response(id: i64, result: serde_json::Value) -> JsonRpcMessage {
     JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result))
+}
+
+fn modern_progress_and_final(
+    id: i64,
+    progress_marker: serde_json::Value,
+) -> [Result<JsonRpcMessage, TransportError>; 2] {
+    [
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({"progressToken": progress_marker, "progress": 0.5})),
+        ))),
+        Ok(response(
+            id,
+            serde_json::json!({
+                "resultType": "complete",
+                "content": [],
+                "isError": false,
+                "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"},
+            }),
+        )),
+    ]
+}
+
+#[test]
+fn clt_01_custom_transport_selected_modern_uses_typed_correlation_and_progress() {
+    let cx = Cx::for_testing();
+    let (transport, probe) =
+        ScriptedTransport::new(modern_progress_and_final(151, serde_json::json!(151)));
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Modern2026);
+    let mut execution = executor
+        .execute(&cx, request(151))
+        .expect("the modern custom transport commits one correlated request");
+
+    let (result, diagnostic, progress) = executor
+        .wait_decoded_with_stream(&cx, &mut execution)
+        .expect("the selected modern transport retains typed final and progress paths");
+    assert!(matches!(result, DecodedResult::Complete(_)));
+    assert!(diagnostic.is_none());
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0].method, "notifications/progress");
+    assert_eq!(executor.protocol_era(), ProtocolEra::Modern2026);
+    assert_eq!(probe.sent_len(), 1);
+}
+
+#[test]
+fn clt_01_custom_transport_accepts_exact_string_advertised_progress_token() {
+    let cx = Cx::for_testing();
+    let marker = serde_json::json!("public-string-progress-token");
+    let (transport, probe) = ScriptedTransport::new(modern_progress_and_final(152, marker.clone()));
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Modern2026);
+    let mut execution = executor
+        .execute(&cx, request_with_progress_marker(152, marker))
+        .expect("the string-marker request commits before progress arrives");
+
+    let (_, _, progress) = executor
+        .wait_decoded_with_stream(&cx, &mut execution)
+        .expect("an exactly repeated string marker owns modern progress");
+    assert_eq!(progress.len(), 1);
+    assert_eq!(probe.sent_len(), 1);
+}
+
+#[test]
+fn clt_01_custom_transport_rejects_progress_without_an_advertised_marker() {
+    let cx = Cx::for_testing();
+    let (transport, probe) =
+        ScriptedTransport::new(modern_progress_and_final(153, serde_json::json!(153)));
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Modern2026);
+    let mut execution = executor
+        .execute(&cx, request_without_progress_marker(153))
+        .expect("the marker-free request commits before the peer notification");
+
+    let (_, _, progress) = executor
+        .wait_decoded_with_stream(&cx, &mut execution)
+        .expect("unowned progress must not reject the correlated final response");
+    assert!(progress.is_empty());
+    assert_eq!(probe.sent_len(), 1);
+}
+
+#[test]
+fn clt_01_custom_transport_rejects_one_changed_advertised_progress_token() {
+    let cx = Cx::for_testing();
+    let marker = serde_json::json!("public-string-progress-token");
+    // Only the peer's advertised marker differs from the paired positive.
+    let (transport, probe) = ScriptedTransport::new(modern_progress_and_final(
+        152,
+        serde_json::json!("other-token"),
+    ));
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Modern2026);
+    let mut execution = executor
+        .execute(&cx, request_with_progress_marker(152, marker))
+        .expect("the same request still commits before foreign progress arrives");
+
+    let (_, _, progress) = executor
+        .wait_decoded_with_stream(&cx, &mut execution)
+        .expect("a foreign progress marker must not fail the correlated final response");
+    assert!(progress.is_empty());
+    assert_eq!(probe.sent_len(), 1);
+}
+
+#[test]
+fn clt_01_custom_transport_rejects_final_result_under_one_changed_selected_era() {
+    let cx = Cx::for_testing();
+    let (transport, probe) =
+        ScriptedTransport::new(modern_progress_and_final(151, serde_json::json!(151)));
+    // Only the already-negotiated era differs from the accepted modern path.
+    // A custom transport must not decode final-only metadata through the
+    // unary exact-2024 compatibility path.
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Legacy2024);
+    let mut execution = executor
+        .execute(&cx, request(151))
+        .expect("the same request still commits before peer result admission");
+
+    let error = executor
+        .wait_decoded_with_stream(&cx, &mut execution)
+        .expect_err("final-only metadata cannot be projected onto exact legacy decoding");
+    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+    assert_eq!(executor.protocol_era(), ProtocolEra::Legacy2024);
+    assert_eq!(probe.sent_len(), 1);
 }
 
 #[test]

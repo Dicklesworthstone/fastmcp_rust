@@ -26,10 +26,11 @@ use fastmcp_protocol::{
     CoreResultDiscriminatorPolicy, CorrelationKey, DecodedResult, FINAL_SUBSCRIPTION_ID_META_KEY,
     FinalCancelledNotificationParams, FinalCoreResult,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId, ResultPeerDiagnostic,
-    ResultPeerEra, SubscriptionFilter, decode_peer_result,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ProgressMarker, RequestId,
+    ResultPeerDiagnostic, ResultPeerEra, SubscriptionFilter, decode_peer_result,
+    decode_strict_jsonrpc_response,
 };
-use fastmcp_transport::{Transport, TransportError};
+use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError};
 use serde_json::Value;
 
 use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
@@ -847,8 +848,36 @@ struct PendingExecution {
     record: PendingRequestRecord,
     owner_dropped: OwnerDropped,
     timeout_policy: RequestTimeoutPolicy,
+    /// The exact optional marker the request advertised in `_meta`.
+    ///
+    /// Progress is never correlated from a JSON-RPC request ID alone: a peer
+    /// notification belongs to this request only when it repeats this marker.
+    advertised_progress_marker: Option<ProgressMarker>,
     last_progress: Option<f64>,
     method: String,
+}
+
+/// Returns the exact progress marker a client request advertised, when valid.
+///
+/// A generic raw request may omit `_meta` or supply an invalid marker. Neither
+/// case grants a peer progress notification ownership of that execution.
+fn advertised_progress_marker(params: Option<&Value>) -> Option<ProgressMarker> {
+    let marker = params
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("_meta"))
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("progressToken"))?;
+    serde_json::from_value(marker.clone()).ok()
+}
+
+/// Returns one valid typed marker from a peer progress notification.
+fn progress_notification_marker(notification: &JsonRpcRequest) -> Option<ProgressMarker> {
+    let marker = notification
+        .params
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("progressToken"))?;
+    serde_json::from_value(marker.clone()).ok()
 }
 
 /// Shared dropped-owner marker. This replaces the executor's local
@@ -1058,6 +1087,8 @@ struct DeferredDropCancellation {
 #[derive(Debug)]
 struct ExecutorState<T> {
     transport: T,
+    receive_frame: Option<fn(&mut T, &Cx) -> Result<ReceivedTransportFrame, TransportError>>,
+    ingress_owner: IngressOwner,
     pending: HashMap<CorrelationKey, PendingExecution>,
     completed: HashMap<(RequestId, u64), ExecutionOutcome>,
     tombstones: HashMap<CorrelationKey, Tombstone>,
@@ -1075,6 +1106,21 @@ struct ExecutorState<T> {
     result_peer_era: ResultPeerEra,
     terminal_error: Option<McpError>,
     shutdown: bool,
+}
+
+/// The one authority allowed to take the next inbound transport frame.
+///
+/// An executor starts unclaimed. Its ordinary [`RequestExecutor::drive`]
+/// claims self-reader mode, while [`RequestExecutor::drive_frame`] claims the
+/// externally driven mode used by a connection-owned selected-I/O arbiter.
+/// The modes never switch for a live executor, preventing a response frame
+/// from being consumed by a second reader after a request owner has chosen
+/// its ingress path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngressOwner {
+    Unclaimed,
+    SelfReader,
+    ExternalDriver,
 }
 
 impl<T> ExecutorState<T> {
@@ -1250,9 +1296,41 @@ where
     /// callers that have not yet integrated negotiation.
     #[must_use]
     pub fn with_result_peer_era(transport: T, result_peer_era: ResultPeerEra) -> Self {
+        Self::with_source_frame_receiver(transport, result_peer_era, None)
+    }
+
+    /// Creates an executor for a transport whose MCP era was already selected.
+    ///
+    /// Custom transports must complete their own bounded handshake before
+    /// constructing this executor. The selected era is then immutable for the
+    /// connection: modern executions use final-result decoding plus
+    /// request-owned progress and subscription handling, while exact legacy
+    /// executions retain the 2024-11-05 compatibility path. This constructor
+    /// deliberately has no `Auto` policy or retry surface, so it cannot replay
+    /// requests across transport instances.
+    #[must_use]
+    pub fn with_protocol_era(transport: T, protocol_era: ProtocolEra) -> Self {
+        Self::with_result_peer_era(transport, protocol_era.into())
+    }
+
+    /// Creates an executor whose one transport reader can retain admitted
+    /// source frames.
+    ///
+    /// The receiver remains owned by this executor's transport; callers use
+    /// this only for a transport that has already selected one immutable peer
+    /// era. Passing `None` retains the ordinary typed [`Transport`] ingress
+    /// behavior used by [`Self::new`] and [`Self::with_result_peer_era`].
+    #[must_use]
+    pub fn with_source_frame_receiver(
+        transport: T,
+        result_peer_era: ResultPeerEra,
+        receive_frame: Option<fn(&mut T, &Cx) -> Result<ReceivedTransportFrame, TransportError>>,
+    ) -> Self {
         Self {
             state: SharedExecutorState::new(ExecutorState {
                 transport,
+                receive_frame,
+                ingress_owner: IngressOwner::Unclaimed,
                 pending: HashMap::new(),
                 completed: HashMap::new(),
                 tombstones: HashMap::new(),
@@ -1283,6 +1361,50 @@ where
         self.state.borrow().result_peer_era
     }
 
+    /// Returns the immutable MCP era selected before this executor was built.
+    #[must_use]
+    pub fn protocol_era(&self) -> ProtocolEra {
+        match self.result_peer_era() {
+            ResultPeerEra::Legacy => ProtocolEra::Legacy2024,
+            ResultPeerEra::Modern => ProtocolEra::Modern2026,
+        }
+    }
+
+    /// Returns whether an admitted final response belongs to this executor.
+    ///
+    /// A connection-owned ingress arbiter uses this before handing a response
+    /// frame to the executor. Retained tombstones count as owned so a late
+    /// exact final cannot fall through to an adjacent request registry.
+    pub(crate) fn owns_response_id(&self, response_id: &RequestId) -> bool {
+        let Ok(key) = response_id.correlation_key() else {
+            return false;
+        };
+        let state = self.state.borrow();
+        state.pending.contains_key(&key) || state.tombstones.contains_key(&key)
+    }
+
+    /// Returns whether a progress notification names one live request owner.
+    ///
+    /// The caller must still pass the full admitted frame to [`Self::drive_frame`]
+    /// so semantic validation, stream retention, and idle-deadline policy
+    /// remain centralized here.
+    pub(crate) fn owns_progress_notification(&self, notification: &JsonRpcRequest) -> bool {
+        if notification.id.is_some() || notification.method != "notifications/progress" {
+            return false;
+        }
+        let Some(marker) = progress_notification_marker(notification) else {
+            return false;
+        };
+        self.state
+            .borrow()
+            .pending
+            .values()
+            .filter(|pending| pending.advertised_progress_marker.as_ref() == Some(&marker))
+            .take(2)
+            .count()
+            == 1
+    }
+
     /// Starts one request-owned execution after its request is committed.
     ///
     /// `request` must be a JSON-RPC request with an ID. Notifications have no
@@ -1307,6 +1429,7 @@ where
         let correlation_key = request_id.correlation_key().map_err(|_| {
             McpError::invalid_params("Request execution requires a valid JSON-RPC request ID")
         })?;
+        let advertised_progress_marker = advertised_progress_marker(request.params.as_ref());
 
         let mut state = self.state.borrow_mut();
         self.drain_abandoned_locked(cx, &mut state)?;
@@ -1387,6 +1510,7 @@ where
                 },
                 owner_dropped: owner_dropped.clone(),
                 timeout_policy,
+                advertised_progress_marker,
                 last_progress: None,
                 method: request.method.clone(),
             },
@@ -1500,47 +1624,125 @@ where
     /// response slot.
     pub fn drive(&self, cx: &Cx) -> McpResult<()> {
         let mut state = self.state.borrow_mut();
-        self.drain_abandoned_locked(cx, &mut state)?;
-        self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
-        if let Some(error) = &state.terminal_error {
-            return Err(error.clone());
-        }
-        let message = match state.transport.recv(cx) {
-            Ok(message) => message,
+        self.claim_ingress_owner_locked(&mut state, IngressOwner::SelfReader)?;
+        self.prepare_drive_locked(cx, &mut state)?;
+        let (message, raw_result) = match state.receive_frame {
+            Some(receive_frame) => {
+                let frame = match receive_frame(&mut state.transport, cx) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let error = transport_error_to_mcp(error);
+                        state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                        return Err(error);
+                    }
+                };
+                let (message, source) = frame.into_parts();
+                let raw_result = match exact_result_source_from_admitted_frame(&message, &source) {
+                    Ok(raw_result) => raw_result,
+                    Err(error) => {
+                        state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
+                        return Err(error);
+                    }
+                };
+                (message, raw_result)
+            }
+            None => match state.transport.recv(cx) {
+                Ok(message) => (message, None),
+                Err(error) => {
+                    let error = transport_error_to_mcp(error);
+                    state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                    return Err(error);
+                }
+            },
+        };
+        self.route_inbound_message_locked(cx, &mut state, message, raw_result)
+    }
+
+    /// Drives one source-preserving peer frame through the correlation registry.
+    ///
+    /// The frame is admitted by the sole negotiated transport reader before it
+    /// reaches this executor. Successful JSON-RPC responses retain the exact
+    /// `result` member source from that same frame; it is never reconstructed
+    /// from the typed value. Requests and notifications follow the identical
+    /// cancellation, reverse-request, and request-owned progress routes used
+    /// by [`Self::drive`].
+    ///
+    /// This method performs no transport read. A negotiated client can retain
+    /// its one reader and pass each admitted frame here without creating a
+    /// competing response path.
+    pub fn drive_frame(&self, cx: &Cx, frame: ReceivedTransportFrame) -> McpResult<()> {
+        let (message, source) = frame.into_parts();
+        let mut state = self.state.borrow_mut();
+        self.claim_ingress_owner_locked(&mut state, IngressOwner::ExternalDriver)?;
+        self.prepare_drive_locked(cx, &mut state)?;
+        let raw_result = match exact_result_source_from_admitted_frame(&message, &source) {
+            Ok(raw_result) => raw_result,
             Err(error) => {
-                let error = transport_error_to_mcp(error);
-                state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+                state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
                 return Err(error);
             }
         };
+        self.route_inbound_message_locked(cx, &mut state, message, raw_result)
+    }
+
+    fn claim_ingress_owner_locked(
+        &self,
+        state: &mut ExecutorState<T>,
+        requested_owner: IngressOwner,
+    ) -> McpResult<()> {
+        match state.ingress_owner {
+            IngressOwner::Unclaimed => {
+                state.ingress_owner = requested_owner;
+                Ok(())
+            }
+            owner if owner == requested_owner => Ok(()),
+            IngressOwner::SelfReader => Err(McpError::invalid_request(
+                "Client request executor already owns transport ingress",
+            )),
+            IngressOwner::ExternalDriver => Err(McpError::invalid_request(
+                "Client request executor is driven by external admitted frames",
+            )),
+        }
+    }
+
+    fn prepare_drive_locked(&self, cx: &Cx, state: &mut ExecutorState<T>) -> McpResult<()> {
+        self.drain_abandoned_locked(cx, state)?;
+        self.expire_timeouts_locked(cx, state, Instant::now())?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        Ok(())
+    }
+
+    fn route_inbound_message_locked(
+        &self,
+        cx: &Cx,
+        state: &mut ExecutorState<T>,
+        message: JsonRpcMessage,
+        raw_result: Option<String>,
+    ) -> McpResult<()> {
         if message.validate().is_err() {
             let error = McpError::invalid_request("Peer sent an invalid JSON-RPC message");
             state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
             return Err(error);
         }
         match message {
-            // `Transport::recv` has already decoded this typed frame, so it
-            // cannot honestly supply the peer's exact result-member source.
-            // Do not manufacture one by serializing the `Value` again: raw
-            // admissions must use `route_response_with_raw_result` instead.
             JsonRpcMessage::Response(response) => {
-                self.route_response_with_raw_result_locked(&mut state, response, None)?;
+                self.route_response_with_raw_result_locked(state, response, raw_result)?;
             }
             JsonRpcMessage::Request(request) => {
                 if request.method == "notifications/cancelled" {
-                    self.route_cancellation_notification_locked(cx, &mut state, &request)?;
+                    self.route_cancellation_notification_locked(cx, state, &request)?;
                 } else if request.id.is_some() {
                     if state.result_peer_era == ResultPeerEra::Modern {
-                        self.reject_modern_reverse_request_locked(cx, &mut state, request)?;
+                        self.reject_modern_reverse_request_locked(cx, state, request)?;
                     } else if let Err(error) = state.retain_reverse_request(request) {
                         state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
                         return Err(error);
                     }
-                } else if self
-                    .route_task_subscription_acknowledgement_locked(&mut state, &request)?
-                {
-                } else if self.route_task_subscription_notification_locked(&mut state, &request)? {
-                } else if self.route_stream_notification_locked(&mut state, &request)? {
+                } else if self.route_task_subscription_acknowledgement_locked(state, &request)? {
+                } else if self.route_task_subscription_notification_locked(state, &request)? {
+                } else if self.route_stream_notification_locked(state, &request)? {
                 } else if !state.retain_notification(request) {
                     let error = McpError::internal_error("Client peer-activity queue is full");
                     state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
@@ -1589,6 +1791,49 @@ where
         let (outcome, _) = self.wait_for_terminal(cx, execution)?;
         match outcome {
             ExecutionOutcome::Response(response) => Ok(response.response),
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Takes an already-routed final response without reading the transport.
+    ///
+    /// A connection-owned ingress driver uses this for request-owned handles:
+    /// it alone admits frames through [`Self::drive_frame`], while callers
+    /// observe their own completed execution without accidentally claiming a
+    /// second transport reader. The returned response retains the normal
+    /// JSON-RPC error envelope; use [`Self::wait`] when self-reader mode is
+    /// intentionally selected instead.
+    pub fn try_take_response(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<JsonRpcResponse>> {
+        execution.ensure_owner(&self.state)?;
+        let Some((outcome, _)) = execution.take_terminal_outcome()? else {
+            return Ok(None);
+        };
+        match outcome {
+            ExecutionOutcome::Response(response) => Ok(Some(response.response)),
+            ExecutionOutcome::Failure(error) => Err(error),
+        }
+    }
+
+    /// Takes an already-routed final response with its exact admitted result
+    /// source, without reading the transport.
+    ///
+    /// This is the source-preserving companion to [`Self::try_take_response`]
+    /// for a negotiated connection whose Client owns transport ingress.
+    pub fn try_take_response_with_raw_result(
+        &self,
+        execution: &mut RequestExecution<T>,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
+        execution.ensure_owner(&self.state)?;
+        let Some((outcome, _)) = execution.take_terminal_outcome()? else {
+            return Ok(None);
+        };
+        match outcome {
+            ExecutionOutcome::Response(response) => {
+                Ok(Some((response.response, response.raw_result)))
+            }
             ExecutionOutcome::Failure(error) => Err(error),
         }
     }
@@ -1937,6 +2182,32 @@ where
         let mut state = self.state.borrow_mut();
         self.drain_abandoned_locked(cx, &mut state)?;
         self.expire_timeouts_locked(cx, &mut state, observed_at)
+    }
+
+    /// Returns the earliest live request deadline for an external ingress
+    /// driver. It does not mutate correlation state or read the transport.
+    pub(crate) fn next_pending_deadline(&self) -> Option<Instant> {
+        self.state
+            .borrow()
+            .pending
+            .values()
+            .fold(None, |earliest, pending| {
+                let deadline = pending
+                    .record
+                    .idle_deadline
+                    .min(pending.record.absolute_deadline);
+                Some(earliest.map_or(deadline, |earliest| earliest.min(deadline)))
+            })
+    }
+
+    /// Releases every request owner after the connection's sole ingress driver
+    /// has selected a terminal transport or protocol failure. The driver owns
+    /// transport teardown; this only publishes the same terminal outcome to
+    /// request-owned handles.
+    pub(crate) fn fail_connection(&self, error: McpError) {
+        self.state
+            .borrow_mut()
+            .fail_all(error, ExecutionTerminalReason::ConnectionLost);
     }
 
     /// Cancels live owners, releases their waiters, and closes the transport.
@@ -2651,10 +2922,7 @@ where
         let Some(params) = notification.params.as_ref().and_then(Value::as_object) else {
             return Ok(false);
         };
-        let Some(token) = params.get("progressToken") else {
-            return Ok(false);
-        };
-        let Ok(request_id) = serde_json::from_value::<RequestId>(token.clone()) else {
+        let Some(marker) = progress_notification_marker(notification) else {
             return Ok(false);
         };
         let Some(progress) = params.get("progress").and_then(Value::as_f64) else {
@@ -2663,10 +2931,18 @@ where
         if !progress.is_finite() {
             return Ok(false);
         }
-        let Ok(correlation_key) = request_id.correlation_key() else {
+        let matching_keys = state
+            .pending
+            .iter()
+            .filter_map(|(key, pending)| {
+                (pending.advertised_progress_marker.as_ref() == Some(&marker))
+                    .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        let [correlation_key] = matching_keys.as_slice() else {
             return Ok(false);
         };
-        let Some(pending) = state.pending.get_mut(&correlation_key) else {
+        let Some(pending) = state.pending.get_mut(correlation_key) else {
             return Ok(false);
         };
         if pending.last_progress.is_some_and(|prior| progress <= prior) {
@@ -2696,6 +2972,24 @@ where
         stream.push_back(notification.clone());
         Ok(true)
     }
+}
+
+fn exact_result_source_from_admitted_frame(
+    message: &JsonRpcMessage,
+    source: &[u8],
+) -> McpResult<Option<String>> {
+    let JsonRpcMessage::Response(response) = message else {
+        return Ok(None);
+    };
+    let admission = decode_strict_jsonrpc_response(source, source.len()).map_err(|_| {
+        McpError::invalid_request("Admitted peer response could not retain its exact result source")
+    })?;
+    if admission.response() != response {
+        return Err(McpError::invalid_request(
+            "Admitted peer response differs from its exact source frame",
+        ));
+    }
+    Ok(admission.into_parts().1)
 }
 
 fn cancellation_control_message_for_era(
@@ -3000,6 +3294,7 @@ mod tests {
     #[derive(Debug)]
     struct ScriptedTransport {
         received: VecDeque<Result<JsonRpcMessage, TransportError>>,
+        received_frames: VecDeque<Result<ReceivedTransportFrame, TransportError>>,
         sent: Vec<JsonRpcMessage>,
         send_error: Option<std::io::ErrorKind>,
     }
@@ -3008,6 +3303,18 @@ mod tests {
         fn new(received: impl IntoIterator<Item = Result<JsonRpcMessage, TransportError>>) -> Self {
             Self {
                 received: received.into_iter().collect(),
+                received_frames: VecDeque::new(),
+                sent: Vec::new(),
+                send_error: None,
+            }
+        }
+
+        fn with_source_frames(
+            received_frames: impl IntoIterator<Item = Result<ReceivedTransportFrame, TransportError>>,
+        ) -> Self {
+            Self {
+                received: VecDeque::new(),
+                received_frames: received_frames.into_iter().collect(),
                 sent: Vec::new(),
                 send_error: None,
             }
@@ -3034,8 +3341,25 @@ mod tests {
         }
     }
 
+    fn receive_scripted_source_frame(
+        transport: &mut ScriptedTransport,
+        _cx: &Cx,
+    ) -> Result<ReceivedTransportFrame, TransportError> {
+        transport
+            .received_frames
+            .pop_front()
+            .unwrap_or(Err(TransportError::Closed))
+    }
+
     fn request(id: i64) -> JsonRpcRequest {
-        JsonRpcRequest::new("tools/call", Some(serde_json::json!({"id": id})), id)
+        JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "id": id,
+                "_meta": {"progressToken": id},
+            })),
+            id,
+        )
     }
 
     fn response(id: i64, result: serde_json::Value) -> JsonRpcMessage {
@@ -3245,6 +3569,7 @@ mod tests {
 
         let backpressured = RequestExecutor::new(ScriptedTransport {
             received: VecDeque::new(),
+            received_frames: VecDeque::new(),
             sent: Vec::new(),
             send_error: Some(std::io::ErrorKind::WouldBlock),
         });
@@ -3667,6 +3992,237 @@ mod tests {
             .wait_with_raw_result(&cx, &mut execution)
             .expect("normal drive preserves the typed response for the waiter");
         assert!(retained_source.is_none());
+    }
+
+    #[test]
+    fn drive_frame_preserves_the_exact_result_source_for_its_request_owner() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":84,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("one complete source frame is admitted before executor routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut execution = executor
+            .execute(&cx, request(84))
+            .expect("request commits before the source-preserving ingress frame");
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("the admitted frame completes only its exact request owner");
+
+        let (response, retained_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("the request owner retains its admitted source result");
+        assert_eq!(response.id, Some(RequestId::Number(84)));
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    fn source_aware_executor_drive_retains_the_exact_result_source() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":7.30e-2}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":84,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("the selected-reader source frame is admitted");
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([Ok(frame)]),
+            ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
+        );
+        let mut execution = executor
+            .execute(&cx, request(84))
+            .expect("source-aware request commits before its response is read");
+
+        let (_, retained_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("the executor's one source-aware reader retains raw result spelling");
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    fn externally_driven_completion_makes_wait_observe_state_without_reading() {
+        let cx = Cx::for_testing();
+        let queued_self_reader_frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","id":999,"result":{"resultType":"complete"}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("the unused self-reader frame is admitted");
+        let raw_result = r#"{"resultType":"complete","opaque":{"decimal":1.20e+4}}"#;
+        let externally_driven_frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":85,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("the external completion frame is admitted");
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([Ok(queued_self_reader_frame)]),
+            ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
+        );
+        let mut execution = executor
+            .execute(&cx, request(85))
+            .expect("owner commits before selected ingress dispatch");
+
+        executor
+            .drive_frame(&cx, externally_driven_frame)
+            .expect("the external sole reader completes its request owner");
+        let (_, retained_source) = executor
+            .wait_with_raw_result(&cx, &mut execution)
+            .expect("wait consumes the already-routed outcome without another transport read");
+
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+        assert_eq!(executor.state.borrow().transport.received_frames.len(), 1);
+    }
+
+    #[test]
+    fn externally_driven_ingress_rejects_a_forced_second_self_reader() {
+        let cx = Cx::for_testing();
+        let queued_self_reader_frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","id":86,"result":{"resultType":"complete"}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("the competing self-reader frame is admitted");
+        let external_progress = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":86,"progress":0.5}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("the external owner first claims ingress");
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([Ok(queued_self_reader_frame)]),
+            ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
+        );
+        let mut execution = executor
+            .execute(&cx, request(86))
+            .expect("request commits before the forced two-reader attempt");
+
+        executor
+            .drive_frame(&cx, external_progress)
+            .expect("external frame claims the sole ingress owner");
+        let error = executor
+            .drive(&cx)
+            .expect_err("a self-reader cannot consume a frame after external ingress is selected");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(executor.state.borrow().transport.received_frames.len(), 1);
+        assert_eq!(
+            execution
+                .take_stream_notifications()
+                .expect("the external owner retains its progress")
+                .len(),
+            1
+        );
+        let error = executor
+            .wait(&cx, &mut execution)
+            .expect_err("a pending external execution must not make wait read transport");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(executor.state.borrow().transport.received_frames.len(), 1);
+    }
+
+    #[test]
+    fn drive_frame_routes_matching_progress_to_its_request_owner() {
+        let cx = Cx::for_testing();
+        let frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":85,"progress":0.5}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("matching progress frame is admitted before routing");
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut execution = executor
+            .execute(&cx, request(85))
+            .expect("matching-progress request commits");
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("matching progress routes without a second reader");
+
+        let stream = execution
+            .take_stream_notifications()
+            .expect("live owner retains its matching progress");
+        assert_eq!(stream.len(), 1);
+        assert_eq!(stream[0].method, "notifications/progress");
+        assert!(executor.take_notifications().is_empty());
+    }
+
+    #[test]
+    fn drive_frame_wrong_progress_token_is_not_owned_by_the_adjacent_request() {
+        let cx = Cx::for_testing();
+        let frame = ReceivedTransportFrame::admit(
+            br#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":86,"progress":0.5}}"#
+                .to_vec()
+                .into_boxed_slice(),
+        )
+        .expect("near-identical progress frame is admitted before routing");
+        let executor = RequestExecutor::new(ScriptedTransport::new(std::iter::empty()));
+        let mut execution = executor
+            .execute(&cx, request(85))
+            .expect("only the request ID differs from the matching positive");
+        let pending_before = executor.pending_records();
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("foreign progress remains connection-level activity");
+
+        assert_eq!(executor.pending_records(), pending_before);
+        assert!(
+            execution
+                .take_stream_notifications()
+                .expect("foreign progress has no request owner")
+                .is_empty()
+        );
+        assert_eq!(executor.take_notifications().len(), 1);
+    }
+
+    #[test]
+    fn drive_frame_flushes_dropped_owner_cancellation_before_its_late_final() {
+        let cx = Cx::for_testing();
+        let raw_result = r#"{"resultType":"complete"}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":87,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("late final source is admitted before routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let dropped = executor
+            .execute(&cx, request(87))
+            .expect("owner commits before its request-owned handle drops");
+        drop(dropped);
+
+        executor
+            .drive_frame(&cx, frame)
+            .expect("the sole ingress frame first drains the dropped owner's cancellation");
+
+        assert!(executor.pending_records().is_empty());
+        assert!(executor.take_uncorrelated_responses().is_empty());
+        assert_eq!(
+            executor.take_cancellation_events(),
+            vec![CancellationRequested {
+                request_id: RequestId::Number(87),
+                reason: ExecutionTerminalReason::CallerDropped,
+            }],
+        );
+        let state = executor.state.borrow();
+        assert_eq!(state.transport.sent.len(), 2);
+        let JsonRpcMessage::Request(cancellation) = &state.transport.sent[1] else {
+            panic!("dropped execution emits one modern cancellation control");
+        };
+        assert_eq!(cancellation.method, "notifications/cancelled");
     }
 
     #[test]

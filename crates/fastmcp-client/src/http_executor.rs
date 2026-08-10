@@ -20,7 +20,6 @@ use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
 use asupersync::http::{Body, Frame};
-use asupersync::sync::Mutex;
 use fastmcp_protocol::extensions::{
     ExtensionDirection, McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID,
     OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
@@ -52,7 +51,7 @@ use fastmcp_protocol::{
 };
 
 use crate::execution::{MrtrDriver, MrtrDriverLimits};
-use crate::session::resolve_mcp_apps_activation;
+use crate::session::{ClientExtensionRuntime, mcp_apps_activation_receipt};
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
@@ -307,7 +306,6 @@ impl ModernHttpResponseMetadata {
     pub const fn kind(&self) -> ModernHttpResponseKind {
         self.kind
     }
-
 }
 
 /// A live native response stream, owned by one modern POST.
@@ -1914,14 +1912,16 @@ pub struct ModernHttpClient {
     client_info: ClientInfo,
     client_capabilities: ClientCapabilities,
     mcp_apps_settings: Option<McpAppsClientSettings>,
+    client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     discovery_state: Arc<std::sync::RwLock<ModernHttpDiscoveryState>>,
     executor: ModernHttpExecutor,
 }
 
 #[derive(Clone)]
 struct ModernHttpDiscoveryState {
-    mcp_apps_active: bool,
+    mcp_apps_activation_receipt: Option<fastmcp_protocol::extensions::McpAppsActivationReceipt>,
     server_discovery: ServerDiscoverResult,
+    negotiated_extensions: Option<fastmcp_protocol::extensions::NegotiatedExtensionSet>,
 }
 
 /// The result of a policy-bound modern HTTP connection attempt.
@@ -2098,6 +2098,7 @@ pub enum ClientHttpConnection {
         reverse_request_handlers: ReverseRequestHandlers,
         cancelled_response_ids: VecDeque<RequestId>,
         persistent_receiver: Option<LegacySsePersistentReceiver>,
+        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     },
 }
 
@@ -2136,6 +2137,9 @@ pub enum ClientHttpConnectionError {
     LegacyCancelledRequestStillDraining { request_id: RequestId },
     /// A public legacy request attempted to carry final-only metadata.
     LegacyFinalMetadata { member: &'static str },
+    /// A raw legacy request attempted to bypass a configured final extension
+    /// descriptor instead of using the negotiated extension request surface.
+    RegisteredExtensionMethodRequiresAdmission { method: String },
     /// Too many interleaved legacy notifications accumulated before a response.
     LegacyNotificationQueueFull,
     /// The ready legacy SSE reader was unavailable before it could be owned by
@@ -2229,6 +2233,10 @@ impl fmt::Display for ClientHttpConnectionError {
                 formatter,
                 "exact legacy request cannot carry final-only metadata member {member}"
             ),
+            Self::RegisteredExtensionMethodRequiresAdmission { method } => write!(
+                formatter,
+                "registered final extension method {method} requires the admitted extension request surface"
+            ),
             Self::LegacyNotificationQueueFull => formatter.write_str(
                 "legacy request received too many interleaved notifications before its response",
             ),
@@ -2302,6 +2310,7 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::LegacyCancelledResponseQueueFull
             | Self::LegacyCancelledRequestStillDraining { .. }
             | Self::LegacyFinalMetadata { .. }
+            | Self::RegisteredExtensionMethodRequiresAdmission { .. }
             | Self::LegacyNotificationQueueFull
             | Self::LegacyPersistentReceiverUnavailable
             | Self::LegacyPersistentReceiverStopped
@@ -2345,13 +2354,34 @@ impl ClientHttpConnection {
         client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
     ) -> Result<Self, ClientHttpConnectionError> {
-        let legacy_client_capabilities = client_capabilities.clone();
-        match ModernHttpClient::connect_with_mcp_apps(
+        Self::connect_with_extensions(
             cx,
             protocol_plan,
             client_info,
             client_capabilities,
             mcp_apps_settings,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_extensions(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        mcp_apps_settings: Option<McpAppsClientSettings>,
+        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+    ) -> Result<Self, ClientHttpConnectionError> {
+        let legacy_client_capabilities = client_capabilities.clone();
+        let legacy_client_extension_runtime = client_extension_runtime.clone();
+        match ModernHttpClient::connect_with_extensions(
+            cx,
+            protocol_plan,
+            client_info,
+            client_capabilities,
+            mcp_apps_settings,
+            client_extension_runtime,
         )
         .await
         .map_err(ClientHttpConnectionError::Modern)?
@@ -2364,6 +2394,7 @@ impl ClientHttpConnection {
                 reverse_request_handlers: ReverseRequestHandlers::new(),
                 cancelled_response_ids: VecDeque::new(),
                 persistent_receiver: None,
+                client_extension_runtime: legacy_client_extension_runtime,
             }),
         }
     }
@@ -2437,6 +2468,39 @@ impl ClientHttpConnection {
         match self {
             Self::Modern(client) => client.mcp_apps_active(),
             Self::LegacySse { .. } => false,
+        }
+    }
+
+    /// Returns the retained generic extension set for a modern connection.
+    #[must_use]
+    pub fn negotiated_extensions(
+        &self,
+    ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
+        match self {
+            Self::Modern(client) => client.negotiated_extensions(),
+            Self::LegacySse { .. } => None,
+        }
+    }
+
+    pub(crate) fn admit_final_extension_method(
+        &self,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+    ) -> McpResult<()> {
+        match self {
+            Self::Modern(client) => client.admit_final_extension_method(extension_id, method),
+            Self::LegacySse { .. } => Err(McpError::invalid_params(
+                "Final client extensions are unavailable in exact MCP 2024-11-05",
+            )),
+        }
+    }
+
+    pub(crate) fn mcp_apps_activation_receipt(
+        &self,
+    ) -> Option<fastmcp_protocol::extensions::McpAppsActivationReceipt> {
+        match self {
+            Self::Modern(client) => client.mcp_apps_activation_receipt(),
+            Self::LegacySse { .. } => None,
         }
     }
 
@@ -2562,8 +2626,19 @@ impl ClientHttpConnection {
                 reverse_request_handlers,
                 cancelled_response_ids,
                 persistent_receiver,
+                client_extension_runtime,
                 ..
             } => {
+                if client_extension_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.owns_method(method))
+                {
+                    return Err(
+                        ClientHttpConnectionError::RegisteredExtensionMethodRequiresAdmission {
+                            method: method.to_owned(),
+                        },
+                    );
+                }
                 reject_final_only_legacy_request_metadata(&parameters)?;
                 if let Some(receiver) = persistent_receiver.as_ref() {
                     return receiver
@@ -3272,31 +3347,19 @@ pub enum ModernHttpClientError {
     /// A normal modern request requires object parameters so final metadata can
     /// be bound without changing the method-specific parameter shape.
     RequestParametersMustBeObject,
-    /// `tools/call`, `prompts/get`, and `resources/read` omitted their required
-    /// value for the final `Mcp-Name` header mirror.
-    MissingRequestName {
-        method: String,
-    },
+    /// A method that requires an `Mcp-Name` header mirror omitted its body
+    /// value. This includes core routing values and final Tasks `taskId`s.
+    MissingRequestName { method: String },
     /// The caller selected no active final client-to-server method.
-    UnsupportedFinalMethod {
-        method: String,
-    },
+    UnsupportedFinalMethod { method: String },
     /// The caller selected a final method that only the server may send.
-    ServerInitiatedFinalMethod {
-        method: String,
-    },
+    ServerInitiatedFinalMethod { method: String },
     /// The caller omitted the request ID required by the selected final method.
-    MissingRequestId {
-        method: String,
-    },
+    MissingRequestId { method: String },
     /// The caller supplied an ID for a final notification method.
-    NotificationHasRequestId {
-        method: String,
-    },
+    NotificationHasRequestId { method: String },
     /// MCP 2026-07-28 does not permit client notification POSTs over HTTP.
-    ClientNotificationPostUnsupported {
-        method: String,
-    },
+    ClientNotificationPostUnsupported { method: String },
     /// JSON-RPC or final metadata serialization failed before a native POST.
     RequestEncodingFailed,
     /// The native executor rejected or failed the HTTP exchange.
@@ -3320,6 +3383,9 @@ pub enum ModernHttpClientError {
     /// The typed final discovery reply did not advertise the final version
     /// selected for this modern HTTP connection.
     DiscoveryDoesNotAdvertiseModernProtocol,
+    /// The builder-owned generic extension registry could not negotiate the
+    /// retained final discovery settings.
+    ClientExtensionNegotiation { message: String },
     /// The configured native legacy SSE connection could not be opened or
     /// safely used after policy selected its exact endpoint bundle.
     LegacySse(LegacySseHttpClientError),
@@ -3330,19 +3396,13 @@ pub enum ModernHttpClientError {
     TasksNegotiation,
     /// The retained final discovery response did not bilaterally admit this
     /// official Tasks lifecycle method with exact empty settings.
-    TasksMethodNegotiation {
-        method: &'static str,
-    },
+    TasksMethodNegotiation { method: &'static str },
     /// The caller supplied an invalid JSON-RPC correlation key for an official
     /// final Tasks lifecycle request.
-    InvalidTasksRequestId {
-        method: &'static str,
-    },
+    InvalidTasksRequestId { method: &'static str },
     /// Constructing or validating the exact official Tasks request failed
     /// before any native HTTP exchange began.
-    TasksRequestEncoding {
-        method: &'static str,
-    },
+    TasksRequestEncoding { method: &'static str },
     /// `tasks/update` requires an `input_required` task returned by this peer.
     TasksUpdateRequiresInputRequired,
     /// `tasks/update` responses did not match the retained task input ledger.
@@ -3375,14 +3435,10 @@ pub enum ModernHttpClientError {
     },
     /// A successful official Tasks lifecycle response did not contain a
     /// lossless result payload.
-    TasksResultMissing {
-        method: &'static str,
-    },
+    TasksResultMissing { method: &'static str },
     /// A successful official Tasks lifecycle response did not match its exact
     /// typed result envelope.
-    TasksResultDecode {
-        method: &'static str,
-    },
+    TasksResultDecode { method: &'static str },
     /// `tasks/get` returned a task ID other than the one requested.
     TasksGetIdMismatch {
         /// Task ID retained from the outgoing request.
@@ -3400,10 +3456,7 @@ pub enum ModernHttpClientError {
         actual: Option<RequestId>,
     },
     /// The server returned a JSON-RPC error for the tool call.
-    RemoteError {
-        code: JsonInteger,
-        message: String,
-    },
+    RemoteError { code: JsonInteger, message: String },
     /// The response contradicted the final typed core result contract.
     TypedResult(CoreDispatchError),
     /// The decoded response was not one final `tools/call` result branch.
@@ -3460,6 +3513,12 @@ impl fmt::Display for ModernHttpClientError {
             }
             Self::DiscoveryDoesNotAdvertiseModernProtocol => {
                 formatter.write_str("server/discover did not advertise MCP 2026-07-28")
+            }
+            Self::ClientExtensionNegotiation { message } => {
+                write!(
+                    formatter,
+                    "final client extension negotiation failed: {message}"
+                )
             }
             Self::LegacySse(error) => error.fmt(formatter),
             Self::InvalidRequestId => {
@@ -3563,6 +3622,7 @@ impl std::error::Error for ModernHttpClientError {
             | Self::DiscoveryRejected { .. }
             | Self::InvalidDiscoveryResponse
             | Self::DiscoveryDoesNotAdvertiseModernProtocol
+            | Self::ClientExtensionNegotiation { .. }
             | Self::InvalidRequestId
             | Self::TasksNegotiation
             | Self::TasksMethodNegotiation { .. }
@@ -3607,6 +3667,25 @@ impl ModernHttpClient {
         client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
     ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
+        Self::connect_with_extensions(
+            cx,
+            protocol_plan,
+            client_info,
+            client_capabilities,
+            mcp_apps_settings,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_extensions(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        mcp_apps_settings: Option<McpAppsClientSettings>,
+        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+    ) -> Result<ModernHttpConnectOutcome, ModernHttpClientError> {
         if cx.checkpoint().is_err() {
             return Err(ModernHttpClientError::Executor(
                 ModernHttpExecutorError::Cancelled,
@@ -3625,7 +3704,18 @@ impl ModernHttpClient {
             .to_owned();
         let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&protocol_plan)
             .map_err(ModernHttpClientError::Negotiation)?;
-        let client_extensions = mcp_apps_client_extensions(mcp_apps_settings.as_ref());
+        let configured_extensions = client_extension_runtime
+            .as_ref()
+            .map(|runtime| runtime.client_wire_extensions());
+        let generic_apps_configured = client_extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.configures_mcp_apps());
+        let client_extensions = merge_client_extensions(
+            (!generic_apps_configured)
+                .then_some(mcp_apps_settings.as_ref())
+                .flatten(),
+            configured_extensions.as_ref(),
+        );
         let probe_request = build_modern_request_with_extensions(
             &modern_post_target,
             &client_info,
@@ -3664,17 +3754,30 @@ impl ModernHttpClient {
             ClientHttpNegotiationDecision::ModernSelected => {
                 let server_discovery =
                     admitted_discovery.ok_or(ModernHttpClientError::InvalidDiscoveryResponse)?;
-                let mcp_apps_active =
-                    resolve_mcp_apps_activation(mcp_apps_settings.as_ref(), &server_discovery);
+                let negotiated_extensions = client_extension_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.negotiate(&server_discovery))
+                    .transpose()
+                    .map_err(|error| ModernHttpClientError::ClientExtensionNegotiation {
+                        message: error.to_string(),
+                    })?;
+                let mcp_apps_activation_receipt = match client_extension_runtime.as_ref() {
+                    Some(runtime) if runtime.configures_mcp_apps() => negotiated_extensions
+                        .as_ref()
+                        .and_then(|negotiated| runtime.mcp_apps_activation_receipt(negotiated)),
+                    _ => mcp_apps_activation_receipt(mcp_apps_settings.as_ref(), &server_discovery),
+                };
                 Ok(ModernHttpConnectOutcome::Modern(Self {
                     protocol_plan,
                     modern_post_target,
                     client_info,
                     client_capabilities,
                     mcp_apps_settings,
+                    client_extension_runtime,
                     discovery_state: Arc::new(std::sync::RwLock::new(ModernHttpDiscoveryState {
-                        mcp_apps_active,
+                        mcp_apps_activation_receipt,
                         server_discovery,
+                        negotiated_extensions,
                     })),
                     executor: ModernHttpExecutor::new(),
                 }))
@@ -3716,7 +3819,75 @@ impl ModernHttpClient {
         self.discovery_state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mcp_apps_active
+            .mcp_apps_activation_receipt
+            .is_some()
+    }
+
+    /// Returns the sole Apps receipt derived by this connection's retained
+    /// final discovery negotiation.
+    #[must_use]
+    pub fn mcp_apps_activation_receipt(
+        &self,
+    ) -> Option<fastmcp_protocol::extensions::McpAppsActivationReceipt> {
+        self.discovery_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .mcp_apps_activation_receipt
+            .clone()
+    }
+
+    /// Returns the frozen generic extension set retained from final discovery.
+    #[must_use]
+    pub fn negotiated_extensions(
+        &self,
+    ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
+        self.discovery_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .negotiated_extensions
+            .clone()
+    }
+
+    fn admit_final_extension_method(
+        &self,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+    ) -> McpResult<()> {
+        let runtime = self.client_extension_runtime.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "No builder-owned final client extension registry is configured",
+            )
+        })?;
+        let negotiated = self
+            .discovery_state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .negotiated_extensions
+            .clone()
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Final client extension settings were not negotiated by server/discover",
+                )
+            })?;
+        runtime.admit_method(&negotiated, extension_id, method)
+    }
+
+    fn configured_client_extensions(
+        &self,
+        additional_client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
+    ) -> Option<BTreeMap<String, serde_json::Value>> {
+        let mut extensions = self
+            .client_extension_runtime
+            .as_ref()
+            .map_or_else(BTreeMap::new, |runtime| runtime.client_wire_extensions());
+        if let Some(additional_client_extensions) = additional_client_extensions {
+            for (extension_id, settings) in additional_client_extensions {
+                extensions
+                    .entry(extension_id.clone())
+                    .or_insert_with(|| settings.clone());
+            }
+        }
+        (!extensions.is_empty()).then_some(extensions)
     }
 
     async fn build_post_discovery_request(
@@ -3731,12 +3902,19 @@ impl ModernHttpClient {
             .discovery_state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mcp_apps_active;
+            .mcp_apps_activation_receipt
+            .is_some();
+        let generic_apps_configured = self
+            .client_extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.configures_mcp_apps());
+        let client_extension_settings =
+            self.configured_client_extensions(additional_client_extensions);
         let client_extensions = merge_client_extensions(
-            mcp_apps_active
+            (mcp_apps_active && !generic_apps_configured)
                 .then_some(self.mcp_apps_settings.as_ref())
                 .flatten(),
-            additional_client_extensions,
+            client_extension_settings.as_ref(),
         );
         let request = build_modern_request_with_extensions(
             &self.modern_post_target,
@@ -4544,12 +4722,16 @@ impl ModernHttpClient {
             ExtensionDirection::ClientToServer,
         )
         .map_err(|_| ModernHttpClientError::TasksMethodNegotiation { method })?;
+        let generic_apps_configured = self
+            .client_extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.configures_mcp_apps());
+        let configured_extensions = self.configured_client_extensions(Some(client_extensions));
         let client_extensions = merge_client_extensions(
-            discovery
-                .mcp_apps_active
+            (discovery.mcp_apps_activation_receipt.is_some() && !generic_apps_configured)
                 .then_some(self.mcp_apps_settings.as_ref())
                 .flatten(),
-            Some(client_extensions),
+            configured_extensions.as_ref(),
         )
         .ok_or(ModernHttpClientError::TasksRequestEncoding { method })?;
         let request = build_modern_tasks_request(
@@ -5787,6 +5969,13 @@ fn mrtr_retry_parameters(
                 ));
             }
         }
+        for request in input_requests.members() {
+            if !input_responses.contains_key(&request.name) {
+                return Err(McpError::invalid_params(
+                    "MRTR inputResponses must include every key requested by the peer",
+                ));
+            }
+        }
     }
     if input_responses.is_empty() && input_required.request_state().is_none() {
         return Err(McpError::invalid_params(
@@ -6028,6 +6217,7 @@ fn request_name_header_value(
     let Some(field) = (match method {
         TOOLS_CALL | PROMPTS_GET => Some("name"),
         RESOURCES_READ => Some("uri"),
+        TASK_GET | TASK_UPDATE | TASK_CANCEL => Some("taskId"),
         _ => None,
     }) else {
         return Ok(None);
@@ -6260,7 +6450,11 @@ mod tests {
     use asupersync::http::Frame;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::{CancelKind, Cx};
-    use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
+    use fastmcp_protocol::extensions::{
+        ClientExtensionDiscovery, ExtensionDescriptorRegistry, McpAppsClientSettings,
+        OFFICIAL_MCP_APPS_EXTENSION_ID, official_mcp_apps_negotiation_resolver,
+        register_official_mcp_apps_extension,
+    };
     use fastmcp_protocol::protocol_policy::{LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION};
     use fastmcp_protocol::{
         ClientCapabilities, ClientInfo, CoreResult, FinalCoreResult, RequestId, ServerNotification,
@@ -6450,6 +6644,100 @@ mod tests {
             Some(&serde_json::json!({
                 "mimeTypes": ["text/html;profile=mcp-app"]
             }))
+        );
+    }
+
+    fn generic_mcp_apps_runtime(mime_type: &str) -> Arc<ClientExtensionRuntime> {
+        let mut registry = ExtensionDescriptorRegistry::new();
+        let apps_id = register_official_mcp_apps_extension(&mut registry)
+            .expect("official Apps descriptor registers before the generic builder freeze");
+        let settings = McpAppsClientSettings::new(vec![mime_type.to_owned()])
+            .expect("generic Apps test MIME is valid");
+        Arc::new(
+            ClientExtensionRuntime::new(
+                registry,
+                ClientExtensionDiscovery {
+                    extensions: BTreeMap::from([(apps_id, settings.to_extension_settings())]),
+                },
+                official_mcp_apps_negotiation_resolver,
+            )
+            .expect("generic Apps runtime freezes one authoritative descriptor registry"),
+        )
+    }
+
+    fn assert_generic_mcp_apps_precedes_compatibility_settings(
+        generic_mime_type: &str,
+        compatibility_mime_type: &str,
+        expected_active: bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind generic Apps listener");
+        let address = listener
+            .local_addr()
+            .expect("read generic Apps listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let expected_generic_settings = serde_json::json!({
+            "mimeTypes": [generic_mime_type]
+        });
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept generic Apps discovery");
+            let probe = read_request(&mut probe);
+            let probe = serde_json::from_slice::<serde_json::Value>(&probe.body)
+                .expect("generic Apps discovery is JSON-RPC");
+            assert_eq!(probe["method"], SERVER_DISCOVER);
+            assert_eq!(
+                probe["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    [OFFICIAL_MCP_APPS_EXTENSION_ID],
+                expected_generic_settings,
+                "the frozen generic registry, not dedicated Apps compatibility settings, owns discovery"
+            );
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect_with_extensions(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "generic-apps-precedence-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            Some(
+                McpAppsClientSettings::new(vec![compatibility_mime_type.to_owned()])
+                    .expect("compatibility Apps test MIME is valid"),
+            ),
+            Some(generic_mcp_apps_runtime(generic_mime_type)),
+        ))
+        .expect("generic Apps discovery selects the modern connection");
+        assert_eq!(
+            connection.mcp_apps_active(),
+            expected_active,
+            "only the generic Apps setting differs across this precedence pair"
+        );
+        server.join().expect("generic Apps precedence server joins");
+    }
+
+    #[test]
+    fn generic_mcp_apps_registry_precedes_dedicated_compatibility_settings() {
+        assert_generic_mcp_apps_precedes_compatibility_settings(
+            "text/html;profile=mcp-app",
+            "text/html",
+            true,
+        );
+        assert_generic_mcp_apps_precedes_compatibility_settings(
+            "text/html",
+            "text/html;profile=mcp-app",
+            false,
         );
     }
 
@@ -6750,6 +7038,85 @@ mod tests {
         ]
     }
 
+    fn run_public_http_subscriptions_listen_terminal(
+        terminal_response_id: &str,
+        terminal_subscription_id: &str,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ClientHttpConnectionError> {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind subscriptions/listen termination listener");
+        let address = listener
+            .local_addr()
+            .expect("read subscriptions/listen termination address");
+        let modern_target = format!("http://{address}/mcp");
+        let terminal_response_id = terminal_response_id.to_owned();
+        let terminal_subscription_id = terminal_subscription_id.to_owned();
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept termination discovery");
+            let discovery_request = read_request(&mut discovery);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&discovery_request.body)
+                    .expect("termination discovery is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            assert!(!discovery_request.head.contains("MCP-Session-Id:"));
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                modern_discovery_body(),
+            );
+
+            let (mut stream, _) = listener
+                .accept()
+                .expect("accept subscriptions/listen termination request");
+            let request = read_request(&mut stream);
+            assert!(!request.head.contains("MCP-Session-Id:"));
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("termination request is JSON-RPC");
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], SUBSCRIPTIONS_LISTEN);
+
+            begin_chunked_sse(&mut stream);
+            let events = subscriptions_listen_sse_events("2e0");
+            write_chunked_sse_event(&mut stream, &events[0]);
+            write_chunked_sse_event(
+                &mut stream,
+                &format!(
+                    "data: {{\"jsonrpc\":\"2.0\",\"id\":{terminal_response_id},\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{terminal_subscription_id}}}}}}}\n\n"
+                ),
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern discovery selects subscriptions/listen");
+        let result = runtime_block_on(connection.listen_subscriptions_typed(
+            &cx,
+            RequestId::Number(2),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                prompts_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero"),
+        ));
+        server
+            .join()
+            .expect("subscriptions/listen termination server joins");
+        result
+    }
+
     fn run_public_http_tasks_subscription(
         notification_task_id: &str,
     ) -> Result<ModernHttpSubscriptionListenCollector, ClientHttpConnectionError> {
@@ -6921,6 +7288,13 @@ mod tests {
             .expect("Tasks lifecycle request must be JSON-RPC");
         assert_eq!(body["id"], request_id);
         assert_eq!(body["method"], method);
+        let task_id = body["params"]["taskId"]
+            .as_str()
+            .expect("Tasks lifecycle request carries a taskId");
+        assert!(
+            request.head.contains(&format!("Mcp-Name: {task_id}\r\n")),
+            "Tasks lifecycle request must mirror taskId through Mcp-Name",
+        );
         assert_eq!(
             body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
             "2026-07-28"
@@ -8524,6 +8898,36 @@ mod tests {
         server
             .join()
             .expect("final subscriptions/listen cancellation server must join");
+    }
+
+    #[test]
+    fn public_http_modern_subscriptions_listen_rejects_wrong_terminal_response_id() {
+        let error = run_public_http_subscriptions_listen_terminal("3", "2")
+            .expect_err("a foreign terminal response ID must not yield a terminal");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::SubscriptionsListen(
+                ModernHttpSubscriptionListenError::ResponseIdMismatch {
+                    expected: RequestId::Number(2),
+                    actual: Some(RequestId::Number(3)),
+                }
+            )
+        ));
+    }
+
+    #[test]
+    fn public_http_modern_subscriptions_listen_rejects_wrong_terminal_subscription_id() {
+        let error = run_public_http_subscriptions_listen_terminal("2", "3")
+            .expect_err("a foreign terminal subscription ID must not yield a terminal");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::SubscriptionsListen(
+                ModernHttpSubscriptionListenError::TerminalIdMismatch {
+                    expected: RequestId::Number(2),
+                    actual: RequestId::Number(3),
+                }
+            )
+        ));
     }
 
     #[test]
@@ -10664,8 +11068,8 @@ mod tests {
         let address = listener.local_addr().expect("read stateless HTTP address");
         let modern_target = format!("http://{address}/mcp");
         let server = thread::spawn(move || {
-            let (mut discovery, _) = listener.accept().expect("accept stateless discovery");
-            let discovery = read_request(&mut discovery);
+            let (mut discovery_stream, _) = listener.accept().expect("accept stateless discovery");
+            let discovery = read_request(&mut discovery_stream);
             assert!(!discovery.head.contains("MCP-Session-Id:"));
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&discovery.body)
@@ -10673,7 +11077,7 @@ mod tests {
                 SERVER_DISCOVER
             );
             write_response(
-                &mut discovery,
+                &mut discovery_stream,
                 200,
                 "application/json",
                 br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"serverInfo":{"name":"stateless","version":"1"},"ttlMs":0,"cacheScope":"private"}}"#,
@@ -10686,10 +11090,11 @@ mod tests {
                 .expect("stateless JSON request is JSON-RPC");
             assert_eq!(json["id"], 2);
             assert_eq!(json["method"], "tools/list");
-            assert!(json["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
-                ["extensions"]
-                .get(OFFICIAL_MCP_APPS_EXTENSION_ID)
-                .is_some());
+            assert!(
+                json["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
+                    .get(OFFICIAL_MCP_APPS_EXTENSION_ID)
+                    .is_some()
+            );
             write_response(
                 &mut json_stream,
                 200,
@@ -10807,650 +11212,6 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
         ));
         server.join().expect("session-header server joins");
     }
-
-    /*
-    fn assert_final_tasks_session_recovery_revalidation(refreshed_tasks_are_admitted: bool) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Tasks recovery listener");
-        let address = listener
-            .local_addr()
-            .expect("read Tasks recovery listener address");
-        let target = format!("http://{address}/mcp");
-        let initial_discovery = modern_tasks_discovery_body();
-        let refreshed_discovery = if refreshed_tasks_are_admitted {
-            modern_tasks_discovery_body()
-        } else {
-            modern_discovery_body().to_vec()
-        };
-        let server = thread::spawn(move || {
-            let (mut discovery, _) = listener.accept().expect("accept initial Tasks discovery");
-            let discovery_request = read_request(&mut discovery);
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&discovery_request.body)
-                    .expect("initial Tasks discovery is JSON-RPC")["method"],
-                SERVER_DISCOVER
-            );
-            write_response_with_session_id(
-                &mut discovery,
-                200,
-                "application/json",
-                &initial_discovery,
-                Some("tasks-session-old"),
-            );
-
-            let (mut stale_stream, _) = listener.accept().expect("accept stale Tasks request");
-            let stale_request = read_request(&mut stale_stream);
-            assert!(
-                stale_request
-                    .head
-                    .contains("MCP-Session-Id: tasks-session-old\r\n"),
-                "the initial Tasks request must use the discovery session"
-            );
-            let stale_request = serde_json::from_slice::<serde_json::Value>(&stale_request.body)
-                .expect("stale Tasks request is JSON-RPC");
-            assert_eq!(stale_request["method"], TOOLS_CALL);
-            assert_eq!(
-                stale_request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
-                    [fastmcp_protocol::TASKS_EXTENSION],
-                serde_json::json!({}),
-                "the original request is Tasks-negotiated"
-            );
-            write_response_with_session_id(&mut stale_stream, 404, "text/plain", b"", None);
-
-            let (mut refresh, _) = listener.accept().expect("accept refreshed Tasks discovery");
-            let refresh_request = read_request(&mut refresh);
-            assert!(
-                !refresh_request.head.contains("MCP-Session-Id:"),
-                "session recovery discovery must not reuse the stale session"
-            );
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&refresh_request.body)
-                    .expect("refreshed Tasks discovery is JSON-RPC")["method"],
-                SERVER_DISCOVER
-            );
-            write_response_with_session_id(
-                &mut refresh,
-                200,
-                "application/json",
-                &refreshed_discovery,
-                Some("tasks-session-fresh"),
-            );
-
-            if refreshed_tasks_are_admitted {
-                let (mut replay_stream, _) =
-                    listener.accept().expect("accept revalidated Tasks replay");
-                let replay = read_request(&mut replay_stream);
-                assert!(
-                    replay
-                        .head
-                        .contains("MCP-Session-Id: tasks-session-fresh\r\n"),
-                    "the revalidated Tasks replay must use the fresh session"
-                );
-                let replay = serde_json::from_slice::<serde_json::Value>(&replay.body)
-                    .expect("revalidated Tasks replay is JSON-RPC");
-                assert_eq!(
-                    replay["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"]
-                        [fastmcp_protocol::TASKS_EXTENSION],
-                    serde_json::json!({}),
-                    "the only changed discovery dimension still admits the Tasks replay"
-                );
-                write_response_with_session_id(
-                    &mut replay_stream,
-                    200,
-                    "text/event-stream",
-                    br#"event: message
-data: {"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"task-replayed","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}
-
-"#,
-                    None,
-                );
-            } else {
-                listener
-                    .set_nonblocking(true)
-                    .expect("configure withdrawn-Tasks no-replay assertion");
-                let deadline = Instant::now() + Duration::from_millis(200);
-                while Instant::now() < deadline {
-                    match listener.accept() {
-                        Ok(_) => panic!(
-                            "withdrawn Tasks discovery must refuse before a fresh-session replay"
-                        ),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(2));
-                        }
-                        Err(error) => panic!("unexpected withdrawn-Tasks accept error: {error}"),
-                    }
-                }
-            }
-        });
-
-        let cx = Cx::for_request();
-        let client = runtime_block_on(ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/legacy-sse",
-                "http://127.0.0.1:9/legacy-message",
-                ProtocolPolicy::ModernOnly,
-            ),
-            ClientInfo {
-                name: "Tasks-recovery-client".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ))
-        .expect("initial Tasks discovery selects modern HTTP")
-        .into_modern()
-        .expect("ModernOnly cannot select legacy HTTP");
-        let result = runtime_block_on(client.open_final_tasks_tool_call_listener(
-            &cx,
-            RequestId::Number(2),
-            "durable-tool",
-            serde_json::json!({}),
-            SseLimits::new(4_096, 65_536, 8).expect("bounded Tasks SSE limits"),
-        ));
-
-        if refreshed_tasks_are_admitted {
-            let mut listener = result.expect("fresh Tasks discovery admits exactly one replay");
-            assert!(matches!(
-                runtime_block_on(listener.next_event(&cx)),
-                Ok(Some(ModernHttpFinalCoreEvent::Terminal(
-                    FinalCoreResult::ToolsCallTask { .. }
-                )))
-            ));
-        } else {
-            assert!(matches!(
-                result,
-                Err(ModernHttpFinalCoreListenError::Request(
-                    ModernHttpClientError::TasksNegotiation
-                ))
-            ));
-        }
-        server.join().expect("Tasks recovery peer joins");
-    }
-
-    #[test]
-    fn final_tasks_session_recovery_replays_when_fresh_discovery_keeps_tasks() {
-        assert_final_tasks_session_recovery_revalidation(true);
-    }
-
-    #[test]
-    fn final_tasks_session_recovery_refuses_when_fresh_discovery_withdraws_tasks() {
-        assert_final_tasks_session_recovery_revalidation(false);
-    }
-
-    #[test]
-    fn modern_http_session_recovery_repeated_stale_response_replays_once_then_stops() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind repeated stale peer");
-        let address = listener.local_addr().expect("read repeated stale address");
-        let target = format!("http://{address}/mcp");
-        let server = thread::spawn(move || {
-            for (expected_method, session, status, response_session) in [
-                (SERVER_DISCOVER, None, 200, Some("old")),
-                ("tools/list", Some("old"), 404, None),
-                (SERVER_DISCOVER, None, 200, Some("new")),
-                ("tools/list", Some("new"), 404, None),
-            ] {
-                let (mut stream, _) = listener.accept().expect("accept bounded recovery request");
-                let request = read_request(&mut stream);
-                assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"],
-                    expected_method
-                );
-                match session {
-                    Some(session) => assert!(
-                        request
-                            .head
-                            .contains(&format!("MCP-Session-Id: {session}\r\n"))
-                    ),
-                    None => assert!(!request.head.contains("MCP-Session-Id:")),
-                }
-                write_response_with_session_id(
-                    &mut stream,
-                    status,
-                    if status == 200 {
-                        "application/json"
-                    } else {
-                        "text/plain"
-                    },
-                    if status == 200 {
-                        modern_discovery_body()
-                    } else {
-                        b""
-                    },
-                    response_session,
-                );
-            }
-            listener.set_nonblocking(true).unwrap();
-            let until = Instant::now() + Duration::from_millis(200);
-            while Instant::now() < until {
-                match listener.accept() {
-                    Ok(_) => panic!("second stale response must not cause another recovery"),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2))
-                    }
-                    Err(error) => panic!("unexpected accept error: {error}"),
-                }
-            }
-        });
-        let cx = Cx::for_request();
-        let client = runtime_block_on(ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/sse",
-                "http://127.0.0.1:9/post",
-                ProtocolPolicy::ModernOnly,
-            ),
-            ClientInfo {
-                name: "repeated".to_owned(),
-                version: "1".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ))
-        .unwrap()
-        .into_modern()
-        .unwrap();
-        assert!(matches!(
-            runtime_block_on(client.request(
-                &cx,
-                "tools/list",
-                serde_json::json!({}),
-                Some(RequestId::Number(2))
-            )),
-            Err(ModernHttpClientError::SessionRecoveryRepeatedNotFound)
-        ));
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn modern_http_failed_session_recovery_is_coalesced_for_one_generation() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind failed recovery peer");
-        let address = listener.local_addr().expect("read failed recovery address");
-        let target = format!("http://{address}/mcp");
-        let server = thread::spawn(move || {
-            for (expected_method, session, status, body, response_session) in [
-                (
-                    SERVER_DISCOVER,
-                    None,
-                    200,
-                    br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"serverInfo":{"name":"unchanged-after-retraction","version":"1"},"ttlMs":0,"cacheScope":"private"}}"#,
-                    Some("old"),
-                ),
-                ("tools/list", Some("old"), 404, b"", None),
-                (
-                    SERVER_DISCOVER,
-                    None,
-                    200,
-                    br#"{"jsonrpc":"2.0","id":1,"error":{"code":-999999999999999999999999999999,"message":"refresh rejected"}}"#,
-                    None,
-                ),
-                ("tools/list", Some("old"), 404, b"", None),
-            ] {
-                let (mut stream, _) = listener.accept().expect("accept bounded recovery request");
-                let request = read_request(&mut stream);
-                assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(&request.body)
-                        .expect("recovery request is JSON-RPC")["method"],
-                    expected_method
-                );
-                match session {
-                    Some(session) => assert!(
-                        request
-                            .head
-                            .contains(&format!("MCP-Session-Id: {session}\r\n"))
-                    ),
-                    None => assert!(!request.head.contains("MCP-Session-Id:")),
-                }
-                write_response_with_session_id(
-                    &mut stream,
-                    status,
-                    if status == 200 {
-                        "application/json"
-                    } else {
-                        "text/plain"
-                    },
-                    body,
-                    response_session,
-                );
-            }
-            listener
-                .set_nonblocking(true)
-                .expect("set failed recovery listener nonblocking");
-            let until = Instant::now() + Duration::from_millis(200);
-            while Instant::now() < until {
-                match listener.accept() {
-                    Ok(_) => panic!("same-generation failed recovery must not rediscover"),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error) => panic!("unexpected accept error: {error}"),
-                }
-            }
-        });
-
-        let cx = Cx::for_request();
-        let client = runtime_block_on(ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/sse",
-                "http://127.0.0.1:9/post",
-                ProtocolPolicy::ModernOnly,
-            ),
-            ClientInfo {
-                name: "failed-recovery".to_owned(),
-                version: "1".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ))
-        .expect("initial discovery selects modern HTTP")
-        .into_modern()
-        .expect("ModernOnly cannot select legacy HTTP");
-
-        for request_id in [RequestId::Number(2), RequestId::Number(3)] {
-            let error = runtime_block_on(client.request(
-                &cx,
-                "tools/list",
-                serde_json::json!({}),
-                Some(request_id),
-            ))
-            .expect_err("same stale generation returns the shared refresh failure");
-            assert!(matches!(
-                error,
-                ModernHttpClientError::SessionRecoveryFailed(source)
-                    if matches!(source.as_ref(), ModernHttpClientError::DiscoveryRejected { code, message, .. }
-                        if code.as_str() == "-999999999999999999999999999999" && message == "refresh rejected")
-            ));
-        }
-        assert_eq!(
-            client
-                .server_discovery()
-                .server_info()
-                .expect("initial discovery retains server identity")
-                .name,
-            "unchanged-after-retraction",
-            "a retracted recovery must not replace the prior admitted discovery"
-        );
-        server.join().expect("failed recovery peer joins");
-    }
-
-    #[test]
-    fn modern_http_session_header_bearing_404_does_not_recover_or_replay() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let target = format!("http://{address}/mcp");
-        let server = thread::spawn(move || {
-            let (mut discovery, _) = listener.accept().unwrap();
-            let _ = read_request(&mut discovery);
-            write_response_with_session_id(
-                &mut discovery,
-                200,
-                "application/json",
-                modern_discovery_body(),
-                Some("session"),
-            );
-            let (mut request, _) = listener.accept().unwrap();
-            let request = read_request(&mut request);
-            assert!(request.head.contains("MCP-Session-Id: session\r\n"));
-            write_response_with_session_id(&mut request, 404, "text/plain", b"", Some("session"));
-            listener.set_nonblocking(true).unwrap();
-            let until = Instant::now() + Duration::from_millis(200);
-            while Instant::now() < until {
-                match listener.accept() {
-                    Ok(_) => panic!("header-bearing 404 must not recover"),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2))
-                    }
-                    Err(error) => panic!("unexpected accept error: {error}"),
-                }
-            }
-        });
-        let cx = Cx::for_request();
-        let client = runtime_block_on(ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/sse",
-                "http://127.0.0.1:9/post",
-                ProtocolPolicy::ModernOnly,
-            ),
-            ClientInfo {
-                name: "control".to_owned(),
-                version: "1".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ))
-        .unwrap()
-        .into_modern()
-        .unwrap();
-        let response = runtime_block_on(client.request(
-            &cx,
-            "tools/list",
-            serde_json::json!({}),
-            Some(RequestId::Number(2)),
-        ))
-        .unwrap();
-        assert_eq!(response.metadata().status(), 404);
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn modern_http_same_id_stale_callers_share_one_epoch_refresh() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let target = format!("http://{address}/mcp");
-        let server = thread::spawn(move || {
-            let steps = [
-                (SERVER_DISCOVER, None, Some("same"), None),
-                ("tools/list", Some("same"), None, None),
-                (SERVER_DISCOVER, None, Some("same"), None),
-                ("tools/list", Some("same"), None, Some(2)),
-                ("tools/list", Some("same"), None, None),
-                ("tools/list", Some("same"), None, Some(3)),
-            ];
-            for (method, session, discovery_session, result_id) in steps {
-                let (mut stream, _) = listener.accept().unwrap();
-                let request = read_request(&mut stream);
-                assert_eq!(
-                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["method"],
-                    method
-                );
-                match session {
-                    Some(session) => assert!(
-                        request
-                            .head
-                            .contains(&format!("MCP-Session-Id: {session}\r\n"))
-                    ),
-                    None => assert!(!request.head.contains("MCP-Session-Id:")),
-                }
-                match (discovery_session, result_id) {
-                    (Some(session), _) => write_response_with_session_id(&mut stream, 200, "application/json", modern_discovery_body(), Some(session)),
-                    (_, Some(id)) => write_response_with_session_id(&mut stream, 200, "application/json", format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}"#).as_bytes(), None),
-                    _ => write_response_with_session_id(&mut stream, 404, "text/plain", b"", None),
-                }
-            }
-        });
-        let cx = Cx::for_request();
-        let client = runtime_block_on(ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/sse",
-                "http://127.0.0.1:9/post",
-                ProtocolPolicy::ModernOnly,
-            ),
-            ClientInfo {
-                name: "epoch".to_owned(),
-                version: "1".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ))
-        .unwrap()
-        .into_modern()
-        .unwrap();
-        let first = runtime_block_on(client.build_post_discovery_request(
-            &cx,
-            "tools/list",
-            serde_json::json!({}),
-            Some(RequestId::Number(2)),
-            None,
-        ))
-        .unwrap();
-        let second = runtime_block_on(client.build_post_discovery_request(
-            &cx,
-            "tools/list",
-            serde_json::json!({}),
-            Some(RequestId::Number(3)),
-            None,
-        ))
-        .unwrap();
-        let first = runtime_block_on(client.execute_post_discovery_request(&cx, &first)).unwrap();
-        runtime_block_on(first.read_to_end(&cx, 4096)).unwrap();
-        let second = runtime_block_on(client.execute_post_discovery_request(&cx, &second)).unwrap();
-        runtime_block_on(second.read_to_end(&cx, 4096)).unwrap();
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn modern_http_stale_sse_opener_discovers_without_header_then_reopens_with_fresh_id() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let target = format!("http://{address}/mcp");
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_request(&mut stream);
-            write_response_with_session_id(
-                &mut stream,
-                200,
-                "application/json",
-                modern_discovery_body(),
-                Some("old-sse"),
-            );
-            let (mut stream, _) = listener.accept().unwrap();
-            assert!(
-                read_request(&mut stream)
-                    .head
-                    .contains("MCP-Session-Id: old-sse\r\n")
-            );
-            write_response_with_session_id(&mut stream, 404, "text/plain", b"", None);
-            let (mut stream, _) = listener.accept().unwrap();
-            let refresh = read_request(&mut stream);
-            assert!(!refresh.head.contains("MCP-Session-Id:"));
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&refresh.body).unwrap()["method"],
-                SERVER_DISCOVER
-            );
-            write_response_with_session_id(
-                &mut stream,
-                200,
-                "application/json",
-                modern_discovery_body(),
-                Some("fresh-sse"),
-            );
-            let (mut stream, _) = listener.accept().unwrap();
-            assert!(
-                read_request(&mut stream)
-                    .head
-                    .contains("MCP-Session-Id: fresh-sse\r\n")
-            );
-            write_response_with_session_id(&mut stream, 200, "text/event-stream", br#"event: message
-data: {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}],"isError":false}}
-
-"#, None);
-        });
-        let cx = Cx::for_request();
-        let client = runtime_block_on(ModernHttpClient::connect(
-            &cx,
-            plan(
-                &target,
-                "http://127.0.0.1:9/sse",
-                "http://127.0.0.1:9/post",
-                ProtocolPolicy::ModernOnly,
-            ),
-            ClientInfo {
-                name: "sse".to_owned(),
-                version: "1".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ))
-        .unwrap()
-        .into_modern()
-        .unwrap();
-        let mut listener = runtime_block_on(client.open_final_tool_call_listener(
-            &cx,
-            RequestId::Number(2),
-            "echo",
-            serde_json::json!({}),
-            SseLimits::new(1024, 4096, 4).unwrap(),
-        ))
-        .unwrap();
-        assert!(matches!(
-            runtime_block_on(listener.next_event(&cx)),
-            Ok(Some(ModernHttpFinalCoreEvent::Terminal(
-                FinalCoreResult::ToolsCall { .. }
-            )))
-        ));
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn modern_http_client_rejects_discovery_without_session_id_before_any_post_discovery_contact() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind missing-session listener");
-        let address = listener.local_addr().expect("read missing-session address");
-        let modern_target = format!("http://{address}/mcp");
-        let server = thread::spawn(move || {
-            let (mut probe, _) = listener.accept().expect("accept missing-session probe");
-            let probe_request = read_request(&mut probe);
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
-                    .expect("missing-session probe is JSON-RPC")["method"],
-                SERVER_DISCOVER
-            );
-            write_response_with_session_id(
-                &mut probe,
-                200,
-                "application/json",
-                modern_discovery_body(),
-                None,
-            );
-
-            listener
-                .set_nonblocking(true)
-                .expect("configure missing-session no-contact assertion");
-            let no_contact_deadline = Instant::now() + Duration::from_millis(200);
-            while Instant::now() < no_contact_deadline {
-                match listener.accept() {
-                    Ok(_) => panic!("missing session ID must reject before a post-discovery POST"),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(2));
-                    }
-                    Err(error) => panic!("unexpected missing-session accept error: {error}"),
-                }
-            }
-        });
-
-        let cx = Cx::for_request();
-        let result = runtime_block_on(ModernHttpClient::connect(
-            &cx,
-            plan(
-                &modern_target,
-                "http://127.0.0.1:9/legacy-sse",
-                "http://127.0.0.1:9/legacy-message",
-                ProtocolPolicy::ModernOnly,
-            ),
-            ClientInfo {
-                name: "missing-session-client".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
-            ClientCapabilities::default(),
-        ));
-        assert!(matches!(
-            result,
-            Err(ModernHttpClientError::MissingDiscoverySessionId)
-        ));
-        server.join().expect("missing-session peer joins");
-    }
-
-    */
 
     #[test]
     fn ordinary_modern_http_mrtr_retries_tool_resource_and_prompt_state_only_without_tasks() {
@@ -11731,5 +11492,153 @@ data: {"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"typ
         assert_eq!(callback_count, MAX_MRTR_CONTINUATION_ROUNDS);
         assert_eq!(next_id, MAX_MRTR_CONTINUATION_ROUNDS as i64 + 3);
         server.join().expect("MRTR no-contact peer joins");
+    }
+
+    fn assert_public_http_mrtr_requires_every_input_key(complete_retry: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind two-input MRTR listener");
+        let address = listener
+            .local_addr()
+            .expect("read two-input MRTR listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept two-input discovery");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("two-input discovery is JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut initial, _) = listener.accept().expect("accept two-input initial request");
+            let initial_request = read_request(&mut initial);
+            let initial_request =
+                serde_json::from_slice::<serde_json::Value>(&initial_request.body)
+                    .expect("two-input initial request is JSON-RPC");
+            assert_eq!(initial_request["id"], 2);
+            assert_eq!(initial_request["method"], TOOLS_CALL);
+            write_response(
+                &mut initial,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"},"sampling":{"method":"sampling/createMessage"}},"requestState":"retry-two"}}"#,
+            );
+
+            if complete_retry {
+                let (mut retry, _) = listener.accept().expect("accept complete-input retry");
+                let retry_request = read_request(&mut retry);
+                let retry_request =
+                    serde_json::from_slice::<serde_json::Value>(&retry_request.body)
+                        .expect("complete-input retry is JSON-RPC");
+                assert_eq!(retry_request["id"], 3);
+                assert_eq!(retry_request["method"], TOOLS_CALL);
+                assert_eq!(
+                    retry_request["params"]["inputResponses"],
+                    serde_json::json!({
+                        "roots": {"roots": []},
+                        "sampling": {"messages": []},
+                    })
+                );
+                assert_eq!(retry_request["params"]["requestState"], "retry-two");
+                write_response(
+                    &mut retry,
+                    200,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[],"isError":false}}"#,
+                );
+            } else {
+                listener
+                    .set_nonblocking(true)
+                    .expect("configure partial-map no-contact assertion");
+                let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+                while Instant::now() < no_contact_deadline {
+                    match listener.accept() {
+                        Ok(_) => panic!(
+                            "a partial MRTR map must reject before a second public HTTP POST"
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => {
+                            panic!("unexpected partial-map no-contact error: {error}");
+                        }
+                    }
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "two-input-mrtr-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects two-input MRTR")
+        .into_modern()
+        .expect("ModernOnly cannot select legacy HTTP");
+        let mut next_request_id = 3_i64;
+        let mut callback_count = 0_usize;
+        let result = runtime_block_on(client.call_tool_with_mrtr_retry(
+            &cx,
+            RequestId::Number(2),
+            Instant::now() + Duration::from_secs(2),
+            "two-input-tool",
+            serde_json::json!({}),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded SSE limits"),
+            4_096,
+            || {
+                let request_id = RequestId::Number(next_request_id);
+                next_request_id += 1;
+                Ok(request_id)
+            },
+            |_| {
+                callback_count += 1;
+                let mut responses =
+                    BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []}))]);
+                if complete_retry {
+                    responses.insert("sampling".to_owned(), serde_json::json!({"messages": []}));
+                }
+                Ok(responses)
+            },
+        ));
+
+        if complete_retry {
+            assert!(matches!(
+                result,
+                Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+            ));
+            assert_eq!(next_request_id, 4);
+        } else {
+            assert!(matches!(
+                result,
+                Err(ModernHttpMrtrError::Driver(ref error))
+                    if error.message == "MRTR inputResponses must include every key requested by the peer"
+            ));
+            assert_eq!(
+                next_request_id, 3,
+                "a partial map must not allocate a continuation request ID"
+            );
+        }
+        assert_eq!(callback_count, 1);
+        server.join().expect("two-input MRTR peer joins");
+    }
+
+    #[test]
+    fn public_http_mrtr_retries_after_every_requested_input_key_is_supplied() {
+        assert_public_http_mrtr_requires_every_input_key(true);
+    }
+
+    #[test]
+    fn public_http_mrtr_partial_input_map_has_no_next_post_or_id_mutation() {
+        assert_public_http_mrtr_requires_every_input_key(false);
     }
 }
