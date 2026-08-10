@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::extensions::McpAppsClientSettings;
-use fastmcp_protocol::protocol_policy::{ProtocolPolicy, ProtocolPolicyError};
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
 
@@ -481,7 +481,6 @@ impl ClientBuilder {
         self,
         cx: &Cx,
     ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
-        self.admit_protocol_plan_for_http()?;
         self.validate_reverse_callback_configuration(&self.protocol_plan)
             .map_err(|_| Self::http_policy_admission_error())?;
         let reverse_request_handlers = self.reverse_request_handlers.clone();
@@ -526,8 +525,6 @@ impl ClientBuilder {
     /// are ready only after `initialize` and `notifications/initialized` have
     /// both completed on the admitted legacy routes.
     pub async fn connect_http_client_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
-        self.admit_protocol_plan()
-            .map_err(HttpClientError::CoreResult)?;
         self.validate_reverse_callback_configuration(&self.protocol_plan)
             .map_err(HttpClientError::CoreResult)?;
         let reverse_request_handlers = self.reverse_request_handlers.clone();
@@ -576,7 +573,6 @@ impl ClientBuilder {
         // auto-initialize must never return a live client that cannot issue its
         // first protocol request.
         self.timeout_policy.validate()?;
-        self.admit_protocol_plan()?;
         let retry_policy = self.effective_connection_retry_policy()?;
         let retry_deadline = Instant::now()
             .checked_add(retry_policy.total_elapsed)
@@ -900,31 +896,6 @@ impl ClientBuilder {
             }
             ProtocolPolicy::ModernOnly | ProtocolPolicy::Auto => Ok(()),
         }
-    }
-
-    /// Admits a client policy before it can create a subprocess or issue a
-    /// transport request. `Auto` is legacy-capable because its fresh-child
-    /// fallback may select exact 2024, so it requires the same installed
-    /// legacy-adapter receipt as an explicitly legacy-only plan.
-    fn admit_protocol_plan(&self) -> McpResult<()> {
-        self.protocol_plan
-            .policy()
-            .validate_for_client(None)
-            .map(|_| ())
-            .map_err(Self::protocol_policy_error_to_mcp)
-    }
-
-    /// Admits a policy before the HTTP runtime can open its first connection.
-    fn admit_protocol_plan_for_http(&self) -> Result<(), ClientHttpConnectionError> {
-        self.protocol_plan
-            .policy()
-            .validate_for_client(None)
-            .map(|_| ())
-            .map_err(|_| Self::http_policy_admission_error())
-    }
-
-    fn protocol_policy_error_to_mcp(error: ProtocolPolicyError) -> McpError {
-        McpError::invalid_params(error.to_string())
     }
 
     fn http_policy_admission_error() -> ClientHttpConnectionError {
@@ -1554,14 +1525,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn public_builder_auto_with_configured_apps_falls_back_without_legacy_metadata_leak() {
+    fn default_builder_auto_with_configured_apps_falls_back_without_legacy_metadata_leak() {
         let script = auto_legacy_lifecycle_script(-32601);
         let mut client = ClientBuilder::new()
             .mcp_apps(
                 McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
                     .expect("valid Apps MIME settings"),
             )
-            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto))
             .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
             .expect("recognized discovery refusal starts a fresh exact legacy client");
 
@@ -1574,6 +1544,33 @@ mod tests {
             .ping()
             .expect("the public builder returns a usable Auto-selected legacy client");
         client.close().expect("Auto-selected legacy client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_builder_auto_rejects_invalid_params_discovery_without_legacy_fallback() {
+        // This differs from the accepted default-Auto fallback fixture only in
+        // the discovery error code. If Auto starts a legacy child for -32602,
+        // the fixture's initialize branch succeeds and this test incorrectly
+        // receives a live legacy client.
+        let script = auto_legacy_lifecycle_script(-32602);
+        let builder = ClientBuilder::new().mcp_apps(
+            McpAppsClientSettings::new(vec!["text/html;profile=mcp-app".to_owned()])
+                .expect("valid Apps MIME settings"),
+        );
+        let state_before_connect = builder.selected_protocol_plan().clone();
+
+        let error = match builder.clone().connect_stdio_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            &Cx::for_request(),
+        ) {
+            Ok(_) => panic!("invalid discovery parameters must not authorize legacy fallback"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(builder.selected_protocol_plan(), &state_before_connect);
     }
 
     #[cfg(unix)]

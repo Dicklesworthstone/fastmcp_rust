@@ -3098,17 +3098,12 @@ fn validate_initialize_result(result: &InitializeResult) -> McpResult<()> {
 }
 
 fn auto_legacy_fallback_is_authorized(error: &McpError) -> bool {
-    // A completed JSON-RPC discovery refusal is distinguishable from malformed
-    // discovery or transport failure because the latter paths surface as
-    // InternalError. -32022 is final's recognized unsupported-version error,
-    // so it remains modern and cannot authorize a legacy attempt.
-    matches!(
-        error.code,
-        McpErrorCode::ParseError
-            | McpErrorCode::InvalidRequest
-            | McpErrorCode::MethodNotFound
-            | McpErrorCode::InvalidParams
-    )
+    // Auto reaches this predicate only after its disposable modern
+    // `server/discover` probe. A JSON-RPC MethodNotFound response is the sole
+    // recognized refusal that establishes the peer does not implement that
+    // method. Generic parsing or parameter errors remain peer errors and must
+    // surface without starting a legacy child.
+    error.code == McpErrorCode::MethodNotFound
 }
 
 fn validate_timeout_duration(
@@ -9984,6 +9979,25 @@ mod tests {
 
     #[cfg(unix)]
     use asupersync::runtime::RuntimeBuilder;
+
+    #[test]
+    fn auto_legacy_fallback_authorizes_only_method_not_found() {
+        for (code, authorized) in [
+            (McpErrorCode::MethodNotFound, true),
+            (McpErrorCode::ParseError, false),
+            (McpErrorCode::InvalidRequest, false),
+            (McpErrorCode::InvalidParams, false),
+            (McpErrorCode::InternalError, false),
+        ] {
+            let error = McpError::new(code, "discovery error");
+            assert_eq!(
+                auto_legacy_fallback_is_authorized(&error),
+                authorized,
+                "{code:?} must {}authorize a legacy child",
+                if authorized { "" } else { "not " }
+            );
+        }
+    }
 
     #[test]
     fn reverse_callback_forced_cancellation_before_writer_election_wins() {
