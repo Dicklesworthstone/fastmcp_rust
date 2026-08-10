@@ -4543,11 +4543,11 @@ impl AuthorizedTaskServiceRunner {
                     ))));
                 }
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
-                    if let Err(error) = cx.checkpoint() {
-                        return std::task::Poll::Ready(Some(Err(McpError::internal_error(
-                            error.to_string(),
-                        ))));
-                    }
+                    // A completed application result is authoritative. The
+                    // sanctioned wind-down idiom cancels the service region
+                    // and then returns success; observing that cancellation
+                    // here would overwrite the success and restore a durable
+                    // handoff the application already consumed.
                     return std::task::Poll::Ready(Some(result));
                 }
                 if heartbeat.as_mut().poll(task_context).is_ready() {
@@ -8523,7 +8523,12 @@ mod tests {
             // the unchanged state. The paired test performs this cancellation
             // immediately instead.
             supervisor_cx.cancel_with(CancelKind::User, None);
-            assert!(matches!(supervisor.join(&cx).await, Ok(Err(_))));
+            // A parked supervisor may report cancellation cooperatively (its
+            // own error return) or as the runtime's cancellation completion.
+            assert!(matches!(
+                supervisor.join(&cx).await,
+                Ok(Err(_)) | Err(asupersync::runtime::JoinError::Cancelled(_))
+            ));
         });
 
         assert_eq!(
@@ -8586,7 +8591,12 @@ mod tests {
                 .as_ref()
                 .expect("the live supervisor publishes its context before polling")
                 .cancel_with(CancelKind::User, None);
-            assert!(matches!(supervisor.join(&cx).await, Ok(Err(_))));
+            // A parked supervisor may report cancellation cooperatively (its
+            // own error return) or as the runtime's cancellation completion.
+            assert!(matches!(
+                supervisor.join(&cx).await,
+                Ok(Err(_)) | Err(asupersync::runtime::JoinError::Cancelled(_))
+            ));
         });
 
         assert_eq!(
