@@ -1411,8 +1411,16 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
                         "MCP 2024-11-05 request envelopes require a non-null string or signed integer id",
                     )));
                 }
-                validate_legacy_2024_11_05_method_params(method.name, params.as_ref())
-                    .map_err(Legacy2024EnvelopeError::MethodParams)?;
+                // Initialize params validation is the exact-era gate, so its
+                // failures stay envelope-class (-32600); other methods'
+                // params-content failures are Invalid Params.
+                validate_legacy_2024_11_05_method_params(method.name, params.as_ref()).map_err(
+                    if method.name == INITIALIZE {
+                        Legacy2024EnvelopeError::Envelope
+                    } else {
+                        Legacy2024EnvelopeError::MethodParams
+                    },
+                )?;
                 Ok(Legacy2024Envelope::Request { method, id, params })
             }
             Legacy2024EnvelopeKind::Notification => {
@@ -1421,8 +1429,13 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
                         "MCP 2024-11-05 notification envelopes must omit id",
                     )));
                 }
-                validate_legacy_2024_11_05_method_params(method.name, params.as_ref())
-                    .map_err(Legacy2024EnvelopeError::MethodParams)?;
+                validate_legacy_2024_11_05_method_params(method.name, params.as_ref()).map_err(
+                    if method.name == INITIALIZE {
+                        Legacy2024EnvelopeError::Envelope
+                    } else {
+                        Legacy2024EnvelopeError::MethodParams
+                    },
+                )?;
                 Ok(Legacy2024Envelope::Notification { method, params })
             }
         };
