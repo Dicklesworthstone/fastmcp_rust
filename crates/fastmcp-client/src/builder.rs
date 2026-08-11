@@ -509,8 +509,11 @@ impl ClientBuilder {
     /// permits at most one modern probe and binds its cache to the complete
     /// configured endpoint bundle rather than to an HTTP origin.
     pub fn http_negotiation(&self) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
-        self.validate_feature_configuration()
-            .map_err(|_| ClientHttpNegotiationError::FeatureConfigurationRejected)?;
+        self.validate_feature_configuration().map_err(|_| {
+            ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                policy: self.protocol_plan.policy(),
+            }
+        })?;
         ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
     }
 
@@ -537,7 +540,7 @@ impl ClientBuilder {
         let builder = self.selected_legacy_builder_with_reverse_handlers();
         builder
             .validate_feature_configuration()
-            .map_err(|_| Self::http_policy_admission_error())?;
+            .map_err(|_| builder.http_feature_configuration_admission_error())?;
         builder
             .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(|_| Self::http_policy_admission_error())?;
@@ -1029,10 +1032,21 @@ impl ClientBuilder {
         Ok(())
     }
 
-    fn http_policy_admission_error() -> ClientHttpConnectionError {
+    fn http_feature_configuration_admission_error(&self) -> ClientHttpConnectionError {
         // The existing public HTTP connection error vocabulary has no
-        // policy-admission variant. This is the closest fail-closed outcome:
-        // no modern probe is sent and no legacy route is opened.
+        // feature-configuration admission variant. This is fail-closed: no
+        // modern probe is sent and no legacy route is opened.
+        ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
+            ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                policy: self.protocol_plan.policy(),
+            },
+        ))
+    }
+
+    fn http_policy_admission_error() -> ClientHttpConnectionError {
+        // Reverse callback admission has its own validation path. Retain the
+        // existing refusal shape here; feature configuration uses the typed
+        // `FeatureConfigurationUnavailable` outcome above.
         ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
             ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly,
         ))
@@ -1481,6 +1495,34 @@ mod tests {
                 "Apps {policy:?} must fail at feature admission rather than process startup"
             );
         }
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn feature_off_http_admission_reports_the_unavailable_configuration_before_contact() {
+        let builder =
+            ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
+
+        assert_eq!(
+            builder.http_negotiation(),
+            Err(
+                ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                    policy: ProtocolPolicy::Auto,
+                }
+            ),
+            "feature admission must reject Auto before constructing a modern probe"
+        );
+
+        let error = block_on(builder.connect_http_with_cx(&Cx::for_testing()))
+            .expect_err("feature admission must reject Auto before HTTP contact");
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
+                ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                    policy: ProtocolPolicy::Auto,
+                }
+            ))
+        ));
     }
 
     #[cfg(feature = "apps")]

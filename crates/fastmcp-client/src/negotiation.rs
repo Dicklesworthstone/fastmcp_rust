@@ -61,8 +61,8 @@ pub enum ClientHttpNegotiationError {
     ModernProbeTransportFailure,
     /// The response cannot authorize a legacy SSE fallback.
     ModernProbeRejectedWithoutLegacyFallback { status: u16, body: HttpProbeBody },
-    /// The plan requires a policy or extension this crate build omitted.
-    FeatureConfigurationRejected,
+    /// The selected plan requires a policy or extension this crate build omitted.
+    FeatureConfigurationUnavailable { policy: ProtocolPolicy },
 }
 
 impl fmt::Display for ClientHttpNegotiationError {
@@ -86,8 +86,9 @@ impl fmt::Display for ClientHttpNegotiationError {
                 formatter,
                 "modern HTTP probe status {status} with {body:?} cannot authorize legacy fallback"
             ),
-            Self::FeatureConfigurationRejected => formatter.write_str(
-                "the client plan requires a policy or extension this crate build did not include",
+            Self::FeatureConfigurationUnavailable { policy } => write!(
+                formatter,
+                "{policy:?} requires a policy or extension this crate build did not include"
             ),
         }
     }
@@ -228,6 +229,22 @@ mod tests {
         .expect("a modern-only plan needs only its modern target")
     }
 
+    fn legacy_only_plan() -> ClientProtocolPlan {
+        ClientProtocolPlan::http(
+            ProtocolPolicy::LegacyOnly,
+            None,
+            Some(CanonicalHttpUrl::parse("https://api.example.test/sse").unwrap()),
+            Some(CanonicalHttpUrl::parse("https://api.example.test/messages").unwrap()),
+            "credential-partition".to_owned(),
+            "security-partition".to_owned(),
+            "http-test".to_owned(),
+            1,
+            1,
+            1,
+        )
+        .expect("a legacy-only plan needs only its exact legacy targets")
+    }
+
     #[test]
     fn modern_only_rejects_one_unrecognized_probe_without_selecting_or_retrying() {
         let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&modern_only_plan())
@@ -256,6 +273,21 @@ mod tests {
                 body: HttpProbeBody::RecognizedModernJsonRpc,
             }),
             Err(ClientHttpNegotiationError::ModernProbeAlreadyDispatched)
+        );
+    }
+
+    #[test]
+    fn legacy_only_keeps_its_modern_probe_refusal_distinct_from_feature_admission() {
+        let mut negotiation = ClientHttpNegotiation::from_protocol_plan(&legacy_only_plan())
+            .expect("the configured legacy plan creates a negotiation attempt");
+
+        assert_eq!(
+            negotiation.observe_modern_probe(HttpModernProbe {
+                status: 200,
+                body: HttpProbeBody::RecognizedModernJsonRpc,
+            }),
+            Err(ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly),
+            "LegacyOnly rejects a modern probe for its own reason"
         );
     }
 }

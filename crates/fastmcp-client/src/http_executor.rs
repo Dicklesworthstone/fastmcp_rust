@@ -26,8 +26,8 @@ use fastmcp_protocol::extensions::ExtensionDirection;
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
 use fastmcp_protocol::methods::{
-    self, Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET,
-    RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
+    Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET, RESOURCES_READ,
+    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
@@ -44,10 +44,9 @@ use fastmcp_protocol::tasks_extension::{
     UpdateTaskParams as FinalUpdateTaskParams, UpdateTaskResult as FinalUpdateTaskResult,
 };
 use fastmcp_protocol::{
-    CancellationSender, CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo,
-    CompleteResult, CoreDispatchError, CoreRequest, CoreResult, CorrelationKey,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalNotificationError,
-    FinalProgressNotificationParams, FinalRequestMeta,
+    CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
+    CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalCoreResult, FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,

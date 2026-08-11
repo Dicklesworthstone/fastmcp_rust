@@ -165,6 +165,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 use std::io::Read;
+#[cfg(all(test, unix))]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -178,7 +179,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(all(test, any(feature = "legacy-2024-11-05", feature = "tasks")))]
+#[cfg(all(test, unix, any(feature = "legacy-2024-11-05", feature = "tasks")))]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
