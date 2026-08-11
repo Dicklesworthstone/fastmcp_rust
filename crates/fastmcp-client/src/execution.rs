@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
+#[cfg(any(feature = "tasks", test))]
+use fastmcp_protocol::FinalCoreResult;
 use fastmcp_protocol::methods::{INITIALIZE, SUBSCRIPTIONS_LISTEN, TOOLS_CALL};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 #[cfg(feature = "tasks")]
@@ -25,11 +27,14 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, CancelledParams, CoreRequest, CoreResult,
     CoreResultDiscriminatorPolicy, CorrelationKey, DecodedResult, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCancelledNotificationParams, FinalCoreResult,
-    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ProgressMarker, RequestId,
-    ResultPeerDiagnostic, ResultPeerEra, SubscriptionFilter, decode_peer_result,
+    FinalCancelledNotificationParams, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    ProgressMarker, RequestId, ResultPeerDiagnostic, ResultPeerEra, decode_peer_result,
     decode_strict_jsonrpc_response,
+};
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::{
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+    SubscriptionFilter,
 };
 use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError};
 use serde_json::Value;

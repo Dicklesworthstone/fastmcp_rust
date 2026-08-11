@@ -510,7 +510,7 @@ impl ClientBuilder {
     /// configured endpoint bundle rather than to an HTTP origin.
     pub fn http_negotiation(&self) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
         self.validate_feature_configuration()
-            .map_err(|_| Self::http_policy_admission_error())?;
+            .map_err(|_| ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly)?;
         ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
     }
 
@@ -1003,7 +1003,7 @@ impl ClientBuilder {
             || self
                 .client_extension_runtime
                 .as_ref()
-                .is_some_and(ClientExtensionRuntime::configures_mcp_apps)
+                .is_some_and(|runtime| runtime.configures_mcp_apps())
         {
             return Err(McpError::invalid_params(
                 "FeatureUnavailable: apps is compiled out; MCP Apps configuration requires --features apps",

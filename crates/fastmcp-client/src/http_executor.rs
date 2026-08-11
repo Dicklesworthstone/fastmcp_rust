@@ -26,8 +26,8 @@ use fastmcp_protocol::extensions::ExtensionDirection;
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
 use fastmcp_protocol::methods::{
-    Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET, RESOURCES_READ,
-    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
+    self, Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET,
+    RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
@@ -44,24 +44,26 @@ use fastmcp_protocol::tasks_extension::{
     UpdateTaskParams as FinalUpdateTaskParams, UpdateTaskResult as FinalUpdateTaskResult,
 };
 use fastmcp_protocol::{
-    CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
-    CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCoreResult, FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
+    CancellationSender, CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo,
+    CompleteResult, CoreDispatchError, CoreRequest, CoreResult, CorrelationKey,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalNotificationError,
+    FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
     SubscriptionFilter, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 
+#[cfg(feature = "tasks")]
+use crate::FinalToolCallOutcome;
 use crate::execution::{MrtrDriver, MrtrDriverLimits};
 use crate::session::{ClientExtensionRuntime, mcp_apps_activation_receipt};
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError, SsePushError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
-    ClientProtocolPlan, FinalToolCallOutcome, MAX_MRTR_CONTINUATION_ROUNDS,
-    MAX_MRTR_INPUT_RESPONSES, MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses,
-    ReverseCallbackState, ReverseRequestCancellation, ReverseRequestHandlers,
-    validate_protocol_plan_feature,
+    ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
+    MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, ReverseCallbackState,
+    ReverseRequestCancellation, ReverseRequestHandlers, validate_protocol_plan_feature,
 };
 #[cfg(feature = "tasks")]
 use crate::{admit_final_tasks_discovery_surface, admit_final_tasks_result_discriminator};
@@ -5666,7 +5668,7 @@ impl LegacySseReverseCallbackDispatcher {
     fn cancel(&self, request_id: &RequestId) -> bool {
         let cancelled = self.state.cancel(request_id);
         if cancelled {
-            let mut tasks = self
+            let tasks = self
                 .tasks
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6026,7 +6028,7 @@ impl LegacySsePersistentReceiver {
         let key = request_id
             .correlation_key()
             .map_err(|_| ClientHttpConnectionError::LegacyPersistentReceiverStopped)?;
-        let (sender, mut receiver) = oneshot::channel();
+        let (sender, receiver) = oneshot::channel();
         {
             let mut state = self
                 .state
@@ -7572,12 +7574,14 @@ mod tests {
         decode_modern_discovery_response, reject_body_frame_after_cancellation,
         retire_abandoned_persistent_waiter, validate_response_head,
     };
+    #[cfg(feature = "tasks")]
+    use crate::FinalToolCallOutcome;
     #[cfg(feature = "apps")]
     use crate::session::ClientExtensionRuntime;
     use crate::sse::SseLimits;
     use crate::{
-        CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, FinalToolCallOutcome, ProtocolEra,
-        ProtocolPolicy, ReverseRequestHandlers,
+        CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolEra, ProtocolPolicy,
+        ReverseRequestHandlers,
     };
     use fastmcp_protocol::methods::{
         PROMPTS_GET, RESOURCES_READ, SERVER_DISCOVER, SUBSCRIPTIONS_LISTEN, TOOLS_CALL,

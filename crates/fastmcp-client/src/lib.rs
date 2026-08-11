@@ -163,6 +163,9 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use std::io::Read;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
@@ -175,7 +178,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, mpsc};
+#[cfg(all(test, any(feature = "legacy-2024-11-05", feature = "tasks")))]
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
@@ -4171,14 +4176,14 @@ enum RequestCancellationTerminalElection {
 }
 
 impl RequestCancellationTerminalElection {
-    fn response_wins(self, response: &ReceivedJsonRpcResponse) -> bool {
+    fn response_wins(self, _response: &ReceivedJsonRpcResponse) -> bool {
         match self {
             Self::CancelFirst => false,
             #[cfg(feature = "tasks")]
             Self::FinalToolsCallTask { request } => {
-                response.response.error.is_none()
-                    && response.response.result.as_ref().is_some_and(|result| {
-                        response.raw_result.as_deref().is_some_and(|source| {
+                _response.response.error.is_none()
+                    && _response.response.result.as_ref().is_some_and(|result| {
+                        _response.raw_result.as_deref().is_some_and(|source| {
                             matches!(
                                 decode_core_result_with_cache_ttl_from_source(
                                     request,
@@ -8158,7 +8163,7 @@ impl Client {
         let request_id = RequestId::Number(
             i64::try_from(id).expect("request ID allocator enforces the i64 bound"),
         );
-        let request = JsonRpcRequest::new(method, Some(params_value), id);
+        let request = JsonRpcRequest::new(method, Some(params_value), request_id.clone());
         let waiter = self.responses.register(request_id.clone())?;
 
         // This second check covers cancellation which arrived after ID
