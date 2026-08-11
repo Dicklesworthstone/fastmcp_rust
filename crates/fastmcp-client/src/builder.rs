@@ -43,10 +43,10 @@ use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
 
 use crate::{
-    ChildGuard, ChildOwnership, Client, ClientExtensionRuntime, ClientHttpConnection,
-    ClientHttpConnectionError, ClientHttpNegotiation, ClientHttpNegotiationError,
-    ClientProtocolPlan, ClientSession, HttpClient, HttpClientError, ModernHttpClientError,
-    ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
+    AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
+    ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
+    ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
+    ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
     combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
     validate_protocol_plan_feature,
 };
@@ -66,6 +66,13 @@ const MAX_CONNECTION_RETRY_ELAPSED: Duration = Duration::from_secs(120);
 const DEFAULT_CONNECTION_RETRY_ELAPSED: Duration = Duration::from_secs(120);
 /// Bounded timer slice used to observe a caller-owned context while waiting.
 const CONNECTION_RETRY_CANCEL_SLICE: Duration = Duration::from_millis(25);
+
+/// One initialized stdio child attempt. `Fallback` is possible only for the
+/// disposable modern Auto probe, after its child has been fully cleaned up.
+enum StdioConnectionAttempt {
+    Connected(Client),
+    Fallback(AutoStdioFallbackSignal),
+}
 
 fn legacy_capabilities_for_handlers(
     capabilities: &ClientCapabilities,
@@ -761,24 +768,36 @@ impl ClientBuilder {
         retry_deadline: Instant,
     ) -> McpResult<Client> {
         match self.protocol_plan.policy() {
-            ProtocolPolicy::ModernOnly => self.try_connect_with_protocol_plan(
+            ProtocolPolicy::ModernOnly => match self.try_connect_with_protocol_plan(
                 command,
                 args,
                 cx,
                 self.protocol_plan.clone(),
                 self.auto_initialize,
+                false,
                 retry_deadline,
-            ),
+            )? {
+                StdioConnectionAttempt::Connected(client) => Ok(client),
+                StdioConnectionAttempt::Fallback(_) => {
+                    unreachable!("only an Auto modern probe can return a fallback signal")
+                }
+            },
             ProtocolPolicy::LegacyOnly => {
                 let legacy_builder = self.legacy_builder_with_reverse_handlers();
-                legacy_builder.try_connect_with_protocol_plan(
+                match legacy_builder.try_connect_with_protocol_plan(
                     command,
                     args,
                     cx,
                     self.protocol_plan.clone(),
                     self.auto_initialize,
+                    false,
                     retry_deadline,
-                )
+                )? {
+                    StdioConnectionAttempt::Connected(client) => Ok(client),
+                    StdioConnectionAttempt::Fallback(_) => {
+                        unreachable!("only an Auto modern probe can return a fallback signal")
+                    }
+                }
             }
             ProtocolPolicy::Auto => self.try_connect_auto(command, args, cx, retry_deadline),
         }
@@ -814,8 +833,9 @@ impl ClientBuilder {
     /// Selects an era with a disposable modern child before exposing a client.
     ///
     /// A stdio peer has one opening-frame classification, so the modern probe
-    /// can never be reused for exact legacy initialization. Only the
-    /// recognized JSON-RPC discovery refusal authorizes a second spawn.
+    /// can never be reused for exact legacy initialization. Only a correlated
+    /// JSON-RPC discovery refusal or Unix-observable clean first-probe timeout
+    /// authorizes a second spawn.
     fn try_connect_auto(
         &self,
         command: &str,
@@ -835,30 +855,37 @@ impl ClientBuilder {
             cx,
             modern_plan,
             false,
+            true,
             retry_deadline,
         ) {
-            Ok(mut client) => {
+            Ok(StdioConnectionAttempt::Connected(mut client)) => {
                 client.set_protocol_plan_after_selection(self.protocol_plan.clone());
                 Ok(client)
             }
-            Err(error) if crate::auto_legacy_fallback_is_authorized(&error) => {
+            Ok(StdioConnectionAttempt::Fallback(_signal)) => {
                 // The disposable modern child has been cleaned up before its
-                // error reaches this branch. Observe cancellation again before
-                // creating a fresh legacy child.
+                // structured signal reaches this branch. Observe cancellation
+                // again before creating a fresh legacy child.
                 crate::admit_auto_legacy_fallback(cx)?;
                 if Instant::now() >= retry_deadline {
                     return Err(Self::connection_retry_elapsed_error());
                 }
                 let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
                 let legacy_builder = self.legacy_builder_with_reverse_handlers();
-                let mut client = legacy_builder.try_connect_with_protocol_plan(
+                let mut client = match legacy_builder.try_connect_with_protocol_plan(
                     command,
                     args,
                     cx,
                     legacy_plan,
                     false,
+                    false,
                     retry_deadline,
-                )?;
+                )? {
+                    StdioConnectionAttempt::Connected(client) => client,
+                    StdioConnectionAttempt::Fallback(_) => {
+                        unreachable!("an exact-2024 connection cannot emit an Auto fallback signal")
+                    }
+                };
                 client.set_protocol_plan_after_selection(self.protocol_plan.clone());
                 Ok(client)
             }
@@ -874,8 +901,9 @@ impl ClientBuilder {
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         defer_initialization: bool,
+        auto_modern_probe: bool,
         retry_deadline: Instant,
-    ) -> McpResult<Client> {
+    ) -> McpResult<StdioConnectionAttempt> {
         self.validate_feature_configuration()?;
         self.validate_reverse_callback_configuration(&protocol_plan)?;
         // Build the command
@@ -961,26 +989,44 @@ impl ClientBuilder {
 
         if defer_initialization {
             // Create uninitialized client - initialization will happen on first use
-            Ok(self.create_uninitialized_client(
-                child,
-                child_ownership,
-                group_anchor,
-                transport,
-                cx,
-                protocol_plan,
-                self.timeout_policy,
+            Ok(StdioConnectionAttempt::Connected(
+                self.create_uninitialized_client(
+                    child,
+                    child_ownership,
+                    group_anchor,
+                    transport,
+                    cx,
+                    protocol_plan,
+                    self.timeout_policy,
+                ),
             ))
         } else {
-            self.initialize_client(
-                child,
-                child_ownership,
-                group_anchor,
-                transport,
-                cx,
-                protocol_plan,
-                initialization_policy.expect("initialized connection has a retry timeout policy"),
-                retry_deadline,
-            )
+            let timeout_policy =
+                initialization_policy.expect("initialized connection has a retry timeout policy");
+            if auto_modern_probe {
+                self.initialize_auto_modern_probe_client(
+                    child,
+                    child_ownership,
+                    group_anchor,
+                    transport,
+                    cx,
+                    protocol_plan,
+                    timeout_policy,
+                    retry_deadline,
+                )
+            } else {
+                self.initialize_client(
+                    child,
+                    child_ownership,
+                    group_anchor,
+                    transport,
+                    cx,
+                    protocol_plan,
+                    timeout_policy,
+                    retry_deadline,
+                )
+                .map(StdioConnectionAttempt::Connected)
+            }
         }
     }
 
@@ -1171,6 +1217,53 @@ impl ClientBuilder {
             );
         }
         Ok(client)
+    }
+
+    /// Initializes Auto's disposable modern child and closes it before
+    /// surfacing its one authorized fallback signal.
+    fn initialize_auto_modern_probe_client(
+        &self,
+        child: Child,
+        child_ownership: ChildOwnership,
+        group_anchor: Option<ProcessGroupAnchor>,
+        transport: StdioTransport<std::process::ChildStdout, std::process::ChildStdin>,
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        timeout_policy: RequestTimeoutPolicy,
+        retry_deadline: Instant,
+    ) -> McpResult<StdioConnectionAttempt> {
+        let mut client = self.create_uninitialized_client(
+            child,
+            child_ownership,
+            group_anchor,
+            transport,
+            cx,
+            protocol_plan,
+            timeout_policy,
+        );
+        match client.ensure_initialized_for_auto_modern_probe() {
+            Ok(Some(signal)) => {
+                // A fallback is valid only once its disposable child is gone.
+                // A cleanup failure is terminal and cannot be converted into a
+                // second subprocess attempt.
+                let cleanup = client.close();
+                combine_operation_and_cleanup(Ok(StdioConnectionAttempt::Fallback(signal)), cleanup)
+            }
+            Ok(None) => {
+                if Instant::now() >= retry_deadline {
+                    let cleanup = client.close();
+                    return combine_operation_with_cleanup(
+                        Err(Self::connection_retry_elapsed_error()),
+                        || cleanup,
+                    );
+                }
+                Ok(StdioConnectionAttempt::Connected(client))
+            }
+            Err(error) => {
+                let cleanup = client.close();
+                combine_operation_with_cleanup(Err(error), || cleanup)
+            }
+        }
     }
 }
 
@@ -1801,6 +1894,122 @@ mod tests {
             .max_retries(0)
             .connect_stdio("fastmcp_nonexistent_binary_xyz", &["--version"]);
         assert!(result.is_err());
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_builder_auto_clean_first_probe_timeout_reopens_a_fresh_legacy_child() {
+        // One invocation can either consume discovery and remain silent, or
+        // consume exact-2024 initialization. The successful second branch
+        // therefore proves the selected legacy connection is a fresh child.
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*) exec sleep 5 ;;
+                *initialize*2024-11-05*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"auto-timeout-legacy","version":"1.0.0"}}}';
+                    IFS= read -r lifecycle || exit 1;
+                    case "$lifecycle" in *notifications/initialized*) ;; *) exit 1 ;; esac;
+                    IFS= read -r request || exit 1;
+                    case "$request" in *ping*) printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}' ;; *) exit 1 ;; esac;
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
+        let started = Instant::now();
+        let mut client = ClientBuilder::new()
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(80))
+                    .expect("bounded probe timeout is valid"),
+            )
+            .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request())
+            .expect("a clean first-probe timeout authorizes one fresh legacy child");
+
+        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+        assert_eq!(
+            client.selected_protocol_era(),
+            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        );
+        client
+            .ping()
+            .expect("the fresh legacy child accepts its first ordinary request");
+        client
+            .close()
+            .expect("fresh legacy timeout-fallback cleanup");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_builder_auto_rejects_wrong_id_partial_malformed_ambiguous_and_transport_probes() {
+        let legacy_success = concat!(
+            "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"forbidden-legacy\",\"version\":\"1.0.0\"}}}'; ",
+            "IFS= read -r lifecycle || exit 1; case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; exec sleep 2"
+        );
+        let cases = [
+            (
+                "wrong-id",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}'; exec sleep 2",
+            ),
+            (
+                "partial-frame-timeout",
+                "printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601'; exec sleep 2",
+            ),
+            (
+                "malformed-result",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{}}}'; exec sleep 2",
+            ),
+            (
+                "ambiguous-envelope",
+                "printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{},\"error\":{\"code\":-32601,\"message\":\"method not found\"}}'; exec sleep 2",
+            ),
+            ("transport-closed", "exit 0"),
+        ];
+
+        for (name, discovery_branch) in cases {
+            let script = format!(
+                "IFS= read -r first || exit 1; case \"$first\" in *server/discover*) {discovery_branch} ;; *initialize*2024-11-05*) {legacy_success} ;; *) exit 1 ;; esac"
+            );
+            let result = ClientBuilder::new()
+                .max_retries(0)
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(80))
+                        .expect("bounded probe timeout is valid"),
+                )
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request());
+            assert!(
+                result.is_err(),
+                "{name} must remain terminal instead of reaching the legacy-success branch"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn public_builder_auto_cancelled_probe_never_opens_legacy_child() {
+        let script = r#"IFS= read -r first || exit 1;
+            case "$first" in
+                *server/discover*) exec sleep 5 ;;
+                *initialize*2024-11-05*)
+                    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"forbidden-cancelled-legacy","version":"1.0.0"}}}';
+                    exec sleep 2 ;;
+                *) exit 1 ;;
+            esac"#;
+        let cx = Cx::for_request();
+        let cancelling_cx = cx.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            cancelling_cx.cancel_fast(asupersync::CancelKind::User);
+        });
+        let error = ClientBuilder::new()
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
+                    .expect("bounded cancellation probe timeout is valid"),
+            )
+            .connect_stdio_with_cx("sh", &["-c", script], &cx)
+            .expect_err("caller cancellation during the modern probe is terminal");
+        canceller
+            .join()
+            .expect("probe cancellation helper joins after the public connection returns");
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
     }
 
     #[cfg(unix)]
