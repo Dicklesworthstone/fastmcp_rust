@@ -79,6 +79,68 @@ fn expect_text(content: &Content) -> &str {
     }
 }
 
+/// Final input responses are a public, validated correlation map rather than
+/// a caller-assembled JSON object. The root, modern, and prelude spellings
+/// must remain constructible from a facade-only dependency.
+#[test]
+fn facade_final_input_response_surface_is_constructible() {
+    use fastmcp_rust::{FinalInputResponseCorrelationError, FinalInputResponses, modern, prelude};
+
+    let root = FinalInputResponses::try_from_entries(Vec::new()).expect("empty root responses");
+    let modern =
+        modern::FinalInputResponses::try_from_entries(Vec::new()).expect("empty modern responses");
+    let prelude = prelude::FinalInputResponses::try_from_entries(Vec::new())
+        .expect("empty prelude responses");
+
+    assert!(root.is_empty());
+    assert!(modern.is_empty());
+    assert!(prelude.is_empty());
+    assert_eq!(
+        FinalInputResponseCorrelationError::MissingResponse.to_string(),
+        "missing final input response"
+    );
+}
+
+/// The experimental facade surface exposes URI/Upgrade transport, negotiated
+/// clients, and listener lifecycle paths while keeping raw adapters outside
+/// era namespaces.
+#[cfg(feature = "websocket-experimental")]
+#[test]
+fn facade_websocket_surface_is_namespace_consistent() {
+    use fastmcp_rust::{
+        AsyncWsClientTransport, AsyncWsServerTransport, ClientTransportRecvHalf, TransportSendHalf,
+        WebSocketClient, WebSocketClientTransport, client::websocket_experimental, prelude, server,
+        transport,
+    };
+
+    fn consumes_websocket_surface<R, S>()
+    where
+        R: ClientTransportRecvHalf,
+        S: TransportSendHalf,
+    {
+        let _: Option<AsyncWsClientTransport<R>> = None;
+        let _: Option<AsyncWsServerTransport<()>> = None;
+        let _: Option<websocket_experimental::AsyncWsClientTransport<()>> = None;
+        let _: Option<server::BoundWebSocketServer> = None;
+        let _: Option<server::WebSocketServerShutdown> = None;
+        let _: Option<transport::websocket::WebSocketListener> = None;
+        let _: Option<transport::websocket::WebSocketUpgradeAdmission> = None;
+        let _: Option<WebSocketClient<R, S>> = None;
+        let _: Option<WebSocketClientTransport<R, S>> = None;
+        let _: Option<prelude::WebSocketClient<R, S>> = None;
+        let _: Option<prelude::BoundWebSocketServer> = None;
+        let _ = fastmcp_rust::ClientBuilder::connect_websocket::<R, S>;
+        let _ = fastmcp_rust::modern::ClientBuilder::connect_websocket::<R, S>;
+        let _ = fastmcp_rust::modern::Server::bind_websocket;
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let _ = fastmcp_rust::auto::ClientBuilder::connect_websocket::<R, S>;
+            let _ = fastmcp_rust::legacy_2024::ClientBuilder::connect_websocket::<R, S>;
+            let _ = fastmcp_rust::legacy_2024::Server::bind_websocket;
+        }
+    }
+}
+
 // This module intentionally imports every macro dependency through the facade
 // only. It is a focused packaging proof: a downstream user needs neither a
 // component crate nor serde_json/asupersync as a direct dependency.

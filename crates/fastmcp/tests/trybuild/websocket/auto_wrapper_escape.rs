@@ -1,3 +1,3 @@
-use fastmcp_rust::auto::WebSocketClient;
+use fastmcp_rust::auto::AsyncWsClientTransport;
 
 fn main() {}

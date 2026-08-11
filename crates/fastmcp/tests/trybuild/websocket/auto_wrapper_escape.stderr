@@ -1,6 +1,5 @@
-error[E0432]: unresolved import `fastmcp_rust::auto::WebSocketClient`
+error[E0432]: unresolved import `fastmcp_rust::auto::AsyncWsClientTransport`
  --> tests/trybuild/websocket/auto_wrapper_escape.rs:1:5
   |
-1 | use fastmcp_rust::auto::WebSocketClient;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `WebSocketClient` in `auto`
-
+1 | use fastmcp_rust::auto::AsyncWsClientTransport;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `AsyncWsClientTransport` in `auto`

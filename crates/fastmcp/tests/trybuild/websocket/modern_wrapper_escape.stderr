@@ -1,5 +1,5 @@
-error[E0432]: unresolved import `fastmcp_rust::modern::WebSocketClient`
+error[E0432]: unresolved import `fastmcp_rust::modern::AsyncWsClientTransport`
  --> tests/trybuild/websocket/modern_wrapper_escape.rs:1:5
   |
-1 | use fastmcp_rust::modern::WebSocketClient;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `WebSocketClient` in `modern`
+1 | use fastmcp_rust::modern::AsyncWsClientTransport;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `AsyncWsClientTransport` in `modern`

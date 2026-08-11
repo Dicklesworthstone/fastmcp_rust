@@ -43,7 +43,7 @@ is_exact_modern_discovery() {
 while IFS= read -r request; do
     emit_wire "$request"
     is_exact_modern_discovery "$request" || exit 1
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-inspect-server","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"completions":{},"extensions":{"io.example/inspect":{"enabled":true}}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-inspect-server","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}'
 done
 "#;
 
@@ -1769,6 +1769,22 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
             Some(expected_text.as_str()),
             "{case_name} text inspect must emit the selected protocol triad exactly"
         );
+        if expected_era == "modern-2026" {
+            let capabilities = text
+                .lines()
+                .find(|line| line.starts_with("Capabilities (final discovery): "))
+                .expect(
+                    "modern inspect text must identify and retain final discovery capabilities",
+                );
+            assert!(capabilities.contains("\"completions\":{}"));
+            assert!(capabilities.contains("\"io.example/inspect\":{\"enabled\":true}"));
+        } else {
+            assert!(
+                text.lines().any(|line| line
+                    == "Capabilities: tools=true resources=true prompts=true logging=false"),
+                "exact legacy inspect must retain its legacy capability rendering"
+            );
+        }
         assert_wire(&observed_protocol_wire(&text_output));
 
         let json_output = inspect_protocol_fixture(policy, "json", fixture);
@@ -1782,8 +1798,35 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
         assert_eq!(json["protocol"]["policy"], policy);
         assert_eq!(json["protocol"]["version"], expected_version);
         assert_eq!(json["protocol"]["era"], expected_era);
+        if expected_era == "modern-2026" {
+            assert_eq!(json["capabilities"]["completions"], serde_json::json!({}));
+            assert_eq!(
+                json["capabilities"]["extensions"]["io.example/inspect"]["enabled"], true,
+                "modern inspect JSON must retain final extension settings"
+            );
+        } else {
+            assert!(
+                json["capabilities"].get("completions").is_none()
+                    && json["capabilities"].get("extensions").is_none(),
+                "exact legacy inspect must not render final-only discovery members"
+            );
+        }
         assert_wire(&observed_protocol_wire(&json_output));
     }
+}
+
+#[test]
+fn e2e_cli_inspect_modern_discovery_planted_negative_rejects_invalid_completions_shape() {
+    let fixture = MODERN_INSPECT_FIXTURE.replace("\"completions\":{}", "\"completions\":true");
+    let output = inspect_protocol_fixture("modern-only", "json", &fixture);
+
+    assert!(
+        !output.status.success(),
+        "changing only completions from an object to a boolean must reject final discovery"
+    );
+    let wire = observed_protocol_wire(&output);
+    assert_modern_negotiation_wire(&wire);
+    assert_no_legacy_initialize(&wire);
 }
 
 #[test]

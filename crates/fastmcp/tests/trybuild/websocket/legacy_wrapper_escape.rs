@@ -1,3 +1,3 @@
-use fastmcp_rust::legacy_2024::WebSocketClient;
+use fastmcp_rust::legacy_2024::AsyncWsClientTransport;
 
 fn main() {}

@@ -218,8 +218,14 @@ pub mod client {
         McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
         McpAppsWireHostPolicy, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
+    #[cfg(feature = "websocket-experimental")]
+    pub use crate::{WebSocketClient, WebSocketClientTransport};
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
+    /// Raw client-side WebSocket framing remains available for advanced
+    /// embeddings that own the transport boundary.
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_client::websocket_experimental;
     pub use fastmcp_client::{http_auth, http_executor, mcp_config, sse};
 }
 
@@ -294,6 +300,12 @@ pub mod server {
         FinalTaskRetentionAuthority, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+    };
+    /// WebSocket server listener and lifecycle APIs.
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_server::{
+        AsyncWsServerTransport, BoundWebSocketServer, WebSocketNonquiescentShutdown,
+        WebSocketServerShutdown,
     };
     #[cfg(feature = "proxy")]
     pub use fastmcp_server::{
@@ -443,20 +455,20 @@ pub use fastmcp_protocol::{
     FinalEmbeddedInputRequest, FinalEmbeddedInputResponse, FinalEmbeddedRootsListParams,
     FinalEmbeddedRootsListResult, FinalEmbeddedUrlElicitationParams, FinalEmptyNotificationParams,
     FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams, FinalGetPromptResult,
-    FinalInputRequiredResultType, FinalListParams, FinalListPromptsResult,
-    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult,
-    FinalLogMessageParams, FinalNotificationError, FinalProgressNotificationParams,
-    FinalPromptMessage, FinalReadResourceParams, FinalReadResourceResult, FinalRequestMeta,
-    FinalResourceUpdatedNotificationParams, FinalSubscriptionsAcknowledgedNotificationParams,
-    FinalSubscriptionsListenParams, FinalSubscriptionsListenResult, IncludeContext,
-    InputRequiredResult, LegacyCoreRequest, LegacyCoreResult, LegacyEmptyResult,
-    MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
-    MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MetadataView, PaginatedResult,
-    RawResultEnvelope, ResultDecodeError, ResultDecodeErrorKind, ResultDiscriminatorDecision,
-    ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic, ResultPeerEra, ServerNotification,
-    TypedCompleteMembers, UnknownResultMembers, decode_peer_result, decode_peer_result_for_era,
-    decode_typed_complete, encode_complete_result, encode_result, exact_json_from_serde,
-    exact_json_to_serde, parse_exact_json,
+    FinalInputRequiredResultType, FinalInputResponseCorrelationError, FinalInputResponses,
+    FinalListParams, FinalListPromptsResult, FinalListResourceTemplatesResult,
+    FinalListResourcesResult, FinalListToolsResult, FinalLogMessageParams, FinalNotificationError,
+    FinalProgressNotificationParams, FinalPromptMessage, FinalReadResourceParams,
+    FinalReadResourceResult, FinalRequestMeta, FinalResourceUpdatedNotificationParams,
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+    FinalSubscriptionsListenResult, IncludeContext, InputRequiredResult, LegacyCoreRequest,
+    LegacyCoreResult, LegacyEmptyResult, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH,
+    MAX_RESULT_ENCODED_BYTES, MAX_RESULT_NUMBER_BYTES, MAX_RESULT_STRING_BYTES, MetadataView,
+    PaginatedResult, RawResultEnvelope, ResultDecodeError, ResultDecodeErrorKind,
+    ResultDiscriminatorDecision, ResultDiscriminatorPolicy, ResultMeta, ResultPeerDiagnostic,
+    ResultPeerEra, ServerNotification, TypedCompleteMembers, UnknownResultMembers,
+    decode_peer_result, decode_peer_result_for_era, decode_typed_complete, encode_complete_result,
+    encode_result, exact_json_from_serde, exact_json_to_serde, parse_exact_json,
 };
 
 // Exact final component and sampling models. These are deliberately separate
@@ -602,24 +614,24 @@ pub use fastmcp_transport::http::{
 };
 pub use fastmcp_transport::sse::SseEvent;
 pub use fastmcp_transport::{
-    AsyncLineReader, AsyncStdin, AsyncStdioTransport, AsyncStdout, Codec, CodecError, HttpError,
-    HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler, HttpResponse,
-    HttpResponseRepresentation, HttpStatus, InvalidMessageKind, MemoryRecvHalf, MemorySendHalf,
-    ModernHttpRequestAdmission, ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits,
-    ModernSseParseError, SendPermit, StdioTransport, StreamableHttpRequestCancellation,
-    StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
-    Transport, TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
+    AsyncLineReader, AsyncStdin, AsyncStdioTransport, AsyncStdout, ClientTransportRecvHalf, Codec,
+    CodecError, HttpError, HttpHandlerConfig, HttpMethod, HttpRequest, HttpRequestHandler,
+    HttpResponse, HttpResponseRepresentation, HttpStatus, InvalidMessageKind, MemoryRecvHalf,
+    MemorySendHalf, ModernHttpRequestAdmission, ModernSseDecoder, ModernSseEndOfStream,
+    ModernSseLimits, ModernSseParseError, ReceivedTransportFrame, SendPermit, StdioTransport,
+    StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
+    StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
+    TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
 };
 
-/// Curated transport diagnostics exposed by the facade.
+/// Direct transport APIs exposed by the facade.
 ///
-/// The facade intentionally does not re-export the blocking WebSocket module:
-/// already-upgraded async WebSocket adaptation remains a lower-crate concern.
-///
-/// ```compile_fail
-/// use fastmcp_rust::transport::websocket;
-/// ```
+/// WebSocket support is explicitly experimental and available only with
+/// `websocket-experimental`, including URI connection, Upgrade primitives,
+/// and the server listener bridge.
 pub mod transport {
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_transport::websocket;
     pub use fastmcp_transport::{
         MemoryRecvHalf, MemorySendHalf, ModernSseDecoder, ModernSseEndOfStream, ModernSseLimits,
         ModernSseParseError, TransportError,
@@ -627,6 +639,14 @@ pub mod transport {
     pub use fastmcp_transport::{http, memory, sse};
 }
 
+/// Experimental WebSocket transport APIs.
+///
+/// Low-level URI/Upgrade framing stays outside `modern`, `legacy_2024`, and
+/// `auto`; those namespaces select an MCP policy through their builders.
+#[cfg(feature = "websocket-experimental")]
+pub use fastmcp_transport::websocket::{
+    AsyncWsClientTransport, AsyncWsServerTransport, WebSocketListener, WebSocketUpgradeAdmission,
+};
 pub use fastmcp_transport::{event_store, http, memory};
 
 // Re-export server types
@@ -644,6 +664,10 @@ pub use fastmcp_server::{
     TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
     TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
     create_context_with_progress, create_context_with_progress_and_senders,
+};
+#[cfg(feature = "websocket-experimental")]
+pub use fastmcp_server::{
+    BoundWebSocketServer, WebSocketNonquiescentShutdown, WebSocketServerShutdown,
 };
 
 /// Tasks server APIs are available only with the official Tasks extension.
@@ -718,6 +742,11 @@ pub use fastmcp_client::{
     SubscriptionListenCollector,
 };
 
+/// Negotiated high-level WebSocket client types are opt-in with the facade's
+/// WebSocket profile. Raw URI and upgrade adapters remain in [`transport`].
+#[cfg(feature = "websocket-experimental")]
+pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
+
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::{
     FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
@@ -769,9 +798,8 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 /// subprocess or HTTP side effect. The caller may replace that immutable plan
 /// with an explicit plan before connecting.
 ///
-/// ```compile_fail
-/// use fastmcp_rust::auto::connect_websocket_with_cx;
-/// ```
+/// `auto::ClientBuilder` negotiates WebSocket traffic with its immutable Auto
+/// policy. Low-level URI/Upgrade transports remain in [`crate::transport`].
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod auto {
     pub use fastmcp_client::http_executor::{
@@ -788,6 +816,8 @@ pub mod auto {
         ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
         SubscriptionFilter, SubscriptionListenCollector,
     };
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
         ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionNegotiationError,
@@ -901,7 +931,7 @@ pub mod auto {
 /// ```
 ///
 /// ```compile_fail
-/// use fastmcp_rust::modern::connect_websocket_with_cx;
+/// use fastmcp_rust::modern::AsyncWsClientTransport;
 /// ```
 ///
 /// ```compile_fail
@@ -962,6 +992,8 @@ pub mod modern {
         PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
         SubscriptionFilter, SubscriptionListenCollector,
     };
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_RESOURCE_READ_DEPTH,
         MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard, McpError, McpOutcome, McpResult,
@@ -1014,10 +1046,11 @@ pub mod modern {
         FinalEmbeddedRootsListResult, FinalEmbeddedUrlElicitationParams,
         FinalEmptyNotificationParams, FinalEmptyParams, FinalEmptyResult, FinalGetPromptParams,
         FinalGetPromptResult, FinalHttpRequestMetadata, FinalInputRequiredResultType,
-        FinalListParams, FinalListPromptsResult, FinalListResourceTemplatesResult,
-        FinalListResourcesResult, FinalListToolsResult, FinalLogMessageParams,
-        FinalNotificationError, FinalProgressNotificationParams, FinalPrompt, FinalPromptArgument,
-        FinalPromptMessage, FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
+        FinalInputResponseCorrelationError, FinalInputResponses, FinalListParams,
+        FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
+        FinalListToolsResult, FinalLogMessageParams, FinalNotificationError,
+        FinalProgressNotificationParams, FinalPrompt, FinalPromptArgument, FinalPromptMessage,
+        FinalProtocolVersion, FinalReadResourceParams, FinalReadResourceResult,
         FinalRequestAdmission, FinalRequestMeta, FinalResource, FinalResourceTemplate,
         FinalResourceUpdatedNotificationParams, FinalSamplingMessage, FinalSamplingMessageContent,
         FinalSamplingMessageContentBlock, FinalSubscriptionsAcknowledgedNotificationParams,
@@ -1118,6 +1151,10 @@ pub mod modern {
         MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler,
         ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
         ToolHandler, TrafficVerbosity, create_context_with_progress,
+    };
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_server::{
+        BoundWebSocketServer, WebSocketNonquiescentShutdown, WebSocketServerShutdown,
     };
     pub use fastmcp_transport::http::{
         StreamableHttpRequestIngress, StreamableHttpRequestResponseMessage,
@@ -1399,6 +1436,37 @@ pub mod modern {
             self.inner
                 .connect_stdio_with_cx(command, args, cx)
                 .map(Client::from_inner)
+        }
+
+        /// Connects one upgraded WebSocket transport under the fixed
+        /// MCP 2026-07-28 policy.
+        #[cfg(feature = "websocket-experimental")]
+        pub fn connect_websocket<R, S>(
+            self,
+            receiver: R,
+            sender: S,
+        ) -> McpResult<WebSocketClient<R, S>>
+        where
+            R: fastmcp_transport::ClientTransportRecvHalf,
+            S: fastmcp_transport::TransportSendHalf,
+        {
+            self.inner.connect_websocket(receiver, sender)
+        }
+
+        /// Connects one upgraded WebSocket transport under the fixed
+        /// MCP 2026-07-28 policy using the supplied capability context.
+        #[cfg(feature = "websocket-experimental")]
+        pub fn connect_websocket_with_cx<R, S>(
+            self,
+            cx: &Cx,
+            receiver: R,
+            sender: S,
+        ) -> McpResult<WebSocketClient<R, S>>
+        where
+            R: fastmcp_transport::ClientTransportRecvHalf,
+            S: fastmcp_transport::TransportSendHalf,
+        {
+            self.inner.connect_websocket_with_cx(cx, receiver, sender)
         }
 
         /// Connects this configured final-only builder over one final HTTP endpoint.
@@ -2807,6 +2875,26 @@ pub mod modern {
             self.inner.serve_http(cx, addr).await
         }
 
+        /// Binds this final-only server to a WebSocket listener.
+        #[cfg(feature = "websocket-experimental")]
+        pub async fn bind_websocket(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+        ) -> McpResult<BoundWebSocketServer> {
+            self.inner.bind_websocket(cx, addr).await
+        }
+
+        /// Binds and serves this final-only server over WebSocket.
+        #[cfg(feature = "websocket-experimental")]
+        pub async fn serve_websocket(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+        ) -> McpResult<WebSocketServerShutdown> {
+            self.inner.serve_websocket(cx, addr).await
+        }
+
         /// Runs this final-only server over stdio.
         pub fn run_stdio(self) -> ! {
             self.inner.run_stdio()
@@ -2848,7 +2936,7 @@ pub mod modern {
 /// ```
 ///
 /// ```compile_fail
-/// use fastmcp_rust::legacy_2024::connect_websocket_with_cx;
+/// use fastmcp_rust::legacy_2024::AsyncWsClientTransport;
 /// ```
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024 {
@@ -2861,6 +2949,8 @@ pub mod legacy_2024 {
         RootsRequestHandler as LegacyRootsRequestHandler,
         SamplingRequestHandler as LegacySamplingRequestHandler,
     };
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientRoot, Cx, McpContext, McpError, McpOutcome, McpResult,
         RootsProvider,
@@ -2905,6 +2995,10 @@ pub mod legacy_2024 {
         HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, Middleware,
         PromptHandler, ResourceHandler, ServerLaunchPolicyError, ToolErrorKind, ToolHandler,
         TrafficVerbosity,
+    };
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_server::{
+        BoundWebSocketServer, WebSocketNonquiescentShutdown, WebSocketServerShutdown,
     };
     pub use fastmcp_transport::sse::{
         LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, LegacySseServerTransport,
@@ -3377,6 +3471,26 @@ pub mod legacy_2024 {
         ) -> McpResult<HttpServerShutdown> {
             self.inner.serve_http(cx, addr).await
         }
+
+        /// Binds this exact-2024 server to a WebSocket listener.
+        #[cfg(feature = "websocket-experimental")]
+        pub async fn bind_websocket(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+        ) -> McpResult<BoundWebSocketServer> {
+            self.inner.bind_websocket(cx, addr).await
+        }
+
+        /// Binds and serves this exact-2024 server over WebSocket.
+        #[cfg(feature = "websocket-experimental")]
+        pub async fn serve_websocket(
+            self,
+            cx: &Cx,
+            addr: impl Into<String>,
+        ) -> McpResult<WebSocketServerShutdown> {
+            self.inner.serve_websocket(cx, addr).await
+        }
     }
 
     /// Creates a server builder pinned to exact MCP 2024-11-05.
@@ -3785,6 +3899,37 @@ pub mod legacy_2024 {
             self.inner
                 .connect_stdio_with_cx(command, args, cx)
                 .map(Client::from_inner)
+        }
+
+        /// Connects one upgraded WebSocket transport under the fixed
+        /// MCP 2024-11-05 policy.
+        #[cfg(feature = "websocket-experimental")]
+        pub fn connect_websocket<R, S>(
+            self,
+            receiver: R,
+            sender: S,
+        ) -> McpResult<WebSocketClient<R, S>>
+        where
+            R: fastmcp_transport::ClientTransportRecvHalf,
+            S: fastmcp_transport::TransportSendHalf,
+        {
+            self.inner.connect_websocket(receiver, sender)
+        }
+
+        /// Connects one upgraded WebSocket transport under the fixed
+        /// MCP 2024-11-05 policy using the supplied capability context.
+        #[cfg(feature = "websocket-experimental")]
+        pub fn connect_websocket_with_cx<R, S>(
+            self,
+            cx: &Cx,
+            receiver: R,
+            sender: S,
+        ) -> McpResult<WebSocketClient<R, S>>
+        where
+            R: fastmcp_transport::ClientTransportRecvHalf,
+            S: fastmcp_transport::TransportSendHalf,
+        {
+            self.inner.connect_websocket_with_cx(cx, receiver, sender)
         }
 
         /// Connects and initializes the sealed exact-2024 HTTP+SSE plan.
@@ -4286,6 +4431,7 @@ pub mod prelude {
         ClientProtocolPlanError,
         ClientRoot,
         ClientSession,
+        ClientTransportRecvHalf,
         CompleteResult,
         CompletionContext,
         CompletionHandler,
@@ -4327,6 +4473,8 @@ pub mod prelude {
         FinalEmbeddedUrlElicitationParams,
         FinalEmptyNotificationParams,
         FinalGetPromptResult,
+        FinalInputResponseCorrelationError,
+        FinalInputResponses,
         FinalLogMessageParams,
         FinalNotificationError,
         FinalProgressNotificationParams,
@@ -4469,6 +4617,12 @@ pub mod prelude {
         official_tasks_descriptor, official_tasks_empty_settings,
         register_official_tasks_extension, tasks_extension,
     };
+    #[cfg(feature = "websocket-experimental")]
+    pub use crate::{
+        AsyncWsClientTransport, AsyncWsServerTransport, BoundWebSocketServer, WebSocketClient,
+        WebSocketClientTransport, WebSocketListener, WebSocketNonquiescentShutdown,
+        WebSocketServerShutdown, WebSocketUpgradeAdmission,
+    };
     pub use crate::{
         CachePartitionKey, ClientCapabilityInfo, ContextNotificationSender,
         DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ElicitationAction,
@@ -4480,10 +4634,10 @@ pub mod prelude {
         MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, MAX_RESOURCE_READ_DEPTH,
         MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation, NoOpElicitationSender,
         NoOpNotificationSender, NoOpSamplingSender, PendingRequests, ProgressReporter,
-        PromptHandler, Request, RequestExecution, RequestExecutor, RequestSender,
-        ResourceContentItem, ResourceHandler, ResourceReadResult, ResourceReader, ReverseRequest,
-        ReverseRequestCancellation, SamplingRequest, SamplingRequestMessage, SamplingResponse,
-        SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
+        PromptHandler, ReceivedTransportFrame, Request, RequestExecution, RequestExecutor,
+        RequestSender, ResourceContentItem, ResourceHandler, ResourceReadResult, ResourceReader,
+        ReverseRequest, ReverseRequestCancellation, SamplingRequest, SamplingRequestMessage,
+        SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
         StdioRequestExecution, StdioRequestExecutor, ToolCallResult, ToolCaller, ToolContentItem,
         ToolHandler, Transport, TransportElicitationSender, TransportRootsProvider,
         TransportSamplingSender, block_on, decode_strict_jsonrpc_message,

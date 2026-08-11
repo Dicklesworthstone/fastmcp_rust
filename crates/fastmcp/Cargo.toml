@@ -52,9 +52,12 @@ proxy-tasks = [
     "fastmcp-server/proxy-tasks",
     "fastmcp-console/proxy-tasks",
 ]
+# Full WebSocket support: URI client transport, negotiated MCP client, and
+# server-owned listener/Upgrade bridge. The facade keeps raw framing adapters
+# outside era namespaces while era-pinned builders select their policy first.
 websocket-experimental = [
     "fastmcp-transport/websocket-experimental",
-    "fastmcp-server/websocket-experimental",
+    "fastmcp-server/websocket",
     "fastmcp-client/websocket-experimental",
     "fastmcp-console/websocket-experimental",
 ]

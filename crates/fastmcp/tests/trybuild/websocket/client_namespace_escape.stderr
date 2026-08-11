@@ -1,5 +1,5 @@
-error[E0432]: unresolved import `fastmcp_rust::client::websocket_experimental`
+error[E0432]: unresolved import `fastmcp_rust::client::websocket_experimental::AsyncWsServerTransport`
  --> tests/trybuild/websocket/client_namespace_escape.rs:1:5
   |
-1 | use fastmcp_rust::client::websocket_experimental;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `websocket_experimental` in `client`
+1 | use fastmcp_rust::client::websocket_experimental::AsyncWsServerTransport;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `AsyncWsServerTransport` in `client::websocket_experimental`

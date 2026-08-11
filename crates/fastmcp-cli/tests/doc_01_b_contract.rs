@@ -32,8 +32,8 @@ const PROVISIONAL_PUBLIC_HELP_ORACLE: PublicHelpOracle = PublicHelpOracle {
 const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
     "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
-    "executable CLI protocol-policy selections. Inspect configures the shipped client; run ",
-    "passes the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
+    "executable CLI protocol-policy selections. Inspect configures the shipped client; run and ",
+    "dev pass the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
     "children may ignore it. This does not prove server support, aggregate conformance, or release readiness. MCP 2025-11-25 is ",
     "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
     "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",

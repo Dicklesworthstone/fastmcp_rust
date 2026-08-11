@@ -59,8 +59,8 @@ const LEGACY_PROTOCOL_POLICY_ENABLED: bool = cfg!(feature = "legacy-2024-11-05")
 const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
     "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
-    "executable CLI protocol-policy selections. Inspect configures the shipped client; run ",
-    "passes the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
+    "executable CLI protocol-policy selections. Inspect configures the shipped client; run and ",
+    "dev pass the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
     "children may ignore it. This does not prove server support, aggregate conformance, or release readiness. MCP 2025-11-25 is ",
     "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
     "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",
@@ -86,8 +86,8 @@ const CLI_PROTOCOL_STATUS_HELP: &str = concat!(
 const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
     "Protocol status: MCP 2026-07-28 support is under implementation and unverified. ",
     "Public PROTOCOL_VERSION remains 2024-11-05; Auto, ModernOnly, and LegacyOnly are ",
-    "executable CLI protocol-policy selections. Inspect configures the shipped client; run ",
-    "passes the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
+    "executable CLI protocol-policy selections. Inspect configures the shipped client; run and ",
+    "dev pass the selected policy to launched FastMCP ServerBuilder targets, while arbitrary ",
     "children may ignore it. This does not prove server support, aggregate conformance, or release readiness. MCP 2025-11-25 is ",
     "unsupported: it has no alias, compatibility profile, route, or diagnostic selection. ",
     "Help, inspect output, and examples are not conformance, runtime-readiness, maturity, ",
@@ -5260,9 +5260,11 @@ fn cmd_inspect(
         client_builder_for_protocol_policy(protocol_policy)?.connect_stdio(server, &args_refs)?;
     let negotiated_protocol_version = client.protocol_version().to_owned();
 
-    // Gather server information
+    // Preserve the negotiated era's capability model. Modern discovery is an
+    // open final model, so rendering it through the legacy capability struct
+    // would silently discard advertised final members.
     let server_info = client.server_info().clone();
-    let capabilities = client.server_capabilities().clone();
+    let capabilities = stdio_inspect_capabilities(&client)?;
 
     // Acquire one bounded page per category. MCP's list requests have no item
     // limit, so the transport may still receive one bounded protocol message,
@@ -5270,7 +5272,7 @@ fn cmd_inspect(
     // auto-pagination budget.
     let limits = ListPageLimits::new(CLI_OUTPUT_MAX_ITEMS, INSPECT_CATEGORY_MAX_BYTES);
     let mut acquisition_truncated = false;
-    let tools = if capabilities.tools.is_some() {
+    let tools = if capabilities.advertises("tools") {
         let page = client.list_tools_page(None, limits)?;
         acquisition_truncated |= page.local_truncated || page.peer_has_more;
         page.items
@@ -5278,7 +5280,7 @@ fn cmd_inspect(
         Vec::new()
     };
 
-    let resources = if capabilities.resources.is_some() {
+    let resources = if capabilities.advertises("resources") {
         let page = client.list_resources_page(None, limits)?;
         acquisition_truncated |= page.local_truncated || page.peer_has_more;
         page.items
@@ -5286,7 +5288,7 @@ fn cmd_inspect(
         Vec::new()
     };
 
-    let resource_templates = if capabilities.resources.is_some() {
+    let resource_templates = if capabilities.advertises("resources") {
         let page = client.list_resource_templates_page(None, limits)?;
         acquisition_truncated |= page.local_truncated || page.peer_has_more;
         page.items
@@ -5294,7 +5296,7 @@ fn cmd_inspect(
         Vec::new()
     };
 
-    let prompts = if capabilities.prompts.is_some() {
+    let prompts = if capabilities.advertises("prompts") {
         let page = client.list_prompts_page(None, limits)?;
         acquisition_truncated |= page.local_truncated || page.peer_has_more;
         page.items
@@ -5319,6 +5321,107 @@ fn cmd_inspect(
         format,
         output,
     )
+}
+
+/// Capability representation retained by inspect for the negotiated protocol
+/// era. Only exact 2024-11-05 sessions use the legacy capability shape; final
+/// discovery is retained as its complete protocol object.
+#[derive(Clone, Debug)]
+enum InspectCapabilities {
+    Legacy(fastmcp_protocol::ServerCapabilities),
+    Final(serde_json::Value),
+}
+
+impl InspectCapabilities {
+    fn advertises(&self, member: &str) -> bool {
+        match self {
+            Self::Legacy(capabilities) => match member {
+                "tools" => capabilities.tools.is_some(),
+                "resources" => capabilities.resources.is_some(),
+                "prompts" => capabilities.prompts.is_some(),
+                "logging" => capabilities.logging.is_some(),
+                _ => false,
+            },
+            Self::Final(capabilities) => capabilities.get(member).is_some(),
+        }
+    }
+
+    fn final_from_discovery(
+        capabilities: &fastmcp_protocol::ServerDiscoverCapabilities,
+        source: &str,
+    ) -> McpResult<Self> {
+        let capabilities = serde_json::to_value(capabilities).map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "inspect could not serialize final {source} capabilities: {error}"
+            ))
+        })?;
+        if !capabilities.is_object() {
+            return Err(fastmcp_core::McpError::internal_error(format!(
+                "inspect received non-object final {source} capabilities"
+            )));
+        }
+        Ok(Self::Final(capabilities))
+    }
+
+    fn text_summary(&self) -> String {
+        match self {
+            Self::Legacy(capabilities) => format!(
+                "Capabilities: tools={} resources={} prompts={} logging={}",
+                capabilities.tools.is_some(),
+                capabilities.resources.is_some(),
+                capabilities.prompts.is_some(),
+                capabilities.logging.is_some(),
+            ),
+            Self::Final(capabilities) => {
+                let mut budget = JsonPreviewBudget::default();
+                let preview = bounded_json_preview_inner(capabilities, 0, &mut budget);
+                let rendered = serde_json::to_string(&preview)
+                    .unwrap_or_else(|_| "<unrenderable final capabilities>".to_owned());
+                format!("Capabilities (final discovery): {rendered}")
+            }
+        }
+    }
+
+    fn json_value(&self, budget: &mut JsonPreviewBudget) -> serde_json::Value {
+        match self {
+            Self::Legacy(capabilities) => serde_json::json!({
+                "tools": capabilities.tools.is_some(),
+                "resources": capabilities.resources.is_some(),
+                "prompts": capabilities.prompts.is_some(),
+                "logging": capabilities.logging.is_some(),
+            }),
+            Self::Final(capabilities) => bounded_json_preview_inner(capabilities, 0, budget),
+        }
+    }
+}
+
+/// Returns the capability model for the era actually selected by a completed
+/// stdio negotiation. Final peers retain `server/discover`; legacy peers use
+/// only the exact initialized 2024-11-05 model. A missing selected era is a
+/// connection invariant failure, not an empty catalog.
+fn stdio_inspect_capabilities(client: &Client) -> McpResult<InspectCapabilities> {
+    match client.selected_protocol_era() {
+        Some(ProtocolEra::Modern2026) => {
+            let discovery = client.server_discovery().ok_or_else(|| {
+                fastmcp_core::McpError::internal_error(
+                    "modern stdio inspect completed without a server/discover result",
+                )
+            })?;
+            InspectCapabilities::final_from_discovery(discovery.capabilities(), "server/discover")
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        Some(ProtocolEra::Legacy2024) => Ok(InspectCapabilities::Legacy(
+            client.server_capabilities().clone(),
+        )),
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        Some(_) => Err(fastmcp_core::McpError::invalid_params(format!(
+            "FeatureUnavailable: {} is compiled out; legacy stdio inspection cannot run",
+            LEGACY_PROTOCOL_POLICY_FEATURE,
+        ))),
+        None => Err(fastmcp_core::McpError::internal_error(
+            "stdio inspect completed without a selected protocol era",
+        )),
+    }
 }
 
 /// Builds the immutable, explicit HTTP endpoint plan accepted by `inspect`.
@@ -5424,7 +5527,7 @@ fn cmd_inspect_http(
 
 fn http_inspect_capabilities(
     client: &fastmcp_client::HttpClient,
-) -> McpResult<fastmcp_protocol::ServerCapabilities> {
+) -> McpResult<InspectCapabilities> {
     match client.selected_protocol_era() {
         ProtocolEra::Modern2026 => {
             let discovery = client.server_discovery().ok_or_else(|| {
@@ -5432,17 +5535,18 @@ fn http_inspect_capabilities(
                     "modern HTTP inspect completed without a server/discover result",
                 )
             })?;
-            project_final_for_inspect::<&fastmcp_protocol::ServerDiscoverCapabilities, _>(
-                discovery.capabilities(),
-                "server/discover",
-            )
+            InspectCapabilities::final_from_discovery(discovery.capabilities(), "server/discover")
         }
         #[cfg(feature = "legacy-2024-11-05")]
-        ProtocolEra::Legacy2024 => client.legacy_server_capabilities().cloned().ok_or_else(|| {
-            fastmcp_core::McpError::internal_error(
-                "legacy HTTP inspect completed without initialize capabilities",
-            )
-        }),
+        ProtocolEra::Legacy2024 => client
+            .legacy_server_capabilities()
+            .cloned()
+            .map(InspectCapabilities::Legacy)
+            .ok_or_else(|| {
+                fastmcp_core::McpError::internal_error(
+                    "legacy HTTP inspect completed without initialize capabilities",
+                )
+            }),
         #[cfg(not(feature = "legacy-2024-11-05"))]
         _ => Err(fastmcp_core::McpError::invalid_params(format!(
             "FeatureUnavailable: {} is compiled out; legacy HTTP inspection cannot run",
@@ -5454,7 +5558,7 @@ fn http_inspect_capabilities(
 #[allow(clippy::type_complexity)]
 fn http_inspect_catalogs(
     client: &mut fastmcp_client::HttpClient,
-    capabilities: &fastmcp_protocol::ServerCapabilities,
+    capabilities: &InspectCapabilities,
 ) -> McpResult<(
     bool,
     Vec<fastmcp_protocol::Tool>,
@@ -5463,7 +5567,7 @@ fn http_inspect_catalogs(
     Vec<fastmcp_protocol::Prompt>,
 )> {
     let mut acquisition_truncated = false;
-    let tools = if capabilities.tools.is_some() {
+    let tools = if capabilities.advertises("tools") {
         let (items, truncated) =
             http_inspect_tools_result(http_inspect_core_request(client, "tools/list")?)?;
         acquisition_truncated |= truncated;
@@ -5471,7 +5575,7 @@ fn http_inspect_catalogs(
     } else {
         Vec::new()
     };
-    let resources = if capabilities.resources.is_some() {
+    let resources = if capabilities.advertises("resources") {
         let (items, truncated) =
             http_inspect_resources_result(http_inspect_core_request(client, "resources/list")?)?;
         acquisition_truncated |= truncated;
@@ -5479,7 +5583,7 @@ fn http_inspect_catalogs(
     } else {
         Vec::new()
     };
-    let resource_templates = if capabilities.resources.is_some() {
+    let resource_templates = if capabilities.advertises("resources") {
         let (items, truncated) = http_inspect_resource_templates_result(
             http_inspect_core_request(client, "resources/templates/list")?,
         )?;
@@ -5488,7 +5592,7 @@ fn http_inspect_catalogs(
     } else {
         Vec::new()
     };
-    let prompts = if capabilities.prompts.is_some() {
+    let prompts = if capabilities.advertises("prompts") {
         let (items, truncated) =
             http_inspect_prompts_result(http_inspect_core_request(client, "prompts/list")?)?;
         acquisition_truncated |= truncated;
@@ -5610,9 +5714,9 @@ fn unexpected_http_inspect_result(method: &str) -> fastmcp_core::McpError {
     ))
 }
 
-/// Projects the exact typed final catalog model only for the existing inspect
-/// renderer, which intentionally has a stable legacy-shaped display model.
-/// The HTTP client itself retains the final result until this rendering seam.
+/// Projects typed final catalog items into the inspect catalog display model.
+/// Final discovery capabilities never pass through this helper: inspect retains
+/// and renders their complete final capability object separately.
 fn project_final_for_inspect<T, U>(value: T, source: &str) -> McpResult<U>
 where
     T: Serialize,
@@ -5633,7 +5737,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn write_inspect_report(
     server_info: &fastmcp_protocol::ServerInfo,
-    capabilities: &fastmcp_protocol::ServerCapabilities,
+    capabilities: &InspectCapabilities,
     tools: &[fastmcp_protocol::Tool],
     resources: &[fastmcp_protocol::Resource],
     resource_templates: &[fastmcp_protocol::ResourceTemplate],
@@ -5645,7 +5749,7 @@ fn write_inspect_report(
 ) -> McpResult<()> {
     // Format output
     let output_text = match format {
-        InspectFormat::Text => format_inspect_text_with_truncation(
+        InspectFormat::Text => format_inspect_text_for_capabilities_with_truncation(
             server_info,
             capabilities,
             tools,
@@ -5655,7 +5759,7 @@ fn write_inspect_report(
             acquisition_truncated,
             protocol_status,
         ),
-        InspectFormat::Json => format_inspect_json_with_truncation(
+        InspectFormat::Json => format_inspect_json_for_capabilities_with_truncation(
             server_info,
             capabilities,
             tools,
@@ -5714,6 +5818,28 @@ fn format_inspect_text_with_truncation(
     acquisition_truncated: bool,
     protocol_status: InspectProtocolStatus,
 ) -> String {
+    format_inspect_text_for_capabilities_with_truncation(
+        server_info,
+        &InspectCapabilities::Legacy(capabilities.clone()),
+        tools,
+        resources,
+        resource_templates,
+        prompts,
+        acquisition_truncated,
+        protocol_status,
+    )
+}
+
+fn format_inspect_text_for_capabilities_with_truncation(
+    server_info: &fastmcp_protocol::ServerInfo,
+    capabilities: &InspectCapabilities,
+    tools: &[fastmcp_protocol::Tool],
+    resources: &[fastmcp_protocol::Resource],
+    resource_templates: &[fastmcp_protocol::ResourceTemplate],
+    prompts: &[fastmcp_protocol::Prompt],
+    acquisition_truncated: bool,
+    protocol_status: InspectProtocolStatus,
+) -> String {
     let mut out = String::new();
 
     let _ = push_output_line(
@@ -5733,16 +5859,7 @@ fn format_inspect_text_with_truncation(
             protocol_status.era_name(),
         ),
     );
-    let _ = push_output_line(
-        &mut out,
-        &format!(
-            "Capabilities: tools={} resources={} prompts={} logging={}",
-            capabilities.tools.is_some(),
-            capabilities.resources.is_some(),
-            capabilities.prompts.is_some(),
-            capabilities.logging.is_some(),
-        ),
-    );
+    let _ = push_output_line(&mut out, &capabilities.text_summary());
     let _ = push_output_line(&mut out, "");
     if acquisition_truncated {
         let _ = push_output_line(
@@ -6096,6 +6213,28 @@ fn format_inspect_json_with_truncation(
     acquisition_truncated: bool,
     protocol_status: InspectProtocolStatus,
 ) -> McpResult<String> {
+    format_inspect_json_for_capabilities_with_truncation(
+        server_info,
+        &InspectCapabilities::Legacy(capabilities.clone()),
+        tools,
+        resources,
+        resource_templates,
+        prompts,
+        acquisition_truncated,
+        protocol_status,
+    )
+}
+
+fn format_inspect_json_for_capabilities_with_truncation(
+    server_info: &fastmcp_protocol::ServerInfo,
+    capabilities: &InspectCapabilities,
+    tools: &[fastmcp_protocol::Tool],
+    resources: &[fastmcp_protocol::Resource],
+    resource_templates: &[fastmcp_protocol::ResourceTemplate],
+    prompts: &[fastmcp_protocol::Prompt],
+    acquisition_truncated: bool,
+    protocol_status: InspectProtocolStatus,
+) -> McpResult<String> {
     let mut budget = JsonPreviewBudget::default();
     let server_name = bounded_json_string(&server_info.name, &mut budget);
     let server_version = bounded_json_string(&server_info.version, &mut budget);
@@ -6119,6 +6258,7 @@ fn format_inspect_json_with_truncation(
         .take(CLI_OUTPUT_MAX_ITEMS)
         .map(|prompt| bounded_prompt_value(prompt, &mut budget))
         .collect::<Vec<_>>();
+    let capability_value = capabilities.json_value(&mut budget);
     let truncated = acquisition_truncated
         || tools.len() > tool_values.len()
         || resources.len() > resource_values.len()
@@ -6136,12 +6276,7 @@ fn format_inspect_json_with_truncation(
             "version": protocol_status.version.as_str(),
             "era": protocol_status.era_name(),
         },
-        "capabilities": {
-            "tools": capabilities.tools.is_some(),
-            "resources": capabilities.resources.is_some(),
-            "prompts": capabilities.prompts.is_some(),
-            "logging": capabilities.logging.is_some(),
-        },
+        "capabilities": capability_value,
         "tools": tool_values,
         "resources": resource_values,
         "resource_templates": template_values,
