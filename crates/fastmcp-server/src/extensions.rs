@@ -39,6 +39,105 @@ pub trait ExtensionHandler<Request, Response>: Send + Sync {
     fn handle(&self, context: &McpContext, request: Request) -> McpResult<Response>;
 }
 
+#[cfg(all(test, feature = "apps"))]
+mod apps_only_tests {
+    use fastmcp_core::{McpContext, McpResult};
+    use fastmcp_protocol::extensions::official_mcp_apps_empty_server_settings;
+    use fastmcp_protocol::{
+        ExtensionDescriptorRegistry, ExtensionRegistryError, ExtensionSettings,
+    };
+    use serde_json::json;
+
+    use super::{ExtensionHandlerKey, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry};
+
+    #[test]
+    fn official_apps_rejects_unowned_client_to_server_handler_without_mutation() {
+        let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
+        let apps_id = handlers
+            .install_official_mcp_apps()
+            .expect("the official Apps descriptor and marker install");
+        let key = ExtensionHandlerKey::new(
+            apps_id.clone(),
+            fastmcp_protocol::extensions::MCP_APPS_INITIALIZE_METHOD,
+        );
+
+        assert_eq!(
+            handlers.register(
+                apps_id.clone(),
+                fastmcp_protocol::extensions::MCP_APPS_INITIALIZE_METHOD,
+                |_context: &McpContext,
+                 _params: serde_json::Value|
+                 -> McpResult<serde_json::Value> { Ok(json!({})) },
+            ),
+            Err(ExtensionHandlerRegistrationError::MethodNotOwned(key)),
+            "MCP Apps owns no client-to-server extension method on this server registry"
+        );
+        assert_eq!(
+            handlers.len(),
+            0,
+            "the rejected Apps handler cannot create a dead dispatch entry"
+        );
+        assert_eq!(
+            handlers.server_metadata_len(),
+            1,
+            "the rejection preserves the installed Apps discovery marker"
+        );
+        assert_eq!(
+            handlers.descriptor_registry().descriptor(&apps_id),
+            Some(&fastmcp_protocol::official_mcp_apps_descriptor()),
+            "the rejected handler cannot alter the official Apps descriptor"
+        );
+    }
+
+    #[test]
+    fn official_apps_installation_duplicate_is_rejected_without_mutating_metadata() {
+        let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
+        let apps_id = handlers
+            .install_official_mcp_apps()
+            .expect("baseline official Apps installation succeeds");
+
+        assert_eq!(
+            handlers
+                .install_official_mcp_apps()
+                .expect_err("only the duplicate installation is rejected"),
+            ExtensionHandlerRegistrationError::OfficialMcpAppsAlreadyInstalled
+        );
+        assert_eq!(handlers.server_metadata_len(), 1);
+        assert_eq!(
+            handlers.descriptor_registry().descriptor(&apps_id),
+            Some(&fastmcp_protocol::official_mcp_apps_descriptor())
+        );
+    }
+
+    #[test]
+    fn manually_registered_official_apps_metadata_requires_the_empty_marker() {
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        let apps_id = fastmcp_protocol::register_official_mcp_apps_extension(&mut descriptors)
+            .expect("the official Apps descriptor registers");
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let rejected = ExtensionSettings::new(json!({ "unexpected": true }))
+            .expect("the one-field alternate is generic extension metadata");
+
+        assert_eq!(
+            handlers.register_server_metadata(apps_id.clone(), rejected),
+            Err(ExtensionHandlerRegistrationError::Registry(
+                ExtensionRegistryError::OfficialMcpAppsServerSettingsNotEmpty
+            )),
+            "only the non-empty official Apps marker is rejected"
+        );
+        assert_eq!(
+            handlers.server_metadata_len(),
+            0,
+            "the rejected marker cannot be retained for later builder composition"
+        );
+
+        handlers
+            .register_server_metadata(apps_id, official_mcp_apps_empty_server_settings())
+            .expect("the exact empty official Apps marker remains accepted");
+        assert_eq!(handlers.server_metadata_len(), 1);
+    }
+}
+
 impl<Request, Response, Handler> ExtensionHandler<Request, Response> for Handler
 where
     Handler: Fn(&McpContext, Request) -> McpResult<Response> + Send + Sync,
@@ -598,7 +697,7 @@ impl ExtensionHandlerRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tasks"))]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -819,96 +918,6 @@ mod tests {
             Some(json!({})),
             "the official Apps server marker is emitted only through the frozen descriptor registry"
         );
-    }
-
-    #[test]
-    #[cfg(feature = "apps")]
-    fn official_apps_rejects_unowned_client_to_server_handler_without_mutation() {
-        let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
-        let apps_id = handlers
-            .install_official_mcp_apps()
-            .expect("the official Apps descriptor and marker install");
-        let key = ExtensionHandlerKey::new(
-            apps_id.clone(),
-            fastmcp_protocol::extensions::MCP_APPS_INITIALIZE_METHOD,
-        );
-
-        assert_eq!(
-            handlers.register(
-                apps_id.clone(),
-                fastmcp_protocol::extensions::MCP_APPS_INITIALIZE_METHOD,
-                |_context: &McpContext,
-                 _params: serde_json::Value|
-                 -> McpResult<serde_json::Value> { Ok(json!({})) },
-            ),
-            Err(ExtensionHandlerRegistrationError::MethodNotOwned(key)),
-            "MCP Apps owns no client-to-server extension method on this server registry"
-        );
-        assert_eq!(
-            handlers.len(),
-            0,
-            "the rejected Apps handler cannot create a dead dispatch entry"
-        );
-        assert_eq!(
-            handlers.server_metadata_len(),
-            1,
-            "the rejection preserves the installed Apps discovery marker"
-        );
-        assert_eq!(
-            handlers.descriptor_registry().descriptor(&apps_id),
-            Some(&fastmcp_protocol::official_mcp_apps_descriptor()),
-            "the rejected handler cannot alter the official Apps descriptor"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "apps")]
-    fn official_apps_installation_duplicate_is_rejected_without_mutating_metadata() {
-        let mut handlers = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
-        let apps_id = handlers
-            .install_official_mcp_apps()
-            .expect("baseline official Apps installation succeeds");
-
-        assert_eq!(
-            handlers
-                .install_official_mcp_apps()
-                .expect_err("only the duplicate installation is rejected"),
-            ExtensionHandlerRegistrationError::OfficialMcpAppsAlreadyInstalled
-        );
-        assert_eq!(handlers.server_metadata_len(), 1);
-        assert_eq!(
-            handlers.descriptor_registry().descriptor(&apps_id),
-            Some(&fastmcp_protocol::official_mcp_apps_descriptor())
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "apps")]
-    fn manually_registered_official_apps_metadata_requires_the_empty_marker() {
-        let mut descriptors = ExtensionDescriptorRegistry::new();
-        let apps_id = fastmcp_protocol::register_official_mcp_apps_extension(&mut descriptors)
-            .expect("the official Apps descriptor registers");
-        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
-        let rejected = ExtensionSettings::new(json!({ "unexpected": true }))
-            .expect("the one-field alternate is generic extension metadata");
-
-        assert_eq!(
-            handlers.register_server_metadata(apps_id.clone(), rejected),
-            Err(ExtensionHandlerRegistrationError::Registry(
-                ExtensionRegistryError::OfficialMcpAppsServerSettingsNotEmpty
-            )),
-            "only the non-empty official Apps marker is rejected"
-        );
-        assert_eq!(
-            handlers.server_metadata_len(),
-            0,
-            "the rejected marker cannot be retained for later builder composition"
-        );
-
-        handlers
-            .register_server_metadata(apps_id, official_mcp_apps_empty_server_settings())
-            .expect("the exact empty official Apps marker remains accepted");
-        assert_eq!(handlers.server_metadata_len(), 1);
     }
 
     #[test]

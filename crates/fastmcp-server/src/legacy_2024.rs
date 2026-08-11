@@ -664,6 +664,9 @@ where
         wire: Value,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
         self.require_binding(binding)?;
+        let response_shaped = wire
+            .as_object()
+            .is_some_and(|object| object.contains_key("result") || object.contains_key("error"));
         let request_id = response_id_from_wire(&wire);
         let envelope = match decode_legacy_2024_11_05_envelope_classified(wire) {
             Ok(envelope) => envelope,
@@ -683,9 +686,15 @@ where
                         )
                     }
                 };
-                return match request_id {
-                    Some(id) => Ok(Legacy2024Outbound::Response(error_response(id, error))),
-                    None => Err(error),
+                return match (response_shaped, request_id) {
+                    // JSON-RPC never sends a response to a response. Keep the
+                    // pending reverse-request authority intact and surface a
+                    // peer/transport failure to the caller instead.
+                    (true, _) => Err(error),
+                    (false, Some(id)) => {
+                        Ok(Legacy2024Outbound::Response(error_response(id, error)))
+                    }
+                    (false, None) => Err(error),
                 };
             }
         };
@@ -1696,6 +1705,165 @@ mod tests {
         assert_eq!(response["error"]["code"], -32600);
         assert_eq!(adapter.snapshot(), before);
         assert!(adapter.handler.methods.is_empty());
+    }
+
+    #[test]
+    fn final_reserved_request_metadata_rejects_before_legacy_adapter_state_changes() {
+        let binding = binding();
+        let mut adapter = adapter();
+        let before = adapter.snapshot();
+
+        for member in [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/serverInfo",
+            "io.modelcontextprotocol/subscriptionId",
+        ] {
+            let mut rejected = initialize();
+            rejected["params"]["_meta"][member] = json!({});
+            let response = adapter
+                .receive(binding, rejected)
+                .expect("invalid request metadata receives a JSON-RPC error response");
+            let Legacy2024Outbound::Response(response) = response else {
+                panic!("request metadata rejection must not become a notification result");
+            };
+            assert_eq!(response["error"]["code"], -32600, "{member}");
+            assert_eq!(adapter.snapshot(), before, "{member}");
+        }
+        assert!(adapter.handler.methods.is_empty());
+    }
+
+    #[test]
+    fn final_result_members_do_not_complete_pending_legacy_reverse_requests() {
+        let binding = binding();
+        let mut adapter = adapter();
+        initialize_operating(&mut adapter);
+        let Legacy2024Outbound::ReverseRequest(accepted_request) = adapter
+            .make_reverse_request(binding, PING, json!({}))
+            .expect("operating adapter admits a ping reverse request")
+        else {
+            panic!("ping must create a reverse request");
+        };
+        let accepted_id = accepted_request["id"].clone();
+        assert!(matches!(
+            adapter.receive(
+                binding,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": accepted_id,
+                    "result": {
+                        "legacy": true,
+                        "_meta": {"com.example/application": true}
+                    }
+                })
+            ),
+            Ok(Legacy2024Outbound::NoResponse)
+        ));
+
+        for member in std::iter::once("resultType").chain([
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/serverInfo",
+            "io.modelcontextprotocol/subscriptionId",
+        ]) {
+            let Legacy2024Outbound::ReverseRequest(request) = adapter
+                .make_reverse_request(binding, PING, json!({}))
+                .expect("each planted negative receives a fresh pending request")
+            else {
+                panic!("ping must create a reverse request");
+            };
+            let mut rejected = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"].clone(),
+                "result": {
+                    "legacy": true,
+                    "_meta": {"com.example/application": true}
+                }
+            });
+            if member == "resultType" {
+                rejected["result"]["resultType"] = json!("complete");
+            } else {
+                rejected["result"]["_meta"][member] = json!({});
+            }
+            let before = adapter.snapshot();
+            let error = adapter
+                .receive(binding, rejected)
+                .expect_err("a response-shaped rejection must not receive a response");
+            assert_eq!(error.code().as_i32(), Some(-32600), "{member}");
+            assert_eq!(adapter.snapshot(), before, "{member}");
+        }
+    }
+
+    #[test]
+    fn mixed_response_shapes_preserve_pending_reverse_and_lifecycle_state() {
+        let binding = binding();
+        let mut adapter = adapter();
+        initialize_operating(&mut adapter);
+        let Legacy2024Outbound::ReverseRequest(reverse_request) = adapter
+            .make_reverse_request(binding, PING, json!({}))
+            .expect("operating adapter admits a ping reverse request")
+        else {
+            panic!("ping must create a reverse request");
+        };
+        let pending_id = reverse_request["id"].clone();
+
+        for rejected in [
+            json!({
+                "jsonrpc": "2.0",
+                "id": pending_id.clone(),
+                "method": null,
+                "result": {
+                    "legacy": true,
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": pending_id.clone(),
+                "method": PING,
+                "result": {"legacy": true}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": pending_id.clone(),
+                "result": {},
+                "error": {"code": -32603, "message": "failed"}
+            }),
+        ] {
+            let before = adapter.snapshot();
+            let handler_methods_before = adapter.handler.methods.clone();
+            let error = adapter
+                .receive(binding, rejected)
+                .expect_err("a response-shaped rejection must not receive a response");
+            assert_eq!(error.code().as_i32(), Some(-32600));
+            assert_eq!(adapter.snapshot(), before);
+            assert_eq!(adapter.handler.methods, handler_methods_before);
+        }
+
+        assert_eq!(
+            adapter.receive(
+                binding,
+                json!({"jsonrpc": "2.0", "id": "legal-request", "method": PING})
+            ),
+            Ok(Legacy2024Outbound::Response(json!({
+                "jsonrpc": "2.0",
+                "id": "legal-request",
+                "result": {}
+            })))
+        );
+        assert!(matches!(
+            adapter.receive(
+                binding,
+                json!({"jsonrpc": "2.0", "id": pending_id, "result": {}})
+            ),
+            Ok(Legacy2024Outbound::NoResponse)
+        ));
+        assert!(adapter.snapshot().pending_reverse_request_ids.is_empty());
+        assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::Operating);
     }
 
     #[test]

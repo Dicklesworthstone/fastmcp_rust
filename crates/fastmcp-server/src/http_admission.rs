@@ -69,6 +69,10 @@ const SINGLETON_HEADERS: [&str; 6] = [
 ///
 /// There is deliberately no `Default`: the frozen numeric ceilings belong to
 /// the central bounds package and are wired in explicitly at integration.
+#[allow(
+    clippy::struct_field_names,
+    reason = "the private fields intentionally mirror the public constructor's distinct admission ceilings"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpAdmissionLimits {
     max_header_count: usize,

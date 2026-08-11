@@ -1133,7 +1133,15 @@ impl FilesystemProvider {
                 message: format!("Cannot allocate buffer for resource {relative_path}: {error}"),
             })?;
         let read_limit = self.max_file_size.saturating_add(1);
-        let mut chunk = [0_u8; 64 * 1024];
+        let mut chunk = Vec::new();
+        chunk
+            .try_reserve_exact(64 * 1024)
+            .map_err(|error| FilesystemProviderError::Io {
+                message: format!(
+                    "Cannot allocate read buffer for resource {relative_path}: {error}"
+                ),
+            })?;
+        chunk.resize(64 * 1024, 0);
         while bytes.len() < read_limit {
             ctx.checkpoint()
                 .map_err(|_| FilesystemProviderError::Cancelled)?;

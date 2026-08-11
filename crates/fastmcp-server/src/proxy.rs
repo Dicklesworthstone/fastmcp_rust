@@ -3,24 +3,30 @@
 //! This module provides lightweight proxy handlers that forward tool/resource/prompt
 //! calls to another MCP server via a backend client.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(feature = "tasks")]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+#[cfg(feature = "tasks")]
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use fastmcp_client::http_executor::{
-    LegacyHttpRequest, ModernHttpClient, ModernHttpFinalCoreEvent, ModernHttpResponseKind,
-    ModernHttpSubscriptionListenError,
-};
+use fastmcp_client::http_executor::{LegacyHttpRequest, ModernHttpClient, ModernHttpResponseKind};
+#[cfg(feature = "tasks")]
+use fastmcp_client::http_executor::{ModernHttpFinalCoreEvent, ModernHttpSubscriptionListenError};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
     Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
-    ClientProtocolPlan, CompletionParams, CompletionReference, FinalToolCallOutcome,
-    ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, ReverseRequestHandlers,
+    ClientProtocolPlan, CompletionParams, CompletionReference, ReverseRequestHandlers,
+};
+#[cfg(feature = "tasks")]
+use fastmcp_client::{
+    FinalToolCallOutcome, ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
 };
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
 use fastmcp_protocol::common_types::RawIcon;
+#[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
     register_official_tasks_extension,
@@ -32,28 +38,33 @@ use fastmcp_protocol::protocol_policy::{
     StdioEraDecision, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientExtensionDiscovery, ClientInfo,
-    CompleteResult, CompletionValues, Content, CoreRequest, CoreResult, CreateTaskResult,
-    ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings, FinalCallToolResult,
-    FinalCancelTaskParams, FinalCancelTaskResult, FinalCompletionParams, FinalCompletionValues,
-    FinalCoreResult, FinalGetPromptResult, FinalGetTaskParams, FinalGetTaskResult,
-    FinalProgressNotificationParams, FinalReadResourceResult, FinalRequestMeta, FinalTaskId,
-    GetPromptResult, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, LegacyCompletionParams, LegacyCompletionReference, LegacyContent,
-    LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsResult, ProgressParams,
-    Prompt, PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent,
-    ResourceTemplate, ServerDiscoverResult, ServerExtensionDiscovery, ServerNotification,
-    SubscriptionFilter, Task as FinalTask, TaskInputResponses as FinalTaskInputResponses, Tool,
-    ToolAnnotations, UpdateTaskParams, UpdateTaskResult, decode_strict_jsonrpc_message,
-    task_subscription_ids,
+    CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
+    CompletionValues, Content, CoreRequest, CoreResult, FinalCallToolResult, FinalCompletionParams,
+    FinalCompletionValues, FinalCoreResult, FinalGetPromptResult, FinalProgressNotificationParams,
+    FinalReadResourceResult, FinalRequestMeta, GetPromptResult, InitializeParams, InitializeResult,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
+    LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
+    LegacyResourceContent, ListRootsResult, ProgressParams, Prompt, PromptMessage,
+    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
+    ServerDiscoverResult, ServerNotification, Tool, ToolAnnotations, decode_strict_jsonrpc_message,
+    decode_strict_jsonrpc_response,
+};
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::{
+    ClientExtensionDiscovery, CreateTaskResult, ExtensionDescriptorRegistry, ExtensionDirection,
+    ExtensionSettings, FinalCancelTaskParams, FinalCancelTaskResult, FinalGetTaskParams,
+    FinalGetTaskResult, FinalTaskId, ServerExtensionDiscovery, SubscriptionFilter,
+    Task as FinalTask, TaskInputResponses as FinalTaskInputResponses, UpdateTaskParams,
+    UpdateTaskResult, task_subscription_ids,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+#[cfg(feature = "tasks")]
+use crate::handler::FinalToolOutcome;
 use crate::handler::{
-    CompletionHandler, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
-    FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
-    UpstreamFinalToolSchemaRegistration, UriParams,
+    CompletionHandler, FinalResourceReadCacheHintProvenance, FinalToolSchemaAuthority,
+    PromptHandler, ResourceHandler, ToolHandler, UpstreamFinalToolSchemaRegistration, UriParams,
 };
 
 /// Progress callback signature used by proxy backends.
@@ -72,6 +83,7 @@ pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotification
 /// stateless after discovery, so this value deliberately owns everything
 /// needed to perform its one request after the proxy route mutex is released.
 #[doc(hidden)]
+#[cfg(feature = "tasks")]
 pub enum ProxyFinalTaskOperation {
     /// A task-capable final tools/call request.
     CallTool {
@@ -95,6 +107,7 @@ pub enum ProxyFinalTaskOperation {
 
 /// A detached modern final Tasks request.
 #[doc(hidden)]
+#[cfg(feature = "tasks")]
 pub struct ProxyFinalTaskRequest {
     client: ModernHttpClient,
     request_id: RequestId,
@@ -102,6 +115,7 @@ pub struct ProxyFinalTaskRequest {
     maximum_response_bytes: usize,
 }
 
+#[cfg(feature = "tasks")]
 enum ProxyFinalTaskResponse {
     CallTool(FinalToolCallOutcome),
     Get(FinalGetTaskResult),
@@ -109,6 +123,7 @@ enum ProxyFinalTaskResponse {
     Cancel(FinalCancelTaskResult),
 }
 
+#[cfg(feature = "tasks")]
 impl ProxyFinalTaskRequest {
     async fn execute(
         self,
@@ -260,6 +275,7 @@ impl ProxyFinalTaskRequest {
 
 /// A detached upstream final Tasks listener opening.
 #[doc(hidden)]
+#[cfg(feature = "tasks")]
 pub struct ProxyFinalTaskListenerRequest {
     client: ModernHttpClient,
     request_id: RequestId,
@@ -267,6 +283,7 @@ pub struct ProxyFinalTaskListenerRequest {
     limits: SseLimits,
 }
 
+#[cfg(feature = "tasks")]
 impl ProxyFinalTaskListenerRequest {
     async fn open(self, ctx: &McpContext) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
         let listener = await_proxy_request_or_cancellation(
@@ -353,6 +370,7 @@ impl ProxyLegacyHttpRequest {
 /// [`ProxyFinalTaskListenerEvent::Acknowledged`] event before any notification
 /// or terminal event. Exact-2024 has no corresponding listener surface and
 /// remains excluded; modern HTTP and stdio routes share this relay contract.
+#[cfg(feature = "tasks")]
 pub trait ProxyFinalTaskListener: Send {
     /// Reads the next already-admitted upstream Tasks listener event.
     fn next(
@@ -367,6 +385,7 @@ pub trait ProxyFinalTaskListener: Send {
 /// A listener emits [`Self::Acknowledged`] exactly once before emitting a
 /// notification or [`Self::Terminal`].
 #[derive(Debug)]
+#[cfg(feature = "tasks")]
 pub enum ProxyFinalTaskListenerEvent {
     /// Upstream accepted the requested task filter.
     Acknowledged(SubscriptionFilter),
@@ -377,11 +396,13 @@ pub enum ProxyFinalTaskListenerEvent {
 }
 
 /// Maximum upstream task snapshots retained by one route-bound relay.
+#[cfg(feature = "tasks")]
 const MAX_RELAYED_FINAL_TASKS: usize = 128;
 
 /// Private descriptor member which carries an already-created upstream task
 /// through the pre-existing router-owned task outcome. It is never persisted
 /// or emitted: the router consumes it only when a proxy relay is installed.
+#[cfg(feature = "tasks")]
 const RELAYED_TASK_RESULT_MEMBER: &str = "io.fastmcp.proxy.relayed-task-result";
 
 /// One exact final cache policy returned with a catalog page.
@@ -531,6 +552,22 @@ pub struct ProxyTypedCatalog {
 }
 
 impl ProxyTypedCatalog {
+    /// Acquires every catalog component from one backend before projecting any
+    /// of them into the legacy-friendly [`ProxyCatalog`] storage shape.
+    ///
+    /// The enum variant is itself selected-era evidence, including for an
+    /// empty page. Keeping all four variants together until [`Self::era`] has
+    /// admitted them prevents `tools/list` from becoming an unbound,
+    /// caller-asserted stand-in for the whole upstream protocol selection.
+    fn from_backend<B: ProxyBackend + ?Sized>(backend: &mut B) -> McpResult<Self> {
+        Ok(Self {
+            tools: backend.list_tool_catalog()?,
+            resources: backend.list_resource_catalog()?,
+            resource_templates: backend.list_resource_template_catalog()?,
+            prompts: backend.list_prompt_catalog()?,
+        })
+    }
+
     /// Returns final tools when the upstream negotiation selected MCP 2026-07-28.
     #[must_use]
     pub fn final_tools(&self) -> Option<&[fastmcp_protocol::FinalTool]> {
@@ -842,12 +879,14 @@ pub trait ProxyBackend: Send {
     /// Returns whether this exact selected upstream admits the complete final
     /// Tasks relay surface. A false result is not a request failure: ordinary
     /// proxy operations remain available without advertising Tasks downstream.
+    #[cfg(feature = "tasks")]
     fn supports_final_tasks_relay(&mut self) -> McpResult<bool> {
         Ok(false)
     }
 
     /// Calls a final tool with the official Tasks result discriminator
     /// explicitly admitted upstream.
+    #[cfg(feature = "tasks")]
     fn call_tool_final_outcome(
         &mut self,
         _name: &str,
@@ -864,6 +903,7 @@ pub trait ProxyBackend: Send {
     /// Backends that cannot expose incremental final progress retain the
     /// existing outcome-only behavior. Native HTTP and stdio implementations
     /// override this when their selected ingress can admit the progress stream.
+    #[cfg(feature = "tasks")]
     fn call_tool_final_outcome_with_context_and_final_progress(
         &mut self,
         ctx: &McpContext,
@@ -876,6 +916,7 @@ pub trait ProxyBackend: Send {
     }
 
     /// Reads one route-bound upstream Task snapshot.
+    #[cfg(feature = "tasks")]
     fn get_final_task(&mut self, _task_id: FinalTaskId) -> McpResult<FinalGetTaskResult> {
         Err(McpError::invalid_request(
             "Proxy upstream does not provide a live final Tasks relay",
@@ -884,6 +925,7 @@ pub trait ProxyBackend: Send {
 
     /// Reads one route-bound upstream Task under the downstream cancellation
     /// domain.
+    #[cfg(feature = "tasks")]
     fn get_final_task_with_context(
         &mut self,
         ctx: &McpContext,
@@ -894,6 +936,7 @@ pub trait ProxyBackend: Send {
     }
 
     /// Supplies one exact task input response map upstream.
+    #[cfg(feature = "tasks")]
     fn update_final_task(
         &mut self,
         _task: &FinalTask,
@@ -906,6 +949,7 @@ pub trait ProxyBackend: Send {
 
     /// Updates one route-bound upstream Task under the downstream
     /// cancellation domain.
+    #[cfg(feature = "tasks")]
     fn update_final_task_with_context(
         &mut self,
         ctx: &McpContext,
@@ -917,6 +961,7 @@ pub trait ProxyBackend: Send {
     }
 
     /// Requests exact upstream task cancellation.
+    #[cfg(feature = "tasks")]
     fn cancel_final_task(&mut self, _task_id: FinalTaskId) -> McpResult<FinalCancelTaskResult> {
         Err(McpError::invalid_request(
             "Proxy upstream does not provide a live final Tasks relay",
@@ -925,6 +970,7 @@ pub trait ProxyBackend: Send {
 
     /// Cancels one route-bound upstream Task under the downstream cancellation
     /// domain.
+    #[cfg(feature = "tasks")]
     fn cancel_final_task_with_context(
         &mut self,
         ctx: &McpContext,
@@ -940,6 +986,7 @@ pub trait ProxyBackend: Send {
     /// stateless request from the route mutex. Other backends retain their
     /// existing synchronous implementation until they can offer the same
     /// ownership guarantee.
+    #[cfg(feature = "tasks")]
     #[doc(hidden)]
     fn start_final_task_request(
         &mut self,
@@ -949,6 +996,7 @@ pub trait ProxyBackend: Send {
     }
 
     /// Reserves a final Tasks listener opening without beginning upstream I/O.
+    #[cfg(feature = "tasks")]
     #[doc(hidden)]
     fn start_final_task_listener(
         &mut self,
@@ -964,7 +1012,7 @@ pub trait ProxyBackend: Send {
     /// [`Self::next_incremental_final_task_listener`].  This split keeps the
     /// client connection as the sole frame reader instead of collecting a
     /// stdio stream to completion and replaying a stale buffer.
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn start_incremental_final_task_listener(
         &mut self,
         _notifications: SubscriptionFilter,
@@ -974,7 +1022,7 @@ pub trait ProxyBackend: Send {
 
     /// Takes one event from a listener started through
     /// [`Self::start_incremental_final_task_listener`].
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn next_incremental_final_task_listener(
         &mut self,
         _cx: &Cx,
@@ -991,6 +1039,7 @@ pub trait ProxyBackend: Send {
     /// return a listener that acknowledges the requested filter before any
     /// notification or terminal event. The default preserves legacy proxy
     /// behavior by rejecting the final-only operation.
+    #[cfg(feature = "tasks")]
     fn open_final_task_listener(
         &mut self,
         _notifications: SubscriptionFilter,
@@ -1722,7 +1771,7 @@ impl ProxyBackend for Client {
         )
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn supports_final_tasks_relay(&mut self) -> McpResult<bool> {
         if self.selected_protocol_era() != Some(ProtocolEra::Modern2026) {
             return Ok(false);
@@ -1733,7 +1782,7 @@ impl ProxyBackend for Client {
             .map(|admitted| admitted.is_some())
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn call_tool_final_outcome(
         &mut self,
         name: &str,
@@ -1747,7 +1796,7 @@ impl ProxyBackend for Client {
         Client::call_tool_final_outcome(self, name, arguments)
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn call_tool_final_outcome_with_context_and_final_progress(
         &mut self,
         ctx: &McpContext,
@@ -1777,7 +1826,7 @@ impl ProxyBackend for Client {
         Ok(outcome)
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn get_final_task(&mut self, task_id: FinalTaskId) -> McpResult<FinalGetTaskResult> {
         if !self.supports_final_tasks_relay()? {
             return Err(McpError::invalid_request(
@@ -1787,7 +1836,7 @@ impl ProxyBackend for Client {
         Client::get_task_final(self, task_id)
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn get_final_task_with_context(
         &mut self,
         ctx: &McpContext,
@@ -1806,7 +1855,7 @@ impl ProxyBackend for Client {
         )
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn update_final_task(
         &mut self,
         task: &FinalTask,
@@ -1820,7 +1869,7 @@ impl ProxyBackend for Client {
         Client::update_task_final(self, task, input_responses)
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn update_final_task_with_context(
         &mut self,
         ctx: &McpContext,
@@ -1841,7 +1890,7 @@ impl ProxyBackend for Client {
         )
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn cancel_final_task(&mut self, task_id: FinalTaskId) -> McpResult<FinalCancelTaskResult> {
         if !self.supports_final_tasks_relay()? {
             return Err(McpError::invalid_request(
@@ -1851,7 +1900,7 @@ impl ProxyBackend for Client {
         Client::cancel_task_final(self, task_id)
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn cancel_final_task_with_context(
         &mut self,
         ctx: &McpContext,
@@ -1870,7 +1919,7 @@ impl ProxyBackend for Client {
         )
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn start_incremental_final_task_listener(
         &mut self,
         notifications: SubscriptionFilter,
@@ -1884,7 +1933,7 @@ impl ProxyBackend for Client {
         Ok(true)
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn next_incremental_final_task_listener(
         &mut self,
         cx: &Cx,
@@ -1903,7 +1952,7 @@ impl ProxyBackend for Client {
         }
     }
 
-    #[cfg(feature = "proxy-tasks")]
+    #[cfg(feature = "tasks")]
     fn open_final_task_listener(
         &mut self,
         notifications: SubscriptionFilter,
@@ -1936,12 +1985,12 @@ impl ProxyBackend for Client {
 /// route; replaying the admitted sequence through this object preserves the
 /// acknowledgement-before-notification relay contract without letting an
 /// unrelated request read the same connection.
-#[cfg(feature = "proxy-tasks")]
+#[cfg(feature = "tasks")]
 struct ProxyBufferedFinalTaskListener {
     events: VecDeque<ProxyFinalTaskListenerEvent>,
 }
 
-#[cfg(feature = "proxy-tasks")]
+#[cfg(feature = "tasks")]
 impl ProxyFinalTaskListener for ProxyBufferedFinalTaskListener {
     fn next(
         &mut self,
@@ -1963,12 +2012,12 @@ impl ProxyFinalTaskListener for ProxyBufferedFinalTaskListener {
 /// reader.  Each `next` call briefly obtains the route mutex only to let that
 /// client advance its own live subscription; it never creates an independent
 /// reader or materializes the whole upstream stream before delivery.
-#[cfg(feature = "proxy-tasks")]
+#[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioFinalTaskListener {
     client: ProxyClient,
 }
 
-#[cfg(feature = "proxy-tasks")]
+#[cfg(feature = "tasks")]
 impl ProxyFinalTaskListener for ProxyIncrementalStdioFinalTaskListener {
     fn next(
         &mut self,
@@ -2025,27 +2074,37 @@ pub struct ProxyCatalog {
 impl ProxyCatalog {
     /// Builds a catalog by querying a proxy backend.
     pub fn from_backend<B: ProxyBackend + ?Sized>(backend: &mut B) -> McpResult<Self> {
-        let (tool_catalog_era, tools, final_tools, final_tool_cache_hints) =
-            match backend.list_tool_catalog()? {
-                ProxyToolCatalog::Legacy(tools) => {
-                    (Some(ProtocolEra::Legacy2024), tools, Vec::new(), Vec::new())
-                }
-                ProxyToolCatalog::Final(tools) => (
-                    Some(ProtocolEra::Modern2026),
-                    Vec::new(),
-                    tools.entries,
-                    tools.cache_hints,
-                ),
-            };
-        let (resources, final_resources, final_resource_cache_hints) =
-            match backend.list_resource_catalog()? {
-                ProxyResourceCatalog::Legacy(resources) => (resources, Vec::new(), Vec::new()),
-                ProxyResourceCatalog::Final(resources) => {
-                    (Vec::new(), resources.entries, resources.cache_hints)
-                }
-            };
+        Self::from_typed_catalog(ProxyTypedCatalog::from_backend(backend)?)
+    }
+
+    /// Projects one already-admitted typed catalog into the registration
+    /// shape while retaining its selected-era evidence.
+    ///
+    /// `ProxyCatalog` keeps separate legacy and final component vectors for
+    /// registration, so all-empty vectors alone cannot reveal their source
+    /// era. The typed variants are therefore admitted first and the resulting
+    /// era is copied into the catalog marker only after that admission.
+    fn from_typed_catalog(catalog: ProxyTypedCatalog) -> McpResult<Self> {
+        let catalog_era = catalog.era()?;
+        let ProxyTypedCatalog {
+            tools: tool_catalog,
+            resources: resource_catalog,
+            resource_templates: resource_template_catalog,
+            prompts: prompt_catalog,
+        } = catalog;
+
+        let (tools, final_tools, final_tool_cache_hints) = match tool_catalog {
+            ProxyToolCatalog::Legacy(tools) => (tools, Vec::new(), Vec::new()),
+            ProxyToolCatalog::Final(tools) => (Vec::new(), tools.entries, tools.cache_hints),
+        };
+        let (resources, final_resources, final_resource_cache_hints) = match resource_catalog {
+            ProxyResourceCatalog::Legacy(resources) => (resources, Vec::new(), Vec::new()),
+            ProxyResourceCatalog::Final(resources) => {
+                (Vec::new(), resources.entries, resources.cache_hints)
+            }
+        };
         let (resource_templates, final_resource_templates, final_resource_template_cache_hints) =
-            match backend.list_resource_template_catalog()? {
+            match resource_template_catalog {
                 ProxyResourceTemplateCatalog::Legacy(resource_templates) => {
                     (resource_templates, Vec::new(), Vec::new())
                 }
@@ -2055,15 +2114,14 @@ impl ProxyCatalog {
                     resource_templates.cache_hints,
                 ),
             };
-        let (prompts, final_prompts, final_prompt_cache_hints) =
-            match backend.list_prompt_catalog()? {
-                ProxyPromptCatalog::Legacy(prompts) => (prompts, Vec::new(), Vec::new()),
-                ProxyPromptCatalog::Final(prompts) => {
-                    (Vec::new(), prompts.entries, prompts.cache_hints)
-                }
-            };
+        let (prompts, final_prompts, final_prompt_cache_hints) = match prompt_catalog {
+            ProxyPromptCatalog::Legacy(prompts) => (prompts, Vec::new(), Vec::new()),
+            ProxyPromptCatalog::Final(prompts) => {
+                (Vec::new(), prompts.entries, prompts.cache_hints)
+            }
+        };
         let catalog = Self {
-            tool_catalog_era,
+            tool_catalog_era: Some(catalog_era),
             tools,
             final_tools,
             final_tool_cache_hints,
@@ -2147,16 +2205,6 @@ impl ProxyCatalog {
             )),
         }
     }
-
-    fn admit_upstream_binding(&self, binding: ProxyUpstreamBinding) -> McpResult<()> {
-        self.admit_catalog_shape()?;
-        if self.tool_catalog_era != Some(binding.era()) {
-            return Err(McpError::invalid_request(
-                "Proxy catalog era contradicts the immutable route binding",
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Shared proxy client wrapper for handler reuse.
@@ -2164,10 +2212,18 @@ impl ProxyCatalog {
 pub struct ProxyClient {
     inner: Arc<Mutex<dyn ProxyBackend>>,
     upstream_binding: Option<ProxyUpstreamBinding>,
+    /// Era observed from an admitted typed catalog or upstream result.
+    ///
+    /// Custom backends can have no transport-level binding. Their first
+    /// selected-era response therefore seals this route-local fact, and every
+    /// later catalog or result must agree. A caller cannot use an unbound
+    /// backend to reinterpret one proxy route across the two eras.
+    observed_era: Arc<Mutex<Option<ProtocolEra>>>,
     /// Recovery state belongs to the configured upstream route rather than to
     /// one transient relay handle. Rebuilding handlers on the same route can
     /// therefore recover a relayed task only after its exact route receipt is
     /// re-admitted.
+    #[cfg(feature = "tasks")]
     final_task_registry: Arc<Mutex<ProxyFinalTaskRegistry>>,
 }
 
@@ -2176,6 +2232,7 @@ impl std::fmt::Debug for ProxyClient {
         formatter
             .debug_struct("ProxyClient")
             .field("upstream_binding", &self.upstream_binding)
+            .field("observed_era", &self.observed_protocol_era().ok())
             .finish_non_exhaustive()
     }
 }
@@ -2186,6 +2243,7 @@ impl std::fmt::Debug for ProxyClient {
 /// intentionally one-route-only: the official Tasks control methods carry no
 /// route discriminator, so composing two independent upstream ID namespaces
 /// would make a collision ambiguous rather than safely relayable.
+#[cfg(feature = "tasks")]
 #[derive(Debug)]
 pub(crate) struct ProxyFinalTaskRelay {
     client: ProxyClient,
@@ -2193,6 +2251,7 @@ pub(crate) struct ProxyFinalTaskRelay {
     tasks: Arc<Mutex<ProxyFinalTaskRegistry>>,
 }
 
+#[cfg(feature = "tasks")]
 #[derive(Debug, Default)]
 struct ProxyFinalTaskRegistry {
     tasks: HashMap<FinalTaskId, ProxyRelayedFinalTask>,
@@ -2205,6 +2264,7 @@ struct ProxyFinalTaskRegistry {
 /// matching the process-local task-store retention rule. A null `ttlMs` is an
 /// explicit unlimited-retention declaration: it remains until a terminal
 /// state is evicted for capacity, never because a local default elapsed.
+#[cfg(feature = "tasks")]
 #[derive(Debug, Clone)]
 struct ProxyRelayedFinalTask {
     task: FinalTask,
@@ -2216,6 +2276,7 @@ struct ProxyRelayedFinalTask {
 /// One bounded upstream Task creation admitted before its non-reversible
 /// `tools/call` side effect. Dropping this reservation releases the slot when
 /// the upstream call returns a non-Task branch or errors.
+#[cfg(feature = "tasks")]
 struct ProxyFinalTaskReservation {
     relay: Arc<ProxyFinalTaskRelay>,
     active: bool,
@@ -2227,6 +2288,7 @@ struct ProxyFinalTaskReservation {
 /// contract cannot be trusted at the router boundary. Keeping this state next
 /// to the relay makes the invariant hold for every backend, including custom
 /// backends that do not use the shipped modern HTTP listener.
+#[cfg(feature = "tasks")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProxyFinalTaskListenerPhase {
     AwaitingAcknowledgement,
@@ -2234,11 +2296,13 @@ enum ProxyFinalTaskListenerPhase {
     Terminated,
 }
 
+#[cfg(feature = "tasks")]
 struct AdmittedProxyFinalTaskListener {
     inner: Box<dyn ProxyFinalTaskListener>,
     phase: ProxyFinalTaskListenerPhase,
 }
 
+#[cfg(feature = "tasks")]
 impl AdmittedProxyFinalTaskListener {
     fn new(inner: Box<dyn ProxyFinalTaskListener>) -> Self {
         Self {
@@ -2253,6 +2317,7 @@ impl AdmittedProxyFinalTaskListener {
     }
 }
 
+#[cfg(feature = "tasks")]
 impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
     fn next(
         &mut self,
@@ -2295,6 +2360,7 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
     }
 }
 
+#[cfg(feature = "tasks")]
 impl Drop for ProxyFinalTaskReservation {
     fn drop(&mut self) {
         if self.active {
@@ -2303,6 +2369,7 @@ impl Drop for ProxyFinalTaskReservation {
     }
 }
 
+#[cfg(feature = "tasks")]
 impl ProxyFinalTaskRelay {
     fn new(client: ProxyClient, binding: ProxyUpstreamBinding) -> Self {
         Self {
@@ -3118,16 +3185,19 @@ impl ProxyHttpClient {
                 }
             }
             ProtocolEra::Legacy2024 => match ctx {
-                Some(ctx) => {
-                    self.request_legacy_response(ctx, method, parameters, request_id.clone())
-                }
-                None => {
-                    self.request_legacy_response_unscoped(method, parameters, request_id.clone())
-                }
+                Some(ctx) => self
+                    .request_legacy_response(ctx, method, parameters, request_id.clone())
+                    .map(ProxyHttpResponse::legacy),
+                None => self
+                    .request_legacy_response_unscoped(method, parameters, request_id.clone())
+                    .map(ProxyHttpResponse::legacy),
             },
         };
-        let response = match response_result {
-            Ok(response) => response,
+        let (response, raw_result) = match response_result {
+            Ok(ProxyHttpResponse {
+                response,
+                raw_result,
+            }) => (response, raw_result),
             Err(error)
                 if ctx.is_some_and(|ctx| ctx.request_cancellation().is_cancel_requested())
                     && self.connection.selected_protocol_era() == ProtocolEra::Legacy2024 =>
@@ -3146,7 +3216,18 @@ impl ProxyHttpClient {
                 error.message, error.code
             )));
         }
-        request.decode_response(&response).map_err(|error| {
+        let decoded = match self.connection.selected_protocol_era() {
+            ProtocolEra::Modern2026 => {
+                let raw_result = raw_result.as_deref().ok_or_else(|| {
+                    McpError::invalid_request(
+                        "Proxy HTTP modern response lost its admitted result source",
+                    )
+                })?;
+                request.decode_response_result(&response, raw_result)
+            }
+            ProtocolEra::Legacy2024 => request.decode_response(&response),
+        };
+        decoded.map_err(|error| {
             McpError::invalid_request(format!(
                 "Proxy HTTP upstream response is invalid for the selected era: {error}"
             ))
@@ -3694,6 +3775,7 @@ impl ProxyBackend for ProxyHttpClient {
         )
     }
 
+    #[cfg(feature = "tasks")]
     fn supports_final_tasks_relay(&mut self) -> McpResult<bool> {
         if self.binding.adapter() != ProxyUpstreamAdapter::ModernHttp {
             return Ok(false);
@@ -3704,6 +3786,7 @@ impl ProxyBackend for ProxyHttpClient {
         Ok(discovery_admits_final_tasks_relay(&discovery).is_ok())
     }
 
+    #[cfg(feature = "tasks")]
     fn call_tool_final_outcome(
         &mut self,
         name: &str,
@@ -3727,6 +3810,7 @@ impl ProxyBackend for ProxyHttpClient {
         })
     }
 
+    #[cfg(feature = "tasks")]
     fn get_final_task(&mut self, task_id: FinalTaskId) -> McpResult<FinalGetTaskResult> {
         if !self.supports_final_tasks_relay()? {
             return Err(McpError::invalid_request(
@@ -3745,6 +3829,7 @@ impl ProxyBackend for ProxyHttpClient {
         })
     }
 
+    #[cfg(feature = "tasks")]
     fn update_final_task(
         &mut self,
         task: &FinalTask,
@@ -3768,6 +3853,7 @@ impl ProxyBackend for ProxyHttpClient {
         })
     }
 
+    #[cfg(feature = "tasks")]
     fn cancel_final_task(&mut self, task_id: FinalTaskId) -> McpResult<FinalCancelTaskResult> {
         if !self.supports_final_tasks_relay()? {
             return Err(McpError::invalid_request(
@@ -3786,6 +3872,7 @@ impl ProxyBackend for ProxyHttpClient {
         })
     }
 
+    #[cfg(feature = "tasks")]
     fn start_final_task_request(
         &mut self,
         operation: ProxyFinalTaskOperation,
@@ -3806,6 +3893,7 @@ impl ProxyBackend for ProxyHttpClient {
         }))
     }
 
+    #[cfg(feature = "tasks")]
     fn start_final_task_listener(
         &mut self,
         notifications: SubscriptionFilter,
@@ -3826,6 +3914,7 @@ impl ProxyBackend for ProxyHttpClient {
         }))
     }
 
+    #[cfg(feature = "tasks")]
     fn open_final_task_listener(
         &mut self,
         notifications: SubscriptionFilter,
@@ -3851,10 +3940,12 @@ impl ProxyBackend for ProxyHttpClient {
     }
 }
 
+#[cfg(feature = "tasks")]
 struct ProxyHttpFinalTaskListener {
     listener: ModernHttpSubscriptionListener,
 }
 
+#[cfg(feature = "tasks")]
 impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
     fn next(
         &mut self,
@@ -3956,6 +4047,7 @@ fn discovery_supports_final_completion(discovery: &ServerDiscoverResult) -> McpR
 /// route. A partial upstream descriptor must remain an ordinary final proxy:
 /// it cannot create a task downstream that the relay cannot later control or
 /// observe.
+#[cfg(feature = "tasks")]
 fn discovery_admits_final_tasks_relay(discovery: &ServerDiscoverResult) -> McpResult<()> {
     let capabilities = serde_json::to_value(discovery.capabilities()).map_err(|error| {
         McpError::internal_error(format!(
@@ -4038,6 +4130,25 @@ fn discovery_admits_final_tasks_relay(discovery: &ServerDiscoverResult) -> McpRe
     Ok(())
 }
 
+/// A proxy response accompanied by the exact source of its successful result.
+///
+/// The source exists only for modern HTTP ingress, where final result decoding
+/// must retain extension-member ordering and JSON-number lexemes. Exact-2024
+/// response handling deliberately keeps its established typed path.
+struct ProxyHttpResponse {
+    response: JsonRpcResponse,
+    raw_result: Option<String>,
+}
+
+impl ProxyHttpResponse {
+    fn legacy(response: JsonRpcResponse) -> Self {
+        Self {
+            response,
+            raw_result: None,
+        }
+    }
+}
+
 fn receive_modern_response(
     client: &ModernHttpClient,
     cx: &Cx,
@@ -4045,7 +4156,7 @@ fn receive_modern_response(
     parameters: serde_json::Value,
     request_id: &RequestId,
     on_progress: FinalProgressCallback<'_>,
-) -> McpResult<JsonRpcResponse> {
+) -> McpResult<ProxyHttpResponse> {
     let response = block_on(client.request(cx, method, parameters, Some(request_id.clone())))
         .map_err(|error| {
             McpError::internal_error(format!("Proxy HTTP modern request failed: {error}"))
@@ -4059,6 +4170,7 @@ fn receive_modern_response(
                     ))
                 })?;
             response_for_request(
+                &body,
                 decode_strict_jsonrpc_message(&body, ProxyHttpClient::MAX_RESPONSE_BYTES).map_err(
                     |_| McpError::invalid_request("Proxy HTTP modern response was not JSON-RPC"),
                 )?,
@@ -4101,7 +4213,7 @@ fn receive_modern_response(
                     )?;
                     continue;
                 }
-                return response_for_request(message, request_id);
+                return response_for_request(event.as_bytes(), message, request_id);
             }
         }
         ModernHttpResponseKind::EmptyAcknowledgement => Err(McpError::invalid_request(
@@ -4149,6 +4261,7 @@ async fn await_proxy_operation_or_cancellation<T>(
 /// the relay even when downstream cancellation arrives in the same poll turn.
 /// Otherwise the proxy would discard the only handle capable of controlling
 /// that real upstream task.
+#[cfg(feature = "tasks")]
 async fn await_proxy_final_task_listener_event_or_cancellation(
     ctx: &McpContext,
     mut operation: std::pin::Pin<
@@ -4223,7 +4336,7 @@ async fn receive_modern_response_with_cancellation(
     parameters: serde_json::Value,
     request_id: &RequestId,
     on_progress: FinalProgressCallback<'_>,
-) -> McpResult<JsonRpcResponse> {
+) -> McpResult<ProxyHttpResponse> {
     let response = await_proxy_request_or_cancellation(
         ctx,
         Box::pin(async {
@@ -4253,6 +4366,7 @@ async fn receive_modern_response_with_cancellation(
             )
             .await?;
             response_for_request(
+                &body,
                 decode_strict_jsonrpc_message(&body, ProxyHttpClient::MAX_RESPONSE_BYTES).map_err(
                     |_| McpError::invalid_request("Proxy HTTP modern response was not JSON-RPC"),
                 )?,
@@ -4297,7 +4411,7 @@ async fn receive_modern_response_with_cancellation(
                     forward_modern_progress_notification(event.as_bytes(), request, on_progress)?;
                     continue;
                 }
-                return response_for_request(message, request_id);
+                return response_for_request(event.as_bytes(), message, request_id);
             }
         }
         ModernHttpResponseKind::EmptyAcknowledgement => Err(McpError::invalid_request(
@@ -4349,20 +4463,40 @@ fn forward_modern_progress_notification(
 }
 
 fn response_for_request(
+    raw_frame: &[u8],
     message: JsonRpcMessage,
     request_id: &RequestId,
-) -> McpResult<JsonRpcResponse> {
+) -> McpResult<ProxyHttpResponse> {
     let JsonRpcMessage::Response(response) = message else {
         return Err(McpError::invalid_request(
             "Proxy HTTP upstream sent a request while its response was required",
         ));
     };
-    if response.id.as_ref() != Some(request_id) {
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(request_id))
+    {
         return Err(McpError::invalid_request(
             "Proxy HTTP upstream response ID does not match its request",
         ));
     }
-    Ok(response)
+    let admission = decode_strict_jsonrpc_response(raw_frame, ProxyHttpClient::MAX_RESPONSE_BYTES)
+        .map_err(|_| {
+            McpError::invalid_request(
+                "Proxy HTTP modern response could not retain its admitted result source",
+            )
+        })?;
+    if admission.response() != &response {
+        return Err(McpError::invalid_request(
+            "Proxy HTTP modern response differs from its admitted source frame",
+        ));
+    }
+    let (response, raw_result) = admission.into_parts();
+    Ok(ProxyHttpResponse {
+        response,
+        raw_result,
+    })
 }
 
 fn proxy_http_connection_error(error: ClientHttpConnectionError) -> McpError {
@@ -4909,6 +5043,8 @@ impl ProxyClient {
         Self {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: None,
+            observed_era: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "tasks")]
             final_task_registry: Arc::new(Mutex::new(ProxyFinalTaskRegistry::default())),
         }
     }
@@ -4927,6 +5063,8 @@ impl ProxyClient {
         Ok(Self {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: Some(binding),
+            observed_era: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "tasks")]
             final_task_registry: Arc::new(Mutex::new(ProxyFinalTaskRegistry::default())),
         })
     }
@@ -4937,9 +5075,18 @@ impl ProxyClient {
         self.upstream_binding
     }
 
+    /// Returns the era sealed by an admitted typed catalog or result.
+    fn observed_protocol_era(&self) -> McpResult<Option<ProtocolEra>> {
+        self.observed_era
+            .lock()
+            .map(|era| *era)
+            .map_err(|_| McpError::internal_error("Proxy observed-era lock poisoned"))
+    }
+
     /// Returns a route-bound relay only when the selected upstream is modern
     /// and its retained discovery admits every official Tasks surface. No Auto
     /// retry, adapter replacement, or legacy projection occurs here.
+    #[cfg(feature = "tasks")]
     pub(crate) fn final_tasks_relay(&self) -> McpResult<Option<Arc<ProxyFinalTaskRelay>>> {
         let Some(binding) = self.upstream_binding else {
             return Ok(None);
@@ -4964,7 +5111,7 @@ impl ProxyClient {
     /// Fetches a catalog by querying the backend.
     pub fn catalog(&self) -> McpResult<ProxyCatalog> {
         let catalog = self.with_backend(|backend| ProxyCatalog::from_backend(backend))?;
-        self.admit_catalog(&catalog)?;
+        self.admit_observed_era(catalog.era()?, "backend catalog")?;
         Ok(catalog)
     }
 
@@ -4976,34 +5123,49 @@ impl ProxyClient {
     /// legacy. A mixed-era response is rejected before any caller can compose
     /// it into a downstream route.
     pub fn catalog_typed(&self) -> McpResult<ProxyTypedCatalog> {
-        let catalog = self.with_backend(|backend| {
-            Ok(ProxyTypedCatalog {
-                tools: backend.list_tool_catalog()?,
-                resources: backend.list_resource_catalog()?,
-                resource_templates: backend.list_resource_template_catalog()?,
-                prompts: backend.list_prompt_catalog()?,
-            })
-        })?;
+        let catalog = self.with_backend(ProxyTypedCatalog::from_backend)?;
         let era = catalog.era()?;
-        if let Some(binding) = self.upstream_binding
-            && binding.era() != era
-        {
-            return Err(McpError::invalid_request(
-                "Proxy typed catalog era contradicts the immutable route binding",
-            ));
-        }
+        self.admit_observed_era(era, "typed catalog")?;
         Ok(catalog)
     }
 
-    /// Admits a catalog only when it agrees with this client's immutable route
-    /// binding. This also protects builder callers that supply a catalog
-    /// directly rather than obtaining it through [`Self::catalog`].
+    /// Admits a caller-provided typed catalog only when this route already
+    /// has transport or backend-observed era evidence.
+    ///
+    /// Unlike [`Self::catalog_typed`], this method does not create that
+    /// evidence: a caller can describe a catalog but cannot assert the era of
+    /// an otherwise unbound proxy route.
+    pub(crate) fn admit_typed_catalog(&self, catalog: &ProxyTypedCatalog) -> McpResult<()> {
+        self.require_bound_era(catalog.era()?, "typed catalog")
+    }
+
+    /// Admits a catalog only when its era is already bound by the selected
+    /// transport or by this backend's own admitted response.
+    ///
+    /// A caller-supplied [`ProxyCatalog`] cannot create the binding it is
+    /// checked against. Unbound routes must first call [`Self::catalog`] or
+    /// [`Self::catalog_typed`], which retain the backend's typed era evidence.
     pub(crate) fn admit_catalog(&self, catalog: &ProxyCatalog) -> McpResult<()> {
         catalog.admit_catalog_shape()?;
+        let catalog_era = catalog.era()?;
         if let Some(binding) = self.upstream_binding {
-            catalog.admit_upstream_binding(binding)?;
+            if binding.era() != catalog_era {
+                return Err(McpError::invalid_request(
+                    "Proxy catalog era contradicts the immutable route binding",
+                ));
+            }
+            return Ok(());
         }
-        Ok(())
+        let observed_era = self.observed_protocol_era()?;
+        match observed_era {
+            Some(observed_era) if observed_era == catalog_era => Ok(()),
+            Some(_) => Err(McpError::invalid_request(
+                "Proxy catalog era contradicts the route's previously observed era",
+            )),
+            None => Err(McpError::invalid_request(
+                "Proxy catalog cannot bind an unbound route; fetch the backend catalog first",
+            )),
+        }
     }
 
     fn with_backend<F, R>(&self, f: F) -> McpResult<R>
@@ -5149,6 +5311,12 @@ impl ProxyClient {
                     "Proxy cannot project a final tools/call result to the legacy handler surface",
                 ));
             }
+            // The broad progress callback cannot carry final progress
+            // lexemes, so using it is itself exact-2024 route evidence. Seal
+            // that fact before invoking a custom backend; a later final
+            // catalog or result then fails closed instead of reinterpreting
+            // this proxy route.
+            self.admit_observed_era(ProtocolEra::Legacy2024, "legacy progress route")?;
             let content = self.with_backend(|backend| {
                 let mut callback = |progress, total, message: Option<String>| {
                     if let Some(total) = total {
@@ -5259,6 +5427,7 @@ impl ProxyClient {
         self.admit_upstream_result("tools/call", result)
     }
 
+    #[cfg(feature = "tasks")]
     fn call_tool_final_outcome(
         &self,
         ctx: &McpContext,
@@ -5325,6 +5494,7 @@ impl ProxyClient {
         Ok(outcome)
     }
 
+    #[cfg(feature = "tasks")]
     fn get_final_task(
         &self,
         ctx: &McpContext,
@@ -5349,6 +5519,7 @@ impl ProxyClient {
         }
     }
 
+    #[cfg(feature = "tasks")]
     fn update_final_task(
         &self,
         ctx: &McpContext,
@@ -5377,6 +5548,7 @@ impl ProxyClient {
         }
     }
 
+    #[cfg(feature = "tasks")]
     fn cancel_final_task(
         &self,
         ctx: &McpContext,
@@ -5403,12 +5575,13 @@ impl ProxyClient {
         }
     }
 
+    #[cfg(feature = "tasks")]
     fn open_final_task_listener(
         &self,
         ctx: &McpContext,
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
-        #[cfg(feature = "proxy-tasks")]
+        #[cfg(feature = "tasks")]
         if self.with_backend(|backend| {
             backend.start_incremental_final_task_listener(notifications.clone())
         })? {
@@ -5534,14 +5707,51 @@ impl ProxyClient {
         if result.method() != method {
             return Err(unexpected_proxy_result(method));
         }
-        if let Some(binding) = self.upstream_binding
-            && binding.era() != result.era()
-        {
-            return Err(McpError::invalid_request(
-                "Proxy upstream result era contradicts the immutable route binding",
-            ));
-        }
+        self.admit_observed_era(result.era(), "result")?;
         Ok(result)
+    }
+
+    fn admit_observed_era(&self, observed: ProtocolEra, source: &str) -> McpResult<()> {
+        if let Some(binding) = self.upstream_binding
+            && binding.era() != observed
+        {
+            return Err(McpError::invalid_request(format!(
+                "Proxy {source} era contradicts the immutable route binding"
+            )));
+        }
+        let mut admitted = self
+            .observed_era
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy observed-era lock poisoned"))?;
+        if let Some(existing) = *admitted
+            && existing != observed
+        {
+            return Err(McpError::invalid_request(format!(
+                "Proxy {source} era contradicts the route's previously observed era"
+            )));
+        }
+        *admitted = Some(observed);
+        Ok(())
+    }
+
+    fn require_bound_era(&self, required: ProtocolEra, source: &str) -> McpResult<()> {
+        if let Some(binding) = self.upstream_binding {
+            if binding.era() != required {
+                return Err(McpError::invalid_request(format!(
+                    "Proxy {source} era contradicts the immutable route binding"
+                )));
+            }
+            return Ok(());
+        }
+        match self.observed_protocol_era()? {
+            Some(observed) if observed == required => Ok(()),
+            Some(_) => Err(McpError::invalid_request(format!(
+                "Proxy {source} era contradicts the route's previously observed era"
+            ))),
+            None => Err(McpError::invalid_request(format!(
+                "Proxy {source} cannot bind an unbound route; fetch the backend catalog first"
+            ))),
+        }
     }
 }
 
@@ -5706,6 +5916,7 @@ pub(crate) struct ProxyToolHandler {
     client: ProxyClient,
     /// Route-bound final Tasks relay, installed only after the complete
     /// upstream Tasks surface was admitted.
+    #[cfg(feature = "tasks")]
     task_relay: Option<Arc<ProxyFinalTaskRelay>>,
 }
 
@@ -5717,6 +5928,7 @@ impl ProxyToolHandler {
             final_tool: None,
             external_name,
             client,
+            #[cfg(feature = "tasks")]
             task_relay: None,
         }
     }
@@ -5733,6 +5945,7 @@ impl ProxyToolHandler {
             final_tool: None,
             external_name,
             client,
+            #[cfg(feature = "tasks")]
             task_relay: None,
         }
     }
@@ -5746,25 +5959,21 @@ impl ProxyToolHandler {
         tool: fastmcp_protocol::FinalTool,
         client: ProxyClient,
     ) -> McpResult<Self> {
-        if let Some(binding) = client.upstream_binding
-            && binding.era() != ProtocolEra::Modern2026
-        {
-            return Err(McpError::invalid_request(
-                "Proxy final tool catalog contradicts the immutable route binding",
-            ));
-        }
+        client.require_bound_era(ProtocolEra::Modern2026, "final tool catalog")?;
         let external_name = tool.name.clone();
         Ok(Self {
             tool: final_tool_legacy_fallback(&tool),
             final_tool: Some(tool),
             external_name,
             client,
+            #[cfg(feature = "tasks")]
             task_relay: None,
         })
     }
 
     /// Creates one exact final proxy tool whose task branch is bound to the
     /// supplied single upstream relay.
+    #[cfg(feature = "tasks")]
     pub(crate) fn from_final_with_task_relay(
         tool: fastmcp_protocol::FinalTool,
         client: ProxyClient,
@@ -5828,10 +6037,12 @@ impl ToolHandler for ProxyToolHandler {
             .call_tool_final(ctx, &self.external_name, arguments)
     }
 
+    #[cfg(feature = "tasks")]
     fn declares_final_tasks(&self) -> bool {
         self.task_relay.is_some()
     }
 
+    #[cfg(feature = "tasks")]
     fn call_final_outcome(
         &self,
         ctx: &McpContext,
@@ -6068,7 +6279,9 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, VecDeque};
+    #[cfg(feature = "tasks")]
+    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, HashMap};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -6078,11 +6291,11 @@ mod tests {
     use asupersync::Cx;
     #[cfg(unix)]
     use fastmcp_client::Client;
+    #[cfg(feature = "tasks")]
+    use fastmcp_client::FinalToolCallOutcome;
     #[cfg(unix)]
     use fastmcp_client::RequestTimeoutPolicy;
-    use fastmcp_client::{
-        CanonicalHttpUrl, ClientHttpConnection, ClientProtocolPlan, FinalToolCallOutcome,
-    };
+    use fastmcp_client::{CanonicalHttpUrl, ClientHttpConnection, ClientProtocolPlan};
     use fastmcp_core::{
         McpContext, McpErrorCode, McpRequestCancellation, NotificationSender, ProgressReporter,
         block_on,
@@ -6093,25 +6306,34 @@ mod tests {
     };
     use fastmcp_protocol::{
         CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
-        Content, CoreResult, CreateTaskResult, EmptyTaskResult, FinalCallToolResult,
-        FinalCoreResult, FinalGetTaskResult, FinalProgressNotificationParams, FinalRequestMeta,
-        JsonRpcMessage, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
+        Content, CoreResult, FinalCallToolResult, FinalCoreResult, FinalProgressNotificationParams,
+        FinalRequestMeta, JsonRpcMessage, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
         LegacyResourceContent, Prompt, PromptMessage, Resource, ResourceContent,
-        ServerNotification, SubscriptionFilter, Tool, decode_strict_jsonrpc_message,
+        ServerNotification, Tool, decode_strict_jsonrpc_message,
+    };
+    #[cfg(feature = "tasks")]
+    use fastmcp_protocol::{
+        CreateTaskResult, EmptyTaskResult, FinalGetTaskResult, SubscriptionFilter,
         set_task_subscription_ids,
     };
 
     use super::{
         ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient, ProxyFinalCatalog,
-        ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyHttpClient, ProxyPromptCatalog,
-        ProxyPromptHandler, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
-        ProxyToolHandler, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
-        await_proxy_final_task_listener_event_or_cancellation,
-        await_proxy_operation_or_cancellation, decode_modern_server_notification,
-        final_tool_legacy_fallback, forward_modern_progress_notification,
-        legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
+        ProxyHttpClient, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
+        ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler, ProxyUpstreamAdapter,
+        ProxyUpstreamBinding, ProxyUpstreamBindingRegistry, await_proxy_operation_or_cancellation,
+        decode_modern_server_notification, final_tool_legacy_fallback,
+        forward_modern_progress_notification, legacy_contents_to_handler,
+        legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
-    use crate::handler::{FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ToolHandler};
+    #[cfg(feature = "tasks")]
+    use super::{
+        ProxyFinalTaskListener, ProxyFinalTaskListenerEvent,
+        await_proxy_final_task_listener_event_or_cancellation,
+    };
+    #[cfg(feature = "tasks")]
+    use crate::handler::FinalToolOutcome;
+    use crate::handler::{FinalToolSchemaAuthority, PromptHandler, ToolHandler};
     use std::task::Poll;
 
     #[test]
@@ -6186,6 +6408,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_silent_listener_wakes_on_downstream_cancellation() {
         let cx = Cx::for_testing();
@@ -6200,6 +6423,7 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_ready_listener_is_not_reclassified_as_cancelled() {
         let cx = Cx::for_testing();
@@ -6213,6 +6437,7 @@ mod tests {
         assert_eq!(delivered, "acknowledged");
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_simultaneous_ready_listener_and_cancellation_prioritizes_cancellation() {
         let cx = Cx::for_testing();
@@ -6233,6 +6458,7 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_simultaneous_task_terminal_and_cancellation_retains_the_task() {
         let cancellation = McpRequestCancellation::new();
@@ -6268,6 +6494,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_simultaneous_complete_terminal_and_cancellation_still_cancels() {
         let cancellation = McpRequestCancellation::new();
@@ -6498,6 +6725,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     struct FinalTaskRelayBackend {
         calls: Arc<Mutex<Vec<&'static str>>>,
         task: CreateTaskResult,
@@ -6506,6 +6734,7 @@ mod tests {
         final_progress: Option<FinalProgressNotificationParams>,
     }
 
+    #[cfg(feature = "tasks")]
     impl FinalTaskRelayBackend {
         fn record(&self, method: &'static str) {
             self.calls
@@ -6515,10 +6744,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     struct FinalTaskRelayListener {
         events: VecDeque<ProxyFinalTaskListenerEvent>,
     }
 
+    #[cfg(feature = "tasks")]
     impl ProxyFinalTaskListener for FinalTaskRelayListener {
         fn next(
             &mut self,
@@ -6533,6 +6764,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     impl ProxyBackend for FinalTaskRelayBackend {
         fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
             Ok(Vec::new())
@@ -6674,10 +6906,12 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     fn final_task_relay_result() -> CreateTaskResult {
         final_task_relay_result_with_ttl("proxy-task-73", None)
     }
 
+    #[cfg(feature = "tasks")]
     fn final_task_relay_result_with_ttl(task_id: &str, ttl_ms: Option<u64>) -> CreateTaskResult {
         serde_json::from_value(serde_json::json!({
             "resultType": "task",
@@ -6691,6 +6925,7 @@ mod tests {
         .expect("the proxy final Task fixture is exact")
     }
 
+    #[cfg(feature = "tasks")]
     fn terminal_task(task_id: &str) -> fastmcp_protocol::Task {
         serde_json::from_value(serde_json::json!({
             "taskId": task_id,
@@ -6702,6 +6937,7 @@ mod tests {
         .expect("the terminal proxy Task fixture is exact")
     }
 
+    #[cfg(feature = "tasks")]
     fn final_task_relay_binding(era: ProtocolEra) -> ProxyUpstreamBinding {
         ProxyUpstreamBinding {
             era,
@@ -6717,6 +6953,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_preserves_one_upstream_handle_controls_and_listener() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -6842,6 +7079,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_rejects_terminal_before_acknowledgement() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -6896,6 +7134,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_is_inert_for_exact_2024_without_backend_invocation() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -6928,6 +7167,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_recovers_a_route_bound_snapshot_after_restart() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -6973,6 +7213,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_accepts_the_same_route_bound_contract_over_modern_stdio() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -7015,6 +7256,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_evicts_terminal_snapshots_before_rejecting_new_work() {
         let proxy = ProxyClient::from_backend_with_upstream_binding(
@@ -7068,6 +7310,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_never_evicts_live_or_null_ttl_snapshots() {
         let proxy = ProxyClient::from_backend_with_upstream_binding(
@@ -7101,6 +7344,7 @@ mod tests {
         assert!(error.message.contains("capacity exhausted"));
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_reclaims_elapsed_finite_ttl_but_retains_null_ttl() {
         let proxy = ProxyClient::from_backend_with_upstream_binding(
@@ -7147,6 +7391,7 @@ mod tests {
         assert!(registry.tasks.contains_key(&unlimited.base().task_id));
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_relay_retains_task_when_cancellation_follows_upstream_commit() {
         let cancellation = McpRequestCancellation::new();
@@ -7193,6 +7438,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_call_forwards_matching_progress_into_downstream_runtime() {
         let capture = Arc::new(ExactProgressCapture::default());
@@ -7239,6 +7485,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_tasks_call_rejects_only_the_wrong_progress_marker() {
         let capture = Arc::new(ExactProgressCapture::default());
@@ -7280,6 +7527,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_task_handler_forwards_matching_progress_into_downstream_runtime() {
         let capture = Arc::new(ExactProgressCapture::default());
@@ -7333,6 +7581,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn proxy_final_task_handler_rejects_only_the_wrong_progress_marker() {
         let capture = Arc::new(ExactProgressCapture::default());
@@ -7862,14 +8111,34 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn list_resource_catalog(&mut self) -> fastmcp_core::McpResult<ProxyResourceCatalog> {
+            Ok(ProxyResourceCatalog::Final(ProxyFinalCatalog::new(
+                Vec::new(),
+            )))
+        }
+
         fn list_resource_templates(
             &mut self,
         ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
             Ok(Vec::new())
         }
 
+        fn list_resource_template_catalog(
+            &mut self,
+        ) -> fastmcp_core::McpResult<ProxyResourceTemplateCatalog> {
+            Ok(ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(
+                Vec::new(),
+            )))
+        }
+
         fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
             Ok(Vec::new())
+        }
+
+        fn list_prompt_catalog(&mut self) -> fastmcp_core::McpResult<ProxyPromptCatalog> {
+            Ok(ProxyPromptCatalog::Final(
+                ProxyFinalCatalog::new(Vec::new()),
+            ))
         }
 
         fn call_tool(
@@ -7899,6 +8168,81 @@ mod tests {
             _arguments: HashMap<String, String>,
         ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
             Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+    }
+
+    struct EmptyTypedCatalogBackend {
+        resource_catalog: ProxyResourceCatalog,
+    }
+
+    impl ProxyBackend for EmptyTypedCatalogBackend {
+        fn list_tools(&mut self) -> fastmcp_core::McpResult<Vec<Tool>> {
+            Ok(Vec::new())
+        }
+
+        fn list_tool_catalog(&mut self) -> fastmcp_core::McpResult<ProxyToolCatalog> {
+            Ok(ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::new())))
+        }
+
+        fn list_resources(&mut self) -> fastmcp_core::McpResult<Vec<Resource>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resource_catalog(&mut self) -> fastmcp_core::McpResult<ProxyResourceCatalog> {
+            Ok(self.resource_catalog.clone())
+        }
+
+        fn list_resource_templates(
+            &mut self,
+        ) -> fastmcp_core::McpResult<Vec<fastmcp_protocol::ResourceTemplate>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resource_template_catalog(
+            &mut self,
+        ) -> fastmcp_core::McpResult<ProxyResourceTemplateCatalog> {
+            Ok(ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(
+                Vec::new(),
+            )))
+        }
+
+        fn list_prompts(&mut self) -> fastmcp_core::McpResult<Vec<Prompt>> {
+            Ok(Vec::new())
+        }
+
+        fn list_prompt_catalog(&mut self) -> fastmcp_core::McpResult<ProxyPromptCatalog> {
+            Ok(ProxyPromptCatalog::Final(
+                ProxyFinalCatalog::new(Vec::new()),
+            ))
+        }
+
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(Vec::new())
+        }
+
+        fn call_tool_with_progress(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+            _on_progress: super::ProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<Vec<Content>> {
+            Ok(Vec::new())
+        }
+
+        fn read_resource(&mut self, _uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+
+        fn get_prompt(
+            &mut self,
+            _name: &str,
+            _arguments: HashMap<String, String>,
+        ) -> fastmcp_core::McpResult<Vec<PromptMessage>> {
+            Ok(Vec::new())
         }
     }
 
@@ -8165,6 +8509,95 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&prompts[0]).expect("prompt serializes"),
             expected_prompt
+        );
+    }
+
+    #[test]
+    fn proxy_catalog_empty_final_retains_observed_era_without_caller_binding() {
+        let proxy = ProxyClient::from_backend(EmptyTypedCatalogBackend {
+            resource_catalog: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+        });
+        assert_eq!(
+            proxy.upstream_binding(),
+            None,
+            "the custom backend contributes catalog evidence instead of a caller-asserted binding"
+        );
+
+        let catalog = proxy
+            .catalog()
+            .expect("all-empty final catalog components retain their observed era");
+
+        assert_eq!(
+            catalog.era().expect("empty catalog retains an exact era"),
+            ProtocolEra::Modern2026
+        );
+        assert!(catalog.tools.is_empty());
+        assert!(catalog.final_tools.is_empty());
+        assert!(catalog.resources.is_empty());
+        assert!(catalog.final_resources.is_empty());
+        assert!(catalog.resource_templates.is_empty());
+        assert!(catalog.final_resource_templates.is_empty());
+        assert!(catalog.prompts.is_empty());
+        assert!(catalog.final_prompts.is_empty());
+        assert_eq!(
+            proxy
+                .observed_protocol_era()
+                .expect("observed-era lock remains available"),
+            Some(ProtocolEra::Modern2026),
+            "the empty final variants seal the route without a caller assertion"
+        );
+    }
+
+    #[test]
+    fn proxy_catalog_rejects_empty_legacy_component_among_final_evidence() {
+        let proxy = ProxyClient::from_backend(EmptyTypedCatalogBackend {
+            // This is the sole difference from the admitted empty-final
+            // catalog: an empty legacy variant still carries legacy evidence.
+            resource_catalog: ProxyResourceCatalog::Legacy(Vec::new()),
+        });
+
+        let error = proxy
+            .catalog()
+            .expect_err("an empty legacy component must not be erased before era admission");
+
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("mixed-era"));
+        assert_eq!(
+            proxy.upstream_binding(),
+            None,
+            "rejection cannot create a caller-selected route binding"
+        );
+        assert_eq!(
+            proxy
+                .observed_protocol_era()
+                .expect("rejected catalog leaves observed-era lock available"),
+            None,
+            "mixed empty evidence cannot seal either era"
+        );
+    }
+
+    #[test]
+    fn proxy_catalog_rejects_unbound_caller_asserted_era() {
+        let proxy = ProxyClient::from_backend(EmptyTypedCatalogBackend {
+            resource_catalog: ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::new())),
+        });
+        let caller_catalog = ProxyCatalog {
+            tool_catalog_era: Some(ProtocolEra::Modern2026),
+            ..ProxyCatalog::default()
+        };
+
+        let error = proxy
+            .admit_catalog(&caller_catalog)
+            .expect_err("caller data must not create a protocol binding for an unbound route");
+
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("cannot bind an unbound route"));
+        assert_eq!(
+            proxy
+                .observed_protocol_era()
+                .expect("rejected caller catalog leaves observed-era lock available"),
+            None,
+            "caller assertion cannot create route evidence"
         );
     }
 
@@ -10112,6 +10545,159 @@ exec sleep 2
                 .expect("modern catalog request must be JSON")["id"],
             serde_json::json!(2),
         );
+    }
+
+    #[test]
+    fn proxy_http_modern_result_source_preserves_ordered_extras_over_json_and_sse() {
+        const ACCEPTED_RESULT: &str = r#"{"resultType":"complete","x-first":1.20e+4,"content":[{"type":"text","text":"forwarded"}],"x-second":{"z-last":3,"a-first":2}}"#;
+        // This differs from ACCEPTED_RESULT only at the method-owned `content`
+        // field. The rejected frame must not alter the proxy's next admitted
+        // result or its open-member source ordering.
+        const REJECTED_RESULT: &str = r#"{"resultType":"complete","x-first":1.20e+4,"content":{},"x-second":{"z-last":3,"a-first":2}}"#;
+        const EXPECTED_REENCODED: &str = r#"{"resultType":"complete","content":[{"type":"text","text":"forwarded"}],"x-first":1.20e+4,"x-second":{"z-last":3,"a-first":2}}"#;
+
+        for (transport_name, content_type) in
+            [("JSON", "application/json"), ("SSE", "text/event-stream")]
+        {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind native modern proxy result listener");
+            let address = listener
+                .local_addr()
+                .expect("read native modern proxy result listener address");
+            let modern_target = format!("http://{address}/mcp");
+            let legacy_sse_target = format!("http://{address}/legacy-sse");
+            let legacy_message_target = format!("http://{address}/legacy-message");
+            let server = thread::spawn(move || {
+                let (mut probe, _) = listener.accept().expect("accept modern probe");
+                let probe_request = read_http_request(&mut probe);
+                write_http_discovery_response(
+                    &mut probe,
+                    br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                );
+
+                // The first public call emits integer request ID 2. Both
+                // alternate spellings are mathematically identical JSON-RPC
+                // IDs and must correlate without changing the raw result.
+                // Request 4 deliberately receives ID 5; request 5 then proves
+                // that refusal did not poison the route or retained result.
+                let response_ids = if content_type == "application/json" {
+                    ["2.0", "3", "5", "5"]
+                } else {
+                    ["2e0", "3", "5", "5"]
+                };
+                let responses = [
+                    ACCEPTED_RESULT,
+                    REJECTED_RESULT,
+                    ACCEPTED_RESULT,
+                    ACCEPTED_RESULT,
+                ];
+                let mut requests = Vec::new();
+                for (response_id, result) in response_ids.into_iter().zip(responses) {
+                    let (mut stream, _) = listener
+                        .accept()
+                        .expect("accept public modern proxy tools/call request");
+                    let request = read_http_request(&mut stream);
+                    let response =
+                        format!(r#"{{"jsonrpc":"2.0","id":{response_id},"result":{result}}}"#);
+                    if content_type == "application/json" {
+                        write_http_response(&mut stream, 200, content_type, response.as_bytes());
+                    } else {
+                        let event = format!("event: message\ndata: {response}\n\n");
+                        write_http_response(&mut stream, 200, content_type, event.as_bytes());
+                    }
+                    requests.push(request);
+                }
+                (probe_request, requests)
+            });
+
+            let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
+            let mut bindings = ProxyClient::upstream_binding_registry();
+            let route = format!("modern-result-source-{transport_name}");
+            let transport = format!("native-h1:{route}");
+            let proxy = bindings
+                .connect_http_with_protocol_plan(
+                    &route,
+                    &transport,
+                    31,
+                    plan,
+                    proxy_http_client_info(),
+                    ClientCapabilities::default(),
+                    Cx::for_request(),
+                )
+                .expect("modern discovery opens the public proxy backend");
+            let handler = ProxyToolHandler::from_final(final_catalog_tool(), proxy)
+                .expect("a negotiated modern proxy builds the public final handler");
+
+            let first = handler
+                .call_final(
+                    &McpContext::new(Cx::for_testing(), 730),
+                    serde_json::json!({}),
+                )
+                .expect("the public modern proxy retains the exact accepted result");
+            assert_eq!(
+                first
+                    .extras
+                    .members()
+                    .iter()
+                    .map(|member| member.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["x-first", "x-second"],
+                "{transport_name} keeps exact open-member order"
+            );
+            let first_encoded = CoreResult::Final(FinalCoreResult::ToolsCall {
+                result: first.clone(),
+                diagnostic: None,
+            })
+            .encode()
+            .expect("the retained result re-encodes");
+            assert_eq!(
+                first_encoded, EXPECTED_REENCODED,
+                "{transport_name} keeps the 1.20e+4 lexeme and nested extra order"
+            );
+
+            let error = handler
+                .call_final(
+                    &McpContext::new(Cx::for_testing(), 731),
+                    serde_json::json!({}),
+                )
+                .expect_err("changing only content to an object must reject the final result");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+
+            let mismatch = handler
+                .call_final(
+                    &McpContext::new(Cx::for_testing(), 732),
+                    serde_json::json!({}),
+                )
+                .expect_err("a mathematically different response ID must fail closed");
+            assert_eq!(mismatch.code, McpErrorCode::InvalidRequest);
+            assert!(mismatch.message.contains("response ID"));
+
+            let after_rejection = handler
+                .call_final(
+                    &McpContext::new(Cx::for_testing(), 733),
+                    serde_json::json!({}),
+                )
+                .expect("the content and ID refusals leave the next accepted result unchanged");
+            let after_rejection_encoded = CoreResult::Final(FinalCoreResult::ToolsCall {
+                result: after_rejection,
+                diagnostic: None,
+            })
+            .encode()
+            .expect("the unchanged result re-encodes");
+            assert_eq!(after_rejection_encoded, first_encoded);
+
+            let (probe, requests) = server.join().expect("modern result-source server joins");
+            assert!(probe.head.contains("Mcp-Method: server/discover\r\n"));
+            assert_eq!(requests.len(), 4);
+            for (offset, request) in requests.iter().enumerate() {
+                assert!(request.head.contains("Mcp-Method: tools/call\r\n"));
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&request.body)
+                        .expect("modern proxy tools/call request is JSON")["id"],
+                    serde_json::json!(offset as i64 + 2)
+                );
+            }
+        }
     }
 
     #[test]

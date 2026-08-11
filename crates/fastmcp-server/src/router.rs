@@ -3532,9 +3532,7 @@ impl Router {
                         "completion handler returned more than 100 values",
                     ));
                 }
-                completion
-                    .validate()
-                    .map_err(|error| McpError::internal_error(error))?;
+                completion.validate().map_err(McpError::internal_error)?;
                 completion
             }
             Outcome::Err(error) => {
@@ -3744,7 +3742,7 @@ impl Router {
                     params.name.clone(),
                     &params.arguments,
                 )?;
-                let resume_inputs = match self.resolve_final_mrtr_retry(
+                match self.resolve_final_mrtr_retry(
                     params.request_state.as_deref(),
                     params.input_responses.as_ref(),
                     binding.as_ref(),
@@ -3772,8 +3770,7 @@ impl Router {
                         )
                         .await?
                     }
-                };
-                resume_inputs
+                }
             }
             "resources/list" => {
                 let request =
@@ -5848,7 +5845,7 @@ impl Router {
         }
 
         let mut template_routes: Vec<_> = final_templates.iter().collect();
-        template_routes.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        template_routes.sort_unstable_by_key(|(uri, _)| *uri);
         let mut exact_routes: Vec<_> = final_resources.iter().collect();
         exact_routes.sort_unstable();
         let mut collisions = Vec::new();
@@ -5919,7 +5916,7 @@ impl Router {
             .collect();
 
         if selection.includes_resources() {
-            for (uri, _handler) in &other.resources {
+            for uri in other.resources.keys() {
                 let mounted_uri = Self::apply_prefix(uri, prefix);
                 let replacing = !self.resources.contains_key(&mounted_uri)
                     || matches!(behavior, crate::DuplicateBehavior::Replace);
@@ -7673,10 +7670,12 @@ mod router_tests {
         CompletionHandler, DEFAULT_FINAL_RESOURCE_TTL_MS, FinalToolSchemaAuthority, PromptHandler,
         ResourceHandler, ToolHandler, UpstreamFinalToolSchemaRegistration,
     };
+    #[cfg(feature = "tasks")]
     use crate::tasks::{
         ApplicationTaskSupervisor, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
         FinalTaskWorkDescriptor,
     };
+    #[cfg(feature = "tasks")]
     use crate::{FinalTaskRuntimeConfig, FinalTaskStore, InMemoryFinalTaskStore};
     use asupersync::channel::oneshot;
     use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
@@ -7693,6 +7692,7 @@ mod router_tests {
     };
     use std::collections::BTreeMap;
     use std::fmt;
+    #[cfg(feature = "tasks")]
     use std::future::Future;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -8622,10 +8622,12 @@ mod router_tests {
         assert!(wire.contains("\"total\":11999"));
     }
 
+    #[cfg(feature = "tasks")]
     struct TaskCapableRouterTool {
         final_calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "tasks")]
     impl ToolHandler for TaskCapableRouterTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -8670,10 +8672,12 @@ mod router_tests {
     /// A single declared task-capable handler whose result branch is selected
     /// only by the `createTask` argument. It proves registration is not itself
     /// a Tasks operation.
+    #[cfg(feature = "tasks")]
     struct ConditionalTaskCapableRouterTool {
         final_calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "tasks")]
     impl ToolHandler for ConditionalTaskCapableRouterTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -8735,10 +8739,12 @@ mod router_tests {
     /// Simulates a handler that overrides the request-owned hook and bypasses
     /// the trait's ordinary declaration guard. The router must still prevent
     /// its undeclared task outcome from reaching task creation.
+    #[cfg(feature = "tasks")]
     struct UndeclaredTaskOutcomeRouterTool {
         final_calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "tasks")]
     impl ToolHandler for UndeclaredTaskOutcomeRouterTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -8783,8 +8789,10 @@ mod router_tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     struct NoopFinalTaskSupervisor;
 
+    #[cfg(feature = "tasks")]
     impl ApplicationTaskSupervisor for NoopFinalTaskSupervisor {
         fn resume<'a>(
             &'a self,
@@ -8795,6 +8803,7 @@ mod router_tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     fn task_runtime_for_router(store: Arc<InMemoryFinalTaskStore>) -> FinalTaskRuntime {
         let store: Arc<dyn FinalTaskStore> = store;
         FinalTaskRuntime::new(
@@ -8805,6 +8814,7 @@ mod router_tests {
         )
     }
 
+    #[cfg(feature = "tasks")]
     fn final_task_capable_tool_request(id: i64) -> JsonRpcRequest {
         JsonRpcRequest::new(
             "tools/call",
@@ -9283,16 +9293,16 @@ mod router_tests {
 
         fn call_final_outcome_async_resuming_in_request<'a>(
             &'a self,
-            _ctx: &'a McpContext,
+            ctx: &'a McpContext,
             _request_cx: &'a Cx,
-            _arguments: serde_json::Value,
+            arguments: serde_json::Value,
             resume_inputs: Option<&'a MrtrCompletedInputs>,
         ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             Box::pin(async move {
                 // None marks the initial invocation under the unified
                 // resuming hook; the retry must carry admitted inputs.
                 let Some(resume_inputs) = resume_inputs else {
-                    return match self.call_final_outcome(_ctx, _arguments) {
+                    return match self.call_final_outcome(ctx, arguments) {
                         Ok(result) => Outcome::Ok(result),
                         Err(error) => Outcome::Err(error),
                     };
@@ -9372,10 +9382,12 @@ mod router_tests {
         }
     }
 
+    #[cfg(feature = "tasks")]
     struct TaskCapableInputRequiredTool {
         final_calls: Arc<AtomicUsize>,
     }
 
+    #[cfg(feature = "tasks")]
     impl ToolHandler for TaskCapableInputRequiredTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -12325,7 +12337,7 @@ mod router_tests {
             let result = main.mount_with_behavior(sub, None, behavior);
             let replaced = behavior == crate::DuplicateBehavior::Replace;
             let rejected = behavior == crate::DuplicateBehavior::Error;
-            let expected_mounted = if replaced { 1 } else { 0 };
+            let expected_mounted = usize::from(replaced);
 
             assert_eq!(result.is_success(), !rejected);
             assert_eq!(result.tools, expected_mounted);
@@ -14401,7 +14413,7 @@ mod router_tests {
         assert!(!wire.contains("Bearer"));
         assert!(!wire.contains("secret"));
         assert!(!wire.contains("peer-secret"));
-        assert!(!wire.contains("\u{001b}"));
+        assert!(!wire.contains('\u{001b}'));
         assert!(wire.len() < 256);
         assert!(!cx.is_cancel_requested());
     }
@@ -17446,6 +17458,7 @@ mod router_tests {
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn final_task_capable_tool_creates_work_bound_task_after_capability_and_service_admission() {
         let final_calls = Arc::new(AtomicUsize::new(0));
@@ -17486,6 +17499,7 @@ mod router_tests {
         assert_eq!(store.task_count(), 1);
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn final_task_declaration_gates_only_the_create_task_outcome() {
         let final_calls = Arc::new(AtomicUsize::new(0));
@@ -17539,6 +17553,7 @@ mod router_tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn final_task_outcome_without_runtime_rejects_after_handler_before_store_mutation() {
         let final_calls = Arc::new(AtomicUsize::new(0));
@@ -17569,6 +17584,7 @@ mod router_tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn final_task_outcome_with_unready_service_rejects_after_handler_before_store_mutation() {
         let final_calls = Arc::new(AtomicUsize::new(0));
@@ -17604,6 +17620,7 @@ mod router_tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn final_task_outcome_requires_peer_capability_before_store_mutation() {
         let final_calls = Arc::new(AtomicUsize::new(0));
@@ -17649,6 +17666,7 @@ mod router_tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn final_router_defensively_rejects_an_undeclared_task_outcome() {
         let final_calls = Arc::new(AtomicUsize::new(0));
@@ -18875,6 +18893,7 @@ mod router_tests {
         );
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn task_capable_input_required_retry_does_not_require_tasks_capability() {
         let final_calls = Arc::new(AtomicUsize::new(0));

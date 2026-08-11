@@ -3017,9 +3017,9 @@ mod tests {
     #[test]
     fn get_ttl_call_methods() {
         let m = ResponseCachingMiddleware::new().call_ttl_secs(900);
-        assert_eq!(m.get_ttl("tools/call"), Duration::from_secs(900));
-        assert_eq!(m.get_ttl("resources/read"), Duration::from_secs(900));
-        assert_eq!(m.get_ttl("prompts/get"), Duration::from_secs(900));
+        assert_eq!(m.get_ttl("tools/call"), Duration::from_mins(15));
+        assert_eq!(m.get_ttl("resources/read"), Duration::from_mins(15));
+        assert_eq!(m.get_ttl("prompts/get"), Duration::from_mins(15));
     }
 
     #[test]

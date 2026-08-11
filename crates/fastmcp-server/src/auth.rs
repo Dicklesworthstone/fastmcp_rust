@@ -193,7 +193,7 @@ pub(crate) fn principal_fingerprint(auth: Option<&AuthContext>) -> McpResult<Sha
                 (None, None) if auth.scopes.is_empty() && auth.claims.is_none() => {
                     canonical.write_all(&[0]).map_err(|_| {
                         McpError::internal_error("authentication admission exceeds bounds")
-                    })?
+                    })?;
                 }
                 (None, None) => {
                     return Err(McpError::internal_error(

@@ -1656,7 +1656,7 @@ mod tests {
                 !limiter.try_consume(1),
                 "invalid rate {rate:?} admitted traffic"
             );
-            assert_eq!(limiter.available_tokens(), 0.0);
+            assert!(limiter.available_tokens().abs() <= f64::EPSILON);
 
             let middleware = RateLimitingMiddleware::new(rate)
                 .burst_capacity(10)
@@ -1674,9 +1674,10 @@ mod tests {
         let limiter = TokenBucketRateLimiter::new(MAX_EXACT_TOKEN_CAPACITY, f64::MIN_POSITIVE);
 
         assert!(limiter.try_consume(1));
+        let expected_tokens = (MAX_EXACT_TOKEN_CAPACITY - 1) as f64;
         assert_eq!(
-            limiter.available_tokens(),
-            (MAX_EXACT_TOKEN_CAPACITY - 1) as f64
+            limiter.available_tokens().total_cmp(&expected_tokens),
+            std::cmp::Ordering::Equal
         );
     }
 
@@ -1686,7 +1687,7 @@ mod tests {
         let inexact_capacity = MAX_EXACT_TOKEN_CAPACITY + 1;
         let limiter = TokenBucketRateLimiter::new(inexact_capacity, 1.0);
         assert!(!limiter.try_consume(1));
-        assert_eq!(limiter.available_tokens(), 0.0);
+        assert!(limiter.available_tokens().abs() <= f64::EPSILON);
 
         let middleware = RateLimitingMiddleware::new(1.0)
             .burst_capacity(inexact_capacity)

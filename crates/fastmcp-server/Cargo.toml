@@ -24,7 +24,14 @@ legacy-2024-11-05 = [
     "fastmcp-transport/legacy-2024-11-05",
     "fastmcp-console/legacy-2024-11-05",
 ]
-tasks = ["fastmcp-protocol/tasks", "fastmcp-console/tasks"]
+# When proxy activates the optional client, keep its Tasks protocol surface in
+# lockstep with the server. The `?` avoids adding a client dependency to a
+# server that enables Tasks without proxy support.
+tasks = [
+    "fastmcp-protocol/tasks",
+    "fastmcp-console/tasks",
+    "fastmcp-client?/tasks",
+]
 apps = ["fastmcp-protocol/apps", "fastmcp-console/apps", "dep:html5ever"]
 enterprise-auth = ["fastmcp-protocol/jose"]
 oauth-client-credentials = ["fastmcp-protocol/jose"]
@@ -35,7 +42,7 @@ proxy-legacy = [
     "legacy-2024-11-05",
     "fastmcp-client/legacy-2024-11-05",
 ]
-proxy-tasks = ["proxy", "tasks", "fastmcp-client/tasks"]
+proxy-tasks = ["proxy", "tasks"]
 # Enables only the transport crate's caller-upgraded async WebSocket adapters.
 # This crate intentionally provides no WebSocket endpoint, listener, URI
 # connector, or HTTP Upgrade path.
@@ -73,6 +80,16 @@ fastmcp-protocol = { workspace = true, features = ["legacy-2024-11-05"] }
 fastmcp-transport = { workspace = true, features = ["legacy-2024-11-05"] }
 # Test-only context construction and deterministic lab exercises.
 asupersync = { workspace = true, features = ["test-internals"] }
+
+[[test]]
+name = "pxy_leg_01_dual_era"
+path = "tests/pxy_leg_01_dual_era.rs"
+required-features = ["proxy-legacy"]
+
+[[test]]
+name = "pxy_leg_01_translation"
+path = "tests/pxy_leg_01_translation.rs"
+required-features = ["proxy-legacy"]
 
 [lints]
 workspace = true

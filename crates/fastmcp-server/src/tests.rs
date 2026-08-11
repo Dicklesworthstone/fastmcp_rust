@@ -28,6 +28,8 @@ use fastmcp_protocol::{
     SetLogLevelParams, Tool,
 };
 
+#[cfg(feature = "tasks")]
+use crate::TaskManager;
 use crate::bidirectional::{PendingRequests, RequestSender, TransportSendFn};
 use crate::caching::ResponseCachingMiddleware;
 use crate::handler::{PromptHandler, ResourceHandler, ToolHandler, UriParams};
@@ -39,7 +41,7 @@ use crate::session::{
 use crate::{
     ActiveRequest, ActiveRequestGuard, ActiveRequestKey, AuthRequest, InboundRequestContext,
     InboundRequestTransport, NotificationSender, RequestCompletion, Server, StaticTokenVerifier,
-    TaskManager, TokenAuthProvider,
+    TokenAuthProvider,
 };
 
 /// Creates a request sender for tests that should not perform server-to-client requests.
@@ -1350,6 +1352,7 @@ mod router_tests {
         assert!(!result.resource_templates.is_empty());
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn test_e2e_task_rpc_quarantine_emits_no_status_notifications() {
         let manager = TaskManager::new_for_testing();
@@ -6849,6 +6852,7 @@ mod builder_tests {
 
     // ── Task Manager ─────────────────────────────────────────────────
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn builder_without_task_manager() {
         let server = ServerBuilder::new("s", "0.1").build();
@@ -6856,6 +6860,7 @@ mod builder_tests {
         assert!(server.capabilities().tasks.is_none());
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn builder_with_task_manager_keeps_tasks_capability_quarantined() {
         let tm = TaskManager::new();

@@ -80,10 +80,10 @@ pub const DEFAULT_MAX_MRTR_INPUT_REQUESTS_TOTAL: usize = 128;
 pub const HARD_MAX_MRTR_INPUT_REQUESTS_TOTAL: usize = 512;
 
 /// Default lifetime for an MRTR request-state record.
-pub const DEFAULT_MRTR_REQUEST_STATE_TTL: Duration = Duration::from_secs(15 * 60);
+pub const DEFAULT_MRTR_REQUEST_STATE_TTL: Duration = Duration::from_mins(15);
 
 /// Absolute maximum lifetime for an MRTR request-state record.
-pub const HARD_MAX_MRTR_REQUEST_STATE_TTL: Duration = Duration::from_secs(60 * 60);
+pub const HARD_MAX_MRTR_REQUEST_STATE_TTL: Duration = Duration::from_hours(1);
 
 /// Default number of retained, process-local MRTR request-state records.
 pub const DEFAULT_MAX_MRTR_REQUEST_STATES: usize = 4_096;
@@ -443,13 +443,13 @@ impl PendingRequests {
             let ids: Vec<CorrelationKey> = state
                 .requests
                 .iter()
-                .filter_map(|(id, pending)| {
+                .filter(|(_, pending)| {
                     pending
                         .request_cancellation
                         .as_ref()
                         .is_some_and(McpRequestCancellation::is_terminal)
-                        .then(|| id.clone())
                 })
+                .map(|(id, _)| id.clone())
                 .collect();
             ids.into_iter()
                 .filter_map(|id| state.requests.remove(&id))

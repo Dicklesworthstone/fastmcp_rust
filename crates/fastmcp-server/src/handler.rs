@@ -797,19 +797,16 @@ impl From<InputRequiredResult> for FinalToolOutcome {
 const UNDECLARED_FINAL_TASK_OUTCOME_ERROR: &str =
     "tool returned CreateTask without declaring final Tasks capability";
 
+#[cfg(feature = "tasks")]
 fn admit_declared_final_tool_outcome(
     declares_final_tasks: bool,
     outcome: FinalToolOutcome,
 ) -> McpResult<FinalToolOutcome> {
-    #[cfg(feature = "tasks")]
     if matches!(&outcome, FinalToolOutcome::CreateTask { .. }) && !declares_final_tasks {
         return Err(McpError::invalid_request(
             UNDECLARED_FINAL_TASK_OUTCOME_ERROR,
         ));
     }
-
-    #[cfg(not(feature = "tasks"))]
-    let _ = declares_final_tasks;
 
     Ok(outcome)
 }
@@ -1346,9 +1343,17 @@ pub trait ToolHandler: Send + Sync {
         Box::pin(async move {
             match self.call_final_outcome(ctx, arguments) {
                 Ok(value) => {
-                    match admit_declared_final_tool_outcome(self.declares_final_tasks(), value) {
-                        Ok(value) => Outcome::Ok(value),
-                        Err(error) => Outcome::Err(error),
+                    #[cfg(feature = "tasks")]
+                    {
+                        match admit_declared_final_tool_outcome(self.declares_final_tasks(), value)
+                        {
+                            Ok(value) => Outcome::Ok(value),
+                            Err(error) => Outcome::Err(error),
+                        }
+                    }
+                    #[cfg(not(feature = "tasks"))]
+                    {
+                        Outcome::Ok(value)
                     }
                 }
                 Err(error) => Outcome::Err(error),
@@ -1366,9 +1371,17 @@ pub trait ToolHandler: Send + Sync {
         Box::pin(async move {
             match self.call_final_outcome_async(ctx, arguments).await {
                 Outcome::Ok(value) => {
-                    match admit_declared_final_tool_outcome(self.declares_final_tasks(), value) {
-                        Ok(value) => Outcome::Ok(value),
-                        Err(error) => Outcome::Err(error),
+                    #[cfg(feature = "tasks")]
+                    {
+                        match admit_declared_final_tool_outcome(self.declares_final_tasks(), value)
+                        {
+                            Ok(value) => Outcome::Ok(value),
+                            Err(error) => Outcome::Err(error),
+                        }
+                    }
+                    #[cfg(not(feature = "tasks"))]
+                    {
+                        Outcome::Ok(value)
                     }
                 }
                 Outcome::Err(error) => Outcome::Err(error),

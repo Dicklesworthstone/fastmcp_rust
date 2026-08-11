@@ -8,15 +8,22 @@ use fastmcp_core::{McpContext, McpResult};
 use fastmcp_derive::tool;
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::JsonRpcMessage;
-use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolPolicy};
+#[cfg(not(feature = "legacy-2024-11-05"))]
+use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
+use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+#[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::{
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, JsonRpcRequest,
-    MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, SERVER_DISCOVER_METHOD,
 };
-use fastmcp_server::{
-    InboundRequestContext, InboundRequestTransport, Server, ServerHttpEndpointResponse,
-};
-use fastmcp_transport::http::{HttpMethod, HttpRequest, HttpStatus};
+use fastmcp_protocol::{JsonRpcRequest, MAX_SERVER_INSTRUCTIONS_BYTES};
+#[cfg(not(feature = "legacy-2024-11-05"))]
+use fastmcp_server::ServerHttpEndpointResponse;
+#[cfg(not(feature = "legacy-2024-11-05"))]
+use fastmcp_server::{HttpServerConfig, ServerHttpEndpointError};
+use fastmcp_server::{InboundRequestContext, InboundRequestTransport, Server};
+use fastmcp_transport::http::HttpStatus;
+#[cfg(not(feature = "legacy-2024-11-05"))]
+use fastmcp_transport::http::{HttpMethod, HttpRequest};
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_transport::{Transport, TransportError};
 use serde_json::json;
@@ -261,7 +268,7 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
     let endpoint = Server::new("feature-off-modern-http", "1.0.0")
         .protocol_policy(ProtocolPolicy::Auto)
         .expect("Auto is available in every server feature set")
-        .build_http_endpoint("http://legacy.example.test")
+        .build_http_endpoint()
         .expect("feature-off server must construct its modern HTTP endpoint");
     let mut session = endpoint
         .open_session(&cx)
@@ -378,7 +385,7 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
 
     let legacy_http_endpoint = Server::new("feature-off-legacy-only-http", "1.0.0")
         .protocol_policy(ProtocolPolicy::LegacyOnly)
-        .map(|builder| builder.build_http_endpoint("http://legacy.example.test"));
+        .map(|builder| builder.build_http_endpoint());
     assert!(matches!(
         legacy_http_endpoint,
         Err(fastmcp_server::ServerLaunchPolicyError::FeatureUnavailable)
@@ -392,4 +399,20 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
         legacy_stdio,
         Err(fastmcp_server::ServerLaunchPolicyError::FeatureUnavailable)
     ));
+}
+
+#[cfg(not(feature = "legacy-2024-11-05"))]
+#[test]
+fn srv_02_b_feature_off_endpoint_uses_the_public_modern_error_contract() {
+    let result = Server::new("feature-off-invalid-http-config", "1.0.0")
+        .http_config(HttpServerConfig::new().request_capacity(0))
+        .build_http_endpoint();
+
+    match result {
+        Err(ServerHttpEndpointError::InvalidConfiguration(message)) => {
+            assert!(message.contains("modern HTTP request capacity must be nonzero"));
+        }
+        Err(error) => panic!("expected the public configuration error, got {error}"),
+        Ok(_) => panic!("zero modern request capacity must be rejected"),
+    }
 }

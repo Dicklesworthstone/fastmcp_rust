@@ -162,9 +162,9 @@ const OAUTH_INVALID_GRANT_ERROR: &str = "OAuth grant is invalid";
 // authorization codes fail closed at configuration admission. Deployments
 // needing longer-lived sessions should rotate refresh tokens instead of
 // extending access-token or authorization-code exposure.
-const MAX_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_REFRESH_TOKEN_LIFETIME: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-const MAX_AUTHORIZATION_CODE_LIFETIME: Duration = Duration::from_secs(10 * 60);
+const MAX_ACCESS_TOKEN_LIFETIME: Duration = Duration::from_hours(24);
+const MAX_REFRESH_TOKEN_LIFETIME: Duration = Duration::from_hours(8_760);
+const MAX_AUTHORIZATION_CODE_LIFETIME: Duration = Duration::from_mins(10);
 const MIN_OAUTH_CREDENTIAL_LIFETIME: Duration = Duration::from_secs(1);
 
 /// Default maximum number of registered OAuth clients.
@@ -270,9 +270,9 @@ impl Default for OAuthServerConfig {
             // syntactically safe while still making deployment configuration
             // visibly mandatory for interoperable issuer claims.
             issuer: "https://fastmcp.invalid/".to_string(),
-            access_token_lifetime: Duration::from_secs(15 * 60), // 15 minutes
-            refresh_token_lifetime: Duration::from_secs(86400 * 30), // 30 days
-            authorization_code_lifetime: Duration::from_secs(5 * 60), // 5 minutes
+            access_token_lifetime: Duration::from_mins(15),
+            refresh_token_lifetime: Duration::from_hours(720),
+            authorization_code_lifetime: Duration::from_mins(5),
             allow_public_clients: true,
             min_code_verifier_length: PKCE_CODE_VERIFIER_MIN_BYTES,
             max_code_verifier_length: PKCE_CODE_VERIFIER_MAX_BYTES,
@@ -3266,9 +3266,7 @@ fn parsed_url_has_credentials(url: &Url) -> bool {
 }
 
 fn raw_url_authority(value: &str) -> Option<&str> {
-    let Some((_, after_scheme)) = value.split_once("://") else {
-        return None;
-    };
+    let (_, after_scheme) = value.split_once("://")?;
     let authority_end = after_scheme
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
@@ -4888,9 +4886,9 @@ mod tests {
     fn config_default_values() {
         let c = OAuthServerConfig::default();
         assert_eq!(c.issuer, "https://fastmcp.invalid/");
-        assert_eq!(c.access_token_lifetime, Duration::from_secs(15 * 60));
-        assert_eq!(c.refresh_token_lifetime, Duration::from_secs(86400 * 30));
-        assert_eq!(c.authorization_code_lifetime, Duration::from_secs(5 * 60));
+        assert_eq!(c.access_token_lifetime, Duration::from_mins(15));
+        assert_eq!(c.refresh_token_lifetime, Duration::from_hours(720));
+        assert_eq!(c.authorization_code_lifetime, Duration::from_mins(5));
         assert!(c.allow_public_clients);
         assert_eq!(c.min_code_verifier_length, 43);
         assert_eq!(c.max_code_verifier_length, 128);
@@ -7175,7 +7173,7 @@ mod tests {
         let refresh = initial.refresh_token.expect("initial refresh token");
         let refresh_digest = refresh_token_digest(&refresh);
         let family_expires_at = Instant::now()
-            .checked_add(Duration::from_secs(5 * 60))
+            .checked_add(Duration::from_mins(5))
             .expect("test family deadline");
         {
             let mut state = server.state.write().unwrap();
