@@ -10,8 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::{
-    AbsoluteUri, ContentBlock, EmbeddedResourceContents, ExactNonNegativeJsonNumber, JsonInteger,
-    LoggingLevel, OpenMetadata,
+    AbsoluteUri, ContentBlock, EmbeddedResourceContents, ExactNonNegativeJsonNumber,
+    Implementation, JsonInteger, LoggingLevel, OpenMetadata,
 };
 use crate::jsonrpc::{JsonRpcRequest, JsonRpcResponse, RequestId};
 use crate::methods::{
@@ -3115,6 +3115,58 @@ pub enum FinalCoreResult {
     },
 }
 
+/// Server-owned final metadata retained across response middleware.
+///
+/// This is intentionally opaque outside the protocol crate: callers preserve
+/// and compare the typed seal, rather than interpreting or reconstructing its
+/// metadata through a raw compatibility path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalResultMetadataSeal {
+    family: FinalResultMetadataFamily,
+    server_info: FinalResultServerInfo,
+    subscription_id: Option<RequestId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalResultMetadataFamily {
+    Discover,
+    Completion,
+    ToolsList,
+    ToolsCall,
+    #[cfg(feature = "tasks")]
+    ToolsCallTask,
+    ToolsCallInputRequired,
+    ResourcesList,
+    ResourceTemplatesList,
+    ResourcesRead,
+    ResourcesReadInputRequired,
+    PromptsList,
+    PromptsGet,
+    PromptsGetInputRequired,
+    SubscriptionsListen,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FinalResultServerInfo {
+    Discovery(Option<FinalDiscoveryServerInfo>),
+    Common(Option<Implementation>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FinalDiscoveryServerInfo {
+    name: String,
+    version: String,
+}
+
+impl From<&ServerInfo> for FinalDiscoveryServerInfo {
+    fn from(server_info: &ServerInfo) -> Self {
+        Self {
+            name: server_info.name.clone(),
+            version: server_info.version.clone(),
+        }
+    }
+}
+
 /// Public, era-aware dispatch for core results.
 #[derive(Debug, Clone)]
 #[allow(
@@ -3838,6 +3890,126 @@ impl FinalCoreResult {
             Self::PromptsList { .. } => PROMPTS_LIST,
             Self::PromptsGet { .. } | Self::PromptsGetInputRequired { .. } => PROMPTS_GET,
             Self::SubscriptionsListen { .. } => SUBSCRIPTIONS_LISTEN,
+        }
+    }
+
+    /// Returns the server-owned metadata that middleware must preserve for
+    /// this selected final result family.
+    ///
+    /// The returned seal includes absence, so middleware cannot introduce a
+    /// reserved server identity where the server did not emit one. It omits
+    /// every open metadata member by design.
+    pub fn protected_metadata_seal(&self) -> Result<FinalResultMetadataSeal, CoreDispatchError> {
+        fn common_server_info<T>(
+            result: &CompleteResult<T>,
+        ) -> Result<Option<Implementation>, CoreDispatchError> {
+            result
+                .meta
+                .final_server_info()
+                .map_err(CoreDispatchError::from)
+        }
+
+        fn input_required_server_info(
+            result: &InputRequiredResult,
+        ) -> Result<Option<Implementation>, CoreDispatchError> {
+            result
+                .meta
+                .final_server_info()
+                .map_err(CoreDispatchError::from)
+        }
+
+        #[cfg(feature = "tasks")]
+        fn task_server_info(
+            result: &crate::tasks_extension::CreateTaskResult,
+        ) -> Result<Option<Implementation>, CoreDispatchError> {
+            result.meta.as_ref().map_or(Ok(None), |metadata| {
+                metadata
+                    .server_info()
+                    .map_err(|_| CoreDispatchError::InvalidResult {
+                        era: ProtocolEra::Modern2026,
+                        method: TOOLS_CALL,
+                    })
+            })
+        }
+
+        match self {
+            Self::Discover(result) => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::Discover,
+                server_info: FinalResultServerInfo::Discovery(
+                    result.server_info().map(FinalDiscoveryServerInfo::from),
+                ),
+                subscription_id: None,
+            }),
+            Self::Completion { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::Completion,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::ToolsList { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ToolsList,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::ToolsCall { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ToolsCall,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            #[cfg(feature = "tasks")]
+            Self::ToolsCallTask { result } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ToolsCallTask,
+                server_info: FinalResultServerInfo::Common(task_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::ToolsCallInputRequired { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ToolsCallInputRequired,
+                server_info: FinalResultServerInfo::Common(input_required_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::ResourcesList { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ResourcesList,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::ResourceTemplatesList { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ResourceTemplatesList,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::ResourcesRead { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ResourcesRead,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::ResourcesReadInputRequired { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ResourcesReadInputRequired,
+                server_info: FinalResultServerInfo::Common(input_required_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::PromptsList { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::PromptsList,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::PromptsGet { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::PromptsGet,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::PromptsGetInputRequired { result, .. } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::PromptsGetInputRequired,
+                server_info: FinalResultServerInfo::Common(input_required_server_info(result)?),
+                subscription_id: None,
+            }),
+            Self::SubscriptionsListen {
+                result,
+                subscription_id,
+                ..
+            } => Ok(FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::SubscriptionsListen,
+                server_info: FinalResultServerInfo::Common(common_server_info(result)?),
+                subscription_id: Some(subscription_id.clone()),
+            }),
         }
     }
 
@@ -6833,6 +7005,93 @@ mod tests {
     }
 
     #[test]
+    fn final_result_metadata_seal_is_typed_and_excludes_open_metadata() {
+        let server_info =
+            Implementation::try_new("sealed-server", "1.0.0").expect("server identity is valid");
+        let metadata = OpenMetadata::try_from_entries([
+            (
+                FINAL_SERVER_INFO_META_KEY.to_owned(),
+                serde_json::to_value(&server_info).expect("server identity serializes"),
+            ),
+            ("com.example/trace".to_owned(), serde_json::json!("open")),
+        ])
+        .expect("metadata is valid");
+        let complete = FinalCoreResult::ToolsCall {
+            result: CompleteResult::new(
+                FinalCallToolResult {
+                    content: Vec::new(),
+                    is_error: false,
+                    structured_content: None,
+                },
+                ResultMeta::server_generated(server_info.clone()).with_metadata(metadata),
+            ),
+            diagnostic: None,
+        };
+        assert_eq!(
+            complete
+                .protected_metadata_seal()
+                .expect("complete result seal is typed"),
+            FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ToolsCall,
+                server_info: FinalResultServerInfo::Common(Some(server_info.clone())),
+                subscription_id: None,
+            }
+        );
+
+        let input_required = FinalCoreResult::PromptsGetInputRequired {
+            result: InputRequiredResult::new(
+                None,
+                Some("retry".to_owned()),
+                ResultMeta::server_generated(server_info.clone()),
+            )
+            .expect("input-required result is valid"),
+            diagnostic: None,
+        };
+        assert_eq!(
+            input_required
+                .protected_metadata_seal()
+                .expect("input-required result seal is typed"),
+            FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::PromptsGetInputRequired,
+                server_info: FinalResultServerInfo::Common(Some(server_info.clone())),
+                subscription_id: None,
+            }
+        );
+
+        let subscription_id = RequestId::String("subscription-7".to_owned());
+        let subscription_metadata = OpenMetadata::try_from_entries([
+            (
+                FINAL_SERVER_INFO_META_KEY.to_owned(),
+                serde_json::to_value(&server_info).expect("server identity serializes"),
+            ),
+            (
+                FINAL_SUBSCRIPTION_ID_META_KEY.to_owned(),
+                serde_json::to_value(&subscription_id).expect("subscription id serializes"),
+            ),
+        ])
+        .expect("subscription metadata is valid");
+        let subscription = FinalCoreResult::SubscriptionsListen {
+            result: CompleteResult::new(
+                FinalSubscriptionsListenResult {},
+                ResultMeta::server_generated(server_info.clone())
+                    .with_metadata(subscription_metadata),
+            ),
+            subscription_id: subscription_id.clone(),
+            diagnostic: None,
+        };
+        assert_eq!(
+            subscription
+                .protected_metadata_seal()
+                .expect("subscription result seal is typed"),
+            FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::SubscriptionsListen,
+                server_info: FinalResultServerInfo::Common(Some(server_info)),
+                subscription_id: Some(subscription_id),
+            }
+        );
+    }
+
+    #[test]
     fn final_log_level_metadata_replaces_final_set_level_rpc() {
         let final_params = serde_json::json!({
             "_meta": {
@@ -6926,7 +7185,7 @@ mod tests {
                 &serde_json::to_string(&accepted).expect("discovery wire serializes for dispatch"),
             )
             .expect("typed discovery result is admitted by final core dispatch");
-        let CoreResult::Final(FinalCoreResult::Discover(decoded)) = &result else {
+        let CoreResult::Final(final_result @ FinalCoreResult::Discover(decoded)) = &result else {
             panic!("server/discover selects its typed final result");
         };
         assert_eq!(
@@ -6940,6 +7199,19 @@ mod tests {
                 .map(|info| (info.name.as_str(), info.version.as_str())),
             Some(("discovery-server", "1.0.0")),
             "serverInfo remains final result metadata"
+        );
+        assert_eq!(
+            final_result
+                .protected_metadata_seal()
+                .expect("discovery result metadata seal is typed"),
+            FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::Discover,
+                server_info: FinalResultServerInfo::Discovery(Some(FinalDiscoveryServerInfo {
+                    name: "discovery-server".to_owned(),
+                    version: "1.0.0".to_owned(),
+                })),
+                subscription_id: None,
+            }
         );
         assert_eq!(
             decoded
@@ -7185,6 +7457,12 @@ mod tests {
             "createdAt": "2026-07-28T12:00:00.000Z",
             "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
             "ttlMs": null,
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "task-server",
+                    "version": "1.0.0"
+                }
+            },
             "com.example/opaque": {"retained": true}
         });
         let wire = serde_json::to_string(&accepted).expect("task result serializes");
@@ -7192,10 +7470,27 @@ mod tests {
         let decoded = request
             .decode_result(&wire)
             .expect("final tools/call task result decodes");
-        let CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) = &decoded else {
+        let CoreResult::Final(final_result) = &decoded else {
+            panic!("tools/call must select a final result branch");
+        };
+        let FinalCoreResult::ToolsCallTask { result } = final_result else {
             panic!("tools/call must select the task result branch");
         };
         assert_eq!(result.task.base().task_id.as_str(), "task-1");
+        assert_eq!(
+            final_result
+                .protected_metadata_seal()
+                .expect("task result metadata seal is typed"),
+            FinalResultMetadataSeal {
+                family: FinalResultMetadataFamily::ToolsCallTask,
+                server_info: FinalResultServerInfo::Common(Some(
+                    Implementation::try_new("task-server", "1.0.0")
+                        .expect("task server identity is valid"),
+                )),
+                subscription_id: None,
+            },
+            "task metadata seals serverInfo while retaining unrelated open entries"
+        );
         assert_eq!(
             result.additional.get("com.example/opaque"),
             Some(&serde_json::json!({"retained": true}))
