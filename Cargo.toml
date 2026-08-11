@@ -27,7 +27,12 @@ readme = "README.md"
 # Runtime (our own).  Production surfaces use runtime-installed ambient
 # contexts; test-only constructors remain opt-in at the test or facade-lab
 # boundary and must not leak into the workspace production graph.
-asupersync = { version = "=0.3.9" }
+# =0.3.10 (was =0.3.9): unifies the asupersync line with mcp_agent_mail_rust
+# and the sqlmodel 0.3.2/0.3.3 registry pins so downstream workspaces that
+# path-patch this checkout can resolve a single asupersync version. 0.3.10's
+# only breaking change (TrackedSender::try_reserve/&Cx, CommittedProof) is
+# unused in this workspace. See mcp_agent_mail_rust bead br-noizk.
+asupersync = { version = "=0.3.10" }
 rich_rust = { version = "=0.2.2" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
@@ -171,3 +176,13 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 too_many_lines = "allow"
 items_after_statements = "allow"
+
+[patch.crates-io]
+# rich_rust 0.2.2 on crates.io still pins time ">=0.3.47, <0.3.48" (the
+# pre-time-0.3.48-regression-fix pin); the sibling checkout's 0.2.2 already
+# moved to time ^0.3.54. fastmcp-console pins time =0.3.55 (needed so this
+# workspace and downstream path consumers like mcp_agent_mail_rust resolve a
+# single `time`), which is unsatisfiable against the published rich_rust.
+# Drop this patch once a rich_rust >0.2.2 with the time ^0.3.54 requirement
+# is published. See mcp_agent_mail_rust bead br-noizk.
+rich_rust = { path = "../rich_rust" }
