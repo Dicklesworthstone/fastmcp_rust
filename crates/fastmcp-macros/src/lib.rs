@@ -995,6 +995,51 @@ fn generate_tool_tasks_declaration(tasks: bool) -> TokenStream2 {
     }
 }
 
+/// Emits typed final MCP Apps UI metadata for a validated tool declaration.
+#[cfg(feature = "apps")]
+fn generate_tool_apps_metadata(ui: Option<&ToolAppsUi>) -> TokenStream2 {
+    let Some(ui) = ui else {
+        return TokenStream2::new();
+    };
+
+    let resource_uri = &ui.resource_uri;
+    let visibility = match ui.visibility.as_deref() {
+        Some(visibility) => {
+            let entries = visibility.iter().map(|visibility| match visibility {
+                ToolAppsToolVisibility::Model => {
+                    quote!(fastmcp_protocol::McpAppsToolVisibility::Model)
+                }
+                ToolAppsToolVisibility::App => {
+                    quote!(fastmcp_protocol::McpAppsToolVisibility::App)
+                }
+            });
+            quote!(Some(vec![#(#entries),*]))
+        }
+        None => quote!(None),
+    };
+
+    quote! {
+        fn final_metadata(&self) -> Option<&fastmcp_protocol::OpenMetadata> {
+            static METADATA: std::sync::OnceLock<fastmcp_protocol::OpenMetadata> =
+                std::sync::OnceLock::new();
+            Some(METADATA.get_or_init(|| {
+                let resource_uri = fastmcp_protocol::AbsoluteUri::parse(#resource_uri)
+                    .expect("#[tool(ui(...))] validates its resource URI during macro expansion");
+                fastmcp_protocol::McpAppsToolMetadata::try_new(Some(resource_uri), #visibility)
+                    .expect("#[tool(ui(...))] validates its metadata during macro expansion")
+                    .to_open_metadata()
+                    .expect("validated MCP Apps metadata encodes as open metadata")
+            }))
+        }
+    }
+}
+
+/// Apps-off tool declarations cannot retain UI metadata after parsing rejects it.
+#[cfg(not(feature = "apps"))]
+fn generate_tool_apps_metadata(_ui: Option<&ToolAppsUi>) -> TokenStream2 {
+    TokenStream2::new()
+}
+
 fn generate_tool_execution_methods(
     is_async: bool,
     expects_context: bool,
@@ -2596,6 +2641,10 @@ fn generate_resource_execution_methods(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod async_handler_expansion_tests {
+    #[cfg(not(feature = "apps"))]
+    use super::TOOL_APPS_UI_FEATURE_DIAGNOSTIC;
+    #[cfg(feature = "apps")]
+    use super::generate_tool_apps_metadata;
     use super::{
         ToolAttrs, found_crate_path, generate_final_prompt_result_conversion,
         generate_final_resource_outcome_conversion, generate_final_resource_result_conversion,
@@ -2937,13 +2986,34 @@ mod async_handler_expansion_tests {
         }
     }
 
+    #[cfg(feature = "apps")]
     #[test]
-    fn tool_rejects_unsupported_apps_ui_syntax() {
+    fn tool_apps_ui_syntax_parses_when_the_feature_is_enabled() {
+        let attrs = syn::parse_str::<ToolAttrs>(
+            "ui(resource_uri = \"ui://weather/dashboard\", visibility = [\"model\", \"app\"])",
+        )
+        .expect("the Apps UI declaration parses with the Apps feature enabled");
+        assert_eq!(
+            attrs
+                .apps_ui
+                .as_ref()
+                .expect("the parsed Apps UI declaration is retained")
+                .resource_uri,
+            "ui://weather/dashboard"
+        );
+        let metadata = generate_tool_apps_metadata(attrs.apps_ui.as_ref()).to_string();
+        assert!(metadata.contains("final_metadata"), "{metadata}");
+        assert!(metadata.contains("McpAppsToolMetadata"), "{metadata}");
+    }
+
+    #[cfg(not(feature = "apps"))]
+    #[test]
+    fn tool_apps_ui_syntax_requires_the_feature_before_expansion() {
         let error = syn::parse_str::<ToolAttrs>(
             "ui(resource_uri = \"ui://weather/dashboard\", visibility = [\"model\", \"app\"])",
         )
-        .expect_err("the canonical macro surface has no Apps-specific ui attribute");
-        assert_eq!(error.to_string(), "unknown attribute");
+        .expect_err("Apps UI syntax must remain unavailable without the feature");
+        assert_eq!(error.to_string(), TOOL_APPS_UI_FEATURE_DIAGNOSTIC);
     }
 
     #[test]
@@ -3571,6 +3641,8 @@ struct ToolAttrs {
     timeout: Option<String>,
     /// Opts a canonical final tool-outcome handler into final Tasks creation.
     tasks: bool,
+    /// Typed final MCP Apps UI metadata attached to this tool.
+    apps_ui: Option<ToolAppsUi>,
     tags: Vec<String>,
     defaults: HashMap<String, Lit>,
     /// Output schema as a JSON literal or type name
@@ -3586,12 +3658,136 @@ struct ToolAttrs {
     annotations_open_world_hint: Option<bool>,
 }
 
+/// The validated `ui(...)` declaration accepted by `#[tool]`.
+#[derive(Debug)]
+struct ToolAppsUi {
+    resource_uri: String,
+    visibility: Option<Vec<ToolAppsToolVisibility>>,
+}
+
+/// One explicit MCP Apps tool audience accepted by the macro surface.
+#[derive(Debug)]
+enum ToolAppsToolVisibility {
+    Model,
+    App,
+}
+
+const TOOL_APPS_UI_FEATURE_DIAGNOSTIC: &str = "#[tool(ui(...))] requires Apps support; enable fastmcp-rust's `apps` feature, or for direct subcrate use enable both fastmcp-derive's and fastmcp-protocol's `apps` features";
+
+/// Parses and validates one Apps UI declaration only when the macro host has
+/// the matching Apps-enabled protocol dependency.
+#[cfg(feature = "apps")]
+fn parse_tool_apps_ui_metadata(
+    input: ParseStream<'_>,
+    ui_span: Span,
+    apps_ui: &mut Option<ToolAppsUi>,
+) -> syn::Result<()> {
+    if apps_ui.is_some() {
+        return Err(syn::Error::new(
+            ui_span,
+            "duplicate ui metadata declaration",
+        ));
+    }
+
+    let content;
+    syn::parenthesized!(content in input);
+    let mut resource_uri = None;
+    let mut visibility = None;
+    while !content.is_empty() {
+        let field: Ident = content.parse()?;
+        match field.to_string().as_str() {
+            "resource_uri" => {
+                if resource_uri.is_some() {
+                    return Err(syn::Error::new(field.span(), "duplicate ui resource_uri"));
+                }
+                content.parse::<Token![=]>()?;
+                let uri: LitStr = content.parse()?;
+                resource_uri = Some(uri);
+            }
+            "visibility" => {
+                if visibility.is_some() {
+                    return Err(syn::Error::new(field.span(), "duplicate ui visibility"));
+                }
+                content.parse::<Token![=]>()?;
+                let values: syn::ExprArray = content.parse()?;
+                let mut audiences = Vec::new();
+                for value in values.elems {
+                    let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(value),
+                        ..
+                    }) = value
+                    else {
+                        return Err(syn::Error::new_spanned(
+                            value,
+                            "ui visibility entries must be string literals",
+                        ));
+                    };
+                    let audience = match value.value().as_str() {
+                        "model" => ToolAppsToolVisibility::Model,
+                        "app" => ToolAppsToolVisibility::App,
+                        _ => {
+                            return Err(syn::Error::new(
+                                value.span(),
+                                "ui visibility entries must be `model` or `app`",
+                            ));
+                        }
+                    };
+                    audiences.push(audience);
+                }
+                visibility = Some(audiences);
+            }
+            _ => {
+                return Err(syn::Error::new(
+                    field.span(),
+                    "ui metadata expects resource_uri and optional visibility",
+                ));
+            }
+        }
+        if !content.is_empty() {
+            content.parse::<Token![,]>()?;
+        }
+    }
+
+    let resource_uri = resource_uri
+        .ok_or_else(|| syn::Error::new(ui_span, "ui metadata requires resource_uri"))?;
+    let parsed_uri =
+        fastmcp_protocol::AbsoluteUri::parse(&resource_uri.value()).map_err(|error| {
+            syn::Error::new(
+                resource_uri.span(),
+                format!("ui resource_uri must be an absolute URI: {error}"),
+            )
+        })?;
+    let typed_visibility = visibility.as_ref().map(|values| {
+        values
+            .iter()
+            .map(|value| match value {
+                ToolAppsToolVisibility::Model => fastmcp_protocol::McpAppsToolVisibility::Model,
+                ToolAppsToolVisibility::App => fastmcp_protocol::McpAppsToolVisibility::App,
+            })
+            .collect()
+    });
+    fastmcp_protocol::McpAppsToolMetadata::try_new(Some(parsed_uri), typed_visibility).map_err(
+        |error| {
+            syn::Error::new(
+                resource_uri.span(),
+                format!("invalid MCP Apps tool UI metadata: {error}"),
+            )
+        },
+    )?;
+    *apps_ui = Some(ToolAppsUi {
+        resource_uri: resource_uri.value(),
+        visibility,
+    });
+    Ok(())
+}
+
 impl Parse for ToolAttrs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut name = None;
         let mut description = None;
         let mut timeout = None;
         let mut tasks = false;
+        let mut apps_ui = None;
         let mut tags = Vec::new();
         let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut output_schema = None;
@@ -3637,6 +3833,15 @@ impl Parse for ToolAttrs {
                         return Err(syn::Error::new(ident.span(), "duplicate tasks opt-in"));
                     }
                     tasks = true;
+                }
+                "ui" => {
+                    #[cfg(feature = "apps")]
+                    parse_tool_apps_ui_metadata(input, ident.span(), &mut apps_ui)?;
+                    #[cfg(not(feature = "apps"))]
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        TOOL_APPS_UI_FEATURE_DIAGNOSTIC,
+                    ));
                 }
                 "version" => {
                     input.parse::<Token![=]>()?;
@@ -3727,6 +3932,7 @@ impl Parse for ToolAttrs {
             description,
             timeout,
             tasks,
+            apps_ui,
             tags,
             defaults,
             output_schema,
@@ -4369,6 +4575,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     let tasks_declaration = generate_tool_tasks_declaration(attrs.tasks);
+    let apps_metadata = generate_tool_apps_metadata(attrs.apps_ui.as_ref());
 
     let execution_methods = generate_tool_execution_methods(
         is_async,
@@ -4440,6 +4647,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #timeout_tokens
 
                 #output_schema_method
+
+                #apps_metadata
 
                 #tasks_declaration
 

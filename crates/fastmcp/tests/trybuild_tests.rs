@@ -87,11 +87,45 @@ use mcp::{
     providers::McpAppsUiResource,
 };
 
+#[mcp::tool(ui(resource_uri = "ui://apps.example.test/weather", visibility = ["model", "app"]))]
+fn apps_ui_tool() -> String {
+    "weather".to_owned()
+}
+
+fn generic_client_host<T, P>(
+    client: &mcp::modern::Client,
+    transport: T,
+    configuration: mcp::modern::McpAppsHostConfiguration,
+    policy: P,
+) -> Result<mcp::modern::McpAppsHost<T, P>, mcp::modern::McpAppsHostError>
+where
+    T: mcp::modern::McpAppsBridgeTransport,
+    P: mcp::modern::McpAppsHostPolicy,
+{
+    client.mcp_apps_host(transport, configuration, policy)
+}
+
+fn generic_http_host<T, P>(
+    client: &mcp::modern::HttpClient,
+    transport: T,
+    configuration: mcp::modern::McpAppsHostConfiguration,
+    policy: P,
+) -> Result<mcp::modern::McpAppsHost<T, P>, mcp::modern::McpAppsHostError>
+where
+    T: mcp::modern::McpAppsBridgeTransport,
+    P: mcp::modern::McpAppsHostPolicy,
+{
+    client.mcp_apps_host(transport, configuration, policy)
+}
+
 pub fn probe() {
     let _: Option<McpAppsUiResource> = None;
     let _: Option<ModernMcpAppsUiResource> = None;
+    let _: Option<mcp::modern::McpAppsInMemoryHostTransport> = None;
+    let _: Option<mcp::modern::McpAppsInMemoryViewTransport> = None;
     let _ = McpAppsClientSettings::new(vec![MCP_APPS_HTML_MIME_TYPE.to_owned()]);
     let _ = mcp_apps::mcp_apps_in_memory_pair(1);
+    let _ = <AppsUiTool as mcp::ToolHandler>::final_metadata(&AppsUiTool);
 }
 "#,
         should_compile: true,
@@ -109,6 +143,19 @@ pub fn probe() {
 "#,
         should_compile: false,
         absent_feature_diagnostic: Some("McpAppsClientSettings"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "apps-absent-exact-legacy-namespace",
+        features: &["apps", "legacy-2024-11-05"],
+        source: r#"
+use mcp::legacy_2024::McpAppsHost;
+
+pub fn probe() {
+    let _: Option<McpAppsHost<(), ()>> = None;
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("McpAppsHost"),
     },
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-protocol-namespace",
@@ -429,6 +476,7 @@ fn compile_fail_tests() {
         let tests = trybuild::TestCases::new();
         tests.compile_fail("tests/trybuild/prompt_*.rs");
         tests.compile_fail("tests/trybuild/resource_*.rs");
+        #[cfg(not(feature = "apps"))]
         tests.compile_fail("tests/trybuild/tool_apps_ui_unsupported.rs");
         tests.compile_fail("tests/trybuild/tool_invalid_timeout.rs");
         tests.compile_fail("tests/trybuild/tool_typed_return.rs");
@@ -443,7 +491,7 @@ fn compile_fail_tests() {
         #[cfg(not(feature = "tasks"))]
         tests.compile_fail("tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs");
         tests.compile_fail("tests/trybuild/websocket/*.rs");
-        #[cfg(feature = "legacy-2024-11-05")]
+        #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
         tests.pass("tests/trybuild_pass/facade_dual_era_consumer.rs");
         return;
     }

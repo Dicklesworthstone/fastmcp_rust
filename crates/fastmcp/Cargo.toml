@@ -36,6 +36,7 @@ apps = [
     "fastmcp-protocol/apps",
     "fastmcp-server/apps",
     "fastmcp-client/apps",
+    "fastmcp-derive/apps",
     "fastmcp-console/apps",
 ]
 proxy = ["fastmcp-server/proxy", "fastmcp-console/proxy"]
