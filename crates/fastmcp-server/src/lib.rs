@@ -518,16 +518,16 @@ use fastmcp_protocol::{
     ExtensionDescriptor, ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt,
     ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY,
     FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCoreResult,
-    FinalLogMessageParams, FinalSubscriptionsAcknowledgedNotificationParams,
-    FinalSubscriptionsListenParams, GetPromptParams, InitializeParams, JsonRpcError,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
-    ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
-    MAX_SERVER_INSTRUCTIONS_BYTES, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
-    MissingRequiredClientCapabilityError, ProgressMarker, Prompt, ReadResourceParams, RequestId,
-    Resource, ResourceTemplate, SERVER_DISCOVER_METHOD, ServerCapabilities,
-    ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
-    ServerExtensionDiscovery, ServerInfo, ServerInstructions, ServerNotification,
-    SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
+    FinalLogMessageParams, FinalResultMetadataSeal,
+    FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
+    GetPromptParams, InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
+    ListToolsParams, LogLevel, LogMessageParams, MAX_SERVER_INSTRUCTIONS_BYTES,
+    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE, MissingRequiredClientCapabilityError,
+    ProgressMarker, Prompt, ReadResourceParams, RequestId, Resource, ResourceTemplate,
+    SERVER_DISCOVER_METHOD, ServerCapabilities, ServerDiscoverCapabilities, ServerDiscoverRequest,
+    ServerDiscoverResult, ServerExtensionDiscovery, ServerInfo, ServerInstructions,
+    ServerNotification, SetLogLevelParams, SubscribeResourceParams, SubscriptionFilter, Tool,
     UnsubscribeResourceParams,
 };
 use fastmcp_protocol::{CompleteResult, FinalSubscriptionsListenResult, ResultMeta};
@@ -1724,6 +1724,55 @@ fn validate_final_core_middleware_response(
         McpError::internal_error("middleware response violates the final result contract")
     })?;
     serde_json::from_str(&encoded).map_err(McpError::from)
+}
+
+/// Captures server-owned final metadata before response middleware receives a
+/// core response. Unknown methods deliberately have no core seal.
+fn final_core_middleware_metadata_seal(
+    core_request: Option<&CoreRequest>,
+    request: &JsonRpcRequest,
+    value: &serde_json::Value,
+) -> McpResult<Option<FinalResultMetadataSeal>> {
+    let Some(core_request) = core_request else {
+        return Ok(None);
+    };
+    let response_id = request.id.clone().ok_or_else(|| {
+        McpError::internal_error("final core middleware response is missing a request id")
+    })?;
+    let response = JsonRpcResponse::success(response_id, value.clone());
+    let CoreResult::Final(result) = core_request.decode_response(&response).map_err(|_| {
+        McpError::internal_error("middleware response violates the final result contract")
+    })?
+    else {
+        return Err(McpError::internal_error(
+            "final core middleware response selected a non-final result",
+        ));
+    };
+    result
+        .protected_metadata_seal()
+        .map(Some)
+        .map_err(|_| McpError::internal_error("middleware response violates final metadata"))
+}
+
+/// Rejects middleware changes to server-owned final response metadata while
+/// leaving every open metadata entry available for ordinary middleware use.
+fn validate_final_core_middleware_metadata_seal(
+    expected: Option<&FinalResultMetadataSeal>,
+    core_request: Option<&CoreRequest>,
+    request: &JsonRpcRequest,
+    value: &serde_json::Value,
+) -> McpResult<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = final_core_middleware_metadata_seal(core_request, request, value)?
+        .ok_or_else(|| McpError::internal_error("final core middleware metadata seal is absent"))?;
+    if &actual != expected {
+        return Err(McpError::internal_error(
+            "middleware changed protected final response metadata",
+        ));
+    }
+    Ok(())
 }
 
 fn is_exact_legacy_initialize(request: &JsonRpcRequest) -> bool {
@@ -8452,7 +8501,14 @@ impl Server {
                 entered_middleware.push(middleware.as_ref());
                 match catch_extension_unwind(|| middleware.on_request(&request_ctx, &request)) {
                     Ok(Ok(MiddlewareDecision::Continue)) => {}
-                    Ok(Ok(MiddlewareDecision::Respond(value))) => return Ok(value),
+                    Ok(Ok(MiddlewareDecision::Respond(value))) => {
+                        if final_core_request.is_some() {
+                            return Err(McpError::internal_error(
+                                "middleware cannot short-circuit a final core response",
+                            ));
+                        }
+                        return Ok(value);
+                    }
                     Ok(Err(error)) => return Err(error),
                     Err(_payload) => return Err(extension_panic_error("middleware_on_request")),
                 }
@@ -8484,18 +8540,46 @@ impl Server {
             }
         })();
         let result = match result {
-            Ok(value) => self
-                .apply_middleware_response(&entered_middleware, &request_ctx, &request, value)
-                .and_then(|value| {
-                    validate_final_core_middleware_response(
-                        final_core_request.as_ref(),
-                        &request,
-                        value,
-                    )
-                })
-                .map_err(|error| {
-                    self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error)
-                }),
+            Ok(value) => {
+                let metadata_seal = final_core_middleware_metadata_seal(
+                    final_core_request.as_ref(),
+                    &request,
+                    &value,
+                );
+                metadata_seal
+                    .and_then(|metadata_seal| {
+                        self.apply_middleware_response(
+                            &entered_middleware,
+                            &request_ctx,
+                            &request,
+                            value,
+                        )
+                        .and_then(|value| {
+                            validate_final_core_middleware_response(
+                                final_core_request.as_ref(),
+                                &request,
+                                value,
+                            )
+                        })
+                        .and_then(|value| {
+                            validate_final_core_middleware_metadata_seal(
+                                metadata_seal.as_ref(),
+                                final_core_request.as_ref(),
+                                &request,
+                                &value,
+                            )?;
+                            Ok(value)
+                        })
+                    })
+                    .map_err(|error| {
+                        self.apply_middleware_error(
+                            &entered_middleware,
+                            &request_ctx,
+                            &request,
+                            error,
+                        )
+                    })
+            }
             Err(error) => {
                 Err(self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error))
             }
@@ -8660,7 +8744,13 @@ impl Server {
             match decision {
                 Ok(MiddlewareDecision::Continue) => {}
                 Ok(MiddlewareDecision::Respond(value)) => {
-                    middleware_result = Some(Ok(value));
+                    middleware_result = Some(if final_core_request.is_some() {
+                        Err(McpError::internal_error(
+                            "middleware cannot short-circuit a final core response",
+                        ))
+                    } else {
+                        Ok(value)
+                    });
                     break;
                 }
                 Err(error) => {
@@ -8735,24 +8825,47 @@ impl Server {
                 final_subscription_completion_result(value, request.id.as_ref())
             });
         let result = match result {
-            Ok(value) => self
-                .apply_middleware_response_with_liveness(
-                    &entered_middleware,
-                    &request_ctx,
+            Ok(value) => {
+                let metadata_seal = final_core_middleware_metadata_seal(
+                    final_core_request.as_ref(),
                     &request,
-                    value,
-                    !raw_graceful_completion,
-                )
-                .and_then(|value| {
-                    validate_final_core_middleware_response(
-                        final_core_request.as_ref(),
-                        &request,
-                        value,
-                    )
-                })
-                .map_err(|error| {
-                    self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error)
-                }),
+                    &value,
+                );
+                metadata_seal
+                    .and_then(|metadata_seal| {
+                        self.apply_middleware_response_with_liveness(
+                            &entered_middleware,
+                            &request_ctx,
+                            &request,
+                            value,
+                            !raw_graceful_completion,
+                        )
+                        .and_then(|value| {
+                            validate_final_core_middleware_response(
+                                final_core_request.as_ref(),
+                                &request,
+                                value,
+                            )
+                        })
+                        .and_then(|value| {
+                            validate_final_core_middleware_metadata_seal(
+                                metadata_seal.as_ref(),
+                                final_core_request.as_ref(),
+                                &request,
+                                &value,
+                            )?;
+                            Ok(value)
+                        })
+                    })
+                    .map_err(|error| {
+                        self.apply_middleware_error(
+                            &entered_middleware,
+                            &request_ctx,
+                            &request,
+                            error,
+                        )
+                    })
+            }
             Err(error) => {
                 Err(self.apply_middleware_error(&entered_middleware, &request_ctx, &request, error))
             }
@@ -16872,6 +16985,57 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn final_core_middleware_short_circuit_cannot_author_metadata() {
+        struct ShortCircuitMiddleware;
+
+        impl Middleware for ShortCircuitMiddleware {
+            fn on_request(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                Ok(MiddlewareDecision::Respond(serde_json::json!({
+                    "resultType": "complete",
+                    "tools": [],
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                    "_meta": {
+                        "io.modelcontextprotocol/serverInfo": {
+                            "name": "middleware",
+                            "version": "1.0.0",
+                        },
+                    },
+                })))
+            }
+        }
+
+        let server = Server::new("final-core-short-circuit", "1.0.0")
+            .middleware(ShortCircuitMiddleware)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 721, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            721_i64,
+        );
+
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("short-circuited final request receives an error response");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InternalError).into())
+        );
+        assert!(response.result.is_none());
+    }
+
+    #[test]
     fn final_core_middleware_rejects_one_field_result_type_mutation() {
         struct ResultTypeMutationMiddleware;
 
@@ -16912,6 +17076,179 @@ mod lib_unit_tests {
             Some(i32::from(McpErrorCode::InternalError).into())
         );
         assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn final_core_middleware_preserves_open_response_metadata() {
+        struct OpenMetadataMiddleware;
+
+        impl Middleware for OpenMetadataMiddleware {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                response["_meta"]["com.example/trace"] = serde_json::json!("retained");
+                Ok(response)
+            }
+        }
+
+        let server = Server::new("final-core-open-metadata", "1.0.0")
+            .middleware(OpenMetadataMiddleware)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 74, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            74_i64,
+        );
+
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("final request has a response");
+        assert!(response.error.is_none());
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/_meta/com.example~1trace")),
+            Some(&serde_json::json!("retained")),
+            "middleware may still add open metadata"
+        );
+    }
+
+    #[test]
+    fn final_core_middleware_rejects_one_field_server_info_injection() {
+        struct ServerInfoInjectionMiddleware;
+
+        impl Middleware for ServerInfoInjectionMiddleware {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                response["_meta"][FINAL_SERVER_INFO_META_KEY] = serde_json::json!({
+                    "name": "middleware",
+                    "version": "1.0.0",
+                });
+                Ok(response)
+            }
+        }
+
+        let server = Server::new("final-core-server-info", "1.0.0")
+            .middleware(ServerInfoInjectionMiddleware)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 75, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            75_i64,
+        );
+
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("sealed metadata mutation receives an error response");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InternalError).into())
+        );
+        assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn final_discovery_middleware_rejects_one_field_server_info_mutation() {
+        struct DiscoveryServerInfoMutationMiddleware;
+
+        impl Middleware for DiscoveryServerInfoMutationMiddleware {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                response["_meta"][FINAL_SERVER_INFO_META_KEY]["name"] =
+                    serde_json::json!("middleware");
+                Ok(response)
+            }
+        }
+
+        let server = Server::new("final-discovery-server-info", "1.0.0")
+            .middleware(DiscoveryServerInfoMutationMiddleware)
+            .build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 76, InboundRequestTransport::Memory);
+        let request = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+            })),
+            76_i64,
+        );
+
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("sealed discovery mutation receives an error response");
+        assert_eq!(
+            response.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InternalError).into())
+        );
+        assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn legacy_middleware_retains_open_result_metadata() {
+        struct LegacyMetadataMiddleware;
+
+        impl Middleware for LegacyMetadataMiddleware {
+            fn on_response(
+                &self,
+                _ctx: &McpContext,
+                _request: &JsonRpcRequest,
+                mut response: serde_json::Value,
+            ) -> McpResult<serde_json::Value> {
+                response["_meta"][FINAL_SERVER_INFO_META_KEY] = serde_json::json!({
+                    "name": "middleware",
+                    "version": "1.0.0",
+                });
+                Ok(response)
+            }
+        }
+
+        let server = Server::new("legacy-open-result-metadata", "1.0.0")
+            .middleware(LegacyMetadataMiddleware)
+            .build();
+        let mut session = initialized_test_session(&server);
+
+        let response = dispatch_test_request(&server, &mut session, "tools/list");
+        assert!(response.error.is_none());
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/_meta/io.modelcontextprotocol~1serverInfo")),
+            Some(&serde_json::json!({
+                "name": "middleware",
+                "version": "1.0.0",
+            })),
+            "the exact legacy result metadata surface remains open to middleware"
+        );
     }
 
     #[test]

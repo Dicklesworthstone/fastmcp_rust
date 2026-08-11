@@ -364,37 +364,14 @@ fn canonical_final_catalog_tags(tags: Option<&[String]>) -> Vec<String> {
 struct FinalCatalogCursor {
     catalog: FinalCatalogKind,
     revision: u64,
-    state: Option<FinalCatalogState>,
     query: FinalCatalogQuery,
     offset: u64,
-}
-
-/// Opaque connection-state snapshot bound into a final catalog cursor.
-///
-/// A final catalog can be filtered by a connection's disabled-component set.
-/// The cursor must therefore be rejected after either the connection identity
-/// or its state revision changes rather than treating an offset from a prior
-/// filtered view as a continuation of the current one.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct FinalCatalogState {
-    partition: [u8; 32],
-    revision: u64,
-}
-
-fn final_catalog_state(request_ctx: &McpContext) -> Option<FinalCatalogState> {
-    request_ctx
-        .session_cache_partition()
-        .map(|(partition, revision)| FinalCatalogState {
-            partition,
-            revision,
-        })
 }
 
 fn decode_final_catalog_cursor_offset(
     cursor: Option<&str>,
     expected_catalog: FinalCatalogKind,
     expected_revision: u64,
-    expected_state: Option<&FinalCatalogState>,
     expected_query: &FinalCatalogQuery,
     catalog_length: usize,
 ) -> McpResult<usize> {
@@ -416,11 +393,6 @@ fn decode_final_catalog_cursor_offset(
     if cursor.revision != expected_revision {
         return Err(McpError::invalid_params(
             "final catalog cursor references a stale catalog revision",
-        ));
-    }
-    if cursor.state.as_ref() != expected_state {
-        return Err(McpError::invalid_params(
-            "final catalog cursor references stale connection state",
         ));
     }
     if &cursor.query != expected_query {
@@ -1426,7 +1398,6 @@ fn encode_cursor_offset(offset: usize) -> String {
 fn encode_final_catalog_cursor(
     catalog: FinalCatalogKind,
     revision: u64,
-    state: Option<FinalCatalogState>,
     query: &FinalCatalogQuery,
     offset: usize,
 ) -> String {
@@ -1434,7 +1405,6 @@ fn encode_final_catalog_cursor(
     let payload = FinalCatalogCursor {
         catalog,
         revision,
-        state,
         query: query.clone(),
         offset,
     };
@@ -1444,34 +1414,24 @@ fn encode_final_catalog_cursor(
 
 /// Pages an already-filtered final catalog snapshot.
 ///
-/// Filtering must precede cursor arithmetic so an exact-legacy-only or
-/// connection-disabled entry cannot create an empty modern page or shift a
-/// final peer's cursor.
+/// Filtering must precede cursor arithmetic so a legacy-only or tag-filtered
+/// entry cannot create an empty modern page or shift a final peer's cursor.
 fn page_final_catalog<T: Clone>(
     items: Vec<T>,
     cursor: Option<&str>,
     page_size: Option<usize>,
     catalog: FinalCatalogKind,
     revision: u64,
-    state: Option<FinalCatalogState>,
     query: &FinalCatalogQuery,
 ) -> McpResult<(Vec<T>, Option<String>)> {
-    let offset = decode_final_catalog_cursor_offset(
-        cursor,
-        catalog,
-        revision,
-        state.as_ref(),
-        query,
-        items.len(),
-    )?;
+    let offset = decode_final_catalog_cursor_offset(cursor, catalog, revision, query, items.len())?;
     let Some(page_size) = page_size else {
         return Ok((items, None));
     };
     let end = offset.saturating_add(page_size).min(items.len());
     Ok((
         items.get(offset..end).unwrap_or_default().to_vec(),
-        (end < items.len())
-            .then(|| encode_final_catalog_cursor(catalog, revision, state, query, end)),
+        (end < items.len()).then(|| encode_final_catalog_cursor(catalog, revision, query, end)),
     ))
 }
 
@@ -3494,10 +3454,10 @@ impl Router {
                 self.final_prompt_completion_handlers.get(name)
             }
             FinalCompletionReference::Resource { uri } => {
-                // Resource-template completion must use the same modern
-                // connection visibility gate as templates/list and
-                // resources/read. In particular, never fall through to the
-                // global completion provider for a hidden template.
+                // Resource-template completion must use the same individual-request
+                // admission gate as resources/read. Catalog listing is deliberately
+                // connection-independent, so never fall through to the global
+                // completion provider for a disabled template.
                 if !request_ctx.is_resource_enabled(uri) {
                     return Err(McpError::invalid_params(
                         "completion resource reference is not registered",
@@ -3596,9 +3556,10 @@ impl Router {
     /// Dispatches a modern request through the transport-neutral final router.
     ///
     /// This is the modern server-side routing seam. It deliberately has no
-    /// `Session` argument: the router catalog is immutable, while a supplied
-    /// modern connection context can still filter disabled components and bind
-    /// both cursor continuations and MRTR retries to its durable partition.
+    /// `Session` argument: final catalog pages and cursors are independent of
+    /// connection state. A supplied modern connection context still controls
+    /// individual request admission and binds MRTR retries to its durable
+    /// partition.
     /// Every successful response is re-emitted through the final
     /// complete-result contract. State-bearing lifecycle methods and exact
     /// 2024-11-05 wire results stay on the legacy adapter rather than
@@ -4279,7 +4240,6 @@ impl Router {
                 .iter()
                 .filter_map(|name| self.tools.get(name))
                 .filter(|entry| entry.final_registration.is_some())
-                .filter(|entry| request_ctx.is_tool_enabled(&entry.definition.name))
                 .map(|entry| entry.definition.clone())
                 .filter(|tool| tag_filters.is_none_or(|filters| filters.matches(&tool.tags)))
                 .collect::<Vec<_>>()
@@ -4292,7 +4252,6 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::Tools,
             self.final_catalog_revision,
-            final_catalog_state(request_ctx),
             &query,
         )?;
         let result = ListToolsResult { tools, next_cursor };
@@ -4345,7 +4304,6 @@ impl Router {
             .resource_order
             .iter()
             .filter_map(|uri| self.final_resources.get(uri).map(|entry| (uri, entry)))
-            .filter(|(uri, _)| request_ctx.is_resource_enabled(uri))
             .filter(|(_, entry)| {
                 filters
                     .as_ref()
@@ -4366,7 +4324,6 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::Resources,
             self.final_catalog_revision,
-            final_catalog_state(request_ctx),
             &query,
         )?;
         Ok(FinalListResourcesResult {
@@ -4393,7 +4350,6 @@ impl Router {
             .resource_template_order
             .iter()
             .filter_map(|key| self.resource_templates.get(key).map(|entry| (key, entry)))
-            .filter(|(key, _)| request_ctx.is_resource_enabled(key))
             .filter_map(|(_, entry)| {
                 entry
                     .final_definition
@@ -4412,7 +4368,6 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::ResourceTemplates,
             self.final_catalog_revision,
-            final_catalog_state(request_ctx),
             &query,
         )?;
         Ok(FinalListResourceTemplatesResult {
@@ -4439,7 +4394,6 @@ impl Router {
             .prompt_order
             .iter()
             .filter_map(|name| self.final_prompts.get(name).map(|entry| (name, entry)))
-            .filter(|(name, _)| request_ctx.is_prompt_enabled(name))
             .filter(|(_, entry)| {
                 filters
                     .as_ref()
@@ -4453,7 +4407,6 @@ impl Router {
             self.list_page_size,
             FinalCatalogKind::Prompts,
             self.final_catalog_revision,
-            final_catalog_state(request_ctx),
             &query,
         )?;
         Ok(FinalListPromptsResult {
@@ -7533,7 +7486,7 @@ mod safe_log_label_tests {
 #[cfg(test)]
 mod cursor_tests {
     use super::{
-        FinalCatalogKind, FinalCatalogQuery, FinalCatalogState, decode_cursor_offset,
+        FinalCatalogKind, FinalCatalogQuery, decode_cursor_offset,
         decode_final_catalog_cursor_offset, encode_cursor_offset, encode_final_catalog_cursor,
     };
 
@@ -7584,7 +7537,7 @@ mod cursor_tests {
         let include_tags = vec!["Visible".to_owned(), "visible".to_owned()];
         let exclude_tags = vec!["excluded".to_owned()];
         let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
-        let cursor = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, None, &query, 7);
+        let cursor = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 7);
         let equivalent_include_tags = vec!["visible".to_owned()];
         let equivalent_query = FinalCatalogQuery::from_tag_filters(
             Some(&equivalent_include_tags),
@@ -7595,7 +7548,6 @@ mod cursor_tests {
                 Some(&cursor),
                 FinalCatalogKind::Resources,
                 41,
-                None,
                 &equivalent_query,
                 8,
             )
@@ -7606,7 +7558,6 @@ mod cursor_tests {
             Some(&cursor),
             FinalCatalogKind::Resources,
             42,
-            None,
             &query,
             8,
         )
@@ -7617,7 +7568,6 @@ mod cursor_tests {
             Some(&cursor),
             FinalCatalogKind::Prompts,
             41,
-            None,
             &query,
             8,
         )
@@ -7631,20 +7581,17 @@ mod cursor_tests {
             Some(&cursor),
             FinalCatalogKind::Resources,
             41,
-            None,
             &other_query,
             8,
         )
         .expect_err("changing only the request filters rejects the continuation");
         assert!(wrong_query.message.contains("query filters"));
 
-        let out_of_range =
-            encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, None, &query, 8);
+        let out_of_range = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 8);
         let range_error = decode_final_catalog_cursor_offset(
             Some(&out_of_range),
             FinalCatalogKind::Resources,
             41,
-            None,
             &query,
             8,
         )
@@ -7654,44 +7601,6 @@ mod cursor_tests {
                 .message
                 .contains("outside the requested catalog page")
         );
-    }
-
-    #[test]
-    fn final_catalog_cursor_rejects_only_a_changed_connection_state() {
-        let query = FinalCatalogQuery::from_tag_filters(None, None);
-        let state = Some(FinalCatalogState {
-            partition: [7; 32],
-            revision: 3,
-        });
-        let cursor =
-            encode_final_catalog_cursor(FinalCatalogKind::Tools, 41, state.clone(), &query, 1);
-        assert_eq!(
-            decode_final_catalog_cursor_offset(
-                Some(&cursor),
-                FinalCatalogKind::Tools,
-                41,
-                state.as_ref(),
-                &query,
-                2,
-            )
-            .expect("the original connection state accepts its cursor"),
-            1
-        );
-
-        let changed_state = Some(FinalCatalogState {
-            partition: [7; 32],
-            revision: 4,
-        });
-        let error = decode_final_catalog_cursor_offset(
-            Some(&cursor),
-            FinalCatalogKind::Tools,
-            41,
-            changed_state.as_ref(),
-            &query,
-            2,
-        )
-        .expect_err("changing only the state revision rejects the continuation");
-        assert!(error.message.contains("stale connection state"));
     }
 }
 
@@ -13419,13 +13328,11 @@ mod router_tests {
         let include_tags = vec!["visible".to_owned()];
         let exclude_tags = vec!["excluded".to_owned()];
         let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
-        let cursor_state = final_catalog_state(&request_ctx);
         assert_eq!(
             decode_final_catalog_cursor_offset(
                 Some(cursor),
                 FinalCatalogKind::Tools,
                 router.final_catalog_revision,
-                cursor_state.as_ref(),
                 &query,
                 2,
             )
@@ -13497,7 +13404,6 @@ mod router_tests {
         let valid_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Tools,
             router.final_catalog_revision,
-            final_catalog_state(&request_ctx),
             &query,
             0,
         );
@@ -13516,13 +13422,8 @@ mod router_tests {
             .final_catalog_revision
             .checked_sub(1)
             .expect("registered tools advance the final catalog revision");
-        let stale_cursor = encode_final_catalog_cursor(
-            FinalCatalogKind::Tools,
-            stale_revision,
-            final_catalog_state(&request_ctx),
-            &query,
-            0,
-        );
+        let stale_cursor =
+            encode_final_catalog_cursor(FinalCatalogKind::Tools, stale_revision, &query, 0);
         let stale = router
             .dispatch_stateless(
                 &request_ctx,
@@ -13535,7 +13436,6 @@ mod router_tests {
         let wrong_kind_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Prompts,
             router.final_catalog_revision,
-            final_catalog_state(&request_ctx),
             &query,
             0,
         );
@@ -13553,7 +13453,6 @@ mod router_tests {
         let wrong_query_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Tools,
             router.final_catalog_revision,
-            final_catalog_state(&request_ctx),
             &other_query,
             0,
         );
@@ -13569,7 +13468,6 @@ mod router_tests {
         let out_of_range_cursor = encode_final_catalog_cursor(
             FinalCatalogKind::Tools,
             router.final_catalog_revision,
-            final_catalog_state(&request_ctx),
             &query,
             2,
         );
@@ -18613,7 +18511,8 @@ mod router_tests {
     }
 
     #[test]
-    fn modern_connection_disablements_filter_final_catalog_discovery() {
+    fn modern_final_catalogs_ignore_connection_disablements_while_exact_legacy_lists_remain_stateful()
+     {
         let template_uri = "file:///input-required-template/{id}";
         let mut router = Router::new();
         router
@@ -18688,29 +18587,98 @@ mod router_tests {
         assert!(request_ctx.disable_resource(template_uri));
         assert!(request_ctx.disable_prompt("connection-scoped-prompt"));
 
-        let hidden_tools = router
+        let discovered_tools = router
             .dispatch_stateless(&request_ctx, &list_request("tools/list", 618_i64))
-            .expect("disabled tool discovery remains a valid final response");
-        let hidden_resources = router
+            .expect("disabled tool remains in the immutable final catalog");
+        let discovered_resources = router
             .dispatch_stateless(&request_ctx, &list_request("resources/list", 619_i64))
-            .expect("disabled resource discovery remains a valid final response");
-        let hidden_templates = router
+            .expect("disabled resource remains in the immutable final catalog");
+        let discovered_templates = router
             .dispatch_stateless(
                 &request_ctx,
                 &list_request("resources/templates/list", 620_i64),
             )
-            .expect("disabled template discovery remains a valid final response");
-        let hidden_prompts = router
+            .expect("disabled template remains in the immutable final catalog");
+        let discovered_prompts = router
             .dispatch_stateless(&request_ctx, &list_request("prompts/list", 621_i64))
-            .expect("disabled prompt discovery remains a valid final response");
-        assert_eq!(hidden_tools["tools"], serde_json::json!([]));
-        assert_eq!(hidden_resources["resources"], serde_json::json!([]));
-        assert_eq!(hidden_templates["resourceTemplates"], serde_json::json!([]));
-        assert_eq!(hidden_prompts["prompts"], serde_json::json!([]));
+            .expect("disabled prompt remains in the immutable final catalog");
+        assert_eq!(
+            discovered_tools["tools"][0]["name"],
+            "connection-scoped-tool"
+        );
+        assert_eq!(
+            discovered_resources["resources"][0]["uri"],
+            "file:///connection-scoped-resource"
+        );
+        assert_eq!(
+            discovered_templates["resourceTemplates"][0]["uriTemplate"],
+            template_uri
+        );
+        assert_eq!(
+            discovered_prompts["prompts"][0]["name"],
+            "connection-scoped-prompt"
+        );
+
+        let legacy_state = SessionState::new();
+        let legacy_request_ctx =
+            request_context(request_ctx.cx(), 622, Budget::INFINITE, &legacy_state);
+        assert!(legacy_request_ctx.disable_tool("connection-scoped-tool"));
+        assert!(legacy_request_ctx.disable_resource("file:///connection-scoped-resource"));
+        assert!(legacy_request_ctx.disable_resource(template_uri));
+        assert!(legacy_request_ctx.disable_prompt("connection-scoped-prompt"));
+
+        let legacy_tools = router
+            .handle_tools_list(
+                &legacy_request_ctx,
+                ListToolsParams {
+                    cursor: None,
+                    include_tags: None,
+                    exclude_tags: None,
+                },
+                Some(&legacy_state),
+            )
+            .expect("exact legacy tools/list remains session-stateful");
+        let legacy_resources = router
+            .handle_resources_list(
+                &legacy_request_ctx,
+                ListResourcesParams {
+                    cursor: None,
+                    include_tags: None,
+                    exclude_tags: None,
+                },
+                Some(&legacy_state),
+            )
+            .expect("exact legacy resources/list remains session-stateful");
+        let legacy_templates = router
+            .handle_resource_templates_list(
+                &legacy_request_ctx,
+                ListResourceTemplatesParams {
+                    cursor: None,
+                    include_tags: None,
+                    exclude_tags: None,
+                },
+                Some(&legacy_state),
+            )
+            .expect("exact legacy resources/templates/list remains session-stateful");
+        let legacy_prompts = router
+            .handle_prompts_list(
+                &legacy_request_ctx,
+                ListPromptsParams {
+                    cursor: None,
+                    include_tags: None,
+                    exclude_tags: None,
+                },
+                Some(&legacy_state),
+            )
+            .expect("exact legacy prompts/list remains session-stateful");
+        assert!(legacy_tools.tools.is_empty());
+        assert!(legacy_resources.resources.is_empty());
+        assert!(legacy_templates.resource_templates.is_empty());
+        assert!(legacy_prompts.prompts.is_empty());
     }
 
     #[test]
-    fn final_catalog_cursor_rejects_only_a_changed_connection_state() {
+    fn final_catalog_cursor_survives_a_changed_session_state() {
         let mut router = Router::new();
         router.set_list_page_size(Some(1));
         router
@@ -18737,27 +18705,95 @@ mod router_tests {
         assert_eq!(
             serde_json::to_vec(&initial).expect("initial request remains serializable"),
             initial_bytes,
-            "connection state is the sole changed catalog-continuation dimension"
+            "connection state cannot alter the request or its catalog continuation"
         );
-        let stale = router
+        let continued = router
             .dispatch_stateless(
                 &request_ctx,
                 &final_tools_list_request(Some(&cursor), None, None, 623_i64),
             )
-            .expect_err("a disabled-component change invalidates the prior final cursor");
-        assert_eq!(stale.code, McpErrorCode::InvalidParams);
-        assert!(stale.message.contains("stale connection state"));
+            .expect("a disabled-component change cannot invalidate an immutable final cursor");
+        assert_eq!(
+            continued["tools"][0]["name"],
+            "second-connection-cursor-tool"
+        );
+        assert!(continued.get("nextCursor").is_none());
 
         let refreshed = router
             .dispatch_stateless(
                 &request_ctx,
                 &final_tools_list_request(None, None, None, 624_i64),
             )
-            .expect("a cursor-free request observes the new connection state");
+            .expect("a cursor-free request keeps the immutable final catalog");
         assert_eq!(
             refreshed["tools"][0]["name"],
-            "second-connection-cursor-tool"
+            "first-connection-cursor-tool"
         );
+    }
+
+    #[test]
+    fn final_catalog_cursor_continues_across_modern_connection_partitions() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router
+            .add_tool(NamedTool::new("first-cross-connection-cursor-tool"))
+            .expect("first tool registration succeeds");
+        router
+            .add_tool(NamedTool::new("second-cross-connection-cursor-tool"))
+            .expect("second tool registration succeeds");
+
+        let cx = Cx::for_testing();
+        let origin_connection = ModernConnection::new();
+        let origin_inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            625,
+            InboundRequestTransport::Stdio,
+            &origin_connection,
+        );
+        let origin_context = origin_inbound.request_context();
+        let continuation_connection = ModernConnection::new();
+        let continuation_inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            626,
+            InboundRequestTransport::Stdio,
+            &continuation_connection,
+        );
+        let continuation_context = continuation_inbound.request_context();
+        let origin_partition = origin_context
+            .session_cache_partition()
+            .expect("a modern origin context has a durable partition")
+            .0;
+        let continuation_partition = continuation_context
+            .session_cache_partition()
+            .expect("a modern continuation context has a durable partition")
+            .0;
+        assert_ne!(
+            origin_partition, continuation_partition,
+            "distinct modern connections have distinct durable partitions"
+        );
+
+        let first_page = router
+            .dispatch_stateless(
+                &origin_context,
+                &final_tools_list_request(None, None, None, 625_i64),
+            )
+            .expect("the origin connection receives the first final catalog page");
+        let cursor = first_page["nextCursor"]
+            .as_str()
+            .expect("the first page has a continuation")
+            .to_owned();
+
+        let continued = router
+            .dispatch_stateless(
+                &continuation_context,
+                &final_tools_list_request(Some(&cursor), None, None, 626_i64),
+            )
+            .expect("a final catalog cursor is not bound to its origin connection partition");
+        assert_eq!(
+            continued["tools"][0]["name"],
+            "second-cross-connection-cursor-tool"
+        );
+        assert!(continued.get("nextCursor").is_none());
     }
 
     #[test]
