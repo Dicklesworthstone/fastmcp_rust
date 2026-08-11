@@ -26,7 +26,7 @@ use crate::methods::{
 use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
 use crate::result::{
-    CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue,
+    CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonObject, ExactJsonValue,
     InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers,
     decode_peer_result_for_era, deserialize_exact_object, encode_complete_result, encode_result,
     exact_json_to_serde, has_final_only_metadata,
@@ -181,6 +181,208 @@ impl FinalRequestMeta {
 // Era-aware core dispatch
 // ============================================================================
 
+/// Typed, order-preserving client replies to server-issued final MRTR input
+/// requests.
+///
+/// An `inputResponses` object is a correlation map, not an open JSON bag: its
+/// values are one of the final embedded input-response payloads. Keeping the
+/// decoded entries in wire order also prevents a retry decode/re-encode cycle
+/// from silently sorting response keys before the server observes them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FinalInputResponses {
+    entries: Vec<(String, FinalEmbeddedInputResponse)>,
+}
+
+impl FinalInputResponses {
+    /// Creates locally authored response entries after rejecting duplicate
+    /// server-assigned keys.
+    pub fn try_from_entries(
+        entries: Vec<(String, FinalEmbeddedInputResponse)>,
+    ) -> Result<Self, FinalInputResponseCorrelationError> {
+        for (index, (key, _)) in entries.iter().enumerate() {
+            if entries[..index].iter().any(|(previous, _)| previous == key) {
+                return Err(FinalInputResponseCorrelationError::DuplicateResponseKey);
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    /// Returns the response entries in their admitted wire order.
+    #[must_use]
+    pub fn entries(&self) -> &[(String, FinalEmbeddedInputResponse)] {
+        &self.entries
+    }
+
+    /// Returns the response associated with an exact server-assigned key.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&FinalEmbeddedInputResponse> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, response)| response)
+    }
+
+    /// Returns the number of supplied responses.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns whether this is a present, empty response map.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Correlates every response with the exact admitted `inputRequests` map.
+    ///
+    /// A retry must answer every requested key exactly once, and each reply
+    /// must have the result shape selected by its corresponding descriptor.
+    pub fn validate_against(
+        &self,
+        input_requests: &ExactJsonObject,
+    ) -> Result<(), FinalInputResponseCorrelationError> {
+        let mut requested = Vec::with_capacity(input_requests.members().len());
+        for member in input_requests.members() {
+            let value = exact_json_to_serde(&member.value)
+                .map_err(|_| FinalInputResponseCorrelationError::InvalidInputRequest)?;
+            let request = serde_json::from_value::<FinalEmbeddedInputRequest>(value)
+                .map_err(|_| FinalInputResponseCorrelationError::InvalidInputRequest)?;
+            requested.push((member.name.as_str(), request.response_kind()));
+        }
+
+        for (key, response) in &self.entries {
+            let Some((_, kind)) = requested
+                .iter()
+                .find(|(requested_key, _)| *requested_key == key)
+            else {
+                return Err(FinalInputResponseCorrelationError::UnknownResponseKey);
+            };
+            if !response.matches_kind(*kind) {
+                return Err(FinalInputResponseCorrelationError::ResponseKindMismatch);
+            }
+        }
+        if self.entries.len() != requested.len() {
+            return Err(FinalInputResponseCorrelationError::MissingResponse);
+        }
+        Ok(())
+    }
+
+    /// Correlates this map directly to an admitted final input-required
+    /// result.
+    ///
+    /// A state-only continuation cannot be answered with response entries.
+    pub fn validate_against_input_required(
+        &self,
+        input_required: &InputRequiredResult,
+    ) -> Result<(), FinalInputResponseCorrelationError> {
+        match input_required.input_requests() {
+            Some(input_requests) => self.validate_against(input_requests),
+            None => Err(FinalInputResponseCorrelationError::StateOnlyInputResponses),
+        }
+    }
+}
+
+impl Serialize for FinalInputResponses {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.entries.len()))?;
+        for (key, response) in &self.entries {
+            map.serialize_entry(key, response)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for FinalInputResponses {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct InputResponsesVisitor;
+
+        impl<'de> Visitor<'de> for InputResponsesVisitor {
+            type Value = FinalInputResponses;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object of final embedded input responses")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut entries = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if entries.iter().any(|(existing, _)| existing == &key) {
+                        return Err(serde::de::Error::custom(
+                            "duplicate final input response key",
+                        ));
+                    }
+                    entries.push((key, map.next_value::<FinalEmbeddedInputResponse>()?));
+                }
+                FinalInputResponses::try_from_entries(entries).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_map(InputResponsesVisitor)
+    }
+}
+
+/// Why a retry response map could not be correlated to a prior MRTR request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalInputResponseCorrelationError {
+    /// A peer input-request descriptor is not one of the final embedded forms.
+    InvalidInputRequest,
+    /// A locally authored or peer-supplied map repeated a response key.
+    DuplicateResponseKey,
+    /// A supplied response key was not requested by the server.
+    UnknownResponseKey,
+    /// At least one requested key was not answered.
+    MissingResponse,
+    /// A response did not match its request descriptor's selected result kind.
+    ResponseKindMismatch,
+    /// A state-only input-required result was retried with a present
+    /// `inputResponses` member, including an explicitly empty map.
+    StateOnlyInputResponses,
+}
+
+impl std::fmt::Display for FinalInputResponseCorrelationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInputRequest => formatter.write_str("invalid final input request"),
+            Self::DuplicateResponseKey => formatter.write_str("duplicate final input response key"),
+            Self::UnknownResponseKey => formatter.write_str("unknown final input response key"),
+            Self::MissingResponse => formatter.write_str("missing final input response"),
+            Self::ResponseKindMismatch => {
+                formatter.write_str("final input response does not match request kind")
+            }
+            Self::StateOnlyInputResponses => formatter
+                .write_str("state-only final input-required result cannot accept input responses"),
+        }
+    }
+}
+
+impl std::error::Error for FinalInputResponseCorrelationError {}
+
+fn deserialize_optional_final_input_responses<'de, D>(
+    deserializer: D,
+) -> Result<Option<FinalInputResponses>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    FinalInputResponses::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_optional_non_null_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
 /// Final pagination parameters shared by the core catalog methods.
 ///
 /// This is intentionally separate from the legacy list parameter structs:
@@ -297,14 +499,16 @@ pub struct FinalCallToolParams {
     #[serde(
         rename = "inputResponses",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_input_responses"
     )]
-    pub input_responses: Option<BTreeMap<String, Value>>,
+    pub input_responses: Option<FinalInputResponses>,
     /// Opaque retry state supplied with embedded input responses.
     #[serde(
         rename = "requestState",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
     )]
     pub request_state: Option<String>,
 }
@@ -322,14 +526,16 @@ pub struct FinalReadResourceParams {
     #[serde(
         rename = "inputResponses",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_input_responses"
     )]
-    pub input_responses: Option<BTreeMap<String, Value>>,
+    pub input_responses: Option<FinalInputResponses>,
     /// Opaque retry state supplied with embedded input responses.
     #[serde(
         rename = "requestState",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
     )]
     pub request_state: Option<String>,
 }
@@ -350,14 +556,16 @@ pub struct FinalGetPromptParams {
     #[serde(
         rename = "inputResponses",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_final_input_responses"
     )]
-    pub input_responses: Option<BTreeMap<String, Value>>,
+    pub input_responses: Option<FinalInputResponses>,
     /// Opaque retry state supplied with embedded input responses.
     #[serde(
         rename = "requestState",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null_string"
     )]
     pub request_state: Option<String>,
 }
@@ -1357,7 +1565,7 @@ fn deserialize_optional_non_null_logger<'de, D>(deserializer: D) -> Result<Optio
 where
     D: Deserializer<'de>,
 {
-    String::deserialize(deserializer).map(Some)
+    deserialize_optional_non_null_string(deserializer)
 }
 
 /// Exact final `notifications/cancelled` parameters.
@@ -3290,6 +3498,85 @@ impl CoreRequest {
             }
             ProtocolEra::Modern2026 => Self::decode_final(method, params),
         }
+    }
+
+    /// Decodes one core request while retaining the admitted raw parameter
+    /// source for final MRTR retry maps.
+    ///
+    /// The ordinary [`Self::decode`] path accepts a materialized
+    /// [`Value`], whose object representation cannot retain member order.
+    /// Callers that admitted the original parameter source can use this form
+    /// for the three final methods whose `inputResponses` maps have typed,
+    /// ordered response entries. The supplied source must describe exactly the
+    /// same parameter value as `params`; it cannot be attached to another
+    /// admitted frame.
+    pub fn decode_with_raw_params(
+        era: ProtocolEra,
+        method: &str,
+        params: Option<&Value>,
+        raw_params: Option<&str>,
+    ) -> Result<Self, CoreDispatchError> {
+        let Some(raw_params) = raw_params else {
+            return Self::decode(era, method, params);
+        };
+        if era != ProtocolEra::Modern2026
+            || !matches!(method, TOOLS_CALL | RESOURCES_READ | PROMPTS_GET)
+        {
+            return Self::decode(era, method, params);
+        }
+        let method_literal = match method {
+            TOOLS_CALL => TOOLS_CALL,
+            RESOURCES_READ => RESOURCES_READ,
+            PROMPTS_GET => PROMPTS_GET,
+            _ => unreachable!("the final MRTR raw-params guard selected a known method"),
+        };
+        crate::result::parse_exact_json(raw_params).map_err(|_| {
+            CoreDispatchError::InvalidParams {
+                era,
+                method: method_literal,
+            }
+        })?;
+        let raw_value: Value =
+            serde_json::from_str(raw_params).map_err(|_| CoreDispatchError::InvalidParams {
+                era,
+                method: method_literal,
+            })?;
+        if params != Some(&raw_value) {
+            return Err(CoreDispatchError::InvalidParams {
+                era,
+                method: method_literal,
+            });
+        }
+
+        let request = match method {
+            TOOLS_CALL => {
+                FinalCoreRequest::ToolsCall(serde_json::from_str(raw_params).map_err(|_| {
+                    CoreDispatchError::InvalidParams {
+                        era,
+                        method: TOOLS_CALL,
+                    }
+                })?)
+            }
+            RESOURCES_READ => {
+                FinalCoreRequest::ResourcesRead(serde_json::from_str(raw_params).map_err(|_| {
+                    CoreDispatchError::InvalidParams {
+                        era,
+                        method: RESOURCES_READ,
+                    }
+                })?)
+            }
+            PROMPTS_GET => {
+                FinalCoreRequest::PromptsGet(serde_json::from_str(raw_params).map_err(|_| {
+                    CoreDispatchError::InvalidParams {
+                        era,
+                        method: PROMPTS_GET,
+                    }
+                })?)
+            }
+            _ => unreachable!("the final MRTR raw-params guard selected a known method"),
+        };
+        request.validate_metadata()?;
+        Ok(Self::Final(request))
     }
 
     /// Returns the era selected by this request.
@@ -6861,7 +7148,7 @@ mod tests {
             },
             "name": "weather",
             "arguments": {"city": "Boston"},
-            "inputResponses": {"request-1": {"approved": true}},
+            "inputResponses": {"request-1": {"roots": []}},
             "requestState": "retry-1"
         });
         let baseline = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&call_params))
@@ -6893,7 +7180,7 @@ mod tests {
                 "io.modelcontextprotocol/clientCapabilities": {}
             },
             "uri": "file:///workspace/status",
-            "inputResponses": {"request-1": {"approved": true}},
+            "inputResponses": {"request-1": {"roots": []}},
             "requestState": "retry-1"
         });
         let get_params = serde_json::json!({
@@ -6902,7 +7189,7 @@ mod tests {
                 "io.modelcontextprotocol/clientCapabilities": {}
             },
             "name": "status",
-            "inputResponses": {"request-1": {"approved": true}},
+            "inputResponses": {"request-1": {"roots": []}},
             "requestState": "retry-1"
         });
         for (method, params) in [(RESOURCES_READ, read_params), (PROMPTS_GET, get_params)] {
@@ -6917,6 +7204,247 @@ mod tests {
                 "{method} retains retry input responses and request state"
             );
         }
+    }
+
+    #[test]
+    fn final_mrtr_retry_responses_are_typed_ordered_and_correlatable() {
+        let responses_wire = r#"{"second":{"roots":[]},"first":{"roots":[]}}"#;
+        let responses: FinalInputResponses = serde_json::from_str(responses_wire)
+            .expect("typed final input responses decode in their wire order");
+        assert_eq!(
+            responses
+                .entries()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"],
+            "input response key order remains observable after decoding"
+        );
+        assert_eq!(
+            serde_json::to_string(&responses).expect("typed responses re-encode"),
+            responses_wire,
+            "the exact inputResponses object order round-trips"
+        );
+
+        let raw_call_params = r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"weather","inputResponses":{"second":{"roots":[]},"first":{"roots":[]}}}"#;
+        let materialized_call_params: Value = serde_json::from_str(raw_call_params)
+            .expect("raw call parameters materialize for JSON-RPC envelope admission");
+        let CoreRequest::Final(FinalCoreRequest::ToolsCall(call)) =
+            CoreRequest::decode_with_raw_params(
+                ProtocolEra::Modern2026,
+                TOOLS_CALL,
+                Some(&materialized_call_params),
+                Some(raw_call_params),
+            )
+            .expect("the raw final core decoder preserves MRTR response ordering")
+        else {
+            panic!("raw tools/call parameters select the final request type");
+        };
+        assert_eq!(
+            call.input_responses
+                .as_ref()
+                .expect("present retry map")
+                .entries()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"],
+            "the core raw-params path does not inherit materialized-map sorting"
+        );
+
+        let ExactJsonValue::Object(input_requests) = crate::result::parse_exact_json(
+            r#"{"second":{"method":"roots/list"},"first":{"method":"roots/list"}}"#,
+        )
+        .expect("input request map admits exactly") else {
+            panic!("inputRequests must be an object");
+        };
+        responses
+            .validate_against(&input_requests)
+            .expect("each typed response matches its exact input request key and kind");
+
+        let wrong_kind: FinalInputResponses =
+            serde_json::from_str(r#"{"second":{"action":"decline"},"first":{"roots":[]}}"#)
+                .expect("a differently typed embedded response is structurally valid");
+        assert_eq!(
+            wrong_kind.validate_against(&input_requests),
+            Err(FinalInputResponseCorrelationError::ResponseKindMismatch),
+            "changing only one response payload kind rejects correlation"
+        );
+
+        let mismatched_raw = raw_call_params.replacen("weather", "forecast", 1);
+        assert!(
+            matches!(
+                CoreRequest::decode_with_raw_params(
+                    ProtocolEra::Modern2026,
+                    TOOLS_CALL,
+                    Some(&materialized_call_params),
+                    Some(&mismatched_raw),
+                ),
+                Err(CoreDispatchError::InvalidParams {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })
+            ),
+            "changing only the raw method-owned value cannot attach a source from another frame"
+        );
+
+        let raw_resource_params = r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"uri":"file:///workspace/status","inputResponses":{"second":{"roots":[]},"first":{"roots":[]}}}"#;
+        let raw_prompt_params = r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"status","inputResponses":{"second":{"roots":[]},"first":{"roots":[]}}}"#;
+        for (method, raw_params, mismatched_raw) in [
+            (
+                RESOURCES_READ,
+                raw_resource_params,
+                raw_resource_params.replacen("status", "other", 1),
+            ),
+            (
+                PROMPTS_GET,
+                raw_prompt_params,
+                raw_prompt_params.replacen("status", "other", 1),
+            ),
+        ] {
+            let materialized: Value = serde_json::from_str(raw_params)
+                .expect("raw method parameters materialize for envelope admission");
+            let decoded = CoreRequest::decode_with_raw_params(
+                ProtocolEra::Modern2026,
+                method,
+                Some(&materialized),
+                Some(raw_params),
+            )
+            .expect("raw final retry parameters preserve ordered input responses");
+            let entries = match decoded {
+                CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) => params
+                    .input_responses
+                    .as_ref()
+                    .expect("resource retry map is present")
+                    .entries(),
+                CoreRequest::Final(FinalCoreRequest::PromptsGet(params)) => params
+                    .input_responses
+                    .as_ref()
+                    .expect("prompt retry map is present")
+                    .entries(),
+                _ => panic!("raw parameters select their method's final request type"),
+            };
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|(key, _)| key.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["second", "first"],
+                "{method} retains inputResponses wire order"
+            );
+            assert!(
+                matches!(
+                    CoreRequest::decode_with_raw_params(
+                        ProtocolEra::Modern2026,
+                        method,
+                        Some(&materialized),
+                        Some(&mismatched_raw),
+                    ),
+                    Err(CoreDispatchError::InvalidParams {
+                        era: ProtocolEra::Modern2026,
+                        method: rejected_method,
+                    }) if rejected_method == method
+                ),
+                "changing only one raw {method} value cannot attach another frame's source"
+            );
+        }
+    }
+
+    #[test]
+    fn final_mrtr_retry_rejects_duplicate_wire_keys_and_present_state_only_maps() {
+        let raw_params = r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"weather","inputResponses":{"roots":{"roots":[]},"roots":{"roots":[]}},"requestState":"retry-1"}"#;
+        let materialized: Value = serde_json::from_str(raw_params)
+            .expect("JSON-RPC envelope materializes duplicate members as a value");
+        assert!(
+            matches!(
+                CoreRequest::decode_with_raw_params(
+                    ProtocolEra::Modern2026,
+                    TOOLS_CALL,
+                    Some(&materialized),
+                    Some(raw_params),
+                ),
+                Err(CoreDispatchError::InvalidParams {
+                    era: ProtocolEra::Modern2026,
+                    method: TOOLS_CALL,
+                })
+            ),
+            "a duplicate inputResponses wire key is rejected before it can collapse into a map"
+        );
+
+        let request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            TOOLS_CALL,
+            Some(&serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "name": "weather"
+            })),
+        )
+        .expect("accepted final tool request remains available after planted rejection");
+        let CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) = request
+            .decode_result(r#"{"resultType":"input_required","requestState":"state-only"}"#)
+            .expect("state-only input-required result decodes")
+        else {
+            panic!("state-only result selects the final input-required branch");
+        };
+        assert_eq!(
+            FinalInputResponses::default().validate_against_input_required(&result),
+            Err(FinalInputResponseCorrelationError::StateOnlyInputResponses),
+            "an explicit empty inputResponses object is not an absent member"
+        );
+        assert!(
+            result.input_requests().is_none(),
+            "the planted explicit-empty rejection does not add input requests"
+        );
+        assert_eq!(
+            result.request_state(),
+            Some("state-only"),
+            "the planted explicit-empty rejection does not mutate accepted state-only state"
+        );
+    }
+
+    #[test]
+    fn final_retry_parameters_reject_null_or_untyped_input_responses() {
+        let accepted = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "name": "weather",
+            "inputResponses": {"request-1": {"roots": []}},
+            "requestState": "retry-1"
+        });
+        let baseline = CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&accepted))
+            .expect("typed final retry parameters are admitted");
+
+        for (field, value) in [
+            ("inputResponses", serde_json::Value::Null),
+            ("requestState", serde_json::Value::Null),
+            (
+                "inputResponses",
+                serde_json::json!({"request-1": {"approved": true}}),
+            ),
+        ] {
+            let mut planted = accepted.clone();
+            planted[field] = value;
+            assert!(
+                matches!(
+                    CoreRequest::decode(ProtocolEra::Modern2026, TOOLS_CALL, Some(&planted)),
+                    Err(CoreDispatchError::InvalidParams {
+                        era: ProtocolEra::Modern2026,
+                        method: TOOLS_CALL,
+                    })
+                ),
+                "changing only {field} rejects a null or untyped final retry member"
+            );
+        }
+        assert_eq!(
+            baseline.encode_params().expect("baseline encodes"),
+            Some(accepted),
+            "each planted rejection leaves the accepted retry parameters unchanged"
+        );
     }
 
     #[test]

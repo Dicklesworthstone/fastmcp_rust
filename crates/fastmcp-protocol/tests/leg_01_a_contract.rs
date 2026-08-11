@@ -283,6 +283,40 @@ fn leg_01_envelopes_positive() {
 }
 
 #[test]
+fn leg_01_legacy_response_metadata_is_separate_from_final_metadata() {
+    let legacy_response = json!({
+        "jsonrpc": "2.0",
+        "id": "legacy-reverse",
+        "result": {
+            "roots": [],
+            "_meta": {"com.example/opaque": {"retained": true}},
+        },
+    });
+
+    assert!(matches!(
+        decode_legacy_2024_11_05_envelope(legacy_response.clone())
+            .expect("application-defined legacy response metadata must remain representable"),
+        Legacy2024Envelope::Response { id, result }
+            if id == json!("legacy-reverse") && result == legacy_response["result"]
+    ));
+
+    let mut final_metadata = legacy_response.clone();
+    final_metadata["result"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+        json!("2026-07-28");
+    assert_eq!(
+        decode_legacy_2024_11_05_envelope(final_metadata)
+            .expect_err("changing only to final metadata must reject the legacy response")
+            .reason(),
+        "final result members cannot be represented by exact MCP 2024-11-05"
+    );
+    assert_eq!(
+        legacy_response["result"]["_meta"],
+        json!({"com.example/opaque": {"retained": true}}),
+        "cross-era rejection must not alter the legacy response baseline"
+    );
+}
+
+#[test]
 fn leg_01_top_level_batch_array_planted_negative() {
     let array_of_one = Value::Array(vec![exact_initialize()]);
     let mixed_array = Value::Array(vec![
