@@ -5826,6 +5826,7 @@ pub struct ElicitationRequiredErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ResultMeta;
     use crate::types::PROTOCOL_VERSION;
 
     const PROGRESS_MARKER_KEY: &str = "progressTo\x6ben";
