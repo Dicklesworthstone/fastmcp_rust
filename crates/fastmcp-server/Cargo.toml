@@ -22,9 +22,10 @@ default = ["legacy-2024-11-05"]
 legacy-2024-11-05 = [
     "fastmcp-protocol/legacy-2024-11-05",
     "fastmcp-transport/legacy-2024-11-05",
+    "fastmcp-console/legacy-2024-11-05",
 ]
-tasks = ["fastmcp-protocol/tasks"]
-apps = ["fastmcp-protocol/apps", "dep:html5ever"]
+tasks = ["fastmcp-protocol/tasks", "fastmcp-console/tasks"]
+apps = ["fastmcp-protocol/apps", "fastmcp-console/apps", "dep:html5ever"]
 enterprise-auth = ["fastmcp-protocol/jose"]
 oauth-client-credentials = ["fastmcp-protocol/jose"]
 builtin-auth-server = ["fastmcp-protocol/jose", "dep:argon2"]

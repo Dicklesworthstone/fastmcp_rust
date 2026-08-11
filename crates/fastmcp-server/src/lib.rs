@@ -10099,7 +10099,7 @@ impl Server {
         if !self.run_startup_hook() {
             error!(target: targets::SERVER, "Startup hook failed");
             if returning {
-                server.graceful_shutdown_returning();
+                self.graceful_shutdown_returning();
                 return;
             }
             self.graceful_shutdown(1);
@@ -19058,7 +19058,7 @@ mod lib_unit_tests {
                 .get_task(&task_id)
                 .expect("admitted update retains its durable result")
                 .task,
-            FinalTask::Working(_)
+            fastmcp_protocol::Task::Working(_)
         ));
     }
 

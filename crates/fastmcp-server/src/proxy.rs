@@ -3,7 +3,7 @@
 //! This module provides lightweight proxy handlers that forward tool/resource/prompt
 //! calls to another MCP server via a backend client.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use fastmcp_client::http_executor::{
     LegacyHttpRequest, ModernHttpClient, ModernHttpFinalCoreEvent, ModernHttpResponseKind,
+    ModernHttpSubscriptionListenError,
 };
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
@@ -365,6 +366,7 @@ pub trait ProxyFinalTaskListener: Send {
 ///
 /// A listener emits [`Self::Acknowledged`] exactly once before emitting a
 /// notification or [`Self::Terminal`].
+#[derive(Debug)]
 pub enum ProxyFinalTaskListenerEvent {
     /// Upstream accepted the requested task filter.
     Acknowledged(SubscriptionFilter),
@@ -1557,11 +1559,11 @@ impl ProxyBackend for Client {
         self.ensure_initialized()?;
         match self.selected_protocol_era() {
             Some(ProtocolEra::Legacy2024) => Ok(true),
-            Some(ProtocolEra::Modern2026) => self
+            Some(ProtocolEra::Modern2026) => Ok(self
                 .server_discovery()
                 .map(discovery_supports_final_completion)
                 .transpose()?
-                .unwrap_or(false),
+                .unwrap_or(false)),
             None => Err(McpError::internal_error(
                 "Proxy client has no selected protocol era for completion/complete",
             )),
@@ -2203,7 +2205,7 @@ struct ProxyFinalTaskRegistry {
 /// matching the process-local task-store retention rule. A null `ttlMs` is an
 /// explicit unlimited-retention declaration: it remains until a terminal
 /// state is evicted for capacity, never because a local default elapsed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ProxyRelayedFinalTask {
     task: FinalTask,
     binding: ProxyUpstreamBinding,
@@ -2519,7 +2521,14 @@ impl ProxyFinalTaskRelay {
             let evicted = registry
                 .tasks
                 .iter()
-                .filter(|(_, retained)| retained.task.base().status.is_terminal())
+                .filter(|(_, retained)| {
+                    matches!(
+                        retained.task.base().status,
+                        fastmcp_protocol::FinalTaskStatus::Completed
+                            | fastmcp_protocol::FinalTaskStatus::Failed
+                            | fastmcp_protocol::FinalTaskStatus::Cancelled
+                    )
+                })
                 .min_by_key(|(_, retained)| retained.retained_at)
                 .map(|(task_id, _)| task_id.clone());
             let Some(task_id) = evicted else {
@@ -2991,14 +3000,18 @@ impl ProxyHttpClient {
 
         let mut handlers = ReverseRequestHandlers::new();
         if self.client_capabilities.sampling.is_some() {
-            handlers = handlers.with_sampling_create_message(|_, _| {
-                Err(McpError::internal_error(
-                    "Proxy HTTP legacy sampling callback is unavailable",
-                ))
+            handlers = handlers.with_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async move {
+                    Err(McpError::internal_error(
+                        "Proxy HTTP legacy sampling callback is unavailable",
+                    ))
+                })
             });
         }
         if self.client_capabilities.roots.is_some() {
-            handlers = handlers.with_roots_list(|_, _| Ok(ListRootsResult::empty()));
+            handlers = handlers.with_roots_list(|_cx, _cancellation, _params| {
+                Box::pin(async move { Ok(ListRootsResult::empty()) })
+            });
         }
         self.connection
             .set_legacy_reverse_request_handlers(handlers)
@@ -3463,12 +3476,12 @@ impl ProxyBackend for ProxyHttpClient {
     fn supports_completion(&mut self) -> McpResult<bool> {
         match self.binding.era() {
             ProtocolEra::Legacy2024 => Ok(true),
-            ProtocolEra::Modern2026 => self
+            ProtocolEra::Modern2026 => Ok(self
                 .connection
                 .server_discovery()
-                .map(discovery_supports_final_completion)
+                .map(|discovery| discovery_supports_final_completion(&discovery))
                 .transpose()?
-                .unwrap_or(false),
+                .unwrap_or(false)),
         }
     }
 
@@ -3848,10 +3861,21 @@ impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<ProxyFinalTaskListenerEvent> {
+        let listen = self.listener.next_event(cx);
+        let listen = async move {
+            listen.await.map_err(|error| match error {
+                ModernHttpSubscriptionListenError::CallerCancelled { .. } => {
+                    McpError::request_cancelled()
+                }
+                other => McpError::invalid_request(format!(
+                    "Proxy HTTP final Tasks listener rejected an upstream frame: {other:?}"
+                )),
+            })
+        };
         match block_on(await_proxy_operation_or_cancellation(
             cx,
             request_cancellation,
-            Box::pin(self.listener.next_event(cx)),
+            Box::pin(listen),
         ))
         .map_err(|error| {
             if error.code == fastmcp_core::McpErrorCode::RequestCancelled {
@@ -5037,7 +5061,7 @@ impl ProxyClient {
         match response {
             Ok(response) => request.decode_response(response, method),
             Err(error) if ctx.request_cancellation().is_cancel_requested() => {
-                request.cancel(ctx.cx())?;
+                block_on(request.cancel(ctx.cx()))?;
                 Err(error)
             }
             Err(error) => Err(error),
@@ -6082,11 +6106,13 @@ mod tests {
         ProxyFinalTaskListener, ProxyFinalTaskListenerEvent, ProxyHttpClient, ProxyPromptCatalog,
         ProxyPromptHandler, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
         ProxyToolHandler, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
-        await_proxy_final_task_listener_event_or_cancellation, decode_modern_server_notification,
+        await_proxy_final_task_listener_event_or_cancellation,
+        await_proxy_operation_or_cancellation, decode_modern_server_notification,
         final_tool_legacy_fallback, forward_modern_progress_notification,
         legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
-    use crate::handler::{FinalToolSchemaAuthority, PromptHandler, ToolHandler};
+    use std::task::Poll;
+    use crate::handler::{FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ToolHandler};
 
     #[test]
     fn proxy_modern_sse_progress_callback_preserves_raw_progress_lexemes() {
@@ -6251,6 +6277,7 @@ mod tests {
         let CoreResult::Final(complete_terminal) = final_tool_result_with_open_members() else {
             panic!("fixture is an exact final tools/call result");
         };
+        let mut complete_terminal = Some(complete_terminal);
 
         let error = block_on(await_proxy_final_task_listener_event_or_cancellation(
             &context,
@@ -6261,7 +6288,9 @@ mod tests {
                 );
                 Poll::Ready(Ok::<_, fastmcp_core::McpError>(Some(
                     fastmcp_client::http_executor::ModernHttpFinalCoreEvent::Terminal(
-                        complete_terminal,
+                        complete_terminal
+                            .take()
+                            .expect("the terminal race future is polled to completion once"),
                     ),
                 )))
             })),
