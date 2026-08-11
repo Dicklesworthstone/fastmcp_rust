@@ -512,11 +512,19 @@ mod trust_std {
                 b"FND01ENTRYv1|bootstrap|produce|E_TEST|pipe\\x7Cslash\\\\lf\\ncr\\rtab\\tnul\\x00del\\x7Futf8-\\xC3\\xA9\\x7E\n",
             );
             assert_eq!(
-                writer.bytes.iter().filter(|byte| **byte == b'|').count(),
+                writer
+                    .bytes
+                    .split(|byte| *byte == b'|')
+                    .count()
+                    .saturating_sub(1),
                 4,
             );
             assert_eq!(
-                writer.bytes.iter().filter(|byte| **byte == b'\n').count(),
+                writer
+                    .bytes
+                    .split(|byte| *byte == b'\n')
+                    .count()
+                    .saturating_sub(1),
                 1,
             );
         }
@@ -661,7 +669,13 @@ mod trust_std {
             ));
         }
         let mut decoded = [0u8; N];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+        {
             let high = lower_hex_nibble(pair[0]).ok_or_else(|| {
                 TrustError::new("E_HEX_FORMAT", format!("{subject}: lowercase hex required"))
             })?;
@@ -786,7 +800,13 @@ mod trust_std {
 
         fn compress(&mut self, block: &[u8; 64]) {
             let mut schedule = [0u32; 64];
-            for (index, word) in block.chunks_exact(4).take(16).enumerate() {
+            for (index, word) in block
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(16)
+                .enumerate()
+            {
                 schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
             }
             for index in 16..64 {
@@ -804,45 +824,51 @@ mod trust_std {
                     .wrapping_add(small_sigma_1);
             }
 
-            let mut a = self.state[0];
-            let mut b = self.state[1];
-            let mut c = self.state[2];
-            let mut d = self.state[3];
-            let mut e = self.state[4];
-            let mut f = self.state[5];
-            let mut g = self.state[6];
-            let mut h = self.state[7];
+            let mut state_a = self.state[0];
+            let mut state_b = self.state[1];
+            let mut state_c = self.state[2];
+            let mut state_d = self.state[3];
+            let mut state_e = self.state[4];
+            let mut state_f = self.state[5];
+            let mut state_g = self.state[6];
+            let mut state_h = self.state[7];
 
             for index in 0..64 {
-                let big_sigma_1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-                let choice = (e & f) ^ ((!e) & g);
-                let temporary_1 = h
+                let big_sigma_1 = state_e.rotate_right(6)
+                    ^ state_e.rotate_right(11)
+                    ^ state_e.rotate_right(25);
+                let choice = (state_e & state_f) ^ ((!state_e) & state_g);
+                let temporary_1 = state_h
                     .wrapping_add(big_sigma_1)
                     .wrapping_add(choice)
                     .wrapping_add(SHA256_ROUND_CONSTANTS[index])
                     .wrapping_add(schedule[index]);
-                let big_sigma_0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-                let majority = (a & b) ^ (a & c) ^ (b & c);
+                let big_sigma_0 = state_a.rotate_right(2)
+                    ^ state_a.rotate_right(13)
+                    ^ state_a.rotate_right(22);
+                let majority = (state_a & state_b)
+                    ^ (state_a & state_c)
+                    ^ (state_b & state_c);
                 let temporary_2 = big_sigma_0.wrapping_add(majority);
 
-                h = g;
-                g = f;
-                f = e;
-                e = d.wrapping_add(temporary_1);
-                d = c;
-                c = b;
-                b = a;
-                a = temporary_1.wrapping_add(temporary_2);
+                state_h = state_g;
+                state_g = state_f;
+                state_f = state_e;
+                state_e = state_d.wrapping_add(temporary_1);
+                state_d = state_c;
+                state_c = state_b;
+                state_b = state_a;
+                state_a = temporary_1.wrapping_add(temporary_2);
             }
 
-            self.state[0] = self.state[0].wrapping_add(a);
-            self.state[1] = self.state[1].wrapping_add(b);
-            self.state[2] = self.state[2].wrapping_add(c);
-            self.state[3] = self.state[3].wrapping_add(d);
-            self.state[4] = self.state[4].wrapping_add(e);
-            self.state[5] = self.state[5].wrapping_add(f);
-            self.state[6] = self.state[6].wrapping_add(g);
-            self.state[7] = self.state[7].wrapping_add(h);
+            self.state[0] = self.state[0].wrapping_add(state_a);
+            self.state[1] = self.state[1].wrapping_add(state_b);
+            self.state[2] = self.state[2].wrapping_add(state_c);
+            self.state[3] = self.state[3].wrapping_add(state_d);
+            self.state[4] = self.state[4].wrapping_add(state_e);
+            self.state[5] = self.state[5].wrapping_add(state_f);
+            self.state[6] = self.state[6].wrapping_add(state_g);
+            self.state[7] = self.state[7].wrapping_add(state_h);
         }
 
         pub fn update(&mut self, mut bytes: &[u8]) -> TrustResult<()> {
@@ -907,7 +933,12 @@ mod trust_std {
             self.compress(&block);
 
             let mut digest = [0u8; 32];
-            for (destination, word) in digest.chunks_exact_mut(4).zip(self.state) {
+            for (destination, word) in digest
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(self.state)
+            {
                 destination.copy_from_slice(&word.to_be_bytes());
             }
             Ok(digest)
@@ -1053,6 +1084,10 @@ mod trust_std {
         ))
     }
 
+    #[allow(
+        clippy::struct_field_names,
+        reason = "field names mirror frozen policy keys consumed by the evidence parser"
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct BootstrapLockLexicalLimits {
         pub max_bytes: u64,
@@ -1862,6 +1897,10 @@ mod trust_std {
         }
     }
 
+    #[allow(
+        clippy::struct_field_names,
+        reason = "field names mirror frozen policy keys consumed by the evidence parser"
+    )]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PhaseBSpaceBudget {
         pub max_tree_entry_count: u64,
@@ -2791,12 +2830,9 @@ mod trust_std {
     }
 
     fn require_qualified_platform() -> TrustResult<()> {
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
+        if std::env::consts::OS == "linux" && std::env::consts::ARCH == "x86_64" {
             Ok(())
-        }
-        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-        {
+        } else {
             Err(TrustError::new(
                 "E_UNQUALIFIED_PLATFORM",
                 "retained evidence requires Linux x86_64",
@@ -3277,9 +3313,9 @@ mod trust_std {
             }
             names.push(name);
         }
-        names.sort();
+        names.sort_unstable();
         let mut expected = EXPECTED_NAMES;
-        expected.sort();
+        expected.sort_unstable();
         if names
             .iter()
             .map(String::as_str)
@@ -8378,8 +8414,8 @@ mod trust_std {
             record.record("supply_bundle")?,
             "control supply bundle",
         )?;
-        if &local_registry != &expected.local_registry
-            || &supply_bundle != &expected.supply_bundle
+        if local_registry != expected.local_registry
+            || supply_bundle != expected.supply_bundle
         {
             return Err(TrustError::new(
                 "E_CONTROL_INPUT_BINDING",
@@ -8429,7 +8465,7 @@ mod trust_std {
             record.record("selected_executable")?,
             "control selected executable",
         )?;
-        if &selected_executable != &expected.selected_executable {
+        if selected_executable != expected.selected_executable {
             return Err(TrustError::new(
                 "E_CONTROL_EXECUTABLE",
                 "selected executable binding mismatch",
@@ -8471,7 +8507,7 @@ mod trust_std {
             record.record("target_snapshot")?,
             "control target snapshot",
         )?;
-        if &target_snapshot != &expected.target_snapshot {
+        if target_snapshot != expected.target_snapshot {
             return Err(TrustError::new(
                 "E_CONTROL_TARGET",
                 "target snapshot mismatch",
@@ -13159,8 +13195,7 @@ mod trust_std {
             )? != 0
             || section_string(build, "evidence_verdict", "producer control build")?
                 != "Pass"
-            || cargo_message_count < 2
-            || cargo_message_count > 1_000_000
+            || !(2..=1_000_000).contains(&cargo_message_count)
             || section_string(artifact, "package_id", "producer artifact")?
                 != expected_package_id
             || section_string(artifact, "manifest_path", "producer artifact")?
@@ -16621,7 +16656,7 @@ mod trust_std {
             );
 
             let mut ordinal = command.clone();
-            ordinal.ordinal = if command.ordinal == 0 { 1 } else { 0 };
+            ordinal.ordinal = u64::from(command.ordinal == 0);
             assert_ne!(
                 validated_acquisition_command_preimage(&ordinal)
                     .expect("mutated ordinal preimage"),
@@ -18866,6 +18901,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     }
 
     mod produce_acquisition_permit {
+        #[allow(
+            clippy::wildcard_imports,
+            reason = "this private evidence submodule consumes the complete frozen phase-B authority surface"
+        )]
         use super::*;
 
         #[derive(Debug)]
@@ -19102,7 +19141,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         trait AmbiguousIfClone<A> { fn check() {} }
         impl<T: ?Sized> AmbiguousIfClone<()> for T {}
         struct CloneMarker;
-        impl<T: ?Sized + Clone> AmbiguousIfClone<CloneMarker> for T {}
+        impl<T: Clone> AmbiguousIfClone<CloneMarker> for T {}
         let _ = <ProduceAcquisitionPermit as AmbiguousIfClone<_>>::check;
         let _ = <BoundedProduceAcquisition as AmbiguousIfClone<_>>::check;
         let _: fn(ProduceAcquisitionPermit) -> TrustResult<BoundedProduceAcquisition> =
@@ -20752,6 +20791,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Materialized(&'a BTreeMap<String, MaterializedNode>),
     }
 
+    fn has_crate_extension(value: &str) -> bool {
+        value
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension == "crate")
+    }
+
     fn acquisition_file_maximum(
         relative: &str,
         byte_length: u64,
@@ -20761,7 +20806,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         {
             if basename.is_empty()
                 || basename.contains('/')
-                || !basename.ends_with(".crate")
+                || !has_crate_extension(basename)
             {
                 return Err(phase_b_error(
                     "E_PHASE_B_ACQUISITION_PATH",
@@ -20769,7 +20814,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 ));
             }
             Some(MAX_ARCHIVE_COMPRESSED_BYTES)
-        } else if relative.ends_with(".crate") {
+        } else if has_crate_extension(relative) {
             return Err(phase_b_error(
                 "E_PHASE_B_ACQUISITION_PATH",
                 format!("{relative}: archive outside exact crate-cache root"),
@@ -21576,7 +21621,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     fn validate_supply_path(kind: u8, path: &str) -> TrustResult<()> {
         validate_relative_path(path, "supply entry")?;
         if kind == 0x01 {
-            if path.contains('/') || !path.ends_with(".crate") {
+            if path.contains('/') || !has_crate_extension(path) {
                 return Err(phase_b_error(
                     "E_PHASE_B_SUPPLY_PATH",
                     format!("invalid crate archive path {path:?}"),
@@ -25402,10 +25447,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             let mut source = None;
             let mut checksum = None;
             let mut dependencies = None;
-            loop {
-                let Some(line) = lines.peek().copied() else {
-                    break;
-                };
+            while let Some(line) = lines.peek().copied() {
                 if line.is_empty() {
                     lines.next();
                     break;
@@ -26272,12 +26314,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 .filter(|(_, declaration)| {
                     declaration.package_name == row.package
                         && declaration.dependency_name == expected_dependency_name
-                        && declaration.renamed == !row.verifier
+                        && declaration.renamed != row.verifier
                         && declaration.source.as_deref() == Some(CRATES_IO)
                         && declaration.path.is_none()
                         && declaration.kind == "normal"
                         && declaration.target_condition.is_none()
-                        && declaration.optional == !row.verifier
+                        && declaration.optional != row.verifier
                         && declaration.uses_default_features == row.default_features
                         && declaration.features.iter().map(String::as_str).eq(row.features.iter().copied())
                 })
@@ -27851,7 +27893,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             {
                 if basename.is_empty()
                     || basename.contains('/')
-                    || !basename.ends_with(".crate")
+                    || !has_crate_extension(basename)
                     || !archive_names.insert(basename.to_owned())
                 {
                     return Err(phase_b_error(
@@ -27861,7 +27903,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                         ),
                     ));
                 }
-            } else if relative.ends_with(".crate") {
+            } else if has_crate_extension(relative) {
                 return Err(phase_b_error(
                     "E_PHASE_B_ACQUISITION_PATH",
                     format!("{relative}: archive outside exact crate-cache root"),
@@ -27905,7 +27947,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             if let Some(basename) = relative.strip_prefix(ACQUISITION_CRATE_CACHE_PREFIX) {
                 if basename.is_empty()
                     || basename.contains('/')
-                    || !basename.ends_with(".crate")
+                    || !has_crate_extension(basename)
                 {
                     return Err(phase_b_error(
                         "E_PHASE_B_ACQUISITION_PATH",
@@ -27949,7 +27991,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 }
                 continue;
             }
-            if relative.ends_with(".crate") {
+            if has_crate_extension(&relative) {
                 return Err(phase_b_error(
                     "E_PHASE_B_ACQUISITION_PATH",
                     format!(
@@ -28999,10 +29041,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         if stream.is_empty() {
             return Err(tool_version_error(format!("{parser}: global.empty")));
         }
-        if stream.iter().any(|byte| *byte == 0) {
+        if stream.contains(&0) {
             return Err(tool_version_error(format!("{parser}: global.nul")));
         }
-        if stream.iter().any(|byte| *byte == b'\r') {
+        if stream.contains(&b'\r') {
             return Err(tool_version_error(format!("{parser}: global.cr")));
         }
         let text = std::str::from_utf8(stream)
@@ -29015,13 +29057,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 "{parser}: global.extra-terminal-lf"
             )));
         }
-        let line_count = body
-            .as_bytes()
-            .iter()
-            .filter(|byte| **byte == b'\n')
-            .count()
-            .checked_add(1)
-            .ok_or_else(|| tool_version_error(format!("{parser}: global.line-count")))?;
+        let line_count = body.split('\n').count();
         Ok(StrictVersionLines { body, line_count })
     }
 
@@ -30519,7 +30555,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )?;
         ensure_repository_directory(
             repository_root,
-            &acquisition_home,
+            acquisition_home,
             true,
             &space_guard,
             PhaseBSpaceGroup::RunOnly,
@@ -30563,7 +30599,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )?;
         ensure_repository_directory(
             repository_root,
-            &acquisition_target,
+            acquisition_target,
             true,
             &space_guard,
             PhaseBSpaceGroup::RunOnly,
@@ -30576,7 +30612,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         ) = inventory_native_tools(
             repository_root,
             &environment.closed_path,
-            &execution_bin,
+            execution_bin,
             authority,
             &space_guard,
         )?;
@@ -30643,7 +30679,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             None,
             authority.cargo_discovery_requires_no_config,
             repository_root,
-            &execution_bin,
+            execution_bin,
             &selected_tools,
             execution_bin_sha256,
             &space_guard,
@@ -30688,7 +30724,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             None,
             authority.cargo_discovery_requires_no_config,
             repository_root,
-            &execution_bin,
+            execution_bin,
             &selected_tools,
             execution_bin_sha256,
             &space_guard,
@@ -30804,7 +30840,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             repository_root,
             &local_registry,
             &supply,
-            &admitted_bootstrap_input,
+            admitted_bootstrap_input,
             &space_guard,
         )?;
         let registry_abs = utf8_absolute(
@@ -31014,7 +31050,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             Some(&config_authority),
             false,
             repository_root,
-            &execution_bin,
+            execution_bin,
             &selected_tools,
             execution_bin_sha256,
             &space_guard,
@@ -31491,6 +31527,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::items_after_test_module,
+        reason = "this large frozen evidence module keeps its typed-result fixtures near their parser"
+    )]
     mod typed_result_tests {
         use super::*;
 
@@ -31875,7 +31915,21 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         const AUTHORITY_REJECTION:&str="E_PHASE_B_ACQUISITION_AUTHORITY";
-        fn pinned_policy_row(a:&[u8],b:&[u8],h:&str){let i=FROZEN_POLICY.windows(a.len()).position(|v|v==a).unwrap();let j=i+FROZEN_POLICY[i..].windows(b.len()).position(|v|v==b).unwrap();assert_eq!(encode_lower_hex(&sha256(&FROZEN_POLICY[i..j]).unwrap()),h)}
+        fn pinned_policy_row(start: &[u8], end: &[u8], expected_hash: &str) {
+            let start_index = FROZEN_POLICY
+                .windows(start.len())
+                .position(|window| window == start)
+                .unwrap();
+            let end_index = start_index
+                + FROZEN_POLICY[start_index..]
+                    .windows(end.len())
+                    .position(|window| window == end)
+                    .unwrap();
+            assert_eq!(
+                encode_lower_hex(&sha256(&FROZEN_POLICY[start_index..end_index]).unwrap()),
+                expected_hash
+            );
+        }
         const PRODUCE_AUTHORITY_MATRIX:&[(&str,&[u8],u8)]=&[
 ("environment",ACQUISITION_ENVIRONMENT_POLICY,0),
 ("argv",b"argv_template = [\"{tool.cargo.path}\", \"metadata\", \"--format-version\", \"1\", \"--all-features\", \"--manifest-path\", \"{bootstrap-manifest}\"]",1),
@@ -32991,9 +33045,9 @@ _ => unreachable!("closed family matrix"),
             ]);
             validate_summaries_cache_v3(&cache, "valid selected cache")
                 .expect("unselected outer-version/checksum/yanked drift remains typed data");
-            let invalid_historical = format!(
-                r#"{{"name":"historical_other","vers":"1.0.1","deps":[{{"name":"dep","req":"*","optional":true,"kind":"dev"}}],"cksum":"","yanked":true}}"#
-            );
+            let invalid_historical =
+                r#"{"name":"historical_other","vers":"1.0.1","deps":[{"name":"dep","req":"*","optional":true,"kind":"dev"}],"cksum":"","yanked":true}"#
+                    .to_owned();
             let invalid_historical_cache = synthetic_summaries_cache(&[
                 ("1.0.0", invalid_historical.as_bytes()),
                 ("1.2.3", selected.as_bytes()),
@@ -33681,10 +33735,10 @@ _ => unreachable!("closed family matrix"),
                 )
             }
             _ => {
-                return Err(phase_b_error(
+                Err(phase_b_error(
                     "E_PHASE_B_SEAL",
                     "role/retained integration-set presence mismatch",
-                ));
+                ))
             }
         }
     }
@@ -35397,6 +35451,10 @@ activate = 1\n";
     }
 
     #[derive(Debug, Deserialize)]
+    #[allow(
+        clippy::struct_field_names,
+        reason = "policy_id is a frozen evidence-schema field name"
+    )]
     struct Policy {
         format: String, schema_version: u32, policy_id: String,
         protocol_version: String, recorded_on: String, hash_algorithm: String,
@@ -35501,6 +35559,10 @@ activate = 1\n";
     }
 
     #[derive(Debug, Clone, Copy)]
+    #[allow(
+        clippy::struct_field_names,
+        reason = "archive-bound field names mirror the frozen evidence schema"
+    )]
     struct ArchiveBounds {
         max_archive_compressed_bytes: u64,
         max_archive_expanded_bytes: u64,
@@ -35515,6 +35577,10 @@ activate = 1\n";
     }
 
     #[derive(Debug, Clone, Copy)]
+    #[allow(
+        clippy::struct_field_names,
+        reason = "lock-bound field names mirror the frozen evidence schema"
+    )]
     struct FixedCargoLockBounds {
         max_source_file_bytes: u64,
         max_record_array_items: usize,
@@ -40133,8 +40199,8 @@ activate = 1\n";
                 .then_with(|| left.ordinal.cmp(&right.ordinal))
         });
         if specs.windows(2).any(|pair| {
-            (pair[0].root == pair[1].root && pair[0].ordinal == pair[1].ordinal)
-                || (pair[0].root == pair[1].root && pair[0].field == pair[1].field)
+            pair[0].root == pair[1].root
+                && (pair[0].ordinal == pair[1].ordinal || pair[0].field == pair[1].field)
         }) {
             return Err(Diagnostic::error(
                 "E_RECORD_TYPE_REGISTRY",
@@ -41852,6 +41918,10 @@ activate = 1\n";
     const SERDE_JSON_PRIVATE_NUMBER_KEY: &str = "$serde_json::private::Number";
 
     #[derive(Debug, Clone, Copy)]
+    #[allow(
+        clippy::struct_field_names,
+        reason = "JSON-bound field names mirror the frozen evidence schema"
+    )]
     struct JsonPreallocationBounds {
         max_depth: usize,
         max_object_members: usize,
@@ -44264,9 +44334,9 @@ activate = 1\n";
         }
     }
 
-    fn validate_mutation_fixtures<'a>(
-        policy: &'a Policy,
-    ) -> VResult<BTreeMap<&'a str, &'a MutationFixture>> {
+    fn validate_mutation_fixtures(
+        policy: &Policy,
+    ) -> VResult<BTreeMap<&str, &MutationFixture>> {
         if policy.mutation_fixture.len() != policy.fixture_contract.exact_fixture_count {
             return Err(Diagnostic::error("E_FIXTURE_COUNT", "mutation_fixture")
                 .at(policy.mutation_fixture.len().to_string()));
@@ -44392,7 +44462,7 @@ activate = 1\n";
         Ok(fixtures)
     }
 
-    fn mutation_argument<'a>(case: &'a NegativeCase) -> VResult<&'a str> {
+    fn mutation_argument(case: &NegativeCase) -> VResult<&str> {
         case.argument
             .as_deref()
             .filter(|argument| !argument.is_empty())
@@ -45074,7 +45144,7 @@ activate = 1\n";
     }
 
     fn decode_lower_hex(value: &str, subject: &str) -> VResult<Vec<u8>> {
-        if value.len() % 2 != 0
+        if !value.len().is_multiple_of(2)
             || !value
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -45083,7 +45153,9 @@ activate = 1\n";
         }
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let text =
                     std::str::from_utf8(pair).map_err(|_| Diagnostic::error("E_HEX", subject))?;
@@ -45485,7 +45557,7 @@ activate = 1\n";
             .all(|pair| pair[0].as_bytes() < pair[1].as_bytes())
     }
 
-    fn assertion_negative_id<'a>(assertion: &'a SemanticAssertion) -> VResult<&'a str> {
+    fn assertion_negative_id(assertion: &SemanticAssertion) -> VResult<&str> {
         let prefix = format!("{}.", assertion.family);
         assertion
             .id
@@ -46137,7 +46209,7 @@ activate = 1\n";
                     let components = parse_pointer(&assertion.selector, &assertion.id)?;
                     let valid_offset = components.get(1).is_some_and(|component| {
                         component == "end"
-                            || component.parse::<usize>().ok().is_some_and(|offset| {
+                            || component.parse::<usize>().is_ok_and(|offset| {
                                 component == &offset.to_string() && offset < source.bytes.len()
                             })
                     });
@@ -48624,11 +48696,7 @@ activate = 1\n";
         subject: &str,
         field: &str,
     ) -> VResult<Vec<ParsedWorkspaceBinding>> {
-        let expected_values = policy
-            ._validated_unmodeled
-            .get("workspace_binding")
-            .and_then(toml::Value::as_array)
-            .ok_or_else(|| Diagnostic::error("E_POLICY_TYPED_EXTRACTION", "workspace_binding"))?;
+        let expected_values = policy_unmodeled_array(policy, "workspace_binding")?;
         let workspace_contract = policy_unmodeled_table(policy, "workspace_snapshot")?;
         let expected_count = record_usize(workspace_contract, "file_count", "workspace_snapshot")?;
         if actual_values.len() != expected_values.len() || actual_values.len() != expected_count {
@@ -49659,7 +49727,12 @@ activate = 1\n";
         let mut sources = BTreeMap::new();
         for binding in workspace_bindings
             .iter()
-            .filter(|binding| binding.path.starts_with("crates/") && binding.path.ends_with(".rs"))
+            .filter(|binding| {
+                binding.path.starts_with("crates/")
+                    && Path::new(binding.path.as_str())
+                        .extension()
+                        .is_some_and(|extension| extension == "rs")
+            })
         {
             let logical = format!("workspace source/{}", binding.path);
             let bytes = checked_workspace_file_bytes(
@@ -49703,19 +49776,29 @@ activate = 1\n";
             let matches = if selector == "crates/**/*.rs" {
                 sources
                     .iter()
-                    .filter(|(path, _)| path.starts_with("crates/") && path.ends_with(".rs"))
+                    .filter(|(path, _)| {
+                        path.starts_with("crates/")
+                            && Path::new(path.as_str())
+                                .extension()
+                                .is_some_and(|extension| extension == "rs")
+                    })
                     .collect::<Vec<_>>()
             } else if selector == "crates/fastmcp-cli/src/**/*.rs" {
                 sources
                     .iter()
                     .filter(|(path, _)| {
-                        path.starts_with("crates/fastmcp-cli/src/") && path.ends_with(".rs")
+                        path.starts_with("crates/fastmcp-cli/src/")
+                            && Path::new(path.as_str())
+                                .extension()
+                                .is_some_and(|extension| extension == "rs")
                     })
                     .collect::<Vec<_>>()
             } else if !selector.is_empty()
                 && !selector.contains('*')
                 && selector.starts_with("crates/")
-                && selector.ends_with(".rs")
+                && Path::new(selector)
+                    .extension()
+                    .is_some_and(|extension| extension == "rs")
             {
                 vec![sources.get_key_value(selector).ok_or_else(|| {
                     Diagnostic::error("E_INTEGRATION_SOURCE_SCOPE", subject).at(selector)
@@ -51340,24 +51423,21 @@ activate = 1\n";
                     .map(|value| value.as_scalar("release/build if"))
                     .transpose()?
                     .map(normalized_workflow_condition);
-                match condition {
-                    Some("runner.os != 'Windows'") => {
-                        if unix.replace((index, run)).is_some() {
-                            return Err(Diagnostic::error(
-                                "E_RELEASE_ASSET_SCRIPT",
-                                "duplicate Unix archive step",
-                            ));
-                        }
-                    }
-                    Some("runner.os == 'Windows'") => {
-                        if windows.replace((index, run)).is_some() {
-                            return Err(Diagnostic::error(
-                                "E_RELEASE_ASSET_SCRIPT",
-                                "duplicate Windows archive step",
-                            ));
-                        }
-                    }
-                    _ => {}
+                if condition == Some("runner.os != 'Windows'")
+                    && unix.replace((index, run)).is_some()
+                {
+                    return Err(Diagnostic::error(
+                        "E_RELEASE_ASSET_SCRIPT",
+                        "duplicate Unix archive step",
+                    ));
+                }
+                if condition == Some("runner.os == 'Windows'")
+                    && windows.replace((index, run)).is_some()
+                {
+                    return Err(Diagnostic::error(
+                        "E_RELEASE_ASSET_SCRIPT",
+                        "duplicate Windows archive step",
+                    ));
                 }
             }
             if step
@@ -52064,7 +52144,7 @@ activate = 1\n";
             let logical = format!("{subject}/jobs/{job_id}");
             let job = value.as_mapping(&logical)?;
             for (_, step, lines) in workflow_run_lines(job, &logical)? {
-                if !lines.iter().any(|line| *line == command) {
+                if !lines.contains(&command) {
                     continue;
                 }
                 if step.contains_key("if")
@@ -55248,7 +55328,7 @@ activate = 1\n";
                 for resolved_feature in &resolved_features {
                     candidates.push(RngRowCandidate {
                         edge,
-                        resolved_feature: *resolved_feature,
+                        resolved_feature,
                         target_condition_encoding: target_condition_encoding.clone(),
                         declaration_features_encoding: declaration_features_encoding.clone(),
                     });
@@ -58407,7 +58487,9 @@ activate = 1\n";
         if components.len() != 3
             || components[0] != "crates"
             || !components[2].starts_with("RUSTSEC-")
-            || !components[2].ends_with(".md")
+            || Path::new(components[2])
+                .extension()
+                .is_none_or(|extension| extension != "md")
         {
             return Ok(None);
         }
@@ -59555,7 +59637,7 @@ activate = 1\n";
         let mut index_file_names = BTreeSet::new();
         for _ in 0..entry_count {
             let kind = cursor.read_u8()?;
-            if !matches!(kind, 0x01 | 0x02 | 0x03) {
+            if !matches!(kind, 0x01..=0x03) {
                 return Err(Diagnostic::error("E_SUPPLY_KIND", subject).at(kind.to_string()));
             }
             let path = cursor.read_string(policy.bounds.max_path_bytes)?;
@@ -59656,7 +59738,7 @@ activate = 1\n";
                     validate_sha256(checksum, &path)?;
                     if strict_json_bool(object, "yanked", &path)?
                         || crates_io_index_path(name, &path)? != path
-                        || !file_package_name.as_ref().is_none_or(|prior| prior == name)
+                        || file_package_name.as_ref().is_some_and(|prior| prior != name)
                         || !file_versions.insert(semver_without_build_metadata(version).to_owned())
                     {
                         return Err(Diagnostic::error("E_SUPPLY_INDEX_BINDING", subject).at(&path));
@@ -59881,11 +59963,10 @@ activate = 1\n";
         let declared_payload_bytes = cursor.read_u64()?;
         let mut actual_payload_bytes = 0u64;
         let mut members = Vec::with_capacity(member_count);
-        for index in 0..member_count {
+        for &expected_package in PACKAGE_IDS.iter().take(member_count) {
             let entry_id = cursor.read_string(policy.bounds.max_id_bytes)?;
             let package_id = cursor.read_string(policy.bounds.max_id_bytes)?;
             let basename = cursor.read_string(policy.bounds.max_path_component_bytes)?;
-            let expected_package = PACKAGE_IDS[index];
             if entry_id != format!("package.{expected_package}")
                 || package_id != expected_package
                 || basename != format!("{expected_package}-{PACKAGE_VERSION}.crate")
@@ -59940,6 +60021,10 @@ activate = 1\n";
         package_union_sha256: String,
     }
 
+    #[allow(
+        clippy::used_underscore_binding,
+        reason = "the underscore-prefixed field is a frozen flattened evidence-schema catch-all"
+    )]
     fn policy_unmodeled_table<'a>(
         policy: &'a Policy,
         name: &str,
@@ -59951,6 +60036,10 @@ activate = 1\n";
             .ok_or_else(|| Diagnostic::error("E_POLICY_TYPED_EXTRACTION", name))
     }
 
+    #[allow(
+        clippy::used_underscore_binding,
+        reason = "the underscore-prefixed field is a frozen flattened evidence-schema catch-all"
+    )]
     fn policy_unmodeled_array<'a>(policy: &'a Policy, name: &str) -> VResult<&'a [toml::Value]> {
         policy
             ._validated_unmodeled
@@ -60239,11 +60328,8 @@ activate = 1\n";
             ));
         }
         let family_order = policy_string_array(policy, "command_matrix_contract", "family_order")?;
-        let family_values = policy
-            ._validated_unmodeled
-            .get("command_family")
-            .and_then(toml::Value::as_array)
-            .ok_or_else(|| Diagnostic::error("E_COMMAND_FAMILY", "command_family"))?;
+        let family_values = policy_unmodeled_array(policy, "command_family")
+            .map_err(|_| Diagnostic::error("E_COMMAND_FAMILY", "command_family"))?;
         if family_order
             .iter()
             .map(String::as_str)
@@ -63822,13 +63908,7 @@ activate = 1\n";
         let header = record_string(contract, "manifest_header_exact_template", subject)?
             .replace("<projection-id>", &projection.id);
         let footer = record_string(contract, footer_field, subject)?;
-        let rows = policy
-            ._validated_unmodeled
-            .get("projection_dependency")
-            .and_then(toml::Value::as_array)
-            .ok_or_else(|| {
-                Diagnostic::error("E_POLICY_TYPED_EXTRACTION", "projection_dependency")
-            })?;
+        let rows = policy_unmodeled_array(policy, "projection_dependency")?;
         let mut manifest = String::with_capacity(
             header
                 .len()
@@ -63982,13 +64062,7 @@ activate = 1\n";
             return Err(Diagnostic::error("E_PROJECTION_ROOT_GRAPH", subject).at("root identity"));
         }
 
-        let rows = policy
-            ._validated_unmodeled
-            .get("projection_dependency")
-            .and_then(toml::Value::as_array)
-            .ok_or_else(|| {
-                Diagnostic::error("E_POLICY_TYPED_EXTRACTION", "projection_dependency")
-            })?;
+        let rows = policy_unmodeled_array(policy, "projection_dependency")?;
         let mut expected_edges = BTreeSet::new();
         let mut dependency_count = 0usize;
         for (index, value) in rows.iter().enumerate() {
@@ -64080,8 +64154,8 @@ activate = 1\n";
         const ALPHABET: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        let mut chunks = bytes.chunks_exact(3);
-        for chunk in &mut chunks {
+        let (chunks, remainder) = bytes.as_chunks::<3>();
+        for chunk in chunks {
             encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
             encoded.push(char::from(
                 ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
@@ -64091,7 +64165,7 @@ activate = 1\n";
             ));
             encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
         }
-        match chunks.remainder() {
+        match remainder {
             [] => {}
             [first] => {
                 encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
@@ -64107,7 +64181,7 @@ activate = 1\n";
                 encoded.push(char::from(ALPHABET[usize::from((second & 0x0f) << 2)]));
                 encoded.push('=');
             }
-            _ => unreachable!("chunks_exact(3) has a remainder shorter than three"),
+            _ => unreachable!("as_chunks::<3>() has a remainder shorter than three"),
         }
         encoded
     }
@@ -65775,6 +65849,10 @@ activate = 1\n";
         Ok(())
     }
 
+    #[allow(
+        clippy::naive_bytecount,
+        reason = "the frozen verifier remains dependency-minimal and this bounded scan is not a hot path"
+    )]
     fn source_line_location(
         bytes: &[u8],
         anchor: usize,
@@ -65925,7 +66003,7 @@ activate = 1\n";
                 if spelling == "extern"
                     && !matches!(
                         tokens.get(index + 1),
-                        Some(TokenTree::Ident(next)) if next.to_string() == "crate"
+                        Some(TokenTree::Ident(next)) if next == "crate"
                     )
                 {
                     push_rust_source_finding(
@@ -67139,7 +67217,7 @@ activate = 1\n";
             format!("@{}", receipt.symbol_inventory.response_file.path);
         if options.iter().map(String::as_str).ne(expected_options)
             || scan.argv.len() != options.len() + 2
-            || scan.argv[1..1 + options.len()]
+            || scan.argv[1..=options.len()]
                 .iter()
                 .map(String::as_str)
                 .ne(expected_options)
@@ -69114,13 +69192,7 @@ activate = 1\n";
         list_path: &str,
         subject: &str,
     ) -> VResult<Option<&'a toml::map::Map<String, toml::Value>>> {
-        let rows = policy
-            ._validated_unmodeled
-            .get("package_relocated_source")
-            .and_then(toml::Value::as_array)
-            .ok_or_else(|| {
-                Diagnostic::error("E_POLICY_TYPED_EXTRACTION", "package_relocated_source")
-            })?;
+        let rows = policy_unmodeled_array(policy, "package_relocated_source")?;
         let mut matching = rows.iter().filter_map(toml::Value::as_table).filter(|row| {
             row.get("package_id").and_then(toml::Value::as_str) == Some(package_id)
                 && row.get("list_path").and_then(toml::Value::as_str) == Some(list_path)
@@ -71322,8 +71394,8 @@ activate = 1\n";
         const ALPHABET: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-        let mut chunks = bytes.chunks_exact(3);
-        for chunk in &mut chunks {
+        let (chunks, remainder) = bytes.as_chunks::<3>();
+        for chunk in chunks {
             encoded.push(char::from(ALPHABET[usize::from(chunk[0] >> 2)]));
             encoded.push(char::from(
                 ALPHABET[usize::from(((chunk[0] & 0x03) << 4) | (chunk[1] >> 4))],
@@ -71333,7 +71405,7 @@ activate = 1\n";
             ));
             encoded.push(char::from(ALPHABET[usize::from(chunk[2] & 0x3f)]));
         }
-        match chunks.remainder() {
+        match remainder {
             [] => {}
             [first] => {
                 encoded.push(char::from(ALPHABET[usize::from(first >> 2)]));
@@ -71508,7 +71580,7 @@ activate = 1\n";
                 || signature.len() != modulus.len()
                 || protected_bytes != expected_protected
                 || signing_input != expected_signing_input.as_bytes()
-                || signing_input.iter().filter(|byte| **byte == b'.').count() != 1
+                || signing_input.split(|byte| *byte == b'.').count() != 2
             {
                 return Err(Diagnostic::error("E_RS256_VECTOR", &subject).at("cryptographic input"));
             }
@@ -72734,7 +72806,7 @@ activate = 1\n";
             || !name.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
             || !name.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
             || name.bytes().any(|byte| {
-                !byte.is_ascii_alphanumeric() && ![b'-', b'_', b'.'].contains(&byte)
+                !byte.is_ascii_alphanumeric() && !b"-_.".contains(&byte)
             })
         {
             return Err(Diagnostic::error("E_SDK_NATIVE_LOCK", subject).at("Python name"));
@@ -72742,7 +72814,7 @@ activate = 1\n";
         let mut normalized = String::new();
         let mut separator = false;
         for byte in name.bytes() {
-            if [b'-', b'_', b'.'].contains(&byte) {
+            if b"-_.".contains(&byte) {
                 separator = true;
             } else {
                 if separator && !normalized.is_empty() {
@@ -77031,7 +77103,7 @@ activate = 1\n";
             }
             let admitted = source_lookup(admitted_files, path)?;
             let bytes = &admitted.bytes;
-            let expected_parse_kind = if path.ends_with(".json") {
+            let expected_parse_kind = if path.strip_suffix(".json").is_some() {
                 FileFamily::Json
             } else {
                 FileFamily::Utf8Text
@@ -77359,8 +77431,8 @@ activate = 1\n";
             || record_string(root, "bead_id", "auth-standards")?
                 != "bd-mcp-2026-07-28-support-ahet.1.4"
             || record_string(root, "hash_algorithm", "auth-standards")? != "sha256"
-            || record_bool(root, "primary_source_only", "auth-standards")? != true
-            || record_bool(root, "offline_body_rehash_available", "auth-standards")? != false
+            || !record_bool(root, "primary_source_only", "auth-standards")?
+            || record_bool(root, "offline_body_rehash_available", "auth-standards")?
             || record_usize(root, "vendor_copy_count", "auth-standards")? != 0
             || record_usize(
                 root,
@@ -79546,7 +79618,7 @@ activate = 1\n";
 
         let oversized_scalar = "x".repeat(MAX_RESTRICTED_YAML_SCALAR_BYTES.saturating_add(1));
         let scalar_workflow =
-            format!("jobs:\n  build:\n    steps:\n      - run: {oversized_scalar}\n",);
+            format!("jobs:\n  build:\n    steps:\n      - run: {oversized_scalar}\n");
         assert_eq!(
             parse_restricted_workflow_yaml(&scalar_workflow, "large scalar workflow")
                 .expect_err("scalar bytes must be bounded")
@@ -81106,14 +81178,11 @@ dependency_kinds = ["build", "normal"]
     }
 
     fn synthetic_toml_optional(value: Option<&str>) -> toml::Value {
-        toml::Value::Array(value.into_iter().map(|value| synthetic_toml_string(value)).collect())
+        toml::Value::Array(value.into_iter().map(synthetic_toml_string).collect())
     }
 
     fn synthetic_workspace_binding_values(policy: &Policy, identity_base: u64) -> Vec<toml::Value> {
-        policy
-            ._validated_unmodeled
-            .get("workspace_binding")
-            .and_then(toml::Value::as_array)
+        policy_unmodeled_array(policy, "workspace_binding")
             .expect("policy workspace bindings must be an array")
             .iter()
             .enumerate()
@@ -85329,7 +85398,7 @@ original = "value"
             }
             if metadata.is_dir() {
                 collect_state_partition_rng_workspace_inventory(inventory, root, &logical_path)?;
-            } else if metadata.is_file() && name.ends_with(".rs") {
+            } else if metadata.is_file() && name.strip_suffix(".rs").is_some() {
                 load_state_partition_rng_rust_source(inventory, logical_path, &absolute_path)?;
             } else if metadata.is_file() && name == "Cargo.toml" {
                 let manifest = fs::read_to_string(&absolute_path)
@@ -85470,8 +85539,7 @@ original = "value"
 
     fn state_partition_rng_qualified_call_count(stream: &TokenStream, path: &[&str]) -> usize {
         let trees = stream.clone().into_iter().collect::<Vec<_>>();
-        let local = (path.len() >= 2)
-        .then(|| {
+        let local = if path.len() >= 2 {
             trees
                 .iter()
                 .enumerate()
@@ -85500,8 +85568,9 @@ original = "value"
                     )
                 })
                 .count()
-        })
-        .unwrap_or(0);
+        } else {
+            0
+        };
         local
             + trees
                 .iter()
@@ -86774,11 +86843,7 @@ original = "value"
             }
         }
         for api in STATE_PARTITION_RNG_SEALED_APIS {
-            let expected_references = if api == "draw_security_identifier" {
-                1
-            } else {
-                0
-            };
+            let expected_references = usize::from(api == "draw_security_identifier");
             if state_partition_rng_sealed_api_reference_count(&state.tokens, api)
                 != expected_references
             {
@@ -88097,7 +88162,7 @@ original = "value"
             assert_eq!(spec.id, *sdk_id, "independent SDK tool authority order");
             assert_eq!(spec.additional_tool_ids, *expected_ids, "{sdk_id}");
             let tools = expected_ids.iter()
-                .map(|id| sdk_test_binding(*id, &format!("/tools/{id}")))
+                .map(|id| sdk_test_binding(id, &format!("/tools/{id}")))
                 .collect::<Vec<_>>();
             sdk_validate_additional_tool_ids(&tools, spec.additional_tool_ids, "test")
                 .expect("exact external command closure");
@@ -88405,7 +88470,7 @@ original = "value"
             assert_eq!(spec.id, *sdk_id, "independent SDK tool authority order");
             assert_eq!(spec.additional_tool_ids, *expected_ids, "{sdk_id}");
             let pristine = expected_ids.iter()
-                .map(|id| sdk_test_binding(*id, &format!("/tools/{id}")))
+                .map(|id| sdk_test_binding(id, &format!("/tools/{id}")))
                 .collect::<Vec<_>>();
             let mut candidate = pristine.clone();
             let _ = candidate.pop();
@@ -90561,7 +90626,7 @@ fn fallible(value: Option<u8>) {
         for ordinal in 0..entry_count {
             let logical = format!("{subject}/entry[{ordinal}]");
             let kind = cursor.read_u8()?;
-            if !matches!(kind, 0x01 | 0x02 | 0x03) {
+            if !matches!(kind, 0x01..=0x03) {
                 return Err(Diagnostic::error("E_ORDINARY_SUPPLY_KIND", &logical)
                     .at(format!("{kind:#04x}")));
             }
@@ -91802,9 +91867,12 @@ fn fallible(value: Option<u8>) {
         }
 
         let bytes = encoded.as_bytes();
-        assert!(!bytes.is_empty() && bytes.len() % 4 == 0, "fixture base64 framing");
+        assert!(
+            !bytes.is_empty() && bytes.len().is_multiple_of(4),
+            "fixture base64 framing"
+        );
         let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
-        for (ordinal, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (ordinal, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             let final_chunk = ordinal + 1 == bytes.len() / 4;
             let padding = usize::from(chunk[3] == b'=') + usize::from(chunk[2] == b'=');
             assert!(padding <= 2 && (padding == 0 || final_chunk), "fixture base64 padding");
@@ -92456,7 +92524,7 @@ fn fallible(value: Option<u8>) {
         let evidence_advances = Cell::new(0usize);
         let mut rejected_batches = 0usize;
         for role in 0..20 {
-            for mutation in 0..10 {
+            for (mutation, expected_diagnostic) in expected_diagnostics.iter().enumerate() {
                 let mut changed = inputs.clone();
                 match mutation {
                     0 => changed[role].tool_id.push_str("-drift"),
@@ -92490,7 +92558,7 @@ fn fallible(value: Option<u8>) {
                 }
                 let error = result.expect_err("one-variable full-batch context drift");
                 assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
-                assert_eq!(error.detail(), expected_diagnostics[mutation]);
+                assert_eq!(error.detail(), *expected_diagnostic);
                 assert_eq!(authorities, authority_baseline, "authority state unchanged");
                 assert_eq!(inputs, input_baseline, "accepted input state unchanged");
                 assert_eq!(
@@ -94512,10 +94580,22 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(test)]
+    #[allow(
+        clippy::upper_case_acronyms,
+        reason = "compact aliases keep the large frozen failure-route oracle readable"
+    )]
     type OFS = OrdinaryFailureSite;
     #[cfg(test)]
+    #[allow(
+        clippy::upper_case_acronyms,
+        reason = "compact aliases keep the large frozen failure-route oracle readable"
+    )]
     type OFR = OrdinaryFailureRoute;
     #[cfg(test)]
+    #[allow(
+        clippy::upper_case_acronyms,
+        reason = "compact aliases keep the large frozen failure-route oracle readable"
+    )]
     type ORO = (OFR, &'static str, &'static str, &'static str, &'static str);
 
     #[cfg(test)]
@@ -97161,7 +97241,7 @@ fn fallible(value: Option<u8>) {
         let source = include_str!("fnd_01_dependency_evidence.rs");
         let ordinary_start = source.find("mod ordinary {").expect("ordinary module");
         let ordinary_end = source.rfind("} // mod ordinary").expect("ordinary module end");
-        let ordinary_source = &source[ordinary_start..ordinary_end + 1];
+        let ordinary_source = &source[ordinary_start..=ordinary_end];
         let body = compact_ordinary_token_text(&ordinary_function_body(
             ordinary_source,
             "harness_main",
@@ -97866,11 +97946,7 @@ fn fallible(value: Option<u8>) {
                             for diagnostic in report.sorted_stable() {
                                 eprintln!("{diagnostic}");
                             }
-                            if failed {
-                                1
-                            } else {
-                                0
-                            }
+                            i32::from(failed)
                         }
                         Err(diagnostic) => {
                             eprintln!("{}", diagnostic.stable());

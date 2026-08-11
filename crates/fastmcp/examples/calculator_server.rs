@@ -152,7 +152,7 @@ fn is_prime(ctx: &McpContext, n: i64) -> String {
         if ctx.is_cancelled() {
             return "Cancelled".to_string();
         }
-        if n_unsigned % i == 0 {
+        if n_unsigned.is_multiple_of(i) {
             return "false".to_string();
         }
     }

@@ -43,7 +43,7 @@ is_exact_modern_discovery() {
 while IFS= read -r request; do
     emit_wire "$request"
     is_exact_modern_discovery "$request" || exit 1
-    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"serverInfo":{"name":"modern-inspect-server","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-inspect-server","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}'
 done
 "#;
 
@@ -1431,8 +1431,7 @@ fn drain_forbidden_http_contacts_after_shutdown(
             .min(FORBIDDEN_CONTACT_POLL_INTERVAL);
         match shutdown_requested.recv_timeout(wait) {
             Ok(())
-            | Err(mpsc::RecvTimeoutError::Disconnected)
-            | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            | Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -1814,7 +1813,7 @@ fn e2e_cli_inspect_http_bundle_modern_only_uses_live_modern_h1_and_negotiated_st
         write_h1_json_response(
             &mut stream,
             deadline,
-            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"serverInfo":{"name":"modern-h1-inspect","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-h1-inspect","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
         );
 
         let mut stream = accept_h1_fixture_connection(
@@ -1951,7 +1950,7 @@ fn e2e_cli_inspect_http_bundle_auto_keeps_modern_after_discovery_when_applicatio
             write_h1_json_response(
                 &mut discovery,
                 deadline,
-                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"serverInfo":{"name":"auto-modern-h1-inspect","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"auto-modern-h1-inspect","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
             let mut application = accept_h1_fixture_connection(
@@ -2977,14 +2976,13 @@ fn assert_initialization_absolute_timeout(server_script: &str, scenario: &str) {
 #[cfg(unix)]
 #[test]
 fn e2e_test_idle_timeout_reports_late_ping_response() {
-    // Complete initialization, then delay the ping response beyond the product
+    // Complete modern discovery, then delay the ping response beyond the product
     // deadline to cover the post-initialization request path separately from
     // the silent and partial-frame initialization cases above.
     const LATE_PING_SERVER: &str = r#"
-IFS= read -r initialize || exit 20
-printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"late-ping-fixture","version":"1.0.0"}}}'
-IFS= read -r initialized || exit 21
-IFS= read -r ping || exit 22
+IFS= read -r discovery || exit 20
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"late-ping-fixture","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}'
+IFS= read -r ping || exit 21
 sleep 2
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
 "#;

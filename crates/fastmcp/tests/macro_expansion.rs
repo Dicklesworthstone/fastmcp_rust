@@ -27,16 +27,17 @@ use fastmcp_rust::serde_json::json;
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
     ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
 };
 use fastmcp_rust::{
     CacheScope, CacheTtl, CompleteResult, Content, ContentBlock, Cx, EmbeddedResourceContents,
     FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage,
-    FinalReadResourceResult, FinalTaskWorkDescriptor, FinalToolOutcome, Implementation,
-    InboundRequestContext, InboundRequestTransport, InputRequiredResult, JsonRpcRequest,
-    JsonSchema, MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, Outcome,
-    PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role, ToolHandler,
-    prompt, resource, tool,
+    FinalReadResourceResult, FinalToolOutcome, Implementation, InboundRequestContext,
+    InboundRequestTransport, InputRequiredResult, JsonRpcRequest, JsonSchema,
+    MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
+    PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role, ToolHandler, prompt,
+    resource, tool,
 };
 use fastmcp_server::Server;
 use std::collections::{BTreeMap, HashMap};
@@ -143,9 +144,12 @@ mod facade_only_macro_compile_proofs {
             "facade_only_prompt"
         );
 
-        let _: Option<fastmcp_rust::legacy_2024::CancelledParams> = None;
-        let _: Option<fastmcp_rust::legacy_2024::InitializeParams> = None;
-        let _: Option<fastmcp_rust::legacy_2024::Tool> = None;
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let _: Option<fastmcp_rust::legacy_2024::CancelledParams> = None;
+            let _: Option<fastmcp_rust::legacy_2024::InitializeParams> = None;
+            let _: Option<fastmcp_rust::legacy_2024::Tool> = None;
+        }
         let _: Option<fastmcp_rust::modern::FinalCallToolParams> = None;
         let _: Option<ResourceContent> = None;
     }
@@ -183,6 +187,7 @@ fn tool_apps_ui_metadata_is_final_only() {
     );
 }
 
+#[cfg(feature = "apps")]
 #[test]
 fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
     use fastmcp_rust::{
@@ -195,7 +200,7 @@ fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
         McpAppsResultProjectionError, McpAppsToolMetadata, McpAppsToolResult,
         McpAppsToolVisibility, McpAppsViewLifecycle, ModernHttpResponseStream,
         ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener, RequestId, SseLimits,
-        SubscriptionFilter, legacy_2024, modern, prelude, project_final_core_tools_call_result,
+        SubscriptionFilter, modern, prelude, project_final_core_tools_call_result,
     };
 
     let resource_uri = FinalAbsoluteUri::parse("ui://apps.example.test/view")
@@ -303,10 +308,6 @@ fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
     let _: usize = prelude::MAX_MCP_APPS_TOOL_VISIBILITY_ENTRIES;
     let _: usize = prelude::MAX_MCP_APPS_UI_METADATA_MEMBERS;
     assert_eq!(prelude::MCP_APPS_UI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY);
-    let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
-    let _: Option<legacy_2024::LegacySamplingRequestHandler> = None;
-    let _: Option<legacy_2024::LegacyRootsRequestHandler> = None;
-    let _: Option<legacy_2024::LegacySseHttpClient> = None;
     let _: Option<McpAppsLifecycleError> = None;
     let _: Option<McpAppsResourceBindingError> = None;
     let _: usize = MAX_MCP_APPS_UI_METADATA_MEMBERS;
@@ -319,6 +320,18 @@ fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
     );
 }
 
+#[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
+#[test]
+fn facade_only_apps_with_legacy_companion_surfaces_compile() {
+    use fastmcp_rust::legacy_2024;
+
+    let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
+    let _: Option<legacy_2024::LegacySamplingRequestHandler> = None;
+    let _: Option<legacy_2024::LegacyRootsRequestHandler> = None;
+    let _: Option<legacy_2024::LegacySseHttpClient> = None;
+}
+
+#[cfg(feature = "proxy")]
 #[test]
 fn facade_only_typed_proxy_catalogs_compile_for_legacy_and_final_eras() {
     use fastmcp_rust::{
@@ -697,7 +710,7 @@ fn long_timed_tool() -> String {
 fn tool_timeout_compound() {
     let handler = LongTimedTool;
     let timeout = handler.timeout();
-    assert_eq!(timeout, Some(std::time::Duration::from_secs(90 * 60)));
+    assert_eq!(timeout, Some(std::time::Duration::from_mins(90)));
 }
 
 // --- Tool with bool parameter ---
@@ -1004,6 +1017,7 @@ fn final_tool_outcome(mode: &str) -> FinalToolOutcome {
             InputRequiredResult::new(None, Some("retry-state".to_string()), final_result_meta())
                 .expect("request state makes input-required valid"),
         ),
+        #[cfg(feature = "tasks")]
         "create-task" => FinalToolOutcome::CreateTask {
             work_descriptor: FinalTaskWorkDescriptor::new(json!({
                 "operation": "macro-expansion-final-task"
@@ -1132,6 +1146,7 @@ fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
                 .expect("input-required outcome is preserved"),
             FinalToolOutcome::InputRequired(_)
         ));
+        #[cfg(feature = "tasks")]
         assert!(matches!(
             handler
                 .call_final_outcome(&ctx, json!({"mode": "create-task"}))

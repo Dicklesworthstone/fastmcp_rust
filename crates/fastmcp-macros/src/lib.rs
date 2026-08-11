@@ -1034,12 +1034,6 @@ fn generate_tool_apps_metadata(ui: Option<&ToolAppsUi>) -> TokenStream2 {
     }
 }
 
-/// Apps-off tool declarations cannot retain UI metadata after parsing rejects it.
-#[cfg(not(feature = "apps"))]
-fn generate_tool_apps_metadata(_ui: Option<&ToolAppsUi>) -> TokenStream2 {
-    TokenStream2::new()
-}
-
 fn generate_tool_execution_methods(
     is_async: bool,
     expects_context: bool,
@@ -3642,6 +3636,7 @@ struct ToolAttrs {
     /// Opts a canonical final tool-outcome handler into final Tasks creation.
     tasks: bool,
     /// Typed final MCP Apps UI metadata attached to this tool.
+    #[cfg(feature = "apps")]
     apps_ui: Option<ToolAppsUi>,
     tags: Vec<String>,
     defaults: HashMap<String, Lit>,
@@ -3659,6 +3654,7 @@ struct ToolAttrs {
 }
 
 /// The validated `ui(...)` declaration accepted by `#[tool]`.
+#[cfg(feature = "apps")]
 #[derive(Debug)]
 struct ToolAppsUi {
     resource_uri: String,
@@ -3666,12 +3662,14 @@ struct ToolAppsUi {
 }
 
 /// One explicit MCP Apps tool audience accepted by the macro surface.
+#[cfg(feature = "apps")]
 #[derive(Debug)]
 enum ToolAppsToolVisibility {
     Model,
     App,
 }
 
+#[cfg(not(feature = "apps"))]
 const TOOL_APPS_UI_FEATURE_DIAGNOSTIC: &str = "#[tool(ui(...))] requires Apps support; enable fastmcp-rust's `apps` feature, or for direct subcrate use enable both fastmcp-derive's and fastmcp-protocol's `apps` features";
 
 /// Parses and validates one Apps UI declaration only when the macro host has
@@ -3787,6 +3785,7 @@ impl Parse for ToolAttrs {
         let mut description = None;
         let mut timeout = None;
         let mut tasks = false;
+        #[cfg(feature = "apps")]
         let mut apps_ui = None;
         let mut tags = Vec::new();
         let mut defaults: HashMap<String, Lit> = HashMap::new();
@@ -3932,6 +3931,7 @@ impl Parse for ToolAttrs {
             description,
             timeout,
             tasks,
+            #[cfg(feature = "apps")]
             apps_ui,
             tags,
             defaults,
@@ -4077,7 +4077,7 @@ mod mrtr_resume_expansion_tests {
             true,
             &handler,
             &[&resume],
-            &[extraction.clone()],
+            std::slice::from_ref(&extraction),
             &resume,
             &resume_type,
             &quote! { Ok(result) },
@@ -4097,7 +4097,7 @@ mod mrtr_resume_expansion_tests {
             false,
             &handler,
             &call_args,
-            &[extraction.clone()],
+            std::slice::from_ref(&extraction),
             &resume,
             &resume_type,
             &quote! { Ok(result) },
@@ -4113,7 +4113,7 @@ mod mrtr_resume_expansion_tests {
             true,
             true,
             &handler,
-            &[resume.clone()],
+            std::slice::from_ref(&resume),
             &[extraction],
             &resume,
             &resume_type,
@@ -4575,7 +4575,10 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     let tasks_declaration = generate_tool_tasks_declaration(attrs.tasks);
+    #[cfg(feature = "apps")]
     let apps_metadata = generate_tool_apps_metadata(attrs.apps_ui.as_ref());
+    #[cfg(not(feature = "apps"))]
+    let apps_metadata = TokenStream2::new();
 
     let execution_methods = generate_tool_execution_methods(
         is_async,

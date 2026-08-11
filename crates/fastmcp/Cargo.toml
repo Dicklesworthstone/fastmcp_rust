@@ -92,5 +92,29 @@ semver = { workspace = true }
 ring = { workspace = true }
 proc-macro2 = { workspace = true }
 
+[[test]]
+name = "e2e_middleware"
+path = "tests/e2e_middleware.rs"
+# The middleware harness requires deterministic `TestClient` and `Cx::for_testing`.
+required-features = ["testing-lab"]
+
+[[test]]
+name = "e2e_protocol"
+path = "tests/e2e_protocol.rs"
+# The protocol harness requires deterministic `TestClient` and `Cx::for_testing`.
+required-features = ["testing-lab"]
+
+[[test]]
+name = "e2e_stress"
+path = "tests/e2e_stress.rs"
+# The stress harness requires deterministic `TestClient` and `Cx::for_testing`.
+required-features = ["testing-lab"]
+
+[[test]]
+name = "e2e_workflow"
+path = "tests/e2e_workflow.rs"
+# The workflow harness requires deterministic test helpers and the Tasks API.
+required-features = ["testing-lab", "tasks"]
+
 [lints]
 workspace = true

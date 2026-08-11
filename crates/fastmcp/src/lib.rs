@@ -11,8 +11,9 @@
 //!
 //! # Protocol status (FND-01)
 //!
-//! **MCP 2026-07-28 support is under implementation and remains unverified.**  
-//! **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
+//! **MCP 2026-07-28 support is under implementation and remains unverified.**
+//!
+//! **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
 //! The primary public surface is [`modern`], which names the exact
 //! `2026-07-28` vocabulary. Exact `2024-11-05` access is explicit through
 //! `legacy_2024`. The root-level `PROTOCOL_VERSION` remains available for
@@ -278,13 +279,13 @@ pub mod server {
         HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, LifespanHooks,
         LoggingConfig, Middleware, MiddlewareDecision, MountResult, NotificationSender,
         PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
-        Router, ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointResponse,
-        ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse,
-        ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
-        TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
-        TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, caching,
-        create_context_with_progress, create_context_with_progress_and_senders, oauth, oidc,
-        providers, rate_limiting, transform,
+        Router, ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
+        ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
+        ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier,
+        StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler,
+        TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
+        TransportSamplingSender, caching, create_context_with_progress,
+        create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
@@ -589,11 +590,15 @@ pub use fastmcp_protocol::protocol_policy::{
 };
 
 // Re-export transport types
+#[cfg(feature = "legacy-2024-11-05")]
 pub use fastmcp_transport::http::{
     DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
     DualEraHttpEndpointResponse, DualEraHttpJsonResponse, DualEraHttpLegacySseResponse,
-    DualEraHttpSession, DualEraHttpSseResponse, StreamableHttpRequestIngress,
-    StreamableHttpRequestResponseMessage, StreamableHttpRequestResponseSender,
+    DualEraHttpSession, DualEraHttpSseResponse,
+};
+pub use fastmcp_transport::http::{
+    StreamableHttpRequestIngress, StreamableHttpRequestResponseMessage,
+    StreamableHttpRequestResponseSender,
 };
 pub use fastmcp_transport::sse::SseEvent;
 pub use fastmcp_transport::{
@@ -633,12 +638,12 @@ pub use fastmcp_server::{
     HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement,
     InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
     NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender,
-    ResourceHandler, Router, ServerHttpEndpoint, ServerHttpEndpointResponse,
-    ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
-    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
-    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    ResourceHandler, Router, ServerHttpEndpoint, ServerHttpEndpointError,
+    ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
+    ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, TagFilters,
+    TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
+    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 
 /// Tasks server APIs are available only with the official Tasks extension.
@@ -1220,6 +1225,12 @@ pub mod modern {
         inner: fastmcp_client::ClientBuilder,
     }
 
+    impl Default for ClientBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl ClientBuilder {
         /// Creates a builder permanently pinned to MCP 2026-07-28 stdio.
         #[must_use]
@@ -1420,12 +1431,6 @@ pub mod modern {
                 .await
                 .map_err(HttpClientConnectError::Connect)
                 .and_then(HttpClient::from_inner)
-        }
-    }
-
-    impl Default for ClientBuilder {
-        fn default() -> Self {
-            Self::new()
         }
     }
 
@@ -3504,6 +3509,33 @@ pub mod legacy_2024 {
             self.inner.call_tool_legacy(name, arguments)
         }
 
+        /// Calls one exact-2024 tool while cooperatively driving stdio on a
+        /// caller-owned asupersync context.
+        ///
+        /// This Unix-only surface is the single-worker-safe counterpart to
+        /// [`Self::call_tool`]. It retains the facade's sealed legacy request
+        /// and result types while allowing server-initiated sampling or roots
+        /// callbacks to run on `RuntimeBuilder::current_thread()`.
+        #[cfg(unix)]
+        pub async fn call_tool_with_cx(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<CallToolResult> {
+            let request = LegacyCoreRequest::ToolsCall(CallToolParams {
+                name: name.to_owned(),
+                arguments: Some(arguments),
+                meta: None,
+            });
+            match self.inner.request_legacy_core_with_cx(cx, request).await? {
+                LegacyCoreResult::ToolsCall(result) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected tools/call result",
+                )),
+            }
+        }
+
         /// Lists exact-2024 resources.
         pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
             self.inner.list_resources()
@@ -3617,6 +3649,12 @@ pub mod legacy_2024 {
     #[derive(Clone)]
     pub struct ClientBuilder {
         inner: fastmcp_client::ClientBuilder,
+    }
+
+    impl Default for ClientBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
     }
 
     impl ClientBuilder {
@@ -4261,10 +4299,6 @@ pub mod prelude {
         Cx,
         DecodedResult,
         DiscoveryCacheHints,
-        DualEraHttpEndpoint,
-        DualEraHttpEndpointConfig,
-        DualEraHttpEndpointError,
-        DualEraHttpLegacySseResponse,
         DuplicateBehavior,
         ExtensionDescriptor,
         ExtensionDescriptorRegistry,
@@ -4380,6 +4414,7 @@ pub mod prelude {
         ServerDiscoverRequest,
         ServerDiscoverResult,
         ServerHttpEndpoint,
+        ServerHttpEndpointError,
         ServerHttpEndpointResponse,
         ServerHttpRequestCancellation,
         ServerHttpSession,
@@ -4453,6 +4488,11 @@ pub mod prelude {
         ToolHandler, Transport, TransportElicitationSender, TransportRootsProvider,
         TransportSamplingSender, block_on, decode_strict_jsonrpc_message,
     };
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub use crate::{
+        DualEraHttpEndpoint, DualEraHttpEndpointConfig, DualEraHttpEndpointError,
+        DualEraHttpLegacySseResponse,
+    };
     #[cfg(feature = "proxy")]
     pub use crate::{
         FinalProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint, ProxyClient,
@@ -4502,6 +4542,7 @@ mod tests {
         let _: Option<super::protocol::uri_template::UriTemplate> = None;
         let _: Option<super::server::ServerLaunchPolicyError> = None;
         let _: Option<super::transport::ModernSseDecoder> = None;
+        #[cfg(feature = "testing-lab")]
         let _: Option<super::asupersync::Cx> = None;
         let _: Option<super::serde_json::Value> = None;
 
@@ -5228,6 +5269,59 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn legacy_facade_async_tool_call_services_reverse_callback_on_current_thread() {
+        use super::{Cx, legacy_2024};
+
+        let script = "IFS= read -r initialize || exit 1; \
+            case \"$initialize\" in *'\"method\":\"initialize\"'*'\"sampling\":{}'*) ;; *) exit 1 ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"facade-callback\",\"version\":\"1.0.0\"}}}'; \
+            IFS= read -r lifecycle || exit 1; \
+            case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+            IFS= read -r request || exit 1; \
+            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) ;; *) exit 1 ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
+            IFS= read -r callback || exit 1; \
+            case \"$callback\" in *'\"id\":41'*'\"model\":\"facade-model\"'*) ;; *) exit 1 ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"facade-result\"}],\"isError\":false}}'; \
+            exec sleep 2";
+        let handlers = legacy_2024::LegacyReverseRequestHandlers::new()
+            .with_sampling_create_message(|_callback_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(legacy_2024::LegacyCreateMessageResult::text(
+                        "facade-callback-result",
+                        "facade-model",
+                    ))
+                })
+            });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread facade callback runtime must build");
+
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("facade callback runtime installs its context");
+            let mut client = legacy_2024::Client::builder()
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .expect("sealed legacy facade initializes before the callback request");
+
+            let result = client
+                .call_tool_with_cx(&cx, "facade-tool", legacy_2024::json!({}))
+                .await
+                .expect("public sealed facade services the reverse callback");
+            assert!(!result.is_error);
+            let result = legacy_2024::serde_json::to_value(result)
+                .expect("legacy tool result remains serializable");
+            assert_eq!(
+                result["content"],
+                legacy_2024::json!([{"type": "text", "text": "facade-result"}])
+            );
+            assert!(result.get("isError").is_none());
+            client.close().expect("facade callback client cleanup");
+        });
+    }
+
+    #[test]
     #[cfg(feature = "legacy-2024-11-05")]
     fn legacy_facade_client_and_http_wrappers_expose_only_exact_operations() {
         use super::{Cx, McpResult, legacy_2024};
@@ -5241,6 +5335,18 @@ mod tests {
             &str,
             legacy_2024::JsonValue,
         ) -> McpResult<legacy_2024::CallToolResult> = legacy_2024::Client::call_tool;
+        #[cfg(unix)]
+        {
+            fn legacy_call_tool_with_cx<'a>(
+                client: &'a mut legacy_2024::Client,
+                cx: &'a Cx,
+            ) -> impl std::future::Future<Output = McpResult<legacy_2024::CallToolResult>> + 'a
+            {
+                client.call_tool_with_cx(cx, "tool", legacy_2024::JsonValue::Null)
+            }
+
+            let _ = legacy_call_tool_with_cx;
+        }
         let _: fn(&mut legacy_2024::Client) -> McpResult<Vec<legacy_2024::Resource>> =
             legacy_2024::Client::list_resources;
         let _: fn(&mut legacy_2024::Client, &str) -> McpResult<legacy_2024::ReadResourceResult> =
@@ -5640,16 +5746,15 @@ mod tests {
     #[test]
     fn facade_reexports_transport_ingress_sse_payload_and_progress_types() {
         use super::{
-            DualEraHttpLegacySseResponse, ProgressCallback, ServerHttpSseResponse,
-            StreamableHttpRequestIngress, StreamableHttpRequestResponseMessage,
-            StreamableHttpRequestResponseSender, modern, prelude,
+            ProgressCallback, ServerHttpSseResponse, StreamableHttpRequestIngress,
+            StreamableHttpRequestResponseMessage, StreamableHttpRequestResponseSender, modern,
+            prelude,
         };
 
         let _: Option<StreamableHttpRequestIngress> = None;
         let _: Option<StreamableHttpRequestResponseMessage> = None;
         let _: Option<StreamableHttpRequestResponseSender> = None;
         let _: Option<ServerHttpSseResponse> = None;
-        let _: Option<DualEraHttpLegacySseResponse> = None;
         let _: Option<ProgressCallback<'_>> = None;
 
         let _: Option<modern::StreamableHttpRequestIngress> = None;
@@ -5660,18 +5765,37 @@ mod tests {
         let _: Option<prelude::StreamableHttpRequestResponseMessage> = None;
         let _: Option<prelude::StreamableHttpRequestResponseSender> = None;
         let _: Option<prelude::ServerHttpSseResponse> = None;
-        let _: Option<prelude::DualEraHttpLegacySseResponse> = None;
         let _: Option<prelude::ProgressCallback<'_>> = None;
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            use super::DualEraHttpLegacySseResponse;
+
+            let _: Option<DualEraHttpLegacySseResponse> = None;
+            let _: Option<prelude::DualEraHttpLegacySseResponse> = None;
+        }
+    }
+
+    #[test]
+    fn facade_reexports_server_http_endpoint_error_beside_its_endpoint() {
+        use super::{ServerHttpEndpoint, ServerHttpEndpointError, prelude, server};
+
+        let _: Option<ServerHttpEndpoint> = None;
+        let _: Option<ServerHttpEndpointError> = None;
+        let _: Option<server::ServerHttpEndpoint> = None;
+        let _: Option<server::ServerHttpEndpointError> = None;
+        let _: Option<prelude::ServerHttpEndpoint> = None;
+        let _: Option<prelude::ServerHttpEndpointError> = None;
     }
 
     #[test]
     #[cfg(feature = "tasks")]
     fn facade_closes_modern_task_handle_and_sse_response_method_signatures() {
         use super::{
-            Cx, DualEraHttpEndpointError, FinalCancelTaskResult, FinalTask, FinalTaskHandle,
-            FinalTaskId, FinalTaskInputResponses, FinalTaskWatch, FinalUpdateTaskResult,
-            HttpClientError, ServerHttpRequestCancellation, ServerHttpSseResponse, SseEvent,
-            SseLimits, modern, prelude,
+            Cx, FinalCancelTaskResult, FinalTask, FinalTaskHandle, FinalTaskId,
+            FinalTaskInputResponses, FinalTaskWatch, FinalUpdateTaskResult, HttpClientError,
+            ServerHttpEndpointError, ServerHttpRequestCancellation, ServerHttpSseResponse,
+            SseEvent, SseLimits, modern, prelude,
         };
 
         async fn drive_task_handle(
@@ -5697,14 +5821,14 @@ mod tests {
 
         let _: fn(&ServerHttpSseResponse) -> ServerHttpRequestCancellation =
             ServerHttpSseResponse::cancellation;
-        let _: fn(&ServerHttpSseResponse, &Cx) -> Result<SseEvent, DualEraHttpEndpointError> =
+        let _: fn(&ServerHttpSseResponse, &Cx) -> Result<SseEvent, ServerHttpEndpointError> =
             ServerHttpSseResponse::recv_event;
         let _: fn(&prelude::ServerHttpSseResponse) -> prelude::ServerHttpRequestCancellation =
             prelude::ServerHttpSseResponse::cancellation;
         let _: fn(
             &prelude::ServerHttpSseResponse,
             &Cx,
-        ) -> Result<prelude::SseEvent, prelude::DualEraHttpEndpointError> =
+        ) -> Result<prelude::SseEvent, prelude::ServerHttpEndpointError> =
             prelude::ServerHttpSseResponse::recv_event;
     }
 
@@ -5759,8 +5883,9 @@ mod tests {
             FinalReadResourceResult, FinalToolCallOutcome, HttpNonquiescentShutdown,
             HttpServerShutdown, HttpShutdownSettlement, JsonValue, McpResult, ModernHttpClient,
             ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpSubscriptionListenCollector,
-            ModernHttpSubscriptionListenError, ServerHttpEndpoint, ServerHttpEndpointResponse,
-            ServerHttpSession, SseLimits, SubscriptionListenCollector, auto,
+            ModernHttpSubscriptionListenError, ServerHttpEndpoint, ServerHttpEndpointError,
+            ServerHttpEndpointResponse, ServerHttpSession, SseLimits, SubscriptionListenCollector,
+            auto,
         };
 
         let _: fn(&mut Client, &str, JsonValue) -> McpResult<FinalCallToolResult> =
@@ -5782,6 +5907,7 @@ mod tests {
         let _: Option<ModernHttpClientError> = None;
         let _: Option<ModernHttpConnectOutcome> = None;
         let _: Option<ServerHttpEndpoint> = None;
+        let _: Option<ServerHttpEndpointError> = None;
         let _: Option<ServerHttpSession> = None;
         let _: Option<ServerHttpEndpointResponse> = None;
         let _: Option<BoundHttpServer> = None;

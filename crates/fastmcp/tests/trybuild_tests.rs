@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const COMPILE_DEADLINE: Duration = Duration::from_secs(10 * 60);
+const COMPILE_DEADLINE: Duration = Duration::from_mins(10);
 const PROCESS_CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(unix)]
@@ -134,92 +134,92 @@ pub fn probe() {
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-root",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::McpAppsClientSettings;
 
 pub fn probe() {
     let _: Option<McpAppsClientSettings> = None;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("McpAppsClientSettings"),
     },
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-exact-legacy-namespace",
         features: &["apps", "legacy-2024-11-05"],
-        source: r#"
+        source: r"
 use mcp::legacy_2024::McpAppsHost;
 
 pub fn probe() {
     let _: Option<McpAppsHost<(), ()>> = None;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("McpAppsHost"),
     },
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-protocol-namespace",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::protocol::extensions::MCP_APPS_HTML_MIME_TYPE;
 
 pub fn probe() {
     let _: &str = MCP_APPS_HTML_MIME_TYPE;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
     },
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-root-extensions-namespace",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::extensions::MCP_APPS_HTML_MIME_TYPE;
 
 pub fn probe() {
     let _: &str = MCP_APPS_HTML_MIME_TYPE;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
     },
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-modern-extensions-namespace",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::modern::extensions::MCP_APPS_HTML_MIME_TYPE;
 
 pub fn probe() {
     let _: &str = MCP_APPS_HTML_MIME_TYPE;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("MCP_APPS_HTML_MIME_TYPE"),
     },
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-private-protocol-namespace",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::__private::protocol::McpAppsBridgeError;
 
 pub fn probe() {
     let _: Option<McpAppsBridgeError> = None;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("McpAppsBridgeError"),
     },
     DownstreamFeatureSymbolProbe {
         name: "apps-absent-extension-handler-installation",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::{ExtensionDescriptorRegistry, ExtensionHandlerRegistry};
 
 pub fn probe() {
     let mut registry = ExtensionHandlerRegistry::new(ExtensionDescriptorRegistry::new());
     let _ = registry.install_official_mcp_apps();
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("install_official_mcp_apps"),
     },
@@ -278,56 +278,56 @@ pub fn probe() {
     DownstreamFeatureSymbolProbe {
         name: "tasks-present",
         features: &["tasks"],
-        source: r#"
+        source: r"
 use mcp::{FinalTaskId, FinalTaskRuntime};
 
 pub fn probe() {
     let _: Option<FinalTaskId> = None;
     let _: Option<FinalTaskRuntime> = None;
 }
-"#,
+",
         should_compile: true,
         absent_feature_diagnostic: None,
     },
     DownstreamFeatureSymbolProbe {
         name: "tasks-absent",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::{FinalTaskId, FinalTaskRuntime};
 
 pub fn probe() {
     let _: Option<FinalTaskId> = None;
     let _: Option<FinalTaskRuntime> = None;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("FinalTaskId"),
     },
     DownstreamFeatureSymbolProbe {
         name: "proxy-present",
         features: &["proxy"],
-        source: r#"
+        source: r"
 use mcp::{ProxyClient, ProxyUpstreamBinding};
 
 pub fn probe() {
     let _: Option<ProxyClient> = None;
     let _: Option<ProxyUpstreamBinding> = None;
 }
-"#,
+",
         should_compile: true,
         absent_feature_diagnostic: None,
     },
     DownstreamFeatureSymbolProbe {
         name: "proxy-absent",
         features: &[],
-        source: r#"
+        source: r"
 use mcp::{ProxyClient, ProxyUpstreamBinding};
 
 pub fn probe() {
     let _: Option<ProxyClient> = None;
     let _: Option<ProxyUpstreamBinding> = None;
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("ProxyClient"),
     },
@@ -748,13 +748,13 @@ impl OwnedProcessGroup {
     fn child_has_exited(&mut self, context: &str) -> Result<bool, String> {
         #[cfg(unix)]
         {
-            return process_is_zombie(
+            process_is_zombie(
                 self.child
                     .as_ref()
                     .expect("owned process guard is armed")
                     .id(),
             )
-            .map_err(|error| format!("{context}: {error}"));
+            .map_err(|error| format!("{context}: {error}"))
         }
         #[cfg(not(unix))]
         {

@@ -479,7 +479,7 @@ fn settle_http_server_with_bound(
     completion_bound: Duration,
 ) -> Result<(), String> {
     match shutdown.try_send(()) {
-        Ok(()) | Err(mpsc::TrySendError::Full(())) | Err(mpsc::TrySendError::Disconnected(())) => {}
+        Ok(()) | Err(mpsc::TrySendError::Full(()) | mpsc::TrySendError::Disconnected(())) => {}
     }
     let completion_result = if completion.is_some() {
         Ok(())
@@ -1118,9 +1118,7 @@ struct StalledOverlapWorker {
 impl StalledOverlapWorker {
     fn release(&self) {
         match self.release.try_send(()) {
-            Ok(())
-            | Err(mpsc::TrySendError::Full(()))
-            | Err(mpsc::TrySendError::Disconnected(())) => {}
+            Ok(()) | Err(mpsc::TrySendError::Full(()) | mpsc::TrySendError::Disconnected(())) => {}
         }
     }
 
@@ -1274,10 +1272,10 @@ fn e2e_public_http_cross_era_refusals_leave_handler_observables_unchanged() {
     };
     assert!(matches!(
         legacy_refusal,
-        legacy_2024::HttpClientConnectError::Connect(legacy_2024::HttpClientError::Connection(
-            ClientHttpConnectionError::Modern(fastmcp_rust::ModernHttpClientError::LegacySse(
+        legacy_2024::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+            fastmcp_rust::ModernHttpClientError::LegacySse(
                 fastmcp_rust::LegacySseHttpClientError::SseGetRejected { status: 400 }
-            ))
+            )
         ))
     ));
     assert_eq!(

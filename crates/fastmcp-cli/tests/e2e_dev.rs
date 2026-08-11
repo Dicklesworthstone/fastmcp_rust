@@ -92,6 +92,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+
+[workspace]
 "#,
     );
     write_file(&root.join("src/main.rs"), body);
