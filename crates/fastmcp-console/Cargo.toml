@@ -16,7 +16,10 @@ categories = ["command-line-interface", "development-tools"]
 rich_rust = { workspace = true }
 log = { workspace = true, features = ["std"] }
 regex.workspace = true
-time = { version = "=0.3.47", features = ["formatting", "macros"] }
+# =0.3.55 (was =0.3.47): rich_rust (shared via beads_rust in downstream
+# workspaces) requires time ^0.3.54 after the 0.3.48 local-offset regressions
+# were fixed upstream; =0.3.47 made the two pins unresolvable in one graph.
+time = { version = "=0.3.55", features = ["formatting", "macros"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 fastmcp-core = { workspace = true }
