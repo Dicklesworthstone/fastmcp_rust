@@ -155,8 +155,12 @@ pub use bidirectional::{
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{BufReader, BufWriter, Read, Write};
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::io::Read;
+use std::io::{BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
@@ -479,6 +483,8 @@ use fastmcp_core::{
     McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
     SessionState, Sha256Digest, block_on, sha256_bounded,
 };
+#[cfg(any(feature = "apps", feature = "tasks"))]
+use fastmcp_protocol::ExtensionDescriptorRegistry;
 use fastmcp_protocol::common_types::OpenMetadata;
 use fastmcp_protocol::common_types::{Implementation, LoggingLevel};
 #[cfg(feature = "apps")]
@@ -509,10 +515,10 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
     ClientExtensionDiscovery, CoreRequest, CoreResult, CorrelationKey, DiscoveryCacheHints,
-    ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionId, ExtensionRegistryError,
-    ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
-    FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams,
-    FinalCoreResult, FinalLogMessageParams, FinalSubscriptionsAcknowledgedNotificationParams,
+    ExtensionDescriptor, ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt,
+    ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCoreResult,
+    FinalLogMessageParams, FinalSubscriptionsAcknowledgedNotificationParams,
     FinalSubscriptionsListenParams, GetPromptParams, InitializeParams, JsonRpcError,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, ListPromptsParams,
     ListResourceTemplatesParams, ListResourcesParams, ListToolsParams, LogLevel, LogMessageParams,
@@ -4333,7 +4339,7 @@ fn accepted_subscription_filter(
 ) -> McpResult<SubscriptionFilter> {
     #[cfg(not(feature = "tasks"))]
     let _ = accept_tasks;
-    let mut accepted = SubscriptionFilter {
+    let accepted = SubscriptionFilter {
         prompts_list_changed: requested.prompts_list_changed.filter(|accepted| *accepted),
         resource_subscriptions: requested.resource_subscriptions.clone(),
         resources_list_changed: requested
@@ -4344,6 +4350,8 @@ fn accepted_subscription_filter(
         // activated by the core server execution path.
         additional: BTreeMap::new(),
     };
+    #[cfg(feature = "tasks")]
+    let mut accepted = accepted;
     #[cfg(feature = "tasks")]
     if let Some(task_ids) = task_subscription_ids(requested)
         .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
@@ -8845,11 +8853,13 @@ impl Server {
         let client_capabilities = params.meta.client_capabilities().map_err(|_| {
             McpError::invalid_params("subscriptions/listen has invalid client capabilities")
         })?;
-        let Some(client_capabilities) = client_capabilities else {
+        if client_capabilities.is_none() {
             return Err(McpError::invalid_params(
                 "subscriptions/listen requires exact final request metadata",
             ));
-        };
+        }
+        #[cfg(feature = "tasks")]
+        let client_capabilities = client_capabilities.expect("presence checked above");
         if protocol_version != Some(MODERN_PROTOCOL_VERSION) {
             return Err(McpError::invalid_params(
                 "subscriptions/listen requires exact final request metadata",
@@ -10099,7 +10109,7 @@ impl Server {
         if !self.run_startup_hook() {
             error!(target: targets::SERVER, "Startup hook failed");
             if returning {
-                server.graceful_shutdown_returning();
+                self.graceful_shutdown_returning();
                 return;
             }
             self.graceful_shutdown(1);

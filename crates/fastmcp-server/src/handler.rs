@@ -797,16 +797,20 @@ impl From<InputRequiredResult> for FinalToolOutcome {
 const UNDECLARED_FINAL_TASK_OUTCOME_ERROR: &str =
     "tool returned CreateTask without declaring final Tasks capability";
 
-#[cfg(feature = "tasks")]
 fn admit_declared_final_tool_outcome(
     declares_final_tasks: bool,
     outcome: FinalToolOutcome,
 ) -> McpResult<FinalToolOutcome> {
+    #[cfg(feature = "tasks")]
     if matches!(&outcome, FinalToolOutcome::CreateTask { .. }) && !declares_final_tasks {
         return Err(McpError::invalid_request(
             UNDECLARED_FINAL_TASK_OUTCOME_ERROR,
         ));
     }
+
+    #[cfg(not(feature = "tasks"))]
+    let _ = declares_final_tasks;
+
     Ok(outcome)
 }
 
@@ -3755,6 +3759,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn tool_handler_task_creation_outcome_preserves_legacy_adapter() {
         struct TaskCreatingTool {
@@ -3828,6 +3833,7 @@ mod tests {
         assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn tool_handler_undeclared_task_creation_fails_closed_and_preserves_legacy_adapter() {
         struct UndeclaredTaskCreatingTool {
@@ -3893,6 +3899,7 @@ mod tests {
         assert_eq!(tool.legacy_calls.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(feature = "tasks")]
     #[test]
     fn task_creation_work_descriptor_rejects_null_before_an_outcome_can_be_constructed() {
         let error = FinalTaskWorkDescriptor::new(serde_json::Value::Null)

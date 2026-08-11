@@ -507,8 +507,11 @@ impl ServerBuilder {
             validate_official_mcp_apps_server_settings(settings)
                 .map_err(ServerExtensionConfigurationError::Registry)?;
         }
+        #[cfg(feature = "tasks")]
         let mut extension_runtime =
             ServerExtensionRuntime::new(handlers, server_discovery, resolver)?;
+        #[cfg(not(feature = "tasks"))]
+        let extension_runtime = ServerExtensionRuntime::new(handlers, server_discovery, resolver)?;
         #[cfg(feature = "tasks")]
         if let Some(task_runtime) = self.final_task_runtime.as_ref() {
             extension_runtime.install_final_tasks(task_runtime)?;

@@ -36,6 +36,8 @@ use fastmcp_core::{
     McpContext, McpError, McpErrorCode, McpOutcome, McpResult, SessionState, block_on,
     sha256_bounded,
 };
+#[cfg(feature = "tasks")]
+use fastmcp_protocol::MissingRequiredClientCapabilityError;
 use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
@@ -53,14 +55,13 @@ use fastmcp_protocol::{
     FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
     FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
     InitializeParams, InitializeResult, InputRequiredResult, JsonRpcRequest,
-    LegacyCompletionParams, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
-    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, MissingRequiredClientCapabilityError,
-    PROTOCOL_VERSION, ProgressMarker, Prompt, PromptMessage, ReadResourceParams,
-    ReadResourceResult, Resource, ResourceContent, ResourceTemplate, ServerBehavior,
-    ServerBehaviorRegistry, TemplateValue, Tool, admit_final_schema, exact_json_to_serde, validate,
-    validate_strict,
+    LegacyCompletionParams, LegacyCompletionReference, LegacyCompletionResult, LegacyContent,
+    LegacyCoreRequest, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
+    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
+    ProgressMarker, Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
+    ResourceContent, ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, TemplateValue,
+    TemplateValues, Tool, admit_final_schema, exact_json_to_serde, validate, validate_strict,
 };
 
 /// Type alias for a notification sender callback.
@@ -2171,7 +2172,7 @@ impl Router {
             .ok_or_else(|| {
                 McpError::invalid_request(format!(
                     "MCP Apps UI resource is not registered: {}",
-                    binding.resource_uri
+                    binding.resource_uri.as_str()
                 ))
             })?;
         binding
@@ -2546,7 +2547,7 @@ impl Router {
                 .transpose()?;
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resource_templates.contains_key(&template.uri_template);
-            if existed {
+            if exists {
                 self.legacy_resource_template_completion_handlers
                     .remove(&template.uri_template);
                 self.final_resource_template_completion_handlers
@@ -4059,6 +4060,7 @@ impl Router {
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
+        #[cfg(feature = "tasks")]
         let request_metadata = params.meta.clone();
         let outcome = self
             .handle_tools_call_final_in_request(
@@ -4756,11 +4758,7 @@ impl Router {
         let handler = &entry.handler;
         let input_schema = final_registration.schemas.input.as_ref();
         let output_schema = final_registration.schemas.output.as_ref();
-        if params.arguments.is_explicit_null() {
-            return Err(McpError::invalid_params(
-                "tools/call arguments must not be null",
-            ));
-        }
+        #[cfg(feature = "tasks")]
         let declares_final_tasks = final_registration.declares_final_tasks;
         let arguments = params
             .arguments
@@ -5553,11 +5551,6 @@ impl Router {
         let final_registration = self.final_prompts.get(&params.name).ok_or_else(|| {
             McpError::invalid_params("prompt is registered only for exact MCP 2024-11-05 dispatch")
         })?;
-        if params.arguments.is_explicit_null() {
-            return Err(McpError::invalid_params(
-                "prompts/get arguments must not be null",
-            ));
-        }
         let arguments = params.arguments.into_value().unwrap_or_default();
         if final_registration
             .definition
@@ -6021,7 +6014,7 @@ impl Router {
                 result.errors.push(format!(
                     "Mount rejected because an MCP Apps tool binding has no final HTML resource; tool_key={}; resource_uri={}",
                     safe_log_label(&name),
-                    binding.resource_uri
+                    binding.resource_uri.as_str()
                 ));
                 continue;
             };
@@ -17466,17 +17459,15 @@ mod router_tests {
             panic!("the final tool parameter shape is selected");
         };
         assert!(absent_tool_params.arguments.is_absent());
-        let CoreRequest::Final(FinalCoreRequest::ToolsCall(null_tool_params)) =
+        assert!(
             CoreRequest::decode(
                 ProtocolEra::Modern2026,
                 "tools/call",
                 null_tool_arguments.params.as_ref(),
             )
-            .expect("explicit-null final tool arguments decode")
-        else {
-            panic!("the final tool parameter shape is selected");
-        };
-        assert!(null_tool_params.arguments.is_explicit_null());
+            .is_err(),
+            "explicit-null final tool arguments are rejected during parameter admission"
+        );
 
         let absent_tool_result = router
             .dispatch_stateless(&request_ctx, &absent_tool_arguments)
@@ -17487,10 +17478,6 @@ mod router_tests {
             .dispatch_stateless(&request_ctx, &null_tool_arguments)
             .expect_err("explicit-null final tool arguments are not defaulted");
         assert_eq!(null_tool_error.code, McpErrorCode::InvalidParams);
-        assert_eq!(
-            null_tool_error.message,
-            "tools/call arguments must not be null"
-        );
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
         let absent_prompt_arguments = direct_final_prompt_request(161_i64);
@@ -17513,17 +17500,15 @@ mod router_tests {
             panic!("the final prompt parameter shape is selected");
         };
         assert!(absent_prompt_params.arguments.is_absent());
-        let CoreRequest::Final(FinalCoreRequest::PromptsGet(null_prompt_params)) =
+        assert!(
             CoreRequest::decode(
                 ProtocolEra::Modern2026,
                 "prompts/get",
                 null_prompt_arguments.params.as_ref(),
             )
-            .expect("explicit-null final prompt arguments decode")
-        else {
-            panic!("the final prompt parameter shape is selected");
-        };
-        assert!(null_prompt_params.arguments.is_explicit_null());
+            .is_err(),
+            "explicit-null final prompt arguments are rejected during parameter admission"
+        );
 
         let absent_prompt_result = router
             .dispatch_stateless(&request_ctx, &absent_prompt_arguments)
@@ -17534,10 +17519,6 @@ mod router_tests {
             .dispatch_stateless(&request_ctx, &null_prompt_arguments)
             .expect_err("explicit-null final prompt arguments are not defaulted");
         assert_eq!(null_prompt_error.code, McpErrorCode::InvalidParams);
-        assert_eq!(
-            null_prompt_error.message,
-            "prompts/get arguments must not be null"
-        );
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
     }
 
