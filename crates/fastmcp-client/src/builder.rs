@@ -48,8 +48,7 @@ use crate::{
     ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
     ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
     combine_operation_and_cleanup, combine_operation_with_cleanup, is_cleanup_unverified,
-    resolve_stdio_command,
-    validate_protocol_plan_feature,
+    resolve_stdio_command, validate_protocol_plan_feature,
 };
 
 #[cfg(feature = "legacy-2024-11-05")]
