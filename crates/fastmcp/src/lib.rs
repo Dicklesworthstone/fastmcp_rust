@@ -234,9 +234,22 @@ pub use fastmcp_derive as derive;
 /// enables that feature on `fastmcp-protocol` itself.
 pub mod protocol {
     pub use fastmcp_protocol::{
-        common_types, methods, protocol_policy, protocol_version, schema, server_discovery,
-        uri_template,
+        common_types, methods, protocol_policy, protocol_version, schema, uri_template,
     };
+
+    /// Curated final server-discovery vocabulary.
+    ///
+    /// The component's implementation module remains private; this facade
+    /// namespace exposes only its supported public protocol types.
+    pub mod server_discovery {
+        pub use fastmcp_protocol::{
+            DiscoveryCacheHints, MAX_SERVER_INSTRUCTIONS_BYTES, SERVER_DISCOVER_METHOD,
+            SERVER_DISCOVER_SERVER_INFO_META_KEY, SERVER_DISCOVER_SUPPORTED_VERSIONS,
+            ServerBehavior, ServerBehaviorRegistry, ServerDiscoverCapabilities,
+            ServerDiscoverRequest, ServerDiscoverResult, ServerDiscoveryError,
+            ServerInstructionError, ServerInstructions,
+        };
+    }
 
     /// Curated extension negotiation vocabulary.
     ///
@@ -2789,7 +2802,7 @@ pub mod modern {
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024 {
     pub use fastmcp_client::{
-        CreateMessageParams as LegacyCreateMessageParams,
+        ClientProtocolPlan, CreateMessageParams as LegacyCreateMessageParams,
         CreateMessageResult as LegacyCreateMessageResult, HttpClientError,
         ListRootsParams as LegacyListRootsParams, ListRootsResult as LegacyListRootsResult,
         RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation,
