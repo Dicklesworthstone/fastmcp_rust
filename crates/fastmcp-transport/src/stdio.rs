@@ -2861,7 +2861,7 @@ mod tests {
         let mut response_count = 0;
         let error = transport
             .dispatch_next(&cx, &mut |_| request_count += 1, &mut |_| {
-                response_count += 1
+                response_count += 1;
             })
             .expect_err("an embedded newline must reject before either direction dispatches");
 
