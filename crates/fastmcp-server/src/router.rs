@@ -2547,7 +2547,7 @@ impl Router {
                 .transpose()?;
             let boxed: BoxedResourceHandler = Box::new(handler);
             let is_new = !self.resource_templates.contains_key(&template.uri_template);
-            if exists {
+            if !is_new {
                 self.legacy_resource_template_completion_handlers
                     .remove(&template.uri_template);
                 self.final_resource_template_completion_handlers
@@ -3223,6 +3223,24 @@ impl Router {
         self.resolve_resource_for_era(uri, None)
     }
 
+    /// Resolves a registered tool visible in one requested protocol era.
+    ///
+    /// A final-only tool (Apps-linked, task-capable) is reachable only in the
+    /// modern era; a legacy-enabled tool is reachable in the exact-2024 era.
+    #[cfg(test)]
+    fn resolve_tool_for_era(
+        &self,
+        name: &str,
+        era: Option<ProtocolEra>,
+    ) -> Option<&AdmittedToolRegistration> {
+        let registration = self.tools.get(name)?;
+        let visible = era.is_none_or(|era| match era {
+            ProtocolEra::Modern2026 => registration.final_registration.is_some(),
+            ProtocolEra::Legacy2024 => registration.legacy_enabled,
+        });
+        visible.then_some(registration)
+    }
+
     /// Resolves a resource that is visible in one requested protocol era.
     ///
     /// A static resource takes precedence only when it is visible to that
@@ -3383,10 +3401,10 @@ impl Router {
         }
 
         let target_handler = match &params.reference {
-            LegacyCompletionReference::Prompt { name } => {
+            fastmcp_protocol::LegacyCompletionReference::Prompt { name } => {
                 self.legacy_prompt_completion_handlers.get(name)
             }
-            LegacyCompletionReference::Resource { uri } => {
+            fastmcp_protocol::LegacyCompletionReference::Resource { uri } => {
                 self.legacy_resource_template_completion_handlers.get(uri)
             }
         };
@@ -4758,6 +4776,8 @@ impl Router {
         let handler = &entry.handler;
         let input_schema = final_registration.schemas.input.as_ref();
         let output_schema = final_registration.schemas.output.as_ref();
+        // FinalArguments deserialization rejects an explicit null before this
+        // point, so `arguments` is here always Absent or a typed value.
         #[cfg(feature = "tasks")]
         let declares_final_tasks = final_registration.declares_final_tasks;
         let arguments = params
@@ -5551,6 +5571,8 @@ impl Router {
         let final_registration = self.final_prompts.get(&params.name).ok_or_else(|| {
             McpError::invalid_params("prompt is registered only for exact MCP 2024-11-05 dispatch")
         })?;
+        // FinalArguments deserialization rejects an explicit null before this
+        // point, so `arguments` is here always Absent or a typed value.
         let arguments = params.arguments.into_value().unwrap_or_default();
         if final_registration
             .definition
@@ -7079,7 +7101,7 @@ fn reversible_template_leading_literal_prefix(
         literal.push_str(part);
     }
     fastmcp_protocol::UriTemplate::parse(&literal)
-        .and_then(|template| template.expand(&TemplateValues::new()))
+        .and_then(|template| template.expand(&fastmcp_protocol::TemplateValues::new()))
         .map_err(|_| McpError::internal_error("admitted resource template lost literal prefix"))
 }
 
@@ -17459,6 +17481,9 @@ mod router_tests {
             panic!("the final tool parameter shape is selected");
         };
         assert!(absent_tool_params.arguments.is_absent());
+        // Final arguments deserialization now rejects an explicit null outright,
+        // so a null `arguments` member fails at decode rather than reaching the
+        // handler as an explicit-null presence marker.
         assert!(
             CoreRequest::decode(
                 ProtocolEra::Modern2026,
@@ -17466,7 +17491,7 @@ mod router_tests {
                 null_tool_arguments.params.as_ref(),
             )
             .is_err(),
-            "explicit-null final tool arguments are rejected during parameter admission"
+            "explicit-null final tool arguments are rejected at decode"
         );
 
         let absent_tool_result = router
@@ -17476,7 +17501,7 @@ mod router_tests {
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
         let null_tool_error = router
             .dispatch_stateless(&request_ctx, &null_tool_arguments)
-            .expect_err("explicit-null final tool arguments are not defaulted");
+            .expect_err("explicit-null final tool arguments are rejected");
         assert_eq!(null_tool_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
@@ -17500,6 +17525,7 @@ mod router_tests {
             panic!("the final prompt parameter shape is selected");
         };
         assert!(absent_prompt_params.arguments.is_absent());
+        // As with tools/call, a null `arguments` member is rejected at decode.
         assert!(
             CoreRequest::decode(
                 ProtocolEra::Modern2026,
@@ -17507,7 +17533,7 @@ mod router_tests {
                 null_prompt_arguments.params.as_ref(),
             )
             .is_err(),
-            "explicit-null final prompt arguments are rejected during parameter admission"
+            "explicit-null final prompt arguments are rejected at decode"
         );
 
         let absent_prompt_result = router
@@ -17517,7 +17543,7 @@ mod router_tests {
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
         let null_prompt_error = router
             .dispatch_stateless(&request_ctx, &null_prompt_arguments)
-            .expect_err("explicit-null final prompt arguments are not defaulted");
+            .expect_err("explicit-null final prompt arguments are rejected");
         assert_eq!(null_prompt_error.code, McpErrorCode::InvalidParams);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
     }

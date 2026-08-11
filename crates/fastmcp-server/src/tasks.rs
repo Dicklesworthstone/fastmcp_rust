@@ -2081,6 +2081,12 @@ impl FinalTaskSnapshot {
     pub fn into_task(self) -> FinalTask {
         self.task
     }
+
+    /// Returns the retained task's identifier.
+    #[cfg(test)]
+    fn task_id(&self) -> &FinalTaskId {
+        &self.task.base().task_id
+    }
 }
 
 /// Default maximum number of retained tasks in [`InMemoryFinalTaskStore`].
@@ -3670,6 +3676,19 @@ struct FinalTaskHandoffAuthority {
     dispatch_fence: u64,
 }
 
+impl std::fmt::Debug for FinalTaskHandoffAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The runtime holds trait-object store/emitter handles and is omitted.
+        formatter
+            .debug_struct("FinalTaskHandoffAuthority")
+            .field("task_id", &self.task_id)
+            .field("generation", &self.generation)
+            .field("owner_id", &self.owner_id)
+            .field("dispatch_fence", &self.dispatch_fence)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FinalTaskHandoffAuthority {
     fn require_input(
         &self,
@@ -3733,6 +3752,7 @@ impl FinalTaskHandoffAuthority {
 }
 
 /// Initial caller-owned work recovered from a newly created final Task.
+#[derive(Debug)]
 #[must_use = "initial task work must be handed to the application supervisor"]
 pub struct FinalTaskInitialWork {
     task_id: FinalTaskId,
@@ -3829,6 +3849,7 @@ impl FinalTaskInitialWork {
 /// task input belongs to the task's private execution state. The caller-owned
 /// supervisor takes this value after a task returns to `working` and uses it to
 /// resume the associated operation.
+#[derive(Debug)]
 #[must_use = "accepted task input must be handed to the resumed worker"]
 pub struct FinalTaskAcceptedInput {
     task_id: FinalTaskId,
@@ -4888,7 +4909,7 @@ impl FinalTaskRuntime {
         self.validate_task_transition_write(&current, &cancelled_task, &cancelled_notification)?;
         let cancellation = self.store.request_cancellation_and_clear_input_if_current(
             &current,
-            cancelled_task,
+            cancelled_task.clone(),
             cancelled_notification.clone(),
         )?;
         let Some(cancellation) = cancellation else {
@@ -8434,7 +8455,8 @@ mod tests {
     #[test]
     fn task_03_in_memory_false_cas_does_not_reclaim_expired_retained_task() {
         let (store, now) = in_memory_store_with_test_clock(4);
-        let task = final_task_with_durations("task-false-cas-retention", Some("1"), None);
+        let task =
+            final_working_task_with_wire_durations("task-false-cas-retention", Some("1"), None);
         let task_id = task.base().task_id.clone();
         let notification = final_task_notification(&task);
         store
@@ -8918,7 +8940,13 @@ mod tests {
             .expect("initial supervisor handoff remains recoverable")
             .expect("retention rejection cannot erase initial task work");
         assert_eq!(recovered.task_id(), &task_id);
-        assert_eq!(recovered.work_descriptor(), &final_test_work_descriptor());
+        assert_eq!(
+            store
+                .work_descriptor_if_current(&recovered)
+                .expect("recovered snapshot exposes its durable work descriptor")
+                .expect("initial work retains its descriptor"),
+            final_test_work_descriptor()
+        );
 
         let mut clock = now
             .lock()

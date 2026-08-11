@@ -4140,9 +4140,11 @@ pub mod legacy_2024 {
     fn legacy_http_plan(
         sse_endpoint: CanonicalHttpUrl,
         message_post_endpoint: CanonicalHttpUrl,
-    ) -> Result<ClientProtocolPlan, fastmcp_protocol::protocol_policy::HttpEndpointBundleError>
-    {
-        ClientProtocolPlan::http(
+    ) -> Result<
+        fastmcp_client::ClientProtocolPlan,
+        fastmcp_protocol::protocol_policy::HttpEndpointBundleError,
+    > {
+        fastmcp_client::ClientProtocolPlan::http(
             ProtocolPolicy::LegacyOnly,
             None,
             Some(sse_endpoint),
@@ -4382,7 +4384,7 @@ pub mod prelude {
         FinalTaskStatusNotification, FinalTaskStore, FinalTaskSupervisorFuture,
         FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor,
         FinalToolCallOutcome, FinalUpdateTaskResult, InMemoryFinalTaskStore,
-        OFFICIAL_TASKS_RESULT_DISCRIMATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
+        OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
         official_tasks_descriptor, official_tasks_empty_settings,
         register_official_tasks_extension, tasks_extension,
     };

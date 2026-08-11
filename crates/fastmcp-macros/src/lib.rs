@@ -3564,6 +3564,7 @@ fn generate_resource_mrtr_outcome_methods(
 // ============================================================================
 
 /// Parsed attributes for #[tool].
+#[derive(Debug)]
 struct ToolAttrs {
     name: Option<String>,
     description: Option<String>,

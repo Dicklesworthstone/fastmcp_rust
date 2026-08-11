@@ -50,7 +50,7 @@ pub mod protocol_policy;
 pub mod protocol_version;
 mod result;
 pub mod schema;
-mod server_discovery;
+pub mod server_discovery;
 #[cfg(feature = "tasks")]
 pub mod tasks_extension;
 mod types;

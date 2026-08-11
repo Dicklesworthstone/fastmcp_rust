@@ -19068,7 +19068,7 @@ mod lib_unit_tests {
                 .get_task(&task_id)
                 .expect("admitted update retains its durable result")
                 .task,
-            FinalTask::Working(_)
+            fastmcp_protocol::Task::Working(_)
         ));
     }
 

@@ -3137,9 +3137,9 @@ mod tests {
 
     #[test]
     fn builder_mcp_apps_tool_requires_apps_opt_in() {
-        let error = ServerBuilder::new("srv", "1.0")
-            .mcp_apps_tool(TestTool)
-            .expect_err("Apps tools must not register before Apps negotiation is configured");
+        let Err(error) = ServerBuilder::new("srv", "1.0").mcp_apps_tool(TestTool) else {
+            panic!("Apps tools must not register before Apps negotiation is configured");
+        };
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
     }
 
