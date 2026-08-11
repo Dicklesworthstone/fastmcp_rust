@@ -168,7 +168,9 @@ fn decode_native_websocket_message(
     message: Option<NativeWsMessage>,
 ) -> Result<JsonRpcMessage, TransportError> {
     match message {
-        Some(NativeWsMessage::Text(text)) => codec.decode_complete_message(text.as_bytes()),
+        Some(NativeWsMessage::Text(text)) => codec
+            .decode_complete_message(text.as_bytes())
+            .map_err(TransportError::from),
         Some(NativeWsMessage::Binary(_)) => Err(websocket_invalid_data(
             "Binary WebSocket messages are not supported by MCP",
         )),
