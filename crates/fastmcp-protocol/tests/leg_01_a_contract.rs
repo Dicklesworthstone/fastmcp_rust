@@ -1,5 +1,7 @@
 //! Literal frozen LEG-01 A runner entries.
 
+use std::fmt::Write as _;
+
 use fastmcp_core::sha256_bounded;
 use fastmcp_protocol::methods::{
     INITIALIZE, LEGACY_2024_11_05_METHODS, LEGACY_2024_11_05_PROTOCOL_VERSION,
@@ -357,15 +359,15 @@ fn leg_01_a_positive() {
         LEGACY_2024_11_05_SCHEMA_SHA256,
         "61cea2392d4f284092d09bc84b9ac488c0d5618ac2b38a56942fc5b99fd960ce"
     );
-    let checksum = sha256_bounded(
+    let digest = sha256_bounded(
         fastmcp_protocol::methods::LEGACY_2024_11_05_SCHEMA_JSON.as_bytes(),
         fastmcp_protocol::methods::LEGACY_2024_11_05_SCHEMA_JSON.len(),
     )
-    .expect("pinned schema has a fixed bounded size")
-    .as_bytes()
-    .iter()
-    .map(|byte| format!("{byte:02x}"))
-    .collect::<String>();
+    .expect("pinned schema has a fixed bounded size");
+    let mut checksum = String::with_capacity(digest.as_bytes().len() * 2);
+    for byte in digest.as_bytes() {
+        write!(checksum, "{byte:02x}").expect("writing hexadecimal bytes to a String cannot fail");
+    }
     assert_eq!(checksum, LEGACY_2024_11_05_SCHEMA_SHA256);
     assert!(matches!(
         decode_legacy_2024_11_05_envelope(exact_initialize())

@@ -1351,6 +1351,22 @@ pub(crate) fn encode_exact_object(object: &ExactJsonObject) -> String {
     output
 }
 
+/// Deserializes one already-admitted set of exact object members without
+/// routing number tokens through `serde_json::Value` first.
+///
+/// Selected typed result members use this boundary so a declared numeric
+/// field retains the peer's exact spelling (for example `7.3e1`) while the
+/// ordinary typed deserializer still enforces its schema.
+pub(crate) fn deserialize_exact_object<T>(
+    members: Vec<ExactJsonMember>,
+) -> Result<T, ResultDecodeError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let source = encode_exact_object(&ExactJsonObject { members });
+    serde_json::from_str(&source).map_err(|_| ResultDecodeError::invalid_known_member("$"))
+}
+
 fn encode_exact_value(value: &ExactJsonValue, output: &mut String) {
     match value {
         ExactJsonValue::Null => output.push_str("null"),
@@ -1856,30 +1872,33 @@ mod tests {
         assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidDiscriminator);
         assert_eq!(error.path(), "$.resultType");
 
-        let legacy_missing = r#"{"extension":true}"#;
-        let legacy_complete = r#"{"resultType":"complete","extension":true}"#;
-        let (legacy_compatibility, diagnostic) = decode_peer_result(
-            legacy_missing,
-            ResultPeerEra::Legacy,
-            &CoreResultDiscriminatorPolicy,
-        )
-        .expect("generic legacy peer ingestion defaults an omitted discriminator to complete");
-        assert_eq!(diagnostic, None);
-        assert_eq!(encode_result(&legacy_compatibility), legacy_complete);
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let legacy_missing = r#"{"extension":true}"#;
+            let legacy_complete = r#"{"resultType":"complete","extension":true}"#;
+            let (legacy_compatibility, diagnostic) = decode_peer_result(
+                legacy_missing,
+                ResultPeerEra::Legacy,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect("generic legacy peer ingestion defaults an omitted discriminator to complete");
+            assert_eq!(diagnostic, None);
+            assert_eq!(encode_result(&legacy_compatibility), legacy_complete);
 
-        let legacy_dispatch = crate::messages::CoreRequest::decode(
-            ProtocolEra::Legacy2024,
-            crate::methods::TOOLS_LIST,
-            None,
-        )
-        .expect("legacy tools/list request");
-        assert!(legacy_dispatch.decode_result(r#"{"tools":[]}"#).is_ok());
-        assert!(matches!(
-            legacy_dispatch.decode_result(r#"{"tools":[],"resultType":"complete"}"#),
-            Err(crate::messages::CoreDispatchError::CrossEraResultType {
-                method: crate::methods::TOOLS_LIST
-            })
-        ));
+            let legacy_dispatch = crate::messages::CoreRequest::decode(
+                ProtocolEra::Legacy2024,
+                crate::methods::TOOLS_LIST,
+                None,
+            )
+            .expect("legacy tools/list request");
+            assert!(legacy_dispatch.decode_result(r#"{"tools":[]}"#).is_ok());
+            assert!(matches!(
+                legacy_dispatch.decode_result(r#"{"tools":[],"resultType":"complete"}"#),
+                Err(crate::messages::CoreDispatchError::CrossEraResultType {
+                    method: crate::methods::TOOLS_LIST
+                })
+            ));
+        }
 
         let top_level_server_info = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"serverInfo":{"name":"legacy-location","version":"0.1"},"extension":true}"#;
         let error = decode_peer_result(

@@ -1160,7 +1160,17 @@ struct McpAppsToolResultWire {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_apps_present_json_value")]
     structured_content: Option<serde_json::Value>,
+}
+
+fn deserialize_apps_present_json_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 impl From<&McpAppsToolResult> for McpAppsToolResultWire {

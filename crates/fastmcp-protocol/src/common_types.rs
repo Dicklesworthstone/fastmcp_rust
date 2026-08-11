@@ -589,6 +589,14 @@ impl<'de> Deserialize<'de> for JsonInteger {
                 Ok(JsonInteger::from(value))
             }
 
+            fn visit_i128<E: serde::de::Error>(self, value: i128) -> Result<JsonInteger, E> {
+                value.to_string().parse().map_err(E::custom)
+            }
+
+            fn visit_u128<E: serde::de::Error>(self, value: u128) -> Result<JsonInteger, E> {
+                value.to_string().parse().map_err(E::custom)
+            }
+
             fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<JsonInteger, E> {
                 serde_json::Number::from_f64(value)
                     .ok_or_else(|| E::custom("JSON integer must be finite"))
@@ -785,8 +793,66 @@ impl<'de> Deserialize<'de> for ExactNonNegativeJsonNumber {
     where
         D: serde::Deserializer<'de>,
     {
-        let number = serde_json::Number::deserialize(deserializer)?;
-        Self::try_from_number(number).map_err(serde::de::Error::custom)
+        struct ExactJsonNumberVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ExactJsonNumberVisitor {
+            type Value = ExactNonNegativeJsonNumber;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded finite JSON progress number")
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                ExactNonNegativeJsonNumber::parse(&value.to_string()).map_err(E::custom)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                ExactNonNegativeJsonNumber::parse(&value.to_string()).map_err(E::custom)
+            }
+
+            fn visit_i128<E: serde::de::Error>(self, value: i128) -> Result<Self::Value, E> {
+                ExactNonNegativeJsonNumber::parse(&value.to_string()).map_err(E::custom)
+            }
+
+            fn visit_u128<E: serde::de::Error>(self, value: u128) -> Result<Self::Value, E> {
+                ExactNonNegativeJsonNumber::parse(&value.to_string()).map_err(E::custom)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(value)
+                    .ok_or_else(|| E::custom("JSON progress number must be finite"))
+                    .and_then(|number| {
+                        ExactNonNegativeJsonNumber::try_from_number(number).map_err(E::custom)
+                    })
+            }
+
+            fn visit_newtype_struct<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let Some(key) = map.next_key::<std::borrow::Cow<'_, str>>()? else {
+                    return Err(serde::de::Error::custom(
+                        "JSON progress number cannot be an object",
+                    ));
+                };
+                if key != SERDE_JSON_RAW_VALUE_TOKEN && key != SERDE_JSON_NUMBER_TOKEN {
+                    return Err(serde::de::Error::custom(
+                        "JSON progress number cannot be an object",
+                    ));
+                }
+                let lexeme = map.next_value::<std::borrow::Cow<'_, str>>()?;
+                ExactNonNegativeJsonNumber::parse(&lexeme).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_newtype_struct(SERDE_JSON_RAW_VALUE_TOKEN, ExactJsonNumberVisitor)
     }
 }
 
@@ -2712,6 +2778,17 @@ mod tests {
     }
 
     #[test]
+    fn json_integer_from_value_accepts_full_width_integer_visitors() {
+        for source in ["9007199254740993123456789", "-9007199254740993123456789"] {
+            let value = serde_json::from_str::<Value>(source).expect("valid arbitrary-width JSON");
+            let integer = serde_json::from_value::<JsonInteger>(value)
+                .expect("Value replay retains an arbitrary-width mathematical integer");
+
+            assert_eq!(integer.as_str(), source);
+        }
+    }
+
+    #[test]
     fn json_integer_bounded_i32_adapters_reject_fractional_and_out_of_range_values() {
         for source in ["-32600.1", "2147483647.1"] {
             assert_eq!(
@@ -2851,6 +2928,44 @@ mod tests {
             ExactNonNegativeJsonNumber::parse("1e10000"),
             Err(CommonTypeError::TooLong("progress number exponent")),
             "the exact comparison representation bounds decimal exponents"
+        );
+    }
+
+    #[test]
+    fn exact_finite_json_number_deserialization_retains_direct_wire_exponents() {
+        for source in ["1e400", "1.20e+4", "-7.30E-12"] {
+            let number = serde_json::from_str::<ExactNonNegativeJsonNumber>(source)
+                .expect("bounded exact progress number deserializes");
+
+            assert_eq!(number.as_str(), source);
+            assert_eq!(
+                serde_json::to_string(&number).expect("exact progress number re-serializes"),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn exact_finite_json_number_deserialization_rejects_only_the_bound_violation() {
+        let accepted = serde_json::from_str::<ExactNonNegativeJsonNumber>("1e9999")
+            .expect("largest admitted exponent deserializes");
+        assert_eq!(accepted.as_str(), "1e9999");
+
+        assert!(
+            serde_json::from_str::<ExactNonNegativeJsonNumber>("1e10000").is_err(),
+            "only the exponent bound changes from the accepted token"
+        );
+        assert_eq!(
+            serde_json::to_string(&accepted).expect("accepted boundary re-serializes"),
+            "1e9999",
+            "rejecting the adjacent exponent cannot mutate the accepted value"
+        );
+
+        let oversized = format!("1{}", "0".repeat(MAX_EXACT_PROGRESS_NUMBER_BYTES));
+        assert_eq!(oversized.len(), MAX_EXACT_PROGRESS_NUMBER_BYTES + 1);
+        assert!(
+            serde_json::from_str::<ExactNonNegativeJsonNumber>(&oversized).is_err(),
+            "the direct deserializer enforces the exact-token byte ceiling"
         );
     }
 

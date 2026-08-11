@@ -159,7 +159,6 @@ impl AdmittedSchema {
     }
 
     /// Validates an instance using this admitted schema.
-    #[must_use]
     pub fn validate(&self, value: &Value) -> ValidationResult {
         validate_admitted_final_schema(&self.schema, value)
     }
@@ -2541,7 +2540,7 @@ fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Option<String> 
     // has neither a path nor a query. A query-only reference replaces it, and
     // every non-empty path starts with no query unless it declares one.
     let query = match (reference_path.is_empty(), reference_query, base_query) {
-        (true, Some(query), _) | (false, Some(query), _) => format!("?{query}"),
+        (_, Some(query), _) => format!("?{query}"),
         (true, None, Some(query)) => format!("?{query}"),
         (true, None, None) | (false, None, _) => String::new(),
     };
@@ -2560,8 +2559,8 @@ fn normalize_absolute_uri_reference(reference: &str) -> Option<String> {
     let (hierarchy, query) = hierarchy
         .split_once('?')
         .map_or((hierarchy, None), |(path, query)| (path, Some(query)));
-    let normalized = if hierarchy.starts_with("//") {
-        let authority_end = hierarchy[2..]
+    let normalized = if let Some(authority_and_path) = hierarchy.strip_prefix("//") {
+        let authority_end = authority_and_path
             .find('/')
             .map_or(hierarchy.len(), |index| index + 2);
         let authority = &hierarchy[..authority_end];
@@ -2654,8 +2653,10 @@ fn remove_uri_dot_segments(path: &str) -> String {
         } else {
             // Move the first input path segment, including its leading slash
             // when present, from the input buffer to the output buffer.
-            let segment_end = if input.starts_with('/') {
-                input[1..].find('/').map_or(input.len(), |index| index + 1)
+            let segment_end = if let Some(path_after_initial_slash) = input.strip_prefix('/') {
+                path_after_initial_slash
+                    .find('/')
+                    .map_or(input.len(), |index| index + 1)
             } else {
                 input.find('/').unwrap_or(input.len())
             };
@@ -4288,13 +4289,12 @@ fn validate_exact_number(
         }
     }
     if let Some(multiple) = schema.get("multipleOf").and_then(ExactDecimal::from_value) {
-        match value.is_multiple_of_bounded(&multiple, path, errors, context) {
-            Some(false) => push_error(
+        if let Some(false) = value.is_multiple_of_bounded(&multiple, path, errors, context) {
+            push_error(
                 errors,
                 path,
                 "value must be a multiple of the exact schema divisor",
-            ),
-            Some(true) | None => {}
+            );
         }
     }
 }
@@ -5244,6 +5244,10 @@ mod tests {
                 "payload": {
                     "$id": "https://schemas.example.test/payload",
                     "type": "string"
+                },
+                "other": {
+                    "$id": "https://schemas.example.test/other",
+                    "type": "string"
                 }
             },
             "$ref": "https://schemas.example.test/payload"
@@ -5252,10 +5256,10 @@ mod tests {
             .expect("a unique declared resource satisfies an absolute local reference");
 
         let mut duplicate = accepted.clone();
-        duplicate["$defs"]["payload"]["$id"] = json!("https://schemas.example.test/root");
+        duplicate["$defs"]["other"]["$id"] = json!("https://schemas.example.test/root");
         let duplicate_error = admit_final_schema(duplicate)
             .expect_err("changing only the resource id to a duplicate rejects");
-        assert_eq!(duplicate_error.path(), "$.$defs.payload.$id");
+        assert_eq!(duplicate_error.path(), "$.$defs.other.$id");
         assert_eq!(
             duplicate_error.reason(),
             "duplicate local schema resource identifier"

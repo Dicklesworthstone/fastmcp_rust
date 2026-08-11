@@ -28,8 +28,8 @@ use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
 use crate::result::{
     CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue,
     InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers,
-    decode_peer_result_for_era, encode_complete_result, encode_result, exact_json_to_serde,
-    has_final_only_metadata,
+    decode_peer_result_for_era, deserialize_exact_object, encode_complete_result, encode_result,
+    exact_json_to_serde, has_final_only_metadata,
 };
 use crate::types::{
     ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
@@ -3790,7 +3790,9 @@ impl FinalCoreRequest {
             Self::SubscriptionsListen(_) => {
                 let (result, diagnostic) = decode_final_complete(SUBSCRIPTIONS_LISTEN, input, &[])?;
                 let subscription_id = subscription_id_from_result(&result)?;
-                if response_id.is_some_and(|response_id| response_id != &subscription_id) {
+                if response_id
+                    .is_some_and(|response_id| !response_id.correlates_with(&subscription_id))
+                {
                     return Err(CoreDispatchError::SubscriptionIdMismatch);
                 }
                 Ok(FinalCoreResult::SubscriptionsListen {
@@ -4071,7 +4073,7 @@ impl FinalCoreResult {
                 subscription_id,
                 ..
             } => {
-                if subscription_id_from_result(result)? != subscription_id.clone() {
+                if !subscription_id_from_result(result)?.correlates_with(subscription_id) {
                     return Err(CoreDispatchError::InvalidResult {
                         era: ProtocolEra::Modern2026,
                         method: SUBSCRIPTIONS_LISTEN,
@@ -4291,21 +4293,20 @@ fn decode_final_complete_or_input_required<T: DeserializeOwned>(
         }
     };
     let CompleteResult { meta, extras, .. } = complete;
-    let mut selected = serde_json::Map::new();
+    let mut selected = Vec::new();
     let mut remaining = Vec::new();
     for member in extras.into_members() {
         if known_names.contains(&member.name.as_str()) {
-            selected.insert(member.name, exact_json_to_serde(&member.value)?);
+            selected.push(member);
         } else {
             remaining.push(member);
         }
     }
-    let payload = serde_json::from_value(Value::Object(selected)).map_err(|_| {
-        CoreDispatchError::InvalidResult {
+    let payload =
+        deserialize_exact_object(selected).map_err(|_| CoreDispatchError::InvalidResult {
             era: ProtocolEra::Modern2026,
             method,
-        }
-    })?;
+        })?;
     let extras = UnknownResultMembers::try_new(remaining, known_names)?;
     Ok(FinalMethodResult::Complete {
         result: CompleteResult {
@@ -5972,44 +5973,47 @@ mod tests {
 
     #[test]
     fn legacy_sampling_core_and_final_mrtr_sampling_wires_remain_disjoint() {
-        let legacy_params = serde_json::json!({
-            "messages": [{"role": "user", "content": {"type": "text", "text": "summarize"}}],
-            "maxTokens": 32,
-            "metadata": {"provider": "legacy"}
-        });
-        let legacy = CoreRequest::decode(
-            ProtocolEra::Legacy2024,
-            SAMPLING_CREATE_MESSAGE,
-            Some(&legacy_params),
-        )
-        .expect("legacy sampling is a direct reverse RPC");
-        assert_eq!(legacy.method(), SAMPLING_CREATE_MESSAGE);
-        assert_eq!(
-            legacy
-                .encode_params()
-                .expect("legacy sampling parameters encode")
-                .expect("legacy sampling owns parameters"),
-            legacy_params
-        );
-        let legacy_result_wire = r#"{"content":{"type":"text","text":"summary"},"role":"assistant","model":"legacy-model","stopReason":"endTurn","_meta":{"trace":"legacy"}}"#;
-        let legacy_result = legacy
-            .decode_result(legacy_result_wire)
-            .expect("legacy sampling result is typed");
-        assert!(matches!(
-            legacy_result,
-            CoreResult::Legacy(LegacyCoreResult::SamplingCreateMessage(_))
-        ));
-        assert_eq!(
-            serde_json::from_str::<Value>(
-                &legacy_result
-                    .encode()
-                    .expect("legacy sampling result encodes"),
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let legacy_params = serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "summarize"}}],
+                "maxTokens": 32,
+                "metadata": {"provider": "legacy"}
+            });
+            let legacy = CoreRequest::decode(
+                ProtocolEra::Legacy2024,
+                SAMPLING_CREATE_MESSAGE,
+                Some(&legacy_params),
             )
-            .expect("legacy sampling encoding is JSON"),
-            serde_json::from_str::<Value>(legacy_result_wire)
-                .expect("legacy sampling fixture is JSON"),
-            "legacy sampling preserves decoded result semantics without asserting member order"
-        );
+            .expect("legacy sampling is a direct reverse RPC");
+            assert_eq!(legacy.method(), SAMPLING_CREATE_MESSAGE);
+            assert_eq!(
+                legacy
+                    .encode_params()
+                    .expect("legacy sampling parameters encode")
+                    .expect("legacy sampling owns parameters"),
+                legacy_params
+            );
+            let legacy_result_wire = r#"{"content":{"type":"text","text":"summary"},"role":"assistant","model":"legacy-model","stopReason":"endTurn","_meta":{"trace":"legacy"}}"#;
+            let legacy_result = legacy
+                .decode_result(legacy_result_wire)
+                .expect("legacy sampling result is typed");
+            assert!(matches!(
+                legacy_result,
+                CoreResult::Legacy(LegacyCoreResult::SamplingCreateMessage(_))
+            ));
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    &legacy_result
+                        .encode()
+                        .expect("legacy sampling result encodes"),
+                )
+                .expect("legacy sampling encoding is JSON"),
+                serde_json::from_str::<Value>(legacy_result_wire)
+                    .expect("legacy sampling fixture is JSON"),
+                "legacy sampling preserves decoded result semantics without asserting member order"
+            );
+        }
 
         let final_params_wire = serde_json::json!({
             "_meta": {
@@ -6236,7 +6240,7 @@ mod tests {
             serde_json::to_value(&client_wire).expect("client notification wire remains JSON")
         );
 
-        let server_wires = vec![
+        let server_wires = [
             JsonRpcRequest::notification(
                 NOTIFICATIONS_CANCELLED,
                 Some(serde_json::json!({
@@ -6542,8 +6546,12 @@ mod tests {
             serde_json::from_str(r#"{"progressToken":"legacy-job","progress":-1.5,"total":2.0}"#)
                 .expect("legacy progress remains governed by its existing f64 decoder");
 
-        assert_eq!(legacy.progress, -1.5);
-        assert_eq!(legacy.total, Some(2.0));
+        assert!((legacy.progress + 1.5).abs() < f64::EPSILON);
+        assert!(
+            legacy
+                .total
+                .is_some_and(|total| (total - 2.0).abs() < f64::EPSILON)
+        );
     }
 
     #[test]
@@ -6688,6 +6696,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_sampling_rejects_one_final_result_field_without_mutating_its_baseline() {
         let request = CoreRequest::decode(
@@ -7145,6 +7154,7 @@ mod tests {
                 method,
             }) if method == PING
         ));
+        #[cfg(feature = "legacy-2024-11-05")]
         assert!(
             CoreRequest::decode(ProtocolEra::Legacy2024, PING, None).is_ok(),
             "the exact legacy ping request remains available only in its legacy era"
@@ -7370,30 +7380,33 @@ mod tests {
             final_wire
         );
 
-        let legacy_params = serde_json::json!({"cursor": ""});
-        let legacy_request =
-            CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, Some(&legacy_params))
-                .expect("legacy tools/list keeps its exact parameter struct");
-        assert_eq!(legacy_request.era(), ProtocolEra::Legacy2024);
-        assert_eq!(
-            legacy_request
-                .encode_params()
-                .expect("legacy request re-encodes")
-                .expect("list request owns a parameter object"),
-            legacy_params
-        );
-        let legacy_wire = r#"{"tools":[],"nextCursor":""}"#;
-        let legacy_result = legacy_request
-            .decode_result(legacy_wire)
-            .expect("legacy result selects the legacy payload");
-        assert!(matches!(
-            legacy_result,
-            CoreResult::Legacy(LegacyCoreResult::ToolsList(_))
-        ));
-        assert_eq!(
-            legacy_result.encode().expect("legacy result re-encodes"),
-            legacy_wire
-        );
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let legacy_params = serde_json::json!({"cursor": ""});
+            let legacy_request =
+                CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, Some(&legacy_params))
+                    .expect("legacy tools/list keeps its exact parameter struct");
+            assert_eq!(legacy_request.era(), ProtocolEra::Legacy2024);
+            assert_eq!(
+                legacy_request
+                    .encode_params()
+                    .expect("legacy request re-encodes")
+                    .expect("list request owns a parameter object"),
+                legacy_params
+            );
+            let legacy_wire = r#"{"tools":[],"nextCursor":""}"#;
+            let legacy_result = legacy_request
+                .decode_result(legacy_wire)
+                .expect("legacy result selects the legacy payload");
+            assert!(matches!(
+                legacy_result,
+                CoreResult::Legacy(LegacyCoreResult::ToolsList(_))
+            ));
+            assert_eq!(
+                legacy_result.encode().expect("legacy result re-encodes"),
+                legacy_wire
+            );
+        }
     }
 
     #[test]
@@ -7789,48 +7802,51 @@ mod tests {
 
     #[test]
     fn core_completion_preserves_legacy_and_final_payload_semantics() {
-        let legacy_params = serde_json::json!({
-            "ref": {"type": "ref/prompt", "name": "deploy"},
-            "argument": {"name": "environment", "value": "sta"}
-        });
-        let legacy_request = CoreRequest::decode(
-            ProtocolEra::Legacy2024,
-            COMPLETION_COMPLETE,
-            Some(&legacy_params),
-        )
-        .expect("exact legacy completion request is typed");
-        assert_eq!(legacy_request.era(), ProtocolEra::Legacy2024);
-        assert_eq!(legacy_request.method(), COMPLETION_COMPLETE);
-        assert_eq!(
-            legacy_request
-                .encode_params()
-                .expect("legacy completion request re-encodes")
-                .expect("completion owns an object parameter"),
-            legacy_params
-        );
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let legacy_params = serde_json::json!({
+                "ref": {"type": "ref/prompt", "name": "deploy"},
+                "argument": {"name": "environment", "value": "sta"}
+            });
+            let legacy_request = CoreRequest::decode(
+                ProtocolEra::Legacy2024,
+                COMPLETION_COMPLETE,
+                Some(&legacy_params),
+            )
+            .expect("exact legacy completion request is typed");
+            assert_eq!(legacy_request.era(), ProtocolEra::Legacy2024);
+            assert_eq!(legacy_request.method(), COMPLETION_COMPLETE);
+            assert_eq!(
+                legacy_request
+                    .encode_params()
+                    .expect("legacy completion request re-encodes")
+                    .expect("completion owns an object parameter"),
+                legacy_params
+            );
 
-        let legacy_wire = r#"{"completion":{"values":["staging"],"total":1,"hasMore":false}}"#;
-        let legacy_result = legacy_request
-            .decode_result(legacy_wire)
-            .expect("exact legacy completion result is typed");
-        let CoreResult::Legacy(LegacyCoreResult::Completion(result)) = &legacy_result else {
-            panic!("legacy completion result");
-        };
-        assert_eq!(result.completion.values, vec!["staging".to_owned()]);
-        assert_eq!(result.completion.total, Some(1));
-        assert_eq!(result.completion.has_more, Some(false));
-        let encoded_legacy: Value = serde_json::from_str(
-            &legacy_result
-                .encode()
-                .expect("legacy completion re-encodes"),
-        )
-        .expect("legacy completion encoding is JSON");
-        assert_eq!(
-            encoded_legacy["completion"]["values"],
-            serde_json::json!(["staging"])
-        );
-        assert_eq!(encoded_legacy["completion"]["total"], 1);
-        assert_eq!(encoded_legacy["completion"]["hasMore"], false);
+            let legacy_wire = r#"{"completion":{"values":["staging"],"total":1,"hasMore":false}}"#;
+            let legacy_result = legacy_request
+                .decode_result(legacy_wire)
+                .expect("exact legacy completion result is typed");
+            let CoreResult::Legacy(LegacyCoreResult::Completion(result)) = &legacy_result else {
+                panic!("legacy completion result");
+            };
+            assert_eq!(result.completion.values, vec!["staging".to_owned()]);
+            assert_eq!(result.completion.total, Some(1));
+            assert_eq!(result.completion.has_more, Some(false));
+            let encoded_legacy: Value = serde_json::from_str(
+                &legacy_result
+                    .encode()
+                    .expect("legacy completion re-encodes"),
+            )
+            .expect("legacy completion encoding is JSON");
+            assert_eq!(
+                encoded_legacy["completion"]["values"],
+                serde_json::json!(["staging"])
+            );
+            assert_eq!(encoded_legacy["completion"]["total"], 1);
+            assert_eq!(encoded_legacy["completion"]["hasMore"], false);
+        }
 
         let final_params = serde_json::json!({
             "_meta": {
@@ -8653,6 +8669,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn legacy_completion_result_retains_meta_during_round_trip() {
         let request = CoreRequest::decode(
@@ -8829,6 +8846,63 @@ mod tests {
     }
 
     #[test]
+    fn final_subscriptions_listen_correlates_equivalent_numeric_id_spellings() {
+        let params = serde_json::json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            },
+            "notifications": {"toolsListChanged": true}
+        });
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, Some(&params))
+                .expect("final subscriptions/listen request");
+        let accepted_frame = r#"{"jsonrpc":"2.0","id":2e0,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2.0}}}"#;
+        let accepted =
+            crate::decode_strict_jsonrpc_response(accepted_frame.as_bytes(), accepted_frame.len())
+                .expect("equivalent numeric subscription identifiers are valid JSON-RPC");
+        let accepted_result_source = accepted
+            .raw_result()
+            .expect("successful subscription response retains exact result source");
+
+        let decoded = request
+            .decode_response_result(accepted.response(), accepted_result_source)
+            .expect("equivalent numeric spellings correlate");
+        let encoded = decoded
+            .encode()
+            .expect("the correlated subscription result re-encodes");
+        assert_eq!(
+            encoded, accepted_result_source,
+            "the exact final result path retains the subscription ID's admitted numeric lexeme"
+        );
+
+        let planted_frame = r#"{"jsonrpc":"2.0","id":2e0,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3.0}}}"#;
+        let planted =
+            crate::decode_strict_jsonrpc_response(planted_frame.as_bytes(), planted_frame.len())
+                .expect("one-number mathematical-integer near-miss is valid JSON-RPC");
+        let planted_result_source = planted
+            .raw_result()
+            .expect("successful planted response retains exact result source");
+        assert!(
+            matches!(
+                request.decode_response_result(planted.response(), planted_result_source),
+                Err(CoreDispatchError::SubscriptionIdMismatch)
+            ),
+            "only the mathematical subscription identifier changes"
+        );
+
+        let reaccepted = request
+            .decode_response_result(accepted.response(), accepted_result_source)
+            .expect("the numeric near-miss cannot mutate correlation state");
+        assert_eq!(
+            reaccepted
+                .encode()
+                .expect("the reaccepted subscription result re-encodes"),
+            encoded
+        );
+    }
+
+    #[test]
     fn final_subscriptions_listen_rejects_one_legacy_subscription_field() {
         let accepted = serde_json::json!({
             "_meta": {
@@ -8882,6 +8956,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn core_completion_rejects_one_field_cross_era_metadata() {
         let accepted = serde_json::json!({
@@ -8952,6 +9027,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn core_request_envelope_rejects_one_final_client_info_member_in_legacy_era() {
         let accepted = serde_json::json!({});
@@ -9010,6 +9086,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn core_result_envelope_rejects_each_final_only_metadata_member_in_legacy_era() {
         let request = CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, None)
@@ -9055,6 +9132,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn core_dispatch_rejects_one_field_final_result_type_on_legacy_result() {
         let request = CoreRequest::decode(ProtocolEra::Legacy2024, TOOLS_LIST, None)
@@ -9643,7 +9721,7 @@ mod tests {
         };
         assert!(params.meta.is_none());
         assert!(
-            params.additional.get("awaitCleanup").is_none(),
+            !params.additional.contains_key("awaitCleanup"),
             "a final client codec emission does not synthesize the legacy-only semantic"
         );
         assert_eq!(

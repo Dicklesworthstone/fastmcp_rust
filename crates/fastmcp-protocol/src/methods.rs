@@ -961,6 +961,7 @@ pub fn validate_legacy_2024_11_05_method_params(
     method: &str,
     params: Option<&Value>,
 ) -> Result<(), Legacy2024WireError> {
+    reject_final_metadata_from_legacy_params(params)?;
     match method {
         TOOLS_CALL => {
             let params = required_params_object(method, params)?;
@@ -1120,6 +1121,25 @@ pub fn validate_legacy_2024_11_05_method_params(
         _ => Err(Legacy2024WireError(
             "method is not part of exact MCP 2024-11-05",
         )),
+    }
+}
+
+/// Rejects final-era protocol metadata before it can be interpreted as open
+/// legacy application metadata.
+///
+/// The exact 2024 envelope permits application-defined `_meta` entries, but
+/// the final-era reserved names select different request semantics. Keeping
+/// that distinction at raw admission prevents either adapter direction from
+/// silently crossing eras.
+fn reject_final_metadata_from_legacy_params(
+    params: Option<&Value>,
+) -> Result<(), Legacy2024WireError> {
+    if params.is_some_and(crate::result::has_final_only_metadata) {
+        Err(Legacy2024WireError(
+            "final protocol metadata cannot be represented by exact MCP 2024-11-05",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1433,6 +1453,20 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
         )));
     }
 
+    let has_method = object.contains_key("method");
+    let has_result = object.contains_key("result");
+    let has_error = object.contains_key("error");
+    if has_method && (has_result || has_error) {
+        return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+            "JSON-RPC method is mutually exclusive with result and error",
+        )));
+    }
+    if has_result && has_error {
+        return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+            "MCP 2024-11-05 response envelopes require exactly one of result or error",
+        )));
+    }
+
     if let Some(method_value) = object.get("method") {
         let method_name = method_value
             .as_str()
@@ -1505,10 +1539,21 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
         )));
     }
     match (object.get("result"), object.get("error")) {
-        (Some(result), None) if result.is_object() => Ok(Legacy2024Envelope::Response {
-            id,
-            result: result.clone(),
-        }),
+        (Some(result), None)
+            if result.is_object()
+                && result.get("resultType").is_none()
+                && !crate::result::has_final_only_metadata(result) =>
+        {
+            Ok(Legacy2024Envelope::Response {
+                id,
+                result: result.clone(),
+            })
+        }
+        (Some(result), None) if result.is_object() => {
+            Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+                "final result members cannot be represented by exact MCP 2024-11-05",
+            )))
+        }
         (Some(_), None) => Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
             "MCP 2024-11-05 response result must be an object",
         ))),
@@ -1990,6 +2035,157 @@ mod tests {
                 .reason(),
             "exact MCP 2024-11-05 progressToken must be a string or integer"
         );
+    }
+
+    #[test]
+    fn leg_01_legacy_application_metadata_and_progress_token_remain_admitted() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "legacy-ping",
+            "method": PING,
+            "params": {
+                "_meta": {
+                    "com.example/application": {"opaque": true},
+                    "progressToken": "legacy-progress"
+                }
+            }
+        });
+
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope_classified(request),
+            Ok(Legacy2024Envelope::Request { method, .. }) if method.name == PING
+        ));
+    }
+
+    #[test]
+    fn leg_01_final_reserved_metadata_is_rejected_from_legacy_request_params() {
+        let accepted = json!({
+            "jsonrpc": "2.0",
+            "id": "legacy-list",
+            "method": TOOLS_LIST,
+            "params": {"_meta": {"com.example/application": true}}
+        });
+        assert!(decode_legacy_2024_11_05_envelope_classified(accepted.clone()).is_ok());
+
+        for member in [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/serverInfo",
+            "io.modelcontextprotocol/subscriptionId",
+        ] {
+            let mut rejected = accepted.clone();
+            rejected["params"]["_meta"][member] = json!({});
+            assert!(matches!(
+                decode_legacy_2024_11_05_envelope_classified(rejected),
+                Err(Legacy2024EnvelopeError::MethodParams(error))
+                    if error.reason()
+                        == "final protocol metadata cannot be represented by exact MCP 2024-11-05"
+            ));
+        }
+    }
+
+    #[test]
+    fn leg_01_final_result_members_are_rejected_from_legacy_responses() {
+        let accepted = json!({
+            "jsonrpc": "2.0",
+            "id": 19,
+            "result": {
+                "legacy": true,
+                "_meta": {"com.example/application": true}
+            }
+        });
+        assert!(decode_legacy_2024_11_05_envelope_classified(accepted.clone()).is_ok());
+
+        let mut result_type = accepted.clone();
+        result_type["result"]["resultType"] = json!("complete");
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope_classified(result_type),
+            Err(Legacy2024EnvelopeError::Envelope(error))
+                if error.reason()
+                    == "final result members cannot be represented by exact MCP 2024-11-05"
+        ));
+
+        for member in [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/serverInfo",
+            "io.modelcontextprotocol/subscriptionId",
+        ] {
+            let mut rejected = accepted.clone();
+            rejected["result"]["_meta"][member] = json!({});
+            assert!(matches!(
+                decode_legacy_2024_11_05_envelope_classified(rejected),
+                Err(Legacy2024EnvelopeError::Envelope(error))
+                    if error.reason()
+                        == "final result members cannot be represented by exact MCP 2024-11-05"
+            ));
+        }
+    }
+
+    #[test]
+    fn leg_01_request_and_response_shapes_are_mutually_exclusive() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": "request",
+            "method": PING,
+            "params": {}
+        });
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope_classified(request),
+            Ok(Legacy2024Envelope::Request { method, .. }) if method.name == PING
+        ));
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "response",
+            "result": {"legacy": true}
+        });
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope_classified(response),
+            Ok(Legacy2024Envelope::Response { id, .. }) if id == json!("response")
+        ));
+
+        for rejected in [
+            json!({
+                "jsonrpc": "2.0",
+                "id": "mixed-null-method",
+                "method": null,
+                "result": {
+                    "legacy": true,
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28"
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "mixed-ping",
+                "method": PING,
+                "result": {"legacy": true}
+            }),
+        ] {
+            assert!(matches!(
+                decode_legacy_2024_11_05_envelope_classified(rejected),
+                Err(Legacy2024EnvelopeError::Envelope(error))
+                    if error.reason()
+                        == "JSON-RPC method is mutually exclusive with result and error"
+            ));
+        }
+
+        let result_and_error = json!({
+            "jsonrpc": "2.0",
+            "id": "mixed-response",
+            "result": {},
+            "error": {"code": -32603, "message": "failed"}
+        });
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope_classified(result_and_error),
+            Err(Legacy2024EnvelopeError::Envelope(error))
+                if error.reason()
+                    == "MCP 2024-11-05 response envelopes require exactly one of result or error"
+        ));
     }
 
     #[test]
