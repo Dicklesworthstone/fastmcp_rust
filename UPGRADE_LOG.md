@@ -109,3 +109,8 @@ Two tests in `fastmcp-server/src/tasks.rs` fail independently of dependency chan
 ## Needs attention (owning lanes)
 - **FND-01 dependency/toolchain evidence must be RE-FROZEN** — fnd_01_dependency_evidence.rs byte-binds exact versions/checksums for the bumped crates + crypto.rs bytes; expect it RED until re-frozen.
 - **Separate pre-existing break (NOT from this update):** server proxy-legacy,proxy-tasks,apps *test* build has 2 errors at a84e9aa (extensions.rs:709/711 + proxy.rs:5126 `FnOnce` not general enough).
+
+## Round 2 — 2026-08-11 (maintainer: "everything latest, make it all work")
+- **asupersync 0.3.10 → 0.4.3** (major 0.3→0.4) — **no call-site changes needed**; workspace lib ✓, core 335/335 ✓, transport 362/362 ✓, server proxy-legacy,proxy-tasks,apps test build ✓. NOTE: contradicts baa2b59's downstream unification (mcp_agent_mail_rust/sqlmodel were pinned to the 0.3.10 line) — downstream may need its own bump.
+- **trybuild 1.0.118 → 1.0.120** — dev-dep; workspace unaffected. (Its downstream-probe suite is still blocked by the pre-existing rich_rust/time-0.3.55 fixture-resolution issue — real fix is publishing rich_rust >0.2.2; tracked separately.)
+- All 29 workspace pins now at latest published (serde_yaml stays 0.9.34 — its latest, upstream-deprecated).

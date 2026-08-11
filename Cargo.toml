@@ -32,7 +32,7 @@ readme = "README.md"
 # path-patch this checkout can resolve a single asupersync version. 0.3.10's
 # only breaking change (TrackedSender::try_reserve/&Cx, CommittedProof) is
 # unused in this workspace. See mcp_agent_mail_rust bead br-noizk.
-asupersync = { version = "=0.3.10" }
+asupersync = { version = "=0.4.3" }
 rich_rust = { version = "=0.2.2" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
@@ -95,7 +95,7 @@ regex = { version = "=1.13.1" }
 clap = { version = "=4.6.6", features = ["derive", "env", "wrap_help"] }
 
 # Testing
-trybuild = { version = "=1.0.118", default-features = false }
+trybuild = { version = "=1.0.120", default-features = false }
 
 # Internal crates
 fastmcp-rust = { version = "0.3.2", path = "crates/fastmcp" }
