@@ -13,7 +13,7 @@
 
 use std::fmt;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -264,7 +264,7 @@ impl HmacSha256Key {
     }
 
     fn new_mac(&self) -> HmacSha256 {
-        <HmacSha256 as Mac>::new_from_slice(&self.bytes)
+        <HmacSha256 as KeyInit>::new_from_slice(&self.bytes)
             .expect("HMAC-SHA-256 accepts every fixed-width key")
     }
 }

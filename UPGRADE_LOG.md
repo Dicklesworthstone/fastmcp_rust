@@ -86,3 +86,26 @@ _(None)_
 Two tests in `fastmcp-server/src/tasks.rs` fail independently of dependency changes:
 - `tasks::tests::can_transition_invalid_pairs` — `can_transition(Pending, Failed)` returns true but test expects false
 - `tasks::tests::fail_task_on_pending_is_ignored` — task transitions to Failed from Pending but test expects it to stay Pending
+
+---
+
+# Dependency Upgrade Run — 2026-08-11 (WildMountain, maintainer-authorized)
+
+**Base rev:** a84e9aa  |  8 of 29 exact-pins outdated; 5 updated, 1 deferred, 2 held, 0 failed.
+
+## Updates
+- **clap 4.6.4 → 4.6.6** (patch) — consumer fastmcp-cli; workspace lib ✓, cli ✓.
+- **toml 1.1.3 → 1.1.4** (patch, 1.1.4+spec-1.1.0) — fastmcp-cli/client/facade; workspace lib ✓, console tests ✓.
+- **base64 0.22.1 → 0.23.1** (minor) — protocol/server; workspace lib ✓, core ✓, protocol 606/3 (3 pre-existing hot-lane, no regression). Lock keeps 0.22.1 for a transitive holdout.
+- **sha2 0.10.9 → 0.11.0 + hmac 0.12.1 → 0.13.0** (RustCrypto digest-0.11 major) — migrated `fastmcp-core/src/crypto.rs` `Mac::new_from_slice` → `KeyInit::new_from_slice` (1 line + import; behavior-preserving). core 335/335 ✓ (HMAC-SHA256 known-answer vectors confirm identical output).
+
+## Deferred
+- **trybuild 1.0.118 → 1.0.120** — kept at baseline. Its own suite can't verify the bump: blocked by a PRE-EXISTING `failed to select a version for time` in the consumer test-projects (baa2b59 time=0.3.55/rich_rust fallout, fails identically at 1.0.118). Negligible dev-dep value.
+
+## Held (not bumped)
+- **asupersync 0.3.10 → 0.4.3** — maintainer deliberately unified on 0.3.10 (baa2b59) for downstream mcp_agent_mail_rust; 0.4.x breaks that + the API. Separate maintainer decision.
+- **serde_yaml → 0.9.34+deprecated** — same version, deprecation marker only (upstream unmaintained; migration is a separate effort).
+
+## Needs attention (owning lanes)
+- **FND-01 dependency/toolchain evidence must be RE-FROZEN** — fnd_01_dependency_evidence.rs byte-binds exact versions/checksums for the bumped crates + crypto.rs bytes; expect it RED until re-frozen.
+- **Separate pre-existing break (NOT from this update):** server proxy-legacy,proxy-tasks,apps *test* build has 2 errors at a84e9aa (extensions.rs:709/711 + proxy.rs:5126 `FnOnce` not general enough).
