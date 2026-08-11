@@ -13,30 +13,33 @@
 //!
 //! # Architecture
 //!
-//! This implementation provides low-level WebSocket message framing.
-//! It does not include HTTP upgrade handling. The caller must provide an
-//! already-upgraded reader and writer.
+//! [`AsyncWsClientTransport::connect`] establishes a native `ws://`
+//! connection and performs the HTTP Upgrade handshake. [`connect_wss`] does
+//! the same over a caller-supplied or WebPKI-rooted asupersync TLS connector.
+//! [`WebSocketUpgradeAdmission`] validates one bounded server Upgrade request,
+//! while [`WebSocketListener`] returns a bounded parsed request for the
+//! caller's route and authentication decision before it can complete that
+//! admission.
 //!
 //! # Example
 //!
 //! ```ignore
-//! use fastmcp_transport::websocket::{WsTransport, WsFrame};
+//! use fastmcp_transport::websocket::AsyncWsClientTransport;
 //!
-//! // After HTTP upgrade, you have a bidirectional byte stream
-//! let transport = WsTransport::new(reader, writer);
+//! let mut transport = AsyncWsClientTransport::connect(&cx, "ws://127.0.0.1:9000/mcp").await?;
 //!
 //! // Receive a message
-//! let msg = transport.recv(&cx)?;
+//! let msg = transport.recv(&cx).await?;
 //!
 //! // Send a response
-//! transport.send(&cx, &response)?;
+//! transport.send(&cx, &response).await?;
 //! ```
 //!
 //! # Cancellation behavior
 //!
 //! The prior synchronous caller-provided `std::io` implementation is retained
-//! only as a focused test fixture. It is not part of the shipped experimental
-//! feature because an arbitrary blocking reader cannot be interrupted safely.
+//! only as a focused test fixture. It is not part of the public transport
+//! because an arbitrary blocking reader cannot be interrupted safely.
 //!
 //! [`AsyncWsServerTransport`] and [`AsyncWsClientTransport`] are the
 //! cancellation-safe API for owned asupersync socket I/O. The client uses
@@ -44,7 +47,6 @@
 //! bounded RFC 6455 framing over the upgraded byte stream. Both poll the owned
 //! socket through the supplied [`Cx`], so cancellation preempts an idle read.
 
-use std::pin::Pin;
 use std::task::Poll;
 #[cfg(test)]
 use std::{
@@ -54,16 +56,23 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+use std::{net::SocketAddr, pin::Pin};
 
 use asupersync::{
     Cx,
     bytes::{Bytes, BytesMut},
     codec::{Decoder, Encoder},
     io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::websocket::{
-        CloseCode, CloseReason, Frame, FrameCodec, Message as NativeWsMessage, Opcode, WebSocket,
-        WebSocketConfig, WsError,
+    net::{
+        tcp::{TcpListener, TcpStream},
+        websocket::{
+            ClientHandshake, CloseCode, CloseReason, Frame, FrameCodec, HandshakeError,
+            HttpRequest as NativeHttpRequest, HttpResponse as NativeHttpResponse,
+            Message as NativeWsMessage, Opcode, ServerHandshake, WebSocket, WebSocketConfig,
+            WsConnectError, WsError, WsUrl,
+        },
     },
+    tls::{TlsConnector, TlsStream},
 };
 #[cfg(test)]
 use fastmcp_core::{WebSocketMask, draw_websocket_mask};
@@ -116,6 +125,38 @@ fn native_websocket_close_reason(error: &WsError) -> CloseReason {
     }
 }
 
+fn websocket_connect_error(cx: &Cx, error: WsConnectError) -> TransportError {
+    match error {
+        WsConnectError::Io(error) => {
+            if error.kind() == std::io::ErrorKind::Interrupted && cx.is_cancel_requested() {
+                websocket_checkpoint(cx)
+                    .err()
+                    .unwrap_or(TransportError::Cancelled)
+            } else {
+                TransportError::Io(error)
+            }
+        }
+        WsConnectError::Cancelled => websocket_checkpoint(cx)
+            .err()
+            .unwrap_or(TransportError::Cancelled),
+        WsConnectError::InvalidUrl(error) | WsConnectError::Handshake(error) => {
+            websocket_handshake_error(error)
+        }
+        WsConnectError::TlsRequired => websocket_invalid_data(
+            "native ws connector received wss://; use connect_wss or connect_wss_with_connector",
+        ),
+        WsConnectError::Protocol(error) => websocket_invalid_data(error.to_string()),
+    }
+}
+
+fn websocket_handshake_error(error: HandshakeError) -> TransportError {
+    websocket_invalid_data(error.to_string())
+}
+
+fn websocket_tls_error(error: impl std::fmt::Display) -> TransportError {
+    websocket_invalid_data(format!("WebSocket TLS handshake failed: {error}"))
+}
+
 /// Maximum WebSocket frame and assembled-message size accepted by FastMCP.
 pub const FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -135,6 +176,13 @@ const FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE: usize =
     FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_CLIENT_FRAME_ENVELOPE_SIZE;
 const FASTMCP_WEBSOCKET_MAX_PENDING_WRITE_BYTES: usize =
     FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE + FASTMCP_WEBSOCKET_MAX_SERVER_FRAME_ENVELOPE_SIZE;
+
+/// Maximum HTTP request or response header block admitted during WebSocket Upgrade.
+///
+/// This is intentionally separate from the JSON-RPC and RFC 6455 frame bounds:
+/// an attacker must not consume a full message allocation before it has passed
+/// the HTTP Upgrade gate.
+pub const FASTMCP_WEBSOCKET_MAX_HTTP_HEADER_SIZE: usize = 16 * 1024;
 
 fn fastmcp_websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
@@ -164,13 +212,13 @@ fn encode_native_websocket_message(
 }
 
 fn decode_native_websocket_message(
-    codec: &mut Codec,
     message: Option<NativeWsMessage>,
-) -> Result<JsonRpcMessage, TransportError> {
+) -> Result<ReceivedTransportFrame, TransportError> {
     match message {
-        Some(NativeWsMessage::Text(text)) => codec
-            .decode_complete_message(text.as_bytes())
-            .map_err(TransportError::from),
+        // `String` owns the exact RFC 6455 text payload. Converting it back
+        // into bytes here does not parse, normalize, or reserialize JSON, so
+        // result member order and number lexemes remain peer-authored source.
+        Some(NativeWsMessage::Text(text)) => ReceivedTransportFrame::admit(text.into_bytes()),
         Some(NativeWsMessage::Binary(_)) => Err(websocket_invalid_data(
             "Binary WebSocket messages are not supported by MCP",
         )),
@@ -233,6 +281,21 @@ where
 
     /// Receives a JSON-RPC message, interrupting an idle owned-socket read on cancellation.
     pub async fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.recv_with_source(cx)
+            .await
+            .map(ReceivedTransportFrame::into_message)
+    }
+
+    /// Receives a JSON-RPC message with its exact bounded source document.
+    ///
+    /// This is the client ingress API for consumers that must preserve a
+    /// response `result` object's peer-supplied member order and JSON-number
+    /// lexemes. The WebSocket text payload is admitted directly, without a
+    /// typed-message reserialization step.
+    pub async fn recv_with_source(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ReceivedTransportFrame, TransportError> {
         if self.closed {
             return Err(TransportError::Closed);
         }
@@ -264,7 +327,7 @@ where
         &mut self,
         cx: &Cx,
         message: Option<NativeWsMessage>,
-    ) -> Result<JsonRpcMessage, TransportError> {
+    ) -> Result<ReceivedTransportFrame, TransportError> {
         if matches!(message, Some(NativeWsMessage::Close(_)) | None) {
             self.closed = true;
             return Err(TransportError::Closed);
@@ -278,7 +341,7 @@ where
             }
             Some(NativeWsMessage::Close(_)) | None => unreachable!("handled above"),
         };
-        match decode_native_websocket_message(&mut self.codec, message) {
+        match decode_native_websocket_message(message) {
             Ok(message) => Ok(message),
             Err(error) => Err(self
                 .terminate(cx, CloseReason::new(close_code, None), error)
@@ -298,12 +361,442 @@ where
     }
 }
 
-/// Cancellation-safe server-side WebSocket transport over caller-owned upgraded I/O.
+impl AsyncWsClientTransport<TcpStream> {
+    /// Connects to a `ws://` endpoint and completes the RFC 6455 handshake.
+    ///
+    /// The connection, HTTP Upgrade, framing, masking, and close handshake are
+    /// all owned by asupersync. `wss://` is deliberately rejected here so TLS
+    /// authentication cannot be bypassed accidentally; use [`connect_wss`]
+    /// or [`connect_wss_with_connector`] for that scheme.
+    pub async fn connect(cx: &Cx, url: &str) -> Result<Self, TransportError> {
+        let parsed = WsUrl::parse(url).map_err(websocket_handshake_error)?;
+        if parsed.tls {
+            return Err(websocket_invalid_data(
+                "wss:// requires AsyncWsClientTransport::connect_wss",
+            ));
+        }
+        websocket_checkpoint(cx)?;
+        let websocket = WebSocket::connect_with_config(cx, url, fastmcp_websocket_config())
+            .await
+            .map_err(|error| websocket_connect_error(cx, error))?;
+        Ok(Self {
+            websocket,
+            codec: Codec::new(),
+            closed: false,
+        })
+    }
+}
+
+impl AsyncWsClientTransport<TlsStream<TcpStream>> {
+    /// Connects to a `wss://` endpoint using the built-in WebPKI root store.
+    ///
+    /// This uses asupersync's Rustls implementation with SNI and HTTP/1.1
+    /// ALPN advertisement. Applications with private roots, pinning, or client
+    /// certificates should use [`connect_wss_with_connector`] instead.
+    pub async fn connect_wss(cx: &Cx, url: &str) -> Result<Self, TransportError> {
+        let connector = TlsConnector::builder()
+            .with_webpki_roots()
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .map_err(websocket_tls_error)?;
+        Self::connect_wss_with_connector(cx, url, &connector).await
+    }
+
+    /// Connects to a `wss://` endpoint using an explicit asupersync TLS policy.
+    ///
+    /// # Cancellation boundary
+    ///
+    /// `asupersync` documents both the TCP connect and TLS handshake below as
+    /// non-cancel-safe. This factory checks `cx` before and after each phase,
+    /// but it does not claim that cancellation wakes a parked connect or TLS
+    /// handshake. Callers that need that guarantee must impose a
+    /// connection-level deadline or use an upgraded transport they own.
+    pub async fn connect_wss_with_connector(
+        cx: &Cx,
+        url: &str,
+        connector: &TlsConnector,
+    ) -> Result<Self, TransportError> {
+        let parsed = WsUrl::parse(url).map_err(websocket_handshake_error)?;
+        if !parsed.tls {
+            return Err(websocket_invalid_data(
+                "connect_wss_with_connector accepts only wss:// URLs",
+            ));
+        }
+        websocket_checkpoint(cx)?;
+        let address = websocket_socket_address(&parsed);
+        let tcp = TcpStream::connect(address)
+            .await
+            .map_err(TransportError::Io)?;
+        tcp.set_nodelay(true).map_err(TransportError::Io)?;
+        websocket_checkpoint(cx)?;
+        let tls = connector
+            .connect(&parsed.host, tcp)
+            .await
+            .map_err(websocket_tls_error)?;
+        websocket_checkpoint(cx)?;
+        client_upgrade(cx, url, tls).await
+    }
+}
+
+fn websocket_socket_address(url: &WsUrl) -> String {
+    if url.host.contains(':') {
+        format!("[{}]:{}", url.host, url.port)
+    } else {
+        format!("{}:{}", url.host, url.port)
+    }
+}
+
+async fn client_upgrade<IO>(
+    cx: &Cx,
+    url: &str,
+    mut io: IO,
+) -> Result<AsyncWsClientTransport<IO>, TransportError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let handshake = ClientHandshake::new(url, cx.entropy()).map_err(websocket_handshake_error)?;
+    write_all_with_checkpoint(cx, &mut io, &handshake.request_bytes()).await?;
+    let response_bytes = read_http_headers_with_checkpoint(cx, &mut io).await?;
+    let response = NativeHttpResponse::parse(&response_bytes).map_err(websocket_handshake_error)?;
+    handshake
+        .validate_response(&response)
+        .map_err(websocket_handshake_error)?;
+    websocket_checkpoint(cx)?;
+    Ok(AsyncWsClientTransport::from_upgraded(io))
+}
+
+async fn write_all_with_checkpoint<IO>(
+    cx: &Cx,
+    io: &mut IO,
+    bytes: &[u8],
+) -> Result<(), TransportError>
+where
+    IO: AsyncWrite + Unpin,
+{
+    let mut written = 0;
+    while written < bytes.len() {
+        let count = std::future::poll_fn(|task_cx| {
+            websocket_checkpoint(cx).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string())
+            })?;
+            Pin::new(&mut *io).poll_write(task_cx, &bytes[written..])
+        })
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted && cx.is_cancel_requested() {
+                websocket_checkpoint(cx)
+                    .err()
+                    .unwrap_or(TransportError::Cancelled)
+            } else {
+                TransportError::Io(error)
+            }
+        })?;
+        if count == 0 {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "WebSocket HTTP Upgrade write returned zero",
+            )));
+        }
+        written = written.checked_add(count).ok_or_else(|| {
+            websocket_invalid_data("WebSocket HTTP Upgrade write length overflow")
+        })?;
+    }
+    std::future::poll_fn(|task_cx| {
+        websocket_checkpoint(cx).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string())
+        })?;
+        Pin::new(&mut *io).poll_flush(task_cx)
+    })
+    .await
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::Interrupted && cx.is_cancel_requested() {
+            websocket_checkpoint(cx)
+                .err()
+                .unwrap_or(TransportError::Cancelled)
+        } else {
+            TransportError::Io(error)
+        }
+    })
+}
+
+async fn read_http_headers_with_checkpoint<IO>(
+    cx: &Cx,
+    io: &mut IO,
+) -> Result<Vec<u8>, TransportError>
+where
+    IO: AsyncRead + Unpin,
+{
+    let mut headers = Vec::with_capacity(1024);
+    loop {
+        websocket_checkpoint(cx)?;
+        if let Some(end) = websocket_http_header_end(&headers) {
+            return Ok(headers[..end].to_vec());
+        }
+        if headers.len() >= FASTMCP_WEBSOCKET_MAX_HTTP_HEADER_SIZE {
+            return Err(websocket_invalid_data(
+                "WebSocket HTTP Upgrade headers exceed 16 KiB",
+            ));
+        }
+
+        // Read one byte at a time during the Upgrade boundary so bytes from
+        // the first WebSocket frame are never lost between the HTTP and RFC
+        // 6455 decoders. This happens once per connection, not per message.
+        let mut byte = [0_u8; 1];
+        let count = std::future::poll_fn(|task_cx| {
+            websocket_checkpoint(cx).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string())
+            })?;
+            let mut read_buf = ReadBuf::new(&mut byte);
+            match Pin::new(&mut *io).poll_read(task_cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted && cx.is_cancel_requested() {
+                websocket_checkpoint(cx)
+                    .err()
+                    .unwrap_or(TransportError::Cancelled)
+            } else {
+                TransportError::Io(error)
+            }
+        })?;
+        if count == 0 {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF before WebSocket HTTP Upgrade headers completed",
+            )));
+        }
+        headers.push(byte[0]);
+    }
+}
+
+fn websocket_http_header_end(bytes: &[u8]) -> Option<usize> {
+    let crlf = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4);
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2);
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
+fn parse_websocket_upgrade_request(
+    request_bytes: &[u8],
+) -> Result<(NativeHttpRequest, Box<[u8]>), TransportError> {
+    let maximum_request_bytes = FASTMCP_WEBSOCKET_MAX_HTTP_HEADER_SIZE
+        .checked_add(FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE)
+        .ok_or_else(|| websocket_invalid_data("WebSocket Upgrade request limit overflow"))?;
+    if request_bytes.len() > maximum_request_bytes {
+        return Err(websocket_invalid_data(
+            "WebSocket Upgrade request exceeds its bounded header and pre-read limits",
+        ));
+    }
+
+    // Scan only the header allotment. The old implementation searched the
+    // whole caller-provided slice before checking a limit, allowing an
+    // arbitrary oversized input to consume CPU before it was rejected.
+    let scan_len = request_bytes
+        .len()
+        .min(FASTMCP_WEBSOCKET_MAX_HTTP_HEADER_SIZE);
+    let header_end = websocket_http_header_end(&request_bytes[..scan_len]).ok_or_else(|| {
+        if request_bytes.len() > FASTMCP_WEBSOCKET_MAX_HTTP_HEADER_SIZE {
+            websocket_invalid_data("WebSocket HTTP Upgrade headers exceed 16 KiB")
+        } else {
+            websocket_invalid_data(
+                "WebSocket HTTP Upgrade request is missing its header terminator",
+            )
+        }
+    })?;
+    let initial_websocket_bytes = &request_bytes[header_end..];
+    if initial_websocket_bytes.len() > FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE {
+        return Err(websocket_invalid_data(
+            "WebSocket bytes pipelined after Upgrade exceed the bounded read buffer",
+        ));
+    }
+    let request = NativeHttpRequest::parse(&request_bytes[..header_end])
+        .map_err(websocket_handshake_error)?;
+    Ok((request, initial_websocket_bytes.into()))
+}
+
+/// Validated HTTP Upgrade response plus any pre-read WebSocket bytes.
 ///
-/// The caller owns HTTP Upgrade validation and endpoint selection. This adapter
-/// owns RFC 6455 server-role framing after that boundary: client input must be
-/// masked, server output is unmasked, and frame, assembled-message, read-buffer,
-/// and pending-write limits are all enforced by this type.
+/// Construct this with [`Self::admit`] at the HTTP routing boundary, after a
+/// route and authentication policy has selected WebSocket service. Calling
+/// [`Self::complete`] commits exactly one 101 response and transfers only the
+/// bounded bytes after that response into the RFC 6455 decoder.
+pub struct WebSocketUpgradeAdmission {
+    response: Box<[u8]>,
+    initial_websocket_bytes: Box<[u8]>,
+}
+
+impl WebSocketUpgradeAdmission {
+    /// Validates one bounded RFC 6455 HTTP Upgrade request.
+    pub fn admit(request_bytes: &[u8]) -> Result<Self, TransportError> {
+        let (request, initial_websocket_bytes) = parse_websocket_upgrade_request(request_bytes)?;
+        Self::from_parsed_request(&request, initial_websocket_bytes)
+    }
+
+    fn from_parsed_request(
+        request: &NativeHttpRequest,
+        initial_websocket_bytes: Box<[u8]>,
+    ) -> Result<Self, TransportError> {
+        let response = ServerHandshake::new()
+            .accept(request)
+            .map_err(websocket_handshake_error)?
+            .response_bytes();
+        Ok(Self {
+            response: response.into_boxed_slice(),
+            initial_websocket_bytes,
+        })
+    }
+
+    /// Writes the 101 response and returns the admitted server transport.
+    pub async fn complete<IO>(
+        self,
+        cx: &Cx,
+        mut io: IO,
+    ) -> Result<AsyncWsServerTransport<IO>, TransportError>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        write_all_with_checkpoint(cx, &mut io, &self.response).await?;
+        AsyncWsServerTransport::from_upgraded_with_initial_bytes(io, self.initial_websocket_bytes)
+    }
+}
+
+/// A bounded parsed HTTP Upgrade request awaiting caller authorization.
+///
+/// A [`WebSocketListener`] produces this value before it writes a 101 response.
+/// Inspect [`Self::request`] (and apply route, header, origin, or authentication
+/// policy) before calling [`Self::into_admission`]. Dropping this value rejects
+/// the peer without an Upgrade response; [`Self::into_stream`] is available
+/// when the caller needs to write a specific HTTP rejection.
+pub struct WebSocketUpgradeRequest<IO> {
+    request: NativeHttpRequest,
+    initial_websocket_bytes: Box<[u8]>,
+    io: IO,
+}
+
+impl<IO> WebSocketUpgradeRequest<IO> {
+    /// Returns the bounded, parsed HTTP Upgrade request selected by the listener.
+    #[must_use]
+    pub const fn request(&self) -> &NativeHttpRequest {
+        &self.request
+    }
+
+    /// Returns the request path for route admission.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.request.path
+    }
+
+    /// Transfers the connection into a validated, but not yet committed, Upgrade.
+    pub fn into_admission(self) -> Result<AdmittedWebSocketUpgrade<IO>, TransportError> {
+        let admission = WebSocketUpgradeAdmission::from_parsed_request(
+            &self.request,
+            self.initial_websocket_bytes,
+        )?;
+        Ok(AdmittedWebSocketUpgrade {
+            admission,
+            io: self.io,
+        })
+    }
+
+    /// Returns the owned stream so the caller can write its own rejection.
+    #[must_use]
+    pub fn into_stream(self) -> IO {
+        self.io
+    }
+}
+
+/// A caller-authorized Upgrade that can commit exactly one 101 response.
+pub struct AdmittedWebSocketUpgrade<IO> {
+    admission: WebSocketUpgradeAdmission,
+    io: IO,
+}
+
+impl<IO> AdmittedWebSocketUpgrade<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Writes the 101 response and returns the admitted server transport.
+    pub async fn complete(self, cx: &Cx) -> Result<AsyncWsServerTransport<IO>, TransportError> {
+        self.admission.complete(cx, self.io).await
+    }
+}
+
+/// A native TCP listener that reads one bounded HTTP Upgrade per connection.
+pub struct WebSocketListener {
+    listener: TcpListener,
+}
+
+impl WebSocketListener {
+    /// Binds a WebSocket TCP listener without creating an async runtime.
+    pub async fn bind<A: std::net::ToSocketAddrs + Send + 'static>(
+        address: A,
+    ) -> Result<Self, TransportError> {
+        TcpListener::bind(address)
+            .await
+            .map(|listener| Self { listener })
+            .map_err(TransportError::Io)
+    }
+
+    /// Returns the bound socket address.
+    pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
+        self.listener.local_addr().map_err(TransportError::Io)
+    }
+
+    /// Accepts TCP and returns one bounded parsed Upgrade request.
+    ///
+    /// This method deliberately does not write a 101 response. Callers must
+    /// inspect the request and explicitly authorize it with
+    /// [`WebSocketUpgradeRequest::into_admission`] before completion.
+    pub async fn accept(
+        &self,
+        cx: &Cx,
+    ) -> Result<WebSocketUpgradeRequest<TcpStream>, TransportError> {
+        websocket_checkpoint(cx)?;
+        let (mut stream, _) = std::future::poll_fn(|task_cx| {
+            websocket_checkpoint(cx).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string())
+            })?;
+            self.listener.poll_accept(task_cx)
+        })
+        .await
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::Interrupted && cx.is_cancel_requested() {
+                websocket_checkpoint(cx)
+                    .err()
+                    .unwrap_or(TransportError::Cancelled)
+            } else {
+                TransportError::Io(error)
+            }
+        })?;
+        let request_bytes = read_http_headers_with_checkpoint(cx, &mut stream).await?;
+        let (request, initial_websocket_bytes) = parse_websocket_upgrade_request(&request_bytes)?;
+        Ok(WebSocketUpgradeRequest {
+            request,
+            initial_websocket_bytes,
+            io: stream,
+        })
+    }
+}
+
+/// Cancellation-safe server-side WebSocket transport over owned asupersync I/O.
+///
+/// [`Self::accept`] completes a validated HTTP Upgrade request. The adapter
+/// then owns RFC 6455 server-role framing: client input must be masked, server
+/// output is unmasked, and frame, assembled-message, read-buffer, and
+/// pending-write limits are all enforced by this type.
 ///
 /// It intentionally does not implement the synchronous or split transport
 /// traits for the same reason as [`AsyncWsClientTransport`].
@@ -323,39 +816,59 @@ impl<IO> AsyncWsServerTransport<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Validates and completes an HTTP Upgrade over an owned asupersync stream.
+    ///
+    /// Route and authentication policy remain outside this primitive: call it
+    /// only after the enclosing HTTP boundary has selected the WebSocket
+    /// endpoint. TCP servers should use [`WebSocketListener`], inspect its
+    /// [`WebSocketUpgradeRequest`], and then explicitly authorize completion.
+    pub async fn accept(cx: &Cx, request_bytes: &[u8], io: IO) -> Result<Self, TransportError> {
+        WebSocketUpgradeAdmission::admit(request_bytes)?
+            .complete(cx, io)
+            .await
+    }
+
     /// Creates a cancellation-safe server transport from an already-upgraded I/O stream.
     ///
-    /// This experimental byte-stream adapter performs no HTTP Upgrade, URI
-    /// connection, endpoint registration, listener startup, or handshake
-    /// authentication. Its caller must have completed HTTP Upgrade admission.
-    /// No prebuilt native WebSocket is accepted: doing so would make this
-    /// profile's resource bounds unverifiable.
-    ///
-    /// The experimental profile deliberately has no Upgrade entry point:
-    ///
-    /// ```compile_fail
-    /// use asupersync::net::tcp::VirtualTcpStream;
-    /// use fastmcp_transport::websocket::AsyncWsServerTransport;
-    ///
-    /// let _ = AsyncWsServerTransport::<VirtualTcpStream>::accept;
-    /// ```
+    /// This is useful only when another trusted in-process HTTP boundary has
+    /// already performed admission. New TCP servers should prefer
+    /// [`Self::accept`] or [`WebSocketListener`].
     #[must_use]
     pub fn from_upgraded(io: IO) -> Self {
-        Self {
+        // This constructor has no pre-read bytes, so the bounded initializer
+        // cannot fail.
+        Self::from_upgraded_with_initial_bytes(io, Box::new([]))
+            .expect("empty WebSocket initial buffer is always within bounds")
+    }
+
+    fn from_upgraded_with_initial_bytes(
+        io: IO,
+        initial_websocket_bytes: Box<[u8]>,
+    ) -> Result<Self, TransportError> {
+        if initial_websocket_bytes.len() > FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE {
+            return Err(websocket_invalid_data(
+                "WebSocket initial read buffer exceeds its configured bound",
+            ));
+        }
+        let mut read_buf = BytesMut::with_capacity(
+            FASTMCP_WEBSOCKET_READ_CHUNK_SIZE.max(initial_websocket_bytes.len()),
+        );
+        read_buf.extend_from_slice(&initial_websocket_bytes);
+        Ok(Self {
             io,
             codec: Codec::new(),
             frame_decoder: FrameCodec::server()
                 .max_payload_size(FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE),
             frame_encoder: FrameCodec::server()
                 .max_payload_size(FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE),
-            // Keep the initial per-connection allocation small. `read_more`
-            // caps its logical length before asking `BytesMut` to grow it.
-            read_buf: BytesMut::with_capacity(FASTMCP_WEBSOCKET_READ_CHUNK_SIZE),
+            // `read_more` caps its logical length before asking `BytesMut` to
+            // grow it; the admission path additionally bounds pipelined bytes.
+            read_buf,
             write_buf: BytesMut::new(),
             fragment_buffer: Vec::new(),
             fragmented_text: false,
             closed: false,
-        }
+        })
     }
 
     /// Sends a JSON-RPC message in one unmasked server-role text frame.
@@ -2316,14 +2829,252 @@ mod tests {
     use super::*;
     use crate::CodecError;
     use asupersync::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
+    use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test;
     use fastmcp_protocol::RequestId;
-    use std::io::{self, Cursor};
+    use std::io::{self, Cursor, Read, Write};
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
+    use std::thread;
+
+    fn spawn_public_ws_peer(
+        status_line: &'static str,
+        source: Option<&'static [u8]>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback WebSocket peer");
+        let address = listener
+            .local_addr()
+            .expect("read loopback WebSocket peer address");
+        let peer = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept WebSocket client");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .expect("bound peer handshake read");
+            let mut request = Vec::new();
+            let mut byte = [0_u8; 1];
+            while websocket_http_header_end(&request).is_none() {
+                stream
+                    .read_exact(&mut byte)
+                    .expect("read WebSocket Upgrade request byte");
+                request.push(byte[0]);
+                assert!(
+                    request.len() <= FASTMCP_WEBSOCKET_MAX_HTTP_HEADER_SIZE,
+                    "client Upgrade request must stay bounded"
+                );
+            }
+            let request = NativeHttpRequest::parse(&request).expect("parse client Upgrade request");
+            if status_line == "HTTP/1.1 101 Switching Protocols" {
+                let response = ServerHandshake::new()
+                    .accept(&request)
+                    .expect("admit client Upgrade request")
+                    .response_bytes();
+                stream
+                    .write_all(&response)
+                    .expect("write valid WebSocket Upgrade response");
+                if let Some(source) = source {
+                    let mut frame = BytesMut::new();
+                    FrameCodec::server()
+                        .encode(Frame::text(Bytes::copy_from_slice(source)), &mut frame)
+                        .expect("encode loopback WebSocket text frame");
+                    stream
+                        .write_all(&frame)
+                        .expect("write loopback WebSocket text frame");
+                }
+            } else {
+                stream
+                    .write_all(format!("{status_line}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .expect("write forbidden Upgrade response");
+            }
+        });
+        (format!("ws://{address}/mcp"), peer)
+    }
+
+    #[test]
+    fn public_upgrade_admission_accepts_one_bounded_switching_request() {
+        let request = b"GET /mcp HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let admission = WebSocketUpgradeAdmission::admit(request)
+            .expect("public server Upgrade admission must accept an RFC 6455 request");
+        assert!(
+            admission
+                .response
+                .starts_with(b"HTTP/1.1 101 Switching Protocols\r\n")
+        );
+        assert!(admission.initial_websocket_bytes.is_empty());
+    }
+
+    #[test]
+    fn public_upgrade_admission_rejects_near_identical_request_without_upgrade_token() {
+        let request = b"GET /mcp HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let error = match WebSocketUpgradeAdmission::admit(request) {
+            Ok(_) => panic!("only the missing Connection Upgrade token must reject the request"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, TransportError::Io(ref source) if source.kind() == io::ErrorKind::InvalidData),
+            "forbidden non-Upgrade request must not produce a server transport: {error:?}"
+        );
+    }
+
+    #[test]
+    fn public_upgrade_admission_rejects_oversized_input_before_header_scan() {
+        let mut request = b"GET /mcp HTTP/1.1\r\nHost: example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n".to_vec();
+        request.resize(
+            FASTMCP_WEBSOCKET_MAX_HTTP_HEADER_SIZE + FASTMCP_WEBSOCKET_MAX_READ_BUFFER_SIZE + 1,
+            b'x',
+        );
+
+        let error = match WebSocketUpgradeAdmission::admit(&request) {
+            Ok(_) => panic!("a request beyond both bounded allotments must reject before parsing"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, TransportError::Io(ref source) if source.kind() == io::ErrorKind::InvalidData),
+            "oversized Upgrade input must not expose an admission: {error:?}"
+        );
+    }
+
+    #[test]
+    fn public_listener_authorizes_configured_path_before_101() {
+        let (address_sender, address_receiver) = std::sync::mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build public WebSocket listener runtime");
+            runtime.block_on(async {
+                let cx = Cx::current().expect("runtime installs a listener context");
+                let listener = WebSocketListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind public WebSocket listener");
+                address_sender
+                    .send(listener.local_addr().expect("read listener address"))
+                    .expect("publish listener address");
+                let pending = listener
+                    .accept(&cx)
+                    .await
+                    .expect("read one bounded public Upgrade request");
+                assert_eq!(pending.path(), "/mcp");
+                let _transport = pending
+                    .into_admission()
+                    .expect("authorize configured path")
+                    .complete(&cx)
+                    .await
+                    .expect("commit one authorized Upgrade");
+            });
+        });
+        let address = address_receiver
+            .recv()
+            .expect("receive public listener address");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build public WebSocket client runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs a client context");
+            AsyncWsClientTransport::<TcpStream>::connect(&cx, &format!("ws://{address}/mcp"))
+                .await
+                .expect("authorized public listener must complete a 101");
+        });
+        peer.join().expect("public listener peer completes");
+    }
+
+    #[test]
+    fn public_listener_rejects_near_identical_wrong_path_before_101() {
+        let (address_sender, address_receiver) = std::sync::mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build public WebSocket listener runtime");
+            runtime.block_on(async {
+                let cx = Cx::current().expect("runtime installs a listener context");
+                let listener = WebSocketListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind public WebSocket listener");
+                address_sender
+                    .send(listener.local_addr().expect("read listener address"))
+                    .expect("publish listener address");
+                let pending = listener
+                    .accept(&cx)
+                    .await
+                    .expect("read one bounded public Upgrade request");
+                assert_eq!(pending.path(), "/forbidden");
+                let mut stream = pending.into_stream();
+                stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .expect("write caller-owned route rejection");
+            });
+        });
+        let address = address_receiver
+            .recv()
+            .expect("receive public listener address");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build public WebSocket client runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs a client context");
+            let error = match AsyncWsClientTransport::<TcpStream>::connect(
+                &cx,
+                &format!("ws://{address}/forbidden"),
+            )
+            .await
+            {
+                Ok(_) => panic!("the wrong route must not receive a 101"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, TransportError::Io(ref source) if source.kind() == io::ErrorKind::InvalidData),
+                "wrong-path listener rejection must fail before transport exposure: {error:?}"
+            );
+        });
+        peer.join()
+            .expect("forbidden public listener peer completes");
+    }
+
+    #[test]
+    fn public_ws_client_handshake_preserves_exact_result_source() {
+        const SOURCE: &[u8] = br#"{"jsonrpc":"2.0","id":71,"result":{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}}"#;
+        let (url, peer) = spawn_public_ws_peer("HTTP/1.1 101 Switching Protocols", Some(SOURCE));
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build public WebSocket client runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs a caller context");
+            let mut client = AsyncWsClientTransport::<TcpStream>::connect(&cx, &url)
+                .await
+                .expect("public ws:// connection and Upgrade must succeed");
+            let received = client
+                .recv_with_source(&cx)
+                .await
+                .expect("public client must admit the server result");
+            assert_eq!(received.source(), SOURCE);
+            assert!(matches!(received.message(), JsonRpcMessage::Response(_)));
+        });
+        peer.join().expect("loopback WebSocket peer completes");
+    }
+
+    #[test]
+    fn public_ws_client_rejects_near_identical_non_switching_response() {
+        let (url, peer) = spawn_public_ws_peer("HTTP/1.1 200 Switching Protocols", None);
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build public WebSocket client runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs a caller context");
+            let error = match AsyncWsClientTransport::<TcpStream>::connect(&cx, &url).await {
+                Ok(_) => panic!("only the forbidden 101-to-200 status difference must reject Upgrade"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, TransportError::Io(ref source) if source.kind() == io::ErrorKind::InvalidData),
+                "non-switching HTTP response must fail before a transport is exposed: {error:?}"
+            );
+        });
+        peer.join()
+            .expect("loopback forbidden WebSocket peer completes");
+    }
 
     fn virtual_socket_pair() -> (
         asupersync::net::tcp::VirtualTcpStream,

@@ -3,8 +3,8 @@
 //! This crate provides transport implementations for MCP communication:
 //! - **Stdio**: Standard input/output (primary transport)
 //! - **SSE**: Server-Sent Events (HTTP-based streaming)
-//! - **WebSocket (experimental)**: Caller-upgraded async composition, enabled
-//!   only by the `websocket-experimental` feature
+//! - **WebSocket**: Native `ws://` and `wss://` client connections plus
+//!   bounded HTTP Upgrade admission and TCP listener building blocks
 //! - **HTTP**: Request/response and streamable-HTTP building blocks
 //! - **Memory**: In-process transport for tests and embedding
 //!
@@ -47,19 +47,8 @@ pub mod http;
 pub mod memory;
 pub mod sse;
 mod stdio;
-#[cfg(feature = "websocket-experimental")]
-#[path = "websocket.rs"]
-mod websocket_impl;
-
-/// Experimental caller-upgraded asynchronous WebSocket composition.
-///
-/// This module intentionally contains only cancellation-aware client and
-/// server adapters. It neither parses `ws://`/`wss://` URIs nor performs an
-/// HTTP Upgrade; callers supply already-upgraded asupersync byte streams.
-#[cfg(feature = "websocket-experimental")]
-pub mod websocket {
-    pub use super::websocket_impl::{AsyncWsClientTransport, AsyncWsServerTransport};
-}
+/// Native cancellation-aware WebSocket transport building blocks.
+pub mod websocket;
 
 pub use async_io::{AsyncLineReader, AsyncStdin, AsyncStdout};
 

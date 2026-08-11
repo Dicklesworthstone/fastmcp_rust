@@ -17,14 +17,18 @@ categories = ["network-programming"]
 # final transport surfaces does not retain the legacy SSE/HTTP route family.
 legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05"]
 
-# Nonstandard embedding-only profile. This intentionally does not provide an
-# HTTP Upgrade listener, URI connector, or blocking byte-stream API.
+# Compatibility feature for workspace feature forwarding. WebSocket transport
+# is now public unconditionally; selecting this name no longer changes the
+# transport dependency graph or public API.
 websocket-experimental = []
 
 [dependencies]
 fastmcp-core.workspace = true
 fastmcp-protocol.workspace = true
-asupersync.workspace = true
+# WebSocket transport uses asupersync's native TCP, RFC 6455, and Rustls
+# stream surfaces. `tls-webpki-roots` supplies an explicit public trust-root
+# path for `wss://`; callers can instead pass their own `TlsConnector`.
+asupersync = { workspace = true, features = ["tls", "tls-webpki-roots"] }
 serde.workspace = true
 serde_json.workspace = true
 # FND-01 TRANSPORT-NO-GETRANDOM: WebSocket masking uses fastmcp-core crypto.
