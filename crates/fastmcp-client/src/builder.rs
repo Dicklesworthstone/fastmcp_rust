@@ -510,7 +510,7 @@ impl ClientBuilder {
     /// configured endpoint bundle rather than to an HTTP origin.
     pub fn http_negotiation(&self) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
         self.validate_feature_configuration()
-            .map_err(|_| ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly)?;
+            .map_err(|_| ClientHttpNegotiationError::FeatureConfigurationRejected)?;
         ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
     }
 
@@ -554,6 +554,7 @@ impl ClientBuilder {
         )
         .await?;
 
+        #[cfg(feature = "legacy-2024-11-05")]
         if connection.selected_protocol_era()
             == fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
         {
@@ -569,6 +570,10 @@ impl ClientBuilder {
                 .set_legacy_reverse_request_handlers(reverse_request_handlers)
                 .map_err(|_| Self::http_policy_admission_error())?;
         }
+        // Without the exact-2024 lane, no connection can select the legacy era,
+        // so the reverse-handler and capability material is inert here.
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let _ = (reverse_request_handlers, legacy_capabilities);
 
         Ok(connection)
     }

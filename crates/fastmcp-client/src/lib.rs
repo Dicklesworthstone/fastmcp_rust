@@ -3774,6 +3774,7 @@ fn install_client_callback_panic_hook() {
                 .try_with(Cell::get)
                 .unwrap_or(false)
             {
+                use std::io::Write as _;
                 let _ = std::io::stderr().write_all(REDACTED_CLIENT_CALLBACK_PANIC);
             } else {
                 previous(panic_info);
@@ -4186,7 +4187,7 @@ impl RequestCancellationTerminalElection {
                         _response.raw_result.as_deref().is_some_and(|source| {
                             matches!(
                                 decode_core_result_with_cache_ttl_from_source(
-                                    request,
+                                    &request,
                                     result,
                                     Some(source),
                                 ),
@@ -11489,7 +11490,7 @@ impl Client {
             request: self.final_task_request_meta()?,
             task_id: task_id.clone(),
         };
-        let result =
+        let result: FinalGetTaskResult =
             self.send_final_task_request_with_cancellation(cx, cancellation, TASK_GET, params)?;
         if result.task.base().task_id != task_id {
             return Err(self.terminate_connection(McpError::invalid_request(

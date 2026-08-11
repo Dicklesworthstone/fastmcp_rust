@@ -2348,7 +2348,7 @@ impl LegacyHttpRequest {
                 request_id: self.commit.request_id.clone(),
             });
         }
-        let params = serde_json::to_value(CancelledParams {
+        let params = serde_json::to_value(fastmcp_protocol::CancelledParams {
             request_id: self.commit.request_id.clone(),
             reason,
         })
@@ -2359,7 +2359,7 @@ impl LegacyHttpRequest {
             .send(
                 cx,
                 &JsonRpcMessage::Request(JsonRpcRequest::notification(
-                    methods::NOTIFICATIONS_CANCELLED,
+                    fastmcp_protocol::methods::NOTIFICATIONS_CANCELLED,
                     Some(params),
                 )),
             )
