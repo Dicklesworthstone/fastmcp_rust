@@ -1231,6 +1231,32 @@ impl ModernHttpSseResponseStream {
         Ok(())
     }
 
+    /// Feeds one already-bounded native body frame through the SSE parser.
+    ///
+    /// Keeping parser dispatch and aggregate pending-event admission in one
+    /// helper makes the frame-level count/byte contract independent of how a
+    /// particular HTTP decoder segments a chunked transfer on the network.
+    fn push_body_frame(&mut self, chunk: &[u8]) -> Result<(), ModernHttpExecutorError> {
+        let mut parser = self
+            .parser
+            .take()
+            .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
+        match parser.push_with(chunk, |event| self.retain_pending_event(event)) {
+            Ok(()) => {
+                self.parser = Some(parser);
+                Ok(())
+            }
+            Err(SsePushError::Parse(error)) => {
+                self.close();
+                Err(ModernHttpExecutorError::SseParse(error))
+            }
+            Err(SsePushError::Consumer(error)) => {
+                self.close();
+                Err(error)
+            }
+        }
+    }
+
     /// Returns the next completed SSE `data` payload, or `None` at EOF.
     ///
     /// The returned payload is not JSON-RPC-admitted. Its caller must decode
@@ -1309,21 +1335,7 @@ impl ModernHttpSseResponseStream {
 
             while data.has_remaining() {
                 let chunk = data.chunk();
-                let mut parser = self
-                    .parser
-                    .take()
-                    .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
-                match parser.push_with(chunk, |event| self.retain_pending_event(event)) {
-                    Ok(()) => self.parser = Some(parser),
-                    Err(SsePushError::Parse(error)) => {
-                        self.close();
-                        return Err(ModernHttpExecutorError::SseParse(error));
-                    }
-                    Err(SsePushError::Consumer(error)) => {
-                        self.close();
-                        return Err(error);
-                    }
-                }
+                self.push_body_frame(chunk)?;
                 data.advance(chunk.len());
             }
             if let Some(event) = self.pending_events.pop_front() {
@@ -1616,6 +1628,23 @@ fn decode_final_subscriptions_terminal(
             method: core_request.method(),
         })
     })?;
+    // The protocol decoder correctly rejects a response whose result metadata
+    // names a different subscription, but that generic rejection would erase
+    // the HTTP listener's more useful expected/actual diagnostic. Inspect only
+    // this already-correlated terminal member first; malformed or absent
+    // metadata still falls through to the authoritative protocol decoder.
+    if let Some(subscription_id) = serde_json::from_str::<serde_json::Value>(result_source)
+        .ok()
+        .and_then(|result| result.get("_meta").cloned())
+        .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY).cloned())
+        .and_then(|subscription_id| serde_json::from_value::<RequestId>(subscription_id).ok())
+        && !subscription_id.correlates_with(&expected_id)
+    {
+        return Err(ModernHttpSubscriptionListenError::TerminalIdMismatch {
+            expected: expected_id,
+            actual: subscription_id,
+        });
+    }
     let result = core_request
         .decode_response_result(&response, result_source)
         .map_err(ModernHttpSubscriptionListenError::TerminalResult)?;
@@ -2250,6 +2279,14 @@ pub enum ClientHttpResponse {
     Legacy(JsonRpcMessage),
 }
 
+/// The already-proven request construction lane used by the shared bounded
+/// JSON response collector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModernRequestAdmission<'a> {
+    Core(&'a str),
+    FinalExtension(&'a str),
+}
+
 /// Immutable evidence that one exact-2024 request POST was acknowledged.
 ///
 /// A [`LegacyHttpRequest`] exists only after this receipt has been created.
@@ -2424,6 +2461,9 @@ pub enum ClientHttpConnectionError {
     /// A raw legacy request attempted to bypass a configured final extension
     /// descriptor instead of using the negotiated extension request surface.
     RegisteredExtensionMethodRequiresAdmission { method: String },
+    /// The frozen client registry or retained discovery result did not admit
+    /// a requested final extension method.
+    FinalExtensionAdmission(McpError),
     /// Too many interleaved legacy notifications accumulated before a response.
     LegacyNotificationQueueFull,
     /// Too many interleaved legacy notifications or reverse requests arrived
@@ -2534,6 +2574,7 @@ impl fmt::Display for ClientHttpConnectionError {
                 formatter,
                 "registered final extension method {method} requires the admitted extension request surface"
             ),
+            Self::FinalExtensionAdmission(error) => error.fmt(formatter),
             Self::LegacyNotificationQueueFull => formatter.write_str(
                 "legacy request received too many interleaved notifications before its response",
             ),
@@ -2635,6 +2676,7 @@ impl std::error::Error for ClientHttpConnectionError {
             | Self::FinalToolCallRequiresModern
             | Self::FinalTasksRequiresModern { .. } => None,
             Self::LegacyCallbackConfiguration(error) => Some(error),
+            Self::FinalExtensionAdmission(error) => Some(error),
             Self::ResponseAdmission(error) => Some(error),
             Self::SubscriptionsListen(error) => Some(error),
             Self::FinalCoreListen(error) => Some(error),
@@ -3245,7 +3287,36 @@ impl ClientHttpConnection {
         self.request_json_with_result_source_at_inner(
             cx,
             None,
-            method.as_ref(),
+            ModernRequestAdmission::Core(method.as_ref()),
+            parameters,
+            request_id,
+            maximum_response_bytes,
+        )
+        .await
+    }
+
+    /// Sends one generic final extension request through the exact method
+    /// descriptor admitted by both the frozen client registry and retained
+    /// `server/discover` result.
+    ///
+    /// Admission, request-ID validation, metadata construction, peer contact,
+    /// and correlated response decoding remain one indivisible path. Ordinary
+    /// raw requests cannot select this core-method bypass.
+    pub(crate) async fn request_final_extension_json_with_result_source_at(
+        &mut self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+        self.admit_final_extension_method(extension_id, method)
+            .map_err(ClientHttpConnectionError::FinalExtensionAdmission)?;
+        self.request_json_with_result_source_at_inner(
+            cx,
+            None,
+            ModernRequestAdmission::FinalExtension(method),
             parameters,
             request_id,
             maximum_response_bytes,
@@ -3274,7 +3345,7 @@ impl ClientHttpConnection {
         self.request_json_with_result_source_at_inner(
             cx,
             Some(cancellation),
-            method.as_ref(),
+            ModernRequestAdmission::Core(method.as_ref()),
             parameters,
             request_id,
             maximum_response_bytes,
@@ -3286,20 +3357,50 @@ impl ClientHttpConnection {
         &mut self,
         cx: &Cx,
         cancellation: Option<&McpRequestCancellation>,
-        method: &str,
+        admission: ModernRequestAdmission<'_>,
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
     ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
-        let response = self
-            .request_with_optional_cancellation(
-                cx,
-                cancellation,
-                method,
-                parameters,
-                request_id.clone(),
-            )
-            .await?;
+        let response = match admission {
+            ModernRequestAdmission::Core(method) => {
+                self.request_with_optional_cancellation(
+                    cx,
+                    cancellation,
+                    method,
+                    parameters,
+                    request_id.clone(),
+                )
+                .await?
+            }
+            ModernRequestAdmission::FinalExtension(method) => {
+                let client = match self {
+                    Self::Modern(client) => client,
+                    #[cfg(feature = "legacy-2024-11-05")]
+                    Self::LegacySse(_) => {
+                        return Err(ClientHttpConnectionError::FinalExtensionAdmission(
+                            McpError::invalid_params(
+                                "Final extensions are unavailable in exact MCP 2024-11-05",
+                            ),
+                        ));
+                    }
+                };
+                debug_assert!(
+                    cancellation.is_none(),
+                    "the final extension surface has no request-local cancellation entry"
+                );
+                client
+                    .execute_admitted_final_extension_request(
+                        cx,
+                        method,
+                        parameters,
+                        request_id.clone(),
+                    )
+                    .await
+                    .map(ClientHttpResponse::Modern)
+                    .map_err(ClientHttpConnectionError::Modern)?
+            }
+        };
         match response {
             #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => {
@@ -4536,6 +4637,56 @@ impl ModernHttpClient {
         }
         let request =
             self.build_post_discovery_request(cx, method, parameters, request_id, None)?;
+        self.execute_post_discovery_request(cx, &request).await
+    }
+
+    /// Executes a final extension request only after the connection-level
+    /// registry/discovery admission has succeeded in the same call path.
+    ///
+    /// This is deliberately private and distinct from [`Self::request`]: it
+    /// bypasses only the core method table, not request-ID, cancellation,
+    /// metadata, or native HTTP admission.
+    async fn execute_admitted_final_extension_request(
+        &self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+    ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::Cancelled,
+            ));
+        }
+        if request_id.validate().is_err() {
+            return Err(ModernHttpClientError::InvalidRequestId);
+        }
+        let generic_apps_configured = self
+            .client_extension_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.configures_mcp_apps());
+        let client_extension_settings = self.configured_client_extensions(None);
+        let client_extensions = merge_client_extensions(
+            (self
+                .discovery_state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mcp_apps_activation_receipt
+                .is_some()
+                && !generic_apps_configured)
+                .then_some(self.mcp_apps_settings.as_ref())
+                .flatten(),
+            client_extension_settings.as_ref(),
+        );
+        let request = build_modern_request_after_method_validation(
+            &self.modern_post_target,
+            &self.client_info,
+            &self.client_capabilities,
+            method,
+            parameters,
+            Some(request_id),
+            client_extensions.as_ref(),
+        )?;
         self.execute_post_discovery_request(cx, &request).await
     }
 
@@ -6369,31 +6520,45 @@ impl LegacySseHttpOutbound {
             )
         })?;
         body.push(b'\n');
-        let mut response = self
-            .post_client
-            .request_streaming(
-                cx,
-                Method::Post,
-                &self.advertised_message_post_target,
-                vec![
-                    (
-                        "Content-Type".to_owned(),
-                        MODERN_MCP_CONTENT_TYPE.to_owned(),
-                    ),
-                    ("Accept".to_owned(), "application/json".to_owned()),
-                    (
-                        "Accept-Encoding".to_owned(),
-                        MODERN_MCP_ACCEPT_ENCODING.to_owned(),
-                    ),
-                ],
-                body,
-            )
-            .await
-            .map_err(|error| {
-                LegacySseOutboundSendError::submitted(LegacySseHttpClientError::Executor(
-                    map_transport_error(error),
-                ))
-            })?;
+        let mut exchange = Box::pin(self.post_client.request_streaming(
+            cx,
+            Method::Post,
+            &self.advertised_message_post_target,
+            vec![
+                (
+                    "Content-Type".to_owned(),
+                    MODERN_MCP_CONTENT_TYPE.to_owned(),
+                ),
+                ("Accept".to_owned(), "application/json".to_owned()),
+                (
+                    "Accept-Encoding".to_owned(),
+                    MODERN_MCP_ACCEPT_ENCODING.to_owned(),
+                ),
+            ],
+            body,
+        ));
+        // The native HTTP exchange checks `cx` before and after its response
+        // head operation, but a quiet peer leaves that future parked on I/O.
+        // Bind a second pending future to the explicit caller context so its
+        // cancellation waker can win while the response head is still absent.
+        // Dropping `exchange` then closes this request-owned connection; the
+        // conservative submitted classification below retains the response
+        // tombstone in case the peer already accepted the POST.
+        let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
+        let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
+        let mut response = poll_fn(|task_cx| {
+            if cancellation.as_mut().poll(task_cx).is_ready() {
+                return Poll::Ready(Err(LegacySseHttpClientError::Cancelled));
+            }
+            match exchange.as_mut().poll(task_cx) {
+                Poll::Ready(response) => Poll::Ready(response.map_err(|error| {
+                    LegacySseHttpClientError::Executor(map_transport_error(error))
+                })),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+        .map_err(LegacySseOutboundSendError::submitted)?;
         if cx.checkpoint().is_err() {
             return Err(LegacySseOutboundSendError::submitted(
                 LegacySseHttpClientError::Cancelled,
@@ -7541,8 +7706,10 @@ mod tests {
     use asupersync::bytes::Bytes;
     use asupersync::channel::oneshot;
     use asupersync::http::Frame;
-    use asupersync::runtime::RuntimeBuilder;
+    use asupersync::runtime::{Runtime, RuntimeBuilder};
     use asupersync::{CancelKind, Cx};
+    #[cfg(feature = "legacy-2024-11-05")]
+    use fastmcp_core::McpError;
     #[cfg(feature = "apps")]
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionDescriptorRegistry, McpAppsClientSettings,
@@ -7550,13 +7717,13 @@ mod tests {
         register_official_mcp_apps_extension,
     };
     use fastmcp_protocol::methods::{
-        PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL,
+        PROMPTS_GET, RESOURCES_READ, SERVER_DISCOVER, SUBSCRIPTIONS_LISTEN, TOOLS_CALL,
     };
-    use fastmcp_protocol::protocol_policy::{
-        LEGACY_PROTOCOL_VERSION, MODERN_PROTOCOL_VERSION, ProtocolEra,
-    };
+    #[cfg(feature = "legacy-2024-11-05")]
+    use fastmcp_protocol::protocol_policy::LEGACY_PROTOCOL_VERSION;
+    use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolEra};
     use fastmcp_protocol::{
-        ClientCapabilities, ClientInfo, CoreResult, FinalCoreResult, RequestId, SERVER_DISCOVER,
+        ClientCapabilities, ClientInfo, CoreResult, FinalCoreResult, JsonRpcRequest, RequestId,
         ServerNotification, SubscriptionFilter,
     };
 
@@ -7564,16 +7731,21 @@ mod tests {
     use super::merge_client_extensions;
     use super::{
         ClientHttpConnection, ClientHttpConnectionError, LegacyPersistentResponse,
-        LegacyPersistentResponseWaiter, LegacySseConnection, LegacySseHttpClientError,
-        LegacySsePersistentState, MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS,
-        MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES, MAX_MRTR_CONTINUATION_ROUNDS,
+        LegacyPersistentResponseWaiter, LegacyPersistentWaiterRetirement, LegacySsePersistentState,
+        MAX_IGNORED_RESPONSE_CONTENT_ENCODING_EMPTY_ELEMENTS, MAX_MRTR_CONTINUATION_ROUNDS,
         MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MAX_PENDING_MODERN_HTTP_SSE_EVENTS,
         MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS, MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS,
         ModernHttpClient, ModernHttpClientError, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
         ModernHttpFinalCoreListenError, ModernHttpMrtrError, ModernHttpResponseKind,
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
-        decode_modern_discovery_response, reject_body_frame_after_cancellation,
-        retire_abandoned_persistent_waiter, validate_response_head,
+        cancellation_control_is_authorized, decode_modern_discovery_response,
+        reject_body_frame_after_cancellation, retire_abandoned_persistent_waiter,
+        validate_response_head,
+    };
+    #[cfg(feature = "legacy-2024-11-05")]
+    use super::{
+        LegacySseConnection, LegacySseHttpClientError, MAX_LEGACY_INTERLEAVED_CONTROL_FRAMES,
+        MAX_PENDING_LEGACY_SSE_EVENT_BYTES, MAX_PENDING_LEGACY_SSE_EVENTS,
     };
     #[cfg(feature = "tasks")]
     use crate::FinalToolCallOutcome;
@@ -7581,11 +7753,7 @@ mod tests {
     use crate::session::ClientExtensionRuntime;
     use crate::sse::SseLimits;
     use crate::{
-        CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolEra, ProtocolPolicy,
-        ReverseRequestHandlers,
-    };
-    use fastmcp_protocol::methods::{
-        PROMPTS_GET, RESOURCES_READ, SERVER_DISCOVER, SUBSCRIPTIONS_LISTEN, TOOLS_CALL,
+        CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolPolicy, ReverseRequestHandlers,
     };
 
     #[derive(Debug)]
@@ -7707,17 +7875,22 @@ mod tests {
         assert!(state.pending.is_empty());
         assert!(state.cancelled_response_ids.is_empty());
         assert!(state.notifications.is_empty());
-        assert!(matches!(
-            runtime_block_on(receiver.recv(&Cx::for_request())),
-            Err(_)
-        ));
+        assert!(runtime_block_on(receiver.recv(&Cx::for_request())).is_err());
+    }
+
+    thread_local! {
+        /// Keeps response bodies and connection-owned receive tasks under the
+        /// same live runtime across the sequential `block_on` calls made by
+        /// one HTTP test. Rebuilding the runtime per call destroys the owner
+        /// of a returned stream or spawned legacy receive pump before the
+        /// test can drive that value again.
+        static HTTP_TEST_RUNTIME: Runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("native HTTP test runtime must build");
     }
 
     fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
-        RuntimeBuilder::current_thread()
-            .build()
-            .expect("native HTTP test runtime must build")
-            .block_on(future)
+        HTTP_TEST_RUNTIME.with(|runtime| runtime.block_on(future))
     }
 
     /// Accepts one local peer connection without allowing a pre-connect
@@ -8071,7 +8244,8 @@ mod tests {
             client_info.clone(),
             ClientCapabilities::default(),
         ))
-        .expect_err("direct policy-bound HTTP connection must reject before contact");
+        .err()
+        .expect("direct policy-bound HTTP connection must reject before contact");
         assert!(matches!(
             connection_error,
             ClientHttpConnectionError::Modern(ModernHttpClientError::FeatureUnavailable(_))
@@ -8083,7 +8257,8 @@ mod tests {
             client_info.clone(),
             ClientCapabilities::default(),
         ))
-        .expect_err("direct modern HTTP constructor must reject before contact");
+        .err()
+        .expect("direct modern HTTP constructor must reject before contact");
         assert!(matches!(
             modern_error,
             ModernHttpClientError::FeatureUnavailable(_)
@@ -8095,7 +8270,8 @@ mod tests {
             client_info,
             ClientCapabilities::default(),
         ))
-        .expect_err("direct high-level HTTP constructor must reject before contact");
+        .err()
+        .expect("direct high-level HTTP constructor must reject before contact");
         assert!(matches!(
             client_error,
             crate::HttpClientError::CoreResult(_)
@@ -8200,14 +8376,6 @@ mod tests {
     fn write_chunked_sse_event(stream: &mut TcpStream, event: &str) {
         write!(stream, "{:X}\r\n{event}\r\n", event.len()).expect("write chunked legacy SSE event");
         stream.flush().expect("flush chunked legacy SSE event");
-    }
-
-    fn write_chunked_sse_frame(stream: &mut TcpStream, frame: &str) {
-        write!(stream, "{:X}\r\n{frame}\r\n", frame.len())
-            .expect("write one chunked modern SSE body frame");
-        stream
-            .flush()
-            .expect("flush one chunked modern SSE body frame");
     }
 
     fn final_progress_payload(message_bytes: usize) -> String {
@@ -8810,7 +8978,6 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accept one-frame tool request");
             let _ = read_request(&mut stream);
             begin_chunked_sse(&mut stream);
-            write_chunked_sse_frame(&mut stream, &body);
             finish_chunked_sse(&mut stream);
         });
 
@@ -8838,7 +9005,15 @@ mod tests {
             limits,
         ))
         .expect("open one-frame final core listener");
-        let result = runtime_block_on(listener.next_event(&cx));
+        // A chunked-transfer chunk is not guaranteed to remain one native
+        // response-body frame: the HTTP decoder may segment it according to
+        // its own read buffer. Feed the exact parser frame through the same
+        // production helper so this boundary test deterministically exercises
+        // the aggregate pending-event contract rather than TCP segmentation.
+        let result = match listener.stream.push_body_frame(body.as_bytes()) {
+            Ok(()) => runtime_block_on(listener.next_event(&cx)),
+            Err(error) => Err(ModernHttpFinalCoreListenError::Executor(error)),
+        };
         let snapshot = (
             listener.stream.response.is_some(),
             listener.stream.parser.is_some(),
@@ -9081,11 +9256,11 @@ mod tests {
         .expect_err("the SSE-only final-core listener must reject a JSON response body");
         assert!(matches!(
             error,
-            ModernHttpFinalCoreListenError::Executor(
+            ClientHttpConnectionError::FinalCoreListen(ModernHttpFinalCoreListenError::Executor(
                 ModernHttpExecutorError::ExpectedSseResponse {
                     actual: ModernHttpResponseKind::Json,
                 }
-            )
+            ))
         ));
         server.join().expect("final core JSON peer joins");
     }
@@ -9556,7 +9731,7 @@ mod tests {
                     &modern_target,
                     "http://127.0.0.1:9/legacy-sse",
                     "http://127.0.0.1:9/legacy-message",
-                    ProtocolPolicy::Auto,
+                    ProtocolPolicy::ModernOnly,
                 ))
                 .connect_http_with_cx(&cx),
         )
@@ -10009,6 +10184,7 @@ mod tests {
         server.join().expect("modern mismatch server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_connection_auto_rejects_one_field_modern_version_mismatch_without_downgrade() {
         let listener =
@@ -10799,7 +10975,7 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let error = runtime_block_on(ClientHttpConnection::connect(
+        let error = match runtime_block_on(ClientHttpConnection::connect(
             &cx,
             plan(
                 "http://127.0.0.1:9/mcp",
@@ -10812,8 +10988,10 @@ mod tests {
                 version: "1.0.0".to_owned(),
             },
             ClientCapabilities::default(),
-        ))
-        .expect_err("one extra legacy event must refuse the long-lived SSE body");
+        )) {
+            Err(error) => error,
+            Ok(_) => panic!("one extra legacy event must refuse the long-lived SSE body"),
+        };
         assert!(matches!(
             error,
             ClientHttpConnectionError::Modern(ModernHttpClientError::LegacySse(
@@ -10881,6 +11059,7 @@ mod tests {
         server.join().expect("legacy mismatch server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn public_http_auto_modern_discovery_omits_exact_legacy_callback_capabilities() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind Auto modern listener");
@@ -10901,7 +11080,7 @@ mod tests {
                 &mut probe,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"serverInfo":{"name":"modern","version":"1"},"ttlMs":0,"cacheScope":"private"}}"#,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern","version":"1"}}}}"#,
             );
         });
 
@@ -10917,9 +11096,11 @@ mod tests {
                 ))
                 .reverse_request_handlers(
                     ReverseRequestHandlers::new().with_sampling_create_message(
-                        move |_cancellation, _params| {
+                        move |_cx, _cancellation, _params| {
                             sampling_calls.fetch_add(1, Ordering::SeqCst);
-                            Ok(crate::CreateMessageResult::text("unexpected", "unexpected"))
+                            Box::pin(async {
+                                Ok(crate::CreateMessageResult::text("unexpected", "unexpected"))
+                            })
                         },
                     ),
                 )
@@ -11788,16 +11969,20 @@ mod tests {
             ..ClientCapabilities::default()
         };
         let handlers = ReverseRequestHandlers::new()
-            .with_sampling_create_message(|_cancellation, _params| {
-                Ok(crate::CreateMessageResult::text(
-                    "handled over legacy HTTP",
-                    "legacy-http-handler",
-                ))
+            .with_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(crate::CreateMessageResult::text(
+                        "handled over legacy HTTP",
+                        "legacy-http-handler",
+                    ))
+                })
             })
-            .with_roots_list(|_cancellation, _params| {
-                Ok(crate::ListRootsResult::new(vec![
-                    fastmcp_protocol::Root::new("file:///workspace"),
-                ]))
+            .with_roots_list(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(crate::ListRootsResult::new(vec![
+                        fastmcp_protocol::Root::new("file:///workspace"),
+                    ]))
+                })
             });
         let cx = Cx::for_request();
         let mut connection = runtime_block_on(ClientHttpConnection::connect(
@@ -12040,16 +12225,20 @@ mod tests {
         let builder = if configure_handlers {
             builder.reverse_request_handlers(
                 ReverseRequestHandlers::new()
-                    .with_sampling_create_message(|_cancellation, _params| {
-                        Ok(crate::CreateMessageResult::text(
-                            "handled during high-level HTTP initialize",
-                            "high-level-http-handler",
-                        ))
+                    .with_sampling_create_message(|_cx, _cancellation, _params| {
+                        Box::pin(async {
+                            Ok(crate::CreateMessageResult::text(
+                                "handled during high-level HTTP initialize",
+                                "high-level-http-handler",
+                            ))
+                        })
                     })
-                    .with_roots_list(|_cancellation, _params| {
-                        Ok(crate::ListRootsResult::new(vec![
-                            fastmcp_protocol::Root::new("file:///workspace"),
-                        ]))
+                    .with_roots_list(|_cx, _cancellation, _params| {
+                        Box::pin(async {
+                            Ok(crate::ListRootsResult::new(vec![
+                                fastmcp_protocol::Root::new("file:///workspace"),
+                            ]))
+                        })
                     }),
             )
         } else {
@@ -12058,13 +12247,14 @@ mod tests {
         let client = runtime_block_on(builder.connect_http_client_with_cx(&cx))
             .expect("public high-level HTTP client completes the exact legacy lifecycle");
         assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+        let served = server
+            .join()
+            .expect("high-level reverse callback server must join")
+            .expect("high-level reverse callback exchange must remain bounded");
         drop(client);
         signal_legacy_test_peer_stop(&stop_tx);
         assert!(
-            server
-                .join()
-                .expect("high-level reverse callback server must join")
-                .expect("high-level reverse callback exchange must remain bounded"),
+            served,
             "high-level legacy peer must receive the configured callback behavior"
         );
     }
@@ -12194,25 +12384,30 @@ mod tests {
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let invoked = Arc::clone(&invoked);
             let observed_cancellation = Arc::clone(&observed_cancellation);
-            move |cancellation, _params| {
-                invoked.fetch_add(1, Ordering::SeqCst);
-                let _ = callback_started_tx.try_send(());
-                let deadline = Instant::now() + Duration::from_millis(200);
-                while Instant::now() < deadline {
+            move |callback_cx, cancellation, _params| {
+                let invoked = Arc::clone(&invoked);
+                let observed_cancellation = Arc::clone(&observed_cancellation);
+                let callback_started_tx = callback_started_tx.clone();
+                Box::pin(async move {
+                    invoked.fetch_add(1, Ordering::SeqCst);
+                    let _ = callback_started_tx.try_send(());
+                    let deadline = Instant::now() + Duration::from_millis(200);
+                    while Instant::now() < deadline {
+                        if cancellation.is_cancel_requested() {
+                            observed_cancellation.fetch_add(1, Ordering::SeqCst);
+                            return Err(McpError::request_cancelled());
+                        }
+                        asupersync::time::sleep(callback_cx.now(), Duration::from_millis(1)).await;
+                    }
                     if cancellation.is_cancel_requested() {
                         observed_cancellation.fetch_add(1, Ordering::SeqCst);
                         return Err(McpError::request_cancelled());
                     }
-                    thread::sleep(Duration::from_millis(1));
-                }
-                if cancellation.is_cancel_requested() {
-                    observed_cancellation.fetch_add(1, Ordering::SeqCst);
-                    return Err(McpError::request_cancelled());
-                }
-                Ok(crate::CreateMessageResult::text(
-                    "reverse callback completed",
-                    "cancellation-fence",
-                ))
+                    Ok(crate::CreateMessageResult::text(
+                        "reverse callback completed",
+                        "cancellation-fence",
+                    ))
+                })
             }
         });
         let cx = Cx::for_request();
@@ -12229,13 +12424,14 @@ mod tests {
         )
         .expect("public high-level HTTP client completes reverse cancellation lifecycle");
         assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+        let served = server
+            .join()
+            .expect("high-level reverse cancellation server must join")
+            .expect("high-level reverse cancellation exchange must remain bounded");
         drop(client);
         signal_legacy_test_peer_stop(&stop_tx);
         assert!(
-            server
-                .join()
-                .expect("high-level reverse cancellation server must join")
-                .expect("high-level reverse cancellation exchange must remain bounded"),
+            served,
             "high-level legacy peer must observe exact reverse cancellation behavior"
         );
         assert_eq!(
@@ -12245,7 +12441,7 @@ mod tests {
         );
         assert_eq!(
             observed_cancellation.load(Ordering::SeqCst),
-            if cancellation_id == 84 { 1 } else { 0 },
+            usize::from(cancellation_id == 84),
             "only the matching cancellation may reach the live callback"
         );
     }
@@ -12286,9 +12482,9 @@ mod tests {
         let invoked = Arc::new(AtomicUsize::new(0));
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let invoked = Arc::clone(&invoked);
-            move |_cancellation, _params| {
+            move |_cx, _cancellation, _params| {
                 invoked.fetch_add(1, Ordering::SeqCst);
-                Ok(crate::CreateMessageResult::text("unexpected", "unexpected"))
+                Box::pin(async { Ok(crate::CreateMessageResult::text("unexpected", "unexpected")) })
             }
         });
         let cx = Cx::for_request();

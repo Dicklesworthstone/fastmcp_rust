@@ -42,6 +42,8 @@ use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
 
+#[cfg(all(test, unix, feature = "legacy-2024-11-05"))]
+use crate::ReverseRequestCancellation;
 use crate::{
     AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
@@ -70,7 +72,7 @@ const CONNECTION_RETRY_CANCEL_SLICE: Duration = Duration::from_millis(25);
 /// One initialized stdio child attempt. `Fallback` is possible only for the
 /// disposable modern Auto probe, after its child has been fully cleaned up.
 enum StdioConnectionAttempt {
-    Connected(Client),
+    Connected(Box<Client>),
     Fallback(AutoStdioFallbackSignal),
 }
 
@@ -554,7 +556,7 @@ impl ClientBuilder {
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
         let legacy_capabilities =
             legacy_capabilities_for_handlers(&builder.capabilities, &reverse_request_handlers);
-        let mut connection = ClientHttpConnection::connect_with_extensions(
+        let connection = ClientHttpConnection::connect_with_extensions(
             cx,
             builder.protocol_plan,
             builder.client_info,
@@ -563,6 +565,8 @@ impl ClientBuilder {
             builder.client_extension_runtime,
         )
         .await?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        let mut connection = connection;
 
         #[cfg(feature = "legacy-2024-11-05")]
         if connection.selected_protocol_era()
@@ -777,7 +781,7 @@ impl ClientBuilder {
                 false,
                 retry_deadline,
             )? {
-                StdioConnectionAttempt::Connected(client) => Ok(client),
+                StdioConnectionAttempt::Connected(client) => Ok(*client),
                 StdioConnectionAttempt::Fallback(_) => {
                     unreachable!("only an Auto modern probe can return a fallback signal")
                 }
@@ -793,7 +797,7 @@ impl ClientBuilder {
                     false,
                     retry_deadline,
                 )? {
-                    StdioConnectionAttempt::Connected(client) => Ok(client),
+                    StdioConnectionAttempt::Connected(client) => Ok(*client),
                     StdioConnectionAttempt::Fallback(_) => {
                         unreachable!("only an Auto modern probe can return a fallback signal")
                     }
@@ -858,7 +862,8 @@ impl ClientBuilder {
             true,
             retry_deadline,
         ) {
-            Ok(StdioConnectionAttempt::Connected(mut client)) => {
+            Ok(StdioConnectionAttempt::Connected(client)) => {
+                let mut client = *client;
                 client.set_protocol_plan_after_selection(self.protocol_plan.clone());
                 Ok(client)
             }
@@ -881,7 +886,7 @@ impl ClientBuilder {
                     false,
                     retry_deadline,
                 )? {
-                    StdioConnectionAttempt::Connected(client) => client,
+                    StdioConnectionAttempt::Connected(client) => *client,
                     StdioConnectionAttempt::Fallback(_) => {
                         unreachable!("an exact-2024 connection cannot emit an Auto fallback signal")
                     }
@@ -989,7 +994,7 @@ impl ClientBuilder {
 
         if defer_initialization {
             // Create uninitialized client - initialization will happen on first use
-            Ok(StdioConnectionAttempt::Connected(
+            Ok(StdioConnectionAttempt::Connected(Box::new(
                 self.create_uninitialized_client(
                     child,
                     child_ownership,
@@ -999,7 +1004,7 @@ impl ClientBuilder {
                     protocol_plan,
                     self.timeout_policy,
                 ),
-            ))
+            )))
         } else {
             let timeout_policy =
                 initialization_policy.expect("initialized connection has a retry timeout policy");
@@ -1025,7 +1030,7 @@ impl ClientBuilder {
                     timeout_policy,
                     retry_deadline,
                 )
-                .map(StdioConnectionAttempt::Connected)
+                .map(|client| StdioConnectionAttempt::Connected(Box::new(client)))
             }
         }
     }
@@ -1257,7 +1262,7 @@ impl ClientBuilder {
                         || cleanup,
                     );
                 }
-                Ok(StdioConnectionAttempt::Connected(client))
+                Ok(StdioConnectionAttempt::Connected(Box::new(client)))
             }
             Err(error) => {
                 let cleanup = client.close();
@@ -1277,6 +1282,14 @@ impl Default for ClientBuilder {
 mod tests {
     use super::*;
     use fastmcp_core::McpErrorCode;
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn reverse_callback_test_runtime() -> asupersync::runtime::Runtime {
+        asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("reverse callback test runtime must build")
+    }
 
     #[cfg(unix)]
     fn auto_legacy_lifecycle_script(discovery_error_code: i32) -> String {
@@ -1335,14 +1348,16 @@ mod tests {
     #[test]
     fn reverse_handlers_derive_exact_legacy_capabilities_before_connect() {
         let handlers = ReverseRequestHandlers::new()
-            .with_sampling_create_message(|_cancellation, _params| {
-                Ok(fastmcp_protocol::CreateMessageResult::text(
-                    "ok",
-                    "test-model",
-                ))
+            .with_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "ok",
+                        "test-model",
+                    ))
+                })
             })
-            .with_roots_list(|_cancellation, _params| {
-                Ok(fastmcp_protocol::ListRootsResult::new(Vec::new()))
+            .with_roots_list(|_cx, _cancellation, _params| {
+                Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
             });
         let builder = ClientBuilder::new()
             .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
@@ -1366,12 +1381,16 @@ mod tests {
     #[test]
     fn reverse_handlers_reject_modern_and_require_legacy_capability_parity() {
         let sampling_handler = || {
-            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
-                Ok(fastmcp_protocol::CreateMessageResult::text(
-                    "ok",
-                    "test-model",
-                ))
-            })
+            ReverseRequestHandlers::new().with_sampling_create_message(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async {
+                        Ok(fastmcp_protocol::CreateMessageResult::text(
+                            "ok",
+                            "test-model",
+                        ))
+                    })
+                },
+            )
         };
         let modern = ClientBuilder::new().reverse_request_handlers(sampling_handler());
         let modern_error = modern
@@ -1386,7 +1405,9 @@ mod tests {
         let legacy = ClientBuilder::new()
             .capabilities(capabilities)
             .reverse_request_handlers(ReverseRequestHandlers::new().with_roots_list(
-                |_cancellation, _params| Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())),
+                |_cx, _cancellation, _params| {
+                    Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
+                },
             ));
         legacy
             .validate_reverse_callback_configuration(&ClientProtocolPlan::stdio(
@@ -1413,45 +1434,301 @@ mod tests {
     #[test]
     fn builder_advertises_callbacks_before_legacy_initialize_and_dispatches_them() {
         let script = "IFS= read -r initialize || exit 1; \
-            case \"$initialize\" in *'\"method\":\"initialize\"'*'\"sampling\":{}'*'\"roots\":{}'*) capabilities_ok=true;; *) capabilities_ok=false;; esac; \
+            capabilities_ok=true; \
+            case \"$initialize\" in *'\"method\":\"initialize\"'*) ;; *) capabilities_ok=false;; esac; \
+            case \"$initialize\" in *'\"sampling\":{}'*) ;; *) capabilities_ok=false;; esac; \
+            case \"$initialize\" in *'\"roots\":{}'*) ;; *) capabilities_ok=false;; esac; \
+            case \"$initialize\" in *'\"elicitation\"'*) capabilities_ok=false;; *) ;; esac; \
             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-builder\",\"version\":\"1.0.0\"}}}'; \
             IFS= read -r lifecycle || exit 1; \
             case \"$lifecycle\" in *notifications/initialized*) lifecycle_ok=true;; *) lifecycle_ok=false;; esac; \
             IFS= read -r request || exit 1; \
             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
             IFS= read -r callback || exit 1; \
-            case \"$callback\" in *'\"id\":41'*'\"model\":\"builder-model\"'*) callback_ok=true;; *) callback_ok=false;; esac; \
+            callback_ok=true; \
+            case \"$callback\" in *'\"id\":41'*) ;; *) callback_ok=false;; esac; \
+            case \"$callback\" in *'\"model\":\"builder-model\"'*) ;; *) callback_ok=false;; esac; \
+            case \"$callback\" in *'\"error\"'*) callback_ok=false;; *) ;; esac; \
             case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"capabilities\":%s,\"lifecycle\":%s,\"callback\":%s,\"request\":%s}}\\n' \"$capabilities_ok\" \"$lifecycle_ok\" \"$callback_ok\" \"$request_ok\"; exec sleep 2";
         let handlers = ReverseRequestHandlers::new()
-            .with_sampling_create_message(|_cancellation, _params| {
-                Ok(fastmcp_protocol::CreateMessageResult::text(
-                    "configured before initialize",
-                    "builder-model",
-                ))
+            .with_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "configured before initialize",
+                        "builder-model",
+                    ))
+                })
             })
-            .with_roots_list(|_cancellation, _params| {
-                Ok(fastmcp_protocol::ListRootsResult::new(Vec::new()))
+            .with_roots_list(|_cx, _cancellation, _params| {
+                Box::pin(async { Ok(fastmcp_protocol::ListRootsResult::new(Vec::new())) })
             });
-        let mut client = ClientBuilder::new()
-            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
-            .reverse_request_handlers(handlers)
-            .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request())
-            .expect("legacy callback configuration completes initialize before exposure");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread callback test runtime must build");
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("callback test runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .expect("legacy callback configuration completes initialize before exposure");
 
-        let result: serde_json::Value = client
-            .send_request("test/builder-callback", serde_json::json!({}))
-            .expect("configured callback responds on the initialized client");
-        assert_eq!(
-            result,
-            serde_json::json!({
-                "capabilities": true,
-                "lifecycle": true,
-                "callback": true,
-                "request": true
-            })
+            let result = client
+                .request_with_cx(&cx, "test/builder-callback", Some(serde_json::json!({})))
+                .await
+                .expect("cooperative ingress lets the configured callback respond");
+            assert_eq!(
+                result.result.as_ref(),
+                Some(&serde_json::json!({
+                    "capabilities": true,
+                    "lifecycle": true,
+                    "callback": true,
+                    "request": true
+                })),
+            );
+            assert!(result.error.is_none());
+            client.close().expect("builder callback client cleanup");
+        });
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn current_thread_receive_cancellation_preserves_connection_and_callback_state() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct CallbackCancellationProbe {
+            dropped: std::sync::Arc<AtomicBool>,
+        }
+
+        impl Drop for CallbackCancellationProbe {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let script = "IFS= read -r initialize || exit 1; \
+            case \"$initialize\" in *'\"method\":\"initialize\"'*) ;; *) exit 1 ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-cancellation-builder\",\"version\":\"1.0.0\"}}}'; \
+            IFS= read -r lifecycle || exit 1; \
+            case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
+            IFS= read -r request || exit 1; \
+            case \"$request\" in *'\"id\":2'*) ;; *) exit 1 ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
+            IFS= read -r control || exit 1; \
+            control_ok=true; \
+            case \"$control\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) ;; *) control_ok=false ;; esac; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"late\":true}}'; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":41}}'; \
+            IFS= read -r next || exit 1; \
+            callback_response=false; follow_up_ok=true; \
+            case \"$next\" in \
+                *'\"method\":\"test/builder-callback-after-cancellation\"'*'\"id\":3'*) ;; \
+                *'\"id\":41'*'\"error\"'*|*'\"id\":41'*'\"result\"'*) callback_response=true; IFS= read -r follow_up || exit 1; case \"$follow_up\" in *'\"method\":\"test/builder-callback-after-cancellation\"'*'\"id\":3'*) ;; *) follow_up_ok=false ;; esac ;; \
+                *) callback_response=true; IFS= read -r follow_up || exit 1; case \"$follow_up\" in *'\"method\":\"test/builder-callback-after-cancellation\"'*'\"id\":3'*) ;; *) follow_up_ok=false ;; esac ;; \
+            esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"control\":%s,\"callbackResponse\":%s,\"followUp\":%s}}\\n' \"$control_ok\" \"$callback_response\" \"$follow_up_ok\"; \
+            exec sleep 2";
+        let callback_started = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_future_dropped = std::sync::Arc::new(AtomicBool::new(false));
+        let callback_cx_observed = std::sync::Arc::new(std::sync::Mutex::new(None::<Cx>));
+        let callback_token_observed =
+            std::sync::Arc::new(std::sync::Mutex::new(None::<ReverseRequestCancellation>));
+        let callback_mutated = std::sync::Arc::new(AtomicBool::new(false));
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+            let callback_started = std::sync::Arc::clone(&callback_started);
+            let callback_future_dropped = std::sync::Arc::clone(&callback_future_dropped);
+            let callback_cx_observed = std::sync::Arc::clone(&callback_cx_observed);
+            let callback_token_observed = std::sync::Arc::clone(&callback_token_observed);
+            let callback_mutated = std::sync::Arc::clone(&callback_mutated);
+            move |callback_cx, cancellation, _params| {
+                let callback_started = std::sync::Arc::clone(&callback_started);
+                let callback_future_dropped = std::sync::Arc::clone(&callback_future_dropped);
+                let callback_cx_observed = std::sync::Arc::clone(&callback_cx_observed);
+                let callback_token_observed = std::sync::Arc::clone(&callback_token_observed);
+                let callback_mutated = std::sync::Arc::clone(&callback_mutated);
+                Box::pin(async move {
+                    callback_started.store(true, Ordering::SeqCst);
+                    *callback_cx_observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(callback_cx.clone());
+                    *callback_token_observed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(cancellation.clone());
+                    let cancellation_probe = CallbackCancellationProbe {
+                        dropped: std::sync::Arc::clone(&callback_future_dropped),
+                    };
+                    let (_park_sender, mut park_receiver) =
+                        asupersync::channel::oneshot::channel::<()>();
+                    let parked = park_receiver.recv(callback_cx).await;
+                    if callback_cx.checkpoint().is_err() && cancellation.checkpoint().is_err() {
+                        drop(cancellation_probe);
+                        return Err(fastmcp_core::McpError::request_cancelled());
+                    }
+                    assert!(
+                        parked.is_ok(),
+                        "a live callback park cannot close before cancellation"
+                    );
+                    callback_mutated.store(true, Ordering::SeqCst);
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "must not be sent after cancellation",
+                        "cancelled-callback-model",
+                    ))
+                })
+            }
+        });
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread callback cancellation runtime must build");
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("callback test runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .expect("legacy callback cancellation configuration initializes");
+
+            let operation_cx = Cx::for_request();
+            let cancellation_cx = operation_cx.clone();
+            let callback_started_for_canceller = std::sync::Arc::clone(&callback_started);
+            let canceller = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while !callback_started_for_canceller.load(Ordering::SeqCst)
+                    && Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    callback_started_for_canceller.load(Ordering::SeqCst),
+                    "the reverse callback must start before forced operation cancellation"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+                cancellation_cx.set_cancel_requested(true);
+            });
+
+            let cancellation = client
+                .request_with_cx(
+                    &operation_cx,
+                    "test/builder-callback-cancellation",
+                    Some(serde_json::json!({})),
+                )
+                .await
+                .expect_err(
+                    "operation cancellation must settle its request without closing the connection",
+                );
+            canceller
+                .join()
+                .expect("forced operation cancellation thread must complete");
+            assert_eq!(cancellation.code, McpErrorCode::RequestCancelled);
+            assert!(client.is_initialized());
+
+            let response = client
+                .request_with_cx(
+                    &cx,
+                    "test/builder-callback-after-cancellation",
+                    Some(serde_json::json!({})),
+                )
+                .await
+                .expect("a later request drives late traffic and proves the connection reusable");
+            assert_eq!(
+                response.result.as_ref(),
+                Some(&serde_json::json!({
+                    "control": true,
+                    "callbackResponse": false,
+                    "followUp": true
+                }))
+            );
+            assert!(response.error.is_none());
+
+            let callback_settlement_deadline =
+                Instant::now() + crate::REVERSE_CALLBACK_SHUTDOWN_TIMEOUT;
+            while !callback_future_dropped.load(Ordering::SeqCst)
+                && Instant::now() < callback_settlement_deadline
+            {
+                client
+                    .drain_completed_reverse_callbacks()
+                    .expect("an expected cancelled callback join is not connection-terminal");
+                asupersync::runtime::yield_now().await;
+            }
+            client
+                .drain_completed_reverse_callbacks()
+                .expect("an expected cancelled callback join is not connection-terminal");
+            assert!(callback_started.load(Ordering::SeqCst));
+            assert!(callback_future_dropped.load(Ordering::SeqCst));
+            assert!(
+                callback_cx_observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(Cx::is_cancel_requested),
+                "task abort must cancel the callback-owned Cx"
+            );
+            assert!(
+                callback_token_observed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .is_some_and(ReverseRequestCancellation::is_cancel_requested),
+                "peer cancellation must cancel the protocol token"
+            );
+            assert!(!callback_mutated.load(Ordering::SeqCst));
+            assert_eq!(client.responses.pending_len(), 0);
+            assert_eq!(client.responses.tombstone_len(), 0);
+            assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
+            assert!(client.responses.terminal_error().is_none());
+            client
+                .close()
+                .expect("cancelled callback is joined by its owning client");
+        });
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn current_thread_receive_deadline_reaps_panicked_reverse_callback() {
+        let script = "IFS= read -r initialize || exit 1; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-panic-builder\",\"version\":\"1.0.0\"}}}'; \
+            IFS= read -r lifecycle || exit 1; \
+            IFS= read -r request || exit 1; \
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
+            exec sleep 2";
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_callback_cx, _cancellation, _params| {
+                Box::pin(async {
+                    panic!("reverse callback panic canary");
+                })
+            },
         );
-        client.close().expect("builder callback client cleanup");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("current-thread callback panic runtime must build");
+
+        runtime.block_on(async move {
+            let cx = Cx::current().expect("callback panic runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .expect("legacy callback panic configuration initializes");
+
+            let error = client
+                .request_with_cx(
+                    &cx,
+                    "test/builder-callback-panic",
+                    Some(serde_json::json!({})),
+                )
+                .await
+                .expect_err("the next bounded ingress turn must reap the callback panic");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, "Client reverse callback task panicked");
+            assert!(!client.is_initialized());
+            client
+                .close()
+                .expect("terminal callback panic still settles subprocess ownership");
+        });
     }
 
     #[cfg(unix)]
@@ -1468,13 +1745,16 @@ mod tests {
             esac;
             printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"auto-modern-callbacks","version":"1.0.0"}}}}';
             exec sleep 2"#;
-        let handlers =
-            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
-                Ok(fastmcp_protocol::CreateMessageResult::text(
-                    "must stay out of modern discovery",
-                    "auto-modern-model",
-                ))
-            });
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "must stay out of modern discovery",
+                        "auto-modern-model",
+                    ))
+                })
+            },
+        );
 
         let mut client = ClientBuilder::new()
             .reverse_request_handlers(handlers)
@@ -1499,50 +1779,63 @@ mod tests {
                     printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}';
                     exec sleep 2 ;;
                 *initialize*2024-11-05*)
-                    case "$first" in *'"sampling":{}'*) capabilities_ok=true ;; *) capabilities_ok=false ;; esac;
+                    capabilities_ok=true;
+                    case "$first" in *'"sampling":{}'*) ;; *) capabilities_ok=false ;; esac;
+                    case "$first" in *'"roots"'*|*'"elicitation"'*) capabilities_ok=false ;; *) ;; esac;
                     printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"auto-legacy-callbacks","version":"1.0.0"}}}';
                     IFS= read -r lifecycle || exit 1;
                     case "$lifecycle" in *notifications/initialized*) lifecycle_ok=true ;; *) lifecycle_ok=false ;; esac;
                     IFS= read -r request || exit 1;
                     printf '%s\n' '{"jsonrpc":"2.0","method":"sampling/createMessage","id":41,"params":{"messages":[],"maxTokens":9}}';
                     IFS= read -r callback || exit 1;
-                    case "$callback" in *'"id":41'*'"model":"auto-legacy-model"'*) callback_ok=true ;; *) callback_ok=false ;; esac;
+                    callback_ok=true;
+                    case "$callback" in *'"id":41'*) ;; *) callback_ok=false ;; esac;
+                    case "$callback" in *'"model":"auto-legacy-model"'*) ;; *) callback_ok=false ;; esac;
+                    case "$callback" in *'"error"'*) callback_ok=false ;; *) ;; esac;
                     case "$request" in *'"id":2'*) request_ok=true ;; *) request_ok=false ;; esac;
                     printf '{"jsonrpc":"2.0","id":2,"result":{"capabilities":%s,"lifecycle":%s,"callback":%s,"request":%s}}\n' "$capabilities_ok" "$lifecycle_ok" "$callback_ok" "$request_ok";
                     exec sleep 2 ;;
                 *) exit 1 ;;
             esac"#;
-        let handlers =
-            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
-                Ok(fastmcp_protocol::CreateMessageResult::text(
-                    "installed after fallback",
-                    "auto-legacy-model",
-                ))
-            });
-
-        let mut client = ClientBuilder::new()
-            .reverse_request_handlers(handlers)
-            .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request())
-            .expect("MethodNotFound authorizes a fresh legacy client with its callbacks");
-
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
-        assert_eq!(
-            client.selected_protocol_era(),
-            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Ok(fastmcp_protocol::CreateMessageResult::text(
+                        "installed after fallback",
+                        "auto-legacy-model",
+                    ))
+                })
+            },
         );
-        let result: serde_json::Value = client
-            .send_request("test/auto-fallback-callback", serde_json::json!({}))
-            .expect("the selected legacy client dispatches its configured callback");
-        assert_eq!(
-            result,
-            serde_json::json!({
-                "capabilities": true,
-                "lifecycle": true,
-                "callback": true,
-                "request": true
-            })
-        );
-        client.close().expect("Auto-legacy client cleanup");
+
+        let runtime = reverse_callback_test_runtime();
+        let test = runtime.handle().spawn(async move {
+            let cx = Cx::current().expect("callback test runtime installs a current context");
+            let mut client = ClientBuilder::new()
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .expect("MethodNotFound authorizes a fresh legacy client with its callbacks");
+
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            assert_eq!(
+                client.selected_protocol_era(),
+                Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+            );
+            let result: serde_json::Value = client
+                .send_request("test/auto-fallback-callback", serde_json::json!({}))
+                .expect("the selected legacy client dispatches its configured callback");
+            assert_eq!(
+                result,
+                serde_json::json!({
+                    "capabilities": true,
+                    "lifecycle": true,
+                    "callback": true,
+                    "request": true
+                })
+            );
+            client.close().expect("Auto-legacy client cleanup");
+        });
+        runtime.block_on(test);
     }
 
     #[cfg(all(unix, not(feature = "legacy-2024-11-05")))]
@@ -1556,7 +1849,8 @@ mod tests {
                     &[],
                     &Cx::for_testing(),
                 )
-                .expect_err("feature-off builder policy must reject before command resolution");
+                .err()
+                .expect("feature-off builder policy must reject before command resolution");
             assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
             assert!(
                 error
@@ -1579,7 +1873,8 @@ mod tests {
                     &[],
                     &Cx::for_testing(),
                 )
-                .expect_err("Apps with an unavailable legacy policy must reject before startup");
+                .err()
+                .expect("Apps with an unavailable legacy policy must reject before startup");
             assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
             assert!(
                 error
@@ -1596,18 +1891,18 @@ mod tests {
         let builder =
             ClientBuilder::new().protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::Auto));
 
-        assert_eq!(
+        assert!(matches!(
             builder.http_negotiation(),
             Err(
                 ClientHttpNegotiationError::FeatureConfigurationUnavailable {
                     policy: ProtocolPolicy::Auto,
                 }
-            ),
-            "feature admission must reject Auto before constructing a modern probe"
-        );
+            )
+        ));
 
         let error = block_on(builder.connect_http_with_cx(&Cx::for_testing()))
-            .expect_err("feature admission must reject Auto before HTTP contact");
+            .err()
+            .expect("feature admission must reject Auto before HTTP contact");
         assert!(matches!(
             error,
             ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
@@ -1999,16 +2294,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
             cancelling_cx.cancel_fast(asupersync::CancelKind::User);
         });
-        let error = ClientBuilder::new()
+        let result = ClientBuilder::new()
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
                     .expect("bounded cancellation probe timeout is valid"),
             )
-            .connect_stdio_with_cx("sh", &["-c", script], &cx)
-            .expect_err("caller cancellation during the modern probe is terminal");
+            .connect_stdio_with_cx("sh", &["-c", script], &cx);
         canceller
             .join()
             .expect("probe cancellation helper joins after the public connection returns");
+        let error = match result {
+            Ok(_) => panic!("caller cancellation during the modern probe is terminal"),
+            Err(error) => error,
+        };
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
     }
 

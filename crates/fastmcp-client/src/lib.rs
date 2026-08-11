@@ -123,7 +123,8 @@ pub use fastmcp_protocol::{
     FinalCompletionArgument as CompletionArgument, FinalCompletionContext as CompletionContext,
     FinalCompletionReference as CompletionReference, FinalCoreResult, FinalGetPromptResult,
     FinalReadResourceResult, FinalSubscriptionsListenResult, GetPromptResult, InputRequiredResult,
-    LegacyCoreResult, ListRootsParams, ListRootsResult, ReadResourceResult, SubscriptionFilter,
+    LegacyCoreRequest, LegacyCoreResult, ListRootsParams, ListRootsResult, ReadResourceResult,
+    SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, ModernHttpClient,
@@ -2082,16 +2083,52 @@ impl Drop for ChildGuard {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct ClientProgressParams {
-    #[serde(rename = "progressTo\x6ben")]
     marker: ProgressMarker,
     progress: f64,
     total: Option<f64>,
     message: Option<String>,
-    #[serde(rename = "_meta")]
     meta: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl<'de> serde::Deserialize<'de> for ClientProgressParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(rename = "progressTo\x6ben")]
+            marker: serde_json::Value,
+            progress: f64,
+            total: Option<f64>,
+            message: Option<String>,
+            #[serde(rename = "_meta")]
+            meta: Option<serde_json::Map<String, serde_json::Value>>,
+        }
+
+        let wire = <Wire as serde::Deserialize>::deserialize(deserializer)?;
+        let marker = match wire.marker {
+            serde_json::Value::String(marker) => ProgressMarker::String(marker),
+            serde_json::Value::Number(marker) => ProgressMarker::Number(
+                JsonInteger::try_from_number(marker).map_err(serde::de::Error::custom)?,
+            ),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "progressToken must be a string or mathematical integer",
+                ));
+            }
+        };
+        Ok(Self {
+            marker,
+            progress: wire.progress,
+            total: wire.total,
+            message: wire.message,
+            meta: wire.meta,
+        })
+    }
 }
 
 impl ClientProgressParams {
@@ -2436,10 +2473,12 @@ impl ReverseCallbackPool {
         let response_sender = Arc::clone(&self.response_sender);
         let task_cx = Cx::current().unwrap_or_else(|| self.cx.clone());
         let task = match task_cx.spawn(move |callback_cx| async move {
-            let result = match invoke_cancellation.checkpoint() {
-                Ok(()) => handler(&callback_cx, invoke_cancellation, params).await,
-                Err(error) => Err(error),
-            };
+            // Admission transfers cancellation observation to the callback.
+            // Invoke it even when cancellation raced ahead of scheduling so
+            // the supplied token remains an observable input; response
+            // election below still prevents a cancelled callback from
+            // committing a late frame.
+            let result = handler(&callback_cx, invoke_cancellation, params).await;
             let response = reverse_request_response(response_id, result);
             match commit_reverse_callback_response(
                 &state,
@@ -2477,6 +2516,9 @@ impl ReverseCallbackPool {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (task_id, task) in tasks.iter() {
                 if task_id.correlates_with(request_id) {
+                    // The token closes the protocol response election; the
+                    // task abort also cancels and wakes the callback's Cx so
+                    // a handler parked in a cancel-aware await can settle.
                     task.abort();
                 }
             }
@@ -2505,22 +2547,25 @@ impl ReverseCallbackPool {
         for (request_id, mut task) in std::mem::take(&mut *tasks) {
             match task.try_join() {
                 Ok(None) => active.push((request_id, task)),
-                Ok(Some(())) => {}
-                Err(_) => panicked = true,
+                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Err(
+                    asupersync::runtime::JoinError::Panicked(_)
+                    | asupersync::runtime::JoinError::PolledAfterCompletion,
+                ) => panicked = true,
             }
         }
         let active_count = active.len();
         *tasks = active;
         if panicked {
             return Err(McpError::internal_error(
-                "Client reverse callback task panicked during shutdown",
+                "Client reverse callback task panicked",
             ));
         }
         Ok(active_count)
     }
 
-    /// Cancels and aborts every retained callback, then observes each task's
-    /// terminal state until the public shutdown deadline. Non-cooperative
+    /// Cancels every retained callback, then observes each task's terminal
+    /// state until the public shutdown deadline. Non-cooperative
     /// tasks remain in this pool for a later explicit `Client::close` retry;
     /// they are never cleared or detached.
     fn join_bounded(&self) -> McpResult<()> {
@@ -2541,8 +2586,8 @@ impl ReverseCallbackPool {
         }
     }
 
-    /// Drop cannot report a join result. It requests cancellation and aborts
-    /// each child, then lets their owner region perform structural settlement.
+    /// Drop cannot report a join result. It requests cancellation, then lets
+    /// the task owner region perform structural settlement.
     fn abort_for_drop(&self) {
         self.cancel_all();
     }
@@ -2768,10 +2813,16 @@ fn json_rpc_error_to_mcp(error: JsonRpcError) -> McpError {
         // than truncating it, normalizing its spelling, or silently
         // manufacturing a different custom code. Preserve the peer's own
         // error data as a distinct value even when it is not an object.
-        Some(serde_json::json!({
-            "jsonrpcErrorCode": peer_code,
-            "jsonrpcErrorData": error.data,
-        }))
+        let mut diagnostic = serde_json::Map::new();
+        diagnostic.insert(
+            "jsonrpcErrorCode".to_owned(),
+            serde_json::Value::Number(peer_code.to_number()),
+        );
+        diagnostic.insert(
+            "jsonrpcErrorData".to_owned(),
+            error.data.unwrap_or(serde_json::Value::Null),
+        );
+        Some(serde_json::Value::Object(diagnostic))
     } else {
         error.data
     };
@@ -3258,6 +3309,7 @@ pub(crate) fn admit_auto_legacy_fallback(cx: &Cx) -> McpResult<()> {
 ///
 /// Public constructors call this before resolving a subprocess, allocating a
 /// request ID, spawning a receive task, or contacting an HTTP peer.
+#[cfg_attr(feature = "legacy-2024-11-05", allow(clippy::unnecessary_wraps))]
 pub(crate) fn validate_protocol_plan_feature(protocol_plan: &ClientProtocolPlan) -> McpResult<()> {
     #[cfg(feature = "legacy-2024-11-05")]
     let _ = protocol_plan;
@@ -3353,7 +3405,19 @@ impl SharedStdioRecv {
         deadline: Option<Instant>,
     ) -> Result<(ReceivedTransportFrame, Instant), TransportError> {
         let mut receiver = self.0.lock().map_err(|_| TransportError::Closed)?;
-        receiver.recv_until_or_closed(cx, deadline)?;
+        if let Err(error) = receiver.recv_until_or_closed(cx, deadline) {
+            // A partial-frame deadline closes the split receiver before its
+            // wrapper returns.  The wrapper consequently reports `Closed`
+            // even though the request-local deadline was the event that won.
+            // Preserve that elected outcome for the client while an EOF that
+            // arrives strictly before the deadline remains ordinary closure.
+            if matches!(error, TransportError::Closed)
+                && deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(TransportError::ReceiveDeadlineExceeded);
+            }
+            return Err(error);
+        }
         let received_at = Instant::now();
         let frame = admitted_stdio_frame(&receiver)?;
         Ok((frame, received_at))
@@ -5059,12 +5123,12 @@ impl HttpClient {
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
-        mut client_capabilities: ClientCapabilities,
+        client_capabilities: ClientCapabilities,
         mcp_apps_settings: Option<McpAppsClientSettings>,
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
         reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {
-        let mut connection = ClientHttpConnection::connect_with_extensions(
+        let connection = ClientHttpConnection::connect_with_extensions(
             cx,
             protocol_plan,
             client_info.clone(),
@@ -5074,6 +5138,12 @@ impl HttpClient {
         )
         .await
         .map_err(HttpClientError::Connection)?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        let mut connection = connection;
+        #[cfg(feature = "legacy-2024-11-05")]
+        let mut client_capabilities = client_capabilities;
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let _ = &reverse_request_handlers;
 
         // Legacy callbacks are part of the capability set advertised by
         // `initialize`, so they must be installed before the lifecycle sends
@@ -5632,6 +5702,9 @@ impl HttpClient {
         method: &str,
         parameters: serde_json::Value,
     ) -> Result<serde_json::Value, HttpClientError> {
+        // This preflight fences request-ID allocation for negative admission.
+        // The HTTP execution seam repeats the same immutable registry check
+        // so no ordinary core/raw request path can select its extension lane.
         self.connection
             .admit_final_extension_method(extension_id, method)
             .map_err(HttpClientError::CoreResult)?;
@@ -5641,8 +5714,9 @@ impl HttpClient {
         let request_id = self.next_request_id()?;
         let (mut response, result_source, _) = self
             .connection
-            .request_json_with_result_source_at(
+            .request_final_extension_json_with_result_source_at(
                 cx,
+                extension_id,
                 method,
                 parameters,
                 request_id,
@@ -6276,6 +6350,15 @@ impl StdioRequestExecutor {
         self.executor.cancel(cx, &mut execution.execution)
     }
 
+    /// Selects caller cancellation for one ordinary request-owned execution.
+    ///
+    /// The selected stdio client keeps this internal so its connection-owned
+    /// ingress driver remains the sole authority that services the resulting
+    /// terminal transition.
+    fn cancel(&self, cx: &Cx, execution: &mut StdioRequestExecution) -> McpResult<()> {
+        self.executor.cancel(cx, &mut execution.execution)
+    }
+
     /// Takes one already-routed final response without reading the transport.
     pub fn try_take_response(
         &self,
@@ -6377,6 +6460,19 @@ fn next_stdio_request_id(next_id: &AtomicU64) -> McpResult<u64> {
         .map_err(|_| McpError::internal_error("Client request ID space exhausted"))
 }
 
+/// A negotiated stdio MCP client.
+///
+/// # Runtime use
+///
+/// The synchronous convenience requests block their caller while the sole
+/// stdio ingress waits for a frame. They therefore cannot make progress on an
+/// exact-2024 reverse callback when invoked from an asupersync
+/// `RuntimeBuilder::current_thread()` task. On Unix,
+/// `Client::request_with_cx` retains that sole ingress owner while
+/// cooperatively yielding between bounded stdio readiness polls so the owned
+/// reverse callback tasks can run. Non-Unix child pipes do not expose a safe
+/// bounded readiness primitive here, so no corresponding async stdio request
+/// API is available there.
 pub struct Client {
     /// The subprocess running the MCP server.
     child: Option<Child>,
@@ -7419,6 +7515,15 @@ impl Client {
     }
 
     fn drain_completed_reverse_callbacks(&mut self) -> McpResult<()> {
+        if let Some(error) = self.reverse_callback_pool.state.terminal_error() {
+            return Err(error);
+        }
+        if let Err(error) = self.reverse_callback_pool.reap_finished_tasks() {
+            self.reverse_callback_pool
+                .state
+                .fail_connection(error.clone());
+            return Err(error);
+        }
         self.reverse_callback_pool
             .state
             .terminal_error()
@@ -7556,6 +7661,11 @@ impl Client {
     /// controls, notifications, and every response ID therefore retain their
     /// normal routing semantics instead of being discarded by a parallel
     /// reader.
+    ///
+    /// This synchronous form blocks a `RuntimeBuilder::current_thread()`
+    /// worker while it waits, so it cannot schedule an exact-2024 reverse
+    /// callback on that worker. On Unix, use `Client::request_with_cx` for
+    /// that case.
     pub fn wait_multiplexed_request(
         &mut self,
         cx: &Cx,
@@ -7568,6 +7678,145 @@ impl Client {
             }
             self.drive_multiplexed_stdio(cx)?;
         }
+    }
+
+    /// Commits and drives one raw request through the negotiated stdio
+    /// connection using the caller's asupersync context.
+    ///
+    /// This remains the connection's only ingress driver. Each turn performs
+    /// at most one bounded 10 ms native stdio readiness wait, checkpoints the
+    /// supplied context, and then yields to asupersync before another turn.
+    /// That lets exact-2024 reverse callback tasks run on a valid
+    /// single-worker `RuntimeBuilder::current_thread()`
+    /// runtime without creating a runtime or helper thread. It is cooperative
+    /// polling rather than an async child-pipe receive primitive.
+    ///
+    /// The supplied context owns only this operation. It is checked before
+    /// and after each connection-owned receive turn; cancellation explicitly
+    /// selects and services this execution with the retained connection
+    /// context before returning. Connection-context cancellation, framing,
+    /// and transport failures retain their existing terminal connection
+    /// behavior.
+    #[cfg(unix)]
+    pub async fn request_with_cx(
+        &mut self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<JsonRpcResponse> {
+        self.request_with_cx_and_raw_result(cx, method, params)
+            .await
+            .map(|(response, _raw_result)| response)
+    }
+
+    #[cfg(unix)]
+    async fn request_with_cx_and_raw_result(
+        &mut self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<(JsonRpcResponse, Option<String>)> {
+        let executor = self.multiplexed_stdio_executor()?;
+        let connection_cx = self.cx.clone();
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let mut execution = self.start_multiplexed_request(&connection_cx, method, params)?;
+        if cx.checkpoint().is_err() {
+            self.cancel_multiplexed_request_with_connection_cx(
+                &connection_cx,
+                &executor,
+                &mut execution,
+            )?;
+            return Err(McpError::request_cancelled());
+        }
+
+        loop {
+            if let Some(response) = executor.try_take_response_with_raw_result(&mut execution)? {
+                return Ok(response);
+            }
+            if cx.checkpoint().is_err() {
+                self.cancel_multiplexed_request_with_connection_cx(
+                    &connection_cx,
+                    &executor,
+                    &mut execution,
+                )?;
+                return Err(McpError::request_cancelled());
+            }
+
+            let receive_deadline = Instant::now()
+                .checked_add(REVERSE_CALLBACK_POLL_SLICE)
+                .unwrap_or_else(Instant::now);
+            self.drive_multiplexed_stdio_until(&connection_cx, Some(receive_deadline))?;
+
+            if cx.checkpoint().is_err() {
+                self.cancel_multiplexed_request_with_connection_cx(
+                    &connection_cx,
+                    &executor,
+                    &mut execution,
+                )?;
+                return Err(McpError::request_cancelled());
+            }
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
+    /// Sends one exact-2024 typed core request while cooperatively driving the
+    /// sole stdio ingress owner on Unix.
+    ///
+    /// Unlike the raw request surface, the input and output are permanently
+    /// confined to the legacy core vocabulary. Method-specific request and
+    /// result validation therefore remains identical to the synchronous typed
+    /// client API, including rejection of final result discriminators and
+    /// metadata. The operation context can cancel this request without
+    /// cancelling the retained connection context.
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    pub async fn request_legacy_core_with_cx(
+        &mut self,
+        cx: &Cx,
+        request: LegacyCoreRequest,
+    ) -> McpResult<LegacyCoreResult> {
+        self.require_legacy_exact_result_session(request.method())?;
+        let request = CoreRequest::Legacy(request);
+        let method = request.method();
+        let params = request.encode_params().map_err(|error| {
+            McpError::invalid_params(format!(
+                "Legacy client request parameters are invalid: {error}"
+            ))
+        })?;
+        let (response, raw_result) = self
+            .request_with_cx_and_raw_result(cx, method, params)
+            .await?;
+        let raw_result = raw_result.as_deref().ok_or_else(|| {
+            self.terminate_connection(McpError::invalid_request(
+                "Exact-2024 typed response lost its admitted result source",
+            ))
+        })?;
+        match request
+            .decode_response_result(&response, raw_result)
+            .map_err(|error| {
+                self.terminate_connection(McpError::invalid_request(format!(
+                    "Invalid exact-2024 core response: {error}"
+                )))
+            })? {
+            CoreResult::Legacy(result) => Ok(result),
+            CoreResult::Final(_) => Err(self.terminate_connection(McpError::internal_error(
+                "Exact-2024 typed request received a final result",
+            ))),
+        }
+    }
+
+    #[cfg(unix)]
+    fn cancel_multiplexed_request_with_connection_cx(
+        &mut self,
+        connection_cx: &Cx,
+        executor: &StdioRequestExecutor,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<()> {
+        executor
+            .cancel(connection_cx, execution)
+            .and_then(|()| executor.service(connection_cx))
+            .map_err(|error| self.terminate_connection(error))
     }
 
     /// Admits and routes one selected stdio frame for every request-owned
@@ -7590,6 +7839,9 @@ impl Client {
         cx: &Cx,
         receive_deadline: Option<Instant>,
     ) -> McpResult<()> {
+        if let Err(error) = self.drain_completed_reverse_callbacks() {
+            return Err(self.terminate_connection(error));
+        }
         let executor = self.multiplexed_stdio_executor()?;
         executor
             .service(cx)
@@ -7607,6 +7859,9 @@ impl Client {
                 executor
                     .service(cx)
                     .map_err(|error| self.terminate_connection(error))?;
+                if let Err(error) = self.drain_completed_reverse_callbacks() {
+                    return Err(self.terminate_connection(error));
+                }
                 return Ok(());
             }
             Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
@@ -7614,7 +7869,11 @@ impl Client {
         executor
             .service_at(cx, received_at)
             .map_err(|error| self.terminate_connection(error))?;
-        self.process_selected_ingress_frame(cx, frame)
+        self.process_selected_ingress_frame(cx, frame)?;
+        if let Err(error) = self.drain_completed_reverse_callbacks() {
+            return Err(self.terminate_connection(error));
+        }
+        Ok(())
     }
 
     /// Flushes request-owner terminal transitions without taking another
@@ -9543,7 +9802,12 @@ impl Client {
 
         loop {
             if let Some(response) = waiter.try_response()? {
-                debug_assert_eq!(response.id.as_ref(), Some(&expected_id));
+                debug_assert!(
+                    response
+                        .id
+                        .as_ref()
+                        .is_some_and(|response_id| response_id.correlates_with(&expected_id))
+                );
                 if let Some(error) = response.error.clone() {
                     return Err(json_rpc_error_to_mcp(error));
                 }
@@ -11981,6 +12245,9 @@ pub(crate) fn transport_error_to_mcp(e: TransportError) -> McpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "legacy-2024-11-05")]
+    use crate::http_executor::ModernHttpConnectOutcome;
+    use fastmcp_protocol::ExtensionDirection;
     use std::collections::{BTreeMap, HashMap};
     #[cfg(all(unix, not(target_os = "linux")))]
     use std::io::Read as _;
@@ -12039,7 +12306,8 @@ mod tests {
                 ClientProtocolPlan::stdio(policy),
                 Cx::for_testing(),
             )
-            .expect_err("feature-off legacy policies must fail before command resolution");
+            .err()
+            .expect("feature-off legacy policies must fail before command resolution");
 
             assert_eq!(error.code, McpErrorCode::InvalidParams);
         }
@@ -12698,8 +12966,6 @@ mod tests {
             .local_addr()
             .expect("read modern completion peer address");
         let modern_target = format!("http://{address}/mcp");
-        let legacy_sse_target = format!("http://{address}/legacy-sse");
-        let legacy_message_target = format!("http://{address}/legacy-message");
         let client_info = ClientInfo {
             name: "http-completion-client".to_owned(),
             version: "1.0.0".to_owned(),
@@ -12754,36 +13020,15 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let auto_plan = ClientProtocolPlan::http(
-            ProtocolPolicy::Auto,
-            Some(
-                CanonicalHttpUrl::parse(&modern_target)
-                    .expect("local modern completion target is canonical"),
-            ),
-            Some(
-                CanonicalHttpUrl::parse(&legacy_sse_target)
-                    .expect("local legacy completion SSE target is canonical"),
-            ),
-            Some(
-                CanonicalHttpUrl::parse(&legacy_message_target)
-                    .expect("local legacy completion message target is canonical"),
-            ),
-            "auto-completion-credential".to_owned(),
-            "auto-completion-security".to_owned(),
-            "auto-completion-transport".to_owned(),
-            1,
-            1,
-            1,
-        )
-        .expect("Auto completion HTTP plan is complete");
+        let modern_plan = http_cache_test_plan(&modern_target);
         let mut client = http_test_runtime_block_on(HttpClient::connect(
             &cx,
-            auto_plan,
+            modern_plan,
             client_info,
             ClientCapabilities::default(),
         ))
         .expect("modern HTTP completion client completes discovery");
-        assert_eq!(client.protocol_plan().policy(), ProtocolPolicy::Auto);
+        assert_eq!(client.protocol_plan().policy(), ProtocolPolicy::ModernOnly);
         assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
         let result = http_test_runtime_block_on(client.complete(&cx, modern_completion_params()))
             .expect("modern HTTP completion returns its typed final payload");
@@ -14348,10 +14593,13 @@ mod tests {
             PROTOCOL_VERSION.to_string(),
         )
         .expect("test client uses the exact legacy protocol version");
+        let runtime_cx = block_on(async {
+            Cx::current().expect("reverse callback tests require a runtime-bound context")
+        });
         let mut client = Client::from_parts(
             child,
             transport,
-            Cx::for_request(),
+            runtime_cx,
             session,
             RequestTimeoutPolicy::new(timeout, timeout).unwrap(),
         );
@@ -15349,7 +15597,7 @@ mod tests {
                 |request_id| {
                     committed_id.set(match request_id {
                         RequestId::Number(id) => Some(*id),
-                        RequestId::String(_) => None,
+                        RequestId::String(_) | RequestId::Integer(_) => None,
                     });
                     assert!(cancellation.cancel());
                 },
@@ -15439,11 +15687,13 @@ mod tests {
              IFS= read -r first || exit 1; \
              case \"$first\" in *'\"method\":\"test/cancel\"'*'\"id\":20'*) ;; *) exit 1 ;; esac; \
              IFS= read -r cancellation || exit 1; \
-             case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":20'*'\"reason\":\"stop\"'*) ;; *) exit 1 ;; esac; \
+             case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*) ;; *) exit 1 ;; esac; \
+             case \"$cancellation\" in *'\"requestId\":20'*) ;; *) exit 1 ;; esac; \
+             case \"$cancellation\" in *'\"reason\":\"stop\"'*) ;; *) exit 1 ;; esac; \
              case \"$cancellation\" in *'\"_meta\"'*|*'\"awaitCleanup\"'*) exit 1 ;; *) ;; esac; \
-             IFS= read -r ping || exit 1; \
-             case \"$ping\" in *'\"method\":\"ping\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r tools || exit 1; \
+             case \"$tools\" in *'\"method\":\"tools/list\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -15477,7 +15727,7 @@ mod tests {
             McpErrorCode::RequestCancelled
         );
         client
-            .ping()
+            .list_tools_typed(None)
             .expect("the scripted peer admits only the exact final cancellation wire");
         assert_eq!(client.responses.cancellation_control_len(), 1);
         client.close().expect("client cleanup");
@@ -15495,12 +15745,13 @@ mod tests {
              case \"$discovery\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \
              IFS= read -r first || exit 1; \
-             case \"$first\" in *'\"method\":\"ping\"'*'\"id\":2'*) \
+             case \"$first\" in *'\"method\":\"tools/list\"'*'\"id\":2'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":2}}}}'; \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r second || exit 1; \
-             case \"$second\" in *'\"method\":\"ping\"'*'\"id\":3'*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             case \"$second\" in *'\"method\":\"tools/list\"'*'\"id\":3'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; \
+             *) printf 'unexpected second frame: %s\\n' \"$second\" >&2; exit 1 ;; esac; \
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -15512,13 +15763,13 @@ mod tests {
         .expect("modern discovery initializes the peer-cancellation client");
 
         client
-            .ping()
-            .expect("matching final peer cancellation must not release a ping waiter");
+            .list_tools_typed(None)
+            .expect("matching final peer cancellation must not release an ordinary waiter");
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
 
         client
-            .ping()
+            .list_tools_typed(None)
             .expect("subsequent ordinary requests remain aligned");
         assert_eq!(client.responses.tombstone_len(), 0);
         assert!(client.is_initialized());
@@ -15601,13 +15852,12 @@ mod tests {
     #[test]
     fn exact_valid_increasing_progress_resets_only_idle() {
         let script = "IFS= read -r request; \
-            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.1,\"_meta\":{\"trace\":\"accepted\"}}}\\n'; \
-            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.2}}\\n'; \
-            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\\n'; exec sleep 2";
+            sleep 0.40; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.1,\"_meta\":{\"trace\":\"accepted\"}}}\\n'; \
+            sleep 0.40; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.2}}\\n'; \
+            sleep 0.40; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\\n'; exec sleep 2";
         let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
         client.timeout_policy =
-            RequestTimeoutPolicy::new(Duration::from_millis(250), Duration::from_millis(800))
-                .unwrap();
+            RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
         let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
@@ -15672,14 +15922,15 @@ mod tests {
     #[test]
     fn unrelated_invalid_and_nonmonotonic_progress_do_not_reset_idle() {
         let script = "IFS= read -r request; \
-            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
-            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":999,\"progress\":0.6}}\\n'; \
-            sleep 0.10; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.7,\"unknown\":true}}\\n'; \
-            sleep 0.05; printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
-            sleep 0.20; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tooLate\":true}}\\n'; exec sleep 2";
-        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(1));
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
+            sleep 2; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":999,\"progress\":0.6}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.7,\"unknown\":true}}\\n'; \
+            printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":2,\"progress\":0.5}}\\n'; \
+            sleep 9; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tooLate\":true}}\\n'; exec sleep 2";
+        let mut client = make_shell_scripted_initialized_client(script, Duration::from_secs(15));
         client.timeout_policy =
-            RequestTimeoutPolicy::new(Duration::from_millis(300), Duration::from_secs(1)).unwrap();
+            RequestTimeoutPolicy::new(Duration::from_secs(10), Duration::from_secs(14)).unwrap();
         let marker = ProgressMarker::Number(JsonInteger::from(2));
         let mut progress_events = Vec::new();
         let mut callback = |progress: f64, _total: Option<f64>, _message: Option<&str>| {
@@ -15701,7 +15952,11 @@ mod tests {
             Some(serde_json::json!({"timeoutSource": "idle"}))
         );
         assert_eq!(progress_events, vec![0.5]);
-        assert!(client.responses.terminal_error().is_none());
+        let terminal_error = client.responses.terminal_error();
+        assert!(
+            terminal_error.is_none(),
+            "non-authoritative progress must not terminate the connection: {terminal_error:?}"
+        );
         client.close().expect("client cleanup");
     }
 
@@ -15873,15 +16128,20 @@ mod tests {
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
             IFS= read -r sampling; \
             case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
-            case \"$sampling\" in *'\"id\":41'*'\"model\":\"selected-half\"'*) callback_ok=true;; *) callback_ok=false;; esac; \
+            case \"$sampling\" in *'\"id\":41'*) callback_id_ok=true;; *) callback_id_ok=false;; esac; \
+            case \"$sampling\" in *'\"model\":\"selected-half\"'*) callback_shape_ok=true;; *) callback_shape_ok=false;; esac; \
+            if $callback_id_ok && $callback_shape_ok; then callback_ok=true; else callback_ok=false; fi; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"request\":%s,\"callback\":%s}}\\n' \
             \"$request_ok\" \"$callback_ok\"; exec sleep 2";
         let callback_calls = Arc::new(AtomicUsize::new(0));
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let callback_calls = Arc::clone(&callback_calls);
-            move |_cancellation, _params| {
-                callback_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(CreateMessageResult::text("handled", "selected-half"))
+            move |_callback_cx, _cancellation, _params| {
+                let callback_calls = Arc::clone(&callback_calls);
+                Box::pin(async move {
+                    callback_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(CreateMessageResult::text("handled", "selected-half"))
+                })
             }
         });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -15931,19 +16191,25 @@ mod tests {
         let handlers = ReverseRequestHandlers::new()
             .with_sampling_create_message({
                 let sampling_calls = std::sync::Arc::clone(&sampling_calls);
-                move |_cancellation, params| {
-                    sampling_calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(params.max_tokens, 9.into());
-                    Ok(CreateMessageResult::text("handled", "handler-model"))
+                move |_callback_cx, _cancellation, params| {
+                    let sampling_calls = std::sync::Arc::clone(&sampling_calls);
+                    Box::pin(async move {
+                        sampling_calls.fetch_add(1, Ordering::Relaxed);
+                        assert_eq!(params.max_tokens, 9.into());
+                        Ok(CreateMessageResult::text("handled", "handler-model"))
+                    })
                 }
             })
             .with_roots_list({
                 let roots_calls = std::sync::Arc::clone(&roots_calls);
-                move |_cancellation, _params| {
-                    roots_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
-                        "file:///workspace",
-                    )]))
+                move |_callback_cx, _cancellation, _params| {
+                    let roots_calls = std::sync::Arc::clone(&roots_calls);
+                    Box::pin(async move {
+                        roots_calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
+                            "file:///workspace",
+                        )]))
+                    })
                 }
             });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -15985,6 +16251,7 @@ mod tests {
         > = Arc::new({
             let invoked = Arc::clone(&invoked);
             move |_cx, _cancellation, ()| {
+                let invoked = Arc::clone(&invoked);
                 Box::pin(async move {
                     invoked.store(true, Ordering::Release);
                     Ok(())
@@ -16024,16 +16291,21 @@ mod tests {
         let script = "IFS= read -r request; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
             IFS= read -r sampling; \
-            case \"$sampling\" in *'\"id\":41'*'\"model\":\"large-model\"'*) shape_ok=true;; *) shape_ok=false;; esac; \
+            case \"$sampling\" in *'\"id\":41'*) callback_id_ok=true;; *) callback_id_ok=false;; esac; \
+            case \"$sampling\" in *'\"model\":\"large-model\"'*) callback_shape_ok=true;; *) callback_shape_ok=false;; esac; \
+            if $callback_id_ok && $callback_shape_ok; then shape_ok=true; else shape_ok=false; fi; \
             case ${#sampling} in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9]) frame_ok=false;; *) frame_ok=true;; esac; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"request\":true,\"frame\":%s,\"shape\":%s}}\\n' \"$frame_ok\" \"$shape_ok\"; \
-            IFS= read -r ping; \
-            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \
-            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"aligned\":%s}}\\n' \"$ping_ok\"; exec sleep 2";
-        let handlers =
-            ReverseRequestHandlers::new().with_sampling_create_message(|_cancellation, _params| {
-                Ok(CreateMessageResult::text("x".repeat(2_048), "large-model"))
-            });
+            IFS= read -r follow_up; \
+            case \"$follow_up\" in *'\"method\":\"test/alignment\"'*'\"id\":3'*) aligned_ok=true;; *) aligned_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"aligned\":%s}}\\n' \"$aligned_ok\"; exec sleep 2";
+        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
+            |_callback_cx, _cancellation, _params| {
+                Box::pin(
+                    async move { Ok(CreateMessageResult::text("x".repeat(2_048), "large-model")) },
+                )
+            },
+        );
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
             script,
             Duration::from_secs(2),
@@ -16047,10 +16319,10 @@ mod tests {
             first,
             serde_json::json!({"request": true, "frame": true, "shape": true})
         );
-        let ping: serde_json::Value = client
-            .send_request("ping", serde_json::json!({}))
+        let follow_up: serde_json::Value = client
+            .send_request("test/alignment", serde_json::json!({}))
             .expect("the following request remains frame-aligned");
-        assert_eq!(ping, serde_json::json!({"aligned": true}));
+        assert_eq!(follow_up, serde_json::json!({"aligned": true}));
         client.close().expect("client cleanup");
     }
 
@@ -16066,12 +16338,16 @@ mod tests {
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let started = Arc::clone(&started);
             let release = Arc::clone(&release);
-            move |_cancellation, _params| {
-                started.store(true, Ordering::Release);
-                while !release.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                Ok(CreateMessageResult::text("released", "shutdown-test"))
+            move |_callback_cx, _cancellation, _params| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    started.store(true, Ordering::Release);
+                    while !release.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    Ok(CreateMessageResult::text("released", "shutdown-test"))
+                })
             }
         });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -16132,13 +16408,16 @@ mod tests {
         let started = Arc::new(AtomicBool::new(false));
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let started = Arc::clone(&started);
-            move |cancellation, _params| {
-                started.store(true, Ordering::Release);
-                while !cancellation.is_cancel_requested() {
-                    std::thread::yield_now();
-                }
-                cancellation.checkpoint()?;
-                Ok(CreateMessageResult::text("unreachable", "shutdown-test"))
+            move |_callback_cx, cancellation, _params| {
+                let started = Arc::clone(&started);
+                Box::pin(async move {
+                    started.store(true, Ordering::Release);
+                    while !cancellation.is_cancel_requested() {
+                        std::thread::yield_now();
+                    }
+                    cancellation.checkpoint()?;
+                    Ok(CreateMessageResult::text("unreachable", "shutdown-test"))
+                })
             }
         });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -16198,13 +16477,17 @@ mod tests {
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let started = Arc::clone(&started);
             let cancelled = Arc::clone(&cancelled);
-            move |cancellation, _params| {
-                started.store(true, Ordering::Release);
-                while !cancellation.is_cancel_requested() {
-                    std::thread::yield_now();
-                }
-                cancelled.store(true, Ordering::Release);
-                Err(McpError::request_cancelled())
+            move |_callback_cx, cancellation, _params| {
+                let started = Arc::clone(&started);
+                let cancelled = Arc::clone(&cancelled);
+                Box::pin(async move {
+                    started.store(true, Ordering::Release);
+                    while !cancellation.is_cancel_requested() {
+                        std::thread::yield_now();
+                    }
+                    cancelled.store(true, Ordering::Release);
+                    Err(McpError::request_cancelled())
+                })
             }
         });
         let mut first = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -16255,21 +16538,24 @@ mod tests {
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":41}}\\n'; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"readerRemainedLive\":true}}\\n'; \
-            IFS= read -r ping; \
+            IFS= read -r follow_up; \
             case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
-            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \
-            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"ping\":%s}}\\n' \
-            \"$request_ok\" \"$ping_ok\"; exec sleep 2";
+            case \"$follow_up\" in *'\"method\":\"test/alignment\"'*'\"id\":3'*) aligned_ok=true;; *) aligned_ok=false;; esac; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"aligned\":%s}}\\n' \
+            \"$request_ok\" \"$aligned_ok\"; exec sleep 2";
         let observed_cancellation = std::sync::Arc::new(AtomicBool::new(false));
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let observed_cancellation = std::sync::Arc::clone(&observed_cancellation);
-            move |cancellation, _params| {
-                while !cancellation.is_cancel_requested() {
-                    std::thread::yield_now();
-                }
-                observed_cancellation.store(true, Ordering::Release);
-                cancellation.checkpoint()?;
-                Ok(CreateMessageResult::text("cancelled", "cancelled"))
+            move |_callback_cx, cancellation, _params| {
+                let observed_cancellation = std::sync::Arc::clone(&observed_cancellation);
+                Box::pin(async move {
+                    while !cancellation.is_cancel_requested() {
+                        std::thread::yield_now();
+                    }
+                    observed_cancellation.store(true, Ordering::Release);
+                    cancellation.checkpoint()?;
+                    Ok(CreateMessageResult::text("cancelled", "cancelled"))
+                })
             }
         });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -16292,10 +16578,13 @@ mod tests {
             "the live callback must observe its matching server cancellation"
         );
 
-        let ping: serde_json::Value = client
-            .send_request("ping", serde_json::json!({}))
+        let follow_up: serde_json::Value = client
+            .send_request("test/alignment", serde_json::json!({}))
             .expect("the reader remains usable after callback cancellation");
-        assert_eq!(ping, serde_json::json!({"request": true, "ping": true}));
+        assert_eq!(
+            follow_up,
+            serde_json::json!({"request": true, "aligned": true})
+        );
         client.close().expect("client cleanup");
     }
 
@@ -16309,32 +16598,42 @@ mod tests {
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}\\n'; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":42}}\\n'; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"readerRemainedLive\":true}}\\n'; \
-            IFS= read -r ping; \
-            IFS= read -r callback; \
+            IFS= read -r next_one; \
+            IFS= read -r next_two; \
             case \"$request\" in *'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \
-            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \
-            case \"$callback\" in *'\"id\":41'*'\"model\":\"uncancelled\"'*) callback_ok=true;; *) callback_ok=false;; esac; \
-            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"ping\":%s,\"callback\":%s}}\\n' \
-            \"$request_ok\" \"$ping_ok\" \"$callback_ok\"; exec sleep 2";
+            aligned_ok=false; callback_ok=false; \
+            for frame in \"$next_one\" \"$next_two\"; do \
+              case \"$frame\" in *'\"method\":\"test/alignment\"'*) \
+                case \"$frame\" in *'\"id\":3'*) aligned_ok=true;; esac;; esac; \
+              case \"$frame\" in *'\"model\":\"uncancelled\"'*) \
+                case \"$frame\" in *'\"id\":41'*) callback_ok=true;; esac;; esac; \
+            done; \
+            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"aligned\":%s,\"callback\":%s}}\\n' \
+            \"$request_ok\" \"$aligned_ok\" \"$callback_ok\"; exec sleep 2";
         let release_callback = std::sync::Arc::new(AtomicBool::new(false));
         let observed_foreign_cancellation = std::sync::Arc::new(AtomicBool::new(false));
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let release_callback = std::sync::Arc::clone(&release_callback);
             let observed_foreign_cancellation =
                 std::sync::Arc::clone(&observed_foreign_cancellation);
-            move |cancellation, _params| {
-                while !release_callback.load(Ordering::Acquire) {
-                    if cancellation.is_cancel_requested() {
-                        observed_foreign_cancellation.store(true, Ordering::Release);
-                        return Err(McpError::request_cancelled());
+            move |_callback_cx, cancellation, _params| {
+                let release_callback = std::sync::Arc::clone(&release_callback);
+                let observed_foreign_cancellation =
+                    std::sync::Arc::clone(&observed_foreign_cancellation);
+                Box::pin(async move {
+                    while !release_callback.load(Ordering::Acquire) {
+                        if cancellation.is_cancel_requested() {
+                            observed_foreign_cancellation.store(true, Ordering::Release);
+                            return Err(McpError::request_cancelled());
+                        }
+                        std::thread::yield_now();
                     }
-                    std::thread::yield_now();
-                }
-                assert!(
-                    !cancellation.is_cancel_requested(),
-                    "a foreign cancellation ID must not affect this callback"
-                );
-                Ok(CreateMessageResult::text("handled", "uncancelled"))
+                    assert!(
+                        !cancellation.is_cancel_requested(),
+                        "a foreign cancellation ID must not affect this callback"
+                    );
+                    Ok(CreateMessageResult::text("handled", "uncancelled"))
+                })
             }
         });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -16349,12 +16648,12 @@ mod tests {
         assert_eq!(result, serde_json::json!({"readerRemainedLive": true}));
         release_callback.store(true, Ordering::Release);
 
-        let ping: serde_json::Value = client
-            .send_request("ping", serde_json::json!({}))
+        let follow_up: serde_json::Value = client
+            .send_request("test/alignment", serde_json::json!({}))
             .expect("the uncancelled callback response and later ping remain aligned");
         assert_eq!(
-            ping,
-            serde_json::json!({"request": true, "ping": true, "callback": true})
+            follow_up,
+            serde_json::json!({"request": true, "aligned": true, "callback": true})
         );
         assert!(
             !observed_foreign_cancellation.load(Ordering::Acquire),
@@ -16373,9 +16672,15 @@ mod tests {
             IFS= read -r roots; \
             printf '{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/create\",\"id\":43,\"params\":{\"mode\":\"form\",\"message\":\"approval\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{}}}}\\n'; \
             IFS= read -r elicitation; \
-            case \"$sampling\" in *'\"code\":-32601'*'\"id\":41'*) sampling_rejected=true;; *) sampling_rejected=false;; esac; \
-            case \"$roots\" in *'\"code\":-32601'*'\"id\":42'*) roots_rejected=true;; *) roots_rejected=false;; esac; \
-            case \"$elicitation\" in *'\"code\":-32601'*'\"id\":43'*) elicitation_rejected=true;; *) elicitation_rejected=false;; esac; \
+            case \"$sampling\" in *'\"code\":-32601'*) sampling_code_ok=true;; *) sampling_code_ok=false;; esac; \
+            case \"$sampling\" in *'\"id\":41'*) sampling_id_ok=true;; *) sampling_id_ok=false;; esac; \
+            if $sampling_code_ok && $sampling_id_ok; then sampling_rejected=true; else sampling_rejected=false; fi; \
+            case \"$roots\" in *'\"code\":-32601'*) roots_code_ok=true;; *) roots_code_ok=false;; esac; \
+            case \"$roots\" in *'\"id\":42'*) roots_id_ok=true;; *) roots_id_ok=false;; esac; \
+            if $roots_code_ok && $roots_id_ok; then roots_rejected=true; else roots_rejected=false; fi; \
+            case \"$elicitation\" in *'\"code\":-32601'*) elicitation_code_ok=true;; *) elicitation_code_ok=false;; esac; \
+            case \"$elicitation\" in *'\"id\":43'*) elicitation_id_ok=true;; *) elicitation_id_ok=false;; esac; \
+            if $elicitation_code_ok && $elicitation_id_ok; then elicitation_rejected=true; else elicitation_rejected=false; fi; \
             printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"samplingRejected\":%s,\"rootsRejected\":%s,\"elicitationRejected\":%s}}\\n' \
             \"$sampling_rejected\" \"$roots_rejected\" \"$elicitation_rejected\"; exec sleep 2";
         let mut client = make_shell_scripted_initialized_client_for_version(
@@ -16424,9 +16729,12 @@ mod tests {
         let roots_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
             let sampling_calls = std::sync::Arc::clone(&sampling_calls);
-            move |_cancellation, _params| {
-                sampling_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(CreateMessageResult::text("handled", "handler-model"))
+            move |_callback_cx, _cancellation, _params| {
+                let sampling_calls = std::sync::Arc::clone(&sampling_calls);
+                Box::pin(async move {
+                    sampling_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(CreateMessageResult::text("handled", "handler-model"))
+                })
             }
         });
         let mut client = make_shell_scripted_initialized_client_with_reverse_handlers(
@@ -16774,22 +17082,15 @@ mod tests {
             .responses
             .register(request_id.clone())
             .expect("register timed-out owner");
-        let malformed = JsonRpcMessage::Response(JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Owned("1.0".to_string()),
-            result: Some(serde_json::Value::Null),
-            error: None,
-            id: Some(request_id.clone()),
-        });
-        let malformed = ReceivedTransportFrame::admit(
-            serde_json::to_vec(&malformed).expect("serialize malformed complete response source"),
-        )
-        .expect("admit malformed complete response source");
+        let malformed =
+            ReceivedTransportFrame::admit(br#"{"jsonrpc":"1.0","result":null,"id":30}"#.to_vec())
+                .expect_err("strict frame admission rejects a non-2.0 response");
 
-        let timeout = client.finish_timeout_after_complete_frame(
-            &request_id,
-            malformed,
-            RequestTimeoutSource::Idle,
-        );
+        // Admission fails before a `ReceivedTransportFrame` exists, so the
+        // deadline owner must receive its already-elected local timeout before
+        // the framing failure is promoted to connection-terminal state.
+        let timeout = client.timeout_committed_request(&request_id, RequestTimeoutSource::Idle);
+        let _ = client.terminate_connection(transport_error_to_mcp(malformed));
 
         assert!(timeout.message.contains("timed out"));
         let waiter_error = waiter
@@ -17083,7 +17384,7 @@ mod tests {
             data: None,
         });
 
-        assert_eq!(error.code, McpErrorCode::Custom(-32_600));
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert_eq!(
             error
                 .data
@@ -17302,9 +17603,16 @@ mod tests {
             .expect("client retains the exact notification params source")
             .expect("modern progress has params");
 
+        let notification = decode_final_server_notification(&request, Some(&raw_params))
+            .expect("the final progress schema does not order progress and total");
         assert!(
-            decode_final_server_notification(&request, Some(&raw_params)).is_err(),
-            "changing only total below progress rejects modern final progress on ingress"
+            matches!(
+                notification,
+                ServerNotification::Progress(params)
+                    if params.progress.as_str() == "1.20e+4"
+                        && params.total.as_ref().is_some_and(|total| total.as_str() == "11999.0")
+            ),
+            "changing only total below progress retains both exact wire values"
         );
     }
 
@@ -18879,14 +19187,14 @@ mod tests {
             &[],
             Cx::for_testing(),
         )
-        .expect_err("the direct Auto stdio constructor must fail before resolving its command");
+        .err()
+        .expect("the feature-off direct constructor attempts only its modern command");
 
-        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(DEFAULT_STDIO_PROTOCOL_POLICY, ProtocolPolicy::ModernOnly);
+        assert_eq!(error.code, McpErrorCode::InternalError);
         assert!(
-            error
-                .message
-                .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out"),
-            "feature-off policy admission is the observable zero-spawn result"
+            error.message.contains("Failed to spawn subprocess"),
+            "the feature-off default is a direct modern connection attempt"
         );
     }
 
@@ -19022,8 +19330,13 @@ mod tests {
         );
         let script = format!("printf '%s\\n' '{response_line}'; exec sleep 2");
 
-        let mut client = Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_request())
-            .expect("direct stdio initialization succeeds");
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("direct exact-legacy stdio initialization succeeds");
         assert_eq!(
             client
                 .next_request_id()
@@ -19170,11 +19483,13 @@ mod tests {
     fn modern_public_client_script(discovery_response: &str) -> String {
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r second || exit 1; \
-             case \"$second\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             case \"$second\" in *tools/list*) ;; *) exit 1 ;; esac; \
+             case \"$second\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -19185,27 +19500,33 @@ mod tests {
             modern_discovery_response("logging-metadata-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *tools/list*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
              case \"$request\" in *io.modelcontextprotocol/logLevel*) exit 1 ;; \
-             *) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; esac; \
+             *) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; esac; \
              exec sleep 2"
         )
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn modern_log_level_metadata_client_script() -> String {
         let discovery_response =
             modern_discovery_response("logging-metadata-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *ping*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             case \"$request\" in *tools/list*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -19216,7 +19537,8 @@ mod tests {
             modern_discovery_response("typed-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r second || exit 1; \
              case \"$second\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
@@ -19233,10 +19555,12 @@ mod tests {
         );
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r second || exit 1; \
-             case \"$second\" in *{method}*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$second\" in *{method}*) ;; *) exit 1 ;; esac; \
+             case \"$second\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -19248,13 +19572,17 @@ mod tests {
             modern_discovery_response("mrtr-retry-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r initial || exit 1; \
-             case \"$initial\" in *{method}*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$initial\" in *{method}*) ;; *) exit 1 ;; esac; \
+             case \"$initial\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"roots\":{{\"method\":\"roots/list\"}}}},\"requestState\":\"retry-1\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r retry || exit 1; \
-             case \"$retry\" in *{method}*'\"inputResponses\":{{\"roots\":{{\"roots\":[]}}}}'*'\"requestState\":\"retry-1\"'*) \
+             case \"$retry\" in *{method}*) ;; *) exit 1 ;; esac; \
+             case \"$retry\" in *'\"inputResponses\":{{\"roots\":{{\"roots\":[]}}}}'*) ;; *) exit 1 ;; esac; \
+             case \"$retry\" in *'\"requestState\":\"retry-1\"'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{complete_result}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -19292,13 +19620,13 @@ mod tests {
              case \"$discover\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r initial || exit 1; \
-             case \"$initial\" in *'\"id\":2'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'*) \
+             case \"$initial\" in *tools/call*'\"arguments\":{{\"round\":1}}'*'\"name\":\"retry-tool\"'*'\"id\":2'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"input_required\",\"inputRequests\":{{\"roots\":{{\"method\":\"roots/list\"}}}},\"requestState\":\"retry-1\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r first_retry || exit 1; \
-             case \"$first_retry\" in *'\"id\":3'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'*'\"inputResponses\":{{\"roots\":{{\"roots\":[]}}}}'*'\"requestState\":\"retry-1\"'*) \
+             case \"$first_retry\" in *tools/call*'\"arguments\":{{\"round\":1}}'*'\"inputResponses\":{{\"roots\":{{\"roots\":[]}}}}'*'\"name\":\"retry-tool\"'*'\"requestState\":\"retry-1\"'*'\"id\":3'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"input_required\",\"requestState\":\"retry-2\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r state_only_retry || exit 1; \
-             case \"$state_only_retry\" in *'\"inputResponses\"'*) exit 1 ;; *'\"id\":4'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'*'\"requestState\":\"retry-2\"'*) \
+             case \"$state_only_retry\" in *'\"inputResponses\"'*) exit 1 ;; *tools/call*'\"arguments\":{{\"round\":1}}'*'\"name\":\"retry-tool\"'*'\"requestState\":\"retry-2\"'*'\"id\":4'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -19320,7 +19648,7 @@ mod tests {
             };
             rounds.push_str(&format!(
                 "IFS= read -r request || exit 1; \
-                 case \"$request\" in *'\"id\":{request_id}'*tools/call*'\"name\":\"retry-tool\"'*'\"arguments\":{{\"round\":1}}'{expected_input_responses}*) ;; *) exit 1 ;; esac; \
+                 case \"$request\" in *tools/call*'\"arguments\":{{\"round\":1}}'{expected_input_responses}*'\"name\":\"retry-tool\"'*'\"id\":{request_id}'*) ;; *) exit 1 ;; esac; \
                  printf '%s\\n' '{continuation_response}'; \
                  "
             ));
@@ -19339,10 +19667,13 @@ mod tests {
             modern_discovery_response("progress-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"progressToken\":2'*) \
+             case \"$request\" in *tools/call*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *'\"progressToken\":2'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":2,\"progress\":0.5,\"total\":1.0,\"message\":\"modern progress\"}}}}'; \
              printf '%s\\n' '{call_response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
@@ -19371,15 +19702,16 @@ mod tests {
             modern_discovery_response("reverse-ping-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r call || exit 1; \
-             case \"$call\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$call\" in *tools/call*) ;; *) exit 1 ;; esac; \
+             case \"$call\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}}'; \
              IFS= read -r reverse_response || exit 1; \
-             case \"$reverse_response\" in *'\"id\":\"server-ping\"'*'\"code\":-32601'*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"reverse ping rejected\"}}],\"isError\":false}}}}' ;; *) exit 1 ;; esac \
-             ;; *) exit 1 ;; esac; \
+             case \"$reverse_response\" in *'\"code\":-32601'*) ;; *) exit 1 ;; esac; \
+             case \"$reverse_response\" in *'\"id\":\"server-ping\"'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"reverse ping rejected\"}}],\"isError\":false}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -19406,10 +19738,13 @@ mod tests {
         };
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*) \
+             case \"$request\" in *subscriptions/listen*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *'\"toolsListChanged\":true'*) \
              printf '%s\\n' '{acknowledgement}'{stream_frames} ;; *) exit 1 ;; esac"
         )
     }
@@ -19513,16 +19848,20 @@ mod tests {
         );
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r listen || exit 1; \
-             case \"$listen\" in *subscriptions/listen*io.modelcontextprotocol/protocolVersion*2026-07-28*'\"toolsListChanged\":true'*) \
+             case \"$listen\" in *subscriptions/listen*) ;; *) exit 1 ;; esac; \
+             case \"$listen\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$listen\" in *'\"toolsListChanged\":true'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}},\"notifications\":{{\"toolsListChanged\":true}}}}}}'; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":2}}}}'; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' ;; *) exit 1 ;; esac; \
-             IFS= read -r ping || exit 1; \
-             case \"$ping\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r tools || exit 1; \
+             case \"$tools\" in *tools/list*) ;; *) exit 1 ;; esac; \
+             case \"$tools\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -19533,10 +19872,12 @@ mod tests {
             modern_discovery_response("typed-list-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r second || exit 1; \
-             case \"$second\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$second\" in *tools/list*) ;; *) exit 1 ;; esac; \
+             case \"$second\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{list_response}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
@@ -19548,29 +19889,38 @@ mod tests {
             modern_discovery_response("remaining-core-modern-server", &[MODERN_PROTOCOL_VERSION]);
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r tools || exit 1; \
-             case \"$tools\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$tools\" in *tools/list*) ;; *) exit 1 ;; esac; \
+             case \"$tools\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r resources || exit 1; \
-             case \"$resources\" in *resources/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$resources\" in *resources/list*) ;; *) exit 1 ;; esac; \
+             case \"$resources\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"resources\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r templates || exit 1; \
-             case \"$templates\" in *resources/templates/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$templates\" in *resources/templates/list*) ;; *) exit 1 ;; esac; \
+             case \"$templates\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"resourceTemplates\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r read_resource || exit 1; \
-             case \"$read_resource\" in *resources/read*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$read_resource\" in *resources/read*) ;; *) exit 1 ;; esac; \
+             case \"$read_resource\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{{\"resultType\":\"complete\",\"contents\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r prompts || exit 1; \
-             case \"$prompts\" in *prompts/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$prompts\" in *prompts/list*) ;; *) exit 1 ;; esac; \
+             case \"$prompts\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{{\"resultType\":\"complete\",\"prompts\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r get_prompt || exit 1; \
-             case \"$get_prompt\" in *prompts/get*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             case \"$get_prompt\" in *prompts/get*) ;; *) exit 1 ;; esac; \
+             case \"$get_prompt\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"resultType\":\"complete\",\"messages\":[]}}}}' ;; *) exit 1 ;; esac; \
-             IFS= read -r ping || exit 1; \
-             case \"$ping\" in *ping*'\"io.modelcontextprotocol/logLevel\":\"notice\"'*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r tools_after_config || exit 1; \
+             case \"$tools_after_config\" in *tools/list*) ;; *) exit 1 ;; esac; \
+             case \"$tools_after_config\" in *'\"io.modelcontextprotocol/logLevel\":\"notice\"'*) ;; *) exit 1 ;; esac; \
+             case \"$tools_after_config\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         )
     }
@@ -19828,7 +20178,7 @@ mod tests {
              case \"$discovery\" in *server/discover*'\"extensions\":{{\"com.example/raw\":{{\"mode\":\"raw\"}}}}'*) \\
              printf '%s\\n' '{discovery}' ;; *) exit 1 ;; esac; \\
              IFS= read -r request || exit 1; \\
-             case \"$request\" in *'\"id\":2'*'\"method\":\"example/echo\"'*'\"input\":\"ok\"'*'\"extensions\":{{\"com.example/raw\":{{\"mode\":\"raw\"}}}}'*) \\
+             case \"$request\" in *'\"method\":\"example/echo\"'*'\"extensions\":{{\"com.example/raw\":{{\"mode\":\"raw\"}}}}'*'\"input\":\"ok\"'*'\"id\":2'*) \\
              printf '%s\\n' '{response}' ;; *) exit 1 ;; esac; \\
              exec sleep 2"
         )
@@ -19933,7 +20283,7 @@ mod tests {
                 fastmcp_protocol::ServerBehavior::ToolsListChangedNotification,
             ]),
             std::collections::BTreeMap::from([(
-                "io.fastmcp.session-state".to_owned(),
+                "com.example/session-state".to_owned(),
                 serde_json::json!({ "mode": "lossless" }),
             )]),
         )
@@ -19951,7 +20301,7 @@ mod tests {
         );
         let mut result = serde_json::to_value(result)
             .expect("typed modern discovery result serializes deterministically");
-        result["_meta"]["io.fastmcp.session-state"] = serde_json::json!({ "origin": "peer" });
+        result["_meta"]["com.example/session-state"] = serde_json::json!({ "origin": "peer" });
         result["cacheScope"] = serde_json::json!(cache_scope);
         serde_json::to_string(&serde_json::json!({
             "jsonrpc": JSONRPC_VERSION,
@@ -19964,13 +20314,14 @@ mod tests {
     #[cfg(unix)]
     fn legacy_public_client_script() -> &'static str {
         "IFS= read -r first || exit 1; \
-         case \"$first\" in *initialize*2024-11-05*) \
+         case \"$first\" in *initialize*) ;; *) exit 1 ;; esac; \
+         case \"$first\" in *2024-11-05*) \
          printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}' ;; *) exit 1 ;; esac; \
          IFS= read -r lifecycle || exit 1; \
          case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
          IFS= read -r request || exit 1; \
-         case \"$request\" in *ping*io.modelcontextprotocol/protocolVersion*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
-         *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
+         case \"$request\" in *io.modelcontextprotocol/protocolVersion*|*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; *) ;; esac; \
+         case \"$request\" in *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
          exec sleep 2"
     }
 
@@ -20004,7 +20355,8 @@ mod tests {
          case \"$client_ping\" in *ping*io.modelcontextprotocol/*|*ping*io.modelcontextprotocol/clientCapabilities*) exit 1 ;; \
          *ping*) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":\"server-ping\",\"method\":\"ping\"}'; ;; *) exit 1 ;; esac; \
          IFS= read -r reverse_response || exit 1; \
-         case \"$reverse_response\" in *'\"id\":\"server-ping\"'*'\"result\":{}'*) \
+         case \"$reverse_response\" in *'\"id\":\"server-ping\"'*) ;; *) exit 1 ;; esac; \
+         case \"$reverse_response\" in *'\"result\":{}'*) \
          printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; *) exit 1 ;; esac; \
          exec sleep 2"
     }
@@ -20057,12 +20409,14 @@ mod tests {
     fn legacy_progress_client_script(progress_token: i64) -> String {
         format!(
             "IFS= read -r first || exit 1; \
-             case \"$first\" in *initialize*2024-11-05*) \
+             case \"$first\" in *'\"method\":\"initialize\"'*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *'\"protocolVersion\":\"2024-11-05\"'*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r lifecycle || exit 1; \
              case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
-             case \"$request\" in *tools/call*'\"progressToken\":2'*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *tools/call*) ;; *) exit 1 ;; esac; \
+             case \"$request\" in *'\"progressToken\":2'*) ;; *) exit 1 ;; esac; \
              case \"$request\" in *io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
              *) printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":{progress_token},\"progress\":0.5,\"total\":1.0,\"message\":\"legacy progress\"}}}}'; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"legacy result\"}}],\"isError\":false}}}}' ;; esac; \
@@ -20078,7 +20432,8 @@ mod tests {
          IFS= read -r lifecycle || exit 1; \
          case \"$lifecycle\" in *notifications/initialized*) ;; *) exit 1 ;; esac; \
          IFS= read -r request || exit 1; \
-         case \"$request\" in *logging/setLevel*'\"level\":\"info\"'*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *logging/setLevel*) ;; *) exit 1 ;; esac; \
+         case \"$request\" in *'\"level\":\"info\"'*) ;; *) exit 1 ;; esac; \
          case \"$request\" in *io.modelcontextprotocol/logLevel*|*io.modelcontextprotocol/protocolVersion*) exit 1 ;; \
          *) printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}' ;; esac; \
          exec sleep 2"
@@ -21502,9 +21857,12 @@ mod tests {
         client
             .set_log_level_typed(LoggingLevel::Notice)
             .expect("modern logging configuration is retained for later request metadata");
-        client
-            .ping()
-            .expect("final ping remains outside the core result algebra");
+        assert!(matches!(
+            client
+                .list_tools_typed(None)
+                .expect("configured modern metadata is carried by a supported core request"),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+        ));
         client.close().expect("modern client cleanup");
     }
 
@@ -21520,13 +21878,17 @@ mod tests {
         )
         .expect("same modern discovery initializes the public client");
 
-        client
-            .ping()
-            .expect("one omitted final logging configuration remains absent on the wire");
+        assert!(matches!(
+            client
+                .list_tools_typed(None)
+                .expect("one omitted final logging configuration remains absent on the wire"),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+        ));
         client.close().expect("modern client cleanup");
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_01_auto_modern_log_level_uses_later_request_metadata() {
         let script = modern_log_level_metadata_client_script();
@@ -21541,9 +21903,12 @@ mod tests {
         client
             .set_log_level_typed(LoggingLevel::Notice)
             .expect("Auto-modern stores final configuration without a logging RPC");
-        client
-            .ping()
-            .expect("the following Auto-modern request carries the final log level");
+        assert!(matches!(
+            client
+                .list_tools_typed(None)
+                .expect("the following Auto-modern request carries the final log level"),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+        ));
         client.close().expect("Auto-modern client cleanup");
     }
 
@@ -22024,7 +22389,7 @@ mod tests {
         assert_eq!(client.responses.tombstone_len(), 0);
         assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
 
-        client.ping().expect(
+        client.list_tools_typed(None).expect(
             "the next request starts after the listener consumed its own terminal response",
         );
         assert_eq!(client.responses.tombstone_len(), 0);
@@ -22257,7 +22622,8 @@ mod tests {
             .list_tools_typed(None)
             .expect_err("a cached hit must not bypass cancellation");
         assert_eq!(error.code, McpErrorCode::RequestCancelled);
-        assert!(!client.is_initialized());
+        assert!(client.is_initialized());
+        assert!(client.responses.terminal_error().is_none());
     }
 
     #[cfg(unix)]
@@ -22278,8 +22644,8 @@ mod tests {
              case \"$third\" in *tools/list*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":-1.5,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
              IFS= read -r fourth || exit 1; \
-             case \"$fourth\" in *ping*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{}}}}' ;; *) exit 1 ;; esac; \
+             case \"$fourth\" in *tools/call*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
@@ -22297,7 +22663,7 @@ mod tests {
             .list_tools_typed(None)
             .expect("a negative TTL is returned as immediately stale");
         client
-            .ping()
+            .call_tool_typed("health", serde_json::json!({}))
             .expect("TTL compatibility leaves the modern connection usable");
 
         assert_eq!(
@@ -22776,6 +23142,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_auto_modern_completion_retains_full_context() {
         let script = modern_completion_client_script(
@@ -22937,7 +23304,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn clt_01_final_progress_queue_rejects_total_below_progress() {
-        // This differs from the accepted exact-progress frame only in `total`.
+        // The final schema deliberately leaves progress and total unordered;
+        // this differs from the baseline only by making total smaller.
         let script = modern_server_notification_client_script(
             r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":2,"progress":1e400,"total":9e399,"message":"exact progress"}}"#,
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"progress result"}],"isError":false}}"#,
@@ -22951,16 +23319,22 @@ mod tests {
         .expect("same modern discovery initializes the public client");
         let mut on_progress = |_progress: f64, _total: Option<f64>, _message: Option<&str>| {};
 
-        let error = client
+        client
             .call_tool_with_progress(
                 "echo",
                 serde_json::json!({"text": "exact progress"}),
                 &mut on_progress,
             )
-            .expect_err("final progress greater than its total must fail the public request");
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert!(client.take_final_progress_notifications().is_empty());
-        assert!(!client.is_initialized());
+            .expect("final progress greater than total remains schema-valid");
+        let progress = client.take_final_progress_notifications();
+        assert!(matches!(
+            progress.as_slice(),
+            [params]
+                if params.progress.as_str() == "1e400"
+                    && params.total.as_ref().is_some_and(|total| total.as_str() == "9e399")
+        ));
+        assert!(client.is_initialized());
+        client.close().expect("modern client cleanup");
     }
 
     #[cfg(unix)]
@@ -23124,11 +23498,11 @@ mod tests {
         let retained = serde_json::to_value(discovery)
             .expect("the retained final discovery result stays serializable");
         assert_eq!(
-            retained["capabilities"]["extensions"]["io.fastmcp.session-state"],
+            retained["capabilities"]["extensions"]["com.example/session-state"],
             serde_json::json!({ "mode": "lossless" })
         );
         assert_eq!(
-            retained["_meta"]["io.fastmcp.session-state"],
+            retained["_meta"]["com.example/session-state"],
             serde_json::json!({ "origin": "peer" })
         );
         client.close().expect("stateful modern client cleanup");
@@ -23176,6 +23550,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_i_positive() {
         let modern_result =
@@ -23198,9 +23573,12 @@ mod tests {
             client.server_discovery().is_some(),
             "Auto plan replacement retains the completed modern discovery result"
         );
-        client
-            .ping()
-            .expect("auto-selected modern client executes normally");
+        assert!(matches!(
+            client
+                .list_tools_typed(None)
+                .expect("auto-selected modern client executes normally"),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+        ));
         client.close().expect("auto modern cleanup");
     }
 
@@ -23240,9 +23618,10 @@ mod tests {
         );
         let retained = serde_json::to_value(discovery)
             .expect("retained compatibility discovery remains serializable");
-        assert!(
-            retained.get("resultType").is_none(),
-            "captured peer evidence remains schema-invalid instead of gaining a synthetic field"
+        assert_eq!(
+            retained.get("resultType"),
+            Some(&serde_json::json!("complete")),
+            "re-emission canonicalizes the peer omission while the diagnostic retains evidence"
         );
         client.close().expect("compatibility modern cleanup");
     }
@@ -23303,6 +23682,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_i_planted_negative() {
         // Only the discovery result's version differs from the Auto positive.
