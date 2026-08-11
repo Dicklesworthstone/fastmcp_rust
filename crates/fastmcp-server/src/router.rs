@@ -55,13 +55,13 @@ use fastmcp_protocol::{
     FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
     FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
     InitializeParams, InitializeResult, InputRequiredResult, JsonRpcRequest,
-    LegacyCompletionParams, LegacyCompletionReference, LegacyCompletionResult, LegacyContent,
-    LegacyCoreRequest, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
-    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
-    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
-    ProgressMarker, Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
-    ResourceContent, ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, TemplateValue,
-    TemplateValues, Tool, admit_final_schema, exact_json_to_serde, validate, validate_strict,
+    LegacyCompletionParams, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
+    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
+    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
+    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
+    Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource, ResourceContent,
+    ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, TemplateValue, Tool,
+    admit_final_schema, exact_json_to_serde, validate, validate_strict,
 };
 
 /// Type alias for a notification sender callback.
