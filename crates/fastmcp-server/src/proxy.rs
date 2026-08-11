@@ -6111,8 +6111,8 @@ mod tests {
         final_tool_legacy_fallback, forward_modern_progress_notification,
         legacy_contents_to_handler, legacy_prompt_messages_to_handler, legacy_resource_to_handler,
     };
-    use std::task::Poll;
     use crate::handler::{FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ToolHandler};
+    use std::task::Poll;
 
     #[test]
     fn proxy_modern_sse_progress_callback_preserves_raw_progress_lexemes() {
