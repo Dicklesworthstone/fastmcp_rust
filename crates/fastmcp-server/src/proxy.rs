@@ -5123,7 +5123,7 @@ impl ProxyClient {
     /// legacy. A mixed-era response is rejected before any caller can compose
     /// it into a downstream route.
     pub fn catalog_typed(&self) -> McpResult<ProxyTypedCatalog> {
-        let catalog = self.with_backend(ProxyTypedCatalog::from_backend)?;
+        let catalog = self.with_backend(|backend| ProxyTypedCatalog::from_backend(backend))?;
         let era = catalog.era()?;
         self.admit_observed_era(era, "typed catalog")?;
         Ok(catalog)
