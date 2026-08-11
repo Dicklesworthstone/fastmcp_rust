@@ -2184,7 +2184,7 @@ mod tests {
         };
         let console = TestConsole::new_rich();
         let renderer = ToolTableRenderer::new(DisplayContext::new_human());
-        renderer.render(&[tool.clone()], console.console());
+        renderer.render(std::slice::from_ref(&tool), console.console());
         renderer.render_detail(&tool, console.console());
         console.assert_contains(canary);
         console.assert_contains(parity_canary);

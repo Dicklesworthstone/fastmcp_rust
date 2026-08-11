@@ -46,7 +46,7 @@ fn get_test_server_binary() -> PathBuf {
                 .stderr(Stdio::piped());
             configure_process_group(&mut command);
             let mut child = command.spawn().expect("Failed to start test_server build");
-            let output = capture_with_timeout(&mut child, Duration::from_secs(5 * 60));
+            let output = capture_with_timeout(&mut child, Duration::from_mins(5));
 
             assert!(
                 output.exit_code == 0,
@@ -939,7 +939,7 @@ fn jsonrpc_message_metadata(message: &str) -> String {
     format!(
         "JSON-RPC method_present={} method_bytes={} id={id} bytes={}",
         method_bytes.is_some(),
-        method_bytes.map_or(0, |bytes| bytes),
+        method_bytes.unwrap_or(0),
         message.len()
     )
 }

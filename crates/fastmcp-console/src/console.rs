@@ -641,6 +641,12 @@ pub(crate) fn terminal_text_is_unsafe(character: char) -> bool {
         )
 }
 
+#[cfg(any(
+    test,
+    feature = "legacy-2024-11-05",
+    feature = "tasks",
+    feature = "apps"
+))]
 /// Produces bounded terminal-safe text escaped for insertion into rich markup.
 ///
 /// When a trusted markup tag will be appended immediately after this value,
@@ -650,6 +656,12 @@ pub(crate) fn bounded_rich_text(text: &str, max_chars: usize) -> String {
     bounded_terminal_text_impl(text, max_chars, true)
 }
 
+#[cfg(any(
+    test,
+    feature = "legacy-2024-11-05",
+    feature = "tasks",
+    feature = "apps"
+))]
 /// Produces bounded terminal-safe text for interpolation before trusted markup.
 ///
 /// Rich markup parses a backslash immediately before `[` as an escape. Doubling

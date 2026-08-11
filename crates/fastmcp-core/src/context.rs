@@ -1752,7 +1752,7 @@ impl McpContext {
     pub fn progress_marker(&self) -> Option<&serde_json::Value> {
         self.ensure_live()
             .ok()
-            .and_then(|_| self.progress_reporter.as_ref()?.marker())
+            .and_then(|()| self.progress_reporter.as_ref()?.marker())
     }
 
     /// Reports progress on the current operation.

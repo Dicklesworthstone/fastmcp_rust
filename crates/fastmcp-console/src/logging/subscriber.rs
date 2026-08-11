@@ -133,7 +133,7 @@ impl RichLayer {
         }
 
         let now = OffsetDateTime::now_utc();
-        if let Ok(fmt) = format_description::parse("[hour]:[minute]:[second]") {
+        if let Ok(fmt) = format_description::parse_borrowed::<1>("[hour]:[minute]:[second]") {
             now.format(&fmt).ok()
         } else {
             None

@@ -145,7 +145,7 @@ impl RichLogger {
         if self.show_timestamps {
             let now = OffsetDateTime::now_utc();
             // Format: HH:MM:SS
-            if let Ok(fmt) = format_description::parse("[hour]:[minute]:[second]") {
+            if let Ok(fmt) = format_description::parse_borrowed::<1>("[hour]:[minute]:[second]") {
                 if let Ok(ts) = now.format(&fmt) {
                     event = event.with_timestamp(ts);
                 }
