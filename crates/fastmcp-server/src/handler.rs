@@ -810,6 +810,16 @@ fn admit_declared_final_tool_outcome(
     Ok(outcome)
 }
 
+// Without the Tasks profile there is no `FinalToolOutcome::CreateTask` variant,
+// so undeclared-Tasks admission is a no-op: the outcome always passes through.
+#[cfg(not(feature = "tasks"))]
+fn admit_declared_final_tool_outcome(
+    _declares_final_tasks: bool,
+    outcome: FinalToolOutcome,
+) -> McpResult<FinalToolOutcome> {
+    Ok(outcome)
+}
+
 /// URI template parameters extracted from a matched resource URI.
 pub type UriParams = HashMap<String, String>;
 
