@@ -288,6 +288,18 @@ impl ClientProtocolPlan {
         }
     }
 
+    /// Creates an immutable protocol selection for one WebSocket connection.
+    ///
+    /// A WebSocket is one long-lived bidirectional connection, so `Auto`
+    /// performs its final discovery probe and, only after a correlated
+    /// `MethodNotFound`, its exact-2024 initialization on this same owned
+    /// connection. The selected era is frozen before ordinary requests can be
+    /// issued.
+    #[must_use]
+    pub const fn websocket(policy: ProtocolPolicy) -> Self {
+        Self::stdio(policy)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn http(
         policy: ProtocolPolicy,

@@ -186,7 +186,7 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, channel::oneshot};
-use execution::{MrtrDriver, MrtrDriverLimits};
+use execution::{MrtrDriver, MrtrDriverLimits, RequestExecution, RequestExecutor};
 use fastmcp_core::{
     McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, block_on,
     sha256_bounded,
@@ -3323,6 +3323,531 @@ pub(crate) fn validate_protocol_plan_feature(protocol_plan: &ClientProtocolPlan)
     }
 
     Ok(())
+}
+
+/// Source-preserving split transport owned by [`WebSocketClient`].
+///
+/// This adapter is deliberately generic over the transport crate's client
+/// halves. A WebSocket upgrader supplies those halves after it has completed
+/// its own HTTP Upgrade boundary; this client owns them for the remainder of
+/// the negotiated MCP connection. In particular, the receive half supplies
+/// [`ReceivedTransportFrame`] values, so a successful result can retain the
+/// peer's exact JSON `result` bytes rather than a reserialized approximation.
+pub struct WebSocketClientTransport<R, S> {
+    receiver: R,
+    sender: S,
+}
+
+impl<R, S> WebSocketClientTransport<R, S> {
+    /// Joins independently-owned WebSocket ingress and egress halves.
+    #[must_use]
+    pub fn from_split(receiver: R, sender: S) -> Self {
+        Self { receiver, sender }
+    }
+
+    /// Returns the owned ingress and egress halves.
+    #[must_use]
+    pub fn into_split(self) -> (R, S) {
+        (self.receiver, self.sender)
+    }
+}
+
+impl<R, S> Transport for WebSocketClientTransport<R, S>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.sender.send(cx, message)
+    }
+
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.receiver.recv(cx)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        self.receiver.close()?;
+        self.sender.close()
+    }
+}
+
+fn receive_websocket_frame<R, S>(
+    transport: &mut WebSocketClientTransport<R, S>,
+    cx: &Cx,
+) -> Result<ReceivedTransportFrame, TransportError>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    transport.receiver.recv_with_source(cx)
+}
+
+/// A negotiated, full-duplex MCP WebSocket client.
+///
+/// Construct this with [`ClientBuilder::connect_websocket_with_cx`] after an
+/// application has completed the WebSocket Upgrade and split the transport.
+/// The builder's immutable `Auto`, exact-2024, or final-2026 policy is
+/// admitted before the first frame is sent. `Auto` sends final discovery and
+/// may send exact-2024 initialization only after that same request receives a
+/// correlated `MethodNotFound` reply; all other discovery failures are
+/// terminal.
+///
+/// Requests are multiplexed by [`RequestExecutor`]. Callers may issue many
+/// [`Self::execute`] calls before waiting; a wait routes out-of-order results,
+/// progress, cancellation notifications, and exact-2024 reverse requests to
+/// their respective owners. Reverse requests are intentionally exposed as
+/// capability-bearing [`ReverseRequest`] values so the embedding application
+/// can choose its response policy and cannot answer a cancelled or stale
+/// request.
+pub struct WebSocketClient<R, S>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    cx: Cx,
+    session: ClientSession,
+    executor: RequestExecutor<WebSocketClientTransport<R, S>>,
+    next_id: AtomicU64,
+}
+
+impl<R, S> std::fmt::Debug for WebSocketClient<R, S>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSocketClient")
+            .field("selected_era", &self.session.selected_era())
+            .field("protocol_plan", self.session.protocol_plan())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R, S> WebSocketClient<R, S>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    /// Negotiates a supplied upgraded and split WebSocket transport.
+    ///
+    /// The supplied `Cx` becomes this connection's sole owned cancellation
+    /// domain. All handshake, request, cancellation, reverse-response, and
+    /// shutdown I/O uses that context; request callers cannot substitute an
+    /// unrelated runtime context part-way through the connection.
+    pub fn connect_with_cx(
+        cx: Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        receiver: R,
+        sender: S,
+    ) -> McpResult<Self> {
+        validate_protocol_plan_feature(&protocol_plan)?;
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+
+        let mut transport = WebSocketClientTransport::from_split(receiver, sender);
+        let initialization = (match protocol_plan.policy() {
+            ProtocolPolicy::ModernOnly => {
+                websocket_discover(&mut transport, &cx, &client_info, &client_capabilities, 1)
+            }
+            ProtocolPolicy::LegacyOnly => {
+                websocket_initialize(&mut transport, &cx, &client_info, &client_capabilities, 1)
+                    .map(WebSocketInitialization::Legacy)
+            }
+            ProtocolPolicy::Auto => {
+                match websocket_discover(&mut transport, &cx, &client_info, &client_capabilities, 1)
+                {
+                    Ok(discovery) => Ok(discovery),
+                    Err(WebSocketHandshakeError::MethodNotFound) => websocket_initialize(
+                        &mut transport,
+                        &cx,
+                        &client_info,
+                        &client_capabilities,
+                        2,
+                    )
+                    .map(WebSocketInitialization::Legacy),
+                    Err(WebSocketHandshakeError::Mcp(error)) => {
+                        Err(WebSocketHandshakeError::Mcp(error))
+                    }
+                }
+            }
+        })
+        .map_err(|error| match error {
+            WebSocketHandshakeError::MethodNotFound => McpError::invalid_request(
+                "WebSocket handshake method was not supported by the peer",
+            ),
+            WebSocketHandshakeError::Mcp(error) => error,
+        })?;
+
+        if matches!(initialization, WebSocketInitialization::Legacy(_)) {
+            transport
+                .send(
+                    &cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+                )
+                .map_err(transport_error_to_mcp)?;
+        }
+
+        let session = match initialization {
+            WebSocketInitialization::Legacy(result) => ClientSession::try_new(
+                client_info,
+                client_capabilities,
+                result.server_info,
+                result.capabilities,
+                result.protocol_version,
+            )
+            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?,
+            WebSocketInitialization::Modern {
+                server_info,
+                discovery,
+            } => ClientSession::try_new(
+                client_info,
+                client_capabilities,
+                server_info,
+                ServerCapabilities::default(),
+                MODERN_PROTOCOL_VERSION.to_owned(),
+            )
+            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
+            .with_server_discovery(discovery),
+        }
+        .try_with_protocol_plan(protocol_plan)
+        .map_err(|_| {
+            McpError::internal_error("Configured protocol policy rejects the negotiated era")
+        })?;
+
+        let peer_era = session.selected_era().ok_or_else(|| {
+            McpError::internal_error("WebSocket negotiation completed without selecting an era")
+        })?;
+        let executor = RequestExecutor::with_source_frame_receiver(
+            transport,
+            peer_era.into(),
+            Some(receive_websocket_frame::<R, S>),
+        );
+        Ok(Self {
+            cx,
+            session,
+            executor,
+            // Handshake consumes ID 1, and an Auto legacy fallback consumes
+            // ID 2. Starting ordinary IDs at 3 leaves both paths collision-free.
+            next_id: AtomicU64::new(3),
+        })
+    }
+
+    /// Returns the immutable session established by discovery or initialize.
+    #[must_use]
+    pub const fn session(&self) -> &ClientSession {
+        &self.session
+    }
+
+    /// Returns the exact protocol era frozen by the completed handshake.
+    #[must_use]
+    pub const fn selected_protocol_era(&self) -> ProtocolEra {
+        self.session
+            .selected_era()
+            .expect("negotiated WebSocket clients always select an era")
+    }
+
+    /// Starts one request without waiting for any other outstanding request.
+    pub fn execute(
+        &self,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<RequestExecution<WebSocketClientTransport<R, S>>> {
+        let id = self
+            .next_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| McpError::internal_error("WebSocket client request ID space exhausted"))?;
+        let id = i64::try_from(id)
+            .map_err(|_| McpError::internal_error("WebSocket client request ID exceeds i64"))?;
+        let params = self.decorate_request_parameters(params)?;
+        self.executor
+            .execute(&self.cx, JsonRpcRequest::new(method.into(), params, id))
+    }
+
+    /// Waits for one request result while routing all peer traffic on this connection.
+    pub fn wait(
+        &self,
+        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+    ) -> McpResult<JsonRpcResponse> {
+        self.executor.wait(&self.cx, execution)
+    }
+
+    /// Waits for one response and returns its exact admitted `result` source.
+    ///
+    /// The source is `None` only for JSON-RPC error envelopes. It is never
+    /// reconstructed from a decoded `serde_json::Value`.
+    pub fn wait_with_raw_result(
+        &self,
+        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+    ) -> McpResult<(JsonRpcResponse, Option<String>)> {
+        self.executor.wait_with_raw_result(&self.cx, execution)
+    }
+
+    /// Takes a response that was already routed by [`Self::drive`].
+    pub fn try_take_response_with_raw_result(
+        &self,
+        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
+        self.executor.try_take_response_with_raw_result(execution)
+    }
+
+    /// Drives one peer frame without issuing another request.
+    pub fn drive(&self) -> McpResult<()> {
+        self.executor.drive(&self.cx)
+    }
+
+    /// Cancels one locally-owned live execution over the selected wire era.
+    pub fn cancel(
+        &self,
+        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+    ) -> McpResult<()> {
+        self.executor.cancel(&self.cx, execution)
+    }
+
+    /// Returns exact-2024 reverse requests admitted while driving this connection.
+    pub fn take_reverse_requests(&self) -> Vec<ReverseRequest> {
+        self.executor.take_reverse_requests()
+    }
+
+    /// Responds to one currently live exact-2024 reverse request.
+    pub fn respond_to_reverse_request(
+        &self,
+        request: &ReverseRequest,
+        result: serde_json::Value,
+    ) -> McpResult<()> {
+        self.executor
+            .respond_to_reverse_request(&self.cx, request, result)
+    }
+
+    /// Returns connection-level notifications that did not belong to a request stream.
+    pub fn take_notifications(&self) -> Vec<JsonRpcRequest> {
+        self.executor.take_notifications()
+    }
+
+    /// Closes the WebSocket halves after cancelling every live request owner.
+    pub fn close(&self) -> McpResult<()> {
+        self.executor.shutdown(&self.cx)
+    }
+
+    fn decorate_request_parameters(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<Option<serde_json::Value>> {
+        if self.selected_protocol_era() != ProtocolEra::Modern2026 {
+            return Ok(params);
+        }
+        let mut params = params.unwrap_or_else(|| serde_json::json!({}));
+        let object = params.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Modern WebSocket requests require object parameters")
+        })?;
+        let mut metadata = serde_json::to_value(FinalRequestMeta {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+            client_capabilities: self.session.client_capabilities().clone(),
+            client_info: Some(self.session.client_info().clone()),
+            additional_metadata: BTreeMap::new(),
+        })
+        .map_err(|_| McpError::internal_error("Modern WebSocket request metadata is invalid"))?;
+        if let Some(existing) = object.remove("_meta") {
+            let existing = existing.as_object().ok_or_else(|| {
+                McpError::invalid_params("Modern WebSocket request metadata must be an object")
+            })?;
+            let generated = metadata.as_object_mut().ok_or_else(|| {
+                McpError::internal_error("Modern WebSocket request metadata is not an object")
+            })?;
+            for (key, value) in existing {
+                generated
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        object.insert("_meta".to_owned(), metadata);
+        Ok(Some(params))
+    }
+}
+
+enum WebSocketInitialization {
+    Legacy(InitializeResult),
+    Modern {
+        server_info: ServerInfo,
+        discovery: ServerDiscoverResult,
+    },
+}
+
+enum WebSocketHandshakeError {
+    MethodNotFound,
+    Mcp(McpError),
+}
+
+fn websocket_discover<R, S>(
+    transport: &mut WebSocketClientTransport<R, S>,
+    cx: &Cx,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    id: i64,
+) -> Result<WebSocketInitialization, WebSocketHandshakeError>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    let mut params = serde_json::to_value(ServerDiscoverRequest::default()).map_err(|_| {
+        WebSocketHandshakeError::Mcp(McpError::internal_error(
+            "Modern WebSocket discovery parameters could not be serialized",
+        ))
+    })?;
+    let metadata = params
+        .get_mut("_meta")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            WebSocketHandshakeError::Mcp(McpError::internal_error(
+                "Modern WebSocket discovery metadata is missing",
+            ))
+        })?;
+    metadata.insert(
+        FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+        serde_json::to_value(client_capabilities).map_err(|_| {
+            WebSocketHandshakeError::Mcp(McpError::internal_error(
+                "Modern WebSocket client capabilities could not be serialized",
+            ))
+        })?,
+    );
+    metadata.insert(
+        "io.modelcontextprotocol/clientInfo".to_owned(),
+        serde_json::to_value(client_info).map_err(|_| {
+            WebSocketHandshakeError::Mcp(McpError::internal_error(
+                "Modern WebSocket client identity could not be serialized",
+            ))
+        })?,
+    );
+    let response = websocket_exchange(
+        transport,
+        cx,
+        JsonRpcRequest::new(SERVER_DISCOVER_METHOD, Some(params), id),
+    )?;
+    let source = response.raw_result.ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "Modern WebSocket discovery response has no admitted result source",
+        ))
+    })?;
+    let discovery = serde_json::from_str::<ServerDiscoverResult>(&source).map_err(|_| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "Modern WebSocket discovery response has an invalid result",
+        ))
+    })?;
+    if !discovery
+        .supported_versions()
+        .iter()
+        .any(|version| version == MODERN_PROTOCOL_VERSION)
+    {
+        return Err(WebSocketHandshakeError::Mcp(McpError::internal_error(
+            UNSUPPORTED_PROTOCOL_VERSION_ERROR,
+        )));
+    }
+    let server_info = discovery.server_info().cloned().ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "Modern WebSocket discovery response has no server identity",
+        ))
+    })?;
+    Ok(WebSocketInitialization::Modern {
+        server_info,
+        discovery,
+    })
+}
+
+fn websocket_initialize<R, S>(
+    transport: &mut WebSocketClientTransport<R, S>,
+    cx: &Cx,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    id: i64,
+) -> Result<InitializeResult, WebSocketHandshakeError>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    let response = websocket_exchange(
+        transport,
+        cx,
+        JsonRpcRequest::new(
+            "initialize",
+            Some(
+                serde_json::to_value(InitializeParams {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    capabilities: client_capabilities.clone(),
+                    client_info: client_info.clone(),
+                })
+                .map_err(|_| {
+                    WebSocketHandshakeError::Mcp(McpError::internal_error(
+                        "WebSocket initialize parameters could not be serialized",
+                    ))
+                })?,
+            ),
+            id,
+        ),
+    )?;
+    let result = response.result.ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket initialize response has no result",
+        ))
+    })?;
+    let result = serde_json::from_value::<InitializeResult>(result).map_err(|_| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket initialize response has an invalid result",
+        ))
+    })?;
+    validate_initialize_result(&result).map_err(WebSocketHandshakeError::Mcp)?;
+    Ok(result)
+}
+
+struct WebSocketHandshakeResponse {
+    result: Option<serde_json::Value>,
+    raw_result: Option<String>,
+}
+
+fn websocket_exchange<R, S>(
+    transport: &mut WebSocketClientTransport<R, S>,
+    cx: &Cx,
+    request: JsonRpcRequest,
+) -> Result<WebSocketHandshakeResponse, WebSocketHandshakeError>
+where
+    R: ClientTransportRecvHalf,
+    S: TransportSendHalf,
+{
+    let request_id = request.id.clone().ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::internal_error(
+            "WebSocket handshake request requires an ID",
+        ))
+    })?;
+    transport
+        .send(cx, &JsonRpcMessage::Request(request))
+        .map_err(|error| WebSocketHandshakeError::Mcp(transport_error_to_mcp(error)))?;
+    let frame = receive_websocket_frame(transport, cx)
+        .map_err(|error| WebSocketHandshakeError::Mcp(transport_error_to_mcp(error)))?;
+    let JsonRpcMessage::Response(response) = frame.message() else {
+        return Err(WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket handshake received a non-response frame",
+        )));
+    };
+    if response.id.as_ref() != Some(&request_id) {
+        return Err(WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket handshake response ID does not match its request",
+        )));
+    }
+    if let Some(error) = response.error.clone() {
+        if error.code.as_i32() == Some(-32601) {
+            return Err(WebSocketHandshakeError::MethodNotFound);
+        }
+        return Err(WebSocketHandshakeError::Mcp(json_rpc_error_to_mcp(error)));
+    }
+    let response = response.clone();
+    let raw_result = raw_result_from_admitted_response(&response, frame, "WebSocket")
+        .map_err(WebSocketHandshakeError::Mcp)?;
+    Ok(WebSocketHandshakeResponse {
+        result: response.result,
+        raw_result,
+    })
 }
 
 fn validate_timeout_duration(
@@ -12249,6 +12774,247 @@ mod tests {
     use crate::http_executor::ModernHttpConnectOutcome;
     use fastmcp_protocol::ExtensionDirection;
     use std::collections::{BTreeMap, HashMap};
+
+    struct WebSocketTestRecv {
+        frames: VecDeque<Box<[u8]>>,
+    }
+
+    impl TransportRecvHalf for WebSocketTestRecv {
+        fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.recv_with_source(cx)
+                .map(ReceivedTransportFrame::into_message)
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.frames.clear();
+            Ok(())
+        }
+    }
+
+    impl ClientTransportRecvHalf for WebSocketTestRecv {
+        fn recv_with_source(&mut self, _cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+            let source = self.frames.pop_front().ok_or(TransportError::Closed)?;
+            ReceivedTransportFrame::admit(source)
+        }
+    }
+
+    #[derive(Clone)]
+    struct WebSocketTestSend {
+        sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl TransportSendHalf for WebSocketTestSend {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.sent
+                .lock()
+                .map_err(|_| TransportError::Closed)?
+                .push(message.clone());
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.closed.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    fn websocket_test_frame(source: &str) -> Box<[u8]> {
+        source.as_bytes().to_vec().into_boxed_slice()
+    }
+
+    fn modern_discovery_response(id: i64) -> Box<[u8]> {
+        websocket_test_frame(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{}},"_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"websocket-test","version":"1.0"}}}},"ttlMs":0,"cacheScope":"private"}}}}"#
+        ))
+    }
+
+    #[test]
+    fn websocket_modern_connection_multiplexes_progress_cancellation_and_exact_result_source() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let receiver = WebSocketTestRecv {
+            frames: VecDeque::from([
+                modern_discovery_response(1),
+                websocket_test_frame(
+                    r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"ws-progress","progress":1.20e+4}}"#,
+                ),
+                websocket_test_frame(
+                    r#"{"jsonrpc":"2.0","id":4,"result":{"opaque":{"decimal":1.20e+4}}}"#,
+                ),
+                websocket_test_frame(r#"{"jsonrpc":"2.0","id":3,"result":{"first":true}}"#),
+            ]),
+        };
+        let sender = WebSocketTestSend {
+            sent: Arc::clone(&sent),
+            closed: Arc::clone(&closed),
+        };
+        let client = WebSocketClient::connect_with_cx(
+            Cx::for_testing(),
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            ClientInfo {
+                name: "websocket-client".to_owned(),
+                version: "1.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            receiver,
+            sender,
+        )
+        .expect("modern discovery negotiates one WebSocket era");
+        assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+
+        let mut first = client
+            .execute(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "first",
+                    "arguments": {},
+                    "_meta": {"progressToken": "ws-progress"}
+                })),
+            )
+            .expect("first request is committed");
+        let mut second = client
+            .execute(
+                "tools/call",
+                Some(serde_json::json!({"name": "second", "arguments": {}})),
+            )
+            .expect("second request is committed before the first resolves");
+
+        client.drive().expect("progress routes to the first owner");
+        assert_eq!(
+            first
+                .take_stream_notifications()
+                .expect("progress remains request-owned")
+                .len(),
+            1
+        );
+        client
+            .drive()
+            .expect("reordered second response routes by exact ID");
+        client.drive().expect("first response routes by exact ID");
+        let (_, second_raw) = client
+            .try_take_response_with_raw_result(&mut second)
+            .expect("second response is available")
+            .expect("second execution completed");
+        assert_eq!(
+            second_raw.as_deref(),
+            Some(r#"{"opaque":{"decimal":1.20e+4}}"#),
+            "the exact peer result lexeme is retained rather than reserialized"
+        );
+        assert!(
+            client
+                .try_take_response_with_raw_result(&mut first)
+                .expect("first response is available")
+                .is_some()
+        );
+
+        let mut cancelled = client
+            .execute(
+                "tools/call",
+                Some(serde_json::json!({"name": "cancel", "arguments": {}})),
+            )
+            .expect("third request is committed");
+        client
+            .cancel(&mut cancelled)
+            .expect("selected-era cancellation sends");
+        client.close().expect("shutdown closes the owned halves");
+        assert!(closed.load(Ordering::Acquire));
+        let sent = sent.lock().expect("test send log is available");
+        assert!(matches!(
+            sent.first(),
+            Some(JsonRpcMessage::Request(request)) if request.method == SERVER_DISCOVER_METHOD
+        ));
+        assert!(sent.iter().any(|message| matches!(
+            message,
+            JsonRpcMessage::Request(request) if request.method == "notifications/cancelled"
+        )));
+    }
+
+    #[test]
+    fn websocket_modern_only_refusal_never_replays_initialize_on_the_same_connection() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receiver = WebSocketTestRecv {
+            frames: VecDeque::from([websocket_test_frame(
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+            )]),
+        };
+        let error = WebSocketClient::connect_with_cx(
+            Cx::for_testing(),
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            ClientInfo {
+                name: "websocket-client".to_owned(),
+                version: "1.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            receiver,
+            WebSocketTestSend {
+                sent: Arc::clone(&sent),
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .expect_err("changing only the selected era to modern-only rejects legacy refusal");
+        assert!(error.to_string().contains("handshake method"));
+        let sent = sent.lock().expect("test send log is available");
+        assert_eq!(
+            sent.len(),
+            1,
+            "wrong-era refusal performs no legacy contact"
+        );
+        assert!(matches!(
+            &sent[0],
+            JsonRpcMessage::Request(request) if request.method == SERVER_DISCOVER_METHOD
+        ));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn websocket_legacy_reverse_request_is_capability_bound_until_its_response() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receiver = WebSocketTestRecv {
+            frames: VecDeque::from([
+                websocket_test_frame(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"legacy-websocket","version":"1.0"}}}"#,
+                ),
+                websocket_test_frame(
+                    r#"{"jsonrpc":"2.0","id":99,"method":"roots/list","params":{}}"#,
+                ),
+            ]),
+        };
+        let client = WebSocketClient::connect_with_cx(
+            Cx::for_testing(),
+            ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+            ClientInfo {
+                name: "websocket-client".to_owned(),
+                version: "1.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            receiver,
+            WebSocketTestSend {
+                sent: Arc::clone(&sent),
+                closed: Arc::new(AtomicBool::new(false)),
+            },
+        )
+        .expect("exact legacy initialize negotiates the WebSocket connection");
+
+        assert!(sent.lock().expect("test send log is available").iter().any(
+            |message| matches!(
+                message,
+                JsonRpcMessage::Request(request) if request.method == "notifications/initialized"
+            )
+        ));
+
+        client.drive().expect("legacy reverse request is admitted");
+        let reverse = client.take_reverse_requests();
+        assert_eq!(reverse.len(), 1);
+        client
+            .respond_to_reverse_request(&reverse[0], serde_json::json!({"roots": []}))
+            .expect("only the live reverse capability can answer the peer request");
+        let sent = sent.lock().expect("test send log is available");
+        assert!(matches!(
+            sent.last(),
+            Some(JsonRpcMessage::Response(response)) if response.id == Some(RequestId::Number(99))
+        ));
+    }
     #[cfg(all(unix, not(target_os = "linux")))]
     use std::io::Read as _;
     #[cfg(unix)]

@@ -16,7 +16,11 @@ use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
 #[cfg(any(feature = "tasks", test))]
 use fastmcp_protocol::FinalCoreResult;
-use fastmcp_protocol::methods::{INITIALIZE, SUBSCRIPTIONS_LISTEN, TOOLS_CALL};
+use fastmcp_protocol::methods::{
+    FINAL_2026_07_28_METHODS, Final2026EnvelopeKind, Final2026Peer, INITIALIZE,
+    LEGACY_2024_11_05_METHODS, Legacy2024Direction, Legacy2024EnvelopeKind, SUBSCRIPTIONS_LISTEN,
+    TOOLS_CALL, validate_legacy_2024_11_05_method_params,
+};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::tasks_extension::{
@@ -1799,8 +1803,20 @@ where
                 if request.method == "notifications/cancelled" {
                     self.route_cancellation_notification_locked(cx, state, &request)?;
                 } else if request.id.is_some() {
-                    if state.result_peer_era == ResultPeerEra::Modern {
-                        self.reject_modern_reverse_request_locked(cx, state, request)?;
+                    if !server_request_is_admitted(state.result_peer_era, &request) {
+                        self.reject_reverse_request_locked(cx, state, request)?;
+                    } else if !legacy_reverse_request_params_are_admitted(
+                        state.result_peer_era,
+                        &request,
+                    ) {
+                        self.reject_reverse_request_with_error_locked(
+                            cx,
+                            state,
+                            request,
+                            McpError::invalid_params(
+                                "Peer reverse request parameters are not exact MCP 2024-11-05",
+                            ),
+                        )?;
                     } else if let Err(error) = state.retain_reverse_request(request) {
                         state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
                         return Err(error);
@@ -2430,17 +2446,26 @@ where
         error
     }
 
-    fn reject_modern_reverse_request_locked(
+    fn reject_reverse_request_locked(
         &self,
         cx: &Cx,
         state: &mut ExecutorState<T>,
         request: JsonRpcRequest,
     ) -> McpResult<()> {
-        let request_id = request.id.expect("modern reverse request has an ID");
-        let rejection = JsonRpcMessage::Response(JsonRpcResponse::error(
-            Some(request_id),
-            McpError::method_not_found(&request.method).into(),
-        ));
+        let error = McpError::method_not_found(&request.method);
+        self.reject_reverse_request_with_error_locked(cx, state, request, error)
+    }
+
+    fn reject_reverse_request_with_error_locked(
+        &self,
+        cx: &Cx,
+        state: &mut ExecutorState<T>,
+        request: JsonRpcRequest,
+        error: McpError,
+    ) -> McpResult<()> {
+        let request_id = request.id.expect("reverse request has an ID");
+        let rejection =
+            JsonRpcMessage::Response(JsonRpcResponse::error(Some(request_id), error.into()));
         state
             .transport
             .send(cx, &rejection)
@@ -3156,6 +3181,50 @@ fn exact_result_source_from_admitted_frame(
     Ok(admission.into_parts().1)
 }
 
+/// Returns whether the selected protocol table admits an ID-bearing request
+/// from the server at the client ingress boundary.
+///
+/// This is deliberately table-driven instead of treating every JSON-RPC
+/// request as a callback. In particular, `completion/complete` is always
+/// client-to-server, elicitation is absent from both selected core tables,
+/// and the final table deliberately excludes historical reverse callbacks.
+fn server_request_is_admitted(peer_era: ResultPeerEra, request: &JsonRpcRequest) -> bool {
+    if request.id.is_none() {
+        return false;
+    }
+    match peer_era {
+        ResultPeerEra::Legacy => LEGACY_2024_11_05_METHODS.iter().any(|method| {
+            method.name == request.method
+                && method.envelope == Legacy2024EnvelopeKind::Request
+                && matches!(
+                    method.direction,
+                    Legacy2024Direction::ServerToClient | Legacy2024Direction::Bidirectional
+                )
+        }),
+        ResultPeerEra::Modern => FINAL_2026_07_28_METHODS.iter().any(|method| {
+            method.name == request.method
+                && method.envelope == Final2026EnvelopeKind::Request
+                && method.direction.admits_sender(Final2026Peer::Server)
+        }),
+    }
+}
+
+/// Applies the pinned method-level schema after the selected-era table has
+/// admitted a reverse request. Final-era request admission is unchanged: its
+/// active table contains no server-to-client request methods.
+fn legacy_reverse_request_params_are_admitted(
+    peer_era: ResultPeerEra,
+    request: &JsonRpcRequest,
+) -> bool {
+    match peer_era {
+        ResultPeerEra::Legacy => {
+            validate_legacy_2024_11_05_method_params(&request.method, request.params.as_ref())
+                .is_ok()
+        }
+        ResultPeerEra::Modern => true,
+    }
+}
+
 fn cancellation_control_message_for_era(
     peer_era: ResultPeerEra,
     request_id: &RequestId,
@@ -3863,7 +3932,7 @@ mod tests {
         let executor = RequestExecutor::new(ScriptedTransport::new([
             Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
                 "sampling/createMessage",
-                Some(serde_json::json!({"messages": []})),
+                Some(serde_json::json!({"messages": [], "maxTokens": 9})),
                 700,
             ))),
             Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
@@ -5012,7 +5081,7 @@ mod tests {
             ScriptedTransport::new([
                 Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
                     "sampling/createMessage",
-                    Some(serde_json::json!({"messages": []})),
+                    Some(serde_json::json!({"messages": [], "maxTokens": 9})),
                     700,
                 ))),
                 Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(

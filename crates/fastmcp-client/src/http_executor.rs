@@ -2050,7 +2050,11 @@ pub struct ModernHttpClient {
     client_capabilities: ClientCapabilities,
     mcp_apps_settings: Option<McpAppsClientSettings>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
-    discovery_state: Arc<std::sync::RwLock<ModernHttpDiscoveryState>>,
+    /// Discovery is committed before this client is constructed and must not
+    /// change for the lifetime of any cloned request handle. Keeping it behind
+    /// `Arc`, rather than a mutable lock, makes the final-era binding a type
+    /// property instead of a convention.
+    discovery_state: Arc<ModernHttpDiscoveryState>,
     executor: ModernHttpExecutor,
 }
 
@@ -4429,11 +4433,11 @@ impl ModernHttpClient {
                     client_capabilities,
                     mcp_apps_settings,
                     client_extension_runtime,
-                    discovery_state: Arc::new(std::sync::RwLock::new(ModernHttpDiscoveryState {
+                    discovery_state: Arc::new(ModernHttpDiscoveryState {
                         mcp_apps_activation_receipt,
                         server_discovery,
                         negotiated_extensions,
-                    })),
+                    }),
                     executor: ModernHttpExecutor::new(),
                 }))
             }
@@ -4468,22 +4472,14 @@ impl ModernHttpClient {
     /// Returns the exact typed discovery result that selected modern HTTP.
     #[must_use]
     pub fn server_discovery(&self) -> ServerDiscoverResult {
-        self.discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .server_discovery
-            .clone()
+        self.discovery_state.server_discovery.clone()
     }
 
     /// Returns whether final discovery activated the official MCP Apps extension.
     #[cfg(feature = "apps")]
     #[must_use]
     pub fn mcp_apps_active(&self) -> bool {
-        self.discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mcp_apps_activation_receipt
-            .is_some()
+        self.discovery_state.mcp_apps_activation_receipt.is_some()
     }
 
     /// Returns the sole Apps receipt derived by this connection's retained
@@ -4493,11 +4489,7 @@ impl ModernHttpClient {
     pub fn mcp_apps_activation_receipt(
         &self,
     ) -> Option<fastmcp_protocol::extensions::McpAppsActivationReceipt> {
-        self.discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mcp_apps_activation_receipt
-            .clone()
+        self.discovery_state.mcp_apps_activation_receipt.clone()
     }
 
     /// Returns the frozen generic extension set retained from final discovery.
@@ -4505,11 +4497,7 @@ impl ModernHttpClient {
     pub fn negotiated_extensions(
         &self,
     ) -> Option<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
-        self.discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .negotiated_extensions
-            .clone()
+        self.discovery_state.negotiated_extensions.clone()
     }
 
     fn admit_final_extension_method(
@@ -4524,8 +4512,6 @@ impl ModernHttpClient {
         })?;
         let negotiated = self
             .discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .negotiated_extensions
             .clone()
             .ok_or_else(|| {
@@ -4562,12 +4548,7 @@ impl ModernHttpClient {
         request_id: Option<RequestId>,
         additional_client_extensions: Option<&BTreeMap<String, serde_json::Value>>,
     ) -> Result<ModernHttpRequest, ModernHttpClientError> {
-        let mcp_apps_active = self
-            .discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mcp_apps_activation_receipt
-            .is_some();
+        let mcp_apps_active = self.discovery_state.mcp_apps_activation_receipt.is_some();
         let generic_apps_configured = self
             .client_extension_runtime
             .as_ref()
@@ -4667,12 +4648,7 @@ impl ModernHttpClient {
             .is_some_and(|runtime| runtime.configures_mcp_apps());
         let client_extension_settings = self.configured_client_extensions(None);
         let client_extensions = merge_client_extensions(
-            (self
-                .discovery_state
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .mcp_apps_activation_receipt
-                .is_some()
+            (self.discovery_state.mcp_apps_activation_receipt.is_some()
                 && !generic_apps_configured)
                 .then_some(self.mcp_apps_settings.as_ref())
                 .flatten(),
@@ -5483,11 +5459,7 @@ impl ModernHttpClient {
         }
         // Discovery fixes the extension authority for the connected client;
         // every Tasks POST is otherwise independent and stateless.
-        let discovery = self
-            .discovery_state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let discovery = self.discovery_state.clone();
         if !discovery
             .server_discovery
             .supported_versions()
@@ -9636,6 +9608,91 @@ mod tests {
     }
 
     #[test]
+    fn public_http_auto_commits_missing_result_type_discovery_before_final_traffic() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind missing-resultType modern listener");
+        let address = listener
+            .local_addr()
+            .expect("read missing-resultType modern address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept modern discovery");
+            let discovery_request = read_request(&mut discovery);
+            assert!(discovery_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                discovery_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n")
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&discovery_request.body)
+                    .expect("discovery is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+
+            let (mut request, _) = listener.accept().expect("accept final request");
+            let final_request = read_request(&mut request);
+            assert!(final_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                final_request
+                    .head
+                    .contains("MCP-Protocol-Version: 2026-07-28\r\n"),
+                "the traffic after discovery remains on the committed final era"
+            );
+            let final_body = serde_json::from_slice::<serde_json::Value>(&final_request.body)
+                .expect("final request is JSON-RPC");
+            assert_eq!(final_body["id"], 2);
+            assert_eq!(final_body["method"], "tools/list");
+            write_response(
+                &mut request,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::Auto,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("an otherwise-valid missing resultType discovery selects final HTTP");
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
+        assert_eq!(
+            connection
+                .server_discovery()
+                .expect("the committed final era retains discovery")
+                .peer_diagnostic(),
+            Some(fastmcp_protocol::ResultPeerDiagnostic::ModernMissingResultType)
+        );
+
+        let response = runtime_block_on(connection.request_json(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect("the committed final connection accepts subsequent final traffic");
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+        server
+            .join()
+            .expect("missing-resultType modern server must join");
+    }
+
+    #[test]
     fn modern_discovery_response_correlates_numeric_aliases_and_rejects_foreign_ids() {
         let numeric_alias = br#"{"jsonrpc":"2.0","id":1e0,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#;
         assert!(decode_modern_discovery_response(numeric_alias).is_ok());
@@ -10182,6 +10239,85 @@ mod tests {
             }
         ));
         server.join().expect("modern mismatch server must join");
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_auto_does_not_fall_back_after_a_recognized_discovery_refusal() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recognized-refusal listener");
+        let address = listener
+            .local_addr()
+            .expect("read recognized-refusal address");
+        let modern_target = format!("http://{address}/mcp");
+        let legacy_sse_target = format!("http://{address}/legacy-sse");
+        let legacy_message_target = format!("http://{address}/legacy-message");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
+            let probe_request = read_request(&mut probe);
+            assert!(probe_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("probe is JSON-RPC")["method"],
+                SERVER_DISCOVER
+            );
+            // This differs from the positive legacy-fallback probe only in
+            // the returned body. A correlated JSON-RPC refusal is protocol
+            // evidence for the final lane, never authorization to contact
+            // the legacy endpoints.
+            write_response(
+                &mut probe,
+                404,
+                "text/plain",
+                br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"server/discover unavailable"}}"#,
+            );
+
+            listener
+                .set_nonblocking(true)
+                .expect("configure listener for no-fallback assertion");
+            let deadline = Instant::now() + Duration::from_millis(100);
+            loop {
+                match listener.accept() {
+                    Ok(_) => panic!(
+                        "a recognized modern discovery refusal must not contact legacy SSE or POST"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("observe unintended legacy contact: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                &legacy_sse_target,
+                &legacy_message_target,
+                ProtocolPolicy::Auto,
+            ),
+            ClientInfo {
+                name: "public-http-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ));
+        let Err(error) = connection else {
+            panic!("a recognized discovery refusal cannot select legacy");
+        };
+        assert!(matches!(
+            error,
+            ClientHttpConnectionError::Modern(ModernHttpClientError::DiscoveryRejected {
+                code,
+                message,
+                data: None,
+            }) if code.as_str() == "-32601" && message == "server/discover unavailable"
+        ));
+        server.join().expect("recognized-refusal server must join");
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

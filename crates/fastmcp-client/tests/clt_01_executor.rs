@@ -70,6 +70,10 @@ impl Probe {
         self.0.borrow().sent.len()
     }
 
+    fn sent(&self) -> Vec<JsonRpcMessage> {
+        self.0.borrow().sent.clone()
+    }
+
     fn closed(&self) -> bool {
         self.0.borrow().closed
     }
@@ -237,6 +241,219 @@ fn clt_01_custom_transport_rejects_final_result_under_one_changed_selected_era()
     assert_eq!(error.code, McpErrorCode::InvalidRequest);
     assert_eq!(executor.protocol_era(), ProtocolEra::Legacy2024);
     assert_eq!(probe.sent_len(), 1);
+}
+
+#[test]
+fn legacy_multiplexed_executor_retains_sampling_and_roots_callbacks() {
+    let cx = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new([
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "sampling/createMessage",
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+            701,
+        ))),
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "roots/list",
+            Some(serde_json::json!({})),
+            702,
+        ))),
+    ]);
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Legacy2024);
+
+    executor
+        .drive(&cx)
+        .expect("legacy sampling callback is retained");
+    executor
+        .drive(&cx)
+        .expect("legacy roots callback is retained");
+    let reverse = executor.take_reverse_requests();
+    assert_eq!(reverse.len(), 2);
+    assert_eq!(reverse[0].request().method, "sampling/createMessage");
+    assert_eq!(reverse[1].request().method, "roots/list");
+
+    executor
+        .respond_to_reverse_request(&cx, &reverse[0], serde_json::json!({"model": "test"}))
+        .expect("sampling reply preserves its callback ownership");
+    executor
+        .respond_to_reverse_request(&cx, &reverse[1], serde_json::json!({"roots": []}))
+        .expect("roots reply preserves its callback ownership");
+
+    let sent = probe.sent();
+    assert!(matches!(
+        &sent[0],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(701))
+                && response.result == Some(serde_json::json!({"model": "test"}))
+    ));
+    assert!(matches!(
+        &sent[1],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(702))
+                && response.result == Some(serde_json::json!({"roots": []}))
+    ));
+}
+
+#[test]
+fn legacy_multiplexed_executor_rejects_sampling_without_only_required_max_tokens() {
+    let cx = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new([
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "sampling/createMessage",
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+            701,
+        ))),
+        // Only mandatory `maxTokens` differs from the admitted callback above.
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "sampling/createMessage",
+            Some(serde_json::json!({"messages": []})),
+            702,
+        ))),
+    ]);
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Legacy2024);
+
+    executor
+        .drive(&cx)
+        .expect("baseline exact legacy sampling callback is retained");
+    let retained = executor.take_reverse_requests();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].request_id(), &RequestId::Number(701));
+
+    executor
+        .drive(&cx)
+        .expect("missing maxTokens receives a correlated local rejection");
+    assert!(executor.take_reverse_requests().is_empty());
+    let sent = probe.sent();
+    assert!(matches!(
+        &sent[0],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(702))
+                && response
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.code.as_i32() == Some(i32::from(McpErrorCode::InvalidParams)))
+    ));
+
+    executor
+        .respond_to_reverse_request(&cx, &retained[0], serde_json::json!({"model": "test"}))
+        .expect("the malformed callback leaves the retained callback ownership unchanged");
+    assert!(matches!(
+        &probe.sent()[1],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(701))
+                && response.result == Some(serde_json::json!({"model": "test"}))
+    ));
+}
+
+#[test]
+fn legacy_multiplexed_executor_rejects_client_direction_and_absent_era_reverse_requests() {
+    let cx = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new([
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "completion/complete",
+            Some(serde_json::json!({})),
+            703,
+        ))),
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "elicitation/create",
+            Some(serde_json::json!({})),
+            704,
+        ))),
+    ]);
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Legacy2024);
+
+    executor
+        .drive(&cx)
+        .expect("wrong-direction completion receives a local rejection");
+    executor
+        .drive(&cx)
+        .expect("elicitation absent from legacy receives a local rejection");
+
+    assert!(executor.take_reverse_requests().is_empty());
+    let sent = probe.sent();
+    assert!(matches!(
+        &sent[0],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(703)) && response.error.is_some()
+    ));
+    assert!(matches!(
+        &sent[1],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(704)) && response.error.is_some()
+    ));
+}
+
+#[test]
+fn reverse_sampling_is_rejected_when_only_selected_era_changes() {
+    let cx = Cx::for_testing();
+    let (transport, probe) =
+        ScriptedTransport::new([Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "sampling/createMessage",
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+            701,
+        )))]);
+    // Only the selected era differs from the accepted legacy callback path.
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Modern2026);
+
+    executor
+        .drive(&cx)
+        .expect("final-era ingress rejects historical reverse callbacks");
+    assert!(executor.take_reverse_requests().is_empty());
+    assert!(matches!(
+        &probe.sent()[0],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(701)) && response.error.is_some()
+    ));
+}
+
+#[test]
+fn legacy_reverse_cancellation_ignores_one_changed_request_envelope() {
+    let cx = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new([
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "sampling/createMessage",
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
+            705,
+        ))),
+        // Only the notification envelope changes from the accepted paired
+        // cancellation path: it incorrectly carries a JSON-RPC request ID.
+        Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
+            "notifications/cancelled",
+            Some(serde_json::json!({"requestId": 705})),
+            706,
+        ))),
+    ]);
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Legacy2024);
+
+    executor
+        .drive(&cx)
+        .expect("legacy sampling callback is retained before cancellation");
+    let reverse = executor
+        .take_reverse_requests()
+        .pop()
+        .expect("callback reaches the public boundary");
+    executor
+        .drive(&cx)
+        .expect("wrong-envelope cancellation is inert without connection failure");
+
+    assert!(
+        !reverse.cancellation().is_cancel_requested(),
+        "a request-shaped cancellation cannot cancel a live callback"
+    );
+    assert_eq!(
+        probe.sent_len(),
+        0,
+        "malformed cancellation receives no reply"
+    );
+
+    executor
+        .respond_to_reverse_request(&cx, &reverse, serde_json::json!({"model": "test"}))
+        .expect("the inert cancellation leaves the retained callback response-capable");
+    assert!(matches!(
+        &probe.sent()[0],
+        JsonRpcMessage::Response(response)
+            if response.id == Some(RequestId::Number(705))
+                && response.result == Some(serde_json::json!({"model": "test"}))
+    ));
 }
 
 #[test]
@@ -537,6 +754,45 @@ fn canonical_terminal_id_tombstone_prevents_reuse_and_late_duplicate_aba() {
 }
 
 #[test]
+fn multiplexed_executor_returns_the_exact_admitted_raw_completion_result() {
+    let cx = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new(std::iter::empty());
+    let executor = RequestExecutor::with_protocol_era(transport, ProtocolEra::Legacy2024);
+    let mut execution = executor
+        .execute(
+            &cx,
+            JsonRpcRequest::new(
+                "completion/complete",
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "deploy"},
+                    "argument": {"name": "environment", "value": "sta"},
+                })),
+                711,
+            ),
+        )
+        .expect("client-originated completion commits through the multiplexed executor");
+    let raw_result = r#"{"completion":{"values":["staging"],"total":1,"hasMore":false}}"#;
+    executor
+        .route_response_with_raw_result(
+            &cx,
+            JsonRpcResponse::success(
+                RequestId::Number(711),
+                serde_json::from_str(raw_result).expect("exact raw result is valid JSON"),
+            ),
+            Some(raw_result.to_owned()),
+        )
+        .expect("exact completion result is routed to its request owner");
+
+    let (response, retained_raw_result) = executor
+        .try_take_response_with_raw_result(&mut execution)
+        .expect("terminal owner is available without a second ingress reader")
+        .expect("the routed terminal response wakes its owner");
+    assert_eq!(response.id, Some(RequestId::Number(711)));
+    assert_eq!(retained_raw_result.as_deref(), Some(raw_result));
+    assert_eq!(probe.sent_len(), 1);
+}
+
+#[test]
 fn clt_01_b_positive() {
     assert_eq!(
         clt_01_b_manifest_digest().as_bytes(),
@@ -550,7 +806,7 @@ fn clt_01_b_positive() {
     let (transport, probe) = ScriptedTransport::new([
         Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
             "sampling/createMessage",
-            Some(serde_json::json!({"messages": []})),
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
             700,
         ))),
         Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
@@ -655,7 +911,7 @@ fn reverse_callback_cancellation_rejects_stale_owner_after_same_id_reuse() {
     let (transport, probe) = ScriptedTransport::new([
         Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
             "sampling/createMessage",
-            Some(serde_json::json!({"messages": []})),
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
             700,
         ))),
         Ok(JsonRpcMessage::Request(JsonRpcRequest::notification(
@@ -664,7 +920,7 @@ fn reverse_callback_cancellation_rejects_stale_owner_after_same_id_reuse() {
         ))),
         Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
             "sampling/createMessage",
-            Some(serde_json::json!({"messages": []})),
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
             700,
         ))),
     ]);
@@ -715,7 +971,7 @@ fn reverse_callback_owner_cannot_cross_connection_boundaries() {
     let reverse_request = || {
         Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
             "sampling/createMessage",
-            Some(serde_json::json!({"messages": []})),
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
             700,
         )))
     };
@@ -761,7 +1017,7 @@ fn reverse_callback_connection_shutdown_cancels_taken_owner() {
     let (transport, probe) =
         ScriptedTransport::new([Ok(JsonRpcMessage::Request(JsonRpcRequest::new(
             "sampling/createMessage",
-            Some(serde_json::json!({"messages": []})),
+            Some(serde_json::json!({"messages": [], "maxTokens": 9})),
             700,
         )))]);
     let executor = RequestExecutor::new(transport);

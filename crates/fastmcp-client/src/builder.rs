@@ -49,9 +49,10 @@ use crate::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
     ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
-    combine_operation_and_cleanup, combine_operation_with_cleanup, is_cleanup_unverified,
-    resolve_stdio_command, validate_protocol_plan_feature,
+    WebSocketClient, combine_operation_and_cleanup, combine_operation_with_cleanup,
+    is_cleanup_unverified, resolve_stdio_command, validate_protocol_plan_feature,
 };
+use fastmcp_transport::{ClientTransportRecvHalf, TransportSendHalf};
 
 #[cfg(feature = "legacy-2024-11-05")]
 const DEFAULT_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
@@ -710,6 +711,60 @@ impl ClientBuilder {
 
         // All attempts failed
         Err(last_error.unwrap_or_else(|| McpError::internal_error("Connection failed")))
+    }
+
+    /// Negotiates one already-upgraded, split WebSocket connection.
+    ///
+    /// The WebSocket Upgrade itself remains the embedding application's
+    /// transport-security boundary. Once it supplies source-preserving client
+    /// halves, this method owns both halves and one cloned capability context
+    /// for discovery/initialize, multiplexing, cancellation, and shutdown.
+    pub fn connect_websocket_with_cx<R, S>(
+        self,
+        cx: &Cx,
+        receiver: R,
+        sender: S,
+    ) -> McpResult<WebSocketClient<R, S>>
+    where
+        R: ClientTransportRecvHalf,
+        S: TransportSendHalf,
+    {
+        self.validate_feature_configuration()?;
+        self.validate_websocket_configuration()?;
+        WebSocketClient::connect_with_cx(
+            cx.clone(),
+            self.protocol_plan,
+            self.client_info,
+            self.capabilities,
+            receiver,
+            sender,
+        )
+    }
+
+    /// Negotiates one already-upgraded WebSocket using the current `Cx`.
+    pub fn connect_websocket<R, S>(self, receiver: R, sender: S) -> McpResult<WebSocketClient<R, S>>
+    where
+        R: ClientTransportRecvHalf,
+        S: TransportSendHalf,
+    {
+        block_on(async {
+            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
+            self.connect_websocket_with_cx(&cx, receiver, sender)
+        })
+    }
+
+    fn validate_websocket_configuration(&self) -> McpResult<()> {
+        if !self.reverse_request_handlers.is_empty() {
+            return Err(McpError::invalid_params(
+                "WebSocket reverse handlers are application-driven; use WebSocketClient::take_reverse_requests and respond_to_reverse_request",
+            ));
+        }
+        if self.mcp_apps_settings.is_some() || self.client_extension_runtime.is_some() {
+            return Err(McpError::invalid_params(
+                "WebSocket client extension discovery is not configured for this transport",
+            ));
+        }
+        Ok(())
     }
 
     fn connection_retry_elapsed_error() -> McpError {
