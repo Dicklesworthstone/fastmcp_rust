@@ -8,9 +8,9 @@
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
 //! public stdio constructor starts with a modern `server/discover` probe and
-//! opens a fresh exact-2024 child only for a recognized `MethodNotFound`
-//! refusal; this source inventory is not aggregate conformance or release
-//! evidence.
+//! opens a fresh exact-2024 child only for a correlated `MethodNotFound`
+//! refusal or Unix-observable clean first-probe timeout; this source inventory
+//! is not aggregate conformance or release evidence.
 //!
 //! # Example
 //!
@@ -3231,19 +3231,24 @@ fn validate_initialize_result(result: &InitializeResult) -> McpResult<()> {
     Err(McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))
 }
 
-fn auto_legacy_fallback_is_authorized(error: &McpError) -> bool {
-    // Auto reaches this predicate only after its disposable modern
-    // `server/discover` probe. A JSON-RPC MethodNotFound response is the sole
-    // recognized refusal that establishes the peer does not implement that
-    // method. Generic parsing or parameter errors remain peer errors and must
-    // surface without starting a legacy child.
-    error.code == McpErrorCode::MethodNotFound
+/// The only probe outcomes that may authorize one fresh exact-2024 child.
+///
+/// This is deliberately not derived from a flattened [`McpError`]: the
+/// classifier retains whether `MethodNotFound` was correlated to the committed
+/// first `server/discover` request, and whether a timeout occurred before any
+/// child ingress was admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AutoStdioFallbackSignal {
+    /// The first, correlated discovery response was JSON-RPC MethodNotFound.
+    CorrelatedDiscoverMethodNotFound,
+    /// The committed first discovery request reached a clean receive deadline.
+    CleanFirstProbeTimeout { source: RequestTimeoutSource },
 }
 
 /// Rechecks the caller-owned context at Auto's one allowed downgrade boundary.
 ///
-/// The modern probe owns its disposable child and may complete with the only
-/// refusal that authorizes exact-2024. That refusal does not authorize a new
+/// The modern probe owns its disposable child and may complete with one of the
+/// narrow signals that authorizes exact-2024. Neither signal authorizes a new
 /// subprocess after the caller has cancelled its connection operation.
 pub(crate) fn admit_auto_legacy_fallback(cx: &Cx) -> McpResult<()> {
     cx.checkpoint().map_err(|_| McpError::request_cancelled())
@@ -6614,10 +6619,11 @@ impl Client {
     /// Creates a client with a provided Cx for cancellation support.
     pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
         // The public convenience constructor follows the same modern-first,
-        // bounded Auto selection as ClientBuilder. A recognized discovery
-        // MethodNotFound closes the disposable probe and opens one fresh
-        // exact-2024 child; malformed discoveries and every other failure are
-        // never replayed as legacy traffic.
+        // bounded Auto selection as ClientBuilder. A correlated discovery
+        // MethodNotFound or Unix-observable clean first-probe timeout closes
+        // the disposable child before opening one fresh exact-2024 child;
+        // malformed discoveries and every other failure are never replayed as
+        // legacy traffic.
         Self::stdio_with_protocol_plan_with_cx(
             command,
             args,
@@ -6631,8 +6637,9 @@ impl Client {
     /// `ModernOnly` performs a modern `server/discover` exchange, while
     /// `LegacyOnly` performs the exact 2024-11-05 initialization lifecycle.
     /// `Auto` first probes a disposable modern process and starts a fresh
-    /// exact-2024 process only for a recognized discovery refusal. Transport
-    /// failures and malformed modern discovery never authorize a downgrade.
+    /// exact-2024 process only for a correlated discovery refusal or an
+    /// Unix-observable clean first-probe timeout. Transport failures and
+    /// malformed modern discovery never authorize a downgrade.
     pub fn stdio_with_protocol_plan(
         command: &str,
         args: &[&str],
@@ -6657,33 +6664,13 @@ impl Client {
             ProtocolPolicy::ModernOnly | ProtocolPolicy::LegacyOnly => {
                 Self::connect_stdio_with_protocol_plan_once(command, args, protocol_plan, cx)
             }
-            ProtocolPolicy::Auto => {
-                let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
-                match Self::connect_stdio_with_protocol_plan_once(
-                    command,
-                    args,
-                    modern_plan,
-                    cx.clone(),
-                ) {
-                    Ok(mut client) => {
-                        client.set_protocol_plan_after_selection(protocol_plan);
-                        Ok(client)
-                    }
-                    Err(error) if auto_legacy_fallback_is_authorized(&error) => {
-                        admit_auto_legacy_fallback(&cx)?;
-                        let legacy_plan = ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly);
-                        let mut client = Self::connect_stdio_with_protocol_plan_once(
-                            command,
-                            args,
-                            legacy_plan,
-                            cx,
-                        )?;
-                        client.set_protocol_plan_after_selection(protocol_plan);
-                        Ok(client)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
+            // The public constructor deliberately shares the builder's
+            // bounded Auto probe. That path owns the one clean-timeout signal,
+            // correlated refusal validation, and fresh-child lifecycle; fixed
+            // selected-era constructors retain this direct lightweight path.
+            ProtocolPolicy::Auto => ClientBuilder::new()
+                .protocol_plan(protocol_plan)
+                .connect_stdio_with_cx(command, args, &cx),
         }
     }
 
@@ -7034,25 +7021,61 @@ impl Client {
             Err(error) => return Err(self.record_initialization_failure(error)),
         };
 
-        let init_protocol_version = initialization.protocol_version().to_owned();
-        if let Err(error) = self.replace_session_after_initialization(initialization) {
-            return Err(self.record_initialization_failure(error));
+        self.complete_initialization(initialization)
+            .map_err(|error| self.record_initialization_failure(error))
+    }
+
+    /// Completes a disposable modern Auto probe without flattening its sole
+    /// eligible fallback signal into an [`McpError`]. The caller owns this
+    /// client until it either becomes selected or is closed before a fresh
+    /// legacy child is created.
+    pub(crate) fn ensure_initialized_for_auto_modern_probe(
+        &mut self,
+    ) -> McpResult<Option<AutoStdioFallbackSignal>> {
+        if let Err(error) = self.drain_completed_reverse_callbacks() {
+            return Err(self.terminate_connection(error));
         }
+        if let Some(error) = self.responses.terminal_error() {
+            return Err(error);
+        }
+        if self.initialized.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if let Some(error) = &self.initialization_error {
+            return Err(error.clone());
+        }
+        if self.session.protocol_plan().policy() != ProtocolPolicy::ModernOnly {
+            return Err(McpError::internal_error(
+                "Auto stdio probe requires a modern-only client session",
+            ));
+        }
+
+        let client_info = self.session.client_info().clone();
+        let capabilities = self.session.client_capabilities().clone();
+        let initialization = match self.initialize_modern_for_auto_probe(client_info, capabilities)
+        {
+            Ok(Ok(initialization)) => initialization,
+            Ok(Err(signal)) => return Ok(Some(signal)),
+            Err(error) => return Err(self.record_initialization_failure(error)),
+        };
+        self.complete_initialization(initialization)
+            .map_err(|error| self.record_initialization_failure(error))?;
+        Ok(None)
+    }
+
+    fn complete_initialization(&mut self, initialization: ClientInitialization) -> McpResult<()> {
+        let init_protocol_version = initialization.protocol_version().to_owned();
+        self.replace_session_after_initialization(initialization)?;
 
         // Exact 2024-11-05 transitions require the lifecycle acknowledgement.
         // Modern discovery has no corresponding initialized notification.
-        if init_protocol_version == PROTOCOL_VERSION
-            && let Err(error) = self.send_initialized_notification()
-        {
-            return Err(self.record_initialization_failure(error));
+        if init_protocol_version == PROTOCOL_VERSION {
+            self.send_initialized_notification()?;
         }
 
         self.activate_selected_io();
-
-        // Mark as initialized
         self.initialized.store(true, Ordering::SeqCst);
         self.install_multiplexed_stdio_executor();
-
         Ok(())
     }
 
@@ -8287,6 +8310,196 @@ impl Client {
             raw_result,
             receipt,
         })
+    }
+
+    /// Sends Auto's one disposable modern discovery request.
+    ///
+    /// Unlike the ordinary prepared-request path, this preserves two facts
+    /// until selection is complete: a correlated MethodNotFound reply and a
+    /// clean no-ingress receive deadline. Both are lost if converted eagerly
+    /// into the generic request error vocabulary.
+    fn send_modern_discovery_probe(
+        &mut self,
+        params_value: serde_json::Value,
+    ) -> McpResult<Result<ReceivedPreparedResult, AutoStdioFallbackSignal>> {
+        let timeout_policy = self.timeout_policy;
+        timeout_policy.validate()?;
+        let cx = self.cx.clone();
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+
+        let id = self.next_request_id()?;
+        let request_id = RequestId::Number(
+            i64::try_from(id).expect("request ID allocator enforces the i64 bound"),
+        );
+        let request = JsonRpcRequest::new(
+            SERVER_DISCOVER_METHOD,
+            Some(params_value),
+            request_id.clone(),
+        );
+        let waiter = self.responses.register(request_id.clone())?;
+        if let Err(error) = self.send_to_server_with_cx(&cx, &JsonRpcMessage::Request(request)) {
+            return Err(self.record_send_failure(Some(&request_id), error));
+        }
+        let deadlines = RequestDeadlines::start_at(timeout_policy, Instant::now())
+            .map_err(|error| self.finish_committed_request_locally(&request_id, error))?;
+        let received = match self.recv_modern_discovery_probe_response(&cx, waiter, deadlines)? {
+            Ok(received) => received,
+            Err(signal) => return Ok(Err(signal)),
+        };
+        let receipt = Instant::now();
+        let mut response = received.response;
+        if let Some(error) = response.error.take() {
+            if error.code.as_i32() == Some(-32_601) {
+                return Ok(Err(
+                    AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
+                ));
+            }
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        let result = response
+            .result
+            .take()
+            .ok_or_else(|| McpError::internal_error("No result in response"))?;
+        Ok(Ok(ReceivedPreparedResult {
+            result,
+            raw_result: received.raw_result,
+            receipt,
+        }))
+    }
+
+    /// Receives the first modern probe response without treating all timeout
+    /// shapes as equivalent. A timeout is eligible only before any complete
+    /// inbound frame has been admitted; malformed, wrong-ID, partial, late,
+    /// transport, and cancellation outcomes all stay terminal.
+    fn recv_modern_discovery_probe_response(
+        &mut self,
+        cx: &Cx,
+        mut waiter: ResponseWaiter,
+        deadlines: RequestDeadlines,
+    ) -> McpResult<Result<ReceivedJsonRpcResponse, AutoStdioFallbackSignal>> {
+        let expected_id = waiter.id.clone();
+        #[cfg(unix)]
+        let mut admitted_ingress = false;
+
+        loop {
+            if let Some(response) = waiter.try_response()? {
+                debug_assert!(
+                    response
+                        .id
+                        .as_ref()
+                        .is_some_and(|response_id| response_id.correlates_with(&expected_id))
+                );
+                return Ok(Ok(response));
+            }
+            if cx.checkpoint().is_err() {
+                return Err(self.finish_open_context_interruption(
+                    &expected_id,
+                    McpError::request_cancelled(),
+                ));
+            }
+            if let Some(source) = deadlines.expired_at(Instant::now()) {
+                // Only Unix child pipes expose the readiness boundary that
+                // distinguishes silence from a consumed partial frame. Other
+                // targets retain the ordinary terminal timeout rather than
+                // claiming a clean fallback signal from a blocking read.
+                #[cfg(unix)]
+                if !admitted_ingress {
+                    return Ok(Err(AutoStdioFallbackSignal::CleanFirstProbeTimeout {
+                        source,
+                    }));
+                }
+                return Err(self.timeout_committed_request(&expected_id, source));
+            }
+
+            let (frame, received_at) = match self.recv_next_child_frame(cx, Some(deadlines.next()))
+            {
+                Ok(received) => received,
+                Err(TransportError::ReceiveDeadlineExceeded) => {
+                    let source = deadlines
+                        .expired_at(Instant::now())
+                        .unwrap_or_else(|| deadlines.next_kind());
+                    if cx.checkpoint().is_err() {
+                        return Err(self.finish_open_context_interruption(
+                            &expected_id,
+                            McpError::request_cancelled(),
+                        ));
+                    }
+                    if self.transport_is_closed() {
+                        return Err(self.finish_partial_frame_timeout(&expected_id, source));
+                    }
+                    #[cfg(unix)]
+                    if !admitted_ingress {
+                        return Ok(Err(AutoStdioFallbackSignal::CleanFirstProbeTimeout {
+                            source,
+                        }));
+                    }
+                    return Err(self.timeout_committed_request(&expected_id, source));
+                }
+                Err(TransportError::Timeout) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::internal_error("Request timed out"),
+                    ));
+                }
+                Err(TransportError::Cancelled) if !self.transport_is_closed() => {
+                    return Err(self.finish_open_context_interruption(
+                        &expected_id,
+                        McpError::request_cancelled(),
+                    ));
+                }
+                Err(error) => return Err(self.terminate_connection(transport_error_to_mcp(error))),
+            };
+            #[cfg(unix)]
+            {
+                admitted_ingress = true;
+            }
+            if let Some(source) = deadlines.expired_at(received_at) {
+                return Err(self.finish_timeout_after_complete_frame(&expected_id, frame, source));
+            }
+            if let Err(error) = validate_inbound_typed_message(frame.message()) {
+                return Err(self.terminate_connection(error));
+            }
+
+            if matches!(frame.message(), JsonRpcMessage::Response(_)) {
+                let route = self
+                    .route_received_response(frame)
+                    .map_err(|error| self.terminate_connection(error))?;
+                if matches!(
+                    route,
+                    ResponseRoute::InvalidEnvelope
+                        | ResponseRoute::MissingId
+                        | ResponseRoute::ConnectionClosed
+                ) {
+                    let error = self.responses.terminal_error().unwrap_or_else(|| {
+                        McpError::internal_error("Client response correlation failed")
+                    });
+                    return Err(self.terminate_connection(error));
+                }
+                continue;
+            }
+
+            let JsonRpcMessage::Request(request) = frame.message() else {
+                unreachable!("a JSON-RPC message is either a request or response")
+            };
+            if self.cancel_legacy_reverse_callback(request) {
+                continue;
+            }
+            match self.retain_modern_server_notification(&frame) {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) => return Err(self.terminate_connection(error)),
+            }
+            let JsonRpcMessage::Request(request) = frame.into_message() else {
+                unreachable!("the frame was checked as a JSON-RPC request")
+            };
+            if let Some(response) = self.server_request_response(&request) {
+                if let Err(error) = self.send_server_response_during_receive(response) {
+                    return Err(self.terminate_connection(error));
+                }
+            }
+        }
     }
 
     /// Sends one supported core request and retains its selected-era result.
@@ -9753,6 +9966,37 @@ impl Client {
             })
             .and_then(|params| self.with_modern_request_metadata(params))?;
         let received = self.send_prepared_request(SERVER_DISCOVER_METHOD, params)?;
+        self.decode_modern_discovery_initialization(received)
+    }
+
+    /// Runs Auto's disposable first `server/discover` exchange. Only the
+    /// structured response path below can surface a fallback signal; every
+    /// decoder, framing, correlation, transport, and caller-cancellation
+    /// failure remains an ordinary terminal error.
+    fn initialize_modern_for_auto_probe(
+        &mut self,
+        _client_info: ClientInfo,
+        _capabilities: ClientCapabilities,
+    ) -> McpResult<Result<ClientInitialization, AutoStdioFallbackSignal>> {
+        let params = serde_json::to_value(ServerDiscoverRequest::default())
+            .map_err(|error| {
+                McpError::internal_error(format!(
+                    "Failed to serialize modern server/discover parameters: {error}"
+                ))
+            })
+            .and_then(|params| self.with_modern_request_metadata(params))?;
+        match self.send_modern_discovery_probe(params)? {
+            Ok(received) => self
+                .decode_modern_discovery_initialization(received)
+                .map(Ok),
+            Err(signal) => Ok(Err(signal)),
+        }
+    }
+
+    fn decode_modern_discovery_initialization(
+        &mut self,
+        received: ReceivedPreparedResult,
+    ) -> McpResult<ClientInitialization> {
         let result_source = received.raw_result.as_deref().ok_or_else(|| {
             self.terminate_connection(McpError::invalid_request(
                 "Modern server/discover response lost its admitted result source",
@@ -11748,22 +11992,27 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
 
     #[test]
-    fn auto_legacy_fallback_authorizes_only_method_not_found() {
-        for (code, authorized) in [
-            (McpErrorCode::MethodNotFound, true),
-            (McpErrorCode::ParseError, false),
-            (McpErrorCode::InvalidRequest, false),
-            (McpErrorCode::InvalidParams, false),
-            (McpErrorCode::InternalError, false),
-        ] {
-            let error = McpError::new(code, "discovery error");
-            assert_eq!(
-                auto_legacy_fallback_is_authorized(&error),
-                authorized,
-                "{code:?} must {}authorize a legacy child",
-                if authorized { "" } else { "not " }
-            );
-        }
+    fn auto_stdio_fallback_signals_are_explicit_and_bounded() {
+        assert_eq!(
+            AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound,
+            AutoStdioFallbackSignal::CorrelatedDiscoverMethodNotFound
+        );
+        assert_eq!(
+            AutoStdioFallbackSignal::CleanFirstProbeTimeout {
+                source: RequestTimeoutSource::Idle
+            },
+            AutoStdioFallbackSignal::CleanFirstProbeTimeout {
+                source: RequestTimeoutSource::Idle
+            }
+        );
+        assert_ne!(
+            AutoStdioFallbackSignal::CleanFirstProbeTimeout {
+                source: RequestTimeoutSource::Idle
+            },
+            AutoStdioFallbackSignal::CleanFirstProbeTimeout {
+                source: RequestTimeoutSource::Absolute
+            }
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

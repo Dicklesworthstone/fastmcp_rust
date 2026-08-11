@@ -4829,7 +4829,9 @@ impl ModernHttpClient {
     /// extension path as [`Self::request`]. Its collector retains exact server
     /// progress notifications from the request-owned SSE body without
     /// projecting them through a legacy `f64` callback; live iteration does
-    /// not retain a hidden duplicate queue.
+    /// not retain a hidden duplicate queue. Although its request retains the
+    /// standard JSON-or-SSE `Accept` contract, this SSE-only API rejects a
+    /// server response on the JSON body lane.
     pub async fn open_final_core_listener(
         &self,
         cx: &Cx,
@@ -8697,6 +8699,12 @@ mod tests {
 
             let (mut stream, _) = listener.accept().expect("accept final core tool stream");
             let request = read_request(&mut stream);
+            assert!(
+                request
+                    .head
+                    .contains("Accept: application/json, text/event-stream\r\n"),
+                "the final-core listener must retain the standard modern response admission"
+            );
             let request = serde_json::from_slice::<serde_json::Value>(&request.body)
                 .expect("final core tool stream request is JSON-RPC");
             assert_eq!(request["id"], 2);
@@ -8959,7 +8967,13 @@ mod tests {
             write_response(&mut probe, 200, "application/json", modern_discovery_body());
 
             let (mut stream, _) = listener.accept().expect("accept final core tool stream");
-            let _ = read_request(&mut stream);
+            let request = read_request(&mut stream);
+            assert!(
+                request
+                    .head
+                    .contains("Accept: application/json, text/event-stream\r\n"),
+                "the final-core listener must retain the standard modern response admission"
+            );
             begin_chunked_sse(&mut stream);
             // This differs from the admitted terminal above only in its JSON-RPC ID.
             write_chunked_sse_event(
@@ -8985,11 +8999,11 @@ mod tests {
             ClientCapabilities::default(),
         ))
         .expect("modern discovery selects the final core listener");
-        let mut listener = runtime_block_on(connection.open_final_tool_call_listener(
+        let mut listener = runtime_block_on(connection.open_final_core_listener(
             &cx,
+            TOOLS_CALL,
+            serde_json::json!({"name": "echo", "arguments": {}}),
             RequestId::Number(2),
-            "echo",
-            serde_json::json!({}),
             SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
         ))
         .expect("open final core listener");
@@ -9011,6 +9025,144 @@ mod tests {
             "ID refusal must release the parser"
         );
         server.join().expect("final core ID peer joins");
+    }
+
+    #[test]
+    fn final_core_listener_rejects_json_response_after_standard_accept() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind final core JSON peer");
+        let address = listener
+            .local_addr()
+            .expect("read final core JSON peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept final core JSON request");
+            let request = read_request(&mut stream);
+            assert!(
+                request
+                    .head
+                    .contains("Accept: application/json, text/event-stream\r\n"),
+                "the final-core listener must retain the standard modern response admission"
+            );
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}],"isError":false}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "final-core-JSON-listener-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects the final core listener");
+        let error = runtime_block_on(connection.open_final_tool_call_listener(
+            &cx,
+            RequestId::Number(2),
+            "echo",
+            serde_json::json!({}),
+            SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+        ))
+        .expect_err("the SSE-only final-core listener must reject a JSON response body");
+        assert!(matches!(
+            error,
+            ModernHttpFinalCoreListenError::Executor(
+                ModernHttpExecutorError::ExpectedSseResponse {
+                    actual: ModernHttpResponseKind::Json,
+                }
+            )
+        ));
+        server.join().expect("final core JSON peer joins");
+    }
+
+    #[test]
+    fn final_core_listener_rejects_server_cancellation_and_closes_body() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind final core cancellation listener");
+        let address = listener
+            .local_addr()
+            .expect("read final core cancellation address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept modern discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+
+            let (mut stream, _) = listener.accept().expect("accept final core tool stream");
+            let request = read_request(&mut stream);
+            assert!(
+                request
+                    .head
+                    .contains("Accept: application/json, text/event-stream\r\n"),
+                "the final-core listener must retain the standard modern response admission"
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body)
+                    .expect("final core tool stream request is JSON-RPC")["method"],
+                "tools/call"
+            );
+            begin_chunked_sse(&mut stream);
+            write_chunked_sse_event(
+                &mut stream,
+                "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2}}\n\n",
+            );
+            finish_chunked_sse(&mut stream);
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "final-core-cancellation-listener-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("modern discovery selects the final core listener");
+        let mut listener = runtime_block_on(connection.open_final_tool_call_listener(
+            &cx,
+            RequestId::Number(2),
+            "echo",
+            serde_json::json!({}),
+            SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+        ))
+        .expect("open final core listener");
+        let error = runtime_block_on(listener.next_event(&cx))
+            .expect_err("server cancellation must be refused on final HTTP SSE");
+        assert!(matches!(
+            error,
+            ModernHttpFinalCoreListenError::ServerCancellationOnHttp
+        ));
+        assert!(
+            listener.stream.response.is_none(),
+            "server cancellation refusal must release the body"
+        );
+        assert!(
+            listener.stream.parser.is_none(),
+            "server cancellation refusal must release the parser"
+        );
+        server.join().expect("final core cancellation peer joins");
     }
 
     #[test]
@@ -9593,6 +9745,12 @@ mod tests {
 
             let (mut stream, _) = listener.accept().expect("accept modern SSE request");
             let request = read_request(&mut stream);
+            assert!(
+                request
+                    .head
+                    .contains("Accept: application/json, text/event-stream\r\n"),
+                "the final-core listener must retain the standard modern response admission"
+            );
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&request.body)
                     .expect("modern request must be JSON-RPC")["method"],
@@ -9625,16 +9783,14 @@ mod tests {
         .expect("modern discovery selects a direct modern client")
         .into_modern()
         .expect("modern-only discovery cannot yield legacy");
-        let response = runtime_block_on(client.request(
+        let mut listener = runtime_block_on(client.open_final_tool_call_listener(
             &cx,
-            "tools/call",
-            serde_json::json!({"name": "echo", "arguments": {}}),
-            Some(RequestId::Number(2)),
+            RequestId::Number(2),
+            "echo",
+            serde_json::json!({}),
+            SseLimits::new(1_024, 8_192, 4).expect("nonzero SSE bounds"),
         ))
-        .expect("open the request-owned SSE response");
-        let mut stream = response
-            .into_sse_stream(SseLimits::new(1_024, 8_192, 4).expect("nonzero SSE bounds"))
-            .expect("the response is an SSE stream");
+        .expect("open the request-owned final-core SSE response");
         ready_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("server exposed the live response body");
@@ -9643,7 +9799,7 @@ mod tests {
         let waker = Waker::from(Arc::clone(&wake_counter));
         let mut task_context = Context::from_waker(&waker);
         {
-            let mut next_event = std::pin::pin!(stream.next_event(&cx));
+            let mut next_event = std::pin::pin!(listener.next_event(&cx));
             assert!(matches!(
                 next_event.as_mut().poll(&mut task_context),
                 Poll::Pending
@@ -9659,12 +9815,14 @@ mod tests {
             );
             assert!(matches!(
                 next_event.as_mut().poll(&mut task_context),
-                Poll::Ready(Err(ModernHttpExecutorError::Cancelled))
+                Poll::Ready(Err(ModernHttpFinalCoreListenError::CallerCancelled {
+                    request_id: RequestId::Number(2),
+                }))
             ));
         }
-        assert!(stream.response.is_none());
-        assert!(stream.parser.is_none());
-        assert!(stream.pending_events.is_empty());
+        assert!(listener.stream.response.is_none());
+        assert!(listener.stream.parser.is_none());
+        assert!(listener.stream.pending_events.is_empty());
 
         release_sender
             .send(())

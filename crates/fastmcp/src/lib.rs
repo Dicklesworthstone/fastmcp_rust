@@ -129,15 +129,9 @@ pub mod __private {
     /// Proc macros need this stable path downstream, but it must not become an
     /// Apps-off bypass around the facade's public feature boundary.
     pub mod protocol {
-        pub use fastmcp_protocol::{
-            CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
-            FinalReadResourceResult, Prompt, PromptArgument, PromptMessage, Resource,
-            ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate, UriTemplatePart,
-            common_types,
-        };
         #[cfg(feature = "apps")]
         pub use fastmcp_protocol::{
-            MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MAX_MCP_APPS_BRIDGE_TEXT_BYTES,
+            AbsoluteUri, MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MAX_MCP_APPS_BRIDGE_TEXT_BYTES,
             MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeError, McpAppsBridgeImplementation,
             McpAppsBridgeRequestId, McpAppsCancelledNotification, McpAppsDisplayModeParams,
             McpAppsDownloadContent, McpAppsDownloadFileParams, McpAppsHostCapabilities,
@@ -146,9 +140,16 @@ pub mod __private {
             McpAppsLogMessageNotification, McpAppsMessageParams, McpAppsMessageRole,
             McpAppsOpenLinkParams, McpAppsOperationResult, McpAppsPingParams,
             McpAppsProgressNotification, McpAppsResourceReadParams, McpAppsResourceTeardownParams,
-            McpAppsSandboxSignal, McpAppsToolCallParams, McpAppsUpdateModelContextParams,
-            McpAppsViewCapabilities, McpAppsViewNotification, McpAppsViewRequest,
-            McpAppsViewResponse, McpAppsViewToHost,
+            McpAppsSandboxSignal, McpAppsToolCallParams, McpAppsToolMetadata,
+            McpAppsToolVisibility, McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
+            McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
+            OpenMetadata,
+        };
+        pub use fastmcp_protocol::{
+            CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
+            FinalReadResourceResult, Prompt, PromptArgument, PromptMessage, Resource,
+            ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate, UriTemplatePart,
+            common_types,
         };
     }
 }
@@ -1163,10 +1164,12 @@ pub mod modern {
 
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
-        McpAppsClientWirePolicy, McpAppsHostError, McpAppsHttpClientWirePolicy,
+        McpAppsBridgeTransport, McpAppsClientWirePolicy, McpAppsHost, McpAppsHostConfiguration,
+        McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
+        McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
         McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
-        McpAppsWireHostPolicy, mcp_apps_in_memory_wire_pair,
+        McpAppsWireHostPolicy, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_protocol::extensions::{
@@ -1454,6 +1457,31 @@ pub mod modern {
                     "ModernOnly client completed initialization without server/discover",
                 )
             })
+        }
+
+        /// Returns whether final discovery activated the official MCP Apps extension.
+        #[must_use]
+        #[cfg(feature = "apps")]
+        pub fn mcp_apps_active(&self) -> bool {
+            self.inner.mcp_apps_active()
+        }
+
+        /// Starts one browser-agnostic Apps Host after final discovery activated Apps.
+        ///
+        /// The caller supplies both the View transport and the host policy;
+        /// activation remains bound to this modern-only client.
+        #[cfg(feature = "apps")]
+        pub fn mcp_apps_host<T, P>(
+            &self,
+            transport: T,
+            configuration: McpAppsHostConfiguration,
+            policy: P,
+        ) -> Result<McpAppsHost<T, P>, McpAppsHostError>
+        where
+            T: McpAppsBridgeTransport,
+            P: McpAppsHostPolicy,
+        {
+            self.inner.mcp_apps_host(transport, configuration, policy)
         }
 
         /// Starts the closed Apps wire bridge after final discovery activated Apps.
@@ -1797,6 +1825,24 @@ pub mod modern {
         #[cfg(feature = "apps")]
         pub fn mcp_apps_active(&self) -> bool {
             self.inner.mcp_apps_active()
+        }
+
+        /// Starts one browser-agnostic Apps Host after final discovery activated Apps.
+        ///
+        /// The caller supplies both the View transport and the host policy;
+        /// activation remains bound to this modern HTTP client.
+        #[cfg(feature = "apps")]
+        pub fn mcp_apps_host<T, P>(
+            &self,
+            transport: T,
+            configuration: McpAppsHostConfiguration,
+            policy: P,
+        ) -> Result<McpAppsHost<T, P>, McpAppsHostError>
+        where
+            T: McpAppsBridgeTransport,
+            P: McpAppsHostPolicy,
+        {
+            self.inner.mcp_apps_host(transport, configuration, policy)
         }
 
         /// Starts the closed Apps wire bridge after final discovery activated Apps.

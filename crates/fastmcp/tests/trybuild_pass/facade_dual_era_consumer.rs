@@ -291,6 +291,35 @@ where
     > = auto::Client::mcp_apps_wire_host::<T>;
 }
 
+#[tool(ui(resource_uri = "ui://apps.example.test/weather", visibility = ["model", "app"]))]
+fn facade_apps_ui_macro_tool() -> String {
+    "weather".to_owned()
+}
+
+fn assert_mcp_apps_host_forwarders<T, P>()
+where
+    T: modern::McpAppsBridgeTransport,
+    P: modern::McpAppsHostPolicy,
+{
+    let _: Option<modern::McpAppsInMemoryHostTransport> = None;
+    let _: Option<modern::McpAppsInMemoryViewTransport> = None;
+    let _: for<'client> fn(
+        &'client modern::Client,
+        T,
+        modern::McpAppsHostConfiguration,
+        P,
+    ) -> Result<modern::McpAppsHost<T, P>, modern::McpAppsHostError> =
+        modern::Client::mcp_apps_host::<T, P>;
+    let _: for<'client> fn(
+        &'client modern::HttpClient,
+        T,
+        modern::McpAppsHostConfiguration,
+        P,
+    ) -> Result<modern::McpAppsHost<T, P>, modern::McpAppsHostError> =
+        modern::HttpClient::mcp_apps_host::<T, P>;
+    let _ = <FacadeAppsUiMacroTool as ToolHandler>::final_metadata(&FacadeAppsUiMacroTool);
+}
+
 fn assert_final_resource_read_cache_hint_provenance() {
     let _: fastmcp_rust::FinalResourceReadCacheHintProvenance =
         fastmcp_rust::FinalResourceReadCacheHintProvenance::RouterPolicy;

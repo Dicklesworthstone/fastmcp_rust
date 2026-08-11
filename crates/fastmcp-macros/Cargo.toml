@@ -16,6 +16,10 @@ categories = ["development-tools::procedural-macro-helpers"]
 proc-macro = true
 
 [features]
+# This enables Apps types for the proc-macro host. Direct subcrate consumers
+# must also enable `fastmcp-protocol/apps` for their target dependency because
+# Cargo does not unify proc-macro host features with target features.
+apps = ["fastmcp-protocol/apps"]
 tasks = []
 
 [dependencies]

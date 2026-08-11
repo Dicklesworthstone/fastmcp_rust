@@ -10540,14 +10540,8 @@ mod tests {
         #[test]
         fn cli_legacy_feature_keeps_auto_as_the_public_default() {
             assert_eq!(CliProtocolPolicy::default(), CliProtocolPolicy::Auto);
-            assert_eq!(
-                validate_cli_protocol_policy(CliProtocolPolicy::Auto),
-                Ok(())
-            );
-            assert_eq!(
-                validate_cli_protocol_policy(CliProtocolPolicy::LegacyOnly),
-                Ok(())
-            );
+            assert!(validate_cli_protocol_policy(CliProtocolPolicy::Auto).is_ok());
+            assert!(validate_cli_protocol_policy(CliProtocolPolicy::LegacyOnly).is_ok());
         }
 
         #[cfg(not(feature = "legacy-2024-11-05"))]

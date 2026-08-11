@@ -151,6 +151,38 @@ mod facade_only_macro_compile_proofs {
     }
 }
 
+/// An Apps UI declaration belongs only to the final catalog projection.  The
+/// legacy tool definition remains its exact legacy shape even when the Apps
+/// facade feature is selected.
+#[cfg(feature = "apps")]
+#[tool(ui(resource_uri = "ui://apps.example.test/weather", visibility = ["model", "app"]))]
+fn facade_apps_ui_metadata_tool() -> String {
+    "weather".to_owned()
+}
+
+#[cfg(feature = "apps")]
+#[test]
+fn tool_apps_ui_metadata_is_final_only() {
+    let handler = FacadeAppsUiMetadataTool;
+    let metadata = handler
+        .final_metadata()
+        .expect("the Apps UI macro emits final tool metadata");
+    assert_eq!(
+        metadata.get("ui"),
+        Some(&json!({
+            "resourceUri": "ui://apps.example.test/weather",
+            "visibility": ["model", "app"],
+        }))
+    );
+
+    let legacy_tool = fastmcp_rust::serde_json::to_value(handler.definition())
+        .expect("the legacy tool definition serializes");
+    assert!(
+        legacy_tool.get("_meta").is_none(),
+        "Apps metadata must not be projected onto the exact legacy tool definition"
+    );
+}
+
 #[test]
 fn facade_only_dual_era_apps_and_subscription_surfaces_compile() {
     use fastmcp_rust::{
