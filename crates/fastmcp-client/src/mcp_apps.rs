@@ -1343,12 +1343,18 @@ pub(crate) fn project_reused_core_result(
             McpAppsRoutedMethod::ToolsCall,
             CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }),
         ) => serde_json::to_value(&result.payload),
+        #[cfg(feature = "tasks")]
         (
             McpAppsRoutedMethod::ToolsCall,
-            CoreResult::Final(
-                FinalCoreResult::ToolsCallTask { .. }
-                | FinalCoreResult::ToolsCallInputRequired { .. },
-            ),
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }),
+        ) => {
+            return Err(McpError::invalid_request(
+                "MCP Apps bridge does not support Tasks or input-required results",
+            ));
+        }
+        (
+            McpAppsRoutedMethod::ToolsCall,
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { .. }),
         )
         | (
             McpAppsRoutedMethod::ResourcesRead,
