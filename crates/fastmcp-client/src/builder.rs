@@ -47,7 +47,8 @@ use crate::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
     ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
-    combine_operation_with_cleanup, is_cleanup_unverified, resolve_stdio_command,
+    combine_operation_and_cleanup, combine_operation_with_cleanup, is_cleanup_unverified,
+    resolve_stdio_command,
     validate_protocol_plan_feature,
 };
 
