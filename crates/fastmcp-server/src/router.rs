@@ -10,6 +10,7 @@ use std::time::Duration;
 #[cfg(feature = "tasks")]
 use crate::FinalTaskRuntime;
 use crate::Session;
+use crate::auth::AuthRequest;
 use crate::bidirectional::{
     MrtrCompletedInputs, MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest,
     MrtrInputRequests, MrtrInputRequired, MrtrRetry,
@@ -25,6 +26,7 @@ use crate::handler::{
 };
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 use crate::proxy::ProxyFinalTaskRelay;
+use crate::session::SessionPrincipalBinding;
 #[cfg(test)]
 use asupersync::time::wall_now;
 use asupersync::types::Time;
@@ -50,17 +52,17 @@ use fastmcp_protocol::{
     AdmittedSchema, CacheScope, CacheTtl, CallToolParams, CallToolResult, CompleteResult, Content,
     CoreRequest, CoreResult, FinalCallToolParams, FinalCallToolResult, FinalCompletionParams,
     FinalCompletionReference, FinalCompletionResult, FinalCoreRequest, FinalCoreResult,
-    FinalGetPromptParams, FinalGetPromptResult, FinalListParams, FinalListPromptsResult,
-    FinalListResourceTemplatesResult, FinalListResourcesResult, FinalListToolsResult, FinalPrompt,
-    FinalPromptArgument, FinalReadResourceParams, FinalReadResourceResult, FinalResource,
-    FinalResourceTemplate, FinalTool, FinalToolAnnotations, GetPromptParams, GetPromptResult,
-    InitializeParams, InitializeResult, InputRequiredResult, JsonRpcRequest,
-    LegacyCompletionParams, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
-    LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
-    ListResourceTemplatesParams, ListResourceTemplatesResult, ListResourcesParams,
-    ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION, ProgressMarker,
-    Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource, ResourceContent,
-    ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, TemplateValue, Tool,
+    FinalGetPromptParams, FinalGetPromptResult, FinalInputResponses, FinalListParams,
+    FinalListPromptsResult, FinalListResourceTemplatesResult, FinalListResourcesResult,
+    FinalListToolsResult, FinalPrompt, FinalPromptArgument, FinalReadResourceParams,
+    FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, FinalToolAnnotations,
+    GetPromptParams, GetPromptResult, InitializeParams, InitializeResult, InputRequiredResult,
+    JsonRpcRequest, LegacyCompletionParams, LegacyCompletionResult, LegacyContent,
+    LegacyCoreRequest, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
+    ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
+    ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
+    ProgressMarker, Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
+    ResourceContent, ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, TemplateValue, Tool,
     admit_final_schema, exact_json_to_serde, validate, validate_strict,
 };
 
@@ -90,12 +92,43 @@ pub enum InboundRequestTransport {
     Memory,
 }
 
+/// Opaque custody for one transport's singleton `Authorization` field.
+///
+/// This deliberately has no `Debug` implementation and no raw-value getter.
+/// Only server admission can convert it into an [`AuthRequest`], so extension
+/// middleware and handlers cannot observe a native transport credential.
+#[derive(Clone, Default)]
+pub(crate) struct TransportAuthorization(Option<String>);
+
+impl TransportAuthorization {
+    /// Captures an already cardinality-validated native authorization field.
+    #[must_use]
+    pub(crate) fn from_singleton_header(value: Option<&str>) -> Self {
+        Self(value.map(ToOwned::to_owned))
+    }
+
+    pub(crate) fn auth_request<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<&'a serde_json::Value>,
+        request_id: u64,
+    ) -> AuthRequest<'a> {
+        AuthRequest {
+            method,
+            params,
+            transport_authorization: self.0.as_deref(),
+            request_id,
+        }
+    }
+}
+
 /// Sanitized, immutable ingress facts for one server dispatch.
 ///
 /// The type intentionally has no `Clone`, `Serialize`, or `Debug`
 /// implementation. In particular, it offers no channel for raw headers or
-/// credentials: a transport must authenticate privately and construct this
-/// context from its allowlisted provenance only. The server creates a fresh
+/// credentials. A native transport may retain its singleton authorization
+/// field in crate-private custody for server admission, but it never exposes
+/// that field through this public context. The server creates a fresh
 /// request-scoped [`McpContext`] from these facts for every dispatch.
 pub struct InboundRequestContext {
     cx: Cx,
@@ -103,11 +136,13 @@ pub struct InboundRequestContext {
     transport: InboundRequestTransport,
     state: Option<SessionState>,
     mrtr_continuation_cancellation: Option<fastmcp_core::McpRequestCancellation>,
+    transport_authorization: TransportAuthorization,
+    principal_binding: Option<SessionPrincipalBinding>,
 }
 
 impl InboundRequestContext {
-    /// Creates sanitized facts after transport-owned authentication and request
-    /// metadata validation have completed.
+    /// Creates sanitized facts after transport metadata validation has
+    /// completed.
     #[must_use]
     pub fn new(cx: Cx, request_id: u64, transport: InboundRequestTransport) -> Self {
         Self {
@@ -116,6 +151,8 @@ impl InboundRequestContext {
             transport,
             state: None,
             mrtr_continuation_cancellation: None,
+            transport_authorization: TransportAuthorization::default(),
+            principal_binding: None,
         }
     }
 
@@ -130,11 +167,31 @@ impl InboundRequestContext {
         transport: InboundRequestTransport,
         connection: &ModernConnection,
     ) -> Self {
+        Self::with_modern_connection_and_transport_authorization(
+            cx,
+            request_id,
+            transport,
+            connection,
+            TransportAuthorization::default(),
+        )
+    }
+
+    /// Creates sanitized modern connection facts while retaining the native
+    /// authorization field solely for server admission.
+    #[must_use]
+    pub(crate) fn with_modern_connection_and_transport_authorization(
+        cx: Cx,
+        request_id: u64,
+        transport: InboundRequestTransport,
+        connection: &ModernConnection,
+        transport_authorization: TransportAuthorization,
+    ) -> Self {
         Self::with_modern_connection_context(
             cx,
             request_id,
             transport,
             &connection.request_context(),
+            transport_authorization,
         )
     }
 
@@ -144,6 +201,7 @@ impl InboundRequestContext {
         request_id: u64,
         transport: InboundRequestTransport,
         connection: &ModernConnectionRequestContext,
+        transport_authorization: TransportAuthorization,
     ) -> Self {
         Self {
             cx,
@@ -151,6 +209,8 @@ impl InboundRequestContext {
             transport,
             state: Some(connection.state.clone()),
             mrtr_continuation_cancellation: Some(connection.continuation_cancellation.clone()),
+            transport_authorization,
+            principal_binding: Some(connection.principal_binding.clone()),
         }
     }
 
@@ -179,6 +239,21 @@ impl InboundRequestContext {
         self.mrtr_continuation_cancellation.clone()
     }
 
+    pub(crate) fn auth_request<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<&'a serde_json::Value>,
+    ) -> AuthRequest<'a> {
+        self.transport_authorization
+            .auth_request(method, params, self.request_id)
+    }
+
+    pub(crate) fn bind_or_verify_principal(&self, fingerprint: fastmcp_core::Sha256Digest) -> bool {
+        self.principal_binding
+            .as_ref()
+            .is_none_or(|binding| binding.bind_or_verify(fingerprint))
+    }
+
     pub(crate) fn with_cx(mut self, cx: Cx) -> Self {
         self.cx = cx;
         self
@@ -195,12 +270,14 @@ impl InboundRequestContext {
 pub(crate) struct ModernConnection {
     state: SessionState,
     continuation_cancellation: fastmcp_core::McpRequestCancellation,
+    principal_binding: SessionPrincipalBinding,
 }
 
 #[derive(Clone)]
 pub(crate) struct ModernConnectionRequestContext {
     state: SessionState,
     continuation_cancellation: fastmcp_core::McpRequestCancellation,
+    principal_binding: SessionPrincipalBinding,
 }
 
 impl ModernConnection {
@@ -208,6 +285,7 @@ impl ModernConnection {
         Self {
             state: SessionState::new(),
             continuation_cancellation: fastmcp_core::McpRequestCancellation::new(),
+            principal_binding: SessionPrincipalBinding::default(),
         }
     }
 
@@ -219,6 +297,7 @@ impl ModernConnection {
         ModernConnectionRequestContext {
             state: self.state.clone(),
             continuation_cancellation: self.continuation_cancellation.clone(),
+            principal_binding: self.principal_binding.clone(),
         }
     }
 }
@@ -3988,7 +4067,7 @@ impl Router {
     fn resolve_final_mrtr_retry(
         &self,
         request_state: Option<&str>,
-        input_responses: Option<&BTreeMap<String, serde_json::Value>>,
+        input_responses: Option<&FinalInputResponses>,
         binding: Option<&MrtrExchangeBinding>,
     ) -> McpResult<FinalMrtrDispatch> {
         match (request_state, input_responses) {
@@ -4011,10 +4090,27 @@ impl Router {
                 let binding = binding.ok_or_else(|| {
                     McpError::invalid_params("MRTR retries require session state")
                 })?;
+                // The protocol decoder has already retained wire order and
+                // rejected duplicate keys. The registry's existing semantic
+                // boundary is keyed lookup, so materialize each typed value
+                // only here without changing any key/value correlation.
+                let input_responses = input_responses
+                    .entries()
+                    .iter()
+                    .map(|(key, response)| {
+                        serde_json::to_value(response)
+                            .map(|response| (key.clone(), response))
+                            .map_err(|_| {
+                                McpError::internal_error(
+                                    "final MRTR response could not be encoded for registry admission",
+                                )
+                            })
+                    })
+                    .collect::<McpResult<BTreeMap<_, _>>>()?;
                 match self.mrtr_exchanges.accept_wire_bound(
                     request_state,
                     binding,
-                    input_responses,
+                    &input_responses,
                 )? {
                     MrtrRetry::Complete(inputs) => Ok(FinalMrtrDispatch::Resume(inputs)),
                     MrtrRetry::InputRequired(result) => encode_mrtr_input_required_result(result)

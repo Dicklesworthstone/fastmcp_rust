@@ -796,13 +796,13 @@ where
                 .and_then(Value::as_object)
                 .and_then(|params| params.get("uri"))
                 .and_then(Value::as_str)
-                .is_some_and(|_| {
+                .is_some_and(|uri| {
                     self.config
                         .capabilities
                         .resources
                         .as_ref()
                         .is_some_and(|resources| resources.subscribe)
-                        && !self.subscriptions.is_empty()
+                        && self.subscriptions.contains(uri)
                 }),
             NOTIFICATIONS_TOOLS_LIST_CHANGED => self
                 .config
@@ -1703,6 +1703,52 @@ mod tests {
             panic!("invalid initialize request must receive a JSON-RPC error response");
         };
         assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(adapter.snapshot(), before);
+        assert!(adapter.handler.methods.is_empty());
+    }
+
+    #[test]
+    fn resource_update_notification_requires_the_exact_subscribed_uri() {
+        let binding = binding();
+        let subscribed_uri = "file:///workspace/subscribed";
+        let mut adapter = adapter();
+        initialize_operating(&mut adapter);
+        assert_eq!(
+            adapter.receive(
+                binding,
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": RESOURCES_SUBSCRIBE,
+                    "params": {"uri": subscribed_uri},
+                }),
+            ),
+            Ok(Legacy2024Outbound::Response(
+                json!({"jsonrpc": "2.0", "id": 2, "result": {}})
+            ))
+        );
+        let before = adapter.snapshot();
+
+        assert_eq!(
+            adapter.make_notification(
+                binding,
+                NOTIFICATIONS_RESOURCES_UPDATED,
+                Some(json!({"uri": subscribed_uri})),
+            ),
+            Ok(Legacy2024Outbound::ReverseNotification(json!({
+                "jsonrpc": "2.0",
+                "method": NOTIFICATIONS_RESOURCES_UPDATED,
+                "params": {"uri": subscribed_uri},
+            })))
+        );
+        assert_eq!(adapter.snapshot(), before);
+
+        let error = adapter
+            .make_notification(
+                binding,
+                NOTIFICATIONS_RESOURCES_UPDATED,
+                Some(json!({"uri": "file:///workspace/not-subscribed"})),
+            )
+            .expect_err("changing only the URI must not notify an unsubscribed resource");
+        assert_eq!(error.code().as_i32(), Some(-32600));
         assert_eq!(adapter.snapshot(), before);
         assert!(adapter.handler.methods.is_empty());
     }

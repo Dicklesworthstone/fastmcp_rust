@@ -100,12 +100,12 @@ pub use extensions::{
 };
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
 pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
-/// Experimental caller-upgraded server-side WebSocket adapter.
+/// Cancellation-aware server-side WebSocket message adapter.
 ///
-/// This feature-gated re-export accepts only a caller-owned, already-upgraded
-/// asupersync async byte stream. FastMCP does not expose a WebSocket listener,
-/// HTTP Upgrade path, or URI connector.
-#[cfg(feature = "websocket-experimental")]
+/// [`BoundWebSocketServer`] owns the listener and HTTP Upgrade boundary; this
+/// lower-level adapter remains available for embedders that already own an
+/// upgraded asupersync byte stream.
+#[cfg(feature = "websocket")]
 pub use fastmcp_transport::websocket::AsyncWsServerTransport;
 pub use handler::{
     BidirectionalSenders, BoxFuture, CompletionHandler, FinalMethodOutcome,
@@ -129,7 +129,7 @@ pub use router::{
     InboundRequestContext, InboundRequestTransport, MountResult, NotificationSender, Router,
     TagFilters,
 };
-use router::{ModernConnection, RouterResourceReader, RouterToolCaller};
+use router::{ModernConnection, RouterResourceReader, RouterToolCaller, TransportAuthorization};
 pub use session::Session;
 use session::{
     InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SessionPrincipalBinding,
@@ -163,8 +163,14 @@ use std::future::Future;
 use std::io::Read;
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "websocket")]
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "websocket")]
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Once};
+#[cfg(feature = "websocket")]
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -462,6 +468,8 @@ use crate::http_admission::{
 
 use asupersync::codec::Framed;
 use asupersync::http::h1::{Http1Codec, Method as Http1Method, Response as Http1Response};
+#[cfg(feature = "websocket")]
+use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
@@ -5761,6 +5769,478 @@ impl BoundHttpServer {
     }
 }
 
+// The WebSocket adapter owns one read/write object, while the established
+// dual-era server dispatcher owns independent synchronous receive and send
+// halves. Keep their bridge bounded in both directions; this preserves the
+// dispatcher's mature cancellation and reverse-request semantics without
+// giving a slow socket an unbounded in-memory queue.
+#[cfg(feature = "websocket")]
+const WEBSOCKET_BRIDGE_QUEUE_CAPACITY: usize = 64;
+#[cfg(feature = "websocket")]
+const WEBSOCKET_HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
+#[cfg(feature = "websocket")]
+const WEBSOCKET_DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+#[cfg(feature = "websocket")]
+const WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A bound, caller-owned WebSocket listener.
+///
+/// Each accepted connection completes HTTP Upgrade before it enters a bounded
+/// bridge to the same split dual-era dispatcher used by stdio. Consequently
+/// its protocol-era decision, session, active-request registry, cancellation
+/// routing, and server-to-client requests are all connection scoped.
+#[cfg(feature = "websocket")]
+pub struct BoundWebSocketServer {
+    listener: AsyncTcpListener,
+    server: Arc<Server>,
+    path: String,
+}
+
+/// Result of a WebSocket listener shutdown.
+#[cfg(feature = "websocket")]
+#[must_use = "a nonquiescent WebSocket shutdown retains connection children that must be settled"]
+pub enum WebSocketServerShutdown {
+    /// The listener stopped and every accepted socket task joined.
+    Quiescent,
+    /// The listener stopped, but the caller retains explicit connection work.
+    Nonquiescent(WebSocketNonquiescentShutdown),
+}
+
+/// Caller-owned WebSocket connection work that outlived bounded shutdown.
+#[cfg(feature = "websocket")]
+#[must_use = "settle retained WebSocket connection children before discarding this outcome"]
+pub struct WebSocketNonquiescentShutdown {
+    children: Vec<asupersync::runtime::TaskHandle<()>>,
+    listener_error: Option<McpError>,
+}
+
+#[cfg(feature = "websocket")]
+impl WebSocketNonquiescentShutdown {
+    /// Number of accepted connections that still require caller-owned settlement.
+    #[must_use]
+    pub const fn remaining_connections(&self) -> usize {
+        self.children.len()
+    }
+
+    /// Returns the listener failure that ended acceptance, when one occurred.
+    #[must_use]
+    pub fn listener_error(&self) -> Option<&McpError> {
+        self.listener_error.as_ref()
+    }
+
+    /// Observes retained children for at most `timeout`, without detaching them.
+    pub async fn settle_for(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !self.children.is_empty() && Instant::now() < deadline {
+            reap_websocket_connection_children(&mut self.children);
+            if !self.children.is_empty() {
+                asupersync::runtime::yield_now().await;
+            }
+        }
+        self.children.is_empty()
+    }
+
+    /// Joins every retained connection in the caller's context.
+    pub async fn settle(mut self, cx: &Cx) -> McpResult<()> {
+        for child in &mut self.children {
+            child.join(cx).await.map_err(|error| {
+                McpError::internal_error(format!(
+                    "WebSocket connection child ended without a final status: {error}"
+                ))
+            })?;
+        }
+        if let Some(error) = self.listener_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl BoundWebSocketServer {
+    /// Returns the address selected by the operating system for this listener.
+    pub fn local_addr(&self) -> McpResult<SocketAddr> {
+        self.listener.local_addr().map_err(|error| {
+            McpError::internal_error(format!("WebSocket listener address unavailable: {error}"))
+        })
+    }
+
+    /// Serves HTTP Upgrade and WebSocket MCP connections until `cx` is cancelled.
+    pub async fn serve(self, cx: &Cx) -> McpResult<WebSocketServerShutdown> {
+        self.server.init_rich_logging();
+        if let Some(stats) = &self.server.stats {
+            stats.connection_opened();
+        }
+        if !self.server.run_startup_hook() {
+            self.server.graceful_shutdown_returning();
+            return Err(McpError::internal_error(
+                "WebSocket server startup hook failed",
+            ));
+        }
+
+        let connection_scope = cx.scope();
+        let mut children = Vec::new();
+        let accept_result = loop {
+            reap_websocket_connection_children(&mut children);
+            if cx.checkpoint().is_err() {
+                break Ok(());
+            }
+            let (stream, _) = match self.listener.accept().await {
+                Ok(connection) => connection,
+                Err(_) if cx.checkpoint().is_err() => break Ok(()),
+                Err(error) => {
+                    break Err(McpError::internal_error(format!(
+                        "WebSocket listener accept failed: {error}"
+                    )));
+                }
+            };
+            let server = Arc::clone(&self.server);
+            let path = self.path.clone();
+            match cx.spawn_in(&connection_scope, move |connection_cx| async move {
+                if let Err(error) =
+                    serve_websocket_connection(&connection_cx, stream, server, &path).await
+                {
+                    debug!(target: targets::TRANSPORT, "WebSocket connection closed: {error}");
+                }
+            }) {
+                Ok(child) => children.push(child),
+                Err(error) => {
+                    break Err(McpError::internal_error(format!(
+                        "WebSocket connection task admission failed: {error}"
+                    )));
+                }
+            }
+        };
+
+        self.server
+            .cancel_active_requests(CancelKind::Shutdown, false);
+        for child in &mut children {
+            child.abort();
+        }
+        let deadline = Instant::now() + WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT;
+        while !children.is_empty() && Instant::now() < deadline {
+            reap_websocket_connection_children(&mut children);
+            if !children.is_empty() {
+                asupersync::runtime::yield_now().await;
+            }
+        }
+        self.server.graceful_shutdown_returning();
+
+        if children.is_empty() {
+            accept_result?;
+            Ok(WebSocketServerShutdown::Quiescent)
+        } else {
+            Ok(WebSocketServerShutdown::Nonquiescent(
+                WebSocketNonquiescentShutdown {
+                    children,
+                    listener_error: accept_result.err(),
+                },
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn reap_websocket_connection_children(children: &mut Vec<asupersync::runtime::TaskHandle<()>>) {
+    let mut active = Vec::with_capacity(children.len());
+    for mut child in std::mem::take(children) {
+        match child.try_join() {
+            Ok(None) => active.push(child),
+            Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+            Err(error) => {
+                debug!(target: targets::TRANSPORT, "WebSocket connection child failed: {error}")
+            }
+        }
+    }
+    *children = active;
+}
+
+#[cfg(feature = "websocket")]
+struct PrefixedWebSocketStream {
+    prefix: Vec<u8>,
+    stream: AsyncTcpStream,
+}
+
+#[cfg(feature = "websocket")]
+impl AsyncRead for PrefixedWebSocketStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        task_cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if !self.prefix.is_empty() {
+            let count = self.prefix.len().min(buffer.unfilled().len());
+            buffer.put_slice(&self.prefix[..count]);
+            self.prefix.drain(..count);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.stream).poll_read(task_cx, buffer)
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl AsyncWrite for PrefixedWebSocketStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        task_cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(task_cx, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        task_cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(task_cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        task_cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(task_cx)
+    }
+}
+
+#[cfg(feature = "websocket")]
+struct WebSocketBridgeRecv {
+    receiver: Receiver<JsonRpcMessage>,
+}
+
+#[cfg(feature = "websocket")]
+impl TransportRecvHalf for WebSocketBridgeRecv {
+    fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
+        self.receiver.recv().map_err(|_| TransportError::Closed)
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "websocket")]
+struct WebSocketBridgeSend {
+    sender: SyncSender<JsonRpcMessage>,
+}
+
+#[cfg(feature = "websocket")]
+impl TransportSendHalf for WebSocketBridgeSend {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
+        self.sender
+            .try_send(message.clone())
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    TransportError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+                TrySendError::Disconnected(_) => TransportError::Closed,
+            })
+    }
+
+    fn close(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "websocket")]
+async fn serve_websocket_connection(
+    cx: &Cx,
+    mut stream: AsyncTcpStream,
+    server: Arc<Server>,
+    expected_path: &str,
+) -> McpResult<()> {
+    let (request, trailing) = read_websocket_handshake(cx, &mut stream).await?;
+    let path = request
+        .path
+        .split_once('?')
+        .map_or(request.path.as_str(), |(path, _)| path);
+    if path != expected_path {
+        stream
+            .write_all(&asupersync::net::websocket::ServerHandshake::reject(
+                404,
+                "Not Found",
+            ))
+            .await
+            .map_err(|_| {
+                McpError::internal_error("WebSocket route rejection could not be written")
+            })?;
+        return Ok(());
+    }
+    let response = match asupersync::net::websocket::ServerHandshake::new().accept(&request) {
+        Ok(response) => response,
+        Err(_) => {
+            stream
+                .write_all(&asupersync::net::websocket::ServerHandshake::reject(
+                    400,
+                    "Bad Request",
+                ))
+                .await
+                .map_err(|_| {
+                    McpError::internal_error("WebSocket handshake rejection could not be written")
+                })?;
+            return Ok(());
+        }
+    };
+    stream
+        .write_all(&response.response_bytes())
+        .await
+        .map_err(|_| McpError::internal_error("WebSocket upgrade response could not be written"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|_| McpError::internal_error("WebSocket upgrade response could not be flushed"))?;
+
+    let transport = AsyncWsServerTransport::from_upgraded(PrefixedWebSocketStream {
+        prefix: trailing,
+        stream,
+    });
+    run_websocket_dispatch_bridge(cx, server, transport).await
+}
+
+#[cfg(feature = "websocket")]
+async fn read_websocket_handshake(
+    cx: &Cx,
+    stream: &mut AsyncTcpStream,
+) -> McpResult<(asupersync::net::websocket::HttpRequest, Vec<u8>)> {
+    let mut bytes = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        cx.checkpoint()
+            .map_err(|_| McpError::internal_error("WebSocket handshake cancelled"))?;
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|_| McpError::invalid_request("WebSocket handshake could not be read"))?;
+        if read == 0 {
+            return Err(McpError::invalid_request(
+                "WebSocket handshake ended before completion",
+            ));
+        }
+        if bytes
+            .len()
+            .checked_add(read)
+            .is_none_or(|length| length > WEBSOCKET_HANDSHAKE_MAX_BYTES)
+        {
+            return Err(McpError::invalid_request(
+                "WebSocket handshake headers exceed the limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        match asupersync::net::websocket::HttpRequest::parse_with_trailing(&bytes) {
+            Ok((request, trailing)) => return Ok((request, trailing.to_vec())),
+            Err(_) if !bytes.windows(4).any(|window| window == b"\r\n\r\n") => {}
+            Err(_) => return Err(McpError::invalid_request("WebSocket handshake is invalid")),
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+async fn run_websocket_dispatch_bridge(
+    cx: &Cx,
+    server: Arc<Server>,
+    mut transport: AsyncWsServerTransport<PrefixedWebSocketStream>,
+) -> McpResult<()> {
+    let (incoming_sender, incoming_receiver) = sync_channel(WEBSOCKET_BRIDGE_QUEUE_CAPACITY);
+    let (outgoing_sender, outgoing_receiver) = sync_channel(WEBSOCKET_BRIDGE_QUEUE_CAPACITY);
+    let dispatch_cx = cx.clone();
+    let mut dispatcher = cx
+        .spawn_blocking(move |pump_cx| {
+            server.run_split_transport_returning_shared_with_dispatch_cx(
+                &pump_cx,
+                &dispatch_cx,
+                WebSocketBridgeRecv {
+                    receiver: incoming_receiver,
+                },
+                WebSocketBridgeSend {
+                    sender: outgoing_sender,
+                },
+            )
+        })
+        .map_err(|error| {
+            McpError::internal_error(format!("WebSocket dispatch admission failed: {error}"))
+        })?;
+
+    let driver_result = loop {
+        while let Ok(message) = outgoing_receiver.try_recv() {
+            transport.send(cx, &message).await.map_err(|_| {
+                McpError::internal_error("WebSocket response could not be committed")
+            })?;
+        }
+        if cx.checkpoint().is_err() {
+            break Ok(());
+        }
+        let deadline = cx.now().saturating_add(WEBSOCKET_DRIVER_POLL_INTERVAL);
+        match asupersync::time::timeout_at(deadline, transport.recv(cx)).await {
+            Ok(Ok(message)) => match incoming_sender.try_send(message) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    break Err(McpError::internal_error("WebSocket ingress queue is full"));
+                }
+                Err(TrySendError::Disconnected(_)) => break Ok(()),
+            },
+            Ok(Err(TransportError::Closed)) | Ok(Err(TransportError::Cancelled)) => break Ok(()),
+            Ok(Err(_)) => break Err(McpError::invalid_request("WebSocket frame was rejected")),
+            Err(_) => {}
+        }
+    };
+    drop(incoming_sender);
+    let _ = transport.close(cx).await;
+    let dispatch_result = dispatcher.join(cx).await.map_err(|error| {
+        McpError::internal_error(format!("WebSocket dispatch worker failed: {error}"))
+    })?;
+    match (driver_result, dispatch_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(driver), Err(dispatch)) => Err(combined_run_and_close_error(driver, dispatch)),
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl Server {
+    /// Binds a turnkey WebSocket MCP listener on the caller-owned context.
+    ///
+    /// The upgrade route is the configured [`HttpServerConfig`] MCP path, so
+    /// one server configuration cannot accidentally expose different HTTP and
+    /// WebSocket entry points. This method only binds; call
+    /// [`BoundWebSocketServer::serve`] to accept connections.
+    pub async fn bind_websocket(
+        self,
+        cx: &Cx,
+        addr: impl Into<String>,
+    ) -> McpResult<BoundWebSocketServer> {
+        cx.checkpoint()
+            .map_err(|_| McpError::internal_error("WebSocket bind was cancelled"))?;
+        let listener = AsyncTcpListener::bind(addr.into()).await.map_err(|error| {
+            McpError::internal_error(format!("WebSocket listener bind failed: {error}"))
+        })?;
+        Ok(BoundWebSocketServer {
+            listener,
+            path: self.http_config.handler_config.base_path.clone(),
+            server: Arc::new(self),
+        })
+    }
+
+    /// Binds and serves a turnkey WebSocket MCP bridge until `cx` is cancelled.
+    pub async fn serve_websocket(
+        self,
+        cx: &Cx,
+        addr: impl Into<String>,
+    ) -> McpResult<WebSocketServerShutdown> {
+        self.bind_websocket(cx, addr).await?.serve(cx).await
+    }
+
+    /// Alias for [`Self::serve_websocket`] for callers that use `run_*` APIs.
+    pub async fn run_websocket(
+        self,
+        cx: &Cx,
+        addr: impl Into<String>,
+    ) -> McpResult<WebSocketServerShutdown> {
+        self.serve_websocket(cx, addr).await
+    }
+}
+
 impl Server {
     /// Consumes this server into a live HTTP endpoint.
     ///
@@ -6026,6 +6506,23 @@ impl ServerHttpSession {
         request: HttpRequest,
         modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        let transport_authorization =
+            TransportAuthorization::from_singleton_header(request.header("authorization"));
+        self.handle_with_modern_request_cancellation_and_transport_authorization(
+            cx,
+            request,
+            transport_authorization,
+            modern_request_cancellation,
+        )
+    }
+
+    fn handle_with_modern_request_cancellation_and_transport_authorization(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+        transport_authorization: TransportAuthorization,
+        modern_request_cancellation: Option<McpRequestCancellation>,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         self.reap_modern_dispatches();
         let mut request = request;
         if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
@@ -6149,7 +6646,12 @@ impl ServerHttpSession {
             self.selected_era.get_or_insert(ProtocolEra::Legacy2024);
         }
         if is_modern {
-            return self.handle_modern(cx, endpoint_response, modern_request_cancellation);
+            return self.handle_modern(
+                cx,
+                endpoint_response,
+                transport_authorization,
+                modern_request_cancellation,
+            );
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         return self.handle_legacy(cx, endpoint_response);
@@ -6390,6 +6892,7 @@ impl ServerHttpSession {
         &mut self,
         cx: &Cx,
         endpoint_response: DualEraHttpEndpointResponse,
+        transport_authorization: TransportAuthorization,
         modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         let request = self
@@ -6417,11 +6920,12 @@ impl ServerHttpSession {
             let request_cancellation = sender.request_cancellation();
             let owner_generation = next_modern_http_stream_generation();
             let terminal_delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
-            let inbound = InboundRequestContext::with_modern_connection(
+            let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                 cx.clone(),
                 request_id_to_u64(request.id.as_ref()),
                 InboundRequestTransport::Http,
                 &self.modern_connection,
+                transport_authorization,
             );
             let dispatch = spawn_modern_sse_dispatch(
                 cx,
@@ -6446,11 +6950,12 @@ impl ServerHttpSession {
             ));
         }
 
-        let inbound = InboundRequestContext::with_modern_connection(
+        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
             cx.clone(),
             request_id_to_u64(request.id.as_ref()),
             InboundRequestTransport::Http,
             &self.modern_connection,
+            transport_authorization,
         );
 
         match endpoint_response {
@@ -6640,6 +7145,7 @@ impl ServerHttpSession {
         &mut self,
         cx: &Cx,
         request: HttpRequest,
+        transport_authorization: TransportAuthorization,
     ) -> Result<
         Result<(JsonRpcRequest, DualEraHttpSseResponse), ServerHttpEndpointResponse>,
         DualEraHttpEndpointError,
@@ -6675,7 +7181,9 @@ impl ServerHttpSession {
             Err(error) => return Err(error),
         };
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
-            return self.handle_modern(cx, endpoint_response, None).map(Err);
+            return self
+                .handle_modern(cx, endpoint_response, transport_authorization, None)
+                .map(Err);
         };
         let request = self
             .endpoint_session
@@ -6959,6 +7467,21 @@ fn h1_request_to_transport(
         }
     }
     Ok(transport)
+}
+
+/// Captures exactly one native `Authorization` field before the H1 request is
+/// decoded into the transport representation. Duplicate fields remain absent
+/// from custody and are rejected by the cardinality-preserving conversion.
+fn h1_transport_authorization(request: &asupersync::http::h1::Request) -> TransportAuthorization {
+    let mut singleton = None;
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            if singleton.replace(value.as_str()).is_some() {
+                return TransportAuthorization::default();
+            }
+        }
+    }
+    TransportAuthorization::from_singleton_header(singleton)
 }
 
 fn h1_response(mut response: HttpResponse) -> Http1Response {
@@ -7780,7 +8303,16 @@ fn dispatch_modern_http_request(
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
 ) -> HttpResponse {
-    dispatch_modern_http_request_with_cancellation(cx, endpoint, modern_sessions, request, None)
+    let transport_authorization =
+        TransportAuthorization::from_singleton_header(request.header("authorization"));
+    dispatch_modern_http_request_with_cancellation_and_transport_authorization(
+        cx,
+        endpoint,
+        modern_sessions,
+        request,
+        transport_authorization,
+        None,
+    )
 }
 
 fn dispatch_modern_http_request_with_cancellation(
@@ -7788,6 +8320,26 @@ fn dispatch_modern_http_request_with_cancellation(
     endpoint: &ServerHttpEndpoint,
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
+    request_cancellation: Option<McpRequestCancellation>,
+) -> HttpResponse {
+    let transport_authorization =
+        TransportAuthorization::from_singleton_header(request.header("authorization"));
+    dispatch_modern_http_request_with_cancellation_and_transport_authorization(
+        cx,
+        endpoint,
+        modern_sessions,
+        request,
+        transport_authorization,
+        request_cancellation,
+    )
+}
+
+fn dispatch_modern_http_request_with_cancellation_and_transport_authorization(
+    cx: &Cx,
+    endpoint: &ServerHttpEndpoint,
+    modern_sessions: &LiveModernHttpSessionRegistry,
+    request: HttpRequest,
+    transport_authorization: TransportAuthorization,
     request_cancellation: Option<McpRequestCancellation>,
 ) -> HttpResponse {
     let error_request = request.clone();
@@ -7800,7 +8352,12 @@ fn dispatch_modern_http_request_with_cancellation(
         Err(_) => return HttpResponse::internal_error(),
     };
     session
-        .handle_with_modern_request_cancellation(cx, request, request_cancellation)
+        .handle_with_modern_request_cancellation_and_transport_authorization(
+            cx,
+            request,
+            transport_authorization,
+            request_cancellation,
+        )
         .map_err(ServerHttpEndpointError::from_internal)
         .map(|response| http_endpoint_response_to_static(cx, response))
         .unwrap_or_else(|error| {
@@ -7822,6 +8379,7 @@ async fn serve_modern_json_http_connection(
     endpoint: Arc<ServerHttpEndpoint>,
     modern_sessions: LiveModernHttpSessionRegistry,
     request: HttpRequest,
+    transport_authorization: TransportAuthorization,
 ) {
     let (mut peer_reader, writer) = stream.into_split();
     let request_cancellation = McpRequestCancellation::new();
@@ -7849,11 +8407,12 @@ async fn serve_modern_json_http_connection(
     let request_modern_sessions = Arc::clone(&modern_sessions);
     let dispatch_cancellation = request_cancellation.clone();
     let mut dispatch = match cx.spawn_blocking(move |request_cx| {
-        dispatch_modern_http_request_with_cancellation(
+        dispatch_modern_http_request_with_cancellation_and_transport_authorization(
             &request_cx,
             &request_endpoint,
             &request_modern_sessions,
             request,
+            transport_authorization,
             Some(dispatch_cancellation),
         )
     }) {
@@ -8034,6 +8593,7 @@ async fn serve_http_connection(
         let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
         return;
     }
+    let transport_authorization = h1_transport_authorization(&request);
     let raw_path = request
         .uri
         .split_once('?')
@@ -8083,13 +8643,14 @@ async fn serve_http_connection(
                 .session
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match session.begin_modern_sse(cx, request.clone()) {
+            match session.begin_modern_sse(cx, request.clone(), transport_authorization.clone()) {
                 Ok(Ok((request, response))) => Ok(Ok((
-                    InboundRequestContext::with_modern_connection(
+                    InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
                         request_id_to_u64(request.id.as_ref()),
                         InboundRequestTransport::Http,
                         &session.modern_connection,
+                        transport_authorization.clone(),
                     ),
                     request,
                     response,
@@ -8160,7 +8721,15 @@ async fn serve_http_connection(
         && request.path == endpoint.server.http_config.handler_config.base_path
     {
         let stream = framed.into_inner();
-        serve_modern_json_http_connection(cx, stream, endpoint, modern_sessions, request).await;
+        serve_modern_json_http_connection(
+            cx,
+            stream,
+            endpoint,
+            modern_sessions,
+            request,
+            transport_authorization,
+        )
+        .await;
         return;
     }
     if !is_legacy_sse {
@@ -8290,6 +8859,7 @@ async fn serve_modern_http_connection(
         let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
         return;
     }
+    let transport_authorization = h1_transport_authorization(&request);
     let raw_path = request
         .uri
         .split_once('?')
@@ -8334,13 +8904,14 @@ async fn serve_modern_http_connection(
                 .session
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match session.begin_modern_sse(cx, request.clone()) {
+            match session.begin_modern_sse(cx, request.clone(), transport_authorization.clone()) {
                 Ok(Ok((request, response))) => Ok(Ok((
-                    InboundRequestContext::with_modern_connection(
+                    InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
                         request_id_to_u64(request.id.as_ref()),
                         InboundRequestTransport::Http,
                         &session.modern_connection,
+                        transport_authorization.clone(),
                     ),
                     request,
                     response,
@@ -8412,7 +8983,15 @@ async fn serve_modern_http_connection(
         && request.path == endpoint.server.http_config.handler_config.base_path
     {
         let stream = framed.into_inner();
-        serve_modern_json_http_connection(cx, stream, endpoint, modern_sessions, request).await;
+        serve_modern_json_http_connection(
+            cx,
+            stream,
+            endpoint,
+            modern_sessions,
+            request,
+            transport_authorization,
+        )
+        .await;
         return;
     }
 
@@ -8952,12 +9531,10 @@ impl Server {
 
     /// Processes one modern request through the final dispatch surface.
     ///
-    /// The transport owns raw headers and credentials. It must authenticate and
-    /// validate those private inputs before constructing an
-    /// [`InboundRequestContext`]; this public boundary receives only immutable,
-    /// allowlisted request facts. Each call creates a fresh request authority,
-    /// commits anonymous auth before extension middleware, and delegates only to
-    /// the router's final dispatch surface. It neither reads nor mutates a
+    /// The transport owns raw headers and retains a native authorization field
+    /// only in crate-private inbound custody. Each call creates a fresh request
+    /// authority, authenticates before extension middleware, and delegates only
+    /// to the router's final dispatch surface. It neither reads nor mutates a
     /// legacy [`Session`]. A transport that supplies a connection-bound
     /// [`InboundRequestContext`] also carries its durable MRTR partition and
     /// retained-continuation cancellation authority.
@@ -9054,19 +9631,18 @@ impl Server {
             ));
         };
 
-        // This modern path deliberately has no server authentication hook yet.
-        // Commit the anonymous admission before middleware so extension code
-        // cannot forge a principal on a context that has no raw credentials.
-        if !request_ctx.commit_anonymous_auth() {
+        let mut admission_request = request.clone();
+        if let Err(error) =
+            self.authenticate_modern_request(&request_ctx, inbound, &mut admission_request)
+        {
             if let Some(stats) = &self.stats {
                 stats.record_request(&method, started_at.elapsed(), false);
             }
-            return response_for_error(McpError::internal_error(
-                "anonymous request admission could not be committed",
-            ));
+            return response_for_error(error);
         }
 
-        let final_core_request = match decode_final_core_request_for_middleware(request) {
+        let final_core_request = match decode_final_core_request_for_middleware(&admission_request)
+        {
             Ok(request) => request,
             Err(error) => {
                 if let Some(stats) = &self.stats {
@@ -9079,7 +9655,6 @@ impl Server {
         // The protocol-version marker is part of typed modern admission. Once
         // that admission has completed, keep the marker out of application
         // middleware and handler parameter decoding just as stdio does.
-        let admission_request = request.clone();
         let mut request = admission_request.clone();
         remove_modern_protocol_metadata(&mut request);
 
@@ -9278,10 +9853,8 @@ impl Server {
                 "request scope could not be established",
             ));
         };
-        if !request_ctx.commit_anonymous_auth() {
-            return response_for_error(McpError::internal_error(
-                "anonymous request admission could not be committed",
-            ));
+        if let Err(error) = self.authenticate_modern_request(&request_ctx, inbound, &mut request) {
+            return response_for_error(error);
         }
 
         let final_core_request = match decode_final_core_request_for_middleware(&request) {
@@ -10654,6 +11227,46 @@ impl Server {
         combine_split_transport_results(run_result, recv_close, send_close)
     }
 
+    #[cfg(feature = "websocket")]
+    fn run_split_transport_returning_shared_with_dispatch_cx<R, S>(
+        self: Arc<Self>,
+        pump_cx: &Cx,
+        dispatch_cx: &Cx,
+        recv_half: R,
+        send_half: S,
+    ) -> McpResult<()>
+    where
+        R: TransportRecvHalf + Send + 'static,
+        S: TransportSendHalf + 'static,
+    {
+        let recv_half = SharedRecvHalf::new(recv_half);
+        let send_half = SharedSendHalf::new(send_half);
+        let notification_failure = Arc::new(AtomicBool::new(false));
+        let notification_sender = create_split_transport_notification_sender(
+            send_half.clone(),
+            pump_cx.clone(),
+            Arc::clone(&notification_failure),
+        );
+        let recv_for_run = recv_half.clone();
+        let send_for_run = send_half.clone();
+        let run_result = self.run_loop_returning_shared_with_dispatch_cx(
+            pump_cx,
+            dispatch_cx,
+            move |cx, _worker_failed| recv_for_run.recv(cx),
+            move |cx, message| send_for_run.send(cx, message),
+            notification_sender,
+            Some(notification_failure),
+            "websocket",
+        );
+        let recv_close = recv_half
+            .close()
+            .map_err(|error| transport_run_error("receive_close", &error));
+        let send_close = send_half
+            .close()
+            .map_err(|error| transport_run_error("send_close", &error));
+        combine_split_transport_results(run_result, recv_close, send_close)
+    }
+
     async fn run_split_transport_with_label<R, S>(
         self,
         cx: &Cx,
@@ -11282,7 +11895,7 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        self.run_loop_pump_with_policy(
+        Arc::new(self).run_loop_pump_with_policy(
             pump_cx,
             dispatch_cx,
             recv,
@@ -11344,6 +11957,41 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
+        match Arc::new(self).run_loop_pump_with_policy(
+            pump_cx,
+            dispatch_cx,
+            move |cx, worker_failed| recv(cx, worker_failed),
+            send,
+            notification_sender,
+            transport_label,
+            false,
+            connection_failure,
+            true,
+        ) {
+            0 => Ok(()),
+            _ => Err(server_run_error(
+                "transport",
+                "pump_failure",
+                "Server transport loop failed",
+            )),
+        }
+    }
+
+    #[cfg(feature = "websocket")]
+    fn run_loop_returning_shared_with_dispatch_cx<R, S>(
+        self: Arc<Self>,
+        pump_cx: &Cx,
+        dispatch_cx: &Cx,
+        mut recv: R,
+        send: S,
+        notification_sender: NotificationSender,
+        connection_failure: Option<Arc<AtomicBool>>,
+        transport_label: &'static str,
+    ) -> McpResult<()>
+    where
+        R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
+    {
         match self.run_loop_pump_with_policy(
             pump_cx,
             dispatch_cx,
@@ -11377,7 +12025,7 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        self.run_loop_pump_with_policy(
+        Arc::new(self).run_loop_pump_with_policy(
             cx,
             cx,
             recv,
@@ -11398,7 +12046,7 @@ impl Server {
     #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
     #[allow(clippy::too_many_arguments)]
     fn run_loop_pump_with_policy<R, S>(
-        self,
+        self: Arc<Self>,
         cx: &Cx,
         _dispatch_cx: &Cx,
         mut recv: R,
@@ -11413,7 +12061,7 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        let server = Arc::new(self);
+        let server = self;
         if let Some(stats) = &server.stats {
             stats.connection_opened();
         }
@@ -11522,7 +12170,7 @@ impl Server {
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
-        self.run_loop_pump_with_policy(
+        Arc::new(self).run_loop_pump_with_policy(
             cx,
             cx,
             recv,
@@ -11538,7 +12186,7 @@ impl Server {
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     #[allow(clippy::too_many_lines)]
     fn run_loop_pump_with_policy<R, S>(
-        self,
+        self: Arc<Self>,
         cx: &Cx,
         dispatch_cx: &Cx,
         mut recv: R,
@@ -11567,7 +12215,7 @@ impl Server {
 
         let traffic_renderer = self.configured_traffic_renderer();
 
-        let server = Arc::new(self);
+        let server = self;
         let session = Session::new(server.info.clone(), server.capabilities.clone());
         let session_id = session.id();
         let session_principal = session.principal_binding();
@@ -11746,6 +12394,7 @@ impl Server {
                         request_id_to_u64(request.id.as_ref()),
                         InboundRequestTransport::Stdio,
                         &worker_modern_connection,
+                        TransportAuthorization::default(),
                     );
                     let request_cancellation = McpRequestCancellation::new();
                     let notification_send = Arc::clone(&worker_send);
@@ -12401,6 +13050,7 @@ impl Server {
                                                 request_id_to_u64(request.id.as_ref()),
                                                 InboundRequestTransport::Stdio,
                                                 &task_modern_connection,
+                                                TransportAuthorization::default(),
                                             );
                                             let started = Instant::now();
                                             let notification_send = Arc::clone(&request_send);
@@ -15025,6 +15675,29 @@ impl Server {
         Some(senders)
     }
 
+    /// Authenticates one modern ingress request before extension middleware
+    /// sees it. Native authorization remains in the inbound custody object;
+    /// recognized JSON credentials are removed after authentication and before
+    /// any extension callback. Connection-backed ingress additionally fences
+    /// retained state to the first authenticated principal.
+    fn authenticate_modern_request(
+        &self,
+        ctx: &McpContext,
+        inbound: &InboundRequestContext,
+        request: &mut JsonRpcRequest,
+    ) -> McpResult<()> {
+        let auth_request = inbound.auth_request(&request.method, request.params.as_ref());
+        let fingerprint = self.authenticate_request(ctx, auth_request)?;
+        auth::strip_recognized_access_credentials(&mut request.params);
+        if !inbound.bind_or_verify_principal(fingerprint) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authenticated principal does not own an admitted session",
+            ));
+        }
+        Self::enforce_request_context(ctx)
+    }
+
     fn authenticate_request(
         &self,
         ctx: &McpContext,
@@ -16394,14 +17067,154 @@ mod lib_unit_tests {
     const LIVE_HTTP_TEST_TIMEOUT_NANOS: u64 = 2_000_000_000;
 
     #[test]
-    fn canonical_websocket_profile_has_no_server_endpoint() {
+    fn websocket_profile_exposes_turnkey_server_endpoint_behind_its_feature() {
         let source = include_str!("lib.rs");
-        let blocking_endpoint = ["pub fn", "run_websocket"].join(" ");
-        let async_endpoint = ["pub async fn", "run_websocket"].join(" ");
-
-        assert!(!source.contains(&blocking_endpoint));
-        assert!(!source.contains(&async_endpoint));
+        assert!(source.contains("#[cfg(feature = \"websocket\")]\nimpl Server"));
+        assert!(source.contains("pub async fn bind_websocket"));
+        assert!(source.contains("pub async fn serve_websocket"));
         assert!(source.contains("pub async fn run_http"));
+    }
+
+    #[cfg(feature = "websocket")]
+    async fn websocket_upgrade(
+        cx: &Cx,
+        address: std::net::SocketAddr,
+        request: &str,
+    ) -> Result<(AsyncTcpStream, Vec<u8>), String> {
+        use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+        let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+        let mut stream = asupersync::time::timeout_at(deadline, AsyncTcpStream::connect(address))
+            .await
+            .map_err(|_| "WebSocket client connect timed out".to_owned())?
+            .map_err(|error| format!("WebSocket client connect failed: {error}"))?;
+        asupersync::time::timeout_at(deadline, stream.write_all(request.as_bytes()))
+            .await
+            .map_err(|_| "WebSocket handshake write timed out".to_owned())?
+            .map_err(|error| format!("WebSocket handshake write failed: {error}"))?;
+        asupersync::time::timeout_at(deadline, stream.flush())
+            .await
+            .map_err(|_| "WebSocket handshake flush timed out".to_owned())?
+            .map_err(|error| format!("WebSocket handshake flush failed: {error}"))?;
+
+        let mut received = Vec::new();
+        while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut chunk = [0_u8; 512];
+            let read = asupersync::time::timeout_at(deadline, stream.read(&mut chunk))
+                .await
+                .map_err(|_| "WebSocket handshake response timed out".to_owned())?
+                .map_err(|error| format!("WebSocket handshake response failed: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            received.extend_from_slice(&chunk[..read]);
+        }
+        Ok((stream, received))
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn live_websocket_upgrade_dispatches_modern_and_rejects_bad_header_and_era_without_state_change()
+     {
+        run_live_http_test(|cx| async move {
+            use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+            let listener = Server::new("live-websocket", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern-only policy is available")
+                .build()
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("WebSocket bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("WebSocket local address failed: {error}"))?;
+            let scope = cx.scope();
+            let mut listener_task = cx
+                .spawn_in(&scope, move |listener_cx| async move {
+                    listener.serve(&listener_cx).await
+                })
+                .map_err(|error| format!("WebSocket listener task admission failed: {error}"))?;
+
+            let valid = concat!(
+                "GET /mcp HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "Sec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            let (mut client, accepted) = websocket_upgrade(&cx, address, valid).await?;
+            if !accepted.starts_with(b"HTTP/1.1 101") {
+                return Err(format!(
+                    "valid WebSocket upgrade was not accepted: {accepted:?}"
+                ));
+            }
+            client
+                .write_all(&masked_websocket_message(modern_discovery_request(7_101)))
+                .await
+                .map_err(|error| format!("modern WebSocket frame write failed: {error}"))?;
+            client
+                .flush()
+                .await
+                .map_err(|error| format!("modern WebSocket frame flush failed: {error}"))?;
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            let mut response = Vec::new();
+            while !response.windows(10).any(|window| window == b"serverInfo") {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, client.read(&mut chunk))
+                    .await
+                    .map_err(|_| "modern WebSocket response timed out".to_owned())?
+                    .map_err(|error| format!("modern WebSocket response failed: {error}"))?;
+                if read == 0 {
+                    return Err("modern WebSocket closed before its response".to_owned());
+                }
+                response.extend_from_slice(&chunk[..read]);
+            }
+            client
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("WebSocket close write failed: {error}"))?;
+
+            let malformed_header = valid.replace("Connection: Upgrade", "Connection: keep-alive");
+            let (_bad_client, rejected) =
+                websocket_upgrade(&cx, address, &malformed_header).await?;
+            if !rejected.starts_with(b"HTTP/1.1 400") {
+                return Err(format!("bad Upgrade header was not rejected: {rejected:?}"));
+            }
+
+            let (mut era_client, era_accepted) = websocket_upgrade(&cx, address, valid).await?;
+            if !era_accepted.starts_with(b"HTTP/1.1 101") {
+                return Err("era-negative WebSocket handshake was not accepted".to_owned());
+            }
+            era_client
+                .write_all(&masked_websocket_message(exact_legacy_initialize_request(
+                    7_102,
+                    serde_json::json!("1.0.0"),
+                )))
+                .await
+                .map_err(|error| format!("legacy-era WebSocket frame write failed: {error}"))?;
+            era_client
+                .flush()
+                .await
+                .map_err(|error| format!("legacy-era WebSocket frame flush failed: {error}"))?;
+            let mut rejection = [0_u8; 1024];
+            let read = asupersync::time::timeout_at(deadline, era_client.read(&mut rejection))
+                .await
+                .map_err(|_| "legacy-era WebSocket rejection timed out".to_owned())?
+                .map_err(|error| format!("legacy-era WebSocket rejection failed: {error}"))?;
+            if read == 0
+                || !rejection[..read]
+                    .windows(5)
+                    .any(|window| window == b"error")
+            {
+                return Err("wrong-era frame did not receive a JSON-RPC refusal".to_owned());
+            }
+
+            listener_task.abort();
+            let _ = listener_task.join(&cx).await;
+            Ok(())
+        });
     }
 
     fn live_http_test_timeout(operation: &str) -> String {
@@ -16917,7 +17730,7 @@ mod lib_unit_tests {
             .try_spawn_with_cx(move |cx| async move {
                 let dispatch_cx = cx.clone();
                 let result = match cx.spawn_blocking(move |pump_cx| {
-                    server.run_loop_pump_with_policy(
+                    Arc::new(server).run_loop_pump_with_policy(
                         &pump_cx,
                         &dispatch_cx,
                         recv,
@@ -23438,7 +24251,7 @@ mod lib_unit_tests {
                 // non-quiescent modern child still occupies its blocking
                 // thread, and the harness only needs the exit code.
                 if let Err(error) = cx.spawn_blocking(move |pump_cx| {
-                    let code = server.run_loop_pump_with_policy(
+                    let code = Arc::new(server).run_loop_pump_with_policy(
                         &pump_cx,
                         &dispatch_cx,
                         move |_receive_cx, _worker_failed| match phase_for_receive
@@ -23530,8 +24343,7 @@ mod lib_unit_tests {
         let failure_from_receive = Arc::clone(&notification_failure);
 
         let cx = Cx::for_testing();
-        let exit_code = Server::new("notification-eof-race-test", "1.0.0")
-            .build()
+        let exit_code = Arc::new(Server::new("notification-eof-race-test", "1.0.0").build())
             .run_loop_pump_with_policy(
                 &cx,
                 &cx,
@@ -23920,6 +24732,77 @@ mod lib_unit_tests {
                 ));
             }
             Ok(vec![Content::text("disabled for this HTTP session")])
+        }
+    }
+
+    struct ModernHttpAuthCounterTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for ModernHttpAuthCounterTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "modern_http_auth_counter".to_owned(),
+                description: Some("Counts authenticated modern HTTP dispatches".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(vec![Content::text("authenticated modern HTTP dispatch")])
+        }
+    }
+
+    #[derive(Clone)]
+    struct ModernHttpAuthMiddleware {
+        calls: Arc<AtomicUsize>,
+        saw_credential: Arc<AtomicBool>,
+    }
+
+    impl Middleware for ModernHttpAuthMiddleware {
+        fn on_request(
+            &self,
+            _ctx: &McpContext,
+            request: &JsonRpcRequest,
+        ) -> McpResult<MiddlewareDecision> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let serialized = serde_json::to_string(request)
+                .map_err(|error| McpError::internal_error(error.to_string()))?;
+            if serialized.contains("Bearer alpha") || serialized.contains("Bearer beta") {
+                self.saw_credential.store(true, Ordering::Release);
+            }
+            Ok(MiddlewareDecision::Continue)
+        }
+    }
+
+    struct ModernHttpAuthProvider;
+
+    impl AuthProvider for ModernHttpAuthProvider {
+        fn authenticate(
+            &self,
+            _ctx: &McpContext,
+            request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            let access = request
+                .access_token()
+                .ok_or_else(|| McpError::new(McpErrorCode::ResourceForbidden, "missing bearer"))?;
+            match access.token.as_str() {
+                "alpha" | "beta" => Ok(AuthContext::with_subject(access.token)),
+                _ => Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "unrecognized bearer",
+                )),
+            }
         }
     }
 
@@ -28444,6 +29327,78 @@ mod lib_unit_tests {
             if calls.load(Ordering::Acquire) != 1 {
                 return Err(
                     "sessionless modern SSE POST did not invoke the handler once".to_owned(),
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_modern_authorization_allows_native_bearer_once() {
+        run_live_http_test(|cx| async move {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let bound = Server::new("live-http-modern-authorization", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .auth_provider(ModernHttpAuthProvider)
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live HTTP authorization bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live HTTP authorization address failed: {error}"))?;
+            let request = modern_http_json_tool_request("modern_http_auth_counter", 935);
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let response = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &request.body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("Authorization", "Bearer alpha"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "modern_http_auth_counter"),
+                            ],
+                        ),
+                    )
+                    .await;
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("live HTTP native bearer proof complete"),
+                    );
+                    response
+                })
+                .map_err(|error| {
+                    format!("live HTTP authorization client admission failed: {error}")
+                })?;
+            let serve = bound.serve(&cx).await;
+            let response = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live HTTP authorization client failed: {error:?}"))??;
+            let shutdown =
+                serve.map_err(|error| format!("live HTTP authorization server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "live HTTP native bearer").await?;
+            let response: JsonRpcResponse =
+                serde_json::from_slice(live_http_response_body(&response)?).map_err(|error| {
+                    format!("live HTTP authorization response was not JSON-RPC: {error}")
+                })?;
+            if response.id != Some(935_i64.into()) || response.error.is_some() {
+                return Err(format!(
+                    "allowed native bearer did not dispatch: {response:?}"
+                ));
+            }
+            if calls.load(Ordering::Acquire) != 1 {
+                return Err(
+                    "allowed native bearer did not invoke the handler exactly once".to_owned(),
                 );
             }
             Ok(())
@@ -36773,6 +37728,155 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn public_http_modern_authorization_authenticates_before_middleware_and_fences_principals() {
+        let cx = Cx::for_testing();
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let saw_credential = Arc::new(AtomicBool::new(false));
+        let endpoint = Server::new("modern-http-authorization", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
+            .auth_provider(ModernHttpAuthProvider)
+            .middleware(ModernHttpAuthMiddleware {
+                calls: Arc::clone(&middleware_calls),
+                saw_credential: Arc::clone(&saw_credential),
+            })
+            .tool(ModernHttpAuthCounterTool {
+                calls: Arc::clone(&handler_calls),
+            })
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+
+        let allowed = session
+            .handle(
+                &cx,
+                modern_http_json_tool_request("modern_http_auth_counter", 931)
+                    .with_header("authorization", "Bearer alpha"),
+            )
+            .expect("allowed bearer must dispatch");
+        let ServerHttpEndpointResponse::Immediate(allowed) = allowed else {
+            panic!("ordinary authenticated modern HTTP must return JSON");
+        };
+        let allowed: JsonRpcResponse =
+            serde_json::from_slice(&allowed.body).expect("allowed response must be JSON-RPC");
+        assert_eq!(allowed.id, Some(931_i64.into()));
+        assert!(allowed.error.is_none());
+        assert_eq!(handler_calls.load(Ordering::Acquire), 1);
+        assert_eq!(middleware_calls.load(Ordering::Acquire), 1);
+        assert!(!saw_credential.load(Ordering::Acquire));
+
+        let rejected = session
+            .handle(
+                &cx,
+                modern_http_json_tool_request("modern_http_auth_counter", 932)
+                    .with_header("authorization", "Bearer beta"),
+            )
+            .expect("a principal mismatch must be represented as JSON-RPC");
+        let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {
+            panic!("principal mismatch must not admit an SSE body");
+        };
+        let rejected_wire = String::from_utf8_lossy(&rejected.body);
+        let rejected: JsonRpcResponse =
+            serde_json::from_slice(&rejected.body).expect("rejection must remain JSON-RPC");
+        assert_eq!(rejected.id, Some(932_i64.into()));
+        assert_eq!(
+            rejected.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::ResourceForbidden).into())
+        );
+        assert!(rejected.result.is_none());
+        assert_eq!(
+            handler_calls.load(Ordering::Acquire),
+            1,
+            "changing only alpha to beta must not invoke the handler",
+        );
+        assert_eq!(
+            middleware_calls.load(Ordering::Acquire),
+            1,
+            "changing only alpha to beta must reject before middleware",
+        );
+        assert!(!saw_credential.load(Ordering::Acquire));
+        assert!(!rejected_wire.contains("alpha") && !rejected_wire.contains("beta"));
+    }
+
+    #[test]
+    fn public_http_modern_sse_authorization_fences_owned_dispatch_before_mutation() {
+        let cx = Cx::for_testing();
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let saw_credential = Arc::new(AtomicBool::new(false));
+        let endpoint = Server::new("modern-http-sse-authorization", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
+            .auth_provider(ModernHttpAuthProvider)
+            .middleware(ModernHttpAuthMiddleware {
+                calls: Arc::clone(&middleware_calls),
+                saw_credential: Arc::clone(&saw_credential),
+            })
+            .tool(ModernHttpAuthCounterTool {
+                calls: Arc::clone(&handler_calls),
+            })
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+        let request = |id, bearer| {
+            modern_http_json_tool_request("modern_http_auth_counter", id)
+                .with_header("accept", "text/event-stream")
+                .with_header("authorization", format!("Bearer {bearer}"))
+        };
+
+        let ServerHttpEndpointResponse::ModernSse(allowed) = session
+            .handle(&cx, request(933, "alpha"))
+            .expect("allowed bearer must admit an owned SSE dispatch")
+        else {
+            panic!("SSE request must retain its owned response body");
+        };
+        assert!(matches!(
+            Codec::new()
+                .decode_complete_message(
+                    allowed
+                        .recv_event(&cx)
+                        .expect("allowed SSE body must emit its terminal response")
+                        .data
+                        .as_bytes(),
+                )
+                .expect("allowed SSE response must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(933_i64.into()) && response.error.is_none()
+        ));
+        assert_eq!(handler_calls.load(Ordering::Acquire), 1);
+        assert_eq!(middleware_calls.load(Ordering::Acquire), 1);
+
+        let ServerHttpEndpointResponse::ModernSse(rejected) = session
+            .handle(&cx, request(934, "beta"))
+            .expect("principal mismatch must retain the protocol-selected SSE body")
+        else {
+            panic!("SSE admission must preserve its owned response path");
+        };
+        let rejected = rejected
+            .recv_event(&cx)
+            .expect("rejected owned dispatch must emit one terminal response");
+        assert!(!rejected.data.contains("alpha") && !rejected.data.contains("beta"));
+        assert!(matches!(
+            Codec::new()
+                .decode_complete_message(rejected.data.as_bytes())
+                .expect("rejected SSE response must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(934_i64.into())
+                    && response.error.is_some_and(|error| {
+                        error.code == i32::from(McpErrorCode::ResourceForbidden).into()
+                    })
+        ));
+        assert_eq!(handler_calls.load(Ordering::Acquire), 1);
+        assert_eq!(middleware_calls.load(Ordering::Acquire), 1);
+        assert!(!saw_credential.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn public_http_mrtr_resumes_only_in_the_admitted_session() {
         let cx = Cx::for_testing();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -37944,6 +39048,7 @@ mod lib_unit_tests {
                             serde_json::to_vec(&cancellation)
                                 .expect("typed cancellation notification must serialize"),
                         ),
+                    TransportAuthorization::default(),
                 )
                 .map_err(|error| format!("cancellation rejection failed: {error}"))?;
             let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {

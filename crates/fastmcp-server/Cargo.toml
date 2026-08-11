@@ -43,9 +43,10 @@ proxy-legacy = [
     "fastmcp-client/legacy-2024-11-05",
 ]
 proxy-tasks = ["proxy", "tasks"]
-# Enables only the transport crate's caller-upgraded async WebSocket adapters.
-# This crate intentionally provides no WebSocket endpoint, listener, URI
-# connector, or HTTP Upgrade path.
+# Enables the server-owned WebSocket listener and HTTP Upgrade bridge.
+websocket = ["fastmcp-transport/websocket-experimental"]
+# Retained while the facade's caller-upgraded transport profile remains named
+# `websocket-experimental`; it does not enable the turnkey listener.
 websocket-experimental = ["fastmcp-transport/websocket-experimental"]
 redis-tasks = ["tasks", "dep:redis"]
 jwt-resource-auth = ["fastmcp-protocol/jose"]
