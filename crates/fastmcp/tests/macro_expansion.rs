@@ -145,11 +145,12 @@ fn facade_websocket_surface_is_namespace_consistent() {
                 .await?;
             let _ = legacy_client.session();
 
-            let auto_transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9003/mcp")
-                .await
-                .map_err(|error| McpError::internal_error(error.to_string()))?;
             let auto_client = fastmcp_rust::auto::ClientBuilder::new()
-                .connect_websocket_with_cx(cx, auto_transport)
+                .connect_websocket_auto_with_cx(cx, move |_| async move {
+                    AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9003/mcp")
+                        .await
+                        .map_err(|error| McpError::internal_error(error.to_string()))
+                })
                 .await?;
             let _ = auto_client.session();
 

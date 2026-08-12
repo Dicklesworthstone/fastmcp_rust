@@ -796,8 +796,8 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 /// subprocess or HTTP side effect. The caller may replace that immutable plan
 /// with an explicit plan before connecting.
 ///
-/// Its WebSocket entry point accepts a caller-owned async URI transport and
-/// has no synchronous split-transport escape route.
+/// Its WebSocket entry point accepts a caller-owned factory for fresh async
+/// URI transports and has no synchronous split-transport escape route.
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod auto {
     #[cfg(feature = "websocket-experimental")]
@@ -898,7 +898,7 @@ pub mod auto {
 
         /// Sets the idle and absolute timeout policy for ordinary requests.
         #[must_use]
-        pub fn request_timeout_policy(self, policy: RequestTimeoutPolicy) -> Self {
+        pub fn request_timeout_policy(self, policy: fastmcp_client::RequestTimeoutPolicy) -> Self {
             Self::from_inner(self.inner.request_timeout_policy(policy))
         }
 
@@ -1037,18 +1037,28 @@ pub mod auto {
             self.inner.connect_stdio_with_cx(command, args, cx)
         }
 
-        /// Negotiates an owned native async WebSocket transport under Auto's
-        /// immutable protocol policy.
+        /// Negotiates Auto WebSocket discovery with caller-owned fresh transports.
+        ///
+        /// The factory is called once for modern discovery and exactly once
+        /// more only after a correlated JSON-RPC `MethodNotFound` refusal.
+        /// Each call must return a fresh upgraded transport: the refused
+        /// connection is never reused for the exact-2024 initialization.
         #[cfg(feature = "websocket-experimental")]
-        pub async fn connect_websocket_with_cx<IO>(
+        pub async fn connect_websocket_auto_with_cx<IO, F, Fut>(
             self,
             cx: &Cx,
-            transport: fastmcp_transport::websocket::AsyncWsClientTransport<IO>,
+            fresh_transport: F,
         ) -> McpResult<WebSocketClient<IO>>
         where
             IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
+            F: FnMut(&Cx) -> Fut,
+            Fut: std::future::Future<
+                    Output = McpResult<fastmcp_transport::websocket::AsyncWsClientTransport<IO>>,
+                >,
         {
-            self.inner.connect_websocket_with_cx(cx, transport).await
+            self.inner
+                .connect_websocket_auto_with_cx(cx, fresh_transport)
+                .await
         }
 
         /// Connects the selected HTTP plan using the current capability context.
@@ -4858,6 +4868,54 @@ mod tests {
 
     use super::{RequestTimeoutPolicy, RequestTimeoutSource};
 
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    use asupersync::io::AsyncWriteExt;
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    use asupersync::test_utils::run_test;
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    use std::{
+        collections::VecDeque,
+        net::SocketAddr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    fn facade_async_websocket_pair() -> (
+        asupersync::net::tcp::VirtualTcpStream,
+        asupersync::net::tcp::VirtualTcpStream,
+    ) {
+        let client_addr: SocketAddr = "127.0.0.1:46101".parse().expect("client address");
+        let server_addr: SocketAddr = "127.0.0.1:46102".parse().expect("server address");
+        asupersync::net::tcp::VirtualTcpStream::pair(client_addr, server_addr)
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    async fn write_facade_server_text_frame(
+        peer: &mut asupersync::net::tcp::VirtualTcpStream,
+        source: &str,
+    ) {
+        let payload = source.as_bytes();
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        frame.push(0x81);
+        if payload.len() <= 125 {
+            frame.push(u8::try_from(payload.len()).expect("small WebSocket payload"));
+        } else {
+            frame.push(126);
+            frame.extend_from_slice(
+                &u16::try_from(payload.len())
+                    .expect("bounded test WebSocket payload")
+                    .to_be_bytes(),
+            );
+        }
+        frame.extend_from_slice(payload);
+        peer.write_all(&frame)
+            .await
+            .expect("write raw server WebSocket text frame");
+    }
+
     #[test]
     fn facade_reexports_client_timeout_types() {
         let policy = RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5))
@@ -4866,6 +4924,90 @@ mod tests {
         assert_eq!(policy.idle_timeout(), Duration::from_secs(2));
         assert_eq!(policy.absolute_timeout(), Duration::from_secs(5));
         assert_ne!(RequestTimeoutSource::Idle, RequestTimeoutSource::Absolute);
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn facade_auto_websocket_uses_a_fresh_transport_after_method_not_found() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (first_client_io, mut first_peer_io) = facade_async_websocket_pair();
+            write_facade_server_text_frame(
+                &mut first_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"peer-specific refusal text"}}"#,
+            )
+            .await;
+            let (legacy_client_io, mut legacy_peer_io) = facade_async_websocket_pair();
+            write_facade_server_text_frame(
+                &mut legacy_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fresh-legacy","version":"1.0"}}}"#,
+            )
+            .await;
+
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls_for_factory = Arc::clone(&factory_calls);
+            let mut transports = VecDeque::from([
+                super::AsyncWsClientTransport::from_upgraded(first_client_io),
+                super::AsyncWsClientTransport::from_upgraded(legacy_client_io),
+            ]);
+            let client = super::auto::client_builder()
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                    let transport = transports.pop_front();
+                    async move {
+                        transport.ok_or_else(|| {
+                            super::McpError::internal_error(
+                                "Auto exceeded its two fresh transport attempts",
+                            )
+                        })
+                    }
+                })
+                .await
+                .expect("public Auto facade retries only on a fresh exact legacy transport");
+
+            assert_eq!(
+                client.selected_protocol_era(),
+                super::ProtocolEra::Legacy2024
+            );
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn facade_auto_websocket_same_refusal_text_with_non_method_not_found_does_not_retry() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (first_client_io, mut first_peer_io) = facade_async_websocket_pair();
+            write_facade_server_text_frame(
+                &mut first_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"peer-specific refusal text"}}"#,
+            )
+            .await;
+
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls_for_factory = Arc::clone(&factory_calls);
+            let mut first_transport = Some(super::AsyncWsClientTransport::from_upgraded(
+                first_client_io,
+            ));
+            let error = super::auto::client_builder()
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                    let transport = first_transport.take();
+                    async move {
+                        transport.ok_or_else(|| {
+                            super::McpError::internal_error(
+                                "non-eligible refusal must not request a fresh transport",
+                            )
+                        })
+                    }
+                })
+                .await
+                .expect_err("only JSON-RPC MethodNotFound may trigger the Auto retry");
+
+            assert_eq!(error.code, super::McpErrorCode::InvalidRequest);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        });
     }
 
     #[test]

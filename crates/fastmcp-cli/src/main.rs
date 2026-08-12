@@ -5807,28 +5807,6 @@ fn format_inspect_text(
     prompts: &[fastmcp_protocol::Prompt],
     protocol_status: InspectProtocolStatus,
 ) -> String {
-    format_inspect_text_with_truncation(
-        server_info,
-        capabilities,
-        tools,
-        resources,
-        resource_templates,
-        prompts,
-        false,
-        protocol_status,
-    )
-}
-
-fn format_inspect_text_with_truncation(
-    server_info: &fastmcp_protocol::ServerInfo,
-    capabilities: &fastmcp_protocol::ServerCapabilities,
-    tools: &[fastmcp_protocol::Tool],
-    resources: &[fastmcp_protocol::Resource],
-    resource_templates: &[fastmcp_protocol::ResourceTemplate],
-    prompts: &[fastmcp_protocol::Prompt],
-    acquisition_truncated: bool,
-    protocol_status: InspectProtocolStatus,
-) -> String {
     format_inspect_text_for_capabilities_with_truncation(
         server_info,
         &InspectCapabilities::Legacy(capabilities.clone()),
@@ -5836,7 +5814,7 @@ fn format_inspect_text_with_truncation(
         resources,
         resource_templates,
         prompts,
-        acquisition_truncated,
+        false,
         protocol_status,
     )
 }
@@ -6202,28 +6180,6 @@ fn format_inspect_json(
     prompts: &[fastmcp_protocol::Prompt],
     protocol_status: InspectProtocolStatus,
 ) -> McpResult<String> {
-    format_inspect_json_with_truncation(
-        server_info,
-        capabilities,
-        tools,
-        resources,
-        resource_templates,
-        prompts,
-        false,
-        protocol_status,
-    )
-}
-
-fn format_inspect_json_with_truncation(
-    server_info: &fastmcp_protocol::ServerInfo,
-    capabilities: &fastmcp_protocol::ServerCapabilities,
-    tools: &[fastmcp_protocol::Tool],
-    resources: &[fastmcp_protocol::Resource],
-    resource_templates: &[fastmcp_protocol::ResourceTemplate],
-    prompts: &[fastmcp_protocol::Prompt],
-    acquisition_truncated: bool,
-    protocol_status: InspectProtocolStatus,
-) -> McpResult<String> {
     format_inspect_json_for_capabilities_with_truncation(
         server_info,
         &InspectCapabilities::Legacy(capabilities.clone()),
@@ -6231,7 +6187,7 @@ fn format_inspect_json_with_truncation(
         resources,
         resource_templates,
         prompts,
-        acquisition_truncated,
+        false,
         protocol_status,
     )
 }
@@ -13507,7 +13463,29 @@ mod tests {
         fn inspect_renderers_surface_page_acquisition_truncation() {
             let server_info = make_test_server_info();
             let capabilities = make_test_capabilities(true, false, false);
-            let text = format_inspect_text_with_truncation(
+            let capabilities = InspectCapabilities::Legacy(capabilities);
+            let complete_text = format_inspect_text_for_capabilities_with_truncation(
+                &server_info,
+                &capabilities,
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                make_test_protocol_status(),
+            );
+            let complete_json = format_inspect_json_for_capabilities_with_truncation(
+                &server_info,
+                &capabilities,
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                make_test_protocol_status(),
+            )
+            .expect("inspect JSON");
+            let truncated_text = format_inspect_text_for_capabilities_with_truncation(
                 &server_info,
                 &capabilities,
                 &[],
@@ -13517,7 +13495,7 @@ mod tests {
                 true,
                 make_test_protocol_status(),
             );
-            let json = format_inspect_json_with_truncation(
+            let truncated_json = format_inspect_json_for_capabilities_with_truncation(
                 &server_info,
                 &capabilities,
                 &[],
@@ -13529,9 +13507,14 @@ mod tests {
             )
             .expect("inspect JSON");
 
-            assert!(text.contains("Data truncated"));
+            assert!(!complete_text.contains("Data truncated"));
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&json).unwrap()["truncated"],
+                serde_json::from_str::<serde_json::Value>(&complete_json).unwrap()["truncated"],
+                false
+            );
+            assert!(truncated_text.contains("Data truncated"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&truncated_json).unwrap()["truncated"],
                 true
             );
         }
