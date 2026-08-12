@@ -135,6 +135,52 @@ pub fn decode_strict_jsonrpc_message(
     }
 }
 
+impl JsonRpcRequest {
+    /// Strictly decodes one request while retaining an exact parameter-source
+    /// sidecar for method-specific ingress decoding.
+    ///
+    /// The returned `String`, when present, is the exact JSON source of the
+    /// request's `params` member. It is deliberately separate from
+    /// [`JsonRpcRequest`] so existing public struct literals and ordinary
+    /// typed request APIs retain their established shape. A consumer may only
+    /// attach this source to the returned request after comparing its
+    /// materialized `params` value; final core dispatch performs that equality
+    /// check before it uses the raw source.
+    ///
+    /// This applies the same bounded raw-document admission as
+    /// [`decode_strict_jsonrpc_message`], including duplicate-member
+    /// rejection, before producing either the typed request or its sidecar.
+    pub fn decode_strict_with_raw_params(
+        bytes: &[u8],
+        document_byte_limit: usize,
+    ) -> Result<(Self, Option<String>), JsonRpcAdmissionError> {
+        admit_raw_jsonrpc_document(bytes, document_byte_limit)
+            .map_err(JsonRpcAdmissionError::Raw)?;
+        let wire =
+            JsonRpcRequestRawWire::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
+                .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        let raw_params = wire.params.as_deref().map(RawValue::get).map(str::to_owned);
+        let params = raw_params
+            .as_deref()
+            .map(|source| {
+                crate::messages::validate_raw_final_completion_params(&wire.method, source)
+                    .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+                serde_json::from_str(source).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)
+            })
+            .transpose()?;
+        let request = Self {
+            jsonrpc: wire.jsonrpc,
+            method: wire.method,
+            params,
+            id: wire.id,
+        };
+        request
+            .validate()
+            .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        Ok((request, raw_params))
+    }
+}
+
 /// One strictly admitted JSON-RPC response paired with the exact source JSON
 /// of its result member.
 ///
@@ -1768,6 +1814,30 @@ mod tests {
         assert_eq!(value["method"], "tools/call");
         assert_eq!(value["params"]["name"], "greet");
         assert_eq!(value["id"], 2);
+    }
+
+    #[test]
+    fn strict_request_raw_params_sidecar_preserves_exact_source_and_rejects_duplicates() {
+        let raw_params = r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"name":"weather","inputResponses":{"second":{"roots":[]},"first":{"roots":[]}},"requestState":"retry-1"}"#;
+        let frame =
+            format!(r#"{{"jsonrpc":"2.0","method":"tools/call","params":{raw_params},"id":7}}"#);
+        let (request, sidecar) =
+            JsonRpcRequest::decode_strict_with_raw_params(frame.as_bytes(), frame.len())
+                .expect("strict request admission retains the exact parameter source");
+        assert_eq!(sidecar.as_deref(), Some(raw_params));
+        assert_eq!(
+            request.params,
+            Some(serde_json::from_str(raw_params).expect("raw params materialize")),
+            "the sidecar belongs to the same admitted typed request"
+        );
+
+        let duplicate = r#"{"jsonrpc":"2.0","method":"tools/call","params":{"inputResponses":{"roots":{"roots":[]},"roots":{"roots":[]}}},"id":7}"#;
+        assert!(matches!(
+            JsonRpcRequest::decode_strict_with_raw_params(duplicate.as_bytes(), duplicate.len()),
+            Err(JsonRpcAdmissionError::Raw(
+                RawJsonAdmissionError::DuplicateObjectMember
+            ))
+        ));
     }
 
     #[test]

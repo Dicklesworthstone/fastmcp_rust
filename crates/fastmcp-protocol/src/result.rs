@@ -1839,6 +1839,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_object_encoding_preserves_admitted_member_order_and_number_lexemes() {
+        let source = r#"{"resultType":"complete","z-last":1.20e+4,"a-first":{"second":2,"first":1},"middle":[-7.30E-12,0]}"#;
+        let (decoded, diagnostic) = decode_peer_result(
+            source,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("ordered exact result object with exponent lexemes is admitted");
+        assert_eq!(diagnostic, None);
+        let DecodedResult::Complete(complete) = &decoded else {
+            panic!("fixture is a complete result");
+        };
+
+        assert_eq!(
+            complete
+                .extras
+                .members()
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["z-last", "a-first", "middle"]
+        );
+        assert_eq!(encode_result(&decoded), source);
+
+        let planted = r#"{"resultType":"complete","z-last":1.,"a-first":{"second":2,"first":1},"middle":[-7.30E-12,0]}"#;
+        let error = decode_peer_result(
+            planted,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("changing only the number grammar must reject the result object");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidJson);
+        assert_eq!(
+            encode_result(&decoded),
+            source,
+            "the rejected near-identical object cannot mutate the admitted raw result"
+        );
+    }
+
+    #[test]
     fn generic_peer_result_missing_type_compatibility_is_era_diagnostic_only() {
         let accepted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":true}"#;
         let (baseline, diagnostic) = decode_peer_result(

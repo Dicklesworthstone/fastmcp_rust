@@ -7311,25 +7311,28 @@ mod tests {
                 Some(raw_params),
             )
             .expect("raw final retry parameters preserve ordered input responses");
-            let entries = match decoded {
+            let entry_keys = match decoded {
                 CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) => params
                     .input_responses
                     .as_ref()
                     .expect("resource retry map is present")
-                    .entries(),
+                    .entries()
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>(),
                 CoreRequest::Final(FinalCoreRequest::PromptsGet(params)) => params
                     .input_responses
                     .as_ref()
                     .expect("prompt retry map is present")
-                    .entries(),
+                    .entries()
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>(),
                 _ => panic!("raw parameters select their method's final request type"),
             };
             assert_eq!(
-                entries
-                    .iter()
-                    .map(|(key, _)| key.as_str())
-                    .collect::<Vec<_>>(),
-                vec!["second", "first"],
+                entry_keys,
+                vec!["second".to_owned(), "first".to_owned()],
                 "{method} retains inputResponses wire order"
             );
             assert!(

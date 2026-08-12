@@ -2961,11 +2961,92 @@ mod tests {
             "rejecting the adjacent exponent cannot mutate the accepted value"
         );
 
+        let at_byte_limit = "1".repeat(MAX_EXACT_PROGRESS_NUMBER_BYTES);
+        let bounded = serde_json::from_str::<ExactNonNegativeJsonNumber>(&at_byte_limit)
+            .expect("an exact progress number at the byte ceiling deserializes");
+        assert_eq!(bounded.as_str(), at_byte_limit);
         let oversized = format!("1{}", "0".repeat(MAX_EXACT_PROGRESS_NUMBER_BYTES));
         assert_eq!(oversized.len(), MAX_EXACT_PROGRESS_NUMBER_BYTES + 1);
         assert!(
             serde_json::from_str::<ExactNonNegativeJsonNumber>(&oversized).is_err(),
-            "the direct deserializer enforces the exact-token byte ceiling"
+            "adding one byte is the only changed dimension and exceeds the byte ceiling"
+        );
+        assert_eq!(
+            serde_json::to_string(&bounded).expect("bounded number re-serializes"),
+            at_byte_limit,
+            "the over-limit rejection cannot alter the admitted 256-byte lexeme"
+        );
+    }
+
+    #[test]
+    fn exact_finite_json_number_deserialization_handles_all_finite_number_visitors() {
+        let from_i64 = <ExactNonNegativeJsonNumber as serde::Deserialize>::deserialize(
+            serde::de::value::I64Deserializer::<serde::de::value::Error>::new(i64::MIN),
+        )
+        .expect("i64 visitor admits a finite JSON number");
+        let from_u64 = <ExactNonNegativeJsonNumber as serde::Deserialize>::deserialize(
+            serde::de::value::U64Deserializer::<serde::de::value::Error>::new(u64::MAX),
+        )
+        .expect("u64 visitor admits a finite JSON number");
+        let from_i128 = <ExactNonNegativeJsonNumber as serde::Deserialize>::deserialize(
+            serde::de::value::I128Deserializer::<serde::de::value::Error>::new(i128::MIN),
+        )
+        .expect("i128 visitor admits a finite JSON number");
+        let from_u128 = <ExactNonNegativeJsonNumber as serde::Deserialize>::deserialize(
+            serde::de::value::U128Deserializer::<serde::de::value::Error>::new(u128::MAX),
+        )
+        .expect("u128 visitor admits a finite JSON number");
+        let from_f64 = <ExactNonNegativeJsonNumber as serde::Deserialize>::deserialize(
+            serde::de::value::F64Deserializer::<serde::de::value::Error>::new(1.25),
+        )
+        .expect("finite f64 visitor admits a JSON number");
+
+        assert_eq!(from_i64.as_str(), "-9223372036854775808");
+        assert_eq!(from_u64.as_str(), "18446744073709551615");
+        assert_eq!(
+            from_i128.as_str(),
+            "-170141183460469231731687303715884105728"
+        );
+        assert_eq!(
+            from_u128.as_str(),
+            "340282366920938463463374607431768211455"
+        );
+        assert_eq!(from_f64.as_str(), "1.25");
+
+        assert!(
+            <ExactNonNegativeJsonNumber as serde::Deserialize>::deserialize(
+                serde::de::value::F64Deserializer::<serde::de::value::Error>::new(f64::NAN),
+            )
+            .is_err(),
+            "changing only the finite f64 to NaN must fail closed"
+        );
+        assert_eq!(
+            serde_json::to_string(&from_f64).expect("finite f64 result re-serializes"),
+            "1.25",
+            "the rejected non-finite visitor cannot change the prior finite result"
+        );
+    }
+
+    #[test]
+    fn exact_finite_json_number_value_replay_uses_the_value_number_representation() {
+        let direct = serde_json::from_str::<ExactNonNegativeJsonNumber>("1.20e+4")
+            .expect("direct raw wire lexeme is admitted");
+        let value = serde_json::from_str::<Value>("1.20e+4")
+            .expect("the same raw number enters a serde Value replay");
+        let expected = value
+            .as_number()
+            .expect("Value remains a number")
+            .as_str()
+            .to_owned();
+        let replayed = serde_json::from_value::<ExactNonNegativeJsonNumber>(value)
+            .expect("Value replay admits the finite number representation");
+
+        assert_eq!(direct.as_str(), "1.20e+4");
+        assert_eq!(replayed.as_str(), expected);
+        assert_eq!(
+            serde_json::to_string(&replayed).expect("replayed number re-serializes"),
+            replayed.as_str(),
+            "replay must not apply another numeric normalization"
         );
     }
 

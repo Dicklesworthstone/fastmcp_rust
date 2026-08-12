@@ -1466,6 +1466,11 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
             "MCP 2024-11-05 response envelopes require exactly one of result or error",
         )));
     }
+    if !has_method && object.contains_key("params") {
+        return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
+            "JSON-RPC params is only permitted on request and notification envelopes",
+        )));
+    }
 
     if let Some(method_value) = object.get("method") {
         let method_name = method_value
@@ -2185,6 +2190,19 @@ mod tests {
             Err(Legacy2024EnvelopeError::Envelope(error))
                 if error.reason()
                     == "MCP 2024-11-05 response envelopes require exactly one of result or error"
+        ));
+
+        let response_with_params = json!({
+            "jsonrpc": "2.0",
+            "id": "response-with-params",
+            "result": {"legacy": true},
+            "params": {}
+        });
+        assert!(matches!(
+            decode_legacy_2024_11_05_envelope_classified(response_with_params),
+            Err(Legacy2024EnvelopeError::Envelope(error))
+                if error.reason()
+                    == "JSON-RPC params is only permitted on request and notification envelopes"
         ));
     }
 
