@@ -6340,7 +6340,7 @@ async fn run_websocket_dispatch_bridge(
         if cx.checkpoint().is_err() {
             break Ok(());
         }
-        let deadline = cx.now().saturating_add(WEBSOCKET_DRIVER_POLL_INTERVAL);
+        let deadline = cx.now() + WEBSOCKET_DRIVER_POLL_INTERVAL;
         match asupersync::time::timeout_at(deadline, transport.recv(cx)).await {
             Ok(Ok(mut message)) => {
                 if let JsonRpcMessage::Request(request) = &mut message {
