@@ -108,12 +108,17 @@ pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
 #[cfg(feature = "websocket")]
 pub use fastmcp_transport::websocket::AsyncWsServerTransport;
 pub use handler::{
-    BidirectionalSenders, BoxFuture, CompletionHandler, FinalMethodOutcome,
-    FinalResourceReadCacheHintProvenance, FinalToolOutcome, FinalToolSchemaAuthority,
-    ProgressNotificationSender, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    BidirectionalSenders, BoxFuture, CompletionHandler, FinalElicitation,
+    FinalElicitationContextExt, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
+    FinalToolOutcome, FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler,
+    ResourceHandler, ToolErrorKind, ToolHandler, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
+use oauth::{
+    AuthorizationRequest, CodeChallengeMethod, OAuthError, OAuthHttpRoutes,
+    OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName, TokenRequest,
+};
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 use proxy::ProxyFinalTaskRelay;
 #[cfg(feature = "proxy")]
@@ -481,8 +486,8 @@ use fastmcp_console::console::FastMcpConsole;
 use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_core::logging::{debug, error, info, targets};
 use fastmcp_core::{
-    AuthContext, McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation,
-    McpResult, SessionState, Sha256Digest, block_on, sha256_bounded,
+    AuthContext, ClientCapabilityInfo, McpContext, McpContextLeaseGuard, McpError, McpErrorCode,
+    McpRequestCancellation, McpResult, SessionState, Sha256Digest, block_on, sha256_bounded,
 };
 #[cfg(any(feature = "apps", feature = "tasks"))]
 use fastmcp_protocol::ExtensionDescriptorRegistry;
@@ -515,11 +520,11 @@ use fastmcp_protocol::tasks_extension::{
 };
 use fastmcp_protocol::{
     CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
-    ClientExtensionDiscovery, CoreRequest, CoreResult, CorrelationKey, DiscoveryCacheHints,
-    ExtensionDescriptor, ExtensionId, ExtensionRegistryError, ExtensionRegistryReceipt,
-    ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SERVER_INFO_META_KEY,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCoreResult,
-    FinalLogMessageParams, FinalResultMetadataSeal,
+    ClientCapabilities, ClientExtensionDiscovery, CoreRequest, CoreResult, CorrelationKey,
+    DiscoveryCacheHints, ExtensionDescriptor, ExtensionId, ExtensionRegistryError,
+    ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams,
+    FinalCoreRequest, FinalCoreResult, FinalLogMessageParams, FinalResultMetadataSeal,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
     GetPromptParams, InitializeParams, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
@@ -1695,6 +1700,50 @@ fn decode_final_core_request_for_middleware(
     )
     .map(Some)
     .map_err(|error| McpError::invalid_params(error.to_string()))
+}
+
+/// Projects admitted final client capabilities into the handler context.
+///
+/// Final handlers use the context capability view to decide whether an
+/// embedded MRTR input may be emitted. This is intentionally independent of
+/// legacy reverse-request senders: final elicitation is carried by the
+/// router-owned `input_required` registry, not by a server-to-client request.
+fn admitted_final_client_capability_info(
+    request: Option<&CoreRequest>,
+) -> McpResult<Option<ClientCapabilityInfo>> {
+    let Some(CoreRequest::Final(request)) = request else {
+        return Ok(None);
+    };
+    let metadata = match request {
+        FinalCoreRequest::Discover(params) => &params.meta,
+        FinalCoreRequest::Completion(params) => &params.meta,
+        FinalCoreRequest::ToolsList(params)
+        | FinalCoreRequest::ResourcesList(params)
+        | FinalCoreRequest::ResourceTemplatesList(params)
+        | FinalCoreRequest::PromptsList(params) => &params.meta,
+        FinalCoreRequest::ToolsCall(params) => &params.meta,
+        FinalCoreRequest::ResourcesRead(params) => &params.meta,
+        FinalCoreRequest::PromptsGet(params) => &params.meta,
+        FinalCoreRequest::SubscriptionsListen(params) => &params.meta,
+    };
+    let capability_value = serde_json::Value::Object(
+        metadata
+            .client_capabilities()
+            .map_err(|error| McpError::invalid_params(error.to_string()))?
+            .ok_or_else(|| McpError::invalid_params("final client capabilities are required"))?
+            .clone(),
+    );
+    let capabilities: ClientCapabilities = serde_json::from_value(capability_value)
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+    let (elicitation_form, elicitation_url) = capabilities
+        .elicitation
+        .as_ref()
+        .map_or((false, false), |elicitation| {
+            (elicitation.supports_form(), elicitation.supports_url())
+        });
+    Ok(Some(
+        ClientCapabilityInfo::new().with_elicitation(elicitation_form, elicitation_url),
+    ))
 }
 
 /// A raw parameter sidecar is usable only while authentication and admission
@@ -3420,6 +3469,26 @@ pub struct ServerHttpEndpoint {
     server: Arc<Server>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_origin: String,
+}
+
+fn validate_server_http_route_configuration(
+    server: &Server,
+) -> Result<(), ServerHttpEndpointError> {
+    let Some(routes) = server.oauth_http_routes.as_ref() else {
+        return Ok(());
+    };
+    let mut occupied = vec![
+        server.http_config.handler_config.base_path.as_str(),
+        server.http_config.health_path.as_str(),
+    ];
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    {
+        occupied.push(server.http_config.legacy_sse_path.as_str());
+        occupied.push(server.http_config.legacy_message_path.as_str());
+    }
+    routes
+        .validate_non_overlapping_paths(occupied)
+        .map_err(|error| ServerHttpEndpointError::InvalidConfiguration(error.to_string()))
 }
 
 /// A server-owned session opened through [`ServerHttpEndpoint`].
@@ -6481,6 +6550,7 @@ impl Server {
     /// Modern Streamable HTTP remains at the configured MCP path.
     #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
     pub fn into_http_endpoint(self) -> Result<ServerHttpEndpoint, ServerHttpEndpointError> {
+        validate_server_http_route_configuration(&self)?;
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
         };
@@ -6499,6 +6569,7 @@ impl Server {
         self,
         legacy_origin: impl Into<String>,
     ) -> Result<ServerHttpEndpoint, ServerHttpEndpointError> {
+        validate_server_http_route_configuration(&self)?;
         let endpoint = ServerHttpEndpoint {
             server: Arc::new(self),
             legacy_origin: legacy_origin.into(),
@@ -7962,6 +8033,305 @@ fn native_http_authentication_rejection() -> HttpResponse {
     HttpResponse::new(HttpStatus::UNAUTHORIZED).with_header("www-authenticate", "Bearer")
 }
 
+fn oauth_http_no_store(response: HttpResponse) -> HttpResponse {
+    response
+        .with_header("cache-control", "no-store")
+        .with_header("pragma", "no-cache")
+}
+
+fn oauth_http_error(error: OAuthError) -> HttpResponse {
+    let status = match &error {
+        OAuthError::ServerError(_) | OAuthError::TemporarilyUnavailable(_) => {
+            HttpStatus::SERVICE_UNAVAILABLE
+        }
+        _ => HttpStatus::BAD_REQUEST,
+    };
+    // OAuth error descriptions may contain implementation detail. The public
+    // route exposes only the standardized error code.
+    oauth_http_no_store(
+        HttpResponse::new(status).with_json(&serde_json::json!({ "error": error.error_code() })),
+    )
+}
+
+fn oauth_http_invalid_request() -> HttpResponse {
+    oauth_http_no_store(
+        HttpResponse::bad_request().with_json(&serde_json::json!({ "error": "invalid_request" })),
+    )
+}
+
+fn oauth_http_method_not_allowed(allow: &'static str) -> HttpResponse {
+    oauth_http_no_store(
+        HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED).with_header("allow", allow),
+    )
+}
+
+fn h1_oauth_singleton_header<'a>(
+    request: &'a asupersync::http::h1::Request,
+    expected_name: &str,
+) -> Result<Option<&'a str>, HttpResponse> {
+    let mut singleton = None;
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case(expected_name) {
+            if singleton.replace(value.as_str()).is_some() {
+                return Err(oauth_http_invalid_request());
+            }
+        }
+    }
+    Ok(singleton)
+}
+
+fn oauth_form_content_type(request: &asupersync::http::h1::Request) -> Result<(), HttpResponse> {
+    let Some(content_type) = h1_oauth_singleton_header(request, "content-type")? else {
+        return Err(HttpResponse::new(HttpStatus(415)));
+    };
+    if !content_type
+        .trim_matches([' ', '\t'])
+        .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+    {
+        return Err(HttpResponse::new(HttpStatus(415)));
+    }
+    Ok(())
+}
+
+fn oauth_reject_http_authorization(
+    request: &asupersync::http::h1::Request,
+) -> Result<(), HttpResponse> {
+    if h1_oauth_singleton_header(request, "authorization")?.is_some() {
+        return Err(oauth_http_invalid_request());
+    }
+    Ok(())
+}
+
+fn oauth_required_parameter(
+    admission: &mut OAuthParameterAdmission,
+    name: OAuthParameterName,
+) -> Result<String, OAuthError> {
+    admission
+        .take_defined_value(name)
+        .map(|value| value.into_string())
+        .ok_or_else(|| {
+            OAuthError::InvalidRequest("required OAuth parameter is missing".to_string())
+        })
+}
+
+fn oauth_authorization_request(
+    admission: &mut OAuthParameterAdmission,
+) -> Result<AuthorizationRequest, OAuthError> {
+    let code_challenge_method =
+        oauth_required_parameter(admission, OAuthParameterName::CodeChallengeMethod)?;
+    let code_challenge_method =
+        CodeChallengeMethod::parse(&code_challenge_method).ok_or_else(|| {
+            OAuthError::InvalidRequest("unsupported code_challenge_method".to_string())
+        })?;
+    let scopes = admission
+        .take_defined_value(OAuthParameterName::Scope)
+        .map(|value| {
+            value
+                .into_string()
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(AuthorizationRequest {
+        response_type: oauth_required_parameter(admission, OAuthParameterName::ResponseType)?,
+        client_id: oauth_required_parameter(admission, OAuthParameterName::ClientId)?,
+        redirect_uri: oauth_required_parameter(admission, OAuthParameterName::RedirectUri)?,
+        resource: admission
+            .take_defined_value(OAuthParameterName::Resource)
+            .map(|value| value.into_string()),
+        scopes,
+        state: admission
+            .take_defined_value(OAuthParameterName::State)
+            .map(|value| value.into_string()),
+        code_challenge: oauth_required_parameter(admission, OAuthParameterName::CodeChallenge)?,
+        code_challenge_method,
+    })
+}
+
+fn oauth_token_request(
+    admission: &mut OAuthParameterAdmission,
+) -> Result<TokenRequest, OAuthError> {
+    let scopes = admission
+        .take_defined_value(OAuthParameterName::Scope)
+        .map(|value| {
+            value
+                .into_string()
+                .split_ascii_whitespace()
+                .map(str::to_owned)
+                .collect()
+        });
+    Ok(TokenRequest {
+        grant_type: oauth_required_parameter(admission, OAuthParameterName::GrantType)?,
+        code: admission
+            .take_defined_value(OAuthParameterName::Code)
+            .map(|value| value.into_string()),
+        redirect_uri: admission
+            .take_defined_value(OAuthParameterName::RedirectUri)
+            .map(|value| value.into_string()),
+        client_id: oauth_required_parameter(admission, OAuthParameterName::ClientId)?,
+        client_secret: admission
+            .take_defined_value(OAuthParameterName::ClientSecret)
+            .map(|value| value.into_string()),
+        code_verifier: admission
+            .take_defined_value(OAuthParameterName::CodeVerifier)
+            .map(|value| value.into_string()),
+        refresh_token: admission
+            .take_defined_value(OAuthParameterName::RefreshToken)
+            .map(|value| value.into_string()),
+        scopes,
+        resource: admission
+            .take_defined_value(OAuthParameterName::Resource)
+            .map(|value| value.into_string()),
+    })
+}
+
+fn dispatch_oauth_h1_request(
+    routes: &OAuthHttpRoutes,
+    request: &asupersync::http::h1::Request,
+    raw_path: &str,
+    raw_query: &str,
+) -> HttpResponse {
+    if let Err(response) = oauth_reject_http_authorization(request) {
+        return response;
+    }
+    if raw_path == routes.authorization_path() {
+        if !matches!(request.method, Http1Method::Get) {
+            return oauth_http_method_not_allowed("GET");
+        }
+        if !request.body.is_empty() {
+            return oauth_http_invalid_request();
+        }
+        let mut admission = match OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::AuthorizationQuery,
+            raw_query.as_bytes(),
+        ) {
+            Ok(admission) => admission,
+            Err(_) => return oauth_http_invalid_request(),
+        };
+        let authorization = match oauth_authorization_request(&mut admission) {
+            Ok(authorization) => authorization,
+            Err(error) => return oauth_http_error(error),
+        };
+        return match routes.server().authorize(&authorization) {
+            Ok((_code, redirect)) => oauth_http_no_store(
+                HttpResponse::new(HttpStatus(303)).with_header("location", redirect),
+            ),
+            Err(error) => oauth_http_error(error),
+        };
+    }
+
+    if !raw_query.is_empty() {
+        return oauth_http_invalid_request();
+    }
+    if raw_path == routes.token_path() {
+        if !matches!(request.method, Http1Method::Post) {
+            return oauth_http_method_not_allowed("POST");
+        }
+        if let Err(response) = oauth_form_content_type(request) {
+            return oauth_http_no_store(response);
+        }
+        let mut admission = match OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            &request.body,
+        ) {
+            Ok(admission) => admission,
+            Err(_) => return oauth_http_invalid_request(),
+        };
+        let token = match oauth_token_request(&mut admission) {
+            Ok(token) => token,
+            Err(error) => return oauth_http_error(error),
+        };
+        return match routes.server().token(&token) {
+            Ok(response) => oauth_http_no_store(HttpResponse::ok().with_json(&response)),
+            Err(error) => oauth_http_error(error),
+        };
+    }
+
+    if !matches!(request.method, Http1Method::Post) {
+        return oauth_http_method_not_allowed("POST");
+    }
+    if let Err(response) = oauth_form_content_type(request) {
+        return oauth_http_no_store(response);
+    }
+    let mut admission =
+        match OAuthParameterAdmission::admit(OAuthParameterEndpoint::RevocationForm, &request.body)
+        {
+            Ok(admission) => admission,
+            Err(_) => return oauth_http_invalid_request(),
+        };
+    let token = match oauth_required_parameter(&mut admission, OAuthParameterName::Token) {
+        Ok(token) => token,
+        Err(error) => return oauth_http_error(error),
+    };
+    let client_id = match oauth_required_parameter(&mut admission, OAuthParameterName::ClientId) {
+        Ok(client_id) => client_id,
+        Err(error) => return oauth_http_error(error),
+    };
+    let client_secret = admission
+        .take_defined_value(OAuthParameterName::ClientSecret)
+        .map(|value| value.into_string());
+    match routes
+        .server()
+        .revoke(&token, &client_id, client_secret.as_deref())
+    {
+        Ok(()) => oauth_http_no_store(HttpResponse::ok()),
+        Err(error) => oauth_http_error(error),
+    }
+}
+
+/// Handles an OAuth-only route before MCP's transport conversion can merge
+/// query fields or discard raw header cardinality. Returns true only when the
+/// request path was one of the installed immutable OAuth routes.
+async fn serve_oauth_h1_request<T>(
+    cx: &Cx,
+    framed: &mut Framed<T, Http1Codec>,
+    endpoint: &ServerHttpEndpoint,
+    request: &asupersync::http::h1::Request,
+) -> bool
+where
+    T: asupersync::io::AsyncWrite + Unpin,
+{
+    let Some(routes) = endpoint.server.oauth_http_routes.as_ref() else {
+        return false;
+    };
+    let (raw_path, raw_query) = request
+        .uri
+        .split_once('?')
+        .map_or((request.uri.as_str(), ""), |(path, query)| (path, query));
+    if !routes.has_path(raw_path) {
+        return false;
+    }
+
+    if cx.checkpoint().is_err() {
+        let _ = send_h1_response(
+            cx,
+            framed,
+            HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE),
+        )
+        .await;
+        return true;
+    }
+    let routes = routes.clone();
+    let request = request.clone();
+    let raw_path = raw_path.to_owned();
+    let raw_query = raw_query.to_owned();
+    let response = match cx.spawn_blocking(move |route_cx| {
+        if route_cx.checkpoint().is_err() {
+            return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
+        }
+        dispatch_oauth_h1_request(&routes, &request, &raw_path, &raw_query)
+    }) {
+        Ok(mut dispatch) => match dispatch.join(cx).await {
+            Ok(response) => response,
+            Err(_) => HttpResponse::internal_error(),
+        },
+        Err(_) => HttpResponse::internal_error(),
+    };
+    let _ = send_h1_response(cx, framed, response).await;
+    true
+}
+
 fn h1_response(mut response: HttpResponse) -> Http1Response {
     response
         .headers
@@ -9084,6 +9454,9 @@ async fn serve_http_connection(
         let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
         return;
     }
+    if serve_oauth_h1_request(cx, &mut framed, &endpoint, &request).await {
+        return;
+    }
     let transport_authorization = match h1_transport_authorization(&request) {
         Ok(authorization) => authorization,
         Err(response) => {
@@ -9360,6 +9733,9 @@ async fn serve_modern_http_connection(
         let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
         return;
     }
+    if serve_oauth_h1_request(cx, &mut framed, &endpoint, &request).await {
+        return;
+    }
     let transport_authorization = match h1_transport_authorization(&request) {
         Ok(authorization) => authorization,
         Err(response) => {
@@ -9568,6 +9944,8 @@ pub struct Server {
     protocol_policy: ProtocolPolicy,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
+    /// Optional OAuth-only public routes admitted before MCP transport conversion.
+    oauth_http_routes: Option<OAuthHttpRoutes>,
     /// Frozen modern-only extension descriptors, handlers, and resolver.
     extension_runtime: Option<Arc<ServerExtensionRuntime>>,
     /// Application-owned final Tasks state retained for the caller's supervisor.
@@ -10169,6 +10547,16 @@ impl Server {
                 return response_for_error(error);
             }
         };
+        let request_ctx = match admitted_final_client_capability_info(final_core_request.as_ref()) {
+            Ok(Some(capabilities)) => request_ctx.with_client_capabilities(capabilities),
+            Ok(None) => request_ctx,
+            Err(error) => {
+                if let Some(stats) = &self.stats {
+                    stats.record_request(&method, started_at.elapsed(), false);
+                }
+                return response_for_error(error);
+            }
+        };
 
         // The protocol-version marker is part of typed modern admission. Once
         // that admission has completed, keep the marker out of application
@@ -10389,6 +10777,13 @@ impl Server {
             Ok(request) => request,
             Err(error) => return response_for_error(error),
         };
+        match admitted_final_client_capability_info(final_core_request.as_ref()) {
+            Ok(Some(capabilities)) => {
+                request_ctx = request_ctx.with_client_capabilities(capabilities)
+            }
+            Ok(None) => {}
+            Err(error) => return response_for_error(error),
+        }
         // The outer request owner retains the sole final-progress runtime.
         // Router/handler derivation sees this reporter and reuses it instead
         // of constructing a second sender, so the coalescing slot and
@@ -26408,6 +26803,72 @@ mod lib_unit_tests {
         calls: Arc<AtomicUsize>,
     }
 
+    #[derive(Clone, Copy)]
+    enum PublicFinalElicitationMode {
+        Form,
+        Url,
+    }
+
+    struct PublicFinalElicitationTool {
+        name: &'static str,
+        mode: PublicFinalElicitationMode,
+    }
+
+    impl ToolHandler for PublicFinalElicitationTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: self.name.to_owned(),
+                description: Some(
+                    "Proves public final elicitation capability propagation".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("exact legacy result")])
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
+        fn call_final_outcome(
+            &self,
+            ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            let elicitation = match self.mode {
+                PublicFinalElicitationMode::Form => ctx.final_elicitation_form(
+                    "approval",
+                    "Approve this operation",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"approved": {"type": "boolean"}},
+                        "required": ["approved"],
+                    }),
+                )?,
+                PublicFinalElicitationMode::Url => ctx.final_elicitation_url(
+                    "approval",
+                    "Approve this operation",
+                    "https://example.com/approve",
+                )?,
+            };
+            Ok(FinalToolOutcome::InputRequired(
+                elicitation.into_input_required()?,
+            ))
+        }
+    }
+
     impl ToolHandler for LiveHttpMrtrTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -30918,6 +31379,194 @@ mod lib_unit_tests {
             {
                 return Err(format!(
                     "modern loopback discovery result was unexpected: {response:?}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_oauth_pkce_authorize_then_token_is_publicly_reachable() {
+        run_live_http_test(|cx| async move {
+            let oauth = Arc::new(oauth::OAuthServer::with_defaults());
+            oauth
+                .register_client(
+                    oauth::OAuthClient::builder("live-pkce-client")
+                        .redirect_uri("https://client.example.test/callback")
+                        .scope("mcp")
+                        .build()
+                        .map_err(|error| {
+                            format!("live OAuth client registration failed: {error}")
+                        })?,
+                )
+                .map_err(|error| format!("live OAuth client retention failed: {error}"))?;
+            let routes = OAuthHttpRoutes::new(Arc::clone(&oauth), "https://fastmcp.invalid/oauth")
+                .map_err(|error| format!("live OAuth HTTP routes were invalid: {error}"))?;
+            let bound = Server::new("live-oauth-pkce", "1.0.0")
+                .oauth_http_routes(routes)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live OAuth HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live OAuth HTTP address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let authorize = format!(
+                        "GET /oauth/authorize?response_type=code&client_id=live-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&state=opaque-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                    );
+                    let authorize = live_http_exchange(address, authorize.into_bytes()).await?;
+                    let location = live_http_response_header(&authorize, "location")?;
+                    let redirect = url::Url::parse(&location)
+                        .map_err(|error| format!("OAuth authorization Location was invalid: {error}"))?;
+                    let code = redirect
+                        .query_pairs()
+                        .find_map(|(name, value)| (name == "code").then(|| value.into_owned()))
+                        .ok_or_else(|| "OAuth authorization Location omitted code".to_owned())?;
+                    if redirect
+                        .query_pairs()
+                        .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+                        .as_deref()
+                        != Some("opaque-state")
+                    {
+                        return Err("OAuth authorization Location changed state".to_owned());
+                    }
+                    let form = format!(
+                        "grant_type=authorization_code&code={}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id=live-pkce-client&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                        url::form_urlencoded::byte_serialize(code.as_bytes()).collect::<String>(),
+                    );
+                    let token = format!(
+                        "POST /oauth/token HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        form.len(), form,
+                    );
+                    let token = live_http_exchange(address, token.into_bytes()).await?;
+                    caller_cx.cancel_with(CancelKind::User, Some("live OAuth PKCE complete"));
+                    Ok::<_, String>((authorize, token))
+                })
+                .map_err(|error| format!("live OAuth client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let (authorize, token) = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live OAuth client failed: {error:?}"))??;
+            let shutdown = serve.map_err(|error| format!("live OAuth server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "live OAuth PKCE").await?;
+            if !authorize.starts_with(b"HTTP/1.1 303") {
+                return Err(format!(
+                    "OAuth authorization did not redirect: {}",
+                    String::from_utf8_lossy(&authorize)
+                ));
+            }
+            if !token.starts_with(b"HTTP/1.1 200")
+                || live_http_response_header(&token, "cache-control")? != "no-store"
+            {
+                return Err(format!(
+                    "OAuth token response was not a no-store success: {}",
+                    String::from_utf8_lossy(&token)
+                ));
+            }
+            let token: serde_json::Value = serde_json::from_slice(live_http_response_body(&token)?)
+                .map_err(|error| format!("OAuth token response was not JSON: {error}"))?;
+            if token["token_type"] != "bearer"
+                || token["access_token"].as_str().is_none_or(str::is_empty)
+            {
+                return Err(format!("OAuth token response was incomplete: {token}"));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_oauth_redirect_uri_mismatch_preserves_authorization_code() {
+        run_live_http_test(|cx| async move {
+            let oauth = Arc::new(oauth::OAuthServer::with_defaults());
+            oauth
+                .register_client(
+                    oauth::OAuthClient::builder("live-redirect-client")
+                        .redirect_uri("https://client.example.test/callback")
+                        .scope("mcp")
+                        .build()
+                        .map_err(|error| {
+                            format!("live redirect client registration failed: {error}")
+                        })?,
+                )
+                .map_err(|error| format!("live redirect client retention failed: {error}"))?;
+            let routes = OAuthHttpRoutes::new(Arc::clone(&oauth), "https://fastmcp.invalid/oauth")
+                .map_err(|error| format!("live redirect OAuth routes were invalid: {error}"))?;
+            let bound = Server::new("live-oauth-redirect-retry", "1.0.0")
+                .oauth_http_routes(routes)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("live redirect OAuth HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("live redirect OAuth HTTP address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let authorize = format!(
+                        "GET /oauth/authorize?response_type=code&client_id=live-redirect-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                    );
+                    let authorize = live_http_exchange(address, authorize.into_bytes()).await?;
+                    let location = live_http_response_header(&authorize, "location")?;
+                    let redirect = url::Url::parse(&location)
+                        .map_err(|error| format!("OAuth redirect Location was invalid: {error}"))?;
+                    let code = redirect
+                        .query_pairs()
+                        .find_map(|(name, value)| (name == "code").then(|| value.into_owned()))
+                        .ok_or_else(|| "OAuth redirect Location omitted code".to_owned())?;
+                    let encoded_code = url::form_urlencoded::byte_serialize(code.as_bytes())
+                        .collect::<String>();
+                    let original = format!(
+                        "grant_type=authorization_code&code={encoded_code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id=live-redirect-client&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+                    );
+                    // RH-5: this form differs from `original` only at redirect_uri.
+                    let mismatch = original.replace(
+                        "redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback",
+                        "redirect_uri=https%3A%2F%2Fclient.example.test%2Fother",
+                    );
+                    let request = |form: &str| {
+                        format!(
+                            "POST /oauth/token HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            form.len(), form,
+                        )
+                        .into_bytes()
+                    };
+                    let rejected = live_http_exchange(address, request(&mismatch)).await?;
+                    let retried = live_http_exchange(address, request(&original)).await?;
+                    caller_cx.cancel_with(CancelKind::User, Some("live OAuth redirect retry complete"));
+                    Ok::<_, String>((rejected, retried))
+                })
+                .map_err(|error| format!("live redirect OAuth client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let (rejected, retried) = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("live redirect OAuth client failed: {error:?}"))??;
+            let shutdown =
+                serve.map_err(|error| format!("live redirect OAuth server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "live OAuth redirect retry").await?;
+            if !rejected.starts_with(b"HTTP/1.1 400")
+                || serde_json::from_slice::<serde_json::Value>(live_http_response_body(&rejected)?)
+                    .ok()
+                    .and_then(|body| body["error"].as_str().map(str::to_owned))
+                    .as_deref()
+                    != Some("invalid_grant")
+            {
+                return Err(format!(
+                    "redirect-only mismatch was not an invalid_grant rejection: {}",
+                    String::from_utf8_lossy(&rejected)
+                ));
+            }
+            if !retried.starts_with(b"HTTP/1.1 200") {
+                return Err(format!(
+                    "redirect-only mismatch consumed the authorization code: {}",
+                    String::from_utf8_lossy(&retried)
                 ));
             }
             Ok(())
@@ -40191,6 +40840,115 @@ mod lib_unit_tests {
         assert_eq!(handler_calls.load(Ordering::Acquire), 1);
         assert_eq!(middleware_calls.load(Ordering::Acquire), 1);
         assert!(!saw_credential.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn public_final_elicitation_projects_admitted_modes_without_mutating_on_rejection() {
+        let server = Server::new("public-final-elicitation", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("modern-only policy is available")
+            .tool(PublicFinalElicitationTool {
+                name: "public-final-form-elicitation",
+                mode: PublicFinalElicitationMode::Form,
+            })
+            .tool(PublicFinalElicitationTool {
+                name: "public-final-url-elicitation",
+                mode: PublicFinalElicitationMode::Url,
+            })
+            .build();
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let admitted_params = serde_json::json!({
+            "name": "public-final-form-elicitation",
+            "arguments": {},
+            "_meta": {
+                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {"elicitation": {"form": {}}},
+            },
+        });
+        let admitted = server
+            .dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    950,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                ),
+                &JsonRpcRequest::new("tools/call", Some(admitted_params.clone()), 950_i64),
+            )
+            .expect("public final form elicitation must respond");
+        assert!(admitted.error.is_none());
+        assert_eq!(
+            admitted
+                .result
+                .as_ref()
+                .and_then(|result| result.get("resultType")),
+            Some(&serde_json::json!("input_required"))
+        );
+        assert_eq!(
+            admitted
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/inputRequests/approval/params/mode")),
+            Some(&serde_json::json!("form"))
+        );
+        let active_before_rejection = server.router.mrtr_exchanges.active_len();
+        assert_eq!(active_before_rejection, 1);
+
+        let mut capability_removed = admitted_params.clone();
+        let capabilities = capability_removed
+            .pointer_mut("/_meta/io.modelcontextprotocol~1clientCapabilities")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("admitted fixture has a client capability object");
+        let admitted_capability_count = capabilities.len();
+        assert!(
+            capabilities.remove("elicitation").is_some(),
+            "the planted negative removes only the elicitation capability"
+        );
+        assert_eq!(capabilities.len() + 1, admitted_capability_count);
+        let capability_rejected = server
+            .dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    951,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                ),
+                &JsonRpcRequest::new("tools/call", Some(capability_removed), 951_i64),
+            )
+            .expect("the capability-negative final request must respond");
+        assert_eq!(
+            capability_rejected.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InvalidRequest).into())
+        );
+        assert_eq!(
+            server.router.mrtr_exchanges.active_len(),
+            active_before_rejection,
+            "removing only client elicitation capability cannot mint or consume MRTR state"
+        );
+
+        let mut url_mismatch = admitted_params;
+        url_mismatch["name"] = serde_json::json!("public-final-url-elicitation");
+        let url_rejected = server
+            .dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx,
+                    952,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                ),
+                &JsonRpcRequest::new("tools/call", Some(url_mismatch), 952_i64),
+            )
+            .expect("the form-only URL negative must respond");
+        assert_eq!(
+            url_rejected.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InvalidRequest).into())
+        );
+        assert_eq!(
+            server.router.mrtr_exchanges.active_len(),
+            active_before_rejection,
+            "a form-only client cannot mint URL elicitation state"
+        );
     }
 
     #[test]
