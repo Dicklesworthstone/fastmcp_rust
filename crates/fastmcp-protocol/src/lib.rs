@@ -41,6 +41,8 @@
 
 pub mod common_types;
 pub mod extensions;
+#[cfg(feature = "jose")]
+pub mod jose;
 mod jsonrpc;
 #[cfg(feature = "apps")]
 pub mod mcp_apps_bridge;

@@ -17,11 +17,9 @@ default = []
 legacy-2024-11-05 = []
 tasks = []
 apps = []
-# Placeholder for JOSE/JWT support gated by the server auth features
-# (enterprise-auth, oauth-client-credentials, builtin-auth-server,
-# jwt-resource-auth). No protocol code is gated on it yet; it exists so
-# those optional server features resolve.
-jose = []
+# Bounded compact-JWS verification primitives. Policy and key discovery stay
+# in their owning server/auth layers.
+jose = ["dep:ring", "dep:zeroize"]
 
 [dependencies]
 fastmcp-core.workspace = true
@@ -29,6 +27,8 @@ base64.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 regex.workspace = true
+ring = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 
 [lints]
 workspace = true
