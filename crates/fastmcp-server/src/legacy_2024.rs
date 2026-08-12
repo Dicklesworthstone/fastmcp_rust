@@ -1394,6 +1394,20 @@ mod tests {
         }
     }
 
+    struct StaticResultHandler {
+        result: Value,
+    }
+
+    impl Legacy2024Handler for StaticResultHandler {
+        fn handle_legacy_2024(
+            &mut self,
+            _method: &'static str,
+            _params: Option<&Value>,
+        ) -> Result<Value, Legacy2024HandlerError> {
+            Ok(self.result.clone())
+        }
+    }
+
     struct LiveRecordingHandler {
         binding: LegacyPeerBinding,
         calls: Arc<Mutex<Vec<(LegacyPeerBinding, &'static str)>>>,
@@ -1457,6 +1471,11 @@ mod tests {
 
     fn failing_adapter(error: Legacy2024HandlerError) -> Legacy2024ServerAdapter<FailingHandler> {
         Legacy2024ServerAdapter::install(binding(), server_config(), FailingHandler { error })
+            .expect("exact test configuration must install")
+    }
+
+    fn tool_result_adapter(result: Value) -> Legacy2024ServerAdapter<StaticResultHandler> {
+        Legacy2024ServerAdapter::install(binding(), server_config(), StaticResultHandler { result })
             .expect("exact test configuration must install")
     }
 
@@ -1784,6 +1803,48 @@ mod tests {
             assert_eq!(adapter.snapshot(), before, "{member}");
         }
         assert!(adapter.handler.methods.is_empty());
+    }
+
+    #[test]
+    fn final_reserved_handler_result_metadata_rejects_without_adapter_state_change() {
+        let binding = binding();
+        let accepted_result = json!({
+            "content": [{"type": "text", "text": "legacy"}],
+            "_meta": {"com.example/application": true}
+        });
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": TOOLS_CALL,
+            "params": {"name": "legacy-tool"}
+        });
+
+        let mut accepted = tool_result_adapter(accepted_result.clone());
+        initialize_operating(&mut accepted);
+        assert_eq!(
+            accepted.receive(binding, request.clone()),
+            Ok(Legacy2024Outbound::Response(json!({
+                "jsonrpc": "2.0", "id": 2, "result": accepted_result,
+            })))
+        );
+
+        let mut rejected_result = accepted_result;
+        rejected_result["_meta"]["io.modelcontextprotocol/serverInfo"] = json!({});
+        let mut rejected = tool_result_adapter(rejected_result);
+        initialize_operating(&mut rejected);
+        let before = rejected.snapshot();
+        assert_eq!(
+            rejected.receive(binding, request),
+            Ok(Legacy2024Outbound::Response(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {
+                    "code": -32602,
+                    "message": "handler result is not losslessly representable in exact MCP 2024-11-05",
+                }
+            })))
+        );
+        assert_eq!(rejected.snapshot(), before);
     }
 
     #[test]

@@ -786,6 +786,11 @@ pub fn classify_legacy_2024_result(
     let object = result.as_object().ok_or(Legacy2024WireError(
         "ordinary MCP 2024-11-05 results must be objects",
     ))?;
+    if crate::result::has_final_only_metadata(result) {
+        return Err(Legacy2024WireError(
+            "final protocol metadata cannot be represented by exact MCP 2024-11-05",
+        ));
+    }
     validate_legacy_2024_result_members(kind, object)?;
     Ok(Legacy2024ResultDisposition::Lossless(kind))
 }
@@ -2127,6 +2132,28 @@ mod tests {
                         == "final result members cannot be represented by exact MCP 2024-11-05"
             ));
         }
+    }
+
+    #[test]
+    fn leg_01_legacy_tool_results_preserve_application_metadata_only() {
+        let accepted = json!({
+            "content": [{"type": "text", "text": "legacy"}],
+            "_meta": {"com.example/application": true}
+        });
+        assert_eq!(
+            translate_legacy_2024_result(TOOLS_CALL, accepted.clone()),
+            Ok(accepted.clone())
+        );
+
+        let mut rejected = accepted;
+        rejected["_meta"]["io.modelcontextprotocol/serverInfo"] = json!({});
+        assert_eq!(
+            translate_legacy_2024_result(TOOLS_CALL, rejected)
+                .expect_err("final-only result metadata cannot cross into exact 2024"),
+            Legacy2024WireError(
+                "final protocol metadata cannot be represented by exact MCP 2024-11-05"
+            )
+        );
     }
 
     #[test]
