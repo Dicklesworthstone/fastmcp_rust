@@ -7587,6 +7587,7 @@ impl ServerHttpSession {
                     endpoint_response,
                     transport_authorization,
                     raw_params,
+                    Some(auth_receipt),
                     None,
                 )
                 .map(Err);
@@ -10274,7 +10275,7 @@ impl Server {
     async fn dispatch_stateless_owned_with_cancellation(
         self: Arc<Self>,
         inbound: &InboundRequestContext,
-        request: JsonRpcRequest,
+        mut request: JsonRpcRequest,
         raw_params: Option<Arc<str>>,
         auth_receipt: Option<AuthDispatchCustody>,
         websocket_connection_generation: Option<u64>,
@@ -14247,6 +14248,11 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
+                        // Stdio is a local trusted pipe with no transport-layer
+                        // authorization; dispatch carries no auth custody for it.
+                        let transport_authorization: Option<TransportAuthorization> = None;
+                        let auth_receipt: Option<AuthDispatchCustody> = None;
+                        let auth_custody_generation: Option<u64> = None;
                         let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
@@ -14651,6 +14657,11 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
+                        // Stdio is a local trusted pipe with no transport-layer
+                        // authorization; dispatch carries no auth custody for it.
+                        let transport_authorization: Option<TransportAuthorization> = None;
+                        let auth_receipt: Option<AuthDispatchCustody> = None;
+                        let auth_custody_generation: Option<u64> = None;
                         let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
@@ -16293,9 +16304,10 @@ impl Server {
             self.authenticate_request_without_commit(ctx, request)?;
         Self::enforce_request_context(ctx)?;
         match authenticated {
-            Some(auth) if ctx.set_auth(auth) => Ok(fingerprint),
-            Some(_) => {
-                if let Some(error) = Self::request_context_error(ctx) {
+            Some(auth) => {
+                if ctx.set_auth(auth) {
+                    Ok(fingerprint)
+                } else if let Some(error) = Self::request_context_error(ctx) {
                     Err(error)
                 } else {
                     Err(McpError::internal_error(

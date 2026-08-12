@@ -191,7 +191,7 @@ use asupersync::{
     channel::oneshot,
     io::{AsyncRead, AsyncWrite},
 };
-use execution::{MrtrDriver, MrtrDriverLimits, RequestExecution, RequestExecutor};
+use execution::{MrtrDriver, MrtrDriverLimits};
 use fastmcp_core::{
     McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, block_on,
     sha256_bounded,
