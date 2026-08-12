@@ -8820,6 +8820,142 @@ mod tests {
         result
     }
 
+    /// Executes two independent final `tasks/get` POSTs after discovery.
+    ///
+    /// The first response varies only by its returned task ID. The second is
+    /// always valid, proving that the first finite response body was consumed
+    /// and cannot be mistaken for a later request-owned result.
+    #[cfg(feature = "tasks")]
+    fn run_public_http_tasks_get_id_pair(
+        first_response_task_id: &str,
+    ) -> (
+        Result<fastmcp_protocol::tasks_extension::GetTaskResult, ClientHttpConnectionError>,
+        fastmcp_protocol::tasks_extension::GetTaskResult,
+    ) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind local Tasks ID-pair HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read local Tasks ID-pair HTTP address");
+        let modern_target = format!("http://{address}/mcp");
+        let first_response_task_id = first_response_task_id.to_owned();
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Tasks ID-pair probe");
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body)
+                    .expect("Tasks ID-pair probe must be JSON-RPC")["method"],
+                "server/discover"
+            );
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let (mut first, _) = listener
+                .accept()
+                .expect("accept first independent tasks/get request");
+            let first_request = assert_public_http_tasks_lifecycle_request(
+                read_request(&mut first),
+                "tasks/get",
+                2,
+            );
+            assert_eq!(first_request["params"]["taskId"], "task-73");
+            let first_response = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","taskId":"{first_response_task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#
+            );
+            write_response(
+                &mut first,
+                200,
+                "application/json",
+                first_response.as_bytes(),
+            );
+
+            let (mut second, _) = listener
+                .accept()
+                .expect("accept fresh tasks/get after the first body is consumed");
+            let second_request = assert_public_http_tasks_lifecycle_request(
+                read_request(&mut second),
+                "tasks/get",
+                3,
+            );
+            assert_eq!(second_request["params"]["taskId"], "task-73");
+            write_response(
+                &mut second,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:01.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":null}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("Tasks discovery selects final HTTP tasks/get");
+        let task_id =
+            fastmcp_protocol::FinalTaskId::parse("task-73").expect("bounded Tasks task ID");
+        let first = runtime_block_on(connection.get_task_final(
+            &cx,
+            RequestId::Number(2),
+            task_id.clone(),
+            4_096,
+        ));
+        let second =
+            runtime_block_on(connection.get_task_final(&cx, RequestId::Number(3), task_id, 4_096))
+                .expect("fresh tasks/get must not observe the first response body");
+        server.join().expect("Tasks ID-pair HTTP server must join");
+        (first, second)
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_tasks_get_exact_id_retains_its_own_response_body() {
+        let (first, second) = run_public_http_tasks_get_id_pair("task-73");
+        assert_eq!(
+            first
+                .expect("the matching first tasks/get response is admitted")
+                .task
+                .base()
+                .task_id
+                .as_str(),
+            "task-73"
+        );
+        assert_eq!(second.task.base().task_id.as_str(), "task-73");
+        assert_eq!(
+            second.task.base().last_updated_at.as_str(),
+            "2026-07-28T12:00:01.000Z"
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_tasks_get_rejects_one_field_foreign_id_then_reuses_fresh_body() {
+        let (first, second) = run_public_http_tasks_get_id_pair("task-74");
+        assert!(matches!(
+            first,
+            Err(ClientHttpConnectionError::Modern(
+                ModernHttpClientError::TasksGetIdMismatch { expected, actual }
+            )) if expected.as_str() == "task-73" && actual.as_str() == "task-74"
+        ));
+        assert_eq!(second.task.base().task_id.as_str(), "task-73");
+        assert_eq!(
+            second.task.base().last_updated_at.as_str(),
+            "2026-07-28T12:00:01.000Z",
+            "the valid second response is fresh rather than leaked from the rejected body"
+        );
+    }
+
     #[test]
     fn final_core_listener_live_progress_is_exact_and_terminal_closes_body() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind final core listener peer");

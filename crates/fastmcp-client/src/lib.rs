@@ -191,7 +191,7 @@ use asupersync::{
     channel::oneshot,
     io::{AsyncRead, AsyncWrite},
 };
-use execution::{MrtrDriver, MrtrDriverLimits, RequestExecution, RequestExecutor};
+use execution::{MrtrDriver, MrtrDriverLimits};
 use fastmcp_core::{
     McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, block_on,
     sha256_bounded,
@@ -3554,7 +3554,7 @@ where
     ) -> McpResult<RequestExecution<SynchronousWebSocketClientTransport<R, S>>> {
         let id = self
             .next_id
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                 current.checked_add(1)
             })
             .map_err(|_| McpError::internal_error("WebSocket client request ID space exhausted"))?;
@@ -4102,11 +4102,7 @@ where
         .await
         {
             Ok(mut client) => {
-                client.session = client
-                    .session
-                    .clone()
-                    .try_with_protocol_plan(auto_plan.clone())
-                    .map_err(|_| McpError::internal_error("Auto rejected final discovery"))?;
+                client.session.set_protocol_plan(auto_plan.clone());
                 Ok(client)
             }
             Err(error) if error.code == McpErrorCode::MethodNotFound => {
@@ -4121,13 +4117,7 @@ where
                     fresh_legacy,
                 )
                 .await?;
-                client.session = client
-                    .session
-                    .clone()
-                    .try_with_protocol_plan(auto_plan)
-                    .map_err(|_| {
-                        McpError::internal_error("Auto rejected exact legacy initialization")
-                    })?;
+                client.session.set_protocol_plan(auto_plan);
                 Ok(client)
             }
             Err(error) => Err(error),
@@ -4610,6 +4600,9 @@ where
         cx: &Cx,
         task_id: FinalTaskId,
     ) -> McpResult<FinalGetTaskResult> {
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
         self.require_final_tasks_method(TASK_GET)?;
         let result: FinalGetTaskResult = self
             .request_final_tasks(
@@ -4622,9 +4615,12 @@ where
             )
             .await?;
         if result.task.base().task_id != task_id {
-            return Err(McpError::invalid_request(
-                "WebSocket tasks/get response taskId does not match its request",
-            ));
+            return Err(self
+                .close_after_protocol_error(
+                    cx,
+                    "WebSocket tasks/get response taskId does not match its request",
+                )
+                .await);
         }
         Ok(result)
     }
@@ -14250,7 +14246,7 @@ mod tests {
         source.as_bytes().to_vec().into_boxed_slice()
     }
 
-    fn modern_discovery_response(id: i64) -> Box<[u8]> {
+    fn websocket_test_modern_discovery_frame(id: i64) -> Box<[u8]> {
         websocket_test_frame(&format!(
             r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{}},"_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"websocket-test","version":"1.0"}}}},"ttlMs":0,"cacheScope":"private"}}}}"#
         ))
@@ -14793,6 +14789,62 @@ mod tests {
                 .expect("typed tasks/get traverses the admitted extension transport");
             assert!(matches!(task.task, FinalTask::InputRequired { .. }));
             client.close(&cx).await.expect("close Tasks client");
+        });
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn websocket_async_tasks_get_task_id_mismatch_is_terminal_and_cannot_be_reused() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(
+                &mut peer_io,
+                &modern_tasks_discovery_response("websocket-task-mismatch", serde_json::json!({})),
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-2","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("Tasks discovery negotiates before taskId mismatch");
+            let error = client
+                .get_task_final(
+                    &cx,
+                    FinalTaskId::parse("task-1").expect("valid requested task ID"),
+                )
+                .await
+                .expect_err("one-dimension tasks/get taskId mismatch is terminal");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(client.closed);
+            assert!(client.close_settled);
+            let next_id = client.next_id;
+            let reuse = client
+                .get_task_final(
+                    &cx,
+                    FinalTaskId::parse("task-1").expect("valid requested task ID"),
+                )
+                .await
+                .expect_err("terminal tasks/get cannot consume later valid-looking frames");
+            assert_eq!(reuse.code, McpErrorCode::InternalError);
+            assert_eq!(
+                client.next_id, next_id,
+                "terminal reuse makes no transport contact"
+            );
         });
     }
 
@@ -15422,7 +15474,7 @@ mod tests {
         let closed = Arc::new(AtomicBool::new(false));
         let receiver = WebSocketTestRecv {
             frames: VecDeque::from([
-                modern_discovery_response(1),
+                websocket_test_modern_discovery_frame(1),
                 websocket_test_frame(
                     r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"ws-progress","progress":1.20e+4}}"#,
                 ),
