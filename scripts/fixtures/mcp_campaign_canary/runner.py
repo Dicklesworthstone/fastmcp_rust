@@ -45,6 +45,8 @@ ORCHESTRATOR = "McpCampaignOrchestrator"
 HARNESS = "scripts/mcp_campaign_canary.sh"
 MODEL = "campaign-canary-v1"
 CHECKBOX = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+")
+SUBJECT_REVISION_PREFIX = "subject_revision:"
+SHORT_REASON_REJECTION = "close reason is shorter than the isolated policy minimum"
 
 
 def now() -> str:
@@ -92,44 +94,54 @@ class Runner:
         if self.stale_revision == self.subject_revision:
             raise RuntimeError("stale canary revision must differ from the subject revision")
         self.current_case = "preflight"
+        self.close_reason_min_length = isolated_close_reason_min_length(POLICY)
 
     def git(self, *args: str) -> str:
         return subprocess.run(
             ["git", *args], cwd=ROOT, check=True, text=True, capture_output=True
         ).stdout.strip()
 
+    def record_command(
+        self,
+        argv: list[str],
+        completed: subprocess.CompletedProcess[str],
+        *,
+        actor: str | None,
+        started_ts: str,
+        finished_ts: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        record: dict[str, Any] = {
+            "case_id": self.current_case,
+            "actor": actor,
+            "argv": argv,
+            "exit_code": completed.returncode,
+            "started_ts": started_ts,
+            "finished_ts": finished_ts,
+            "stdout_sha256": sha256_bytes(completed.stdout.encode()),
+            "stderr_sha256": sha256_bytes(completed.stderr.encode()),
+            "stdout": json_value(completed.stdout),
+            "stderr": completed.stderr,
+        }
+        if extra:
+            record.update(extra)
+        self.commands.append(record)
+
     def run(self, argv: list[str], *, actor: str | None = None) -> subprocess.CompletedProcess[str]:
+        started_ts = now()
         completed = subprocess.run(argv, cwd=ROOT, text=True, capture_output=True, check=False)
-        self.commands.append(
-            {
-                "case_id": self.current_case,
-                "actor": actor,
-                "argv": argv,
-                "exit_code": completed.returncode,
-                "stdout_sha256": sha256_bytes(completed.stdout.encode()),
-                "stderr_sha256": sha256_bytes(completed.stderr.encode()),
-                "stdout": json_value(completed.stdout),
-                "stderr": completed.stderr,
-            }
-        )
+        self.record_command(argv, completed, actor=actor, started_ts=started_ts, finished_ts=now())
         return completed
 
     def br(self, *args: str, actor: str | None = None) -> subprocess.CompletedProcess[str]:
         argv = [str(self.br_binary), *args, "--db", str(self.db), "--json"]
         if actor:
             argv.extend(["--actor", actor])
+        started_ts = now()
         completed = subprocess.run(
             argv, cwd=self.workspace, text=True, capture_output=True, check=False
         )
-        self.commands.append(
-            {
-                "case_id": self.current_case, "actor": actor, "argv": argv,
-                "exit_code": completed.returncode,
-                "stdout_sha256": sha256_bytes(completed.stdout.encode()),
-                "stderr_sha256": sha256_bytes(completed.stderr.encode()),
-                "stdout": json_value(completed.stdout), "stderr": completed.stderr,
-            }
-        )
+        self.record_command(argv, completed, actor=actor, started_ts=started_ts, finished_ts=now())
         return completed
 
     def initialize_isolated_tracker(self) -> subprocess.CompletedProcess[str]:
@@ -192,15 +204,36 @@ class Runner:
         if completed.returncode:
             raise RuntimeError(f"cannot report {provider} {status}: {completed.stderr}")
 
-    def close(self, issue_id: str, *, actor: str, reason: str, attributed: bool = True) -> subprocess.CompletedProcess[str]:
+    def close(
+        self,
+        issue_id: str,
+        *,
+        actor: str,
+        reason: str,
+        agent_name: str | None = None,
+        harness: str | None = None,
+        model: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         args = ["close", issue_id, "--reason", reason]
-        if attributed:
-            args.extend(["--agent-name", actor, "--harness", HARNESS, "--model", MODEL])
+        if agent_name:
+            args.extend(["--agent-name", agent_name])
+        if harness:
+            args.extend(["--harness", harness])
+        if model:
+            args.extend(["--model", model])
         return self.br(*args, actor=actor)
 
     def guarded_close(
-        self, issue_id: str, *, issue: Any, ledger: Any, actor: str, reason: str,
-        attributed: bool = True,
+        self,
+        issue_id: str,
+        *,
+        issue: Any,
+        ledger: Any,
+        actor: str,
+        reason: str,
+        agent_name: str | None = None,
+        harness: str | None = None,
+        model: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Require every non-bypass campaign closure to satisfy the frozen contract.
 
@@ -208,51 +241,62 @@ class Runner:
         This owned, auditable pre-transition guard supplies that missing operational
         control without claiming it is tracker-native enforcement.
         """
+        started_ts = now()
         rejection = guarded_close_rejection(
             issue=issue,
             ledger=ledger,
             actor=actor,
             reason=reason,
-            attributed=attributed,
+            closer_agent_name=agent_name or "",
+            harness=harness or "",
+            model=model or "",
             subject_revision=self.subject_revision,
+            case_id=self.current_case,
             explicit_db=self.db,
+            close_reason_min_length=self.close_reason_min_length,
         )
         argv = [
             "guarded-close", issue_id, "--db", str(self.db),
             "--expected-revision", self.subject_revision,
+            "--closer-agent-name", agent_name or "",
+            "--harness", harness or "",
+            "--model", model or "",
         ]
         if rejection:
             completed = subprocess.CompletedProcess(
-                argv, 1, json.dumps({"rejected": rejection}),
+                argv, 1, json.dumps({"rejected": rejection, "closure_entry_point": "guarded-close"}),
                 "guarded-close refused close before tracker transition",
             )
-            self.commands.append(
-                {
-                    "case_id": self.current_case, "actor": actor, "argv": argv,
-                    "exit_code": completed.returncode,
-                    "stdout_sha256": sha256_bytes(completed.stdout.encode()),
-                    "stderr_sha256": sha256_bytes(completed.stderr.encode()),
-                    "stdout": json_value(completed.stdout), "stderr": completed.stderr,
-                }
+            self.record_command(
+                argv, completed, actor=actor, started_ts=started_ts, finished_ts=now(),
+                extra={"closure_entry_point": "guarded-close", "guard_decision": "rejected"},
             )
             return completed
-        self.commands.append(
-            {
-                "case_id": self.current_case, "actor": actor, "argv": argv,
-                "exit_code": 0,
-                "stdout_sha256": sha256_bytes(b'{"guarded_close":"accepted"}'),
-                "stderr_sha256": sha256_bytes(b""),
-                "stdout": {"guarded_close": "accepted", "closure_entry_point": "guarded-close"},
-                "stderr": "",
-            }
+        accepted = subprocess.CompletedProcess(
+            argv, 0, json.dumps({"guarded_close": "accepted", "closure_entry_point": "guarded-close"}),
+            "",
         )
-        return self.close(issue_id, actor=actor, reason=reason, attributed=attributed)
+        self.record_command(
+            argv, accepted, actor=actor, started_ts=started_ts, finished_ts=now(),
+            extra={"closure_entry_point": "guarded-close", "guard_decision": "accepted"},
+        )
+        return self.close(
+            issue_id, actor=actor, reason=reason,
+            agent_name=agent_name, harness=harness, model=model,
+        )
 
     def record_case(
         self, case: dict[str, str], issue_id: str | None, before: Any, after: Any,
         ledger_before: Any, ledger_after: Any, audit_before: Any, audit_after: Any,
-        passed: bool, detail: str,
+        passed: bool, detail: str, *, started_ts: str, finished_ts: str,
+        execution_outcomes: dict[str, int] | None = None,
     ) -> None:
+        case_commands = [command for command in self.commands if command["case_id"] == case["id"]]
+        outcomes = {
+            "early_aborted": 0, "stale": 0, "mixed": 0, "substituted": 0,
+        }
+        if execution_outcomes:
+            outcomes.update(execution_outcomes)
         self.events.append(
             {
                 "case_id": case["id"], "kind": case["kind"], "planted_dimension": case["planted_dimension"],
@@ -260,11 +304,18 @@ class Runner:
                 "passed": passed, "detail": detail, "issue_before": before, "issue_after": after,
                 "gate_ledger_before": ledger_before, "gate_ledger_after": ledger_after,
                 "audit_before": audit_before, "audit_after": audit_after,
+                "started_ts": started_ts, "finished_ts": finished_ts,
                 "command_indexes": [i for i, command in enumerate(self.commands) if command["case_id"] == case["id"]],
+                "command_clocks": [
+                    {
+                        "argv": command.get("argv"),
+                        "started_ts": command.get("started_ts"),
+                        "finished_ts": command.get("finished_ts"),
+                    }
+                    for command in case_commands
+                ],
                 "first_attempt": 1, "retries": 0,
-                "execution_outcomes": {
-                    "early_aborted": 0, "stale": 0, "mixed": 0, "substituted": 0,
-                },
+                "execution_outcomes": outcomes,
             }
         )
 
@@ -294,8 +345,43 @@ def unchanged(before: tuple[Any, Any, Any], after: tuple[Any, Any, Any]) -> bool
     return all(same(left, right) for left, right in zip(before, after, strict=True))
 
 
-def retains_revision(value: Any, revision: str) -> bool:
-    return revision in json.dumps(value, sort_keys=True)
+def isolated_close_reason_min_length(policy_path: Path) -> int:
+    """Read the copied/tracked policy min_length. The canary does not invent policy."""
+    in_block = False
+    for raw in policy_path.read_text().splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("require_close_reason:"):
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        if stripped.startswith("min_length:"):
+            return int(stripped.split(":", 1)[1].strip())
+        if stripped and not raw[:1].isspace() and not stripped.startswith("#"):
+            break
+    raise RuntimeError("tracked policy does not declare close_policy.require_close_reason.min_length")
+
+
+def subject_revisions_in_notes(value: Any) -> set[str]:
+    """Collect only explicit subject_revision:<sha> tokens from gate notes."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key in ("note", "notes"):
+            note = value.get(key)
+            if isinstance(note, str):
+                for token in note.split():
+                    if token.startswith(SUBJECT_REVISION_PREFIX):
+                        found.add(token.removeprefix(SUBJECT_REVISION_PREFIX))
+        for child in value.values():
+            found.update(subject_revisions_in_notes(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.update(subject_revisions_in_notes(child))
+    return found
+
+
+def bound_to_subject_revision(ledger: Any, revision: str) -> bool:
+    return subject_revisions_in_notes(ledger) == {revision}
 
 
 def issue_field(issue: Any, field: str) -> Any:
@@ -324,8 +410,18 @@ def has_concrete_typed_references(reason: str, subject_revision: str, case_id: s
 
 
 def guarded_close_rejection(
-    *, issue: Any, ledger: Any, actor: str, reason: str, attributed: bool,
-    subject_revision: str, explicit_db: Path,
+    *,
+    issue: Any,
+    ledger: Any,
+    actor: str,
+    reason: str,
+    closer_agent_name: str,
+    harness: str,
+    model: str,
+    subject_revision: str,
+    case_id: str,
+    explicit_db: Path,
+    close_reason_min_length: int,
 ) -> str | None:
     if not explicit_db.is_file():
         return "explicit isolated database is unavailable"
@@ -335,22 +431,19 @@ def guarded_close_rejection(
         return "acceptance criteria are not fully checked"
     if actor == WORKER:
         return "closer must be distinct from the worker"
-    if not attributed:
+    if not closer_agent_name or not harness or not model:
         return "tier-one closer attribution is required"
+    if closer_agent_name != actor:
+        return "closer agent_name must equal the closer actor"
     if provider_statuses(ledger) != [("batch_verify", "pass")]:
         return "sole effective batch_verify PASS is required"
-    if not retains_revision(ledger, subject_revision):
+    if not bound_to_subject_revision(ledger, subject_revision):
         return "batch_verify PASS is not bound to the subject revision"
-    if not has_concrete_typed_references(reason, subject_revision, reason_case_id(reason)):
+    if len(reason) < close_reason_min_length:
+        return SHORT_REASON_REJECTION
+    if not has_concrete_typed_references(reason, subject_revision, case_id):
         return "concrete typed close references are required"
     return None
-
-
-def reason_case_id(reason: str) -> str:
-    for token in reason.split():
-        if token.startswith("run:"):
-            return token.removeprefix("run:")
-    return ""
 
 
 def guard_rejected_for(attempt: subprocess.CompletedProcess[str], reason: str) -> bool:
@@ -365,8 +458,21 @@ def valid_reason(runner: Runner) -> str:
     )
 
 
+def orchestrator_attribution() -> dict[str, str]:
+    return {"agent_name": ORCHESTRATOR, "harness": HARNESS, "model": MODEL}
+
+
+def last_guard_decision(runner: Runner, case_id: str) -> str | None:
+    for command in reversed(runner.commands):
+        if command.get("case_id") == case_id and command.get("closure_entry_point") == "guarded-close":
+            decision = command.get("guard_decision")
+            return decision if isinstance(decision, str) else None
+    return None
+
+
 def run_case(runner: Runner, case: dict[str, str]) -> None:
     runner.current_case = case["id"]
+    started_ts = now()
     issue_id: str | None = None
     before: Any = None
     after: Any = None
@@ -376,6 +482,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
     audit_after: Any = None
     passed = False
     detail = ""
+    execution_outcomes = {"early_aborted": 0, "stale": 0, "mixed": 0, "substituted": 0}
     try:
         case_id = case["id"]
         if case_id == "canary_live_tracker_unchanged":
@@ -388,25 +495,32 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.review(issue_id)
             runner.report_gate(
                 issue_id, "batch_verify", "pass", ORCHESTRATOR,
-                note=f"subject_revision:{runner.stale_revision}",
+                note=f"{SUBJECT_REVISION_PREFIX}{runner.stale_revision}",
             )
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
-                reason=valid_reason(runner),
+                reason=valid_reason(runner), **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
+            stale_only = subject_revisions_in_notes(ledger_before) == {runner.stale_revision}
+            execution_outcomes["stale"] = 1 if stale_only else 0
+            execution_outcomes["mixed"] = 1 if len(subject_revisions_in_notes(ledger_before)) > 1 else 0
             passed = (
                 runner.stale_revision != runner.subject_revision
-                and retains_revision(ledger_before, runner.stale_revision)
+                and stale_only
+                and not bound_to_subject_revision(ledger_before, runner.subject_revision)
                 and guard_rejected_for(attempt, "batch_verify PASS is not bound to the subject revision")
                 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             )
-            detail = "freshness guard rejects a ledger PASS bound to a distinct real ancestor revision before close"
+            detail = "freshness guard rejects a ledger PASS whose note binds only a distinct ancestor revision"
         elif case_id == "canary_direct_close_rejected":
             issue_id = runner.create_subject(case_id)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
+            attempt = runner.close(
+                issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner),
+                **orchestrator_attribution(),
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             detail = "open-to-closed close rejects without changing issue state"
@@ -423,15 +537,21 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
         elif case_id == "canary_self_close_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
-            runner.report_gate(issue_id, "batch_verify", "pass", WORKER)
+            runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=WORKER,
                 reason=valid_reason(runner),
+                agent_name=WORKER, harness=HARNESS, model=MODEL,
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
-            detail = "claimant cannot self-close after in-progress"
+            passed = (
+                bound_to_subject_revision(ledger_before, runner.subject_revision)
+                and provider_statuses(ledger_before) == [("batch_verify", "pass")]
+                and guard_rejected_for(attempt, "closer must be distinct from the worker")
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            )
+            detail = "only the closer identity is planted; worker cannot self-close"
         elif case_id == "canary_unchecked_acceptance_rejected":
             issue_id = runner.create_subject(case_id, checked=False)
             runner.review(issue_id)
@@ -439,7 +559,7 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
-                reason=valid_reason(runner),
+                reason=valid_reason(runner), **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
@@ -454,23 +574,33 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
-                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR, reason="short",
+                issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
+                reason="short", **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
-            detail = "short close reason rejects without state mutation"
+            passed = (
+                len("short") < runner.close_reason_min_length
+                and guard_rejected_for(attempt, SHORT_REASON_REJECTION)
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            )
+            detail = "short close reason is rejected at the length check before typed-reference evaluation"
         elif case_id == "canary_missing_typed_reference_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             runner.report_gate(issue_id, "batch_verify", "pass", ORCHESTRATOR)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
+            long_without_refs = "this deliberately long reason contains no required typed references"
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
-                reason="this deliberately long reason contains no required typed references",
+                reason=long_without_refs, **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
-            detail = "missing commit/run/evidence/incident references reject"
+            passed = (
+                len(long_without_refs) >= runner.close_reason_min_length
+                and guard_rejected_for(attempt, "concrete typed close references are required")
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            )
+            detail = "missing commit/run/evidence/incident references reject after the length check passes"
         elif case_id == "canary_missing_attribution_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
@@ -478,24 +608,27 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
-                reason=valid_reason(runner), attributed=False,
+                reason=valid_reason(runner),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
                 guard_rejected_for(attempt, "tier-one closer attribution is required")
                 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
             )
-            detail = "missing tier-one attribution rejects"
+            detail = "missing agent_name/harness/model rejects before any tracker transition"
         elif case_id == "canary_review_without_pass_rejected":
             issue_id = runner.create_subject(case_id)
             runner.review(issue_id)
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
-                reason=valid_reason(runner),
+                reason=valid_reason(runner), **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
-            passed = attempt.returncode != 0 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            passed = (
+                guard_rejected_for(attempt, "sole effective batch_verify PASS is required")
+                and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
+            )
             detail = "review issue without batch_verify PASS rejects"
         elif case_id == "canary_unauthorized_provider_limitation_detected":
             issue_id = runner.create_subject(case_id)
@@ -505,7 +638,10 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             # Intentional direct br close: this frozen limitation case proves that
             # installed br accepts an unauthorized provider PASS.  It is never a
             # passing campaign closure and the retained receipt names the bypass.
-            attempt = runner.close(issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner))
+            attempt = runner.close(
+                issue_id, actor=ORCHESTRATOR, reason=valid_reason(runner),
+                **orchestrator_attribution(),
+            )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             statuses = provider_statuses(ledger_before)
             passed = attempt.returncode == 0 and ("impostor", "pass") in statuses
@@ -521,11 +657,11 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             before, ledger_before, audit_before = runner.snapshot(issue_id)
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
-                reason=valid_reason(runner),
+                reason=valid_reason(runner), **orchestrator_attribution(),
             )
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
-                attempt.returncode != 0
+                guard_rejected_for(attempt, "sole effective batch_verify PASS is required")
                 and unchanged((before, ledger_before, audit_before), (after, ledger_after, audit_after))
                 and not any(status == "pass" for _, status in provider_statuses(ledger_after))
             )
@@ -538,19 +674,25 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             statuses = provider_statuses(ledger_before)
             fresh = (
                 runner.subject_revision == runner.receipt_revision
-                and retains_revision(ledger_before, runner.subject_revision)
+                and bound_to_subject_revision(ledger_before, runner.subject_revision)
             )
             attempt = runner.guarded_close(
                 issue_id, issue=before, ledger=ledger_before, actor=ORCHESTRATOR,
-                reason=valid_reason(runner),
+                reason=valid_reason(runner), **orchestrator_attribution(),
             ) if fresh and statuses == [("batch_verify", "pass")] else None
             after, ledger_after, audit_after = runner.snapshot(issue_id)
             passed = (
                 issue_field(before, "acceptance_criteria") == "- [x] verified canary acceptance"
+                and issue_field(before, "status") == "review"
                 and attempt is not None
+                and last_guard_decision(runner, case_id) == "accepted"
                 and attempt.returncode == 0
+                and issue_field(after, "status") == "closed"
+                and provider_statuses(ledger_before) == [("batch_verify", "pass")]
+                and provider_statuses(ledger_after) == [("batch_verify", "pass")]
+                and bound_to_subject_revision(ledger_after, runner.subject_revision)
             )
-            detail = "distinct orchestrator closes only with the fresh sole batch_verify PASS"
+            detail = "distinct orchestrator closes only after guarded-close accepts a fresh sole batch_verify PASS; status becomes closed"
         else:
             raise RuntimeError(f"unknown frozen case {case_id}")
     except Exception as error:  # Receipt must retain first failure rather than aborting the inventory.
@@ -560,7 +702,8 @@ def run_case(runner: Runner, case: dict[str, str]) -> None:
             after, ledger_after, audit_after = runner.snapshot(issue_id)
     runner.record_case(
         case, issue_id, before, after, ledger_before, ledger_after, audit_before, audit_after,
-        passed, detail,
+        passed, detail, started_ts=started_ts, finished_ts=now(),
+        execution_outcomes=execution_outcomes,
     )
 
 
@@ -639,7 +782,11 @@ def main() -> int:
         "passed": sum(event["passed"] for event in runner.events), "first_attempts": len(runner.events),
         "retries": 0, "ignored": 0, "filtered": 0, "skipped": len(cases) - len(runner.events),
         "execution_integrity": {
-            "zero_run": 0, "early_aborted": 0, "stale": 0, "mixed": 0, "substituted": 0,
+            "zero_run": 0,
+            "early_aborted": sum(event["execution_outcomes"].get("early_aborted", 0) for event in runner.events),
+            "stale": sum(event["execution_outcomes"].get("stale", 0) for event in runner.events),
+            "mixed": sum(event["execution_outcomes"].get("mixed", 0) for event in runner.events),
+            "substituted": sum(event["execution_outcomes"].get("substituted", 0) for event in runner.events),
         },
         "events_path": "events.jsonl",
         "commands_path": "commands.jsonl", "named_consumers": ["CI-BASE-01", "GATE-ALL-MCP-READY"],
