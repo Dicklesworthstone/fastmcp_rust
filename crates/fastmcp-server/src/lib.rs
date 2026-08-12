@@ -14292,14 +14292,12 @@ impl Server {
                     if matches!(era, ProtocolEra::Modern2026) {
                         // Stdio is a local trusted pipe with no transport-layer
                         // authorization; dispatch carries no auth custody for it.
-                        let transport_authorization: Option<TransportAuthorization> = None;
-                        let auth_receipt: Option<AuthDispatchCustody> = None;
-                        let auth_custody_generation: Option<u64> = None;
                         let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
+                            TransportAuthorization::default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
@@ -14700,14 +14698,12 @@ impl Server {
                     if matches!(era, ProtocolEra::Modern2026) {
                         // Stdio is a local trusted pipe with no transport-layer
                         // authorization; dispatch carries no auth custody for it.
-                        let transport_authorization: Option<TransportAuthorization> = None;
-                        let auth_receipt: Option<AuthDispatchCustody> = None;
-                        let auth_custody_generation: Option<u64> = None;
                         let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
+                            TransportAuthorization::default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
