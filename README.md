@@ -60,6 +60,17 @@
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.
+- **CLI inspection is bounded diagnostics, not conformance evidence:** with
+  default features in a current source checkout, `fastmcp inspect
+  --protocol-policy` reports the selected `auto`, `modern-only`, or
+  `legacy-only` era. A selected modern session requires valid
+  `_meta.io.modelcontextprotocol/serverInfo` metadata and retains the open
+  discovery capability shape (including `completions` and `extensions`)
+  subject to output bounds and credential/control-text sanitization; a
+  selected legacy session renders only the exact legacy capability shape. A
+  `--no-default-features` build supports `modern-only` only. This does not
+  qualify either protocol era as aggregate conformance or production
+  readiness.
 - **Subprocess cleanup is explicit and platform-bounded:**
   `Client::close(&mut self)` returns cleanup failures. The opt-in owned-group mode used by
   `fastmcp test` is Unix-only and fails before spawn elsewhere. It uses a live

@@ -30,17 +30,14 @@ Aggregate MCP 2026-07-28 support is not claimed by FND-01.
 
 Current safety posture (2026-08-02): advisory
 `ToolAnnotations.readOnlyHint` metadata is not an execution-safety boundary.
-The old sessionful HTTP listener is private and unreachable, and public
-`run_http*` entry points fail closed before binding. Modern `LatestOnly` still
-requires immutable stateless per-request dispatch with an independently owned
-request execution and child context. Multi-client isolation tests remain
-required, so cancellation and `await_cleanup` are partial rather than isolated
-end-to-end guarantees. A bounded, owner-bound Session registry belongs only to
-the feature-gated LEG-02 MCP 2025-11-25 legacy adapter; it is not the modern
-fix.
+The old sessionful HTTP listener is private and unreachable. Public native HTTP
+routing separates modern MCP 2026-07-28 admission from exact MCP 2024-11-05
+lifecycle handling. Multi-client isolation, cancellation, and `await_cleanup`
+remain partial rather than isolated end-to-end guarantees, and aggregate
+MCP 2026-07-28 support remains unverified.
 
 - **`dispatch_request_concurrent` API name retained without a lock-free guarantee** -- The public entry point exists, but the current implementation serializes through the same shared session mutex as ordinary dispatch. Historical lock-free and sub-microsecond snapshot claims are withdrawn. ([`d2fd587`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d2fd587e158b644b32e3b20a66416d6e155dced3))
-- **Historical turnkey HTTP server (quarantined)** -- `run_http` / `run_http_with_cx` / `run_http_returning` were introduced with a sessionful listener. The listener is now private and unreachable because it shared mutable legacy state across clients; public entry points emit a fixed diagnostic and fail closed before binding until stateless modern dispatch is qualified. ([`693bc06`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/693bc06f83ab6e579f1d8ea3167d4a5495b3e430))
+- **Historical turnkey HTTP server (quarantined)** -- `run_http` / `run_http_with_cx` / `run_http_returning` were introduced with a sessionful listener. That listener is private and unreachable because it shared mutable legacy state across clients. Current public native HTTP routing separates modern MCP 2026-07-28 admission from exact MCP 2024-11-05 lifecycle handling; aggregate qualification remains unverified. ([`693bc06`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/693bc06f83ab6e579f1d8ea3167d4a5495b3e430))
 - **OAuth/OIDC limits** -- CSPRNG-backed opaque-token draws and PKCE verification are not evidence of complete OAuth 2.0/2.1 or OIDC conformance. The current OIDC surface advertises no signing algorithms or JWKS endpoint and fails closed for ID-token issuance.
 
 ---

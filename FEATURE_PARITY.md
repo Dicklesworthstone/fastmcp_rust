@@ -90,11 +90,11 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | Stdio transport | ✅ | ✅ | NDJSON implementation present |
 | SSE transport | ✅ | ✅ | `run_sse()` with `SseServerTransport` |
 | WebSocket transport | ✅ | ✅ | `run_websocket()` with `WsTransport` and caller-provided reader/writer integration |
-| **HTTP transport** | ✅ | 🟡 | HTTP parsing/framing primitives exist; the turnkey `run_http*` listener fails closed before bind pending stateless qualification |
-| **Streamable HTTP transport** | ✅ | 🟡 | `StreamableHttpTransport` primitives exist; no qualified public modern listener/client path is claimed |
+| **HTTP transport** | ✅ | 🟡 | Public native HTTP admission and listener paths implement modern MCP 2026-07-28 and isolated exact MCP 2024-11-05 routing; aggregate qualification remains unverified |
+| **Streamable HTTP transport** | ✅ | 🟡 | `StreamableHttpTransport` and public modern/legacy HTTP paths exist; aggregate protocol qualification remains unverified |
 | Server request timeout/budget | ✅ | 🟡 | Server dispatch uses asupersync `Budget`; request-owned child-context isolation and end-to-end cleanup qualification remain open (FND-04) |
 | Cancellation behavior | 🟡 | 🟡 | Unix stdio keeps receiving while a bounded worker dispatches and can route a live cancellation; non-Unix stdio and custom/SSE/WebSocket paths retain sequential/blocking boundaries, and request-owned child `Cx` isolation plus cleanup qualification remain open |
-| HTTP multi-client isolation | ✅ | 🟡 | The unsafe shared-Session listener is quarantined and unreachable. Modern `LatestOnly` still needs immutable stateless per-request dispatch with an owned request execution; a bounded owner-bound Session registry is LEG-02-only legacy work |
+| HTTP multi-client isolation | ✅ | 🟡 | The unsafe shared-Session listener is quarantined and unreachable. Current public HTTP routing separates modern MCP 2026-07-28 admission from exact MCP 2024-11-05 lifecycle handling; aggregate multi-client and request-execution qualification remains unverified |
 | Lifecycle hooks (lifespan) | ✅ | ✅ | `on_startup()` / `on_shutdown()` |
 | Ping/health check | ✅ | ✅ | `ping` method handled |
 | Statistics collection | ❌ | ✅ | `ServerStats` with snapshots |
@@ -458,11 +458,10 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
 
 - The private, unwired legacy HTTP dispatch helper deliberately serializes through
   one shared session mutex; advisory read-only metadata is not a concurrency
-  boundary. Public `run_http*` entry points remain fail-closed
-- Modern `LatestOnly` HTTP still needs to remove the shared legacy `Session`
-  and use immutable stateless per-request dispatch with an owned request
-  execution; a bounded owner-bound Session registry belongs only to the
-  feature-gated LEG-02 MCP 2025-11-25 adapter
+  boundary. It remains quarantined and is not the public HTTP routing path
+- Public HTTP routing separates modern MCP 2026-07-28 admission from exact
+  MCP 2024-11-05 lifecycle handling. Aggregate multi-client isolation and
+  request-owned execution qualification remain unverified
 - Unix stdio keeps a receive pump active while a bounded worker serializes
   dispatch, allowing cancellation routing during handler execution. Non-Unix
   stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries,
