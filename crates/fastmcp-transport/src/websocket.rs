@@ -47,31 +47,36 @@
 //! bounded RFC 6455 framing over the upgraded byte stream. Both poll the owned
 //! socket through the supplied [`Cx`], so cancellation preempts an idle read.
 
-use std::task::Poll;
 #[cfg(test)]
+use std::io::{BufReader, Read, Write};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::{
-    io::{BufReader, Read, Write},
+    future::Future,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
+    task::Poll,
 };
 use std::{net::SocketAddr, pin::Pin};
 
 use asupersync::{
     Cx,
     bytes::{Bytes, BytesMut},
+    channel::oneshot,
     codec::{Decoder, Encoder},
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{
-        tcp::{TcpListener, TcpStream},
+        TcpListener, TcpStream,
         websocket::{
             ClientHandshake, CloseCode, CloseReason, Frame, FrameCodec, HandshakeError,
             HttpRequest as NativeHttpRequest, HttpResponse as NativeHttpResponse,
             Message as NativeWsMessage, Opcode, ServerHandshake, WebSocket, WebSocketConfig,
-            WsConnectError, WsError, WsUrl,
+            WebSocketRead, WebSocketWrite, WsConnectError, WsError, WsUrl,
         },
     },
+    sync::Mutex,
     tls::{TlsConnector, TlsStream},
 };
 #[cfg(test)]
@@ -157,6 +162,70 @@ fn websocket_tls_error(error: impl std::fmt::Display) -> TransportError {
     websocket_invalid_data(format!("WebSocket TLS handshake failed: {error}"))
 }
 
+fn websocket_lock_error(cx: &Cx, error: impl std::fmt::Display) -> TransportError {
+    if cx.is_cancel_requested() {
+        return websocket_checkpoint(cx)
+            .err()
+            .unwrap_or(TransportError::Cancelled);
+    }
+    websocket_invalid_data(format!("WebSocket writer coordination failed: {error}"))
+}
+
+/// Runs one owned establishment phase under a child of the caller's context.
+///
+/// `oneshot::Receiver::recv(cx)` registers the caller context's cancellation
+/// waker. That makes a quiet TCP, TLS, or Upgrade wait interruptible even when
+/// its I/O future has no readiness event to wake it. The phase itself runs in a
+/// region-owned child context, so cancellation also wakes that task to observe
+/// its checkpoint and drop its partially established socket or TLS stream.
+async fn await_with_caller_cx<F, Fut, T>(cx: &Cx, phase: F) -> Result<T, TransportError>
+where
+    F: FnOnce(Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    websocket_checkpoint(cx)?;
+    let (sender, mut receiver) = oneshot::channel();
+    let phase_task = cx
+        .spawn(move |phase_cx| async move {
+            let mut future = Box::pin(phase(phase_cx.clone()));
+            let output = std::future::poll_fn(|task_cx| {
+                if phase_cx.checkpoint().is_err() {
+                    return Poll::Ready(None);
+                }
+                future.as_mut().poll(task_cx).map(Some)
+            })
+            .await;
+            if let Some(output) = output {
+                let _ = sender.send(&phase_cx, output);
+            }
+        })
+        .map_err(|error| {
+            websocket_invalid_data(format!(
+                "WebSocket establishment task could not start: {error}"
+            ))
+        })?;
+
+    match receiver.recv(cx).await {
+        Ok(output) => Ok(output),
+        Err(oneshot::RecvError::Cancelled) => {
+            phase_task.abort();
+            Err(websocket_checkpoint(cx)
+                .err()
+                .unwrap_or(TransportError::Cancelled))
+        }
+        Err(oneshot::RecvError::Closed) => {
+            phase_task.abort();
+            Err(websocket_checkpoint(cx).err().unwrap_or_else(|| {
+                websocket_invalid_data("WebSocket establishment phase ended without a result")
+            }))
+        }
+        Err(oneshot::RecvError::PolledAfterCompletion) => Err(websocket_invalid_data(
+            "WebSocket establishment result was polled after completion",
+        )),
+    }
+}
+
 /// Maximum WebSocket frame and assembled-message size accepted by FastMCP.
 pub const FASTMCP_WEBSOCKET_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
@@ -238,14 +307,145 @@ fn decode_native_websocket_message(
 /// [`Self::recv`] is interrupted when `cx` is cancelled, without requiring
 /// peer traffic.
 ///
-/// It intentionally does not implement the synchronous or split transport
-/// traits: satisfying those APIs would require blocking an async receive or
-/// creating a runtime, either of which would lose the caller-owned `Cx`
-/// cancellation semantics this type provides.
+/// It intentionally does not implement the synchronous transport traits:
+/// satisfying them would require blocking an async receive or creating a
+/// runtime, either of which would lose the caller-owned `Cx` cancellation
+/// semantics this type provides. Use [`Self::into_split`] for its native
+/// asynchronous one-reader / independent-writer driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebSocketTerminalState {
+    Open,
+    Closing,
+    Closed,
+    Failed,
+}
+
+impl WebSocketTerminalState {
+    const OPEN: u8 = 0;
+    const CLOSING: u8 = 1;
+    const CLOSED: u8 = 2;
+    const FAILED: u8 = 3;
+
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::Open => Self::OPEN,
+            Self::Closing => Self::CLOSING,
+            Self::Closed => Self::CLOSED,
+            Self::Failed => Self::FAILED,
+        }
+    }
+
+    const fn is_open(self) -> bool {
+        matches!(self, Self::Open)
+    }
+
+    fn load(terminal: &AtomicU8) -> Self {
+        match terminal.load(Ordering::Acquire) {
+            Self::OPEN => Self::Open,
+            Self::CLOSING => Self::Closing,
+            Self::CLOSED => Self::Closed,
+            Self::FAILED => Self::Failed,
+            _ => Self::Failed,
+        }
+    }
+}
+
+fn terminal_unavailable(terminal: &AtomicU8) -> bool {
+    !WebSocketTerminalState::load(terminal).is_open()
+}
+
+/// Writes an elected close frame while holding the one shared writer lock.
+///
+/// Normal close election occurs only after the lock is acquired. Therefore a
+/// caller cancelled while *waiting* for a competing write leaves the shared
+/// state open and may safely retry. Once the frame write starts, either a
+/// successful frame commits `Closed`, or an error commits `Failed`; neither
+/// path can be misreported as an already-successful later close.
+async fn close_split_connection<IO>(
+    cx: &Cx,
+    writer: &Arc<Mutex<WebSocketWrite<IO>>>,
+    terminal: &Arc<AtomicU8>,
+    reason: CloseReason,
+) -> Result<(), TransportError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    websocket_checkpoint(cx)?;
+    let mut writer = writer
+        .lock(cx)
+        .await
+        .map_err(|error| websocket_lock_error(cx, error))?;
+
+    match WebSocketTerminalState::load(terminal) {
+        WebSocketTerminalState::Closed => return Ok(()),
+        WebSocketTerminalState::Failed | WebSocketTerminalState::Closing => {
+            return Err(TransportError::Closed);
+        }
+        WebSocketTerminalState::Open => {}
+    }
+    terminal.store(WebSocketTerminalState::Closing.as_u8(), Ordering::Release);
+
+    match writer.send(cx, NativeWsMessage::Close(Some(reason))).await {
+        Ok(()) => {
+            terminal.store(WebSocketTerminalState::Closed.as_u8(), Ordering::Release);
+            Ok(())
+        }
+        Err(error) => {
+            terminal.store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+            Err(native_websocket_error(cx, error))
+        }
+    }
+}
+
+/// Makes a protocol failure terminal before attempting its structured Close.
+///
+/// Unlike a caller-requested close, an invalid peer frame must prevent later
+/// application writes even if cancellation interrupts the best-effort reply.
+async fn terminate_split_connection<IO>(
+    cx: &Cx,
+    writer: &Arc<Mutex<WebSocketWrite<IO>>>,
+    terminal: &Arc<AtomicU8>,
+    reason: CloseReason,
+) where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    if terminal
+        .compare_exchange(
+            WebSocketTerminalState::Open.as_u8(),
+            WebSocketTerminalState::Closing.as_u8(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+
+    let result = async {
+        let mut writer = writer
+            .lock(cx)
+            .await
+            .map_err(|error| websocket_lock_error(cx, error))?;
+        writer
+            .send(cx, NativeWsMessage::Close(Some(reason)))
+            .await
+            .map_err(|error| native_websocket_error(cx, error))
+    }
+    .await;
+    terminal.store(
+        if result.is_ok() {
+            WebSocketTerminalState::Closed.as_u8()
+        } else {
+            WebSocketTerminalState::Failed.as_u8()
+        },
+        Ordering::Release,
+    );
+}
+
 pub struct AsyncWsClientTransport<IO> {
     websocket: WebSocket<IO>,
     codec: Codec,
-    closed: bool,
+    terminal: WebSocketTerminalState,
 }
 
 impl<IO> AsyncWsClientTransport<IO>
@@ -258,13 +458,13 @@ where
         Self {
             websocket: WebSocket::from_upgraded(io, fastmcp_websocket_config()),
             codec: Codec::new(),
-            closed: false,
+            terminal: WebSocketTerminalState::Open,
         }
     }
 
     /// Sends a JSON-RPC message through the owned native WebSocket.
     pub async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        if self.closed {
+        if !self.terminal.is_open() {
             return Err(TransportError::Closed);
         }
         websocket_checkpoint(cx)?;
@@ -296,7 +496,7 @@ where
         &mut self,
         cx: &Cx,
     ) -> Result<ReceivedTransportFrame, TransportError> {
-        if self.closed {
+        if !self.terminal.is_open() {
             return Err(TransportError::Closed);
         }
         websocket_checkpoint(cx)?;
@@ -311,16 +511,27 @@ where
         self.decode_or_terminate(cx, message).await
     }
 
-    /// Closes the native WebSocket and permanently latches this transport closed.
+    /// Closes the native WebSocket and commits its terminal outcome.
     pub async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        if self.closed {
-            return Ok(());
+        match self.terminal {
+            WebSocketTerminalState::Closed => return Ok(()),
+            WebSocketTerminalState::Closing | WebSocketTerminalState::Failed => {
+                return Err(TransportError::Closed);
+            }
+            WebSocketTerminalState::Open => {}
         }
-        self.closed = true;
-        self.websocket
-            .close(cx, CloseReason::normal())
-            .await
-            .map_err(|error| native_websocket_error(cx, error))
+        websocket_checkpoint(cx)?;
+        self.terminal = WebSocketTerminalState::Closing;
+        match self.websocket.close(cx, CloseReason::normal()).await {
+            Ok(()) => {
+                self.terminal = WebSocketTerminalState::Closed;
+                Ok(())
+            }
+            Err(error) => {
+                self.terminal = WebSocketTerminalState::Failed;
+                Err(native_websocket_error(cx, error))
+            }
+        }
     }
 
     async fn decode_or_terminate(
@@ -329,7 +540,7 @@ where
         message: Option<NativeWsMessage>,
     ) -> Result<ReceivedTransportFrame, TransportError> {
         if matches!(message, Some(NativeWsMessage::Close(_)) | None) {
-            self.closed = true;
+            self.terminal = WebSocketTerminalState::Closed;
             return Err(TransportError::Closed);
         }
 
@@ -355,8 +566,193 @@ where
         close_reason: CloseReason,
         error: TransportError,
     ) -> TransportError {
-        self.closed = true;
+        self.terminal = WebSocketTerminalState::Failed;
         let _ = self.websocket.close(cx, close_reason).await;
+        error
+    }
+
+    /// Splits this established connection into one source-preserving ingress
+    /// driver and one caller-context egress driver.
+    ///
+    /// The receive half is intentionally not `Clone`: an embedding has one
+    /// explicit reader to route correlated responses, notifications, and
+    /// cancellation. The send half serializes writes through asupersync's
+    /// cancel-aware mutex while allowing it to progress independently of an
+    /// idle receive. Both halves share terminal state; a protocol failure or
+    /// structured close makes subsequent operations fail closed.
+    #[must_use]
+    pub fn into_split(self) -> (AsyncWsClientRecvHalf<IO>, AsyncWsClientSendHalf<IO>) {
+        let (reader, writer) = self.websocket.split();
+        let writer = Arc::new(Mutex::with_name("websocket-client-write", writer));
+        let terminal = Arc::new(AtomicU8::new(self.terminal.as_u8()));
+        (
+            AsyncWsClientRecvHalf {
+                reader,
+                writer: Arc::clone(&writer),
+                terminal: Arc::clone(&terminal),
+            },
+            AsyncWsClientSendHalf {
+                writer,
+                codec: self.codec,
+                terminal,
+            },
+        )
+    }
+}
+
+/// The sole asynchronous ingress driver for a split WebSocket client.
+///
+/// Keep this value with the connection's multiplexer. Its mutable receive API
+/// prevents two independent tasks from consuming and misrouting peer frames.
+pub struct AsyncWsClientRecvHalf<IO> {
+    reader: WebSocketRead<IO>,
+    writer: Arc<Mutex<WebSocketWrite<IO>>>,
+    terminal: Arc<AtomicU8>,
+}
+
+impl<IO> AsyncWsClientRecvHalf<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Receives one JSON-RPC message and discards its retained wire source.
+    pub async fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+        self.recv_with_source(cx)
+            .await
+            .map(ReceivedTransportFrame::into_message)
+    }
+
+    /// Receives one JSON-RPC message with its exact bounded JSON text payload.
+    ///
+    /// This is the client-facing ingress primitive for result decoders that
+    /// must retain peer-authored member ordering and JSON number lexemes.
+    pub async fn recv_with_source(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ReceivedTransportFrame, TransportError> {
+        if terminal_unavailable(&self.terminal) {
+            return Err(TransportError::Closed);
+        }
+        websocket_checkpoint(cx)?;
+        let message = match self.reader.recv(cx).await {
+            Ok(message) => message,
+            Err(error) => {
+                let close_reason = native_websocket_close_reason(&error);
+                let error = native_websocket_error(cx, error);
+                return Err(self.terminate(cx, close_reason, error).await);
+            }
+        };
+
+        if matches!(message, Some(NativeWsMessage::Close(_)) | None) {
+            self.terminal
+                .store(WebSocketTerminalState::Closed.as_u8(), Ordering::Release);
+            return Err(TransportError::Closed);
+        }
+
+        let close_code = match &message {
+            Some(NativeWsMessage::Text(_)) => CloseCode::InvalidPayload,
+            Some(NativeWsMessage::Binary(_)) => CloseCode::Unsupported,
+            Some(NativeWsMessage::Ping(_)) | Some(NativeWsMessage::Pong(_)) => {
+                CloseCode::ProtocolError
+            }
+            Some(NativeWsMessage::Close(_)) | None => unreachable!("handled above"),
+        };
+        match decode_native_websocket_message(message) {
+            Ok(message) => Ok(message),
+            Err(error) => Err(self
+                .terminate(cx, CloseReason::new(close_code, None), error)
+                .await),
+        }
+    }
+
+    /// Closes the shared connection through the paired write half.
+    pub async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        self.close_with_reason(cx, CloseReason::normal()).await
+    }
+
+    async fn close_with_reason(
+        &mut self,
+        cx: &Cx,
+        reason: CloseReason,
+    ) -> Result<(), TransportError> {
+        close_split_connection(cx, &self.writer, &self.terminal, reason).await
+    }
+
+    async fn terminate(
+        &mut self,
+        cx: &Cx,
+        close_reason: CloseReason,
+        error: TransportError,
+    ) -> TransportError {
+        terminate_split_connection(cx, &self.writer, &self.terminal, close_reason).await;
+        error
+    }
+}
+
+/// Independent asynchronous egress for a split WebSocket client.
+///
+/// `send` and `close` both require the caller's `Cx`; lock waits and socket
+/// writes therefore observe cancellation without coupling egress to the one
+/// connection reader.
+pub struct AsyncWsClientSendHalf<IO> {
+    writer: Arc<Mutex<WebSocketWrite<IO>>>,
+    codec: Codec,
+    terminal: Arc<AtomicU8>,
+}
+
+impl<IO> AsyncWsClientSendHalf<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Sends one JSON-RPC text message through the split connection.
+    pub async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if terminal_unavailable(&self.terminal) {
+            return Err(TransportError::Closed);
+        }
+        websocket_checkpoint(cx)?;
+        let message = encode_native_websocket_message(&mut self.codec, message)?;
+        let mut writer = self
+            .writer
+            .lock(cx)
+            .await
+            .map_err(|error| websocket_lock_error(cx, error))?;
+        // A peer close or the paired receive half may have become terminal
+        // while this sender was parked on the writer lock. Recheck under the
+        // lock so no data frame can overtake that terminal transition.
+        if terminal_unavailable(&self.terminal) {
+            return Err(TransportError::Closed);
+        }
+        let send_result = writer.send(cx, message).await;
+        drop(writer);
+        match send_result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let close_reason = native_websocket_close_reason(&error);
+                let error = native_websocket_error(cx, error);
+                Err(self.terminate(cx, close_reason, error).await)
+            }
+        }
+    }
+
+    /// Initiates a normal RFC 6455 close under the caller's context.
+    pub async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+        self.close_with_reason(cx, CloseReason::normal()).await
+    }
+
+    async fn close_with_reason(
+        &mut self,
+        cx: &Cx,
+        reason: CloseReason,
+    ) -> Result<(), TransportError> {
+        close_split_connection(cx, &self.writer, &self.terminal, reason).await
+    }
+
+    async fn terminate(
+        &mut self,
+        cx: &Cx,
+        close_reason: CloseReason,
+        error: TransportError,
+    ) -> TransportError {
+        terminate_split_connection(cx, &self.writer, &self.terminal, close_reason).await;
         error
     }
 }
@@ -376,13 +772,16 @@ impl AsyncWsClientTransport<TcpStream> {
             ));
         }
         websocket_checkpoint(cx)?;
-        let websocket = WebSocket::connect_with_config(cx, url, fastmcp_websocket_config())
-            .await
-            .map_err(|error| websocket_connect_error(cx, error))?;
+        let url = url.to_owned();
+        let websocket = await_with_caller_cx(cx, move |phase_cx| async move {
+            WebSocket::connect_with_config(&phase_cx, &url, fastmcp_websocket_config()).await
+        })
+        .await?
+        .map_err(|error| websocket_connect_error(cx, error))?;
         Ok(Self {
             websocket,
             codec: Codec::new(),
-            closed: false,
+            terminal: WebSocketTerminalState::Open,
         })
     }
 }
@@ -406,11 +805,11 @@ impl AsyncWsClientTransport<TlsStream<TcpStream>> {
     ///
     /// # Cancellation boundary
     ///
-    /// `asupersync` documents both the TCP connect and TLS handshake below as
-    /// non-cancel-safe. This factory checks `cx` before and after each phase,
-    /// but it does not claim that cancellation wakes a parked connect or TLS
-    /// handshake. Callers that need that guarantee must impose a
-    /// connection-level deadline or use an upgraded transport they own.
+    /// TCP establishment, the TLS handshake, and HTTP Upgrade are each driven
+    /// in a child of `cx`; a native cancel-aware result wait registers the
+    /// caller's cancellation waker. Cancellation therefore interrupts a quiet
+    /// phase, drops the in-flight socket or TLS stream, and returns a typed
+    /// cancellation error rather than retaining a retryable half-connection.
     pub async fn connect_wss_with_connector(
         cx: &Cx,
         url: &str,
@@ -424,15 +823,18 @@ impl AsyncWsClientTransport<TlsStream<TcpStream>> {
         }
         websocket_checkpoint(cx)?;
         let address = websocket_socket_address(&parsed);
-        let tcp = TcpStream::connect(address)
-            .await
+        let tcp = await_with_caller_cx(cx, move |_phase_cx| TcpStream::connect(address))
+            .await?
             .map_err(TransportError::Io)?;
         tcp.set_nodelay(true).map_err(TransportError::Io)?;
         websocket_checkpoint(cx)?;
-        let tls = connector
-            .connect(&parsed.host, tcp)
-            .await
-            .map_err(websocket_tls_error)?;
+        let connector = connector.clone();
+        let domain = parsed.host.clone();
+        let tls = await_with_caller_cx(cx, move |_phase_cx| async move {
+            connector.connect(&domain, tcp).await
+        })
+        .await?
+        .map_err(websocket_tls_error)?;
         websocket_checkpoint(cx)?;
         client_upgrade(cx, url, tls).await
     }
@@ -447,6 +849,21 @@ fn websocket_socket_address(url: &WsUrl) -> String {
 }
 
 async fn client_upgrade<IO>(
+    cx: &Cx,
+    url: &str,
+    io: IO,
+) -> Result<AsyncWsClientTransport<IO>, TransportError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let url = url.to_owned();
+    await_with_caller_cx(cx, move |phase_cx| async move {
+        client_upgrade_phase(&phase_cx, &url, io).await
+    })
+    .await?
+}
+
+async fn client_upgrade_phase<IO>(
     cx: &Cx,
     url: &str,
     mut io: IO,
@@ -2836,7 +3253,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use std::thread;
 
@@ -3056,6 +3473,30 @@ mod tests {
     }
 
     #[test]
+    fn public_ws_client_split_preserves_exact_result_source_for_one_reader() {
+        const SOURCE: &[u8] = br#"{"jsonrpc":"2.0","id":72,"result":{"zeta":1.20e+4,"alpha":{"second":2,"first":1}}}"#;
+        let (url, peer) = spawn_public_ws_peer("HTTP/1.1 101 Switching Protocols", Some(SOURCE));
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build split WebSocket client runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("runtime installs a caller context");
+            let client = AsyncWsClientTransport::<TcpStream>::connect(&cx, &url)
+                .await
+                .expect("public ws:// split connection and Upgrade must succeed");
+            let (mut receiver, _sender) = client.into_split();
+            let received = receiver
+                .recv_with_source(&cx)
+                .await
+                .expect("the single public split reader must admit the server result");
+            assert_eq!(received.source(), SOURCE);
+            assert!(matches!(received.message(), JsonRpcMessage::Response(_)));
+        });
+        peer.join()
+            .expect("loopback split WebSocket peer completes");
+    }
+
+    #[test]
     fn public_ws_client_rejects_near_identical_non_switching_response() {
         let (url, peer) = spawn_public_ws_peer("HTTP/1.1 200 Switching Protocols", None);
         let runtime = RuntimeBuilder::current_thread()
@@ -3132,6 +3573,124 @@ mod tests {
         }
     }
 
+    struct WriteCountingIo {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl WriteCountingIo {
+        fn new(writes: Arc<AtomicUsize>) -> Self {
+            Self { writes }
+        }
+    }
+
+    impl AsyncRead for WriteCountingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for WriteCountingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.get_mut().writes.fetch_add(1, Ordering::AcqRel);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct GatedWriteIo {
+        write_started: Arc<AtomicBool>,
+    }
+
+    impl GatedWriteIo {
+        fn new(write_started: Arc<AtomicBool>) -> Self {
+            Self { write_started }
+        }
+    }
+
+    impl AsyncRead for GatedWriteIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for GatedWriteIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.get_mut().write_started.store(true, Ordering::Release);
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// An injected establishment phase with no peer readiness. Its second
+    /// poll records an observable mutation, so cancellation must make the
+    /// production phase wrapper drop it before that mutation can occur.
+    struct QuietEstablishmentPhase {
+        started: Arc<AtomicBool>,
+        post_cancel_progress: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl QuietEstablishmentPhase {
+        fn new(
+            started: Arc<AtomicBool>,
+            post_cancel_progress: Arc<AtomicUsize>,
+            dropped: Arc<AtomicBool>,
+        ) -> Self {
+            Self {
+                started,
+                post_cancel_progress,
+                dropped,
+            }
+        }
+    }
+
+    impl Future for QuietEstablishmentPhase {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.started.swap(true, Ordering::AcqRel) {
+                self.post_cancel_progress.fetch_add(1, Ordering::AcqRel);
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for QuietEstablishmentPhase {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
     struct ReadFailingIo {
         write_attempted: Arc<AtomicBool>,
     }
@@ -3186,6 +3745,58 @@ mod tests {
         while !read_started.load(Ordering::Acquire) {
             asupersync::runtime::yield_now().await;
         }
+    }
+
+    async fn wait_for_phase_drop(dropped: &AtomicBool) {
+        while !dropped.load(Ordering::Acquire) {
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
+    async fn assert_quiet_establishment_phase_cancellation(cx: &Cx, phase_name: &'static str) {
+        let started = Arc::new(AtomicBool::new(false));
+        let post_cancel_progress = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut caller = cx
+            .spawn({
+                let started = Arc::clone(&started);
+                let post_cancel_progress = Arc::clone(&post_cancel_progress);
+                let dropped = Arc::clone(&dropped);
+                move |caller_cx| async move {
+                    await_with_caller_cx(&caller_cx, move |_phase_cx| {
+                        QuietEstablishmentPhase::new(started, post_cancel_progress, dropped)
+                    })
+                    .await
+                }
+            })
+            .expect("spawn caller-owned quiet establishment phase");
+
+        wait_for_idle_read(&started).await;
+        assert!(
+            !caller.is_finished(),
+            "quiet {phase_name} phase must remain pending without peer progress"
+        );
+        assert_eq!(
+            post_cancel_progress.load(Ordering::Acquire),
+            0,
+            "quiet {phase_name} phase must not mutate before caller cancellation"
+        );
+
+        caller.abort();
+        assert!(matches!(
+            caller.join(cx).await,
+            Ok(Err(TransportError::Cancelled))
+        ));
+        wait_for_phase_drop(&dropped).await;
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "cancelled {phase_name} child phase must settle and drop"
+        );
+        assert_eq!(
+            post_cancel_progress.load(Ordering::Acquire),
+            0,
+            "cancelled {phase_name} must not make a later connection or Upgrade mutation"
+        );
     }
 
     #[test]
@@ -4082,6 +4693,58 @@ mod tests {
     }
 
     #[test]
+    fn async_client_upgrade_cancellation_wakes_a_quiet_peer_read() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (client_socket, _quiet_peer) = virtual_socket_pair();
+            let read_started = Arc::new(AtomicBool::new(false));
+            let client_socket = ReadNotifyingIo::new(client_socket, Arc::clone(&read_started));
+            let mut upgrade = cx
+                .spawn(move |task_cx| async move {
+                    client_upgrade(&task_cx, "ws://quiet-peer.test/mcp", client_socket).await
+                })
+                .expect("spawn quiet-peer Upgrade task");
+
+            wait_for_idle_read(&read_started).await;
+            assert!(
+                !upgrade.is_finished(),
+                "quiet peer must leave the HTTP Upgrade read parked before cancellation"
+            );
+
+            // The peer writes no HTTP response. Completion therefore proves
+            // that the caller-Cx-aware phase wait registered a cancellation
+            // waker rather than relying on socket readiness.
+            upgrade.abort();
+            assert!(matches!(
+                upgrade.join(&cx).await,
+                Ok(Err(TransportError::Cancelled))
+            ));
+        });
+    }
+
+    #[test]
+    fn async_client_tcp_connect_cancellation_wakes_a_quiet_phase() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            // This injected quiet connector uses the same production
+            // `await_with_caller_cx` seam as `TcpStream::connect`, while
+            // making the no-readiness interleaving deterministic.
+            assert_quiet_establishment_phase_cancellation(&cx, "TCP connect").await;
+        });
+    }
+
+    #[test]
+    fn async_client_tls_handshake_cancellation_wakes_a_quiet_phase() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            // This injected quiet handshake uses the same production
+            // `await_with_caller_cx` seam as `TlsConnector::connect`, while
+            // making the no-readiness interleaving deterministic.
+            assert_quiet_establishment_phase_cancellation(&cx, "TLS handshake").await;
+        });
+    }
+
+    #[test]
     fn async_server_recv_cancellation_wakes_idle_owned_socket_read() {
         run_test(|| async {
             let cx = Cx::current().expect("runtime root context");
@@ -4214,6 +4877,151 @@ mod tests {
                 panic!("expected server response");
             };
             assert_eq!(response.id, Some(RequestId::Number(18)));
+        });
+    }
+
+    #[test]
+    fn async_client_split_close_uses_the_caller_context_and_latches_both_halves() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (client_socket, mut peer) = virtual_socket_pair();
+            let mut peer_task = cx
+                .spawn(move |_task_cx| async move {
+                    let mut frame = [0_u8; 6];
+                    peer.read_exact(&mut frame)
+                        .await
+                        .expect("read masked client close frame");
+                    frame
+                })
+                .expect("spawn split close peer");
+
+            let client = AsyncWsClientTransport::from_upgraded(client_socket);
+            let (mut receiver, mut sender) = client.into_split();
+            sender
+                .close(&cx)
+                .await
+                .expect("caller-context split close must emit one close frame");
+            let frame = peer_task.join(&cx).await.expect("join split close peer");
+            assert_eq!(frame[0], 0x88, "close must use the RFC 6455 close opcode");
+            assert_eq!(frame[1], 0x80, "client close must be masked");
+            assert!(matches!(sender.close(&cx).await, Ok(())));
+            assert!(matches!(
+                receiver.recv_with_source(&cx).await,
+                Err(TransportError::Closed)
+            ));
+        });
+    }
+
+    #[test]
+    fn async_client_split_cancelled_close_waiting_for_writer_can_retry() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let (client_socket, mut peer) = virtual_socket_pair();
+            let client = AsyncWsClientTransport::from_upgraded(client_socket);
+            let (mut receiver, mut sender) = client.into_split();
+            let writer = Arc::clone(&sender.writer);
+            let held_writer = writer
+                .lock(&cx)
+                .await
+                .expect("hold the split writer before close election");
+
+            let mut cancelled_close = cx
+                .spawn(move |task_cx| async move { sender.close(&task_cx).await })
+                .expect("spawn close blocked on writer lock");
+            asupersync::runtime::yield_now().await;
+            cancelled_close.abort();
+            assert!(matches!(
+                cancelled_close.join(&cx).await,
+                Ok(Err(TransportError::Cancelled))
+            ));
+            assert_eq!(
+                WebSocketTerminalState::load(&receiver.terminal),
+                WebSocketTerminalState::Open,
+                "cancellation before writer-lock acquisition must not elect close"
+            );
+
+            drop(held_writer);
+            receiver
+                .close(&cx)
+                .await
+                .expect("a close cancelled before election must be safely retryable");
+            let mut close = [0_u8; 6];
+            peer.read_exact(&mut close)
+                .await
+                .expect("the retry must write one masked Close frame");
+            assert_eq!(close[0], 0x88);
+            assert_eq!(close[1], 0x80);
+        });
+    }
+
+    #[test]
+    fn async_client_split_sender_rechecks_terminal_state_after_writer_wait() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let writes = Arc::new(AtomicUsize::new(0));
+            let client =
+                AsyncWsClientTransport::from_upgraded(WriteCountingIo::new(Arc::clone(&writes)));
+            let (receiver, mut sender) = client.into_split();
+            let writer = Arc::clone(&sender.writer);
+            let held_writer = writer
+                .lock(&cx)
+                .await
+                .expect("hold writer until sender is queued");
+            let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(73),
+                serde_json::json!({"must_not_write": true}),
+            ));
+            let mut send = cx
+                .spawn(move |task_cx| async move { sender.send(&task_cx, &message).await })
+                .expect("spawn sender blocked on writer lock");
+            asupersync::runtime::yield_now().await;
+
+            // Force the exact interleaving: the send observed Open before the
+            // lock, then the paired connection became terminal before release.
+            receiver
+                .terminal
+                .store(WebSocketTerminalState::Closed.as_u8(), Ordering::Release);
+            drop(held_writer);
+            assert!(matches!(
+                send.join(&cx).await,
+                Ok(Err(TransportError::Closed))
+            ));
+            assert_eq!(
+                writes.load(Ordering::Acquire),
+                0,
+                "a sender parked on the writer lock must not overtake terminal close"
+            );
+        });
+    }
+
+    #[test]
+    fn async_client_split_cancel_during_close_write_commits_terminal_failure() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let write_started = Arc::new(AtomicBool::new(false));
+            let client = AsyncWsClientTransport::from_upgraded(GatedWriteIo::new(Arc::clone(
+                &write_started,
+            )));
+            let (mut receiver, mut sender) = client.into_split();
+            let mut close = cx
+                .spawn(move |task_cx| async move { sender.close(&task_cx).await })
+                .expect("spawn close with a gated frame write");
+
+            wait_for_idle_read(&write_started).await;
+            close.abort();
+            assert!(matches!(
+                close.join(&cx).await,
+                Ok(Err(TransportError::Cancelled))
+            ));
+            assert_eq!(
+                WebSocketTerminalState::load(&receiver.terminal),
+                WebSocketTerminalState::Failed,
+                "a cancellation after close-frame emission starts is terminal, not a false success"
+            );
+            assert!(matches!(
+                receiver.close(&cx).await,
+                Err(TransportError::Closed)
+            ));
         });
     }
 

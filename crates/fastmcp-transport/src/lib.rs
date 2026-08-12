@@ -3,8 +3,9 @@
 //! This crate provides transport implementations for MCP communication:
 //! - **Stdio**: Standard input/output (primary transport)
 //! - **SSE**: Server-Sent Events (HTTP-based streaming)
-//! - **WebSocket**: Native `ws://` and `wss://` client connections plus
-//!   bounded HTTP Upgrade admission and TCP listener building blocks
+//! - **WebSocket**: Native `ws://` and `wss://` client connections, a
+//!   one-reader source-preserving async split driver, bounded HTTP Upgrade
+//!   admission, and caller-owned TCP listener building blocks
 //! - **HTTP**: Request/response and streamable-HTTP building blocks
 //! - **Memory**: In-process transport for tests and embedding
 //!

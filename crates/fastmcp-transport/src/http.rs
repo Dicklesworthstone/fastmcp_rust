@@ -3918,6 +3918,7 @@ impl DualEraHttpEndpoint {
             legacy_message_endpoint,
             legacy_request_capacity: self.config.legacy_request_capacity,
             legacy_requests: VecDeque::new(),
+            legacy_responses: VecDeque::new(),
             legacy_stream_generation: 0,
             legacy_codec,
             legacy_live_sender: None,
@@ -4228,6 +4229,12 @@ struct LegacyQueuedRequest {
     request: JsonRpcRequest,
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
+struct LegacyQueuedResponse {
+    generation: u64,
+    response: JsonRpcResponse,
+}
+
 /// One live legacy SSE response body for an exact MCP 2024-11-05 session.
 ///
 /// The stream starts with its endpoint event. Subsequent server messages arrive
@@ -4246,6 +4253,15 @@ pub struct DualEraHttpLegacySseResponse {
 
 #[cfg(feature = "legacy-2024-11-05")]
 impl DualEraHttpLegacySseResponse {
+    fn deactivate(&self) {
+        let _lifecycle_guard = self
+            .post_lifecycle_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.active.store(false, Ordering::Release);
+        self.pending.store(0, Ordering::Release);
+    }
+
     /// Returns the HTTP status and headers to send before the live SSE body.
     #[must_use]
     pub fn response(&self) -> &HttpResponse {
@@ -4263,7 +4279,10 @@ impl DualEraHttpLegacySseResponse {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
-        http_checkpoint(cx)?;
+        if let Err(error) = http_checkpoint(cx) {
+            self.deactivate();
+            return Err(DualEraHttpEndpointError::Transport(error));
+        }
         if !self.active.load(Ordering::Acquire) {
             return Err(DualEraHttpEndpointError::Transport(TransportError::Closed));
         }
@@ -4287,7 +4306,10 @@ impl DualEraHttpLegacySseResponse {
     }
 
     pub fn recv_event(&mut self, cx: &Cx) -> Result<SseEvent, DualEraHttpEndpointError> {
-        http_checkpoint(cx)?;
+        if let Err(error) = http_checkpoint(cx) {
+            self.deactivate();
+            return Err(DualEraHttpEndpointError::Transport(error));
+        }
         if !self.active.load(Ordering::Acquire) {
             return Err(DualEraHttpEndpointError::Transport(TransportError::Closed));
         }
@@ -4296,7 +4318,10 @@ impl DualEraHttpLegacySseResponse {
         }
 
         loop {
-            http_checkpoint(cx)?;
+            if let Err(error) = http_checkpoint(cx) {
+                self.deactivate();
+                return Err(DualEraHttpEndpointError::Transport(error));
+            }
             if !self.active.load(Ordering::Acquire) {
                 return Err(DualEraHttpEndpointError::Transport(TransportError::Closed));
             }
@@ -4328,12 +4353,7 @@ impl DualEraHttpLegacySseResponse {
 #[cfg(feature = "legacy-2024-11-05")]
 impl Drop for DualEraHttpLegacySseResponse {
     fn drop(&mut self) {
-        let _lifecycle_guard = self
-            .post_lifecycle_guard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.active.store(false, Ordering::Release);
-        self.pending.store(0, Ordering::Release);
+        self.deactivate();
     }
 }
 
@@ -4348,6 +4368,7 @@ pub struct DualEraHttpSession {
     legacy_message_endpoint: String,
     legacy_request_capacity: usize,
     legacy_requests: VecDeque<LegacyQueuedRequest>,
+    legacy_responses: VecDeque<LegacyQueuedResponse>,
     legacy_stream_generation: u64,
     legacy_codec: Codec,
     legacy_live_sender: Option<mpsc::Sender<LegacySseLiveMessage>>,
@@ -4544,6 +4565,7 @@ impl DualEraHttpSession {
             );
         }
         self.legacy_requests.clear();
+        self.legacy_responses.clear();
         self.legacy_live_pending.store(0, Ordering::Release);
         let (sender, receiver) = mpsc::channel(self.legacy_request_capacity);
         self.legacy_live_sender = Some(sender);
@@ -4563,16 +4585,13 @@ impl DualEraHttpSession {
     }
 
     fn handle_legacy_post(&mut self, request: HttpRequest) -> DualEraHttpEndpointResponse {
-        let legacy_request = match admit_legacy_2024_http_post(
+        let legacy_message = match admit_legacy_2024_http_post(
             &request,
             &self.legacy_message_path,
             &self.session_id,
             self.handler.config().max_body_size,
         ) {
-            Ok(Legacy2024HttpPostEnvelope::ClientMessage(request)) => request,
-            Ok(Legacy2024HttpPostEnvelope::Response(_)) => {
-                return DualEraHttpEndpointResponse::Immediate(HttpResponse::bad_request());
-            }
+            Ok(message) => message,
             Err(response) => return DualEraHttpEndpointResponse::Immediate(response),
         };
 
@@ -4581,16 +4600,27 @@ impl DualEraHttpSession {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.legacy_live_active.load(Ordering::Acquire)
-            || self.legacy_requests.len() >= self.legacy_request_capacity
+            || self.legacy_requests.len() + self.legacy_responses.len()
+                >= self.legacy_request_capacity
         {
             return DualEraHttpEndpointResponse::Immediate(HttpResponse::new(
                 HttpStatus::SERVICE_UNAVAILABLE,
             ));
         }
-        self.legacy_requests.push_back(LegacyQueuedRequest {
-            generation: self.legacy_stream_generation,
-            request: legacy_request,
-        });
+        match legacy_message {
+            Legacy2024HttpPostEnvelope::ClientMessage(request) => {
+                self.legacy_requests.push_back(LegacyQueuedRequest {
+                    generation: self.legacy_stream_generation,
+                    request,
+                });
+            }
+            Legacy2024HttpPostEnvelope::Response(response) => {
+                self.legacy_responses.push_back(LegacyQueuedResponse {
+                    generation: self.legacy_stream_generation,
+                    response,
+                });
+            }
+        }
         DualEraHttpEndpointResponse::Immediate(HttpResponse::new(HttpStatus::ACCEPTED))
     }
 
@@ -4625,11 +4655,39 @@ impl DualEraHttpSession {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !self.legacy_live_active.load(Ordering::Acquire) {
             self.legacy_requests.clear();
+            self.legacy_responses.clear();
             return None;
         }
         while let Some(queued) = self.legacy_requests.pop_front() {
             if queued.generation == self.legacy_stream_generation {
                 return Some(queued.request);
+            }
+        }
+        None
+    }
+
+    /// Removes the next exact-2024 client response in FIFO order.
+    ///
+    /// The transport admits only a structurally exact response; its live
+    /// server adapter remains responsible for correlating it to an owned
+    /// reverse request before mutating pending-request state.
+    #[must_use]
+    pub fn take_legacy_response(&mut self) -> Option<JsonRpcResponse> {
+        if self.closed {
+            return None;
+        }
+        let _lifecycle_guard = self
+            .legacy_post_lifecycle_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.legacy_live_active.load(Ordering::Acquire) {
+            self.legacy_requests.clear();
+            self.legacy_responses.clear();
+            return None;
+        }
+        while let Some(queued) = self.legacy_responses.pop_front() {
+            if queued.generation == self.legacy_stream_generation {
+                return Some(queued.response);
             }
         }
         None
@@ -4712,6 +4770,13 @@ impl DualEraHttpSession {
                 error,
             )))
         })?;
+        // Serialize liveness observation and the channel commit with body
+        // teardown. A stale response-body capability cannot publish after its
+        // stream has transitioned out of the live generation.
+        let _lifecycle_guard = self
+            .legacy_post_lifecycle_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let reserves_live_delivery = self.reserve_legacy_live_delivery()?;
         if reserves_live_delivery {
             let Some(sender) = self.legacy_live_sender.as_ref() else {
@@ -4786,6 +4851,7 @@ impl DualEraHttpSession {
         self.legacy_live_pending.store(0, Ordering::Release);
         self.legacy_live_sender = None;
         self.legacy_requests.clear();
+        self.legacy_responses.clear();
     }
 }
 
@@ -9246,6 +9312,147 @@ Content-Length: {}\r\n\
                 .expect("live legacy response stays JSON-RPC"),
             JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(71))
         ));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_legacy_post_admits_exact_reverse_response_but_rejects_request_members() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let codec = Codec::new();
+
+        let stream = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+            .expect("legacy SSE GET is admitted");
+        let DualEraHttpEndpointResponse::LegacySse(mut stream) = stream else {
+            panic!("legacy GET creates the liveness gate required for POST");
+        };
+        let _endpoint = stream
+            .recv_event(&cx)
+            .expect("the live stream advertises its exact POST endpoint");
+
+        let response = JsonRpcResponse::success(
+            RequestId::Number(76),
+            serde_json::json!({"legacy": true, "_meta": {"com.example/application": true}}),
+        );
+        let accepted = HttpRequest::new(HttpMethod::Post, "/legacy/messages")
+            .with_header("content-type", "application/json")
+            .with_query("session_id", session.session_id())
+            .with_body(
+                codec
+                    .encode_response(&response)
+                    .expect("exact legacy response serializes"),
+            );
+        let mut rejected = accepted.clone();
+        let mut planted: serde_json::Value =
+            serde_json::from_slice(&accepted.body).expect("baseline response body is JSON");
+        planted["params"] = serde_json::json!({});
+        rejected.body = serde_json::to_vec(&planted).expect("planted response encodes");
+
+        let rejected = session
+            .handle(&cx, rejected)
+            .expect("response shape rejection is an HTTP response");
+        let DualEraHttpEndpointResponse::Immediate(rejected) = rejected else {
+            panic!("rejected response cannot create a response body");
+        };
+        assert_eq!(rejected.status, HttpStatus::BAD_REQUEST);
+        assert!(session.take_legacy_response().is_none());
+
+        let accepted = session
+            .handle(&cx, accepted)
+            .expect("otherwise identical exact response is admitted");
+        let DualEraHttpEndpointResponse::Immediate(accepted) = accepted else {
+            panic!("exact reverse response has an immediate acceptance response");
+        };
+        assert_eq!(accepted.status, HttpStatus::ACCEPTED);
+        assert_eq!(
+            session.take_legacy_response(),
+            Some(response),
+            "only the request-only params member differs from the admitted reverse response"
+        );
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_legacy_stream_cancellation_revokes_post_authority_before_reconnect() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let cancelled_cx = Cx::for_testing();
+        let codec = Codec::new();
+
+        let stream = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+            .expect("legacy SSE GET is admitted");
+        let DualEraHttpEndpointResponse::LegacySse(mut stream) = stream else {
+            panic!("legacy GET creates a live stream");
+        };
+        let _endpoint = stream
+            .recv_event(&cx)
+            .expect("the live stream advertises its exact POST endpoint");
+        let stale_lifecycle = session.legacy_lifecycle();
+        let request = JsonRpcRequest::new("ping", None, 77_i64);
+        let post = |session: &DualEraHttpSession| {
+            HttpRequest::new(HttpMethod::Post, "/legacy/messages")
+                .with_header("content-type", "application/json")
+                .with_query("session_id", session.session_id())
+                .with_body(
+                    codec
+                        .encode_request(&request)
+                        .expect("exact legacy request serializes"),
+                )
+        };
+
+        cancelled_cx.set_cancel_requested(true);
+        assert!(matches!(
+            stream.try_recv_event(&cancelled_cx),
+            Err(DualEraHttpEndpointError::Transport(
+                TransportError::Cancelled
+            ))
+        ));
+        assert!(
+            !stale_lifecycle.is_live(),
+            "a cancelled stream must revoke its post-side capability"
+        );
+        let rejected = session
+            .handle(&cx, post(&session))
+            .expect("a dead-stream POST has an HTTP response");
+        assert!(matches!(
+            rejected,
+            DualEraHttpEndpointResponse::Immediate(response)
+                if response.status == HttpStatus::SERVICE_UNAVAILABLE
+        ));
+        assert!(session.take_legacy_request().is_none());
+
+        let fresh = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+            .expect("the cancelled generation permits a fresh reconnect");
+        let DualEraHttpEndpointResponse::LegacySse(mut fresh) = fresh else {
+            panic!("reconnect creates a fresh stream");
+        };
+        let _endpoint = fresh
+            .recv_event(&cx)
+            .expect("fresh stream advertises a fresh POST authority");
+        assert!(
+            !stale_lifecycle.is_live(),
+            "the old generation remains dead after a fresh reconnect"
+        );
+        let admitted = session
+            .handle(&cx, post(&session))
+            .expect("otherwise identical POST is admitted by the fresh stream");
+        assert!(matches!(
+            admitted,
+            DualEraHttpEndpointResponse::Immediate(response)
+                if response.status == HttpStatus::ACCEPTED
+        ));
+        assert_eq!(
+            session
+                .take_legacy_request()
+                .expect("fresh stream receives the identical request")
+                .id,
+            Some(RequestId::Number(77))
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
