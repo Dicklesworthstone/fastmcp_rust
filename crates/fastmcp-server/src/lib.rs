@@ -2038,7 +2038,7 @@ fn protocol_era_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
 fn is_quarantined_task_rpc(method: &str) -> bool {
     matches!(
         method,
-        "tasks/list" | "tasks/get" | "tasks/cancel" | "tasks/submit"
+        "tasks/list" | "tasks/get" | "tasks/update" | "tasks/cancel" | "tasks/submit"
     )
 }
 
@@ -2066,6 +2066,7 @@ fn is_request_only_method(method: &str) -> bool {
             | SUBSCRIPTIONS_LISTEN
             | "tasks/list"
             | "tasks/get"
+            | "tasks/update"
             | "tasks/cancel"
             | "tasks/submit"
     )
@@ -23822,7 +23823,13 @@ mod lib_unit_tests {
         assert!(server.capabilities().tasks.is_none());
 
         let mut session = initialized_test_session(&server);
-        for method in ["tasks/list", "tasks/get", "tasks/cancel", "tasks/submit"] {
+        for method in [
+            "tasks/list",
+            "tasks/get",
+            "tasks/update",
+            "tasks/cancel",
+            "tasks/submit",
+        ] {
             let response = dispatch_test_request(&server, &mut session, method);
             let error = response
                 .error
@@ -23831,6 +23838,15 @@ mod lib_unit_tests {
             assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound).into());
             assert!(response.result.is_none());
         }
+    }
+
+    #[test]
+    fn task_rpc_quarantine_matches_exact_legacy_task_method_names() {
+        assert!(is_quarantined_task_rpc("tasks/update"));
+        assert!(
+            !is_quarantined_task_rpc("tasks/updates"),
+            "changing only the owned method name must not quarantine an unrelated extension"
+        );
     }
 
     #[test]
