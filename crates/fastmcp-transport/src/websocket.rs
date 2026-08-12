@@ -76,7 +76,7 @@ use asupersync::{
             WebSocketRead, WebSocketWrite, WsConnectError, WsError, WsUrl,
         },
     },
-    sync::Mutex,
+    sync::{Mutex, OwnedMutexGuard},
     tls::{TlsConnector, TlsStream},
 };
 #[cfg(test)]
@@ -371,8 +371,7 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     websocket_checkpoint(cx)?;
-    let mut writer = writer
-        .lock(cx)
+    let mut writer = OwnedMutexGuard::lock(Arc::clone(writer), cx)
         .await
         .map_err(|error| websocket_lock_error(cx, error))?;
 
@@ -422,8 +421,7 @@ async fn terminate_split_connection<IO>(
     }
 
     let result = async {
-        let mut writer = writer
-            .lock(cx)
+        let mut writer = OwnedMutexGuard::lock(Arc::clone(writer), cx)
             .await
             .map_err(|error| websocket_lock_error(cx, error))?;
         writer
@@ -710,9 +708,7 @@ where
         }
         websocket_checkpoint(cx)?;
         let message = encode_native_websocket_message(&mut self.codec, message)?;
-        let mut writer = self
-            .writer
-            .lock(cx)
+        let mut writer = OwnedMutexGuard::lock(Arc::clone(&self.writer), cx)
             .await
             .map_err(|error| websocket_lock_error(cx, error))?;
         // A peer close or the paired receive half may have become terminal
@@ -4920,8 +4916,7 @@ mod tests {
             let client = AsyncWsClientTransport::from_upgraded(client_socket);
             let (mut receiver, mut sender) = client.into_split();
             let writer = Arc::clone(&sender.writer);
-            let held_writer = writer
-                .lock(&cx)
+            let held_writer = OwnedMutexGuard::lock(writer, &cx)
                 .await
                 .expect("hold the split writer before close election");
 
@@ -4963,8 +4958,7 @@ mod tests {
                 AsyncWsClientTransport::from_upgraded(WriteCountingIo::new(Arc::clone(&writes)));
             let (receiver, mut sender) = client.into_split();
             let writer = Arc::clone(&sender.writer);
-            let held_writer = writer
-                .lock(&cx)
+            let held_writer = OwnedMutexGuard::lock(writer, &cx)
                 .await
                 .expect("hold writer until sender is queued");
             let message = JsonRpcMessage::Response(JsonRpcResponse::success(
