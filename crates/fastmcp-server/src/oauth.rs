@@ -117,6 +117,8 @@ pub const MAX_OAUTH_CLIENT_NAME_BYTES: usize = 256;
 pub const MAX_OAUTH_CLIENT_DESCRIPTION_BYTES: usize = 4_096;
 /// Maximum UTF-8 byte length of an authorization grant subject.
 pub const MAX_OAUTH_SUBJECT_BYTES: usize = 1_024;
+/// Maximum UTF-8 byte length of an RFC 8707 authorization resource indicator.
+pub const MAX_OAUTH_RESOURCE_BYTES: usize = 2_048;
 const MAX_OAUTH_SESSION_OWNER_INPUT_BYTES: usize = OAUTH_SESSION_OWNER_DOMAIN.len()
     + 8
     + MAX_OAUTH_ISSUER_BYTES
@@ -128,6 +130,20 @@ const MAX_OAUTH_SESSION_OWNER_INPUT_BYTES: usize = OAUTH_SESSION_OWNER_DOMAIN.le
     + MAX_OAUTH_SUBJECT_BYTES;
 /// Maximum UTF-8 byte length of an OAuth authorization `state` value.
 pub const MAX_OAUTH_STATE_BYTES: usize = 4_096;
+
+/// Maximum encoded bytes admitted by one authorization query.
+///
+/// This bound applies before percent decoding, so an attacker cannot make a
+/// small wire request allocate an unbounded decoded value.
+pub const MAX_OAUTH_AUTHORIZATION_QUERY_BYTES: usize = 16 * 1_024;
+/// Maximum encoded bytes admitted by one token-like form body.
+pub const MAX_OAUTH_FORM_BODY_BYTES: usize = 16 * 1_024;
+/// Maximum key/value pairs admitted by one OAuth endpoint request.
+pub const MAX_OAUTH_PARAMETER_PAIRS: usize = 64;
+/// Maximum decoded bytes in one OAuth parameter name.
+pub const MAX_OAUTH_PARAMETER_NAME_BYTES: usize = 256;
+/// Maximum decoded bytes in one OAuth parameter value.
+pub const MAX_OAUTH_PARAMETER_VALUE_BYTES: usize = MAX_OAUTH_STATE_BYTES;
 
 const OAUTH_ISSUER_ERROR: &str = "OAuth issuer URL is invalid or outside retained-value bounds";
 const OAUTH_CLIENT_ID_RETENTION_ERROR: &str = "OAuth client_id is outside retained-value bounds";
@@ -151,12 +167,510 @@ const OAUTH_AUTHORIZATION_SUBJECT_RETENTION_ERROR: &str =
     "OAuth authorization subject is invalid or outside retention bounds";
 const OAUTH_AUTHORIZATION_STATE_RETENTION_ERROR: &str =
     "OAuth authorization state is invalid or outside retention bounds";
+const OAUTH_AUTHORIZATION_RESOURCE_RETENTION_ERROR: &str =
+    "OAuth authorization resource is invalid or outside retention bounds";
 const OAUTH_REQUEST_SCOPE_COUNT_ERROR: &str = "OAuth request scope count exceeds retention bounds";
 const OAUTH_REQUEST_SCOPE_VALUE_ERROR: &str = "OAuth request scope is invalid or outside bounds";
 const OAUTH_CLIENT_NOT_FOUND_ERROR: &str = "OAuth client not found";
 const OAUTH_CLIENT_AUTHENTICATION_ERROR: &str = "client authentication failed";
 const OAUTH_GRANT_TYPE_UNSUPPORTED_ERROR: &str = "OAuth grant_type is not supported";
 const OAUTH_INVALID_GRANT_ERROR: &str = "OAuth grant is invalid";
+
+// =============================================================================
+// Raw OAuth parameter admission
+// =============================================================================
+
+/// The exact OAuth endpoint grammar used to admit an untrusted parameter
+/// sequence.
+///
+/// Authorization parameters originate in a URI query; all other profiles
+/// originate in an `application/x-www-form-urlencoded` request body. The
+/// profile is selected by the HTTP adapter's route, not by a peer-controlled
+/// content type or parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthParameterEndpoint {
+    /// Authorization endpoint query parameters.
+    AuthorizationQuery,
+    /// Token endpoint form parameters.
+    TokenForm,
+    /// Token-revocation endpoint form parameters.
+    RevocationForm,
+    /// Token-introspection endpoint form parameters.
+    IntrospectionForm,
+}
+
+impl OAuthParameterEndpoint {
+    /// Returns the only permitted wire source for this endpoint profile.
+    #[must_use]
+    pub const fn source(self) -> OAuthParameterSource {
+        match self {
+            Self::AuthorizationQuery => OAuthParameterSource::Query,
+            Self::TokenForm | Self::RevocationForm | Self::IntrospectionForm => {
+                OAuthParameterSource::Form
+            }
+        }
+    }
+
+    const fn maximum_input_bytes(self) -> usize {
+        match self {
+            Self::AuthorizationQuery => MAX_OAUTH_AUTHORIZATION_QUERY_BYTES,
+            Self::TokenForm | Self::RevocationForm | Self::IntrospectionForm => {
+                MAX_OAUTH_FORM_BODY_BYTES
+            }
+        }
+    }
+
+    fn defined_parameter(self, name: &str) -> Option<OAuthParameterName> {
+        match self {
+            Self::AuthorizationQuery => match name {
+                "response_type" => Some(OAuthParameterName::ResponseType),
+                "client_id" => Some(OAuthParameterName::ClientId),
+                "redirect_uri" => Some(OAuthParameterName::RedirectUri),
+                "resource" => Some(OAuthParameterName::Resource),
+                "scope" => Some(OAuthParameterName::Scope),
+                "state" => Some(OAuthParameterName::State),
+                "code_challenge" => Some(OAuthParameterName::CodeChallenge),
+                "code_challenge_method" => Some(OAuthParameterName::CodeChallengeMethod),
+                _ => None,
+            },
+            Self::TokenForm => match name {
+                "grant_type" => Some(OAuthParameterName::GrantType),
+                "code" => Some(OAuthParameterName::Code),
+                "redirect_uri" => Some(OAuthParameterName::RedirectUri),
+                "resource" => Some(OAuthParameterName::Resource),
+                "client_id" => Some(OAuthParameterName::ClientId),
+                "client_secret" => Some(OAuthParameterName::ClientSecret),
+                "code_verifier" => Some(OAuthParameterName::CodeVerifier),
+                "refresh_token" => Some(OAuthParameterName::RefreshToken),
+                "scope" => Some(OAuthParameterName::Scope),
+                _ => None,
+            },
+            Self::RevocationForm | Self::IntrospectionForm => match name {
+                "token" => Some(OAuthParameterName::Token),
+                "token_type_hint" => Some(OAuthParameterName::TokenTypeHint),
+                "client_id" => Some(OAuthParameterName::ClientId),
+                "client_secret" => Some(OAuthParameterName::ClientSecret),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The wire source that supplied an admitted parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthParameterSource {
+    /// URI query text on the authorization endpoint.
+    Query,
+    /// `application/x-www-form-urlencoded` request body.
+    Form,
+}
+
+/// A parameter name whose value may influence the matching endpoint.
+///
+/// Names outside the selected endpoint profile remain admitted as bounded,
+/// ordered unknown parameters and never appear through
+/// [`OAuthParameterAdmission::take_defined_value`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OAuthParameterName {
+    /// `response_type`
+    ResponseType,
+    /// `client_id`
+    ClientId,
+    /// `redirect_uri`
+    RedirectUri,
+    /// RFC 8707 `resource`
+    Resource,
+    /// `scope`
+    Scope,
+    /// `state`
+    State,
+    /// `code_challenge`
+    CodeChallenge,
+    /// `code_challenge_method`
+    CodeChallengeMethod,
+    /// `grant_type`
+    GrantType,
+    /// `code`
+    Code,
+    /// `client_secret`
+    ClientSecret,
+    /// `code_verifier`
+    CodeVerifier,
+    /// `refresh_token`
+    RefreshToken,
+    /// `token`
+    Token,
+    /// `token_type_hint`
+    TokenTypeHint,
+}
+
+/// One decoded parameter retained in exact wire order.
+#[derive(Debug, Clone)]
+pub struct OAuthAdmittedParameter {
+    source: OAuthParameterSource,
+    ordinal: usize,
+    name: String,
+    value_len: usize,
+    defined: bool,
+}
+
+impl OAuthAdmittedParameter {
+    /// Returns the query or form source that supplied this value.
+    #[must_use]
+    pub const fn source(&self) -> OAuthParameterSource {
+        self.source
+    }
+
+    /// Returns this parameter's zero-based wire order.
+    #[must_use]
+    pub const fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    /// Returns the decoded parameter name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the decoded parameter value's byte length.
+    ///
+    /// The value itself is deliberately unavailable through the public
+    /// diagnostics view. In particular, this prevents codes, refresh tokens,
+    /// client secrets, and repeated unknown values from being copied into a
+    /// log or inspection surface.
+    #[must_use]
+    pub const fn value_len(&self) -> usize {
+        self.value_len
+    }
+
+    /// Returns whether the selected endpoint profile defines this name.
+    #[must_use]
+    pub const fn is_defined(&self) -> bool {
+        self.defined
+    }
+}
+
+/// A duplicate-aware, bounded admission result for one OAuth parameter source.
+///
+/// Empty defined values are retained in [`Self::parameters`] for diagnostics,
+/// but are intentionally omitted from the sensitive taking surface. This gives the
+/// endpoint parser one missing-value representation without allowing an empty
+/// duplicate to evade defined-name duplicate rejection.
+pub struct OAuthParameterAdmission {
+    endpoint: OAuthParameterEndpoint,
+    source: OAuthParameterSource,
+    parameters: Vec<OAuthAdmittedParameter>,
+    defined: HashMap<OAuthParameterName, OAuthSensitiveParameterValue>,
+}
+
+/// One defined OAuth value retained only for the next crate-local endpoint
+/// parser.
+///
+/// This is intentionally neither `Clone` nor `Debug`. Values are moved out of
+/// [`OAuthParameterAdmission`] with [`OAuthParameterAdmission::take_defined_value`]
+/// and are zeroized if the endpoint declines to consume them.
+pub(crate) struct OAuthSensitiveParameterValue {
+    value: Zeroizing<String>,
+}
+
+impl OAuthSensitiveParameterValue {
+    /// Moves the value into the endpoint's own typed request boundary.
+    #[must_use]
+    pub(crate) fn into_string(mut self) -> String {
+        std::mem::take(&mut *self.value)
+    }
+}
+
+impl std::fmt::Debug for OAuthParameterAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthParameterAdmission")
+            .field("endpoint", &self.endpoint)
+            .field("source", &self.source)
+            .field("parameter_count", &self.parameters.len())
+            .field("defined_count", &self.defined.len())
+            .finish()
+    }
+}
+
+/// A rejection raised before endpoint authentication, grant handling, or
+/// another stateful OAuth operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthParameterAdmissionError {
+    /// The encoded query or form body exceeds its endpoint bound.
+    InputTooLarge,
+    /// The request carries more pairs than the shared endpoint bound permits.
+    TooManyPairs,
+    /// A decoded parameter name is empty.
+    EmptyName,
+    /// A decoded parameter name exceeds its bound.
+    NameTooLarge,
+    /// A decoded parameter value exceeds its bound.
+    ValueTooLarge,
+    /// Percent decoding was incomplete or contained a non-hex digit.
+    MalformedPercentEncoding,
+    /// A percent-decoded component was not valid UTF-8.
+    InvalidUtf8,
+    /// A decoded name or value contains a control character.
+    ControlCharacter,
+    /// A profile-defined name occurs more than once, including empty values.
+    DuplicateDefinedParameter {
+        /// The endpoint-defined name that was repeated.
+        parameter: OAuthParameterName,
+        /// The query or form source containing both occurrences.
+        source: OAuthParameterSource,
+        /// Wire order of the first occurrence.
+        first_ordinal: usize,
+        /// Wire order of the rejected duplicate occurrence.
+        duplicate_ordinal: usize,
+    },
+}
+
+impl std::fmt::Display for OAuthParameterAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::InputTooLarge => "OAuth parameter input exceeds the endpoint bound",
+            Self::TooManyPairs => "OAuth parameter input contains too many pairs",
+            Self::EmptyName => "OAuth parameter name is empty",
+            Self::NameTooLarge => "OAuth parameter name exceeds the endpoint bound",
+            Self::ValueTooLarge => "OAuth parameter value exceeds the endpoint bound",
+            Self::MalformedPercentEncoding => "OAuth parameter percent encoding is malformed",
+            Self::InvalidUtf8 => "OAuth parameter encoding is not valid UTF-8",
+            Self::ControlCharacter => "OAuth parameter contains a control character",
+            Self::DuplicateDefinedParameter { .. } => {
+                "OAuth parameter input repeats a defined endpoint parameter"
+            }
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for OAuthParameterAdmissionError {}
+
+impl OAuthParameterAdmission {
+    /// Strictly admits one raw authorization query or token-like form body.
+    ///
+    /// This function is deliberately pure: it performs no redirect handling,
+    /// authentication, token lookup, grant consumption, or other OAuth state
+    /// mutation. This lower layer is not a production HTTP gate: a later
+    /// adapter must select `endpoint` from its already-routed HTTP endpoint,
+    /// enforce content type and transport policy, and perform endpoint auth,
+    /// rate admission, and all stateful OAuth work after this parser returns.
+    pub fn admit(
+        endpoint: OAuthParameterEndpoint,
+        input: &[u8],
+    ) -> Result<Self, OAuthParameterAdmissionError> {
+        if input.len() > endpoint.maximum_input_bytes() {
+            return Err(OAuthParameterAdmissionError::InputTooLarge);
+        }
+
+        let source = endpoint.source();
+        let mut parameters = Vec::new();
+        let mut defined = HashMap::new();
+        let mut seen_defined = HashMap::new();
+        if input.is_empty() {
+            return Ok(Self {
+                endpoint,
+                source,
+                parameters,
+                defined,
+            });
+        }
+
+        let mut ordinal = 0;
+        for pair in input.split(|byte| *byte == b'&') {
+            // HTML form serialization permits empty segments, such as a
+            // leading/trailing ampersand or `&&`. They carry no parameter and
+            // must not consume the bounded admitted-pair budget.
+            if pair.is_empty() {
+                continue;
+            }
+            if ordinal >= MAX_OAUTH_PARAMETER_PAIRS {
+                return Err(OAuthParameterAdmissionError::TooManyPairs);
+            }
+            // In application/x-www-form-urlencoded, both `name` and `name=`
+            // mean an empty value. Required-field validation occurs only
+            // after this layer turns either spelling into an omitted typed
+            // defined value.
+            let (raw_name, raw_value): (&[u8], &[u8]) =
+                match pair.iter().position(|byte| *byte == b'=') {
+                    Some(delimiter) => {
+                        let (name, value_with_delimiter) = pair.split_at(delimiter);
+                        (name, &value_with_delimiter[1..])
+                    }
+                    None => (pair, &[]),
+                };
+            let name = Zeroizing::new(
+                decode_oauth_form_component(raw_name, MAX_OAUTH_PARAMETER_NAME_BYTES).map_err(
+                    |error| match error {
+                        OAuthFormDecodeError::TooLarge => {
+                            OAuthParameterAdmissionError::NameTooLarge
+                        }
+                        error => OAuthParameterAdmissionError::from(error),
+                    },
+                )?,
+            );
+            let value = Zeroizing::new(
+                decode_oauth_form_component(raw_value, MAX_OAUTH_PARAMETER_VALUE_BYTES)
+                    .map_err(OAuthParameterAdmissionError::from)?,
+            );
+            if name.is_empty() {
+                return Err(OAuthParameterAdmissionError::EmptyName);
+            }
+            if name.chars().any(char::is_control) || value.chars().any(char::is_control) {
+                return Err(OAuthParameterAdmissionError::ControlCharacter);
+            }
+
+            let value_len = value.len();
+            let defined_name = endpoint.defined_parameter(name.as_str());
+            if let Some(defined_name) = defined_name {
+                if let Some(first_ordinal) = seen_defined.insert(defined_name, ordinal) {
+                    return Err(OAuthParameterAdmissionError::DuplicateDefinedParameter {
+                        parameter: defined_name,
+                        source,
+                        first_ordinal,
+                        duplicate_ordinal: ordinal,
+                    });
+                }
+                // An empty defined field is intentionally equivalent to an
+                // omitted field for endpoint parsing, while still counting as
+                // present for duplicate-pollution rejection.
+                if !value.is_empty() {
+                    defined.insert(defined_name, OAuthSensitiveParameterValue { value });
+                }
+            }
+            parameters.push(OAuthAdmittedParameter {
+                source,
+                ordinal,
+                // Names are the intentionally public diagnostic surface; all
+                // decoded staging buffers remain owned by `Zeroizing`.
+                name: name.to_string(),
+                value_len,
+                defined: defined_name.is_some(),
+            });
+            ordinal += 1;
+        }
+
+        Ok(Self {
+            endpoint,
+            source,
+            parameters,
+            defined,
+        })
+    }
+
+    /// Returns the selected endpoint profile.
+    #[must_use]
+    pub const fn endpoint(&self) -> OAuthParameterEndpoint {
+        self.endpoint
+    }
+
+    /// Returns the sole wire source permitted by the selected profile.
+    #[must_use]
+    pub const fn source(&self) -> OAuthParameterSource {
+        self.source
+    }
+
+    /// Returns every admitted parameter in exact decoded wire order.
+    #[must_use]
+    pub fn parameters(&self) -> &[OAuthAdmittedParameter] {
+        &self.parameters
+    }
+
+    /// Removes one nonempty endpoint-defined value for crate-local typed
+    /// endpoint parsing.
+    ///
+    /// An empty defined value is omitted, and unknown values are dropped after
+    /// validation instead of being retained. Taking is one-way: no public API
+    /// can inspect, clone, or serialize these values.
+    pub(crate) fn take_defined_value(
+        &mut self,
+        name: OAuthParameterName,
+    ) -> Option<OAuthSensitiveParameterValue> {
+        self.defined.remove(&name)
+    }
+
+    /// Iterates bounded unknown parameters in their original wire order.
+    ///
+    /// Their decoded values are zeroized immediately after admission and are
+    /// not retained by this result.
+    pub fn unknown_parameters(&self) -> impl Iterator<Item = &OAuthAdmittedParameter> {
+        self.parameters
+            .iter()
+            .filter(|parameter| !parameter.is_defined())
+    }
+}
+
+enum OAuthFormDecodeError {
+    TooLarge,
+    MalformedPercentEncoding,
+    InvalidUtf8,
+}
+
+impl From<OAuthFormDecodeError> for OAuthParameterAdmissionError {
+    fn from(error: OAuthFormDecodeError) -> Self {
+        match error {
+            OAuthFormDecodeError::TooLarge => Self::ValueTooLarge,
+            OAuthFormDecodeError::MalformedPercentEncoding => Self::MalformedPercentEncoding,
+            OAuthFormDecodeError::InvalidUtf8 => Self::InvalidUtf8,
+        }
+    }
+}
+
+fn decode_oauth_form_component(
+    input: &[u8],
+    maximum_output_bytes: usize,
+) -> Result<String, OAuthFormDecodeError> {
+    // Keep the wire-decoded scratch bytes in zeroizing storage on every
+    // return path. In particular, malformed percent escapes, invalid UTF-8,
+    // and output-limit rejection must not leave a temporary credential copy
+    // in an ordinary dropped allocation.
+    let mut decoded = Zeroizing::new(Vec::with_capacity(input.len().min(maximum_output_bytes)));
+    let mut index = 0;
+    while index < input.len() {
+        let byte = input[index];
+        match byte {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let Some(high) = input.get(index + 1).copied().and_then(decode_hex_digit) else {
+                    return Err(OAuthFormDecodeError::MalformedPercentEncoding);
+                };
+                let Some(low) = input.get(index + 2).copied().and_then(decode_hex_digit) else {
+                    return Err(OAuthFormDecodeError::MalformedPercentEncoding);
+                };
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            _ => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+        if decoded.len() > maximum_output_bytes {
+            return Err(OAuthFormDecodeError::TooLarge);
+        }
+    }
+    // Do not move the scratch allocation into `String`: copying the validated
+    // text leaves `decoded` owned by `Zeroizing`, which wipes it on both the
+    // success and error paths. Defined values are immediately wrapped in their
+    // own one-way zeroizing holder by the caller; unknown values are dropped.
+    std::str::from_utf8(decoded.as_slice())
+        .map(str::to_owned)
+        .map_err(|_| OAuthFormDecodeError::InvalidUtf8)
+}
+
+const fn decode_hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
 
 // These ceilings make accidentally persistent bearer credentials and
 // authorization codes fail closed at configuration admission. Deployments
@@ -1031,6 +1545,8 @@ pub struct AuthorizationCode {
     pub redirect_uri: String,
     /// Approved scopes.
     pub scopes: Vec<String>,
+    /// Approved RFC 8707 resource indicator, if one was requested.
+    pub resource: Option<String>,
     /// PKCE code challenge.
     pub code_challenge: String,
     /// PKCE code challenge method.
@@ -1053,6 +1569,7 @@ impl std::fmt::Debug for AuthorizationCode {
             .field("client_id_len", &self.client_id.len())
             .field("redirect_uri_len", &self.redirect_uri.len())
             .field("scope_count", &self.scopes.len())
+            .field("resource_present", &self.resource.is_some())
             .field("code_challenge_len", &self.code_challenge.len())
             .field("subject_present", &self.subject.is_some())
             .field("state_present", &self.state.is_some())
@@ -1152,6 +1669,8 @@ pub struct OAuthToken {
     pub client_id: String,
     /// Approved scopes.
     pub scopes: Vec<String>,
+    /// Exact RFC 8707 resource/audience binding, if the grant specified one.
+    pub resource: Option<String>,
     /// When the token was issued.
     pub issued_at: Instant,
     /// When the token expires.
@@ -1167,6 +1686,7 @@ impl std::fmt::Debug for OAuthToken {
         f.debug_struct("OAuthToken")
             .field("client_id_len", &self.client_id.len())
             .field("scope_count", &self.scopes.len())
+            .field("resource_present", &self.resource.is_some())
             .field("subject_present", &self.subject.is_some())
             .finish_non_exhaustive()
     }
@@ -1250,6 +1770,220 @@ impl std::fmt::Debug for TokenResponse {
 // Authorization Request
 // =============================================================================
 
+/// Immutable generation of the authorization-approval policy installed in an
+/// [`OAuthServer`].
+///
+/// A backend must return this exact generation in an approved decision. It is
+/// deliberately an opaque value: callers can compare generations but cannot
+/// inspect policy material through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorizationApprovalGeneration([u8; 32]);
+
+impl AuthorizationApprovalGeneration {
+    /// Creates an opaque approval-policy generation from fixed-width bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct AuthorizationApprovalBinding {
+    client_id: String,
+    redirect_uri: String,
+    scopes: Vec<String>,
+    resource: Option<String>,
+    state: Option<String>,
+    code_challenge: String,
+    code_challenge_method: CodeChallengeMethod,
+    registration_epoch: OAuthRegistrationEpoch,
+}
+
+/// Redacted, immutable request presented to the authorization/consent
+/// backend after OAuth request and client validation succeeds.
+///
+/// It never contains a client secret, authorization code, access token, or
+/// refresh token. The fields are bounded and canonicalized before this value
+/// is created.
+pub struct AuthorizationApprovalRequest {
+    binding: AuthorizationApprovalBinding,
+}
+
+impl AuthorizationApprovalRequest {
+    /// Validated client identifier.
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.binding.client_id
+    }
+
+    /// Validated redirect URI.
+    #[must_use]
+    pub fn redirect_uri(&self) -> &str {
+        &self.binding.redirect_uri
+    }
+
+    /// Canonical requested scopes.
+    #[must_use]
+    pub fn scopes(&self) -> &[String] {
+        &self.binding.scopes
+    }
+
+    /// Validated RFC 8707 resource indicator, if one was requested.
+    #[must_use]
+    pub fn resource(&self) -> Option<&str> {
+        self.binding.resource.as_deref()
+    }
+
+    /// Caller-supplied state, if present.
+    #[must_use]
+    pub fn state(&self) -> Option<&str> {
+        self.binding.state.as_deref()
+    }
+
+    /// S256 PKCE challenge identifier.
+    #[must_use]
+    pub fn code_challenge(&self) -> &str {
+        &self.binding.code_challenge
+    }
+
+    /// Validated PKCE method (always S256 on this server).
+    #[must_use]
+    pub const fn code_challenge_method(&self) -> CodeChallengeMethod {
+        self.binding.code_challenge_method
+    }
+
+    /// Produces a non-forgeable approval decision bound to this exact request.
+    ///
+    /// The decision is intentionally neither cloneable nor serializable. A
+    /// backend may approve only the exact canonical scopes and resource it was
+    /// shown; any mismatch is rejected by [`OAuthServer::authorize`] before a
+    /// code is drawn or state is changed.
+    pub fn approve(
+        &self,
+        subject: String,
+        approved_scopes: Vec<String>,
+        approved_resource: Option<String>,
+        generation: AuthorizationApprovalGeneration,
+    ) -> Result<AuthorizationApprovalDecision, OAuthError> {
+        validate_authorization_subject(&subject)?;
+        Ok(AuthorizationApprovalDecision {
+            binding: self.binding.clone(),
+            subject,
+            approved_scopes,
+            approved_resource,
+            generation,
+        })
+    }
+}
+
+impl std::fmt::Debug for AuthorizationApprovalRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationApprovalRequest")
+            .field("client_id_len", &self.binding.client_id.len())
+            .field("redirect_uri_len", &self.binding.redirect_uri.len())
+            .field("scope_count", &self.binding.scopes.len())
+            .field("resource_present", &self.binding.resource.is_some())
+            .field("state_present", &self.binding.state.is_some())
+            .field("code_challenge_len", &self.binding.code_challenge.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One-shot approval decision produced only by an
+/// [`AuthorizationApprovalBackend`].
+///
+/// Its fields are private and it deliberately implements neither `Clone` nor
+/// serialization, preventing reuse or network transport of an approval
+/// receipt.
+pub struct AuthorizationApprovalDecision {
+    binding: AuthorizationApprovalBinding,
+    subject: String,
+    approved_scopes: Vec<String>,
+    approved_resource: Option<String>,
+    generation: AuthorizationApprovalGeneration,
+}
+
+impl std::fmt::Debug for AuthorizationApprovalDecision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationApprovalDecision")
+            .field("subject_len", &self.subject.len())
+            .field("scope_count", &self.approved_scopes.len())
+            .field("resource_present", &self.approved_resource.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of a synchronous authorization/consent backend invocation.
+pub enum AuthorizationApprovalDisposition {
+    /// The backend approved the exact redacted request.
+    Approved(AuthorizationApprovalDecision),
+    /// The resource owner denied the request.
+    Denied,
+    /// The backend could not reach a decision.
+    Error,
+    /// The interaction was cancelled before approval completed.
+    Cancelled,
+}
+
+impl std::fmt::Debug for AuthorizationApprovalDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Approved(_) => f.write_str("AuthorizationApprovalDisposition::Approved(..)"),
+            Self::Denied => f.write_str("AuthorizationApprovalDisposition::Denied"),
+            Self::Error => f.write_str("AuthorizationApprovalDisposition::Error"),
+            Self::Cancelled => f.write_str("AuthorizationApprovalDisposition::Cancelled"),
+        }
+    }
+}
+
+/// Synchronous, sealed authorization/consent policy boundary.
+///
+/// This API is intentionally synchronous because the existing OAuth server is
+/// synchronous. An asynchronous backend would require a cancellation-correct
+/// `Cx` threading change and is not represented by this surface.
+pub trait AuthorizationApprovalBackend: Send + Sync {
+    /// Immutable generation of the installed backend configuration.
+    fn generation(&self) -> AuthorizationApprovalGeneration;
+
+    /// Decides one already-validated authorization request.
+    fn approve(&self, request: &AuthorizationApprovalRequest) -> AuthorizationApprovalDisposition;
+}
+
+struct DenyAllAuthorizationApprovalBackend;
+
+impl AuthorizationApprovalBackend for DenyAllAuthorizationApprovalBackend {
+    fn generation(&self) -> AuthorizationApprovalGeneration {
+        AuthorizationApprovalGeneration::from_bytes([0; 32])
+    }
+
+    fn approve(&self, _request: &AuthorizationApprovalRequest) -> AuthorizationApprovalDisposition {
+        AuthorizationApprovalDisposition::Denied
+    }
+}
+
+#[cfg(test)]
+struct TestDefaultAuthorizationApprovalBackend;
+
+#[cfg(test)]
+impl AuthorizationApprovalBackend for TestDefaultAuthorizationApprovalBackend {
+    fn generation(&self) -> AuthorizationApprovalGeneration {
+        AuthorizationApprovalGeneration::from_bytes([0x54; 32])
+    }
+
+    fn approve(&self, request: &AuthorizationApprovalRequest) -> AuthorizationApprovalDisposition {
+        AuthorizationApprovalDisposition::Approved(
+            request
+                .approve(
+                    "oauth-test-subject".to_string(),
+                    request.scopes().to_vec(),
+                    request.resource().map(str::to_string),
+                    self.generation(),
+                )
+                .expect("validated test approval request must produce a decision"),
+        )
+    }
+}
+
 /// Authorization request parameters.
 #[derive(Clone)]
 pub struct AuthorizationRequest {
@@ -1261,6 +1995,8 @@ pub struct AuthorizationRequest {
     pub redirect_uri: String,
     /// Requested scopes (space-separated in original request).
     pub scopes: Vec<String>,
+    /// RFC 8707 resource indicator requested for this authorization.
+    pub resource: Option<String>,
     /// State parameter (recommended for CSRF protection).
     pub state: Option<String>,
     /// PKCE code challenge.
@@ -1276,6 +2012,7 @@ impl std::fmt::Debug for AuthorizationRequest {
             .field("client_id_len", &self.client_id.len())
             .field("redirect_uri_len", &self.redirect_uri.len())
             .field("scope_count", &self.scopes.len())
+            .field("resource_present", &self.resource.is_some())
             .field("state_present", &self.state.is_some())
             .field("code_challenge_len", &self.code_challenge.len())
             .finish()
@@ -1300,6 +2037,9 @@ pub struct TokenRequest {
     pub refresh_token: Option<String>,
     /// Requested scopes (for refresh_token grant, subset of original scopes).
     pub scopes: Option<Vec<String>>,
+    /// RFC 8707 resource indicator. It must exactly match the bound
+    /// authorization-code or refresh-token resource when supplied.
+    pub resource: Option<String>,
 }
 
 impl std::fmt::Debug for TokenRequest {
@@ -1313,6 +2053,7 @@ impl std::fmt::Debug for TokenRequest {
             .field("code_verifier_present", &self.code_verifier.is_some())
             .field("refresh_token_present", &self.refresh_token.is_some())
             .field("scope_count", &self.scopes.as_ref().map_or(0, Vec::len))
+            .field("resource_present", &self.resource.is_some())
             .finish()
     }
 }
@@ -1752,6 +2493,8 @@ impl PreparedTokenPair {
 /// That implementation policy is not an OAuth profile-conformance claim.
 pub struct OAuthServer {
     config: OAuthServerConfig,
+    approval_backend: Arc<dyn AuthorizationApprovalBackend>,
+    approval_generation: AuthorizationApprovalGeneration,
     pub(crate) state: RwLock<OAuthServerState>,
 }
 
@@ -1763,8 +2506,24 @@ impl OAuthServer {
     /// reject invalid configuration eagerly.
     #[must_use]
     pub fn new(config: OAuthServerConfig) -> Self {
+        Self::with_approval_backend(config, Arc::new(DenyAllAuthorizationApprovalBackend))
+    }
+
+    /// Creates an OAuth server with an installed authorization/consent backend.
+    ///
+    /// The backend is called exactly once after request and client validation,
+    /// and before credential generation or state mutation. The default
+    /// [`Self::new`] constructor installs a fail-closed deny-all backend.
+    #[must_use]
+    pub fn with_approval_backend(
+        config: OAuthServerConfig,
+        approval_backend: Arc<dyn AuthorizationApprovalBackend>,
+    ) -> Self {
+        let approval_generation = approval_backend.generation();
         Self {
             config,
+            approval_backend,
+            approval_generation,
             state: RwLock::new(OAuthServerState::new()),
         }
     }
@@ -1781,10 +2540,29 @@ impl OAuthServer {
         Ok(Self::new(config))
     }
 
+    /// Creates a validated OAuth server with an installed approval backend.
+    pub fn try_with_approval_backend(
+        config: OAuthServerConfig,
+        approval_backend: Arc<dyn AuthorizationApprovalBackend>,
+    ) -> Result<Self, OAuthError> {
+        config.validate()?;
+        Ok(Self::with_approval_backend(config, approval_backend))
+    }
+
     /// Creates a new OAuth server with default configuration.
     #[must_use]
     pub fn with_defaults() -> Self {
-        Self::new(OAuthServerConfig::default())
+        #[cfg(test)]
+        {
+            return Self::with_approval_backend(
+                OAuthServerConfig::default(),
+                Arc::new(TestDefaultAuthorizationApprovalBackend),
+            );
+        }
+        #[cfg(not(test))]
+        {
+            Self::new(OAuthServerConfig::default())
+        }
     }
 
     /// Returns the server configuration.
@@ -1801,6 +2579,32 @@ impl OAuthServer {
             .state
             .write()
             .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
+        // Capture time only after acquiring the write lock. A caller may have
+        // waited arbitrarily long behind another mutation.
+        let now = Instant::now();
+        state.cleanup_expired_at(now);
+        Ok((state, now))
+    }
+
+    /// Acquires the write-side mutation gate only after rechecking a resource
+    /// binding against the uncleaned state. This makes a resource mismatch a
+    /// strict no-op: opportunistic expiry cleanup cannot run before the
+    /// mismatch is rejected.
+    fn state_for_resource_checked_mutation<F>(
+        &self,
+        resource_matches: F,
+    ) -> Result<(std::sync::RwLockWriteGuard<'_, OAuthServerState>, Instant), OAuthError>
+    where
+        F: FnOnce(&OAuthServerState) -> bool,
+    {
+        self.config.validate()?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
+        if !resource_matches(&state) {
+            return Err(invalid_grant_error());
+        }
         // Capture time only after acquiring the write lock. A caller may have
         // waited arbitrarily long behind another mutation.
         let now = Instant::now();
@@ -1921,15 +2725,8 @@ impl OAuthServer {
     // Authorization Endpoint
     // -------------------------------------------------------------------------
 
-    /// Validates an authorization request and creates an authorization code.
-    ///
-    /// This is called after the resource owner has authenticated and approved
-    /// the authorization request.
-    ///
-    /// # Arguments
-    ///
-    /// * `request` - The authorization request parameters
-    /// * `subject` - The authenticated user's identifier (optional)
+    /// Validates an authorization request, obtains one backend approval, and
+    /// creates an authorization code only for a matching approved decision.
     ///
     /// # Returns
     ///
@@ -1937,15 +2734,13 @@ impl OAuthServer {
     pub fn authorize(
         &self,
         request: &AuthorizationRequest,
-        subject: Option<String>,
     ) -> Result<(String, String), OAuthError> {
-        self.authorize_with_token_draw(request, subject, draw_security_identifier)
+        self.authorize_with_token_draw(request, draw_security_identifier)
     }
 
     fn authorize_with_token_draw<F, E>(
         &self,
         request: &AuthorizationRequest,
-        subject: Option<String>,
         draw: F,
     ) -> Result<(String, String), OAuthError>
     where
@@ -1958,12 +2753,12 @@ impl OAuthServer {
                 "invalid redirect_uri".to_string(),
             ));
         }
-        validate_optional_authorization_subject(subject.as_deref())?;
         validate_optional_authorization_value(
             request.state.as_deref(),
             MAX_OAUTH_STATE_BYTES,
             OAUTH_AUTHORIZATION_STATE_RETENTION_ERROR,
         )?;
+        validate_optional_authorization_resource(request.resource.as_deref())?;
         let canonical_scopes = canonicalize_request_scopes(&request.scopes)?;
 
         // Validate response_type
@@ -2012,9 +2807,54 @@ impl OAuthServer {
             ));
         }
         validate_s256_code_challenge(&request.code_challenge)?;
+        self.config.validate()?;
+
+        let approval_request = AuthorizationApprovalRequest {
+            binding: AuthorizationApprovalBinding {
+                client_id: request.client_id.clone(),
+                redirect_uri: request.redirect_uri.clone(),
+                scopes: canonical_scopes.clone(),
+                resource: request.resource.clone(),
+                state: request.state.clone(),
+                code_challenge: request.code_challenge.clone(),
+                code_challenge_method: request.code_challenge_method,
+                registration_epoch: approved_registration_epoch,
+            },
+        };
+        let approval = match self.approval_backend.approve(&approval_request) {
+            AuthorizationApprovalDisposition::Approved(approval) => approval,
+            AuthorizationApprovalDisposition::Denied => {
+                return Err(OAuthError::AccessDenied(
+                    "authorization approval was denied".to_string(),
+                ));
+            }
+            AuthorizationApprovalDisposition::Error => {
+                return Err(OAuthError::TemporarilyUnavailable(
+                    "authorization approval backend failed".to_string(),
+                ));
+            }
+            AuthorizationApprovalDisposition::Cancelled => {
+                return Err(OAuthError::AccessDenied(
+                    "authorization approval was cancelled".to_string(),
+                ));
+            }
+        };
+        if approval.binding != approval_request.binding
+            || approval.generation != self.approval_generation
+            || approval.approved_scopes != canonical_scopes
+            || approval.approved_resource != request.resource
+        {
+            return Err(OAuthError::AccessDenied(
+                "authorization approval did not bind the admitted request".to_string(),
+            ));
+        }
+
+        // The accepted decision is consumed here before the code draw. No
+        // denial, backend error, cancellation, or binding mismatch reaches
+        // either random generation or mutable OAuth state.
+        let subject = approval.subject;
 
         // Generate authorization code
-        self.config.validate()?;
         let code_value = generate_token_with_draw(draw)?;
         let code_digest = digest_credential(CredentialKind::AuthorizationCode, &code_value)?;
         // Store the code
@@ -2059,11 +2899,12 @@ impl OAuthServer {
                 client_id: request.client_id.clone(),
                 redirect_uri: request.redirect_uri.clone(),
                 scopes: canonical_scopes.clone(),
+                resource: request.resource.clone(),
                 code_challenge: request.code_challenge.clone(),
                 code_challenge_method: request.code_challenge_method,
                 issued_at: now,
                 expires_at,
-                subject,
+                subject: Some(subject),
                 state: request.state.clone(),
                 registration_epoch: approved_registration_epoch,
             };
@@ -2145,6 +2986,8 @@ impl OAuthServer {
         if parse_redirect_uri(redirect_uri).is_none() {
             return Err(invalid_grant_error());
         }
+        validate_optional_authorization_resource(request.resource.as_deref())
+            .map_err(|_| invalid_grant_error())?;
 
         // Enforce the fixed RFC 7636 syntax and hard bounds before consuming
         // the one-use authorization code or performing SHA-256.
@@ -2155,11 +2998,34 @@ impl OAuthServer {
             return Err(invalid_grant_error());
         }
 
+        // Reject a mismatched resource under a read-only snapshot before any
+        // write-side cleanup can affect otherwise unrelated expired state.
+        // A missing code remains deferred to the mutation gate so existing
+        // indistinguishable invalid-grant handling and cleanup semantics hold.
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OAuthError::ServerError("failed to acquire read lock".to_string()))?;
+            if state
+                .authorization_codes
+                .get(&code_digest)
+                .is_some_and(|code| request.resource != code.resource)
+            {
+                return Err(invalid_grant_error());
+            }
+        }
+
         // Validation, capacity admission, credential generation, one-time code
         // consumption, and token insertion share one write-side critical
         // section. Failed validation, capacity checks, or either random draw
         // leaves the authorization code available for a legitimate retry.
-        let (mut state, now) = self.state_for_mutation()?;
+        let (mut state, now) = self.state_for_resource_checked_mutation(|state| {
+            state
+                .authorization_codes
+                .get(&code_digest)
+                .is_none_or(|code| request.resource == code.resource)
+        })?;
         let current_registration_epoch = authenticate_client_or_dummy(
             &state,
             &request.client_id,
@@ -2181,6 +3047,9 @@ impl OAuthServer {
             return Err(invalid_grant_error());
         }
         if auth_code.redirect_uri != *redirect_uri {
+            return Err(invalid_grant_error());
+        }
+        if request.resource != auth_code.resource {
             return Err(invalid_grant_error());
         }
         if auth_code.code_challenge_method != CodeChallengeMethod::S256
@@ -2207,6 +3076,7 @@ impl OAuthServer {
         let prepared = self.prepare_token_pair_with_draw(
             &auth_code.client_id,
             &auth_code.scopes,
+            auth_code.resource.as_deref(),
             auth_code.subject.as_deref(),
             current_registration_epoch,
             Some(derive_authorization_grant_id(code_digest)?),
@@ -2255,11 +3125,39 @@ impl OAuthServer {
             refresh_value,
             OAUTH_INVALID_GRANT_ERROR,
         )?;
+        validate_optional_authorization_resource(request.resource.as_deref())
+            .map_err(|_| invalid_grant_error())?;
+        // As for authorization-code exchange, resource mismatch must be a
+        // no-op even when the state contains unrelated expired entries.
+        // Absence is deliberately deferred: a retained replay marker needs
+        // the existing write-side family-revocation behavior.
+        {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OAuthError::ServerError("failed to acquire read lock".to_string()))?;
+            if state
+                .refresh_tokens
+                .get(&refresh_digest)
+                .is_some_and(|token| {
+                    request.resource.is_some() && request.resource != token.resource
+                })
+            {
+                return Err(invalid_grant_error());
+            }
+        }
         // Validation, rotation, tombstoning, and insertion are one atomic
         // mutation. A successful refresh consumes the presented token exactly
         // once. Replaying a retained rotated-token marker revokes every live
         // descendant before returning the indistinguishable grant error.
-        let (mut state, now) = self.state_for_mutation()?;
+        let (mut state, now) = self.state_for_resource_checked_mutation(|state| {
+            state
+                .refresh_tokens
+                .get(&refresh_digest)
+                .is_none_or(|token| {
+                    request.resource.is_none() || request.resource == token.resource
+                })
+        })?;
         let current_registration_epoch = authenticate_client_or_dummy(
             &state,
             &request.client_id,
@@ -2282,6 +3180,9 @@ impl OAuthServer {
             || stored_refresh.expires_at <= now
             || stored_refresh.family_expires_at <= now
         {
+            return Err(invalid_grant_error());
+        }
+        if request.resource.is_some() && request.resource != stored_refresh.resource {
             return Err(invalid_grant_error());
         }
 
@@ -2318,6 +3219,7 @@ impl OAuthServer {
         let prepared = self.prepare_token_pair_with_draw(
             &request.client_id,
             &scopes,
+            stored_refresh.resource.as_deref(),
             stored_refresh.subject.as_deref(),
             current_registration_epoch,
             Some(stored_refresh.grant_id),
@@ -2367,6 +3269,7 @@ impl OAuthServer {
         &self,
         client_id: &str,
         scopes: &[String],
+        resource: Option<&str>,
         subject: Option<&str>,
         registration_epoch: OAuthRegistrationEpoch,
         grant_id: Option<OAuthGrantId>,
@@ -2425,6 +3328,7 @@ impl OAuthServer {
                     token_type: TokenType::Bearer,
                     client_id: client_id.to_string(),
                     scopes: scopes.to_vec(),
+                    resource: resource.map(String::from),
                     issued_at,
                     expires_at: access_expires_at,
                     subject: subject.map(String::from),
@@ -2442,6 +3346,7 @@ impl OAuthServer {
                     token_type: TokenType::Bearer,
                     client_id: client_id.to_string(),
                     scopes: scopes.to_vec(),
+                    resource: resource.map(String::from),
                     issued_at,
                     expires_at: family_expires_at,
                     subject: subject.map(String::from),
@@ -2492,6 +3397,7 @@ impl OAuthServer {
         let prepared = self.prepare_token_pair_with_draw(
             client_id,
             &scopes,
+            None,
             subject,
             registration_epoch,
             None,
@@ -2722,6 +3628,7 @@ impl TokenVerifier for OAuthTokenVerifier {
         let OAuthToken {
             client_id,
             scopes,
+            resource,
             subject,
             ..
         } = token_info;
@@ -2741,6 +3648,7 @@ impl TokenVerifier for OAuthTokenVerifier {
         auth.claims = Some(serde_json::json!({
             "client_id": client_id,
             "grant_subject": subject,
+            "resource": resource,
             "iss": self.server.config.issuer,
         }));
         Ok(auth.with_session_owner(session_owner))
@@ -2888,6 +3796,38 @@ fn validate_optional_authorization_subject(subject: Option<&str>) -> Result<(), 
         MAX_OAUTH_SUBJECT_BYTES,
         OAUTH_AUTHORIZATION_SUBJECT_RETENTION_ERROR,
     )
+}
+
+fn validate_authorization_subject(subject: &str) -> Result<(), OAuthError> {
+    if subject.is_empty() {
+        return Err(OAuthError::InvalidRequest(
+            OAUTH_AUTHORIZATION_SUBJECT_RETENTION_ERROR.to_string(),
+        ));
+    }
+    validate_optional_authorization_value(
+        Some(subject),
+        MAX_OAUTH_SUBJECT_BYTES,
+        OAUTH_AUTHORIZATION_SUBJECT_RETENTION_ERROR,
+    )
+}
+
+fn validate_optional_authorization_resource(resource: Option<&str>) -> Result<(), OAuthError> {
+    validate_optional_authorization_value(
+        resource,
+        MAX_OAUTH_RESOURCE_BYTES,
+        OAUTH_AUTHORIZATION_RESOURCE_RETENTION_ERROR,
+    )?;
+    if let Some(resource) = resource {
+        let url = Url::parse(resource).map_err(|_| {
+            OAuthError::InvalidRequest(OAUTH_AUTHORIZATION_RESOURCE_RETENTION_ERROR.to_string())
+        })?;
+        if url.cannot_be_a_base() || url.has_authority() && url.host().is_none() {
+            return Err(OAuthError::InvalidRequest(
+                OAUTH_AUTHORIZATION_RESOURCE_RETENTION_ERROR.to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_valid_oauth_scope_token(scope: &str) -> bool {
@@ -3408,13 +4348,559 @@ fn loopback_match(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Copy)]
+    enum ApprovalTestMode {
+        Exact,
+        WrongBinding,
+        WrongGeneration,
+        WrongScopes,
+        WrongResource,
+        Denied,
+        Error,
+        Cancelled,
+    }
+
+    struct CountingApprovalBackend {
+        generation: AuthorizationApprovalGeneration,
+        mode: ApprovalTestMode,
+        calls: AtomicUsize,
+        observed_debug: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingApprovalBackend {
+        fn new(mode: ApprovalTestMode) -> Self {
+            Self {
+                generation: AuthorizationApprovalGeneration::from_bytes([0x07; 32]),
+                mode,
+                calls: AtomicUsize::new(0),
+                observed_debug: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl AuthorizationApprovalBackend for CountingApprovalBackend {
+        fn generation(&self) -> AuthorizationApprovalGeneration {
+            self.generation
+        }
+
+        fn approve(
+            &self,
+            request: &AuthorizationApprovalRequest,
+        ) -> AuthorizationApprovalDisposition {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.observed_debug
+                .lock()
+                .expect("approval observation lock")
+                .push(format!("{request:?}"));
+            match self.mode {
+                ApprovalTestMode::Denied => AuthorizationApprovalDisposition::Denied,
+                ApprovalTestMode::Error => AuthorizationApprovalDisposition::Error,
+                ApprovalTestMode::Cancelled => AuthorizationApprovalDisposition::Cancelled,
+                mode => {
+                    let mut decision = request
+                        .approve(
+                            "approved-subject".to_string(),
+                            request.scopes().to_vec(),
+                            request.resource().map(str::to_string),
+                            if matches!(mode, ApprovalTestMode::WrongGeneration) {
+                                AuthorizationApprovalGeneration::from_bytes([0x08; 32])
+                            } else {
+                                self.generation
+                            },
+                        )
+                        .expect("validated request must construct test decision");
+                    match mode {
+                        ApprovalTestMode::WrongBinding => {
+                            decision.binding.state = Some("wrong-state".to_string());
+                        }
+                        ApprovalTestMode::WrongScopes => {
+                            decision.approved_scopes.push("wrong-scope".to_string());
+                        }
+                        ApprovalTestMode::WrongResource => {
+                            decision.approved_resource = Some("https://wrong.example/".to_string());
+                        }
+                        ApprovalTestMode::Exact
+                        | ApprovalTestMode::WrongGeneration
+                        | ApprovalTestMode::Denied
+                        | ApprovalTestMode::Error
+                        | ApprovalTestMode::Cancelled => {}
+                    }
+                    AuthorizationApprovalDisposition::Approved(decision)
+                }
+            }
+        }
+    }
+
+    fn server_with_counting_approval(backend: Arc<CountingApprovalBackend>) -> OAuthServer {
+        OAuthServer::with_approval_backend(OAuthServerConfig::default(), backend)
+    }
+
+    fn configured_approved_test_server(config: OAuthServerConfig) -> OAuthServer {
+        OAuthServer::with_approval_backend(
+            config,
+            Arc::new(TestDefaultAuthorizationApprovalBackend),
+        )
+    }
+
+    fn take_parameter_value(
+        admission: &mut OAuthParameterAdmission,
+        name: OAuthParameterName,
+    ) -> Option<String> {
+        admission
+            .take_defined_value(name)
+            .map(OAuthSensitiveParameterValue::into_string)
+    }
+
+    fn unknown_form_with_value_lengths(value_lengths: &[usize]) -> Vec<u8> {
+        assert!(!value_lengths.is_empty());
+        let mut input = Vec::new();
+        for (index, value_len) in value_lengths.iter().copied().enumerate() {
+            if index != 0 {
+                input.push(b'&');
+            }
+            input.extend_from_slice(b"unknown=");
+            input.extend(std::iter::repeat_n(b'x', value_len));
+        }
+        input
+    }
+
+    fn assert_oauth_stats_unchanged(before: &OAuthServerStats, after: &OAuthServerStats) {
+        assert_eq!(after.clients, before.clients);
+        assert_eq!(after.authorization_codes, before.authorization_codes);
+        assert_eq!(after.access_tokens, before.access_tokens);
+        assert_eq!(after.refresh_tokens, before.refresh_tokens);
+        assert_eq!(after.revoked_tokens, before.revoked_tokens);
+    }
+
+    #[test]
+    fn authorization_parameter_admission_preserves_order_and_unknowns_without_typed_effect() {
+        let mut admission = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::AuthorizationQuery,
+            b"response_type=code&client_id=demo&scope=read+write&state=&unknown=one&unknown=two",
+        )
+        .expect("bounded authorization query must be admitted");
+
+        assert_eq!(admission.source(), OAuthParameterSource::Query);
+        assert_eq!(admission.parameters().len(), 6);
+        assert_eq!(admission.parameters()[0].ordinal(), 0);
+        assert_eq!(
+            admission.parameters()[0].source(),
+            OAuthParameterSource::Query
+        );
+        assert_eq!(admission.parameters()[0].name(), "response_type");
+        assert_eq!(admission.parameters()[2].value_len(), "read write".len());
+        assert!(admission.parameters()[3].is_defined());
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::ResponseType),
+            Some("code".to_string())
+        );
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::ClientId),
+            Some("demo".to_string())
+        );
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::State),
+            None
+        );
+        assert_eq!(
+            admission
+                .unknown_parameters()
+                .map(|parameter| (parameter.ordinal(), parameter.name(), parameter.value_len()))
+                .collect::<Vec<_>>(),
+            vec![(4, "unknown", 3), (5, "unknown", 3)]
+        );
+    }
+
+    #[test]
+    fn authorization_parameter_admission_rejects_only_a_repeated_defined_name() {
+        // This differs from the matching positive only by a second client_id.
+        // Rejection occurs before an adapter could authenticate a client or
+        // create an authorization grant.
+        let error = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::AuthorizationQuery,
+            b"response_type=code&client_id=demo&scope=read+write&state=&client_id=other&unknown=two",
+        )
+        .expect_err("a repeated defined parameter must be rejected");
+
+        assert_eq!(
+            error,
+            OAuthParameterAdmissionError::DuplicateDefinedParameter {
+                parameter: OAuthParameterName::ClientId,
+                source: OAuthParameterSource::Query,
+                first_ordinal: 1,
+                duplicate_ordinal: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn form_parameter_admission_decodes_percent_and_plus_and_omits_empty_defined_values() {
+        let mut admission = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            b"grant_type=authorization_code&client_id=demo%2Bclient&client_secret=&code_verifier=one+two%2Bthree&unknown=x&unknown=y",
+        )
+        .expect("strictly encoded token form must be admitted");
+
+        assert_eq!(admission.source(), OAuthParameterSource::Form);
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::ClientId),
+            Some("demo+client".to_string())
+        );
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::CodeVerifier),
+            Some("one two+three".to_string())
+        );
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::ClientSecret),
+            None
+        );
+        assert_eq!(admission.unknown_parameters().count(), 2);
+    }
+
+    #[test]
+    fn form_parameter_admission_rejects_an_empty_then_nonempty_defined_duplicate() {
+        // The near-identical positive above has one client_secret field. An
+        // empty first occurrence still reserves that defined name, so a later
+        // value cannot turn omission into an authentication ambiguity.
+        let error = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            b"grant_type=authorization_code&client_id=demo%2Bclient&client_secret=&client_secret=secret&code_verifier=one+two%2Bthree&unknown=x&unknown=y",
+        )
+        .expect_err("empty defined values must not evade duplicate rejection");
+
+        assert_eq!(
+            error,
+            OAuthParameterAdmissionError::DuplicateDefinedParameter {
+                parameter: OAuthParameterName::ClientSecret,
+                source: OAuthParameterSource::Form,
+                first_ordinal: 2,
+                duplicate_ordinal: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn resource_is_a_defined_singleton_for_authorization_and_token_profiles() {
+        let resource = "https%3A%2F%2Fresource.example%2Fapi";
+        let mut authorization = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::AuthorizationQuery,
+            format!("client_id=demo&resource={resource}").as_bytes(),
+        )
+        .expect("authorization resource must be admitted");
+        assert_eq!(
+            take_parameter_value(&mut authorization, OAuthParameterName::Resource),
+            Some("https://resource.example/api".to_string())
+        );
+
+        let mut token = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            format!("grant_type=refresh_token&resource={resource}").as_bytes(),
+        )
+        .expect("token resource must be admitted");
+        assert_eq!(
+            take_parameter_value(&mut token, OAuthParameterName::Resource),
+            Some("https://resource.example/api".to_string())
+        );
+    }
+
+    #[test]
+    fn token_resource_duplicate_is_rejected_before_grant_processing() {
+        // This differs from the matching token positive only by a second
+        // resource field. It must not become an ambiguous resource selector.
+        let error = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            b"grant_type=refresh_token&resource=https%3A%2F%2Fresource.example%2Fa&resource=https%3A%2F%2Fresource.example%2Fb",
+        )
+        .expect_err("repeated RFC 8707 resource must be rejected");
+        assert_eq!(
+            error,
+            OAuthParameterAdmissionError::DuplicateDefinedParameter {
+                parameter: OAuthParameterName::Resource,
+                source: OAuthParameterSource::Form,
+                first_ordinal: 1,
+                duplicate_ordinal: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn parameter_admission_ignores_empty_segments_and_treats_bare_names_as_empty() {
+        let mut admission = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::AuthorizationQuery,
+            b"&&state&&client_id=demo&scope&unknown&unknown=&&",
+        )
+        .expect("empty segments and bare names are standard form syntax");
+
+        assert_eq!(admission.parameters().len(), 5);
+        assert_eq!(admission.parameters()[0].ordinal(), 0);
+        assert_eq!(admission.parameters()[0].name(), "state");
+        assert_eq!(admission.parameters()[0].value_len(), 0);
+        assert_eq!(admission.parameters()[2].name(), "scope");
+        assert_eq!(admission.parameters()[2].value_len(), 0);
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::State),
+            None
+        );
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::Scope),
+            None
+        );
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::ClientId),
+            Some("demo".to_string())
+        );
+        assert_eq!(
+            admission
+                .unknown_parameters()
+                .map(|parameter| (parameter.ordinal(), parameter.name(), parameter.value_len()))
+                .collect::<Vec<_>>(),
+            vec![(3, "unknown", 0), (4, "unknown", 0)]
+        );
+    }
+
+    #[test]
+    fn bare_and_equals_empty_defined_names_still_trigger_duplicate_rejection() {
+        // The positive above contains one bare `state`. Adding only `state=`
+        // must be rejected even though both values are omitted downstream.
+        let error = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::AuthorizationQuery,
+            b"&&state&state=&&client_id=demo&scope&unknown&unknown=&&",
+        )
+        .expect_err("empty spellings cannot evade duplicate defined-name rejection");
+        assert_eq!(
+            error,
+            OAuthParameterAdmissionError::DuplicateDefinedParameter {
+                parameter: OAuthParameterName::State,
+                source: OAuthParameterSource::Query,
+                first_ordinal: 0,
+                duplicate_ordinal: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parameter_admission_is_pure_and_not_an_http_or_authorization_gate() {
+        // The parser accepts raw bytes only. It neither receives an OAuth
+        // server nor has a route, transport, redirect, subject, or mutation
+        // capability; later HTTP and AUTH-07 layers own those concerns.
+        let server = OAuthServer::with_defaults();
+        let before = server.stats();
+        let mut admission = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            b"grant_type=refresh_token&refresh_token=credential&unknown=discard-me",
+        )
+        .expect("pure parameter admission must succeed independently of OAuth state");
+        assert_eq!(
+            take_parameter_value(&mut admission, OAuthParameterName::RefreshToken),
+            Some("credential".to_string())
+        );
+        let after = server.stats();
+        assert_oauth_stats_unchanged(&before, &after);
+    }
+
+    #[test]
+    fn admission_diagnostics_are_redacted_for_defined_and_unknown_values() {
+        let admission = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            b"client_secret=defined-never-prints&unknown=unknown-never-prints",
+        )
+        .expect("bounded input must be admitted for redaction inspection");
+
+        let admission_debug = format!("{admission:?}");
+        let parameter_debug = format!("{:?}", admission.parameters());
+        for secret in ["defined-never-prints", "unknown-never-prints"] {
+            assert!(!admission_debug.contains(secret));
+            assert!(!parameter_debug.contains(secret));
+        }
+        assert!(parameter_debug.contains("value_len"));
+    }
+
+    #[test]
+    fn parameter_admission_profiles_keep_defined_names_endpoint_specific() {
+        let mut token_form = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::TokenForm,
+            b"grant_type=refresh_token&token=opaque-value&unknown=first&unknown=second",
+        )
+        .expect("token form must admit bounded unknown parameters");
+        assert_eq!(
+            take_parameter_value(&mut token_form, OAuthParameterName::GrantType),
+            Some("refresh_token".to_string())
+        );
+        assert_eq!(
+            take_parameter_value(&mut token_form, OAuthParameterName::Token),
+            None
+        );
+        assert_eq!(
+            token_form
+                .unknown_parameters()
+                .map(OAuthAdmittedParameter::name)
+                .collect::<Vec<_>>(),
+            vec!["token", "unknown", "unknown"]
+        );
+
+        for endpoint in [
+            OAuthParameterEndpoint::RevocationForm,
+            OAuthParameterEndpoint::IntrospectionForm,
+        ] {
+            let mut form = OAuthParameterAdmission::admit(
+                endpoint,
+                b"token=opaque-value&token_type_hint=refresh_token&client_id=demo&client_secret=&resource=https%3A%2F%2Fresource.example%2Fapi",
+            )
+            .expect("token-like form must admit its defined values");
+            assert_eq!(form.source(), OAuthParameterSource::Form);
+            assert_eq!(
+                take_parameter_value(&mut form, OAuthParameterName::Token),
+                Some("opaque-value".to_string())
+            );
+            assert_eq!(
+                take_parameter_value(&mut form, OAuthParameterName::TokenTypeHint),
+                Some("refresh_token".to_string())
+            );
+            assert_eq!(
+                take_parameter_value(&mut form, OAuthParameterName::ClientId),
+                Some("demo".to_string())
+            );
+            assert_eq!(
+                take_parameter_value(&mut form, OAuthParameterName::ClientSecret),
+                None
+            );
+            assert_eq!(
+                take_parameter_value(&mut form, OAuthParameterName::Resource),
+                None
+            );
+            assert_eq!(
+                form.unknown_parameters()
+                    .map(OAuthAdmittedParameter::name)
+                    .collect::<Vec<_>>(),
+                vec!["resource"]
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_admission_rejects_malformed_encoding_and_controls_before_state() {
+        for (input, expected) in [
+            (
+                b"grant_type=authorization_code&code=%".as_slice(),
+                OAuthParameterAdmissionError::MalformedPercentEncoding,
+            ),
+            (
+                b"grant_type=authorization_code&code=%GG".as_slice(),
+                OAuthParameterAdmissionError::MalformedPercentEncoding,
+            ),
+            (
+                b"grant_type=authorization_code&code=%FF".as_slice(),
+                OAuthParameterAdmissionError::InvalidUtf8,
+            ),
+            (
+                b"grant_type=authorization_code&code=%0A".as_slice(),
+                OAuthParameterAdmissionError::ControlCharacter,
+            ),
+            (
+                b"grant_type=authorization_code&code=raw\ncontrol".as_slice(),
+                OAuthParameterAdmissionError::ControlCharacter,
+            ),
+            (
+                b"grant_type=authorization_code&=code".as_slice(),
+                OAuthParameterAdmissionError::EmptyName,
+            ),
+        ] {
+            let error = OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, input)
+                .expect_err("malformed token form must be rejected before endpoint logic");
+            assert_eq!(error, expected);
+        }
+    }
+
+    #[test]
+    fn parameter_admission_accepts_exact_limits_and_rejects_each_n_plus_one_without_state() {
+        let server = OAuthServer::with_defaults();
+        let before = server.stats();
+
+        // Four bounded unknown values reach exactly 16 KiB without exceeding
+        // the 4 KiB decoded-value cap: 3 * (8 + 4096) + 3 + (8 + 4061).
+        let exact_body = unknown_form_with_value_lengths(&[4_096, 4_096, 4_096, 4_061]);
+        assert_eq!(exact_body.len(), MAX_OAUTH_FORM_BODY_BYTES);
+        let form = OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &exact_body)
+            .expect("exact form-body limit must be admitted");
+        assert_eq!(form.parameters().len(), 4);
+
+        let mut form_n_plus_one = exact_body.clone();
+        form_n_plus_one.push(b'x');
+        let error =
+            OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &form_n_plus_one)
+                .expect_err("form body N+1 must reject before endpoint logic");
+        assert_eq!(error, OAuthParameterAdmissionError::InputTooLarge);
+
+        assert_eq!(exact_body.len(), MAX_OAUTH_AUTHORIZATION_QUERY_BYTES);
+        let query =
+            OAuthParameterAdmission::admit(OAuthParameterEndpoint::AuthorizationQuery, &exact_body)
+                .expect("exact authorization-query limit must be admitted");
+        assert_eq!(query.parameters().len(), 4);
+
+        let mut query_n_plus_one = exact_body.clone();
+        query_n_plus_one.push(b'x');
+        let error = OAuthParameterAdmission::admit(
+            OAuthParameterEndpoint::AuthorizationQuery,
+            &query_n_plus_one,
+        )
+        .expect_err("authorization query N+1 must reject before endpoint logic");
+        assert_eq!(error, OAuthParameterAdmissionError::InputTooLarge);
+
+        let exact_pair_lengths = [1; MAX_OAUTH_PARAMETER_PAIRS];
+        let exact_pairs = unknown_form_with_value_lengths(&exact_pair_lengths);
+        let pairs = OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &exact_pairs)
+            .expect("64 nonempty pairs must be admitted");
+        assert_eq!(pairs.parameters().len(), MAX_OAUTH_PARAMETER_PAIRS);
+
+        let mut pairs_n_plus_one = exact_pairs;
+        pairs_n_plus_one.extend_from_slice(b"&unknown=x");
+        let error =
+            OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &pairs_n_plus_one)
+                .expect_err("65th nonempty pair must reject before endpoint logic");
+        assert_eq!(error, OAuthParameterAdmissionError::TooManyPairs);
+
+        let mut exact_name = vec![b'n'; MAX_OAUTH_PARAMETER_NAME_BYTES];
+        exact_name.push(b'=');
+        let name = OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &exact_name)
+            .expect("256-byte decoded name must be admitted");
+        assert_eq!(
+            name.parameters()[0].name().len(),
+            MAX_OAUTH_PARAMETER_NAME_BYTES
+        );
+
+        let mut name_n_plus_one = exact_name;
+        name_n_plus_one.insert(MAX_OAUTH_PARAMETER_NAME_BYTES, b'n');
+        let error =
+            OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &name_n_plus_one)
+                .expect_err("257-byte decoded name must reject before endpoint logic");
+        assert_eq!(error, OAuthParameterAdmissionError::NameTooLarge);
+
+        let exact_value = unknown_form_with_value_lengths(&[MAX_OAUTH_PARAMETER_VALUE_BYTES]);
+        let value = OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &exact_value)
+            .expect("4096-byte decoded value must be admitted");
+        assert_eq!(
+            value.parameters()[0].value_len(),
+            MAX_OAUTH_PARAMETER_VALUE_BYTES
+        );
+
+        let mut value_n_plus_one = exact_value;
+        value_n_plus_one.push(b'x');
+        let error =
+            OAuthParameterAdmission::admit(OAuthParameterEndpoint::TokenForm, &value_n_plus_one)
+                .expect_err("4097-byte decoded value must reject before endpoint logic");
+        assert_eq!(error, OAuthParameterAdmissionError::ValueTooLarge);
+
+        assert_oauth_stats_unchanged(&before, &server.stats());
+    }
 
     fn issue_access_token_via_auth_code(
         server: &OAuthServer,
         client_id: &str,
         redirect_uri: &str,
         scopes: &[&str],
-        subject: &str,
+        _subject: &str,
     ) -> TokenResponse {
         let code_verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string();
         let code_challenge = compute_s256_challenge(&code_verifier).expect("valid verifier");
@@ -3423,14 +4909,13 @@ mod tests {
             client_id: client_id.to_string(),
             redirect_uri: redirect_uri.to_string(),
             scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+            resource: None,
             state: Some("oauth-test-state".to_string()),
             code_challenge,
             code_challenge_method: CodeChallengeMethod::S256,
         };
 
-        let (code, _redirect) = server
-            .authorize(&auth_request, Some(subject.to_string()))
-            .expect("authorize");
+        let (code, _redirect) = server.authorize(&auth_request).expect("authorize");
         server
             .token(&TokenRequest {
                 grant_type: "authorization_code".to_string(),
@@ -3441,6 +4926,7 @@ mod tests {
                 code_verifier: Some(code_verifier),
                 refresh_token: None,
                 scopes: None,
+                resource: None,
             })
             .expect("token exchange")
     }
@@ -3509,10 +4995,408 @@ mod tests {
             client_id: client_id.to_string(),
             redirect_uri: "http://127.0.0.1/callback".to_string(),
             scopes: Vec::new(),
+            resource: None,
             state: None,
             code_challenge: compute_s256_challenge(verifier).expect("valid verifier"),
             code_challenge_method: CodeChallengeMethod::S256,
         }
+    }
+
+    fn approved_resource_request(client_id: &str) -> AuthorizationRequest {
+        AuthorizationRequest {
+            resource: Some("https://resource.example/api".to_string()),
+            state: Some("approval-state".to_string()),
+            scopes: vec!["read".to_string()],
+            ..bounded_authorization_request(client_id)
+        }
+    }
+
+    fn resource_code_exchange_request(client_id: &str, code: &str, resource: &str) -> TokenRequest {
+        TokenRequest {
+            resource: Some(resource.to_string()),
+            ..bounded_code_exchange_request(client_id, code)
+        }
+    }
+
+    fn resource_refresh_request(
+        client_id: &str,
+        refresh_token: &str,
+        resource: &str,
+    ) -> TokenRequest {
+        TokenRequest {
+            resource: Some(resource.to_string()),
+            ..bounded_refresh_request(client_id, refresh_token)
+        }
+    }
+
+    fn insert_expired_authorization_code_cleanup_canary(
+        server: &OAuthServer,
+        client_id: &str,
+    ) -> CredentialDigest {
+        let expired_code = base64url_encode(&[0xa7_u8; 32]);
+        let digest = authorization_code_digest(&expired_code);
+        let now = Instant::now();
+        let mut state = server.state.write().expect("state");
+        let registration_epoch = state
+            .clients
+            .get(client_id)
+            .expect("registered client")
+            .registration_epoch;
+        state.authorization_codes.insert(
+            digest,
+            AuthorizationCode {
+                client_id: client_id.to_string(),
+                redirect_uri: "http://127.0.0.1/callback".to_string(),
+                scopes: Vec::new(),
+                resource: None,
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+                code_challenge_method: CodeChallengeMethod::S256,
+                issued_at: now,
+                expires_at: now - Duration::from_secs(1),
+                subject: None,
+                state: None,
+                registration_epoch,
+            },
+        );
+        digest
+    }
+
+    #[test]
+    fn authorization_approval_backend_is_called_once_and_receives_only_redacted_facts() {
+        const CLIENT_SECRET: &str = "approval-client-secret-canary";
+        const CODE_CANARY: &str = "approval-code-canary";
+        const TOKEN_CANARY: &str = "approval-token-canary";
+        let backend = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
+        let server = server_with_counting_approval(Arc::clone(&backend));
+        server
+            .register_client(
+                OAuthClient::builder("approval-client")
+                    .secret(CLIENT_SECRET)
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .expect("bounded confidential client"),
+            )
+            .expect("register client");
+        let request = approved_resource_request("approval-client");
+        let before = server.stats();
+
+        let (code, _) = server.authorize(&request).expect("approved authorization");
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server.stats().authorization_codes,
+            before.authorization_codes + 1
+        );
+        let state = server.state.read().expect("state");
+        let retained = state
+            .authorization_codes
+            .get(&authorization_code_digest(&code))
+            .expect("approved code retained");
+        assert_eq!(retained.subject.as_deref(), Some("approved-subject"));
+        assert_eq!(retained.scopes, ["read"]);
+        assert_eq!(
+            retained.resource.as_deref(),
+            Some("https://resource.example/api")
+        );
+        let observed = backend
+            .observed_debug
+            .lock()
+            .expect("observed request")
+            .join("\n");
+        for canary in [CLIENT_SECRET, CODE_CANARY, TOKEN_CANARY] {
+            assert!(!observed.contains(canary));
+        }
+        assert!(observed.contains("AuthorizationApprovalRequest"));
+    }
+
+    #[test]
+    fn approved_resource_survives_code_exchange_introspection_auth_and_refresh_rotation() {
+        const RESOURCE: &str = "https://resource.example/api";
+        let backend = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
+        let server = Arc::new(server_with_counting_approval(Arc::clone(&backend)));
+        server
+            .register_client(
+                OAuthClient::builder("resource-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .expect("bounded client"),
+            )
+            .expect("register client");
+
+        let (code, _) = server
+            .authorize(&approved_resource_request("resource-client"))
+            .expect("approved authorization");
+        let issued = server
+            .token(&resource_code_exchange_request(
+                "resource-client",
+                &code,
+                RESOURCE,
+            ))
+            .expect("exact resource code exchange");
+        let initial_access = server
+            .validate_access_token(&issued.access_token)
+            .expect("issued access token introspection");
+        assert_eq!(initial_access.resource.as_deref(), Some(RESOURCE));
+        let refresh = issued.refresh_token.expect("refresh token");
+
+        let auth = server
+            .token_verifier()
+            .verify(
+                &McpContext::new(asupersync::Cx::for_testing(), 1),
+                AuthRequest {
+                    method: "tools/list",
+                    params: None,
+                    transport_authorization: None,
+                    request_id: 1,
+                },
+                &AccessToken {
+                    scheme: "Bearer".to_string(),
+                    token: issued.access_token,
+                },
+            )
+            .expect("token verifier accepts issued access token");
+        assert_eq!(
+            auth.claims
+                .as_ref()
+                .and_then(|facts| facts["resource"].as_str()),
+            Some(RESOURCE)
+        );
+
+        let rotated = server
+            .token(&bounded_refresh_request("resource-client", &refresh))
+            .expect("omitted-resource refresh preserves the bound resource");
+        let rotated_access = server
+            .validate_access_token(&rotated.access_token)
+            .expect("rotated access token introspection");
+        assert_eq!(rotated_access.resource.as_deref(), Some(RESOURCE));
+        let rotated_refresh = rotated.refresh_token.expect("rotated refresh token");
+        assert_eq!(
+            server
+                .state
+                .read()
+                .expect("state")
+                .refresh_tokens
+                .get(&refresh_token_digest(&rotated_refresh))
+                .and_then(|token| token.resource.as_deref()),
+            Some(RESOURCE)
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn refresh_resource_mismatch_rejects_without_consuming_or_widening_the_grant() {
+        const RESOURCE: &str = "https://resource.example/api";
+        const WRONG_RESOURCE: &str = "https://resource.example/other";
+        let backend = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
+        let server = server_with_counting_approval(Arc::clone(&backend));
+        server
+            .register_client(
+                OAuthClient::builder("resource-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .expect("bounded client"),
+            )
+            .expect("register client");
+        let (code, _) = server
+            .authorize(&approved_resource_request("resource-client"))
+            .expect("approved authorization");
+        let issued = server
+            .token(&resource_code_exchange_request(
+                "resource-client",
+                &code,
+                RESOURCE,
+            ))
+            .expect("exact resource code exchange");
+        let refresh = issued.refresh_token.expect("refresh token");
+        let cleanup_canary =
+            insert_expired_authorization_code_cleanup_canary(&server, "resource-client");
+        let before = server.stats();
+
+        let error = server
+            .token(&resource_refresh_request(
+                "resource-client",
+                &refresh,
+                WRONG_RESOURCE,
+            ))
+            .expect_err("only the resource differs");
+
+        assert!(matches!(error, OAuthError::InvalidGrant(_)));
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        {
+            let state = server.state.read().expect("state");
+            assert!(state.authorization_codes.contains_key(&cleanup_canary));
+            assert_eq!(
+                state
+                    .refresh_tokens
+                    .get(&refresh_token_digest(&refresh))
+                    .and_then(|token| token.resource.as_deref()),
+                Some(RESOURCE)
+            );
+        }
+
+        let rotated = server
+            .token(&resource_refresh_request(
+                "resource-client",
+                &refresh,
+                RESOURCE,
+            ))
+            .expect("unchanged refresh remains usable with its exact resource");
+        assert_eq!(
+            server
+                .validate_access_token(&rotated.access_token)
+                .and_then(|token| token.resource),
+            Some(RESOURCE.to_string())
+        );
+    }
+
+    #[test]
+    fn authorization_code_resource_mismatch_rejects_before_expiry_cleanup() {
+        const RESOURCE: &str = "https://resource.example/api";
+        const WRONG_RESOURCE: &str = "https://resource.example/other";
+        let backend = Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact));
+        let server = server_with_counting_approval(Arc::clone(&backend));
+        server
+            .register_client(
+                OAuthClient::builder("resource-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .expect("bounded client"),
+            )
+            .expect("register client");
+        let (code, _) = server
+            .authorize(&approved_resource_request("resource-client"))
+            .expect("approved authorization");
+        let code_digest = authorization_code_digest(&code);
+        let cleanup_canary =
+            insert_expired_authorization_code_cleanup_canary(&server, "resource-client");
+        let before = server.stats();
+
+        let error = server
+            .token(&resource_code_exchange_request(
+                "resource-client",
+                &code,
+                WRONG_RESOURCE,
+            ))
+            .expect_err("only the requested resource differs");
+
+        assert!(matches!(error, OAuthError::InvalidGrant(_)));
+        assert_oauth_stats_unchanged(&before, &server.stats());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let state = server.state.read().expect("state");
+        assert!(state.authorization_codes.contains_key(&cleanup_canary));
+        assert_eq!(
+            state
+                .authorization_codes
+                .get(&code_digest)
+                .and_then(|code| code.resource.as_deref()),
+            Some(RESOURCE)
+        );
+        drop(state);
+
+        let issued = server
+            .token(&resource_code_exchange_request(
+                "resource-client",
+                &code,
+                RESOURCE,
+            ))
+            .expect("unchanged code remains exchangeable with its exact resource");
+        assert_eq!(
+            server
+                .validate_access_token(&issued.access_token)
+                .and_then(|token| token.resource),
+            Some(RESOURCE.to_string())
+        );
+    }
+
+    #[test]
+    fn authorization_approval_binding_generation_scope_and_resource_mismatches_do_not_mutate() {
+        for mode in [
+            ApprovalTestMode::WrongBinding,
+            ApprovalTestMode::WrongGeneration,
+            ApprovalTestMode::WrongScopes,
+            ApprovalTestMode::WrongResource,
+        ] {
+            let backend = Arc::new(CountingApprovalBackend::new(mode));
+            let server = server_with_counting_approval(Arc::clone(&backend));
+            server
+                .register_client(
+                    OAuthClient::builder("approval-client")
+                        .redirect_uri("http://127.0.0.1/callback")
+                        .scope("read")
+                        .build()
+                        .expect("bounded client"),
+                )
+                .expect("register client");
+            let before = server.stats();
+
+            let error = server
+                .authorize(&approved_resource_request("approval-client"))
+                .expect_err("one changed approval fact must reject");
+
+            assert!(matches!(error, OAuthError::AccessDenied(_)));
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            assert_oauth_stats_unchanged(&before, &server.stats());
+        }
+    }
+
+    #[test]
+    fn authorization_approval_denial_error_and_cancellation_do_not_create_codes() {
+        for mode in [
+            ApprovalTestMode::Denied,
+            ApprovalTestMode::Error,
+            ApprovalTestMode::Cancelled,
+        ] {
+            let backend = Arc::new(CountingApprovalBackend::new(mode));
+            let server = server_with_counting_approval(Arc::clone(&backend));
+            server
+                .register_client(
+                    OAuthClient::builder("approval-client")
+                        .redirect_uri("http://127.0.0.1/callback")
+                        .scope("read")
+                        .build()
+                        .expect("bounded client"),
+                )
+                .expect("register client");
+            let before = server.stats();
+
+            let error = server
+                .authorize(&approved_resource_request("approval-client"))
+                .expect_err("non-approved disposition must reject");
+
+            assert!(matches!(
+                error,
+                OAuthError::AccessDenied(_) | OAuthError::TemporarilyUnavailable(_)
+            ));
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            assert_oauth_stats_unchanged(&before, &server.stats());
+        }
+    }
+
+    #[test]
+    fn default_oauth_server_construction_is_fail_closed_without_an_approval_backend() {
+        let server = OAuthServer::new(OAuthServerConfig::default());
+        server
+            .register_client(
+                OAuthClient::builder("approval-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .expect("bounded client"),
+            )
+            .expect("register client");
+        let before = server.stats();
+
+        let error = server
+            .authorize(&approved_resource_request("approval-client"))
+            .expect_err("default construction must not silently approve");
+
+        assert!(matches!(error, OAuthError::AccessDenied(_)));
+        assert_oauth_stats_unchanged(&before, &server.stats());
     }
 
     fn bounded_refresh_request(client_id: &str, refresh_token: &str) -> TokenRequest {
@@ -3525,6 +5409,7 @@ mod tests {
             code_verifier: None,
             refresh_token: Some(refresh_token.to_string()),
             scopes: None,
+            resource: None,
         }
     }
 
@@ -3538,6 +5423,7 @@ mod tests {
             code_verifier: Some("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".to_string()),
             refresh_token: None,
             scopes: None,
+            resource: None,
         }
     }
 
@@ -3877,8 +5763,7 @@ mod tests {
         let mut request = bounded_authorization_request("bounded");
         request.scopes = scopes;
         request.state = Some("s".repeat(MAX_OAUTH_STATE_BYTES));
-        let subject = "u".repeat(MAX_OAUTH_SUBJECT_BYTES);
-        let (code, _) = server.authorize(&request, Some(subject)).unwrap();
+        let (code, _) = server.authorize(&request).unwrap();
 
         let state = server.state.read().unwrap();
         let retained = state
@@ -3892,7 +5777,7 @@ mod tests {
         );
         assert_eq!(
             retained.subject.as_ref().map(String::len),
-            Some(MAX_OAUTH_SUBJECT_BYTES)
+            Some("oauth-test-subject".len())
         );
     }
 
@@ -3909,7 +5794,7 @@ mod tests {
 
         let mut request = bounded_authorization_request("bounded");
         request.scopes = vec!["read".to_string(), "read".to_string(), "write".to_string()];
-        let (code, _) = server.authorize(&request, None).unwrap();
+        let (code, _) = server.authorize(&request).unwrap();
 
         let state = server.state.read().unwrap();
         assert_eq!(
@@ -3940,7 +5825,6 @@ mod tests {
                     state: Some("s".repeat(MAX_OAUTH_STATE_BYTES + 1)),
                     ..request.clone()
                 },
-                None,
                 || {
                     draws.set(draws.get() + 1);
                     draw_security_identifier().map_err(|_| "unexpected RNG failure")
@@ -3955,27 +5839,10 @@ mod tests {
 
         let error = server
             .authorize_with_token_draw(
-                &request,
-                Some("u".repeat(MAX_OAUTH_SUBJECT_BYTES + 1)),
-                || {
-                    draws.set(draws.get() + 1);
-                    draw_security_identifier().map_err(|_| "unexpected RNG failure")
-                },
-            )
-            .unwrap_err();
-        assert_eq!(
-            error.description(),
-            OAUTH_AUTHORIZATION_SUBJECT_RETENTION_ERROR
-        );
-        assert_eq!(draws.get(), 0);
-
-        let error = server
-            .authorize_with_token_draw(
                 &AuthorizationRequest {
                     scopes: vec!["x".repeat(MAX_OAUTH_SCOPE_BYTES + 1)],
                     ..request.clone()
                 },
-                None,
                 || {
                     draws.set(draws.get() + 1);
                     draw_security_identifier().map_err(|_| "unexpected RNG failure")
@@ -3991,7 +5858,6 @@ mod tests {
                     scopes: vec!["read".to_string(); MAX_OAUTH_SCOPES_PER_CLIENT + 1],
                     ..request
                 },
-                None,
                 || {
                     draws.set(draws.get() + 1);
                     draw_security_identifier().map_err(|_| "unexpected RNG failure")
@@ -4223,7 +6089,7 @@ mod tests {
             .register_client(bounded_test_client("public"))
             .unwrap();
         let (code, _) = server
-            .authorize(&bounded_authorization_request("public"), None)
+            .authorize(&bounded_authorization_request("public"))
             .unwrap();
         let mut exchange = bounded_code_exchange_request("public", &code);
         exchange.client_secret = Some("must-not-be-accepted".to_string());
@@ -4314,14 +6180,13 @@ mod tests {
             client_id: "test-client".to_string(),
             redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
             scopes: vec!["read".to_string()],
+            resource: None,
             state: Some("xyz".to_string()),
             code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
 
-        let (code, redirect) = server
-            .authorize(&request, Some("user123".to_string()))
-            .unwrap();
+        let (code, redirect) = server.authorize(&request).unwrap();
 
         assert!(!code.is_empty());
         assert!(redirect.contains("code="));
@@ -4344,12 +6209,13 @@ mod tests {
             client_id: "test-client".to_string(),
             redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: String::new(), // Missing!
             code_challenge_method: CodeChallengeMethod::S256,
         };
 
-        let result = server.authorize(&request, None);
+        let result = server.authorize(&request);
         assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
     }
 
@@ -4368,11 +6234,12 @@ mod tests {
             client_id: "test-client".to_string(),
             redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: verifier.to_string(),
             code_challenge_method: CodeChallengeMethod::Plain,
         };
-        let error = server.authorize(&plain, None).unwrap_err();
+        let error = server.authorize(&plain).unwrap_err();
         assert!(matches!(error, OAuthError::InvalidRequest(_)));
 
         let malformed_s256 = AuthorizationRequest {
@@ -4380,22 +6247,39 @@ mod tests {
             code_challenge_method: CodeChallengeMethod::S256,
             ..plain
         };
-        let error = server.authorize(&malformed_s256, None).unwrap_err();
+        let error = server.authorize(&malformed_s256).unwrap_err();
         assert!(matches!(error, OAuthError::InvalidRequest(_)));
         assert!(server.state.read().unwrap().authorization_codes.is_empty());
     }
 
     #[test]
-    fn authorization_rejects_empty_subject_before_retention() {
-        let server = OAuthServer::with_defaults();
-        server.register_client(bounded_test_client("c1")).unwrap();
+    fn authorization_approval_decision_rejects_empty_subject() {
+        let request = AuthorizationApprovalRequest {
+            binding: AuthorizationApprovalBinding {
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/callback".to_string(),
+                scopes: Vec::new(),
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                )
+                .expect("valid challenge"),
+                code_challenge_method: CodeChallengeMethod::S256,
+                registration_epoch: test_registration_epoch(1),
+            },
+        };
 
-        let error = server
-            .authorize(&bounded_authorization_request("c1"), Some(String::new()))
-            .expect_err("an empty subject is not a usable owner identity");
+        let error = request
+            .approve(
+                String::new(),
+                Vec::new(),
+                None,
+                AuthorizationApprovalGeneration::from_bytes([1; 32]),
+            )
+            .expect_err("an empty subject is not a usable approval identity");
 
         assert!(matches!(error, OAuthError::InvalidRequest(_)));
-        assert!(server.state.read().unwrap().authorization_codes.is_empty());
     }
 
     #[test]
@@ -4428,15 +6312,11 @@ mod tests {
         let authorizing_server = Arc::clone(&server);
 
         let authorizing = std::thread::spawn(move || {
-            authorizing_server.authorize_with_token_draw(
-                &request,
-                Some("subject".to_string()),
-                || {
-                    draw_started_tx.send(()).expect("signal code draw");
-                    resume_draw_rx.recv().expect("resume code draw");
-                    draw_security_identifier().map_err(|_| "unexpected RNG failure")
-                },
-            )
+            authorizing_server.authorize_with_token_draw(&request, || {
+                draw_started_tx.send(()).expect("signal code draw");
+                resume_draw_rx.recv().expect("resume code draw");
+                draw_security_identifier().map_err(|_| "unexpected RNG failure")
+            })
         });
 
         draw_started_rx.recv().expect("authorization reached draw");
@@ -4514,13 +6394,14 @@ mod tests {
             client_id: "test-client".to_string(),
             redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
         let draw_calls = std::cell::Cell::new(0);
 
-        let result = server.authorize_with_token_draw(&request, None, || {
+        let result = server.authorize_with_token_draw(&request, || {
             draw_calls.set(draw_calls.get() + 1);
             Err::<SecurityIdentifier, _>("forced security-identifier draw failure")
         });
@@ -4537,7 +6418,7 @@ mod tests {
         let final_draw_completed = std::cell::Cell::new(None);
 
         let (code, _) = server
-            .authorize_with_token_draw(&bounded_authorization_request("c1"), None, || {
+            .authorize_with_token_draw(&bounded_authorization_request("c1"), || {
                 let identifier = draw_security_identifier()
                     .map_err(|_| "unexpected operating-system RNG failure")?;
                 final_draw_completed.set(Some(Instant::now()));
@@ -4658,6 +6539,7 @@ mod tests {
             code_verifier: None,
             refresh_token: Some(refresh_token.clone()),
             scopes: None,
+            resource: None,
         };
         let draw_calls = std::cell::Cell::new(0);
 
@@ -4858,7 +6740,7 @@ mod tests {
         let result = verifier.verify(&mcp_ctx, auth_request, &access);
         assert!(result.is_ok());
         let auth = result.unwrap();
-        assert_eq!(auth.subject, Some("user123".to_string()));
+        assert_eq!(auth.subject, Some("oauth-test-subject".to_string()));
         assert_eq!(auth.scopes, vec!["read".to_string()]);
 
         // Invalid token
@@ -5247,6 +7129,7 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             code_challenge: "challenge".to_string(),
             code_challenge_method: CodeChallengeMethod::Plain,
             issued_at: Instant::now(),
@@ -5266,6 +7149,7 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             code_challenge: "challenge".to_string(),
             code_challenge_method: CodeChallengeMethod::Plain,
             issued_at: Instant::now() - Duration::from_secs(100),
@@ -5284,6 +7168,7 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             code_challenge: verifier.to_string(),
             code_challenge_method: CodeChallengeMethod::Plain,
             issued_at: Instant::now(),
@@ -5306,6 +7191,7 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             code_challenge: challenge,
             code_challenge_method: CodeChallengeMethod::S256,
             issued_at: Instant::now(),
@@ -5326,6 +7212,7 @@ mod tests {
             client_id: "cid".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec!["read".to_string()],
+            resource: None,
             code_challenge: "ch".to_string(),
             code_challenge_method: CodeChallengeMethod::Plain,
             issued_at: Instant::now(),
@@ -5373,6 +7260,7 @@ mod tests {
             token_type: TokenType::Bearer,
             client_id: "c".to_string(),
             scopes: vec![],
+            resource: None,
             issued_at: Instant::now(),
             expires_at: Instant::now()
                 .checked_add(Duration::from_secs(3600))
@@ -5391,6 +7279,7 @@ mod tests {
             token_type: TokenType::Bearer,
             client_id: "c".to_string(),
             scopes: vec![],
+            resource: None,
             issued_at: Instant::now() - Duration::from_secs(100),
             expires_at: Instant::now() - Duration::from_secs(1),
             subject: None,
@@ -5407,6 +7296,7 @@ mod tests {
             token_type: TokenType::Bearer,
             client_id: "c".to_string(),
             scopes: vec!["read".to_string()],
+            resource: None,
             issued_at: Instant::now(),
             expires_at: Instant::now()
                 .checked_add(Duration::from_secs(60))
@@ -5464,6 +7354,7 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec!["read".to_string()],
+            resource: None,
             state: Some("s".to_string()),
             code_challenge: "ch".to_string(),
             code_challenge_method: CodeChallengeMethod::S256,
@@ -5485,6 +7376,7 @@ mod tests {
             code_verifier: Some("verifier".to_string()),
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         let debug = format!("{:?}", req);
         assert!(debug.contains("TokenRequest"));
@@ -5514,6 +7406,7 @@ mod tests {
             client_id: format!("client-{CANARY}"),
             redirect_uri: format!("https://{CANARY}.example/code"),
             scopes: vec![format!("scope-{CANARY}")],
+            resource: None,
             code_challenge: format!("challenge-{CANARY}"),
             code_challenge_method: CodeChallengeMethod::S256,
             issued_at: now,
@@ -5529,6 +7422,7 @@ mod tests {
             token_type: TokenType::Bearer,
             client_id: format!("client-{CANARY}"),
             scopes: vec![format!("scope-{CANARY}")],
+            resource: None,
             issued_at: now,
             expires_at: now
                 .checked_add(Duration::from_secs(60))
@@ -5548,6 +7442,7 @@ mod tests {
             client_id: format!("client-{CANARY}"),
             redirect_uri: format!("https://{CANARY}.example/request"),
             scopes: vec![format!("scope-{CANARY}")],
+            resource: None,
             state: Some(format!("state-{CANARY}")),
             code_challenge: format!("challenge-{CANARY}"),
             code_challenge_method: CodeChallengeMethod::S256,
@@ -5561,6 +7456,7 @@ mod tests {
             code_verifier: Some(format!("verifier-{CANARY}")),
             refresh_token: Some(format!("refresh-{CANARY}")),
             scopes: Some(vec![format!("scope-{CANARY}")]),
+            resource: None,
         };
         let error = OAuthError::InvalidGrant(format!("error-{CANARY}"));
 
@@ -5720,11 +7616,12 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: "ch".to_string(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
-        let result = server.authorize(&req, None);
+        let result = server.authorize(&req);
         assert!(matches!(
             result,
             Err(OAuthError::UnsupportedResponseType(_))
@@ -5745,11 +7642,12 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "https://evil.com/cb".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: "ch".to_string(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
-        let result = server.authorize(&req, None);
+        let result = server.authorize(&req);
         assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
     }
 
@@ -5768,11 +7666,12 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec!["admin".to_string()],
+            resource: None,
             state: None,
             code_challenge: "ch".to_string(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
-        let result = server.authorize(&req, None);
+        let result = server.authorize(&req);
         assert!(matches!(result, Err(OAuthError::InvalidScope(_))));
     }
 
@@ -5784,11 +7683,12 @@ mod tests {
             client_id: "nonexistent".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: "ch".to_string(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
-        let result = server.authorize(&req, None);
+        let result = server.authorize(&req);
         assert!(matches!(result, Err(OAuthError::InvalidClient(_))));
     }
 
@@ -5804,6 +7704,7 @@ mod tests {
             code_verifier: None,
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         let result = server.token(&req);
         assert!(matches!(result, Err(OAuthError::UnsupportedGrantType(_))));
@@ -5821,6 +7722,7 @@ mod tests {
             code_verifier: Some("v".repeat(43)),
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         let result = server.token(&req);
         assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
@@ -5838,6 +7740,7 @@ mod tests {
             code_verifier: Some("v".repeat(43)),
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         let result = server.token(&req);
         assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
@@ -5855,6 +7758,7 @@ mod tests {
             code_verifier: None, // missing
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         let result = server.token(&req);
         assert!(matches!(result, Err(OAuthError::InvalidRequest(_))));
@@ -5882,11 +7786,12 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: compute_s256_challenge(issued_verifier).unwrap(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
-        let (code, _) = server.authorize(&req, None).unwrap();
+        let (code, _) = server.authorize(&req).unwrap();
         let stored_code = code.clone();
 
         let token_req = TokenRequest {
@@ -5898,6 +7803,7 @@ mod tests {
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         let result = server.token(&token_req);
         // PKCE verifier failures on the token endpoint uniformly surface as
@@ -5932,13 +7838,12 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec!["read".to_string()],
+            resource: None,
             state: None,
             code_challenge: challenge,
             code_challenge_method: CodeChallengeMethod::S256,
         };
-        let (code, _) = server
-            .authorize(&auth_req, Some("user1".to_string()))
-            .unwrap();
+        let (code, _) = server.authorize(&auth_req).unwrap();
 
         let token_req = TokenRequest {
             grant_type: "authorization_code".to_string(),
@@ -5949,6 +7854,7 @@ mod tests {
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         let resp = server.token(&token_req).unwrap();
         assert!(!resp.access_token.is_empty());
@@ -5972,11 +7878,12 @@ mod tests {
             client_id: "c".to_string(),
             redirect_uri: "http://127.0.0.1/cb".to_string(),
             scopes: vec![],
+            resource: None,
             state: None,
             code_challenge: compute_s256_challenge(verifier).unwrap(),
             code_challenge_method: CodeChallengeMethod::S256,
         };
-        let (code, _) = server.authorize(&auth_req, None).unwrap();
+        let (code, _) = server.authorize(&auth_req).unwrap();
 
         let token_req = TokenRequest {
             grant_type: "authorization_code".to_string(),
@@ -5987,6 +7894,7 @@ mod tests {
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
         // First use succeeds
         server.token(&token_req).unwrap();
@@ -6185,6 +8093,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh.clone()),
                 scopes: None,
+                resource: None,
             })
             .unwrap();
 
@@ -6232,6 +8141,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: Some(vec!["read".to_string()]),
+                resource: None,
             })
             .unwrap();
 
@@ -6268,6 +8178,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: Some(vec!["admin".to_string()]),
+                resource: None,
             })
             .unwrap_err();
 
@@ -6309,6 +8220,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -6352,6 +8264,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -6378,6 +8291,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: None,
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -6404,6 +8318,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some("nonexistent".to_string()),
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -6427,18 +8342,16 @@ mod tests {
 
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let (code, _) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: None,
-                    code_challenge: compute_s256_challenge(verifier).unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(verifier).unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         // Exchange with different redirect_uri
@@ -6452,6 +8365,7 @@ mod tests {
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -6485,18 +8399,16 @@ mod tests {
 
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let (code, _) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: None,
-                    code_challenge: compute_s256_challenge(verifier).unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(verifier).unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         // Exchange with different client_id
@@ -6510,6 +8422,7 @@ mod tests {
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -6538,18 +8451,16 @@ mod tests {
 
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let (code, _) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: None,
-                    code_challenge: compute_s256_challenge(verifier).unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(verifier).unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         // Exchange with wrong secret
@@ -6563,6 +8474,7 @@ mod tests {
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -6588,18 +8500,16 @@ mod tests {
 
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let (code, _) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec![],
-                    state: None,
-                    code_challenge: compute_s256_challenge(verifier).unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec![],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(verifier).unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         let request = |code_verifier: &str| TokenRequest {
@@ -6611,6 +8521,7 @@ mod tests {
             code_verifier: Some(code_verifier.to_string()),
             refresh_token: None,
             scopes: None,
+            resource: None,
         };
 
         let malformed_verifier = "a".repeat(PKCE_CODE_VERIFIER_MIN_BYTES - 1);
@@ -6669,18 +8580,16 @@ mod tests {
         server.register_client(client).unwrap();
 
         let err = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: None,
-                    code_challenge: String::new(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: None,
+                code_challenge: String::new(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap_err();
 
         assert_eq!(err.error_code(), "invalid_request");
@@ -6698,21 +8607,19 @@ mod tests {
         server.register_client(client).unwrap();
 
         let (code, redirect) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: Some("my-csrf-state".to_string()),
-                    code_challenge: compute_s256_challenge(
-                        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
-                    )
-                    .unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                Some("user1".to_string()),
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: Some("my-csrf-state".to_string()),
+                code_challenge: compute_s256_challenge(
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                )
+                .unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         // Redirect should contain code, state, and the RFC 9207 issuer binding.
@@ -6739,21 +8646,19 @@ mod tests {
         server.register_client(client).unwrap();
 
         let (_code, redirect) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb?foo=bar".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: None,
-                    code_challenge: compute_s256_challenge(
-                        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
-                    )
-                    .unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb?foo=bar".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                )
+                .unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         // Should use '&' separator since '?' already exists
@@ -6894,18 +8799,16 @@ mod tests {
         // Create an auth code
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let (code, _) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: None,
-                    code_challenge: compute_s256_challenge(verifier).unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(verifier).unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         // Verify code exists
@@ -7271,6 +9174,7 @@ mod tests {
             token_type: TokenType::Bearer,
             client_id: "c".to_string(),
             scopes: vec![],
+            resource: None,
             issued_at: Instant::now(),
             expires_at: Instant::now()
                 .checked_add(Duration::from_secs(3600))
@@ -7296,18 +9200,16 @@ mod tests {
         // Authorization does not authenticate the client; token exchange does.
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let (code, _) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec!["read".to_string()],
-                    state: None,
-                    code_challenge: compute_s256_challenge(verifier).unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec!["read".to_string()],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(verifier).unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         // Token exchange with correct secret
@@ -7321,6 +9223,7 @@ mod tests {
                 code_verifier: Some(verifier.to_string()),
                 refresh_token: None,
                 scopes: None,
+                resource: None,
             })
             .unwrap();
 
@@ -7337,6 +9240,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh.clone()),
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -7355,6 +9259,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -7462,21 +9367,19 @@ mod tests {
         server.register_client(client).unwrap();
 
         let (_code, redirect) = server
-            .authorize(
-                &AuthorizationRequest {
-                    response_type: "code".to_string(),
-                    client_id: "c1".to_string(),
-                    redirect_uri: "http://127.0.0.1/cb".to_string(),
-                    scopes: vec![],
-                    state: None,
-                    code_challenge: compute_s256_challenge(
-                        "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
-                    )
-                    .unwrap(),
-                    code_challenge_method: CodeChallengeMethod::S256,
-                },
-                None,
-            )
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: "c1".to_string(),
+                redirect_uri: "http://127.0.0.1/cb".to_string(),
+                scopes: vec![],
+                resource: None,
+                state: None,
+                code_challenge: compute_s256_challenge(
+                    "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+                )
+                .unwrap(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
             .unwrap();
 
         assert!(redirect.contains("code="));
@@ -7515,6 +9418,7 @@ mod tests {
                 code_verifier: None,
                 refresh_token: Some(refresh),
                 scopes: None,
+                resource: None,
             })
             .unwrap_err();
 
@@ -8081,7 +9985,7 @@ mod tests {
 
     #[test]
     fn authorization_code_global_capacity_is_exact_and_atomic() {
-        let server = OAuthServer::new(OAuthServerConfig {
+        let server = configured_approved_test_server(OAuthServerConfig {
             max_authorization_codes: 2,
             max_authorization_codes_per_client: 2,
             ..OAuthServerConfig::default()
@@ -8090,13 +9994,13 @@ mod tests {
         server.register_client(bounded_test_client("c2")).unwrap();
 
         server
-            .authorize(&bounded_authorization_request("c1"), None)
+            .authorize(&bounded_authorization_request("c1"))
             .unwrap();
         server
-            .authorize(&bounded_authorization_request("c1"), None)
+            .authorize(&bounded_authorization_request("c1"))
             .unwrap();
         let error = server
-            .authorize(&bounded_authorization_request("c2"), None)
+            .authorize(&bounded_authorization_request("c2"))
             .expect_err("global authorization-code cap must reject the next code");
 
         assert!(matches!(error, OAuthError::TemporarilyUnavailable(_)));
@@ -8108,7 +10012,7 @@ mod tests {
 
     #[test]
     fn authorization_code_per_client_capacity_is_exact_and_isolated() {
-        let server = OAuthServer::new(OAuthServerConfig {
+        let server = configured_approved_test_server(OAuthServerConfig {
             max_authorization_codes: 3,
             max_authorization_codes_per_client: 1,
             ..OAuthServerConfig::default()
@@ -8117,14 +10021,14 @@ mod tests {
         server.register_client(bounded_test_client("c2")).unwrap();
 
         server
-            .authorize(&bounded_authorization_request("c1"), None)
+            .authorize(&bounded_authorization_request("c1"))
             .unwrap();
         let error = server
-            .authorize(&bounded_authorization_request("c1"), None)
+            .authorize(&bounded_authorization_request("c1"))
             .expect_err("per-client authorization-code cap must reject the next code");
         assert!(matches!(error, OAuthError::TemporarilyUnavailable(_)));
         server
-            .authorize(&bounded_authorization_request("c2"), None)
+            .authorize(&bounded_authorization_request("c2"))
             .unwrap();
 
         let state = server.state.read().unwrap();
@@ -8231,7 +10135,7 @@ mod tests {
 
     #[test]
     fn code_exchange_capacity_failure_preserves_single_use_code_for_retry() {
-        let server = OAuthServer::new(OAuthServerConfig {
+        let server = configured_approved_test_server(OAuthServerConfig {
             max_access_tokens: 1,
             max_access_tokens_per_client: 1,
             ..OAuthServerConfig::default()
@@ -8239,7 +10143,7 @@ mod tests {
         server.register_client(bounded_test_client("c1")).unwrap();
         let blocker = server.issue_tokens("c1", &[], None).unwrap();
         let (code, _) = server
-            .authorize(&bounded_authorization_request("c1"), None)
+            .authorize(&bounded_authorization_request("c1"))
             .unwrap();
         let request = bounded_code_exchange_request("c1", &code);
 
@@ -8270,7 +10174,7 @@ mod tests {
 
     #[test]
     fn code_exchange_refresh_capacity_failure_preserves_single_use_code_for_retry() {
-        let server = OAuthServer::new(OAuthServerConfig {
+        let server = configured_approved_test_server(OAuthServerConfig {
             max_access_tokens: 2,
             max_access_tokens_per_client: 2,
             max_refresh_tokens: 1,
@@ -8281,7 +10185,7 @@ mod tests {
         let blocker = server.issue_tokens("c1", &[], None).unwrap();
         let blocker_refresh = blocker.refresh_token.expect("refresh token");
         let (code, _) = server
-            .authorize(&bounded_authorization_request("c1"), None)
+            .authorize(&bounded_authorization_request("c1"))
             .unwrap();
         let request = bounded_code_exchange_request("c1", &code);
 
@@ -8315,7 +10219,7 @@ mod tests {
         let server = OAuthServer::with_defaults();
         server.register_client(bounded_test_client("c1")).unwrap();
         let (code, _) = server
-            .authorize(&bounded_authorization_request("c1"), None)
+            .authorize(&bounded_authorization_request("c1"))
             .unwrap();
         let request = bounded_code_exchange_request("c1", &code);
         let draw_calls = std::cell::Cell::new(0);
@@ -8799,6 +10703,7 @@ mod tests {
                     client_id: "c1".to_string(),
                     redirect_uri: "http://127.0.0.1/callback".to_string(),
                     scopes: Vec::new(),
+                    resource: None,
                     code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
                     code_challenge_method: CodeChallengeMethod::S256,
                     issued_at,
@@ -8816,6 +10721,7 @@ mod tests {
                         token_type: TokenType::Bearer,
                         client_id: "c1".to_string(),
                         scopes: Vec::new(),
+                        resource: None,
                         issued_at,
                         expires_at: expired_at,
                         subject: None,
@@ -8834,6 +10740,7 @@ mod tests {
                         token_type: TokenType::Bearer,
                         client_id: "c1".to_string(),
                         scopes: Vec::new(),
+                        resource: None,
                         issued_at,
                         expires_at: expired_at,
                         subject: None,

@@ -409,12 +409,44 @@ fn e2e_auth_static_token_flow_allows_and_denies() {
 #[test]
 fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
     use fastmcp_rust::oauth::{
-        AuthorizationRequest, CodeChallengeMethod, OAuthClient, OAuthServer, OAuthServerConfig,
-        TokenRequest,
+        AuthorizationApprovalBackend, AuthorizationApprovalDisposition,
+        AuthorizationApprovalGeneration, AuthorizationApprovalRequest, AuthorizationRequest,
+        CodeChallengeMethod, OAuthClient, OAuthServer, OAuthServerConfig, TokenRequest,
     };
 
-    let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+    const CLIENT_SECRET: &str = "e2e-approval-client-secret-canary";
+    struct E2eApprovalBackend(std::sync::Mutex<Option<String>>);
+    impl AuthorizationApprovalBackend for E2eApprovalBackend {
+        fn generation(&self) -> AuthorizationApprovalGeneration {
+            AuthorizationApprovalGeneration::from_bytes([0xE2; 32])
+        }
+
+        fn approve(
+            &self,
+            request: &AuthorizationApprovalRequest,
+        ) -> AuthorizationApprovalDisposition {
+            *self.0.lock().expect("approval observation") = Some(format!("{request:?}"));
+            AuthorizationApprovalDisposition::Approved(
+                request
+                    .approve(
+                        "user123".to_string(),
+                        request.scopes().to_vec(),
+                        request.resource().map(str::to_string),
+                        self.generation(),
+                    )
+                    .expect("validated approval request"),
+            )
+        }
+    }
+
+    let approval = Arc::new(E2eApprovalBackend(std::sync::Mutex::new(None)));
+    let approval_backend: Arc<dyn AuthorizationApprovalBackend> = approval.clone();
+    let oauth = Arc::new(OAuthServer::with_approval_backend(
+        OAuthServerConfig::default(),
+        approval_backend,
+    ));
     let client_def = OAuthClient::builder("test-client")
+        .secret(CLIENT_SECRET)
         .redirect_uri("http://127.0.0.1:3000/callback")
         .scope("read")
         .build()
@@ -428,13 +460,20 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
         client_id: "test-client".to_string(),
         redirect_uri: "http://127.0.0.1:3000/callback".to_string(),
         scopes: vec!["read".to_string()],
+        resource: None,
         state: None,
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
         code_challenge_method: CodeChallengeMethod::S256,
     };
-    let (code, _redirect) = oauth
-        .authorize(&auth_request, Some("user123".to_string()))
-        .unwrap();
+    let (code, _redirect) = oauth.authorize(&auth_request).unwrap();
+    let approval_debug = approval
+        .0
+        .lock()
+        .expect("approval observation")
+        .clone()
+        .expect("approval backend called");
+    assert!(!approval_debug.contains(CLIENT_SECRET));
+    assert!(!approval_debug.contains(&code));
 
     let token_response = oauth
         .token(&TokenRequest {
@@ -442,12 +481,23 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
             code: Some(code),
             redirect_uri: Some("http://127.0.0.1:3000/callback".to_string()),
             client_id: "test-client".to_string(),
-            client_secret: None,
+            client_secret: Some(CLIENT_SECRET.to_string()),
             code_verifier: Some(code_verifier.to_string()),
             refresh_token: None,
             scopes: None,
+            resource: None,
         })
         .unwrap();
+
+    assert!(!approval_debug.contains(&token_response.access_token));
+    assert!(
+        !approval_debug.contains(
+            token_response
+                .refresh_token
+                .as_deref()
+                .expect("refresh token")
+        )
+    );
 
     let access = token_response.access_token.clone();
     let refresh = token_response.refresh_token.clone().expect("refresh token");
@@ -518,6 +568,7 @@ fn e2e_auth_oauth_token_verifier_revocation_and_refresh() {
             code_verifier: None,
             refresh_token: Some(refresh),
             scopes: None,
+            resource: None,
         })
         .unwrap();
 

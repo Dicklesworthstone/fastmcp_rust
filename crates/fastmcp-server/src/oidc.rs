@@ -960,6 +960,7 @@ mod non_signing_tests {
             token_type: crate::oauth::TokenType::Bearer,
             client_id: "client".to_string(),
             scopes: vec!["openid".to_string()],
+            resource: None,
             issued_at: std::time::Instant::now(),
             expires_at: std::time::Instant::now(),
             subject: Some("subject".to_string()),

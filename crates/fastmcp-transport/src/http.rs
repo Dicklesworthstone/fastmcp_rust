@@ -49,17 +49,32 @@
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(feature = "legacy-2024-11-05")]
-use std::net::{Shutdown, TcpStream};
+use std::net::{Shutdown, TcpStream as StdTcpStream};
+#[cfg(test)]
+use std::pin::Pin;
 use std::sync::{
     Arc, Mutex, TryLockError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use asupersync::{Cx, channel::mpsc};
-use fastmcp_core::{McpRequestCancellation, draw_security_identifier};
+use asupersync::{
+    Cx,
+    channel::mpsc,
+    http::h1::{Http1Client as NativeHttp1Client, Request as NativeHttpRequest},
+    net::{
+        TcpStream as NativeTcpStream,
+        dns::{Resolver as NativeDnsResolver, ResolverConfig},
+    },
+    time,
+    tls::TlsConnector,
+};
+use fastmcp_core::{McpRequestCancellation, draw_security_identifier, sha256_bounded};
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_protocol::methods::{
     Legacy2024Direction, Legacy2024Envelope, decode_legacy_2024_11_05_envelope_classified,
@@ -228,9 +243,9 @@ impl ModernHttpSseCollector {
     /// Incrementally consumes an HTTP response-body chunk.
     ///
     /// Each server notification is delivered immediately in wire order. A
-    /// response is retained only if its ID exactly matches this collector's
-    /// request ID. Continue feeding chunks through EOF so duplicate terminals
-    /// cannot be hidden after an otherwise valid first response.
+    /// response is retained only if its ID mathematically correlates with this
+    /// collector's request ID. Continue feeding chunks through EOF so duplicate
+    /// terminals cannot be hidden after an otherwise valid first response.
     pub fn push(
         &mut self,
         cx: &Cx,
@@ -275,7 +290,11 @@ impl ModernHttpSseCollector {
                                 request_id: request_id.clone(),
                             });
                         }
-                        if response.id.as_ref() != Some(&request_id) {
+                        if !response
+                            .id
+                            .as_ref()
+                            .is_some_and(|actual| actual.correlates_with(&request_id))
+                        {
                             return Err(ModernHttpSseCollectorError::TerminalResponseIdMismatch {
                                 expected: request_id.clone(),
                                 actual: response.id,
@@ -568,7 +587,7 @@ impl crate::sse::LegacySsePostSink for LegacySseHttpPostSink {
             return Err(TransportError::Cancelled);
         }
         let (authority, target) = legacy_sse_http_post_target(post.endpoint())?;
-        let mut stream = TcpStream::connect(authority).map_err(TransportError::Io)?;
+        let mut stream = StdTcpStream::connect(authority).map_err(TransportError::Io)?;
         let request = format!(
             "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             post.body().len(),
@@ -820,6 +839,900 @@ impl From<TransportError> for HttpError {
     fn from(err: TransportError) -> Self {
         Self::Transport(err)
     }
+}
+
+// =============================================================================
+// Guarded outbound HTTPS fetcher
+// =============================================================================
+
+/// Maximum URL bytes accepted by [`GuardedHttpsUrl`].
+pub const MAX_GUARDED_HTTPS_URL_BYTES: usize = 2 * 1024;
+/// Maximum root-policy revision bytes retained in fetch provenance.
+pub const MAX_GUARDED_ROOT_POLICY_REVISION_BYTES: usize = 128;
+/// The HTTP/1 header ceiling enforced by the native one-shot client.
+pub const MAX_GUARDED_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
+/// Maximum response body ceiling accepted by this fetcher.
+pub const MAX_GUARDED_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum leaf certificate bytes admitted to the core-owned digest primitive.
+pub const MAX_GUARDED_LEAF_CERTIFICATE_BYTES: usize = 128 * 1024;
+/// Maximum DNS addresses admitted from one complete resolver answer set.
+pub const MAX_GUARDED_RESOLVED_ADDRESSES: usize = 64;
+/// Longest full URL-resolution through response-body deadline this vertical admits.
+pub const MAX_GUARDED_FETCH_DEADLINE: Duration = Duration::from_secs(30);
+/// Longest TLS handshake timeout this vertical admits.
+pub const MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Test-only resolver seam whose complete answer set is checked before any connection.
+///
+/// Production fetchers own the cancel-safe native resolver. Tests use this seam
+/// to prove address fencing and cancellation without replacing the production
+/// resolver's custody guarantees.
+#[cfg(test)]
+trait GuardedHttpResolver: Send + Sync {
+    /// Resolve all IP answers for the supplied canonical DNS host.
+    ///
+    /// The future receives the fetch phase's child context and therefore must
+    /// observe its cancellation before returning. The fetcher applies its
+    /// non-extendable full-fetch deadline to this operation, just like the
+    /// subsequent TCP/TLS/HTTP exchange. A resolver must not hide blocking
+    /// work behind this future: this transport deliberately owns no threads or
+    /// runtime of its own.
+    fn resolve_all(
+        &self,
+        cx: Cx,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>;
+}
+
+#[cfg(test)]
+struct StaticGuardedResolverForLoopback {
+    address: IpAddr,
+}
+
+#[cfg(test)]
+impl GuardedHttpResolver for StaticGuardedResolverForLoopback {
+    fn resolve_all(
+        &self,
+        cx: Cx,
+        _host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>
+    {
+        let address = self.address;
+        Box::pin(async move {
+            guarded_fetch_checkpoint(&cx)?;
+            Ok(vec![address])
+        })
+    }
+}
+
+/// A bounded HTTPS URL accepted by [`GuardedHttpFetcher`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedHttpsUrl {
+    host: String,
+    port: u16,
+    target: String,
+}
+
+impl GuardedHttpsUrl {
+    /// Parse an absolute HTTPS URL with a DNS hostname and a bounded target.
+    pub fn parse(url: &str) -> Result<Self, GuardedHttpFetchError> {
+        if url.is_empty() || url.len() > MAX_GUARDED_HTTPS_URL_BYTES {
+            return Err(GuardedHttpFetchError::InvalidUrl("URL length"));
+        }
+        if url
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(GuardedHttpFetchError::InvalidUrl("URL control byte"));
+        }
+        let remainder = url
+            .strip_prefix("https://")
+            .ok_or(GuardedHttpFetchError::InvalidUrl("HTTPS required"))?;
+        let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+        let authority = &remainder[..authority_end];
+        if authority.is_empty() || authority.contains('@') || authority.starts_with('[') {
+            return Err(GuardedHttpFetchError::InvalidUrl("DNS authority required"));
+        }
+        let tail = &remainder[authority_end..];
+        if tail.contains('#') {
+            return Err(GuardedHttpFetchError::InvalidUrl("fragment"));
+        }
+        let (host, port) = parse_guarded_https_authority(authority)?;
+        let target = if tail.is_empty() {
+            "/".to_owned()
+        } else if tail.starts_with('?') {
+            format!("/{tail}")
+        } else {
+            tail.to_owned()
+        };
+        Ok(Self { host, port, target })
+    }
+
+    /// Canonical ASCII DNS hostname used for resolver lookup and TLS SNI.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Explicit or default HTTPS port.
+    #[must_use]
+    pub const fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Origin-form request target, including query when present.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    fn authority(&self) -> String {
+        if self.port == 443 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+}
+
+/// Finite limits and caller policy identity carried by a guarded fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedHttpFetchPolicy {
+    response_body_bytes: usize,
+    deadline: Duration,
+    tls_handshake_timeout: Duration,
+    root_policy_revision: String,
+}
+
+impl GuardedHttpFetchPolicy {
+    /// Construct a finite policy for a WebPKI-rooted HTTP/1.1 fetcher.
+    pub fn new(
+        response_body_bytes: usize,
+        deadline: Duration,
+        tls_handshake_timeout: Duration,
+        root_policy_revision: impl Into<String>,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let root_policy_revision = root_policy_revision.into();
+        if response_body_bytes == 0 || response_body_bytes > MAX_GUARDED_RESPONSE_BODY_BYTES {
+            return Err(GuardedHttpFetchError::InvalidPolicy("response body bound"));
+        }
+        if deadline.is_zero() || tls_handshake_timeout.is_zero() {
+            return Err(GuardedHttpFetchError::InvalidPolicy(
+                "finite timeout required",
+            ));
+        }
+        if deadline > MAX_GUARDED_FETCH_DEADLINE {
+            return Err(GuardedHttpFetchError::InvalidPolicy("full fetch deadline"));
+        }
+        if tls_handshake_timeout > MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT {
+            return Err(GuardedHttpFetchError::InvalidPolicy(
+                "TLS handshake timeout",
+            ));
+        }
+        if tls_handshake_timeout > deadline {
+            return Err(GuardedHttpFetchError::InvalidPolicy(
+                "TLS handshake exceeds full fetch deadline",
+            ));
+        }
+        if root_policy_revision.is_empty()
+            || root_policy_revision.len() > MAX_GUARDED_ROOT_POLICY_REVISION_BYTES
+            || !root_policy_revision.bytes().all(is_http_token_byte)
+        {
+            return Err(GuardedHttpFetchError::InvalidPolicy("root policy revision"));
+        }
+        Ok(Self {
+            response_body_bytes,
+            deadline,
+            tls_handshake_timeout,
+            root_policy_revision,
+        })
+    }
+
+    /// Maximum accepted decoded response bytes.
+    #[must_use]
+    pub const fn response_body_bytes(&self) -> usize {
+        self.response_body_bytes
+    }
+
+    /// Non-extendable full-fetch deadline.
+    #[must_use]
+    pub const fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
+    /// Finite TLS handshake ceiling configured on the connector.
+    #[must_use]
+    pub const fn tls_handshake_timeout(&self) -> Duration {
+        self.tls_handshake_timeout
+    }
+
+    /// Caller policy identity recorded with provenance.
+    ///
+    /// This label does not select trust roots: the fetcher always uses its
+    /// non-injectable WebPKI connector.
+    #[must_use]
+    pub fn root_policy_revision(&self) -> &str {
+        &self.root_policy_revision
+    }
+}
+
+/// TLS peer and route facts for one completed guarded fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedHttpPeerProvenance {
+    /// Canonical hostname supplied to both resolver and TLS SNI validation.
+    pub host: String,
+    /// Deterministically selected, verified-public socket address.
+    pub selected_address: SocketAddr,
+    /// SHA-256 digest of the admitted leaf DER certificate.
+    pub leaf_certificate_sha256: [u8; 32],
+    /// Negotiated ALPN bytes, when present.
+    pub alpn: Option<Vec<u8>>,
+    /// TLS protocol version debug identity, when present.
+    pub tls_protocol: Option<String>,
+    /// Caller policy identity; the actual trust roots are fixed WebPKI roots.
+    pub root_policy_revision: String,
+}
+
+/// Observed redirect response. Redirects are reported, never followed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedHttpRedirect {
+    /// 3xx status observed on the single request.
+    pub status: u16,
+    /// Raw `Location` response field, when present.
+    pub location: Option<String>,
+}
+
+/// A fully bounded one-shot response from [`GuardedHttpFetcher`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedHttpFetchResponse {
+    /// HTTP status returned by the single request.
+    pub status: u16,
+    /// Response fields in wire order.
+    pub headers: Vec<(String, String)>,
+    /// Identity-coded response body, bounded by policy.
+    pub body: Vec<u8>,
+    /// Typed redirect observation; no follow-up request occurs.
+    pub redirect: Option<GuardedHttpRedirect>,
+    /// Selected route and TLS facts.
+    pub provenance: GuardedHttpPeerProvenance,
+}
+
+/// Failure from guarded URL admission, resolution, TLS, or one-shot HTTP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardedHttpFetchError {
+    /// URL is not a bounded HTTPS URL suitable for DNS/SNI handling.
+    InvalidUrl(&'static str),
+    /// Fetch policy omitted a finite or bounded requirement.
+    InvalidPolicy(&'static str),
+    /// Resolver returned no usable answers.
+    ResolutionEmpty,
+    /// The bounded native resolver could not return a complete address set.
+    Resolution(String),
+    /// The resolver answer set exceeded the fixed admission bound.
+    ResolutionTooMany,
+    /// At least one answer was private, special-purpose, or otherwise non-public.
+    DisallowedResolvedAddress(IpAddr),
+    /// Caller cancellation stopped the owned exchange.
+    Cancelled,
+    /// The finite fetch deadline elapsed.
+    DeadlineExceeded,
+    /// TCP connection to the selected address failed.
+    Connect(String),
+    /// TLS authentication or handshake failed.
+    Tls(String),
+    /// The authenticated TLS stack did not expose a leaf certificate.
+    PeerCertificateUnavailable,
+    /// The authenticated TLS leaf certificate exceeded the digest admission bound.
+    PeerCertificateTooLarge,
+    /// HTTP/1.1 framing or I/O failed.
+    Http(String),
+    /// The peer used a non-identity content coding.
+    UnexpectedContentEncoding(String),
+    /// Response fields exceeded the fixed transport header bound.
+    ResponseHeadersTooLarge,
+}
+
+impl std::fmt::Display for GuardedHttpFetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUrl(reason) => write!(formatter, "invalid guarded HTTPS URL: {reason}"),
+            Self::InvalidPolicy(reason) => {
+                write!(formatter, "invalid guarded fetch policy: {reason}")
+            }
+            Self::ResolutionEmpty => formatter.write_str("guarded resolver returned no addresses"),
+            Self::Resolution(error) => write!(formatter, "guarded resolver failed: {error}"),
+            Self::ResolutionTooMany => {
+                formatter.write_str("guarded resolver returned too many addresses")
+            }
+            Self::DisallowedResolvedAddress(address) => {
+                write!(
+                    formatter,
+                    "guarded resolver returned non-public address {address}"
+                )
+            }
+            Self::Cancelled => formatter.write_str("guarded fetch cancelled"),
+            Self::DeadlineExceeded => formatter.write_str("guarded fetch deadline exceeded"),
+            Self::Connect(error) => write!(formatter, "guarded TCP connect failed: {error}"),
+            Self::Tls(error) => write!(formatter, "guarded TLS handshake failed: {error}"),
+            Self::PeerCertificateUnavailable => {
+                formatter.write_str("guarded TLS peer did not expose a leaf certificate")
+            }
+            Self::PeerCertificateTooLarge => {
+                formatter.write_str("guarded TLS leaf certificate exceeded the digest bound")
+            }
+            Self::Http(error) => write!(formatter, "guarded HTTP exchange failed: {error}"),
+            Self::UnexpectedContentEncoding(value) => {
+                write!(
+                    formatter,
+                    "guarded response uses non-identity content encoding {value:?}"
+                )
+            }
+            Self::ResponseHeadersTooLarge => {
+                formatter.write_str("guarded response headers too large")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GuardedHttpFetchError {}
+
+/// A fresh-connection, WebPKI-rooted HTTPS fetcher with resolver-answer fencing.
+pub struct GuardedHttpFetcher {
+    resolver: Arc<NativeDnsResolver>,
+    policy: GuardedHttpFetchPolicy,
+    connector: TlsConnector,
+    #[cfg(test)]
+    test_resolver: Option<Arc<dyn GuardedHttpResolver>>,
+    #[cfg(test)]
+    test_loopback_authority: Option<SocketAddr>,
+    #[cfg(test)]
+    test_exchange: Option<Arc<dyn GuardedHttpTestExchange>>,
+}
+
+/// Test-only lower wire seam. Production construction never accepts a custom
+/// exchange, so it cannot weaken selected-address TCP or WebPKI TLS custody.
+#[cfg(test)]
+trait GuardedHttpTestExchange: Send + Sync {
+    fn exchange(
+        &self,
+        cx: Cx,
+        request: GuardedHttpTestRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<GuardedHttpTestWireResponse, GuardedHttpFetchError>>
+                + Send
+                + 'static,
+        >,
+    >;
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardedHttpTestRequest {
+    host: String,
+    authority: String,
+    target: String,
+    selected_address: SocketAddr,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuardedHttpTestWireResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    provenance: GuardedHttpPeerProvenance,
+}
+
+impl std::fmt::Debug for GuardedHttpFetcher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GuardedHttpFetcher")
+            .field("policy", &self.policy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GuardedHttpFetcher {
+    /// Build a fetcher that uses WebPKI roots, SNI, certificate validation, and
+    /// a finite handshake timeout. It never accepts a caller-supplied connector
+    /// because that could silently weaken this vertical's root custody.
+    pub fn new(policy: GuardedHttpFetchPolicy) -> Result<Self, GuardedHttpFetchError> {
+        let connector = TlsConnector::builder()
+            .with_webpki_roots()
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .enable_early_data(false)
+            .handshake_timeout(policy.tls_handshake_timeout)
+            .build()
+            .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))?;
+        Ok(Self {
+            resolver: Arc::new(NativeDnsResolver::with_config(ResolverConfig {
+                timeout: policy.deadline,
+                retries: 0,
+                happy_eyeballs: false,
+                ..ResolverConfig::default()
+            })),
+            policy,
+            connector,
+            #[cfg(test)]
+            test_resolver: None,
+            #[cfg(test)]
+            test_loopback_authority: None,
+            #[cfg(test)]
+            test_exchange: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_test_exchange(
+        resolver: Arc<dyn GuardedHttpResolver>,
+        policy: GuardedHttpFetchPolicy,
+        test_exchange: Arc<dyn GuardedHttpTestExchange>,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        let mut fetcher = Self::new(policy)?;
+        fetcher.test_resolver = Some(resolver);
+        fetcher.test_exchange = Some(test_exchange);
+        Ok(fetcher)
+    }
+
+    /// Builds a test-only real-wire fetcher for one loopback listener.
+    ///
+    /// The override is deliberately private and test-gated: it admits exactly
+    /// one supplied loopback socket, resolves no production name, and trusts
+    /// only the supplied fixture CA. Production construction retains its fixed
+    /// WebPKI connector and public-address fence.
+    #[cfg(test)]
+    fn new_loopback_test_authority(
+        policy: GuardedHttpFetchPolicy,
+        loopback_authority: SocketAddr,
+        fixture_ca: asupersync::tls::Certificate,
+    ) -> Result<Self, GuardedHttpFetchError> {
+        if !loopback_authority.ip().is_loopback() {
+            return Err(GuardedHttpFetchError::InvalidPolicy(
+                "test loopback authority",
+            ));
+        }
+        let connector = TlsConnector::builder()
+            .add_root_certificate(&fixture_ca)
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .enable_early_data(false)
+            .handshake_timeout(policy.tls_handshake_timeout)
+            .build()
+            .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))?;
+        Ok(Self {
+            resolver: Arc::new(NativeDnsResolver::new()),
+            policy,
+            connector,
+            test_resolver: Some(Arc::new(StaticGuardedResolverForLoopback {
+                address: loopback_authority.ip(),
+            })),
+            test_loopback_authority: Some(loopback_authority),
+            test_exchange: None,
+        })
+    }
+
+    /// Fetch one HTTPS resource over a fresh connection.
+    ///
+    /// The resolver's complete answer set is admitted before `TcpStream::connect`
+    /// receives exactly one selected `SocketAddr`. TLS uses the original DNS host
+    /// for SNI and certificate validation. Redirects, cookies, credentials,
+    /// proxies, and connection reuse are deliberately absent.
+    pub async fn fetch(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        guarded_fetch_checkpoint(cx)?;
+        let fetch_deadline = time::wall_now() + self.policy.deadline;
+        let answers = self
+            .resolve_all(cx, fetch_deadline, url.host.clone())
+            .await?;
+        #[cfg(test)]
+        let selected_address = guarded_select_address_with_test_loopback(
+            answers,
+            url.port(),
+            self.test_loopback_authority,
+        )?;
+        #[cfg(not(test))]
+        let selected_address = guarded_select_address(answers, url.port())?;
+        guarded_fetch_checkpoint(cx)?;
+
+        #[cfg(test)]
+        if let Some(exchange) = self.test_exchange.as_ref() {
+            let exchange = Arc::clone(exchange);
+            let request = GuardedHttpTestRequest {
+                host: url.host.clone(),
+                authority: url.authority(),
+                target: url.target.clone(),
+                selected_address,
+            };
+            let body_limit = self.policy.response_body_bytes;
+            let wire = guarded_await_phase(cx, fetch_deadline, move |phase_cx| {
+                exchange.exchange(phase_cx, request)
+            })
+            .await?;
+            return guarded_admit_native_response(
+                wire.status,
+                wire.headers,
+                wire.body,
+                body_limit,
+                wire.provenance,
+            );
+        }
+
+        let connector = self.connector.clone();
+        let host = url.host.clone();
+        let authority = url.authority();
+        let target = url.target.clone();
+        let policy = self.policy.clone();
+        let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
+            guarded_fetch_checkpoint(&phase_cx)?;
+            let tcp = NativeTcpStream::connect(selected_address)
+                .await
+                .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
+            tcp.set_nodelay(true)
+                .map_err(|error| GuardedHttpFetchError::Connect(error.to_string()))?;
+            guarded_fetch_checkpoint(&phase_cx)?;
+            let tls = connector
+                .connect(&host, tcp)
+                .await
+                .map_err(|error| GuardedHttpFetchError::Tls(error.to_string()))?;
+            let provenance = guarded_peer_provenance(&tls, host, selected_address, &policy)?;
+            guarded_fetch_checkpoint(&phase_cx)?;
+            let request = NativeHttpRequest::get(target)
+                .header("Host", authority)
+                .header("Accept-Encoding", "identity")
+                .header("Connection", "close")
+                .build();
+            let (response, _stream, _body_withheld) =
+                NativeHttp1Client::request_with_io_and_max_body_size(
+                    tls,
+                    request,
+                    policy.response_body_bytes,
+                )
+                .await
+                .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
+            guarded_admit_native_response(
+                response.status,
+                response.headers,
+                response.body,
+                policy.response_body_bytes,
+                provenance,
+            )
+        })
+        .await?;
+        guarded_fetch_checkpoint(cx)?;
+        Ok(response)
+    }
+
+    /// The fixed policy used by this fetcher.
+    #[must_use]
+    pub fn policy(&self) -> &GuardedHttpFetchPolicy {
+        &self.policy
+    }
+
+    async fn resolve_all(
+        &self,
+        cx: &Cx,
+        deadline: asupersync::Time,
+        host: String,
+    ) -> Result<Vec<IpAddr>, GuardedHttpFetchError> {
+        #[cfg(test)]
+        if let Some(resolver) = self.test_resolver.as_ref() {
+            let resolver = Arc::clone(resolver);
+            return guarded_await_phase(cx, deadline, move |phase_cx| {
+                resolver.resolve_all(phase_cx, host)
+            })
+            .await;
+        }
+
+        let resolver = Arc::clone(&self.resolver);
+        guarded_await_phase(cx, deadline, move |phase_cx| async move {
+            guarded_fetch_checkpoint(&phase_cx)?;
+            let lookup = resolver
+                .lookup_ip(&host)
+                .await
+                .map_err(|error| GuardedHttpFetchError::Resolution(error.to_string()))?;
+            guarded_fetch_checkpoint(&phase_cx)?;
+            Ok(lookup.into_iter().collect())
+        })
+        .await
+    }
+}
+
+fn guarded_admit_native_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    body_limit: usize,
+    provenance: GuardedHttpPeerProvenance,
+) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+    let header_bytes = headers.iter().try_fold(0_usize, |total, (name, value)| {
+        total
+            .checked_add(name.len())
+            .and_then(|total| total.checked_add(value.len()))
+            .and_then(|total| total.checked_add(4))
+            .ok_or(GuardedHttpFetchError::ResponseHeadersTooLarge)
+    })?;
+    if header_bytes > MAX_GUARDED_RESPONSE_HEADER_BYTES {
+        return Err(GuardedHttpFetchError::ResponseHeadersTooLarge);
+    }
+    if body.len() > body_limit {
+        return Err(GuardedHttpFetchError::Http(
+            "response body exceeded guarded bound".to_owned(),
+        ));
+    }
+    for (_, encoding) in headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+    {
+        if !is_identity_content_coding(encoding) {
+            return Err(GuardedHttpFetchError::UnexpectedContentEncoding(
+                encoding.clone(),
+            ));
+        }
+    }
+    let redirect = (300..400).contains(&status).then(|| GuardedHttpRedirect {
+        status,
+        location: headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.clone()),
+    });
+    Ok(GuardedHttpFetchResponse {
+        status,
+        headers,
+        body,
+        redirect,
+        provenance,
+    })
+}
+
+fn guarded_peer_provenance(
+    tls: &asupersync::tls::TlsStream<NativeTcpStream>,
+    host: String,
+    selected_address: SocketAddr,
+    policy: &GuardedHttpFetchPolicy,
+) -> Result<GuardedHttpPeerProvenance, GuardedHttpFetchError> {
+    let leaf_certificate_sha256 = guarded_leaf_certificate_sha256(tls.peer_leaf_certificate_der())?;
+    Ok(GuardedHttpPeerProvenance {
+        host,
+        selected_address,
+        leaf_certificate_sha256,
+        alpn: tls.alpn_protocol().map(<[u8]>::to_vec),
+        tls_protocol: tls.protocol_version().map(|version| format!("{version:?}")),
+        root_policy_revision: policy.root_policy_revision.clone(),
+    })
+}
+
+fn guarded_leaf_certificate_sha256(
+    leaf_der: Option<Vec<u8>>,
+) -> Result<[u8; 32], GuardedHttpFetchError> {
+    let leaf_der = leaf_der.ok_or(GuardedHttpFetchError::PeerCertificateUnavailable)?;
+    sha256_bounded(&leaf_der, MAX_GUARDED_LEAF_CERTIFICATE_BYTES)
+        .map_err(|_| GuardedHttpFetchError::PeerCertificateTooLarge)
+        .map(|digest| digest.into_bytes())
+}
+
+async fn guarded_await_phase<F, Fut, T>(
+    cx: &Cx,
+    deadline: asupersync::Time,
+    phase: F,
+) -> Result<T, GuardedHttpFetchError>
+where
+    F: FnOnce(Cx) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, GuardedHttpFetchError>> + Send + 'static,
+    T: Send + 'static,
+{
+    if time::wall_now() >= deadline {
+        return Err(GuardedHttpFetchError::DeadlineExceeded);
+    }
+    let mut task = cx
+        .spawn(move |phase_cx| async move {
+            let mut future = Box::pin(phase(phase_cx.clone()));
+            std::future::poll_fn(|task_cx| {
+                if let Err(error) = guarded_fetch_checkpoint(&phase_cx) {
+                    return Poll::Ready(Err(error));
+                }
+                future.as_mut().poll(task_cx)
+            })
+            .await
+        })
+        .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
+    match time::timeout_at(deadline, task.join(cx)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(guarded_join_error(error, cx)),
+        Err(_) => {
+            // `timeout` drops its join future, which requests cancellation.
+            // Abort again explicitly, then settle the task before returning so
+            // no phase (and no owned TCP/TLS stream) escapes this fetch.
+            task.abort();
+            match task.join(cx).await {
+                Ok(Ok(_)) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {
+                    Err(GuardedHttpFetchError::DeadlineExceeded)
+                }
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(guarded_join_error(error, cx)),
+            }
+        }
+    }
+}
+
+fn guarded_join_error(error: asupersync::runtime::JoinError, cx: &Cx) -> GuardedHttpFetchError {
+    match error {
+        asupersync::runtime::JoinError::Cancelled(_) => guarded_fetch_checkpoint(cx)
+            .err()
+            .unwrap_or(GuardedHttpFetchError::Cancelled),
+        asupersync::runtime::JoinError::Panicked(payload) => {
+            GuardedHttpFetchError::Http(format!("guarded fetch phase panicked: {payload}"))
+        }
+        asupersync::runtime::JoinError::PolledAfterCompletion => {
+            GuardedHttpFetchError::Http("guarded fetch phase join consumed unexpectedly".to_owned())
+        }
+    }
+}
+
+fn guarded_fetch_checkpoint(cx: &Cx) -> Result<(), GuardedHttpFetchError> {
+    cx.checkpoint()
+        .map_err(|_| GuardedHttpFetchError::Cancelled)
+}
+
+fn parse_guarded_https_authority(authority: &str) -> Result<(String, u16), GuardedHttpFetchError> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') => {
+            let port = port
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or(GuardedHttpFetchError::InvalidUrl("port"))?;
+            (host, port)
+        }
+        _ => (authority, 443),
+    };
+    let host = host.to_ascii_lowercase();
+    if host.len() > 253
+        || host.ends_with('.')
+        || host.parse::<IpAddr>().is_ok()
+        || !host.split('.').all(is_guarded_dns_label)
+    {
+        return Err(GuardedHttpFetchError::InvalidUrl("DNS host"));
+    }
+    Ok((host, port))
+}
+
+fn is_guarded_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && !label.starts_with('-')
+        && !label.ends_with('-')
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn guarded_select_address(
+    answers: Vec<IpAddr>,
+    port: u16,
+) -> Result<SocketAddr, GuardedHttpFetchError> {
+    guarded_select_address_inner(answers, port, None)
+}
+
+#[cfg(test)]
+fn guarded_select_address_with_test_loopback(
+    answers: Vec<IpAddr>,
+    port: u16,
+    allowed_loopback: Option<SocketAddr>,
+) -> Result<SocketAddr, GuardedHttpFetchError> {
+    guarded_select_address_inner(answers, port, allowed_loopback)
+}
+
+fn guarded_select_address_inner(
+    answers: Vec<IpAddr>,
+    port: u16,
+    #[cfg_attr(not(test), allow(unused_variables))] allowed_loopback: Option<SocketAddr>,
+) -> Result<SocketAddr, GuardedHttpFetchError> {
+    if answers.is_empty() {
+        return Err(GuardedHttpFetchError::ResolutionEmpty);
+    }
+    if answers.len() > MAX_GUARDED_RESOLVED_ADDRESSES {
+        return Err(GuardedHttpFetchError::ResolutionTooMany);
+    }
+    let mut addresses = Vec::with_capacity(answers.len());
+    for answer in answers {
+        let canonical = canonical_guarded_ip(answer);
+        let address = SocketAddr::new(canonical, port);
+        #[cfg(test)]
+        let is_exact_test_loopback = allowed_loopback == Some(address);
+        #[cfg(not(test))]
+        let is_exact_test_loopback = false;
+        if !is_exact_test_loopback && !is_public_guarded_ip(canonical) {
+            return Err(GuardedHttpFetchError::DisallowedResolvedAddress(canonical));
+        }
+        addresses.push(address);
+    }
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses
+        .into_iter()
+        .next()
+        .ok_or(GuardedHttpFetchError::ResolutionEmpty)
+}
+
+fn canonical_guarded_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        address => address,
+    }
+}
+
+fn is_public_guarded_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_guarded_ipv4(address),
+        IpAddr::V6(address) => is_public_guarded_ipv6(address),
+    }
+}
+
+fn is_public_guarded_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !matches!(
+        (a, b, c),
+        (0, _, _)
+            | (10, _, _)
+            | (100, 64..=127, _)
+            | (127, _, _)
+            | (169, 254, _)
+            | (172, 16..=31, _)
+            | (192, 0, _)
+            | (192, 2, _)
+            | (192, 88, 99)
+            | (192, 168, _)
+            | (198, 18..=19, _)
+            | (198, 51, 100)
+            | (203, 0, 113)
+            | (224..=255, _, _)
+    )
+}
+
+fn is_public_guarded_ipv6(address: Ipv6Addr) -> bool {
+    if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
+        return false;
+    }
+    let segments = address.segments();
+    !matches!(
+        segments,
+        [0x0000, ..]
+            | [0x0064, 0xFF9B, 0, 0, 0, 0, ..]
+            | [0x0064, 0xFF9B, 0x0001, ..]
+            | [0x0100, 0, 0, 0, ..]
+            | [0x2001, 0, ..]
+            | [0x2001, 0x0DB8, ..]
+            | [0x2002, ..]
+            | [0xFC00..=0xFDFF, ..]
+            | [0xFE80..=0xFEBF, ..]
+    )
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 fn is_http_token(value: &str) -> bool {
@@ -5197,7 +6110,1064 @@ fn generate_session_id() -> Result<String, HttpSessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor},
+    };
     use std::io::Cursor;
+
+    #[derive(Clone)]
+    struct StaticGuardedResolver {
+        answers: Vec<IpAddr>,
+    }
+
+    const GUARDED_LOOPBACK_ROOT_PEM: &[u8] = br"-----BEGIN CERTIFICATE-----
+MIIBgDCCASegAwIBAgIUPHDUu9WL36yvTmFeNFZVe/qhClcwCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSUnVzdGxzIFJvYnVzdCBSb290MCAXDTc1MDEwMTAwMDAwMFoY
+DzQwOTYwMTAxMDAwMDAwWjAdMRswGQYDVQQDDBJSdXN0bHMgUm9idXN0IFJvb3Qw
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASW/VkDFs5iGDQvH8jaXYT4jMx66jo+
+5CWKyMt4OlTDdBfKfnmQ9LYeK/PsYfJ8wVizuSlPzXi9je8SnyYejGP3o0MwQTAP
+BgNVHQ8BAf8EBQMDB4QAMB0GA1UdDgQWBBRqY/oMENJbNo7y39iL6GW3tDs0rzAP
+BgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIEUbrmSUjANju9nNpFop
+PAl9Wh8tBxI5IY+BPh466+aUAiA1/9+prypt6s3Doo0GDsnoFGJi1UBivUg1qdik
+cy4eNw==
+-----END CERTIFICATE-----";
+    const GUARDED_LOOPBACK_CHAIN_PEM: &[u8] = br"-----BEGIN CERTIFICATE-----
+MIIBszCCAVmgAwIBAgIUUg3keFcU1xXWK8BNVb1KynPulV8wCgYIKoZIzj0EAwIw
+JjEkMCIGA1UEAwwbUnVzdGxzIFJvYnVzdCBSb290IC0gUnVuZyAyMCAXDTc1MDEw
+MTAwMDAwMFoYDzQwOTYwMTAxMDAwMDAwWjAhMR8wHQYDVQQDDBZyY2dlbiBzZWxm
+IHNpZ25lZCBjZXJ0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEud6w4gtZ0xbw
+J3E69SSMy5TZfdIifl9L5ZY+hgEe4UiUsBWS32f6Y5NR5Jo8FO1f6o13b3+FvVHR
+EHCGdvppL6NoMGYwFQYDVR0RBA4wDIIKZm9vYmFyLmNvbTAdBgNVHSUEFjAUBggr
+BgEFBQcDAQYIKwYBBQUHAwIwHQYDVR0OBBYEFELvxbj5tD75n4pYFvJyr+c8qVEi
+MA8GA1UdEwEB/wQFMAMBAQAwCgYIKoZIzj0EAwIDSAAwRQIhALxSSdUsrRFnwNMu
+/doBqI8i8u5HdohVAheFTDwObkOMAiASSjULUtkWSD15u/7Sr01Wm9J1MpqW1pob
+BVqU3CNRlA==
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+MIIBiTCCATCgAwIBAgIUHWiVYIvMMWoZEFYvSz46COf2FqowCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSUnVzdGxzIFJvYnVzdCBSb290MCAXDTc1MDEwMTAwMDAwMFoY
+DzQwOTYwMTAxMDAwMDAwWjAmMSQwIgYDVQQDDBtSdXN0bHMgUm9idXN0IFJvb3Qg
+LSBSdW5nIDIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATAOCcBD7dXjmAZ3te5
+D47cCJ9ec93PWv7BKYIL826CJsKfXQOGrBTthLm77hXLhHu6uv8E5QXNLZpfowLQ
+Do1ao0MwQTAPBgNVHQ8BAf8EBQMDB4QAMB0GA1UdDgQWBBRdza76r11Ok9vRmlg6
+Nn/wL/N+jTAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIFmZrXeK
+hnfkahocvkhhNT3cDv1LWf6WBoFaCiBwZXFPAiARaKRiSCMG7PCHmSqFe82TBVmL
+odHGogAVax1Dh/aYAA==
+-----END CERTIFICATE-----";
+    const GUARDED_LOOPBACK_KEY_PEM: &[u8] = br"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTbAQpfjAT46fgF4B
+mP15n37woNG5ZNJmwcqsred/7tmhRANCAAS53rDiC1nTFvAncTr1JIzLlNl90iJ+
+X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
+-----END PRIVATE KEY-----";
+
+    fn guarded_loopback_acceptor() -> TlsAcceptor {
+        let chain = CertificateChain::from_pem(GUARDED_LOOPBACK_CHAIN_PEM)
+            .expect("bounded loopback certificate chain");
+        let key =
+            PrivateKey::from_pem(GUARDED_LOOPBACK_KEY_PEM).expect("bounded loopback private key");
+        TlsAcceptor::builder(chain, key)
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .handshake_timeout(Duration::from_millis(100))
+            .build()
+            .expect("bounded loopback TLS acceptor")
+    }
+
+    fn guarded_loopback_root() -> Certificate {
+        Certificate::from_pem(GUARDED_LOOPBACK_ROOT_PEM)
+            .expect("bounded loopback fixture CA")
+            .into_iter()
+            .next()
+            .expect("one loopback fixture CA")
+    }
+
+    async fn guarded_loopback_read_request(
+        tls: &mut asupersync::tls::TlsStream<NativeTcpStream>,
+    ) -> Result<Vec<u8>, String> {
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 512];
+        while request.len() < 8 * 1024 {
+            let read = tls
+                .read(&mut chunk)
+                .await
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(request);
+            }
+        }
+        Err("loopback HTTP request exceeded header bound or ended before terminator".to_owned())
+    }
+
+    async fn guarded_loopback_serve(
+        cx: Cx,
+        deadline: asupersync::Time,
+        listener: TcpListener,
+        responses: Vec<Vec<u8>>,
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
+    ) -> Result<(), String> {
+        let acceptor = guarded_loopback_acceptor();
+        for response in responses {
+            cx.checkpoint()
+                .map_err(|_| "loopback server cancelled before accept".to_owned())?;
+            let (stream, _) = time::timeout_at(deadline, listener.accept())
+                .await
+                .map_err(|_| "loopback server accept deadline elapsed".to_owned())?
+                .map_err(|error| error.to_string())?;
+            cx.checkpoint()
+                .map_err(|_| "loopback server cancelled before TLS".to_owned())?;
+            let tls = time::timeout_at(deadline, acceptor.accept(stream))
+                .await
+                .map_err(|_| "loopback server TLS deadline elapsed".to_owned())?;
+            let Ok(mut tls) = tls else {
+                // A hostname refusal can terminate TLS before HTTP bytes are
+                // available. The next accepted connection is the valid retry.
+                continue;
+            };
+            cx.checkpoint()
+                .map_err(|_| "loopback server cancelled before HTTP read".to_owned())?;
+            let request = time::timeout_at(deadline, guarded_loopback_read_request(&mut tls))
+                .await
+                .map_err(|_| "loopback server HTTP-read deadline elapsed".to_owned())??;
+            requests
+                .lock()
+                .expect("loopback request record lock")
+                .push(request);
+            cx.checkpoint()
+                .map_err(|_| "loopback server cancelled before HTTP write".to_owned())?;
+            time::timeout_at(deadline, tls.write_all(&response))
+                .await
+                .map_err(|_| "loopback server HTTP-write deadline elapsed".to_owned())?
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn guarded_loopback_fetches(
+        hosts: &[&str],
+        responses: Vec<Vec<u8>>,
+    ) -> (
+        Vec<Result<GuardedHttpFetchResponse, GuardedHttpFetchError>>,
+        Vec<Vec<u8>>,
+    ) {
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().expect("runtime installs loopback context");
+            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .await
+                .expect("bind loopback listener");
+            let authority = listener.local_addr().expect("loopback listener address");
+            let server_deadline = time::wall_now() + Duration::from_secs(2);
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let server_requests = Arc::clone(&requests);
+            let mut server = cx
+                .spawn(move |server_cx| {
+                    guarded_loopback_serve(
+                        server_cx,
+                        server_deadline,
+                        listener,
+                        responses,
+                        server_requests,
+                    )
+                })
+                .expect("spawn loopback TLS server");
+            let fetcher = GuardedHttpFetcher::new_loopback_test_authority(
+                guarded_test_policy_with_handshake(
+                    1024,
+                    Duration::from_secs(1),
+                    Duration::from_millis(100),
+                ),
+                authority,
+                guarded_loopback_root(),
+            )
+            .expect("private loopback fetcher");
+            let mut results = Vec::with_capacity(hosts.len());
+            for host in hosts {
+                let url =
+                    GuardedHttpsUrl::parse(&format!("https://{host}:{}/proof", authority.port()))
+                        .expect("loopback proof URL");
+                results.push(fetcher.fetch(&cx, &url).await);
+            }
+            match time::timeout_at(server_deadline, server.join(&cx)).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => panic!("loopback TLS server: {error}"),
+                Ok(Err(error)) => panic!("loopback TLS server task: {error}"),
+                Err(_) => {
+                    // The dropped timed join has already requested task
+                    // cancellation; make that explicit and give settlement a
+                    // second, independent finite bound before panicking.
+                    server.abort();
+                    let settlement_deadline = time::wall_now() + Duration::from_millis(250);
+                    match time::timeout_at(settlement_deadline, server.join(&cx)).await {
+                        Ok(Ok(Ok(()))) => panic!("loopback TLS server exceeded its join deadline"),
+                        Ok(Ok(Err(error))) => {
+                            panic!("loopback TLS server exceeded join deadline: {error}")
+                        }
+                        Ok(Err(error)) => {
+                            panic!("loopback TLS server cancellation settled: {error}")
+                        }
+                        Err(_) => {
+                            panic!("loopback TLS server failed bounded cancellation settlement")
+                        }
+                    }
+                }
+            }
+            let requests = requests
+                .lock()
+                .expect("loopback request record lock")
+                .clone();
+            (results, requests)
+        })
+    }
+
+    impl GuardedHttpResolver for StaticGuardedResolver {
+        fn resolve_all(
+            &self,
+            cx: Cx,
+            _host: String,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>,
+        > {
+            let answers = self.answers.clone();
+            Box::pin(async move {
+                guarded_fetch_checkpoint(&cx)?;
+                Ok(answers)
+            })
+        }
+    }
+
+    struct ScriptedGuardedResolver {
+        answers: Arc<Mutex<VecDeque<Vec<IpAddr>>>>,
+    }
+
+    impl GuardedHttpResolver for ScriptedGuardedResolver {
+        fn resolve_all(
+            &self,
+            cx: Cx,
+            _host: String,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>,
+        > {
+            let answers = self
+                .answers
+                .lock()
+                .expect("scripted resolver lock")
+                .pop_front()
+                .expect("one answer set per public fetch");
+            Box::pin(async move {
+                guarded_fetch_checkpoint(&cx)?;
+                Ok(answers)
+            })
+        }
+    }
+
+    struct DelayedGuardedResolver {
+        delay: Duration,
+        answers: Vec<IpAddr>,
+    }
+
+    impl GuardedHttpResolver for DelayedGuardedResolver {
+        fn resolve_all(
+            &self,
+            cx: Cx,
+            _host: String,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>,
+        > {
+            let answers = self.answers.clone();
+            let delay = self.delay;
+            Box::pin(async move {
+                time::sleep(time::wall_now(), delay).await;
+                guarded_fetch_checkpoint(&cx)?;
+                Ok(answers)
+            })
+        }
+    }
+
+    struct PendingGuardedResolver {
+        dropped: Arc<AtomicUsize>,
+        cancel_on_first_poll: bool,
+    }
+
+    impl GuardedHttpResolver for PendingGuardedResolver {
+        fn resolve_all(
+            &self,
+            cx: Cx,
+            _host: String,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>,
+        > {
+            Box::pin(PendingGuardedResolverFuture {
+                dropped: Arc::clone(&self.dropped),
+                cx,
+                cancel_on_first_poll: self.cancel_on_first_poll,
+            })
+        }
+    }
+
+    struct PendingGuardedResolverFuture {
+        dropped: Arc<AtomicUsize>,
+        cx: Cx,
+        cancel_on_first_poll: bool,
+    }
+
+    impl Future for PendingGuardedResolverFuture {
+        type Output = Result<Vec<IpAddr>, GuardedHttpFetchError>;
+
+        fn poll(
+            mut self: Pin<&mut Self>,
+            task_cx: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
+            if self.cancel_on_first_poll {
+                self.cx.set_cancel_requested(true);
+                self.cancel_on_first_poll = false;
+                task_cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingGuardedResolverFuture {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct RecordingGuardedExchange {
+        requests: Arc<Mutex<Vec<GuardedHttpTestRequest>>>,
+        responses: Arc<Mutex<VecDeque<Result<GuardedHttpTestWireResponse, GuardedHttpFetchError>>>>,
+    }
+
+    impl GuardedHttpTestExchange for RecordingGuardedExchange {
+        fn exchange(
+            &self,
+            cx: Cx,
+            request: GuardedHttpTestRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<GuardedHttpTestWireResponse, GuardedHttpFetchError>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let requests = Arc::clone(&self.requests);
+            let responses = Arc::clone(&self.responses);
+            Box::pin(async move {
+                guarded_fetch_checkpoint(&cx)?;
+                requests
+                    .lock()
+                    .expect("test exchange request lock")
+                    .push(request.clone());
+                let mut response = responses
+                    .lock()
+                    .expect("test exchange response lock")
+                    .pop_front()
+                    .expect("one test response per public fetch")?;
+                response.provenance.host = request.host;
+                response.provenance.selected_address = request.selected_address;
+                Ok(response)
+            })
+        }
+    }
+
+    struct PendingGuardedExchange {
+        dropped: Arc<AtomicUsize>,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl GuardedHttpTestExchange for PendingGuardedExchange {
+        fn exchange(
+            &self,
+            _cx: Cx,
+            _request: GuardedHttpTestRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<GuardedHttpTestWireResponse, GuardedHttpFetchError>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            self.started.fetch_add(1, Ordering::AcqRel);
+            Box::pin(PendingGuardedExchangeFuture {
+                dropped: Arc::clone(&self.dropped),
+            })
+        }
+    }
+
+    struct PendingGuardedExchangeFuture {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingGuardedExchangeFuture {
+        type Output = Result<GuardedHttpTestWireResponse, GuardedHttpFetchError>;
+
+        fn poll(self: Pin<&mut Self>, _task_cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingGuardedExchangeFuture {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    struct DelayedGuardedExchange {
+        delay: Duration,
+        response: GuardedHttpTestWireResponse,
+        started: Arc<AtomicUsize>,
+    }
+
+    impl GuardedHttpTestExchange for DelayedGuardedExchange {
+        fn exchange(
+            &self,
+            cx: Cx,
+            _request: GuardedHttpTestRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<GuardedHttpTestWireResponse, GuardedHttpFetchError>>
+                    + Send
+                    + 'static,
+            >,
+        > {
+            let delay = self.delay;
+            let response = self.response.clone();
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::AcqRel);
+                time::sleep(time::wall_now(), delay).await;
+                guarded_fetch_checkpoint(&cx)?;
+                Ok(response)
+            })
+        }
+    }
+
+    fn guarded_test_policy(body_limit: usize, deadline: Duration) -> GuardedHttpFetchPolicy {
+        guarded_test_policy_with_handshake(body_limit, deadline, Duration::from_millis(50))
+    }
+
+    fn guarded_test_policy_with_handshake(
+        body_limit: usize,
+        deadline: Duration,
+        tls_handshake_timeout: Duration,
+    ) -> GuardedHttpFetchPolicy {
+        GuardedHttpFetchPolicy::new(body_limit, deadline, tls_handshake_timeout, "webpki-r1")
+            .expect("finite guarded test policy")
+    }
+
+    fn guarded_test_wire_response(
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> GuardedHttpTestWireResponse {
+        GuardedHttpTestWireResponse {
+            status,
+            headers,
+            body,
+            provenance: guarded_test_provenance(),
+        }
+    }
+
+    fn guarded_test_fetcher(
+        answers: Vec<IpAddr>,
+        body_limit: usize,
+        responses: Vec<Result<GuardedHttpTestWireResponse, GuardedHttpFetchError>>,
+    ) -> (GuardedHttpFetcher, Arc<Mutex<Vec<GuardedHttpTestRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let exchange = Arc::new(RecordingGuardedExchange {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+        });
+        let fetcher = GuardedHttpFetcher::new_with_test_exchange(
+            Arc::new(StaticGuardedResolver { answers }),
+            guarded_test_policy(body_limit, Duration::from_secs(1)),
+            exchange,
+        )
+        .expect("test fetcher");
+        (fetcher, requests)
+    }
+
+    fn guarded_fetch_for_test(
+        fetcher: &GuardedHttpFetcher,
+        url: &GuardedHttpsUrl,
+    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().expect("runtime installs fetch context");
+            fetcher.fetch(&cx, url).await
+        })
+    }
+
+    fn guarded_test_provenance() -> GuardedHttpPeerProvenance {
+        GuardedHttpPeerProvenance {
+            host: "public.example".to_owned(),
+            selected_address: SocketAddr::from(([93, 184, 216, 34], 443)),
+            leaf_certificate_sha256: [0; 32],
+            alpn: Some(b"http/1.1".to_vec()),
+            tls_protocol: Some("TLSv1_3".to_owned()),
+            root_policy_revision: "webpki-r1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn guarded_fetch_public_path_fences_all_answers_and_records_selected_route() {
+        let url =
+            GuardedHttpsUrl::parse("https://PUBLIC.example:8443/a?b=c").expect("bounded HTTPS URL");
+        let (fetcher, requests) = guarded_test_fetcher(
+            vec![
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35)),
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            ],
+            16,
+            vec![Ok(guarded_test_wire_response(
+                200,
+                Vec::new(),
+                b"public".to_vec(),
+            ))],
+        );
+
+        let response = guarded_fetch_for_test(&fetcher, &url).expect("public guarded fetch");
+        let calls = requests.lock().expect("test exchange request lock");
+
+        assert_eq!(response.body, b"public");
+        assert_eq!(response.provenance.host, "public.example");
+        assert_eq!(
+            response.provenance.selected_address,
+            SocketAddr::from(([93, 184, 216, 34], 8443))
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].authority, "public.example:8443");
+        assert_eq!(calls[0].target, "/a?b=c");
+        assert_eq!(
+            calls[0].selected_address,
+            response.provenance.selected_address
+        );
+    }
+
+    #[test]
+    fn rh5_guarded_fetch_private_answer_fences_connect_then_valid_retry_uses_same_fetcher() {
+        let public = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let private = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+        let resolver = Arc::new(ScriptedGuardedResolver {
+            answers: Arc::new(Mutex::new(VecDeque::from([
+                vec![public, private],
+                vec![public],
+            ]))),
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let exchange = Arc::new(RecordingGuardedExchange {
+            requests: Arc::clone(&requests),
+            responses: Arc::new(Mutex::new(VecDeque::from([Ok(
+                guarded_test_wire_response(200, Vec::new(), b"retry".to_vec()),
+            )]))),
+        });
+        let fetcher = GuardedHttpFetcher::new_with_test_exchange(
+            resolver,
+            guarded_test_policy(16, Duration::from_secs(1)),
+            exchange,
+        )
+        .expect("test fetcher");
+        let url = GuardedHttpsUrl::parse("https://public.example/").expect("bounded HTTPS URL");
+        let public_input = vec![public, private];
+        let input_snapshot = public_input.clone();
+
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url),
+            Err(GuardedHttpFetchError::DisallowedResolvedAddress(private))
+        );
+        assert_eq!(public_input, input_snapshot);
+        assert!(
+            requests
+                .lock()
+                .expect("test exchange request lock")
+                .is_empty()
+        );
+
+        let retry =
+            guarded_fetch_for_test(&fetcher, &url).expect("valid retry after fenced answer");
+        assert_eq!(retry.body, b"retry");
+        assert_eq!(
+            requests.lock().expect("test exchange request lock").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn guarded_fetch_redirect_is_typed_and_never_follows_a_second_request() {
+        let (fetcher, requests) = guarded_test_fetcher(
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            16,
+            vec![Ok(guarded_test_wire_response(
+                302,
+                vec![(
+                    "Location".to_owned(),
+                    "https://other.example/next".to_owned(),
+                )],
+                Vec::new(),
+            ))],
+        );
+        let url = GuardedHttpsUrl::parse("https://public.example/first").expect("bounded URL");
+
+        let response = guarded_fetch_for_test(&fetcher, &url).expect("redirect observation");
+
+        assert_eq!(
+            response.redirect,
+            Some(GuardedHttpRedirect {
+                status: 302,
+                location: Some("https://other.example/next".to_owned()),
+            })
+        );
+        assert_eq!(
+            requests.lock().expect("test exchange request lock").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn guarded_fetch_two_public_calls_open_two_fresh_exchanges() {
+        let (fetcher, requests) = guarded_test_fetcher(
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            16,
+            vec![
+                Ok(guarded_test_wire_response(200, Vec::new(), b"one".to_vec())),
+                Ok(guarded_test_wire_response(200, Vec::new(), b"two".to_vec())),
+            ],
+        );
+        let url = GuardedHttpsUrl::parse("https://public.example/").expect("bounded URL");
+
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url).expect("first").body,
+            b"one"
+        );
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url).expect("second").body,
+            b"two"
+        );
+        assert_eq!(
+            requests.lock().expect("test exchange request lock").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rh5_guarded_fetch_body_n_and_n_plus_one_and_content_encoding_retry() {
+        let body = vec![0xA5; 8];
+        let body_snapshot = body.clone();
+        let (fetcher, requests) = guarded_test_fetcher(
+            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            8,
+            vec![
+                Ok(guarded_test_wire_response(200, Vec::new(), body.clone())),
+                Ok(guarded_test_wire_response(200, Vec::new(), vec![0xA5; 9])),
+                Ok(guarded_test_wire_response(
+                    200,
+                    vec![
+                        ("Content-Encoding".to_owned(), "identity".to_owned()),
+                        ("Content-Encoding".to_owned(), "gzip".to_owned()),
+                    ],
+                    Vec::new(),
+                )),
+                Ok(guarded_test_wire_response(
+                    200,
+                    Vec::new(),
+                    b"retry".to_vec(),
+                )),
+            ],
+        );
+        let url = GuardedHttpsUrl::parse("https://public.example/").expect("bounded URL");
+
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url)
+                .expect("N bytes")
+                .body
+                .len(),
+            8
+        );
+        assert_eq!(body, body_snapshot);
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url),
+            Err(GuardedHttpFetchError::Http(
+                "response body exceeded guarded bound".to_owned()
+            ))
+        );
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url),
+            Err(GuardedHttpFetchError::UnexpectedContentEncoding(
+                "gzip".to_owned()
+            ))
+        );
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url)
+                .expect("valid retry")
+                .body,
+            b"retry"
+        );
+        assert_eq!(
+            requests.lock().expect("test exchange request lock").len(),
+            4
+        );
+    }
+
+    #[test]
+    fn guarded_fetch_pending_resolver_cancellation_settles_and_drops_phase() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let exchange = Arc::new(PendingGuardedExchange {
+            dropped: Arc::new(AtomicUsize::new(0)),
+            started: Arc::new(AtomicUsize::new(0)),
+        });
+        let fetcher = GuardedHttpFetcher::new_with_test_exchange(
+            Arc::new(PendingGuardedResolver {
+                dropped: Arc::clone(&dropped),
+                cancel_on_first_poll: true,
+            }),
+            guarded_test_policy(16, Duration::from_millis(100)),
+            exchange,
+        )
+        .expect("test fetcher");
+        let url = GuardedHttpsUrl::parse("https://public.example/").expect("bounded URL");
+
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url),
+            Err(GuardedHttpFetchError::Cancelled)
+        );
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn guarded_fetch_pending_resolver_deadline_settles_and_drops_phase() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let exchange_started = Arc::new(AtomicUsize::new(0));
+        let deadline = Duration::from_millis(5);
+        let fetcher = GuardedHttpFetcher::new_with_test_exchange(
+            Arc::new(PendingGuardedResolver {
+                dropped: Arc::clone(&dropped),
+                cancel_on_first_poll: false,
+            }),
+            // Only the helper's TLS-handshake bound changes: the planted
+            // resolver deadline, pending future, and zero-exchange assertion
+            // remain exactly the same.
+            guarded_test_policy_with_handshake(16, deadline, deadline),
+            Arc::new(PendingGuardedExchange {
+                dropped: Arc::new(AtomicUsize::new(0)),
+                started: Arc::clone(&exchange_started),
+            }),
+        )
+        .expect("test fetcher");
+        let url = GuardedHttpsUrl::parse("https://public.example/").expect("bounded URL");
+
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url),
+            Err(GuardedHttpFetchError::DeadlineExceeded)
+        );
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
+        assert_eq!(exchange_started.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn guarded_fetch_resolver_delay_consumes_the_single_exchange_budget() {
+        let exchange_started = Arc::new(AtomicUsize::new(0));
+        let deadline = Duration::from_millis(20);
+        let fetcher = GuardedHttpFetcher::new_with_test_exchange(
+            Arc::new(DelayedGuardedResolver {
+                delay: Duration::from_millis(15),
+                answers: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+            }),
+            // Only the helper's TLS-handshake bound changes: 15ms resolver
+            // plus 15ms exchange still exceeds this same 20ms fetch deadline.
+            guarded_test_policy_with_handshake(16, deadline, deadline),
+            Arc::new(DelayedGuardedExchange {
+                delay: Duration::from_millis(15),
+                response: guarded_test_wire_response(200, Vec::new(), b"late".to_vec()),
+                started: Arc::clone(&exchange_started),
+            }),
+        )
+        .expect("test fetcher");
+        let url = GuardedHttpsUrl::parse("https://public.example/").expect("bounded URL");
+
+        assert_eq!(
+            guarded_fetch_for_test(&fetcher, &url),
+            Err(GuardedHttpFetchError::DeadlineExceeded)
+        );
+        assert_eq!(exchange_started.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn guarded_loopback_real_wire_200_records_request_body_and_leaf_provenance() {
+        let (results, requests) = guarded_loopback_fetches(
+            &["foobar.com"],
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec()],
+        );
+        let response = results
+            .into_iter()
+            .next()
+            .expect("one response")
+            .expect("200 response");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        assert_ne!(response.provenance.leaf_certificate_sha256, [0; 32]);
+        assert_eq!(response.provenance.host, "foobar.com");
+        assert!(response.provenance.selected_address.ip().is_loopback());
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(b"GET /proof HTTP/1.1\r\n"));
+        assert!(
+            requests[0]
+                .windows(b"Host: foobar.com:".len())
+                .any(|window| window == b"Host: foobar.com:")
+        );
+        assert!(
+            requests[0]
+                .windows(b"Accept-Encoding: identity".len())
+                .any(|window| window == b"Accept-Encoding: identity")
+        );
+    }
+
+    #[test]
+    fn rh5_guarded_loopback_wrong_host_has_zero_http_bytes_then_valid_retry() {
+        let (results, requests) = guarded_loopback_fetches(
+            &["wrong.example", "foobar.com"],
+            vec![
+                Vec::new(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+            ],
+        );
+
+        assert!(matches!(results[0], Err(GuardedHttpFetchError::Tls(_))));
+        assert_eq!(
+            requests.len(),
+            1,
+            "hostname refusal must precede HTTP bytes"
+        );
+        assert_eq!(
+            results[1].as_ref().expect("same fetcher valid retry").body,
+            b"ok"
+        );
+        assert!(
+            requests[0]
+                .windows(b"Host: foobar.com:".len())
+                .any(|window| window == b"Host: foobar.com:")
+        );
+    }
+
+    #[test]
+    fn rh5_guarded_loopback_real_wire_redirect_is_typed_without_follow_up() {
+        let (results, requests) = guarded_loopback_fetches(
+            &["foobar.com"],
+            vec![b"HTTP/1.1 302 Found\r\nLocation: https://other.example/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()],
+        );
+        let response = results
+            .into_iter()
+            .next()
+            .expect("one response")
+            .expect("redirect response");
+
+        assert_eq!(
+            response.redirect,
+            Some(GuardedHttpRedirect {
+                status: 302,
+                location: Some("https://other.example/next".to_owned()),
+            })
+        );
+        assert_eq!(
+            requests.len(),
+            1,
+            "redirect must not open a follow-up connection"
+        );
+    }
+
+    #[test]
+    fn rh5_guarded_policy_time_bounds_accept_n_and_reject_n_plus_one() {
+        let root = "webpki-r1";
+        assert!(
+            GuardedHttpFetchPolicy::new(
+                1,
+                MAX_GUARDED_FETCH_DEADLINE,
+                MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT,
+                root,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            GuardedHttpFetchPolicy::new(
+                1,
+                MAX_GUARDED_FETCH_DEADLINE + Duration::from_nanos(1),
+                MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT,
+                root,
+            ),
+            Err(GuardedHttpFetchError::InvalidPolicy("full fetch deadline"))
+        );
+        assert_eq!(
+            GuardedHttpFetchPolicy::new(
+                1,
+                MAX_GUARDED_FETCH_DEADLINE,
+                MAX_GUARDED_TLS_HANDSHAKE_TIMEOUT + Duration::from_nanos(1),
+                root,
+            ),
+            Err(GuardedHttpFetchError::InvalidPolicy(
+                "TLS handshake timeout"
+            ))
+        );
+        assert_eq!(
+            GuardedHttpFetchPolicy::new(
+                1,
+                Duration::from_secs(1),
+                Duration::from_secs(1) + Duration::from_nanos(1),
+                root,
+            ),
+            Err(GuardedHttpFetchError::InvalidPolicy(
+                "TLS handshake exceeds full fetch deadline"
+            ))
+        );
+    }
+
+    #[test]
+    fn rh5_guarded_leaf_provenance_requires_admitted_certificate_and_valid_retry() {
+        let leaf = vec![0xA5; MAX_GUARDED_LEAF_CERTIFICATE_BYTES];
+        let oversized = vec![0xA5; MAX_GUARDED_LEAF_CERTIFICATE_BYTES + 1];
+        let oversized_snapshot = oversized.clone();
+
+        assert_eq!(
+            guarded_leaf_certificate_sha256(None),
+            Err(GuardedHttpFetchError::PeerCertificateUnavailable)
+        );
+        assert_eq!(
+            guarded_leaf_certificate_sha256(Some(oversized.clone())),
+            Err(GuardedHttpFetchError::PeerCertificateTooLarge)
+        );
+        assert_eq!(oversized, oversized_snapshot);
+        assert_ne!(
+            guarded_leaf_certificate_sha256(Some(leaf)).expect("admitted leaf digest"),
+            [0; 32]
+        );
+    }
+
+    #[test]
+    fn guarded_https_url_public_address_selects_deterministically() {
+        let url =
+            GuardedHttpsUrl::parse("https://PUBLIC.example:8443/a?b=c").expect("bounded HTTPS URL");
+        let selected = guarded_select_address(
+            vec![
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 35)),
+                IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            ],
+            url.port(),
+        )
+        .expect("all answers are public");
+
+        assert_eq!(url.host(), "public.example");
+        assert_eq!(url.target(), "/a?b=c");
+        assert_eq!(selected, SocketAddr::from(([93, 184, 216, 34], 8443)));
+    }
+
+    #[test]
+    fn rh5_guarded_private_or_mapped_answer_rejects_before_any_connect_selection() {
+        let public = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let private = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+        let mapped_private = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 7));
+        let well_known_nat64 = IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0x0808, 0x0808));
+        let local_use_nat64 = IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0x0808, 0x0808));
+        let adjacent_public = IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 2, 0, 0, 0, 0x0808, 0x0808));
+        for prohibited in [private, mapped_private, well_known_nat64, local_use_nat64] {
+            let answers = vec![public, prohibited];
+            let input_snapshot = answers.clone();
+
+            assert_eq!(
+                guarded_select_address(answers.clone(), 443),
+                Err(GuardedHttpFetchError::DisallowedResolvedAddress(
+                    canonical_guarded_ip(prohibited)
+                ))
+            );
+            assert_eq!(answers, input_snapshot);
+        }
+        assert_eq!(
+            guarded_select_address(vec![public], 443),
+            Ok(SocketAddr::from(([93, 184, 216, 34], 443)))
+        );
+        assert!(is_public_guarded_ip(adjacent_public));
+    }
+
+    #[test]
+    fn rh5_guarded_loopback_exception_is_exact_socket_only() {
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let allowed = SocketAddr::from((Ipv4Addr::LOCALHOST, 9443));
+
+        assert_eq!(
+            guarded_select_address_with_test_loopback(vec![loopback], 9443, Some(allowed)),
+            Ok(allowed)
+        );
+        assert_eq!(
+            guarded_select_address_with_test_loopback(vec![loopback], 9444, Some(allowed)),
+            Err(GuardedHttpFetchError::DisallowedResolvedAddress(loopback))
+        );
+    }
+
+    #[test]
+    fn guarded_redirect_is_observed_without_follow_up_request_state() {
+        let response = guarded_admit_native_response(
+            302,
+            vec![(
+                "Location".to_owned(),
+                "https://other.example/next".to_owned(),
+            )],
+            Vec::new(),
+            64,
+            guarded_test_provenance(),
+        )
+        .expect("single redirect response is observable");
+
+        assert_eq!(
+            response.redirect,
+            Some(GuardedHttpRedirect {
+                status: 302,
+                location: Some("https://other.example/next".to_owned()),
+            })
+        );
+        assert_eq!(response.provenance.host, "public.example");
+    }
+
+    #[test]
+    fn rh5_guarded_response_body_bound_accepts_n_and_rejects_n_plus_one() {
+        let provenance = guarded_test_provenance();
+        let accepted =
+            guarded_admit_native_response(200, Vec::new(), vec![0xA5; 8], 8, provenance.clone())
+                .expect("exact body bound admits");
+        let body = vec![0xA5; 9];
+        let input_snapshot = body.clone();
+
+        assert_eq!(accepted.body.len(), 8);
+        assert_eq!(
+            guarded_admit_native_response(200, Vec::new(), body.clone(), 8, provenance),
+            Err(GuardedHttpFetchError::Http(
+                "response body exceeded guarded bound".to_owned()
+            ))
+        );
+        assert_eq!(body, input_snapshot);
+    }
+
+    #[test]
+    fn rh5_guarded_nonidentity_response_encoding_rejects_without_changing_input() {
+        let headers = vec![("Content-Encoding".to_owned(), "gzip".to_owned())];
+        let headers_snapshot = headers.clone();
+        let body = b"identity-looking-but-not-decoded".to_vec();
+        let body_snapshot = body.clone();
+
+        assert_eq!(
+            guarded_admit_native_response(
+                200,
+                headers.clone(),
+                body.clone(),
+                64,
+                guarded_test_provenance(),
+            ),
+            Err(GuardedHttpFetchError::UnexpectedContentEncoding(
+                "gzip".to_owned()
+            ))
+        );
+        assert_eq!(headers, headers_snapshot);
+        assert_eq!(body, body_snapshot);
+    }
 
     struct InterruptEveryOtherRead {
         inner: Cursor<Vec<u8>>,
@@ -9964,6 +11934,112 @@ Content-Length: {}\r\n\
 
         assert_eq!(admission.response().id, Some(request_id));
         assert_eq!(admission.raw_result(), Some(raw_result));
+    }
+
+    #[test]
+    fn modern_http_sse_collector_correlates_mathematical_terminal_ids_and_preserves_source() {
+        let request_id = RequestId::Number(2);
+        let raw_result =
+            r#"{"resultType":"complete","opaque":{"decimal":1.20e+4,"order":{"z":1,"a":2}}}"#;
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let cx = Cx::for_testing();
+
+        for terminal_id in ["2.0", "2e0"] {
+            let body = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":{terminal_id},\"result\":{raw_result}}}\n\n"
+            );
+            let mut collector =
+                ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
+
+            collector
+                .push(&cx, body.as_bytes(), |_| Ok(()))
+                .expect("mathematically correlated terminal response is admitted");
+            let admission = collector
+                .finish_admission(&cx)
+                .expect("EOF returns the admitted terminal response");
+
+            assert!(
+                admission
+                    .response()
+                    .id
+                    .as_ref()
+                    .is_some_and(|actual| actual.correlates_with(&request_id))
+            );
+            assert_eq!(admission.raw_result(), Some(raw_result));
+        }
+    }
+
+    #[test]
+    fn modern_http_sse_collector_mismatched_mathematical_terminal_id_closes_without_reuse() {
+        let request_id = RequestId::Number(2);
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","opaque":{"decimal":1.20e+4,"order":{"z":1,"a":2}}}"#;
+        // This is byte-for-byte the correlated `2.0` terminal payload from
+        // the positive proof above except for its one forbidden dimension.
+        let mismatched =
+            format!("data: {{\"jsonrpc\":\"2.0\",\"id\":3.0,\"result\":{raw_result}}}\n\n");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
+
+        assert!(matches!(
+            collector.push(&cx, mismatched.as_bytes(), |_| Ok(())),
+            Err(ModernHttpSseCollectorError::TerminalResponseIdMismatch {
+                expected,
+                actual: Some(RequestId::Integer(actual)),
+            }) if expected == request_id && actual == "3.0"
+        ));
+        assert_collector_is_closed(&mut collector, &cx);
+
+        let body = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":2e0,\"result\":{raw_result}}}\n\n");
+        let mut fresh_collector = ModernHttpSseCollector::new(request_id, limits)
+            .expect("a separate collector is unaffected by the closed one");
+        fresh_collector
+            .push(&cx, body.as_bytes(), |_| Ok(()))
+            .expect("fresh collector admits its own mathematically correlated terminal");
+        assert_eq!(
+            fresh_collector
+                .finish_admission(&cx)
+                .expect("fresh collector returns only its own terminal")
+                .raw_result(),
+            Some(raw_result)
+        );
+    }
+
+    #[test]
+    fn modern_http_sse_collector_absent_terminal_id_closes_without_reuse() {
+        let request_id = RequestId::Number(2);
+        let limits = ModernSseLimits::new(4_096, 4_096, 8).expect("nonzero SSE limits");
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","opaque":{"decimal":1.20e+4,"order":{"z":1,"a":2}}}"#;
+        let absent = format!("data: {{\"jsonrpc\":\"2.0\",\"result\":{raw_result}}}\n\n");
+        let mut collector =
+            ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
+
+        assert!(matches!(
+            collector.push(&cx, absent.as_bytes(), |_| Ok(())),
+            Err(ModernHttpSseCollectorError::TerminalResponseIdMismatch {
+                expected,
+                actual: None,
+            }) if expected == request_id
+        ));
+        assert_collector_is_closed(&mut collector, &cx);
+
+        let body = format!("data: {{\"jsonrpc\":\"2.0\",\"id\":2e0,\"result\":{raw_result}}}\n\n");
+        let mut fresh_collector = ModernHttpSseCollector::new(request_id, limits)
+            .expect("a separate collector is unaffected by the closed one");
+        fresh_collector
+            .push(&cx, body.as_bytes(), |_| Ok(()))
+            .expect("fresh collector admits its own mathematically correlated terminal");
+        assert_eq!(
+            fresh_collector
+                .finish_admission(&cx)
+                .expect("fresh collector returns only its own terminal")
+                .raw_result(),
+            Some(raw_result)
+        );
     }
 
     #[test]
