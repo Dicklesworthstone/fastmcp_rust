@@ -25,13 +25,15 @@ use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::{
-    CacheScope, CacheTtl, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
-    DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
-    FinalGetPromptResult, FinalProgressNotificationParams, FinalPrompt, FinalPromptMessage,
-    FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, Icon,
-    InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams,
-    Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra,
-    Tool, ToolAnnotations, decode_peer_result, encode_result,
+    AdmittedFinalFormSchema, CacheScope, CacheTtl, CompleteResult, CompletionValues, Content,
+    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue, FinalCallToolResult,
+    FinalCompletionParams, FinalCompletionValues, FinalEmbeddedElicitationParams,
+    FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest,
+    FinalEmbeddedUrlElicitationParams, FinalGetPromptResult, FinalProgressNotificationParams,
+    FinalPrompt, FinalPromptMessage, FinalReadResourceResult, FinalResource, FinalResourceTemplate,
+    FinalTool, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, ProgressMarker,
+    ProgressParams, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta,
+    ResultPeerEra, Tool, ToolAnnotations, decode_peer_result, encode_result, exact_json_from_serde,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -790,6 +792,136 @@ impl From<CompleteResult<FinalCallToolResult>> for FinalToolOutcome {
 impl From<InputRequiredResult> for FinalToolOutcome {
     fn from(result: InputRequiredResult) -> Self {
         Self::InputRequired(result)
+    }
+}
+
+/// One final-era elicitation request that a handler returns as MRTR input.
+///
+/// This is deliberately not an async request/response operation. MCP
+/// 2026-07-28 carries server-to-client input in the original method's
+/// `input_required` result, then reinvokes the handler with
+/// [`MrtrCompletedInputs`] after the client retries. A normal
+/// [`McpContext::elicit_form`] future cannot preserve its stack frame across
+/// that protocol boundary.
+#[derive(Debug, Clone)]
+pub struct FinalElicitation {
+    input_key: String,
+    parameters: FinalEmbeddedElicitationParams,
+}
+
+impl FinalElicitation {
+    fn new(
+        context: &McpContext,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedElicitationParams,
+    ) -> McpResult<Self> {
+        let supported = match &parameters {
+            FinalEmbeddedElicitationParams::Form(_) => context.client_supports_elicitation_form(),
+            FinalEmbeddedElicitationParams::Url(_) => context.client_supports_elicitation_url(),
+        };
+        if !supported {
+            return Err(McpError::invalid_request(
+                "Final elicitation mode is not advertised by the client",
+            ));
+        }
+        let input_key = input_key.into();
+        if input_key.is_empty() {
+            return Err(McpError::invalid_params(
+                "Final elicitation input key must not be empty",
+            ));
+        }
+        Ok(Self {
+            input_key,
+            parameters,
+        })
+    }
+
+    /// Returns the opaque map key that correlates this elicitation on retry.
+    #[must_use]
+    pub fn input_key(&self) -> &str {
+        &self.input_key
+    }
+
+    /// Converts this request into the only handler outcome accepted by final
+    /// MRTR dispatch. The router validates the descriptor and replaces any
+    /// handler-selected retry state with a framework-minted value.
+    pub fn into_input_required(self) -> McpResult<InputRequiredResult> {
+        let descriptor = FinalEmbeddedInputRequest::Elicitation(self.parameters);
+        let wire = serde_json::json!({self.input_key: descriptor});
+        let ExactJsonValue::Object(input_requests) = exact_json_from_serde(&wire)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?
+        else {
+            return Err(McpError::internal_error(
+                "Final elicitation input requests must encode as an object",
+            ));
+        };
+        InputRequiredResult::new(Some(input_requests), None, ResultMeta::empty())
+            .map_err(|error| McpError::invalid_params(error.to_string()))
+    }
+}
+
+/// Final-only elicitation construction for [`McpContext`].
+///
+/// Import this trait to use [`Self::final_elicitation_form`] or
+/// [`Self::final_elicitation_url`] inside a final handler. Return the resulting
+/// [`FinalElicitation`] through [`FinalToolOutcome::InputRequired`], then read
+/// the accepted value with [`MrtrCompletedInputs::elicitation`] on the resumed
+/// invocation.
+pub trait FinalElicitationContextExt {
+    /// Builds an embedded final form elicitation request.
+    fn final_elicitation_form(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        requested_schema: serde_json::Value,
+    ) -> McpResult<FinalElicitation>;
+
+    /// Builds an embedded final URL elicitation request.
+    fn final_elicitation_url(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        url: impl Into<String>,
+    ) -> McpResult<FinalElicitation>;
+}
+
+impl FinalElicitationContextExt for McpContext {
+    fn final_elicitation_form(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        requested_schema: serde_json::Value,
+    ) -> McpResult<FinalElicitation> {
+        let requested_schema = AdmittedFinalFormSchema::admit(requested_schema)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        FinalElicitation::new(
+            self,
+            input_key,
+            FinalEmbeddedElicitationParams::Form(FinalEmbeddedFormElicitationParams {
+                mode: fastmcp_protocol::ElicitMode::Form,
+                message: message.into(),
+                requested_schema,
+            }),
+        )
+    }
+
+    fn final_elicitation_url(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        url: impl Into<String>,
+    ) -> McpResult<FinalElicitation> {
+        let url =
+            AbsoluteUri::parse(url).map_err(|error| McpError::invalid_params(error.to_string()))?;
+        FinalElicitation::new(
+            self,
+            input_key,
+            FinalEmbeddedElicitationParams::Url(FinalEmbeddedUrlElicitationParams {
+                mode: fastmcp_protocol::ElicitMode::Url,
+                message: message.into(),
+                url,
+            }),
+        )
     }
 }
 
