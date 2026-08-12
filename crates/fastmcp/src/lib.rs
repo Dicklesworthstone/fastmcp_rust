@@ -169,6 +169,8 @@ pub use asupersync;
 /// `websocket-experimental` feature cannot expose that caller-upgraded
 /// experimental transport through `fastmcp_rust::client`.
 pub mod client {
+    #[cfg(feature = "websocket-experimental")]
+    pub use crate::WebSocketClient;
     pub use crate::{
         BearerBindingError, BoundBearerCredential, ConfigError, ConfigLoader, HttpEndpointConfig,
         HttpEndpointConfigError, MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT,
@@ -218,8 +220,6 @@ pub mod client {
         McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
         McpAppsWireHostPolicy, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
-    #[cfg(feature = "websocket-experimental")]
-    pub use crate::{WebSocketClient, WebSocketClientTransport};
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
     /// Raw client-side WebSocket framing remains available for advanced
@@ -642,7 +642,8 @@ pub mod transport {
 /// Experimental WebSocket transport APIs.
 ///
 /// Low-level URI/Upgrade framing stays outside `modern`, `legacy_2024`, and
-/// `auto`; those namespaces select an MCP policy through their builders.
+/// `auto`. The socket client is caller-driven and async; era namespaces expose
+/// only the server lifecycle whose policy is fixed before the listener binds.
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_transport::websocket::{
     AsyncWsClientTransport, AsyncWsServerTransport, WebSocketListener, WebSocketUpgradeAdmission,
@@ -725,6 +726,8 @@ pub use fastmcp_server::providers;
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
+#[cfg(feature = "websocket-experimental")]
+pub use fastmcp_client::WebSocketClient;
 pub use fastmcp_client::{
     BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
@@ -741,11 +744,6 @@ pub use fastmcp_client::{
     ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor, SubscriptionFilter,
     SubscriptionListenCollector,
 };
-
-/// Negotiated high-level WebSocket client types are opt-in with the facade's
-/// WebSocket profile. Raw URI and upgrade adapters remain in [`transport`].
-#[cfg(feature = "websocket-experimental")]
-pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
 
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::{
@@ -798,30 +796,30 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 /// subprocess or HTTP side effect. The caller may replace that immutable plan
 /// with an explicit plan before connecting.
 ///
-/// `auto::ClientBuilder` negotiates WebSocket traffic with its immutable Auto
-/// policy. Low-level URI/Upgrade transports remain in [`crate::transport`].
+/// Its WebSocket entry point accepts a caller-owned async URI transport and
+/// has no synchronous split-transport escape route.
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod auto {
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_client::WebSocketClient;
     pub use fastmcp_client::http_executor::{
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
         ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
     };
     pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
-        Client, ClientBuilder, ClientHttpConnection, ClientHttpConnectionError,
-        ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
-        ClientHttpNegotiationState, ClientHttpResponse, ClientProtocolPlan,
-        ClientProtocolPlanError, ClientSession, HttpClient, HttpClientError,
-        HttpSubscriptionListener, Request, RequestExecution, RequestExecutor, ReverseRequest,
-        ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
-        SubscriptionFilter, SubscriptionListenCollector,
+        Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
+        ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
+        ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession, HttpClient,
+        HttpClientError, HttpSubscriptionListener, Request, RequestExecution, RequestExecutor,
+        ReverseRequest, ReverseRequestCancellation, ReverseRequestHandlers, StdioRequestExecution,
+        StdioRequestExecutor, SubscriptionFilter, SubscriptionListenCollector,
     };
-    #[cfg(feature = "websocket-experimental")]
-    pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
-        ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionNegotiationError,
-        ExtensionSettings, ExtensionSettingsCompatibilityResolver, ExtensionSettingsResolution,
+        ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+        ExtensionNegotiationError, ExtensionSettings, ExtensionSettingsCompatibilityResolver,
+        ExtensionSettingsResolution,
     };
     pub use fastmcp_protocol::protocol_policy::{
         HttpEndpointBundle, HttpEndpointBundleError, ProtocolEra, ProtocolPolicy, ProtocolVersion,
@@ -864,7 +862,223 @@ pub mod auto {
         FinalCancelTaskResult, FinalGetTaskResult, FinalTaskId, tasks_extension,
     };
 
-    /// Creates the public client builder with its immutable Auto stdio plan.
+    /// Auto-policy facade over the underlying client builder.
+    ///
+    /// It preserves Auto's stdio and HTTP policy selection while withholding
+    /// the component's synchronous split-WebSocket constructors. The supported
+    /// socket client remains the caller-driven async transport at
+    /// [`crate::transport::websocket`].
+    #[derive(Clone)]
+    pub struct ClientBuilder {
+        inner: fastmcp_client::ClientBuilder,
+    }
+
+    impl Default for ClientBuilder {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl ClientBuilder {
+        fn from_inner(inner: fastmcp_client::ClientBuilder) -> Self {
+            Self { inner }
+        }
+
+        /// Creates a builder with Auto's default stdio plan.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::from_inner(fastmcp_client::ClientBuilder::new())
+        }
+
+        /// Sets the client identity used during discovery or initialization.
+        #[must_use]
+        pub fn client_info(self, name: impl Into<String>, version: impl Into<String>) -> Self {
+            Self::from_inner(self.inner.client_info(name, version))
+        }
+
+        /// Sets the idle and absolute timeout policy for ordinary requests.
+        #[must_use]
+        pub fn request_timeout_policy(self, policy: RequestTimeoutPolicy) -> Self {
+            Self::from_inner(self.inner.request_timeout_policy(policy))
+        }
+
+        /// Sets the maximum retry count for connection attempts.
+        #[must_use]
+        pub fn max_retries(self, retries: u32) -> Self {
+            Self::from_inner(self.inner.max_retries(retries))
+        }
+
+        /// Sets the delay between connection retries in milliseconds.
+        #[must_use]
+        pub fn retry_delay_ms(self, delay: u64) -> Self {
+            Self::from_inner(self.inner.retry_delay_ms(delay))
+        }
+
+        /// Sets a bounded validated connection retry policy.
+        pub fn connection_retry_policy(
+            self,
+            max_attempts: u32,
+            retry_delay: std::time::Duration,
+            total_elapsed: std::time::Duration,
+        ) -> McpResult<Self> {
+            self.inner
+                .connection_retry_policy(max_attempts, retry_delay, total_elapsed)
+                .map(Self::from_inner)
+        }
+
+        /// Selects the immutable stdio or HTTP protocol plan before connect.
+        #[must_use]
+        pub fn protocol_plan(self, protocol_plan: ClientProtocolPlan) -> Self {
+            Self::from_inner(self.inner.protocol_plan(protocol_plan))
+        }
+
+        /// Returns the protocol plan that this builder will validate on connect.
+        #[must_use]
+        pub const fn selected_protocol_plan(&self) -> &ClientProtocolPlan {
+            self.inner.selected_protocol_plan()
+        }
+
+        /// Starts side-effect-free HTTP negotiation for this builder plan.
+        pub fn http_negotiation(
+            &self,
+        ) -> Result<ClientHttpNegotiation, ClientHttpNegotiationError> {
+            self.inner.http_negotiation()
+        }
+
+        /// Adds one subprocess environment variable.
+        #[must_use]
+        pub fn env(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+            Self::from_inner(self.inner.env(key, value))
+        }
+
+        /// Sets the subprocess working directory.
+        #[must_use]
+        pub fn working_dir(self, path: impl Into<std::path::PathBuf>) -> Self {
+            Self::from_inner(self.inner.working_dir(path))
+        }
+
+        /// Adds several subprocess environment variables.
+        #[must_use]
+        pub fn envs<I, K, V>(self, vars: I) -> Self
+        where
+            I: IntoIterator<Item = (K, V)>,
+            K: Into<String>,
+            V: Into<String>,
+        {
+            Self::from_inner(self.inner.envs(vars))
+        }
+
+        /// Selects whether the child inherits the parent environment.
+        #[must_use]
+        pub fn inherit_env(self, inherit: bool) -> Self {
+            Self::from_inner(self.inner.inherit_env(inherit))
+        }
+
+        /// Sets the discovery or initialize capabilities.
+        #[must_use]
+        pub fn capabilities(self, capabilities: ClientCapabilities) -> Self {
+            Self::from_inner(self.inner.capabilities(capabilities))
+        }
+
+        /// Configures exact-2024 reverse request handlers for a selected or
+        /// Auto-fallback legacy connection.
+        #[must_use]
+        pub fn reverse_request_handlers(self, handlers: ReverseRequestHandlers) -> Self {
+            Self::from_inner(self.inner.reverse_request_handlers(handlers))
+        }
+
+        /// Configures MCP Apps settings for a modern connection.
+        #[cfg(feature = "apps")]
+        #[must_use]
+        pub fn mcp_apps(self, settings: McpAppsClientSettings) -> Self {
+            Self::from_inner(self.inner.mcp_apps(settings))
+        }
+
+        /// Installs final extension settings before connection.
+        pub fn extension_registry<F, R>(
+            self,
+            descriptors: ExtensionDescriptorRegistry,
+            client_discovery: ClientExtensionDiscovery,
+            resolver_factory: F,
+        ) -> McpResult<Self>
+        where
+            F: Fn() -> R + Send + Sync + 'static,
+            R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+        {
+            self.inner
+                .extension_registry(descriptors, client_discovery, resolver_factory)
+                .map(Self::from_inner)
+        }
+
+        /// Defers initialization until the selected client first needs it.
+        #[must_use]
+        pub fn auto_initialize(self, enabled: bool) -> Self {
+            Self::from_inner(self.inner.auto_initialize(enabled))
+        }
+
+        /// Selects caller-owned child process-group cleanup where supported.
+        #[must_use]
+        pub fn owned_process_group(self, enabled: bool) -> Self {
+            Self::from_inner(self.inner.owned_process_group(enabled))
+        }
+
+        /// Connects the selected stdio plan using the current capability context.
+        pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
+            self.inner.connect_stdio(command, args)
+        }
+
+        /// Connects the selected stdio plan with an explicit capability context.
+        pub fn connect_stdio_with_cx(
+            self,
+            command: &str,
+            args: &[&str],
+            cx: &Cx,
+        ) -> McpResult<Client> {
+            self.inner.connect_stdio_with_cx(command, args, cx)
+        }
+
+        /// Negotiates an owned native async WebSocket transport under Auto's
+        /// immutable protocol policy.
+        #[cfg(feature = "websocket-experimental")]
+        pub async fn connect_websocket_with_cx<IO>(
+            self,
+            cx: &Cx,
+            transport: fastmcp_transport::websocket::AsyncWsClientTransport<IO>,
+        ) -> McpResult<WebSocketClient<IO>>
+        where
+            IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
+        {
+            self.inner.connect_websocket_with_cx(cx, transport).await
+        }
+
+        /// Connects the selected HTTP plan using the current capability context.
+        pub fn connect_http(self) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
+            self.inner.connect_http()
+        }
+
+        /// Connects the selected HTTP plan with an explicit capability context.
+        pub async fn connect_http_with_cx(
+            self,
+            cx: &Cx,
+        ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
+            self.inner.connect_http_with_cx(cx).await
+        }
+
+        /// Connects a ready selected HTTP client using the current capability context.
+        pub fn connect_http_client(self) -> Result<HttpClient, HttpClientError> {
+            self.inner.connect_http_client()
+        }
+
+        /// Connects a ready selected HTTP client with an explicit capability context.
+        pub async fn connect_http_client_with_cx(
+            self,
+            cx: &Cx,
+        ) -> Result<HttpClient, HttpClientError> {
+            self.inner.connect_http_client_with_cx(cx).await
+        }
+    }
+
+    /// Creates the public client builder with Auto's default stdio plan.
     #[must_use]
     pub fn client_builder() -> ClientBuilder {
         ClientBuilder::new()
@@ -973,6 +1187,8 @@ pub mod auto {
 /// }
 /// ```
 pub mod modern {
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_client::WebSocketClient;
     pub use fastmcp_client::http_executor::{
         MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
         MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpSubscriptionListenCollector,
@@ -992,8 +1208,6 @@ pub mod modern {
         PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
         SubscriptionFilter, SubscriptionListenCollector,
     };
-    #[cfg(feature = "websocket-experimental")]
-    pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_RESOURCE_READ_DEPTH,
         MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard, McpError, McpOutcome, McpResult,
@@ -1438,35 +1652,18 @@ pub mod modern {
                 .map(Client::from_inner)
         }
 
-        /// Connects one upgraded WebSocket transport under the fixed
-        /// MCP 2026-07-28 policy.
+        /// Negotiates an owned native async WebSocket transport under the
+        /// fixed MCP 2026-07-28 policy.
         #[cfg(feature = "websocket-experimental")]
-        pub fn connect_websocket<R, S>(
-            self,
-            receiver: R,
-            sender: S,
-        ) -> McpResult<WebSocketClient<R, S>>
-        where
-            R: fastmcp_transport::ClientTransportRecvHalf,
-            S: fastmcp_transport::TransportSendHalf,
-        {
-            self.inner.connect_websocket(receiver, sender)
-        }
-
-        /// Connects one upgraded WebSocket transport under the fixed
-        /// MCP 2026-07-28 policy using the supplied capability context.
-        #[cfg(feature = "websocket-experimental")]
-        pub fn connect_websocket_with_cx<R, S>(
+        pub async fn connect_websocket_with_cx<IO>(
             self,
             cx: &Cx,
-            receiver: R,
-            sender: S,
-        ) -> McpResult<WebSocketClient<R, S>>
+            transport: fastmcp_transport::websocket::AsyncWsClientTransport<IO>,
+        ) -> McpResult<WebSocketClient<IO>>
         where
-            R: fastmcp_transport::ClientTransportRecvHalf,
-            S: fastmcp_transport::TransportSendHalf,
+            IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
         {
-            self.inner.connect_websocket_with_cx(cx, receiver, sender)
+            self.inner.connect_websocket_with_cx(cx, transport).await
         }
 
         /// Connects this configured final-only builder over one final HTTP endpoint.
@@ -2940,6 +3137,8 @@ pub mod modern {
 /// ```
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024 {
+    #[cfg(feature = "websocket-experimental")]
+    pub use fastmcp_client::WebSocketClient;
     pub use fastmcp_client::{
         ClientProtocolPlan, CreateMessageParams as LegacyCreateMessageParams,
         CreateMessageResult as LegacyCreateMessageResult, HttpClientError,
@@ -2949,8 +3148,6 @@ pub mod legacy_2024 {
         RootsRequestHandler as LegacyRootsRequestHandler,
         SamplingRequestHandler as LegacySamplingRequestHandler,
     };
-    #[cfg(feature = "websocket-experimental")]
-    pub use fastmcp_client::{WebSocketClient, WebSocketClientTransport};
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientRoot, Cx, McpContext, McpError, McpOutcome, McpResult,
         RootsProvider,
@@ -3901,35 +4098,18 @@ pub mod legacy_2024 {
                 .map(Client::from_inner)
         }
 
-        /// Connects one upgraded WebSocket transport under the fixed
-        /// MCP 2024-11-05 policy.
+        /// Negotiates an owned native async WebSocket transport under the
+        /// fixed MCP 2024-11-05 policy.
         #[cfg(feature = "websocket-experimental")]
-        pub fn connect_websocket<R, S>(
-            self,
-            receiver: R,
-            sender: S,
-        ) -> McpResult<WebSocketClient<R, S>>
-        where
-            R: fastmcp_transport::ClientTransportRecvHalf,
-            S: fastmcp_transport::TransportSendHalf,
-        {
-            self.inner.connect_websocket(receiver, sender)
-        }
-
-        /// Connects one upgraded WebSocket transport under the fixed
-        /// MCP 2024-11-05 policy using the supplied capability context.
-        #[cfg(feature = "websocket-experimental")]
-        pub fn connect_websocket_with_cx<R, S>(
+        pub async fn connect_websocket_with_cx<IO>(
             self,
             cx: &Cx,
-            receiver: R,
-            sender: S,
-        ) -> McpResult<WebSocketClient<R, S>>
+            transport: fastmcp_transport::websocket::AsyncWsClientTransport<IO>,
+        ) -> McpResult<WebSocketClient<IO>>
         where
-            R: fastmcp_transport::ClientTransportRecvHalf,
-            S: fastmcp_transport::TransportSendHalf,
+            IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
         {
-            self.inner.connect_websocket_with_cx(cx, receiver, sender)
+            self.inner.connect_websocket_with_cx(cx, transport).await
         }
 
         /// Connects and initializes the sealed exact-2024 HTTP+SSE plan.
@@ -4620,8 +4800,8 @@ pub mod prelude {
     #[cfg(feature = "websocket-experimental")]
     pub use crate::{
         AsyncWsClientTransport, AsyncWsServerTransport, BoundWebSocketServer, WebSocketClient,
-        WebSocketClientTransport, WebSocketListener, WebSocketNonquiescentShutdown,
-        WebSocketServerShutdown, WebSocketUpgradeAdmission,
+        WebSocketListener, WebSocketNonquiescentShutdown, WebSocketServerShutdown,
+        WebSocketUpgradeAdmission,
     };
     pub use crate::{
         CachePartitionKey, ClientCapabilityInfo, ContextNotificationSender,

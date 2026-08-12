@@ -1721,11 +1721,20 @@ fn e2e_test_json_report_against_static_protocol_fixture() {
 #[cfg(feature = "legacy-2024-11-05")]
 #[test]
 fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
-    for (case_name, policy, fixture, expected_version, expected_era, assert_wire) in [
+    for (
+        case_name,
+        policy,
+        fixture,
+        expected_server_name,
+        expected_version,
+        expected_era,
+        assert_wire,
+    ) in [
         (
             "modern-only",
             "modern-only",
             MODERN_INSPECT_FIXTURE,
+            "modern-inspect-server",
             "2026-07-28",
             "modern-2026",
             assert_modern_negotiation_wire as fn(&[serde_json::Value]),
@@ -1734,6 +1743,7 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
             "auto-modern",
             "auto",
             MODERN_INSPECT_FIXTURE,
+            "modern-inspect-server",
             "2026-07-28",
             "modern-2026",
             assert_modern_negotiation_wire,
@@ -1742,6 +1752,7 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
             "legacy-only",
             "legacy-only",
             LEGACY_FALLBACK_INSPECT_FIXTURE,
+            "legacy-inspect-server",
             "2024-11-05",
             "legacy-2024",
             assert_legacy_negotiation_wire,
@@ -1750,6 +1761,7 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
             "auto-legacy-fallback",
             "auto",
             LEGACY_FALLBACK_INSPECT_FIXTURE,
+            "legacy-inspect-server",
             "2024-11-05",
             "legacy-2024",
             assert_auto_legacy_fallback_wire,
@@ -1764,6 +1776,11 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
         let expected_text =
             format!("Protocol: policy={policy} version={expected_version} era={expected_era}");
         let text = stdout_str(&text_output);
+        let expected_server_text = format!("Server: {expected_server_name} v1.0.0");
+        assert!(
+            text.lines().any(|line| line == expected_server_text),
+            "{case_name} inspect must render the server identity admitted from its selected-era response"
+        );
         assert_eq!(
             text.lines().find(|line| line.starts_with("Protocol: ")),
             Some(expected_text.as_str()),
@@ -1795,6 +1812,8 @@ fn e2e_cli_inspect_protocol_policy_reports_selected_era_and_exact_version() {
         );
         let json: serde_json::Value =
             serde_json::from_str(&stdout_str(&json_output)).expect("inspect output should be JSON");
+        assert_eq!(json["server"]["name"], expected_server_name);
+        assert_eq!(json["server"]["version"], "1.0.0");
         assert_eq!(json["protocol"]["policy"], policy);
         assert_eq!(json["protocol"]["version"], expected_version);
         assert_eq!(json["protocol"]["era"], expected_era);
@@ -1823,6 +1842,40 @@ fn e2e_cli_inspect_modern_discovery_planted_negative_rejects_invalid_completions
     assert!(
         !output.status.success(),
         "changing only completions from an object to a boolean must reject final discovery"
+    );
+    let wire = observed_protocol_wire(&output);
+    assert_modern_negotiation_wire(&wire);
+    assert_no_legacy_initialize(&wire);
+}
+
+#[test]
+fn e2e_cli_inspect_modern_discovery_planted_negative_rejects_invalid_extensions_shape() {
+    let fixture = MODERN_INSPECT_FIXTURE.replace(
+        r#""extensions":{"io.example/inspect":{"enabled":true}}"#,
+        r#""extensions":{"io.example/inspect":true}"#,
+    );
+    assert_ne!(fixture, MODERN_INSPECT_FIXTURE);
+    let output = inspect_protocol_fixture("modern-only", "json", &fixture);
+
+    assert!(
+        !output.status.success(),
+        "changing only an extension setting from an object to a boolean must reject final discovery"
+    );
+    let wire = observed_protocol_wire(&output);
+    assert_modern_negotiation_wire(&wire);
+    assert_no_legacy_initialize(&wire);
+}
+
+#[test]
+fn e2e_cli_inspect_modern_discovery_planted_negative_rejects_malformed_server_info_metadata() {
+    let fixture =
+        MODERN_INSPECT_FIXTURE.replace(r#""name":"modern-inspect-server""#, r#""name":false"#);
+    assert_ne!(fixture, MODERN_INSPECT_FIXTURE);
+    let output = inspect_protocol_fixture("modern-only", "json", &fixture);
+
+    assert!(
+        !output.status.success(),
+        "changing only _meta serverInfo.name from a string to a boolean must reject final discovery"
     );
     let wire = observed_protocol_wire(&output);
     assert_modern_negotiation_wire(&wire);

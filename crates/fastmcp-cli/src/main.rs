@@ -5329,7 +5329,10 @@ fn cmd_inspect(
 #[derive(Clone, Debug)]
 enum InspectCapabilities {
     Legacy(fastmcp_protocol::ServerCapabilities),
-    Final(serde_json::Value),
+    /// Final discovery capabilities are an open object. Retain its complete
+    /// object shape so the inspect renderer never recasts a modern peer into
+    /// the closed legacy capability model.
+    Final(serde_json::Map<String, serde_json::Value>),
 }
 
 impl InspectCapabilities {
@@ -5342,7 +5345,7 @@ impl InspectCapabilities {
                 "logging" => capabilities.logging.is_some(),
                 _ => false,
             },
-            Self::Final(capabilities) => capabilities.get(member).is_some(),
+            Self::Final(capabilities) => capabilities.contains_key(member),
         }
     }
 
@@ -5355,11 +5358,11 @@ impl InspectCapabilities {
                 "inspect could not serialize final {source} capabilities: {error}"
             ))
         })?;
-        if !capabilities.is_object() {
+        let serde_json::Value::Object(capabilities) = capabilities else {
             return Err(fastmcp_core::McpError::internal_error(format!(
                 "inspect received non-object final {source} capabilities"
             )));
-        }
+        };
         Ok(Self::Final(capabilities))
     }
 
@@ -5374,7 +5377,11 @@ impl InspectCapabilities {
             ),
             Self::Final(capabilities) => {
                 let mut budget = JsonPreviewBudget::default();
-                let preview = bounded_json_preview_inner(capabilities, 0, &mut budget);
+                let preview = bounded_json_preview_inner(
+                    &serde_json::Value::Object(capabilities.clone()),
+                    0,
+                    &mut budget,
+                );
                 let rendered = serde_json::to_string(&preview)
                     .unwrap_or_else(|_| "<unrenderable final capabilities>".to_owned());
                 format!("Capabilities (final discovery): {rendered}")
@@ -5390,7 +5397,11 @@ impl InspectCapabilities {
                 "prompts": capabilities.prompts.is_some(),
                 "logging": capabilities.logging.is_some(),
             }),
-            Self::Final(capabilities) => bounded_json_preview_inner(capabilities, 0, budget),
+            Self::Final(capabilities) => bounded_json_preview_inner(
+                &serde_json::Value::Object(capabilities.clone()),
+                0,
+                budget,
+            ),
         }
     }
 }

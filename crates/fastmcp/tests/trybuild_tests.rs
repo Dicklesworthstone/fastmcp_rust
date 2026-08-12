@@ -334,42 +334,59 @@ pub fn probe() {
     DownstreamFeatureSymbolProbe {
         name: "websocket-experimental-present",
         features: &["websocket-experimental"],
-        source: r"
+        source: r#"
 use mcp::{
     AsyncWsClientTransport,
     AsyncWsServerTransport,
-    ClientTransportRecvHalf,
-    TransportSendHalf,
-    WebSocketClient,
-    WebSocketClientTransport,
+    Cx,
+    McpError,
+    McpResult,
     client::websocket_experimental,
     prelude,
     server,
     transport,
 };
 
-pub fn probe<R, S>()
-where
-    R: ClientTransportRecvHalf,
-    S: TransportSendHalf,
-{
-    let _: Option<AsyncWsClientTransport<R>> = None;
+async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
+    let transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9000/mcp")
+        .await
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
+    let client = mcp::ClientBuilder::new()
+        .connect_websocket_with_cx(cx, transport)
+        .await?;
+    let _ = client.session();
+
+    let modern_transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9001/mcp")
+        .await
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
+    let modern_client = mcp::modern::ClientBuilder::new()
+        .connect_websocket_with_cx(cx, modern_transport)
+        .await?;
+    let _ = modern_client.session();
+
+    let listener = mcp::modern::server_builder("modern-ws", "1.0")
+        .build()
+        .bind_websocket(cx, "127.0.0.1:0")
+        .await?;
+    let _ = listener.local_addr()?;
+    Ok(())
+}
+
+pub fn probe<IO>() {
+    let _: Option<AsyncWsClientTransport<IO>> = None;
     let _: Option<AsyncWsServerTransport<()>> = None;
-    let _: Option<websocket_experimental::AsyncWsClientTransport<R>> = None;
+    let _: Option<websocket_experimental::AsyncWsClientTransport<IO>> = None;
     let _: Option<server::AsyncWsServerTransport<()>> = None;
-    let _: Option<transport::websocket::AsyncWsClientTransport<R>> = None;
+    let _: Option<transport::websocket::AsyncWsClientTransport<IO>> = None;
     let _: Option<transport::websocket::AsyncWsServerTransport<()>> = None;
     let _: Option<transport::websocket::WebSocketListener> = None;
     let _: Option<transport::websocket::WebSocketUpgradeAdmission> = None;
-    let _: Option<prelude::AsyncWsClientTransport<R>> = None;
+    let _: Option<prelude::AsyncWsClientTransport<IO>> = None;
     let _: Option<prelude::AsyncWsServerTransport<()>> = None;
-    let _: Option<WebSocketClient<R, S>> = None;
-    let _: Option<WebSocketClientTransport<R, S>> = None;
-    let _ = mcp::ClientBuilder::connect_websocket::<R, S>;
-    let _ = mcp::modern::ClientBuilder::connect_websocket::<R, S>;
     let _ = mcp::modern::Server::bind_websocket;
+    let _ = composes_actual_async_websocket_client;
 }
-",
+"#,
         should_compile: true,
         absent_feature_diagnostic: None,
     },
@@ -385,6 +402,32 @@ pub fn probe<IO>() {
 ",
         should_compile: false,
         absent_feature_diagnostic: Some("AsyncWsClientTransport"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-root-old-sync-client-escape",
+        features: &["websocket-experimental"],
+        source: r"
+use mcp::WebSocketClientTransport;
+
+pub fn probe() {
+    let _: Option<WebSocketClientTransport<(), ()>> = None;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("WebSocketClientTransport"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-root-raw-sync-client-escape",
+        features: &["websocket-experimental"],
+        source: r"
+use mcp::SynchronousWebSocketClient;
+
+pub fn probe() {
+    let _: Option<SynchronousWebSocketClient<(), ()>> = None;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("SynchronousWebSocketClient"),
     },
     DownstreamFeatureSymbolProbe {
         name: "final-input-responses-present",
@@ -436,6 +479,58 @@ pub fn probe<IO>() {
 ",
         should_compile: false,
         absent_feature_diagnostic: Some("AsyncWsClientTransport"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-root-old-sync-builder-escape",
+        features: &["websocket-experimental"],
+        source: r"
+use mcp::ClientBuilder;
+
+pub fn probe() {
+    let _ = ClientBuilder::connect_websocket;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_websocket"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-modern-old-sync-builder-escape",
+        features: &["websocket-experimental"],
+        source: r"
+use mcp::modern::ClientBuilder;
+
+pub fn probe() {
+    let _ = ClientBuilder::connect_websocket;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_websocket"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-sync-legacy-client-builder-escape",
+        features: &["websocket-experimental", "legacy-2024-11-05"],
+        source: r"
+use mcp::legacy_2024::ClientBuilder;
+
+pub fn probe() {
+    let _ = ClientBuilder::connect_websocket;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_websocket"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-sync-auto-client-builder-escape",
+        features: &["websocket-experimental", "legacy-2024-11-05"],
+        source: r"
+use mcp::auto::ClientBuilder;
+
+pub fn probe() {
+    let _ = ClientBuilder::connect_websocket;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_websocket"),
     },
     DownstreamFeatureSymbolProbe {
         name: "websocket-experimental-legacy-era-escape",
@@ -622,10 +717,19 @@ fn compile_fail_tests() {
         }
         #[cfg(not(feature = "tasks"))]
         tests.compile_fail("tests/trybuild/tasks_disabled/tool_tasks_feature_disabled.rs");
-        #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
-        tests.compile_fail("tests/trybuild/websocket/*.rs");
         #[cfg(feature = "websocket-experimental")]
-        tests.pass("tests/trybuild_pass/websocket_experimental_consumer.rs");
+        {
+            // These must remain valid in ModernOnly, without the exact-2024
+            // adapter selected by a dependency or this crate's defaults.
+            tests.compile_fail("tests/trybuild/websocket/client_namespace_escape.rs");
+            tests.compile_fail("tests/trybuild/websocket/modern_wrapper_escape.rs");
+            tests.pass("tests/trybuild_pass/websocket_experimental_consumer.rs");
+        }
+        #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+        {
+            tests.compile_fail("tests/trybuild/websocket/auto_wrapper_escape.rs");
+            tests.compile_fail("tests/trybuild/websocket/legacy_wrapper_escape.rs");
+        }
         #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
         tests.pass("tests/trybuild_pass/facade_dual_era_consumer.rs");
         return;
