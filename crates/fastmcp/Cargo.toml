@@ -14,7 +14,9 @@ categories = ["network-programming", "api-bindings", "development-tools"]
 exclude = ["tests/fnd_01_dependency_evidence.rs.*"]
 
 [features]
-default = ["legacy-2024-11-05"]
+# Official 2026 Tasks are available from the default facade graph.  The
+# exact-2024 adapter remains a separate, Tasks-blind protocol surface.
+default = ["legacy-2024-11-05", "tasks"]
 
 # Canonical nonsecurity facade graph (plan 25.10).  The facade owns these
 # forwarding equations; component crates own the implementation behind them.
@@ -72,7 +74,10 @@ fastmcp-core.workspace = true
 fastmcp-protocol.workspace = true
 fastmcp-transport.workspace = true
 fastmcp-server = { workspace = true, default-features = false }
-fastmcp-client.workspace = true
+# Keep the facade's ModernOnly graph free of the component's default
+# exact-2024 adapter. The explicit facade forwarding feature above is the
+# sole owner of that legacy selection.
+fastmcp-client = { workspace = true, default-features = false }
 fastmcp-derive.workspace = true
 # Console rendering is activated only by a facade profile that forwards to it.
 # Keeping the dependency optional preserves the core ModernOnly graph when

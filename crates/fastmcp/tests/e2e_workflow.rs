@@ -937,7 +937,7 @@ impl Drop for FinalTasksHttpStartupGuard {
 }
 
 impl FinalTasksHttpFixture {
-    fn spawn(server: Server, runner: AuthorizedTaskServiceRunner) -> Self {
+    fn spawn(server: auto::Server, runner: AuthorizedTaskServiceRunner) -> Self {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
         let (finished_tx, finished_rx) = mpsc::sync_channel(1);
@@ -1420,10 +1420,10 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         )
         .expect("application-owned final Task service installs");
 
-    let server = Server::new("final-tasks-e2e", "1.0.0")
+    let server = auto::server_builder("final-tasks-e2e", "1.0.0")
         .tool(PublicFinalTaskTool)
         .final_tasks(runtime.clone())
-        .expect("official final Tasks extension installs")
+        .expect("official final Tasks extension installs through the public facade")
         .build();
     let fixture = FinalTasksHttpFixture::spawn(server, runner);
     let cx = Cx::for_request();

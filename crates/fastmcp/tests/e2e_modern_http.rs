@@ -15,6 +15,7 @@
 //! MCP 2026-07-28 conformance claim.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -22,12 +23,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_rust::{
-    CanonicalHttpUrl, ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, Content,
-    Cx, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
-    JsonRpcRequest, McpContext, McpError, McpResult, Middleware, MiddlewareDecision,
-    ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler, PromptMessage, ProtocolEra,
-    ProtocolPolicy, ResourceHandler, Role, SseLimits, ToolHandler, auto, core, legacy_2024, modern,
-    prompt, resource, tool,
+    AuthContext, CanonicalHttpUrl, ClientHttpConnectionError, ClientHttpResponse,
+    ClientProtocolPlan, Content, Cx, HttpNonquiescentShutdown, HttpServerShutdown,
+    HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpResult,
+    Middleware, MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream,
+    PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy, ResourceHandler, Role, SseLimits,
+    StaticTokenVerifier, TokenAuthProvider, ToolHandler, auto, core, legacy_2024, modern, prompt,
+    resource, tool,
 };
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
@@ -416,6 +418,106 @@ impl HttpServerFixture {
     fn shutdown(mut self) {
         self.settle()
             .unwrap_or_else(|error| panic!("public HTTP server teardown failed: {error}"));
+    }
+}
+
+/// Starts the public ModernOnly facade with native bearer admission enabled.
+///
+/// This fixture intentionally uses the facade builder instead of the lower
+/// server crate so the test covers the public modern API's HTTP delegation.
+fn spawn_authenticated_modern_facade_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("authenticated HTTP server control receiver went away".to_owned());
+            }
+            let verifier = StaticTokenVerifier::new([(
+                "alpha",
+                AuthContext::with_subject("e2e-native-http-principal"),
+            )])
+            .expect("the deterministic native bearer verifier is valid")
+            .with_allowed_schemes(["Bearer"])
+            .expect("the bearer scheme allowlist is valid");
+            let server = modern::ServerBuilder::new("facade-native-http-auth", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(verifier))
+                .tool(CountingPublicHttpValue {
+                    counters: tool_calls,
+                })
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("authenticated facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("authenticated facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("authenticated HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("authenticated facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("authenticated facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("authenticated facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("authenticated facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
     }
 }
 
@@ -1241,6 +1343,254 @@ fn e2e_public_http_typed_facades_invoke_real_handlers_in_each_exact_era() {
     let legacy = invoke_legacy_public_handlers(&cx, legacy_server.address());
     assert_public_handler_observables(&legacy);
     legacy_server.shutdown();
+}
+
+#[test]
+fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool() {
+    const MAX_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+
+    fn exchange(
+        address: SocketAddr,
+        protocol_version: &str,
+        method: &str,
+        tool_name: Option<&str>,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+            .expect("native HTTP client connects to the public facade listener");
+        stream
+            .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client read deadline is configured");
+        stream
+            .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client write deadline is configured");
+        let tool_name_header =
+            tool_name.map_or_else(String::new, |name| format!("Mcp-Name: {name}\r\n"));
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer alpha\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {protocol_version}\r\nMcp-Method: {method}\r\n{tool_name_header}Content-Length: {}\r\n\r\n",
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(body))
+            .expect("native HTTP request commits to the public facade listener");
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("native HTTP response reads within its configured deadline");
+            if read == 0 {
+                break;
+            }
+            assert!(
+                response
+                    .len()
+                    .checked_add(read)
+                    .is_some_and(|size| size <= MAX_NATIVE_HTTP_RESPONSE_BYTES),
+                "native HTTP response exceeds the test's bounded response budget"
+            );
+            response.extend_from_slice(&buffer[..read]);
+        }
+        response
+    }
+
+    fn chunked_response_body(body: &[u8]) -> Vec<u8> {
+        let mut cursor = 0;
+        let mut decoded = Vec::new();
+        loop {
+            let size_end = body[cursor..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .map(|offset| cursor + offset)
+                .expect("chunked response contains a complete chunk-size line");
+            let size_line = std::str::from_utf8(&body[cursor..size_end])
+                .expect("chunked response chunk size is ASCII");
+            let size = usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+                .expect("chunked response chunk size is hexadecimal");
+            cursor = size_end + 2;
+            if size == 0 {
+                loop {
+                    let trailer_end = body[cursor..]
+                        .windows(2)
+                        .position(|window| window == b"\r\n")
+                        .map(|offset| cursor + offset)
+                        .expect("chunked response contains a complete trailer line");
+                    let trailer = &body[cursor..trailer_end];
+                    cursor = trailer_end + 2;
+                    if trailer.is_empty() {
+                        assert_eq!(
+                            cursor,
+                            body.len(),
+                            "chunked response has no bytes after its terminal trailer"
+                        );
+                        return decoded;
+                    }
+                    assert!(
+                        trailer.contains(&b':'),
+                        "chunked response trailer has an HTTP field delimiter"
+                    );
+                }
+            }
+            let chunk_end = cursor
+                .checked_add(size)
+                .expect("chunked response chunk length does not overflow");
+            assert!(
+                chunk_end.checked_add(2).is_some_and(|terminator_end| {
+                    terminator_end <= body.len() && &body[chunk_end..terminator_end] == b"\r\n"
+                }),
+                "chunked response contains a complete chunk body and terminator"
+            );
+            decoded.extend_from_slice(&body[cursor..chunk_end]);
+            cursor = chunk_end + 2;
+        }
+    }
+
+    fn response_body(response: &[u8]) -> Vec<u8> {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("native HTTP response contains a complete header terminator");
+        let headers = std::str::from_utf8(&response[..header_end])
+            .expect("native HTTP response headers are ASCII");
+        let mut content_length = None;
+        let mut chunked = false;
+        for header in headers.lines().skip(1) {
+            let (name, value) = header
+                .split_once(':')
+                .expect("native HTTP response header has a field delimiter");
+            if name.eq_ignore_ascii_case("content-length") {
+                assert!(
+                    content_length.is_none(),
+                    "native HTTP response has one Content-Length field"
+                );
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("native HTTP Content-Length is a valid byte count"),
+                );
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked = true;
+            }
+        }
+        let body = &response[header_end + 4..];
+        if chunked {
+            assert!(
+                content_length.is_none(),
+                "chunked native HTTP response does not also carry Content-Length"
+            );
+            return chunked_response_body(body);
+        }
+        let content_length =
+            content_length.expect("native HTTP response uses Content-Length or chunked framing");
+        assert_eq!(
+            body.len(),
+            content_length,
+            "native HTTP response body is complete according to Content-Length"
+        );
+        body.to_vec()
+    }
+
+    let server = spawn_authenticated_modern_facade_http_server();
+    let discovery = JsonRpcRequest::new(
+        "server/discover",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        1_i64,
+    );
+    let discovery_body =
+        serde_json::to_vec(&discovery).expect("exact-modern discovery request serializes");
+    let discovery_response = exchange(
+        server.address(),
+        modern::PROTOCOL_VERSION,
+        "server/discover",
+        None,
+        &discovery_body,
+    );
+    assert!(
+        discovery_response.starts_with(b"HTTP/1.1 200"),
+        "authenticated exact-modern discovery must succeed: {}",
+        String::from_utf8_lossy(&discovery_response)
+    );
+    let discovery_body = response_body(&discovery_response);
+    let discovery: serde_json::Value = serde_json::from_slice(&discovery_body)
+        .expect("authenticated discovery response is JSON-RPC");
+    assert_eq!(discovery["id"], json!(1));
+    assert!(
+        discovery.get("error").is_none(),
+        "authenticated discovery must negotiate the modern era: {discovery}"
+    );
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_TOOL_NAME,
+            "arguments": {"value": PUBLIC_HTTP_TOOL_ARGUMENT},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("exact-modern tool request serializes");
+    let tool_response = exchange(
+        server.address(),
+        modern::PROTOCOL_VERSION,
+        "tools/call",
+        Some(PUBLIC_HTTP_TOOL_NAME),
+        &tool_body,
+    );
+    assert!(
+        tool_response.starts_with(b"HTTP/1.1 200"),
+        "authenticated exact-modern tool call must succeed: {}",
+        String::from_utf8_lossy(&tool_response)
+    );
+    let tool_response_body = response_body(&tool_response);
+    let tool: serde_json::Value = serde_json::from_slice(&tool_response_body)
+        .expect("authenticated tool response is JSON-RPC");
+    assert_eq!(tool["id"], json!(2));
+    assert!(
+        tool.get("error").is_none(),
+        "authenticated exact-modern tool call must reach the handler: {tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the authenticated exact-modern tool call invokes the facade handler once"
+    );
+
+    // RH-5 near-negative: retain the valid bearer and exact JSON-RPC body,
+    // changing only the native MCP-Protocol-Version header to an unsupported
+    // date. Strict admission must reject before the handler can run again.
+    let rejection = exchange(
+        server.address(),
+        "2025-11-25",
+        "tools/call",
+        Some(PUBLIC_HTTP_TOOL_NAME),
+        &tool_body,
+    );
+    assert!(
+        rejection.starts_with(b"HTTP/1.1 400"),
+        "the one-variable unsupported-era request must fail before dispatch: {}",
+        String::from_utf8_lossy(&rejection)
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "changing only MCP-Protocol-Version must not invoke the authenticated handler"
+    );
+    server.shutdown();
 }
 
 #[test]

@@ -13,6 +13,7 @@ keywords = ["mcp", "client", "json-rpc", "async", "protocol"]
 categories = ["network-programming"]
 
 [features]
+default = ["legacy-2024-11-05"]
 legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05", "fastmcp-transport/legacy-2024-11-05"]
 tasks = ["fastmcp-protocol/tasks"]
 apps = ["fastmcp-protocol/apps", "dep:html5ever"]

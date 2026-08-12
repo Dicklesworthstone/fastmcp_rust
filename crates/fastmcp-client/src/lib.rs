@@ -15759,6 +15759,44 @@ mod tests {
         });
     }
 
+    #[cfg(all(not(feature = "legacy-2024-11-05"), feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_async_feature_off_auto_rejects_before_factory_contact() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls_for_factory = Arc::clone(&factory_calls);
+
+            let error =
+                WebSocketClient::<asupersync::net::tcp::VirtualTcpStream>::connect_auto_with_cx(
+                    &cx,
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    move |_| {
+                        factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            Err::<
+                                AsyncWsClientTransport<asupersync::net::tcp::VirtualTcpStream>,
+                                McpError,
+                            >(McpError::internal_error(
+                                "feature-off Auto factory must not run",
+                            ))
+                        }
+                    },
+                )
+                .await
+                .expect_err("feature-off Auto must reject before opening a WebSocket transport");
+
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert!(
+                error
+                    .message
+                    .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out")
+            );
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     #[test]
     fn websocket_async_auto_wrong_error_never_attempts_a_fresh_legacy_transport() {

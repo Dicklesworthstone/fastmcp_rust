@@ -276,12 +276,13 @@ pub mod server {
         BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, DuplicateBehavior,
         ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
-        FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
-        FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
-        HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, LifespanHooks,
-        LoggingConfig, Middleware, MiddlewareDecision, MountResult, NotificationSender,
-        PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
-        Router, ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
+        FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
+        FinalResourceReadCacheHintProvenance, FinalToolOutcome, FinalToolSchemaAuthority,
+        HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement,
+        InboundRequestContext, InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware,
+        MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+        ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
+        ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
         ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
         ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier,
         StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler,
@@ -650,17 +651,18 @@ pub use fastmcp_transport::{event_store, http, memory};
 // FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
-    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig,
-    FinalResourceReadCacheHintProvenance, FinalToolOutcome, FinalToolSchemaAuthority,
-    HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement,
-    InboundRequestContext, InboundRequestTransport, Middleware, MiddlewareDecision, MountResult,
-    NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender,
-    ResourceHandler, Router, ServerHttpEndpoint, ServerHttpEndpointError,
-    ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
-    ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier, StatsSnapshot, TagFilters,
-    TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
+    FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
+    FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
+    HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, Middleware,
+    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+    ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
+    ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
+    ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
+    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
+    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+    TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_server::{
@@ -1840,12 +1842,13 @@ pub mod modern {
         AuthProvider, AuthRequest, BannerStyle, BoxFuture, CompletionHandler, ConsoleConfig,
         DuplicateBehavior, ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
-        FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
-        FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerShutdown,
-        HttpShutdownSettlement, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
-        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler,
-        ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
-        ToolHandler, TrafficVerbosity, create_context_with_progress,
+        FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
+        FinalResourceReadCacheHintProvenance, FinalToolOutcome, FinalToolSchemaAuthority,
+        HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, LifespanHooks,
+        LoggingConfig, Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender,
+        PromptHandler, ResourceHandler, ServerExtensionConfigurationError, ShutdownHook,
+        StartupHook, TagFilters, ToolErrorKind, ToolHandler, TrafficVerbosity,
+        create_context_with_progress,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
@@ -5460,17 +5463,15 @@ mod tests {
 
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     use asupersync::io::AsyncWriteExt;
-    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[cfg(feature = "websocket-experimental")]
     use asupersync::test_utils::run_test;
-    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
-    use std::{
-        collections::VecDeque,
-        net::SocketAddr,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+    #[cfg(feature = "websocket-experimental")]
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    use std::{collections::VecDeque, net::SocketAddr};
 
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     fn facade_async_websocket_pair() -> (
@@ -5739,6 +5740,57 @@ mod tests {
 
             assert_eq!(error.code, super::McpErrorCode::InvalidRequest);
             assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[cfg(all(not(feature = "legacy-2024-11-05"), feature = "websocket-experimental"))]
+    #[test]
+    fn facade_no_default_client_is_modern_only_and_legacy_plans_do_not_contact_websocket_factory() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            assert_eq!(
+                super::ClientBuilder::new()
+                    .selected_protocol_plan()
+                    .policy(),
+                super::ProtocolPolicy::ModernOnly
+            );
+
+            for policy in [
+                super::ProtocolPolicy::Auto,
+                super::ProtocolPolicy::LegacyOnly,
+            ] {
+                let factory_calls = Arc::new(AtomicUsize::new(0));
+                let factory_calls_for_factory = Arc::clone(&factory_calls);
+                let error = super::ClientBuilder::new()
+                    .protocol_plan(super::ClientProtocolPlan::websocket(policy))
+                    .connect_websocket_auto_with_cx::<asupersync::net::tcp::VirtualTcpStream, _, _>(
+                        &cx,
+                        move |_| {
+                            factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                            async {
+                                Err::<
+                                    super::AsyncWsClientTransport<
+                                        asupersync::net::tcp::VirtualTcpStream,
+                                    >,
+                                    super::McpError,
+                                >(super::McpError::internal_error(
+                                    "feature-off WebSocket factory must not run",
+                                ))
+                            }
+                        },
+                    )
+                    .await
+                    .expect_err("feature-off Auto and legacy plans must reject before contact");
+
+                assert_eq!(error.code, super::McpErrorCode::InvalidParams);
+                assert!(
+                    error
+                        .message
+                        .contains("FeatureUnavailable: legacy-2024-11-05 is compiled out"),
+                    "{policy:?} must fail at feature admission"
+                );
+                assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+            }
         });
     }
 
