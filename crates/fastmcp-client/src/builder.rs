@@ -25,6 +25,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
@@ -32,7 +33,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use asupersync::Cx;
+use asupersync::{
+    Cx,
+    io::{AsyncRead, AsyncWrite},
+};
 use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::extensions::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
@@ -41,6 +45,7 @@ use fastmcp_protocol::extensions::{
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
+use fastmcp_transport::websocket::AsyncWsClientTransport;
 
 #[cfg(all(test, unix, feature = "legacy-2024-11-05"))]
 use crate::ReverseRequestCancellation;
@@ -52,7 +57,6 @@ use crate::{
     WebSocketClient, combine_operation_and_cleanup, combine_operation_with_cleanup,
     is_cleanup_unverified, resolve_stdio_command, validate_protocol_plan_feature,
 };
-use fastmcp_transport::{ClientTransportRecvHalf, TransportSendHalf};
 
 #[cfg(feature = "legacy-2024-11-05")]
 const DEFAULT_PROTOCOL_POLICY: ProtocolPolicy = ProtocolPolicy::Auto;
@@ -713,50 +717,67 @@ impl ClientBuilder {
         Err(last_error.unwrap_or_else(|| McpError::internal_error("Connection failed")))
     }
 
-    /// Negotiates one already-upgraded, split WebSocket connection.
+    /// Negotiates one native caller-context async WebSocket connection.
     ///
-    /// The WebSocket Upgrade itself remains the embedding application's
-    /// transport-security boundary. Once it supplies source-preserving client
-    /// halves, this method owns both halves and one cloned capability context
-    /// for discovery/initialize, multiplexing, cancellation, and shutdown.
-    pub fn connect_websocket_with_cx<R, S>(
+    /// The caller establishes the real `ws://` or `wss://` transport with
+    /// [`AsyncWsClientTransport`] and passes its owned value here. This method
+    /// never blocks, creates a runtime, or accepts synthetic transport halves.
+    pub async fn connect_websocket_with_cx<IO>(
         self,
         cx: &Cx,
-        receiver: R,
-        sender: S,
-    ) -> McpResult<WebSocketClient<R, S>>
+        transport: AsyncWsClientTransport<IO>,
+    ) -> McpResult<WebSocketClient<IO>>
     where
-        R: ClientTransportRecvHalf,
-        S: TransportSendHalf,
+        IO: AsyncRead + AsyncWrite + Unpin,
     {
         self.validate_feature_configuration()?;
         self.validate_websocket_configuration()?;
-        WebSocketClient::connect_with_cx(
-            cx.clone(),
+        WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+            cx,
             self.protocol_plan,
             self.client_info,
             self.capabilities,
-            receiver,
-            sender,
+            self.reverse_request_handlers,
+            transport,
         )
+        .await
     }
 
-    /// Negotiates one already-upgraded WebSocket using the current `Cx`.
-    pub fn connect_websocket<R, S>(self, receiver: R, sender: S) -> McpResult<WebSocketClient<R, S>>
+    /// Negotiates Auto with a caller-owned factory that creates a fresh
+    /// upgraded transport for the sole permitted exact-legacy retry.
+    pub async fn connect_websocket_auto_with_cx<IO, F, Fut>(
+        self,
+        cx: &Cx,
+        fresh_transport: F,
+    ) -> McpResult<WebSocketClient<IO>>
     where
-        R: ClientTransportRecvHalf,
-        S: TransportSendHalf,
+        IO: AsyncRead + AsyncWrite + Unpin,
+        F: FnMut(&Cx) -> Fut,
+        Fut: Future<Output = McpResult<AsyncWsClientTransport<IO>>>,
     {
-        block_on(async {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.connect_websocket_with_cx(&cx, receiver, sender)
-        })
+        self.validate_feature_configuration()?;
+        self.validate_websocket_configuration()?;
+        if !matches!(self.protocol_plan.policy(), ProtocolPolicy::Auto) {
+            return Err(McpError::invalid_params(
+                "connect_websocket_auto_with_cx requires the Auto protocol policy",
+            ));
+        }
+        WebSocketClient::connect_auto_with_reverse_request_handlers_with_cx(
+            cx,
+            self.client_info,
+            self.capabilities,
+            self.reverse_request_handlers,
+            fresh_transport,
+        )
+        .await
     }
 
     fn validate_websocket_configuration(&self) -> McpResult<()> {
-        if !self.reverse_request_handlers.is_empty() {
+        if matches!(self.protocol_plan.policy(), ProtocolPolicy::ModernOnly)
+            && !self.reverse_request_handlers.is_empty()
+        {
             return Err(McpError::invalid_params(
-                "WebSocket reverse handlers are application-driven; use WebSocketClient::take_reverse_requests and respond_to_reverse_request",
+                "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
             ));
         }
         if self.mcp_apps_settings.is_some() || self.client_extension_runtime.is_some() {

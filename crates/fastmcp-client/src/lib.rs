@@ -101,6 +101,7 @@ pub use fastmcp_core::CanonicalHttpUrl;
 pub use fastmcp_protocol::common_types::LoggingLevel;
 #[cfg(feature = "apps")]
 pub use fastmcp_protocol::extensions::McpAppsClientSettings;
+pub use fastmcp_transport::websocket::AsyncWsClientTransport;
 // The public re-export is feature-gated, while the client keeps this type
 // internally to reject configuration that names Apps when that feature is
 // absent. Keep the private name available in feature-off builds.
@@ -135,10 +136,10 @@ pub use http_executor::{
 pub use http_executor::{
     LegacyHttpRequest, LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError,
 };
-/// Experimental caller-upgraded async WebSocket composition.
+/// Compatibility module for the caller-upgraded async WebSocket transport.
 ///
-/// This module is deliberately available only from `fastmcp-client` with its
-/// `websocket-experimental` feature. The facade remains diagnostics-only.
+/// New code can import [`AsyncWsClientTransport`] directly from this crate.
+/// The facade remains diagnostics-only.
 #[cfg(feature = "websocket-experimental")]
 pub mod websocket_experimental {
     pub use fastmcp_transport::websocket::AsyncWsClientTransport;
@@ -185,7 +186,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use asupersync::{Cx, channel::oneshot};
+use asupersync::{
+    Cx,
+    channel::oneshot,
+    io::{AsyncRead, AsyncWrite},
+};
 use execution::{MrtrDriver, MrtrDriverLimits, RequestExecution, RequestExecutor};
 use fastmcp_core::{
     McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, block_on,
@@ -202,7 +207,7 @@ use fastmcp_protocol::extensions::{
     register_official_tasks_extension,
 };
 use fastmcp_protocol::methods::{
-    Final2026Peer, NOTIFICATIONS_ROOTS_LIST_CHANGED, final_2026_07_28_method,
+    Final2026EnvelopeKind, Final2026Peer, NOTIFICATIONS_ROOTS_LIST_CHANGED, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 #[cfg(feature = "tasks")]
@@ -372,6 +377,7 @@ impl ReverseRequestHandlers {
         Ok(())
     }
 }
+use fastmcp_transport::websocket::{AsyncWsClientRecvHalf, AsyncWsClientSendHalf};
 use fastmcp_transport::{
     ClientTransportRecvHalf, ReceivedTransportFrame, StdioRecvHalf, StdioSendHalf, StdioTransport,
     Transport, TransportError, TransportRecvHalf, TransportSendHalf,
@@ -3325,7 +3331,7 @@ pub(crate) fn validate_protocol_plan_feature(protocol_plan: &ClientProtocolPlan)
     Ok(())
 }
 
-/// Source-preserving split transport owned by [`WebSocketClient`].
+/// Legacy synchronous split transport retained only for internal regression tests.
 ///
 /// This adapter is deliberately generic over the transport crate's client
 /// halves. A WebSocket upgrader supplies those halves after it has completed
@@ -3333,12 +3339,14 @@ pub(crate) fn validate_protocol_plan_feature(protocol_plan: &ClientProtocolPlan)
 /// the negotiated MCP connection. In particular, the receive half supplies
 /// [`ReceivedTransportFrame`] values, so a successful result can retain the
 /// peer's exact JSON `result` bytes rather than a reserialized approximation.
-pub struct WebSocketClientTransport<R, S> {
+#[cfg(test)]
+struct SynchronousWebSocketClientTransport<R, S> {
     receiver: R,
     sender: S,
 }
 
-impl<R, S> WebSocketClientTransport<R, S> {
+#[cfg(test)]
+impl<R, S> SynchronousWebSocketClientTransport<R, S> {
     /// Joins independently-owned WebSocket ingress and egress halves.
     #[must_use]
     pub fn from_split(receiver: R, sender: S) -> Self {
@@ -3352,7 +3360,8 @@ impl<R, S> WebSocketClientTransport<R, S> {
     }
 }
 
-impl<R, S> Transport for WebSocketClientTransport<R, S>
+#[cfg(test)]
+impl<R, S> Transport for SynchronousWebSocketClientTransport<R, S>
 where
     R: ClientTransportRecvHalf,
     S: TransportSendHalf,
@@ -3371,8 +3380,9 @@ where
     }
 }
 
+#[cfg(test)]
 fn receive_websocket_frame<R, S>(
-    transport: &mut WebSocketClientTransport<R, S>,
+    transport: &mut SynchronousWebSocketClientTransport<R, S>,
     cx: &Cx,
 ) -> Result<ReceivedTransportFrame, TransportError>
 where
@@ -3387,10 +3397,9 @@ where
 /// Construct this with [`ClientBuilder::connect_websocket_with_cx`] after an
 /// application has completed the WebSocket Upgrade and split the transport.
 /// The builder's immutable `Auto`, exact-2024, or final-2026 policy is
-/// admitted before the first frame is sent. `Auto` sends final discovery and
-/// may send exact-2024 initialization only after that same request receives a
-/// correlated `MethodNotFound` reply; all other discovery failures are
-/// terminal.
+/// admitted before the first frame is sent. `Auto` sends final discovery once;
+/// a correlated `MethodNotFound` reply is terminal and never replays exact
+/// initialization on that connection.
 ///
 /// Requests are multiplexed by [`RequestExecutor`]. Callers may issue many
 /// [`Self::execute`] calls before waiting; a wait routes out-of-order results,
@@ -3399,32 +3408,35 @@ where
 /// capability-bearing [`ReverseRequest`] values so the embedding application
 /// can choose its response policy and cannot answer a cancelled or stale
 /// request.
-pub struct WebSocketClient<R, S>
+#[cfg(test)]
+struct SynchronousWebSocketClient<R, S>
 where
     R: ClientTransportRecvHalf,
     S: TransportSendHalf,
 {
     cx: Cx,
     session: ClientSession,
-    executor: RequestExecutor<WebSocketClientTransport<R, S>>,
+    executor: RequestExecutor<SynchronousWebSocketClientTransport<R, S>>,
     next_id: AtomicU64,
 }
 
-impl<R, S> std::fmt::Debug for WebSocketClient<R, S>
+#[cfg(test)]
+impl<R, S> std::fmt::Debug for SynchronousWebSocketClient<R, S>
 where
     R: ClientTransportRecvHalf,
     S: TransportSendHalf,
 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("WebSocketClient")
+            .debug_struct("SynchronousWebSocketClient")
             .field("selected_era", &self.session.selected_era())
             .field("protocol_plan", self.session.protocol_plan())
             .finish_non_exhaustive()
     }
 }
 
-impl<R, S> WebSocketClient<R, S>
+#[cfg(test)]
+impl<R, S> SynchronousWebSocketClient<R, S>
 where
     R: ClientTransportRecvHalf,
     S: TransportSendHalf,
@@ -3446,7 +3458,7 @@ where
         validate_protocol_plan_feature(&protocol_plan)?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
 
-        let mut transport = WebSocketClientTransport::from_split(receiver, sender);
+        let mut transport = SynchronousWebSocketClientTransport::from_split(receiver, sender);
         let initialization = (match protocol_plan.policy() {
             ProtocolPolicy::ModernOnly => {
                 websocket_discover(&mut transport, &cx, &client_info, &client_capabilities, 1)
@@ -3456,21 +3468,7 @@ where
                     .map(WebSocketInitialization::Legacy)
             }
             ProtocolPolicy::Auto => {
-                match websocket_discover(&mut transport, &cx, &client_info, &client_capabilities, 1)
-                {
-                    Ok(discovery) => Ok(discovery),
-                    Err(WebSocketHandshakeError::MethodNotFound) => websocket_initialize(
-                        &mut transport,
-                        &cx,
-                        &client_info,
-                        &client_capabilities,
-                        2,
-                    )
-                    .map(WebSocketInitialization::Legacy),
-                    Err(WebSocketHandshakeError::Mcp(error)) => {
-                        Err(WebSocketHandshakeError::Mcp(error))
-                    }
-                }
+                websocket_discover(&mut transport, &cx, &client_info, &client_capabilities, 1)
             }
         })
         .map_err(|error| match error {
@@ -3553,7 +3551,7 @@ where
         &self,
         method: impl Into<String>,
         params: Option<serde_json::Value>,
-    ) -> McpResult<RequestExecution<WebSocketClientTransport<R, S>>> {
+    ) -> McpResult<RequestExecution<SynchronousWebSocketClientTransport<R, S>>> {
         let id = self
             .next_id
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
@@ -3570,7 +3568,7 @@ where
     /// Waits for one request result while routing all peer traffic on this connection.
     pub fn wait(
         &self,
-        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+        execution: &mut RequestExecution<SynchronousWebSocketClientTransport<R, S>>,
     ) -> McpResult<JsonRpcResponse> {
         self.executor.wait(&self.cx, execution)
     }
@@ -3581,7 +3579,7 @@ where
     /// reconstructed from a decoded `serde_json::Value`.
     pub fn wait_with_raw_result(
         &self,
-        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+        execution: &mut RequestExecution<SynchronousWebSocketClientTransport<R, S>>,
     ) -> McpResult<(JsonRpcResponse, Option<String>)> {
         self.executor.wait_with_raw_result(&self.cx, execution)
     }
@@ -3589,7 +3587,7 @@ where
     /// Takes a response that was already routed by [`Self::drive`].
     pub fn try_take_response_with_raw_result(
         &self,
-        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+        execution: &mut RequestExecution<SynchronousWebSocketClientTransport<R, S>>,
     ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
         self.executor.try_take_response_with_raw_result(execution)
     }
@@ -3602,7 +3600,7 @@ where
     /// Cancels one locally-owned live execution over the selected wire era.
     pub fn cancel(
         &self,
-        execution: &mut RequestExecution<WebSocketClientTransport<R, S>>,
+        execution: &mut RequestExecution<SynchronousWebSocketClientTransport<R, S>>,
     ) -> McpResult<()> {
         self.executor.cancel(&self.cx, execution)
     }
@@ -3681,8 +3679,9 @@ enum WebSocketHandshakeError {
     Mcp(McpError),
 }
 
+#[cfg(test)]
 fn websocket_discover<R, S>(
-    transport: &mut WebSocketClientTransport<R, S>,
+    transport: &mut SynchronousWebSocketClientTransport<R, S>,
     cx: &Cx,
     client_info: &ClientInfo,
     client_capabilities: &ClientCapabilities,
@@ -3756,8 +3755,9 @@ where
     })
 }
 
+#[cfg(test)]
 fn websocket_initialize<R, S>(
-    transport: &mut WebSocketClientTransport<R, S>,
+    transport: &mut SynchronousWebSocketClientTransport<R, S>,
     cx: &Cx,
     client_info: &ClientInfo,
     client_capabilities: &ClientCapabilities,
@@ -3806,8 +3806,9 @@ struct WebSocketHandshakeResponse {
     raw_result: Option<String>,
 }
 
+#[cfg(test)]
 fn websocket_exchange<R, S>(
-    transport: &mut WebSocketClientTransport<R, S>,
+    transport: &mut SynchronousWebSocketClientTransport<R, S>,
     cx: &Cx,
     request: JsonRpcRequest,
 ) -> Result<WebSocketHandshakeResponse, WebSocketHandshakeError>
@@ -3830,7 +3831,11 @@ where
             "WebSocket handshake received a non-response frame",
         )));
     };
-    if response.id.as_ref() != Some(&request_id) {
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(&request_id))
+    {
         return Err(WebSocketHandshakeError::Mcp(McpError::invalid_request(
             "WebSocket handshake response ID does not match its request",
         )));
@@ -3848,6 +3853,1424 @@ where
         result: response.result,
         raw_result,
     })
+}
+
+/// One response received through the real async WebSocket client.
+///
+/// `raw_result` is populated only for successful JSON-RPC response envelopes.
+/// It is extracted from the same bounded transport frame as `response`; it is
+/// never reconstructed from the decoded `serde_json::Value`.
+#[derive(Debug, Clone)]
+pub struct WebSocketResponse {
+    /// The typed JSON-RPC response admitted from the peer.
+    pub response: JsonRpcResponse,
+    /// The exact peer-authored JSON source of the response `result` member.
+    pub raw_result: Option<String>,
+}
+
+/// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
+///
+/// The client owns one source-preserving receive half and one independently
+/// cancellable send/close half obtained from [`AsyncWsClientTransport`]. Its
+/// negotiated era is frozen before this value is returned. Exact legacy is
+/// selected only by `LegacyOnly`; `Auto` requires a fresh-transport factory,
+/// performs final discovery once, and never replays a legacy initialize
+/// request on the refused connection.
+pub struct WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    receiver: AsyncWsClientRecvHalf<IO>,
+    sender: AsyncWsClientSendHalf<IO>,
+    session: ClientSession,
+    reverse_request_handlers: ReverseRequestHandlers,
+    next_id: u64,
+    closed: bool,
+    close_settled: bool,
+}
+
+impl<IO> std::fmt::Debug for WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebSocketClient")
+            .field("selected_era", &self.session.selected_era())
+            .field("protocol_plan", self.session.protocol_plan())
+            .field("closed", &self.closed)
+            .field("close_settled", &self.close_settled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<IO> WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Negotiates a native, already-established async WebSocket transport.
+    pub async fn connect_with_cx(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        transport: AsyncWsClientTransport<IO>,
+    ) -> McpResult<Self> {
+        Self::connect_with_reverse_request_handlers_with_cx(
+            cx,
+            protocol_plan,
+            client_info,
+            client_capabilities,
+            ReverseRequestHandlers::new(),
+            transport,
+        )
+        .await
+    }
+
+    /// Negotiates one native WebSocket connection with exact-2024 reverse
+    /// handlers. Handler-derived capabilities are admitted only for an
+    /// explicitly selected exact legacy connection.
+    pub async fn connect_with_reverse_request_handlers_with_cx(
+        cx: &Cx,
+        protocol_plan: ClientProtocolPlan,
+        client_info: ClientInfo,
+        mut client_capabilities: ClientCapabilities,
+        reverse_request_handlers: ReverseRequestHandlers,
+        transport: AsyncWsClientTransport<IO>,
+    ) -> McpResult<Self> {
+        validate_protocol_plan_feature(&protocol_plan)?;
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        match protocol_plan.policy() {
+            ProtocolPolicy::LegacyOnly => {
+                reverse_request_handlers.derive_legacy_capabilities(&mut client_capabilities);
+                reverse_request_handlers.validate_legacy_capabilities(&client_capabilities)?;
+            }
+            ProtocolPolicy::ModernOnly if !reverse_request_handlers.is_empty() => {
+                return Err(McpError::invalid_params(
+                    "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
+                ));
+            }
+            ProtocolPolicy::ModernOnly => {}
+            ProtocolPolicy::Auto => {}
+        }
+        if matches!(protocol_plan.policy(), ProtocolPolicy::Auto) {
+            return Err(McpError::invalid_params(
+                "WebSocket Auto requires connect_auto_with_cx with a fresh transport factory",
+            ));
+        }
+
+        let (mut receiver, mut sender) = transport.into_split();
+        let initialization = match protocol_plan.policy() {
+            ProtocolPolicy::ModernOnly => {
+                match async_websocket_discover(
+                    &mut receiver,
+                    &mut sender,
+                    cx,
+                    &client_info,
+                    &client_capabilities,
+                    1,
+                )
+                .await
+                {
+                    Ok(initialization) => initialization,
+                    Err(WebSocketHandshakeError::MethodNotFound) => {
+                        let _ = close_async_websocket_halves(&mut receiver, &mut sender, cx).await;
+                        return Err(McpError::method_not_found(SERVER_DISCOVER_METHOD));
+                    }
+                    Err(WebSocketHandshakeError::Mcp(error)) => return Err(error),
+                }
+            }
+            ProtocolPolicy::LegacyOnly => async_websocket_initialize(
+                &mut receiver,
+                &mut sender,
+                cx,
+                &client_info,
+                &client_capabilities,
+                1,
+            )
+            .await
+            .map(WebSocketInitialization::Legacy)
+            .map_err(|error| match error {
+                WebSocketHandshakeError::MethodNotFound => {
+                    McpError::invalid_request("WebSocket initialize was not supported by the peer")
+                }
+                WebSocketHandshakeError::Mcp(error) => error,
+            })?,
+            ProtocolPolicy::Auto => unreachable!("Auto was rejected before transport ownership"),
+        };
+
+        if matches!(initialization, WebSocketInitialization::Legacy(_)) {
+            if let Err(error) = sender
+                .send(
+                    cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+                )
+                .await
+            {
+                let _ = close_async_websocket_halves(&mut receiver, &mut sender, cx).await;
+                return Err(transport_error_to_mcp(error));
+            }
+        }
+
+        let session = match initialization {
+            WebSocketInitialization::Legacy(result) => ClientSession::try_new(
+                client_info,
+                client_capabilities,
+                result.server_info,
+                result.capabilities,
+                result.protocol_version,
+            ),
+            WebSocketInitialization::Modern {
+                server_info,
+                discovery,
+            } => ClientSession::try_new(
+                client_info,
+                client_capabilities,
+                server_info,
+                ServerCapabilities::default(),
+                MODERN_PROTOCOL_VERSION.to_owned(),
+            )
+            .map(|session| session.with_server_discovery(discovery)),
+        }
+        .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
+        .try_with_protocol_plan(protocol_plan)
+        .map_err(|_| {
+            McpError::internal_error("Configured protocol policy rejects the negotiated era")
+        })?;
+
+        Ok(Self {
+            receiver,
+            sender,
+            session,
+            reverse_request_handlers,
+            next_id: 2,
+            closed: false,
+            close_settled: false,
+        })
+    }
+
+    /// Negotiates Auto over at most two fresh caller-owned transports.
+    ///
+    /// The factory is invoked once for final discovery and, only after its
+    /// correlated `MethodNotFound` refusal, once more for exact-2024
+    /// initialization. No request is replayed on the refused connection.
+    pub async fn connect_auto_with_cx<F, Fut>(
+        cx: &Cx,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        fresh_transport: F,
+    ) -> McpResult<Self>
+    where
+        F: FnMut(&Cx) -> Fut,
+        Fut: Future<Output = McpResult<AsyncWsClientTransport<IO>>>,
+    {
+        Self::connect_auto_with_reverse_request_handlers_with_cx(
+            cx,
+            client_info,
+            client_capabilities,
+            ReverseRequestHandlers::new(),
+            fresh_transport,
+        )
+        .await
+    }
+
+    /// Negotiates Auto over at most two fresh transports, retaining exact
+    /// reverse handlers solely for the authorized fresh legacy attempt.
+    pub async fn connect_auto_with_reverse_request_handlers_with_cx<F, Fut>(
+        cx: &Cx,
+        client_info: ClientInfo,
+        client_capabilities: ClientCapabilities,
+        reverse_request_handlers: ReverseRequestHandlers,
+        mut fresh_transport: F,
+    ) -> McpResult<Self>
+    where
+        F: FnMut(&Cx) -> Fut,
+        Fut: Future<Output = McpResult<AsyncWsClientTransport<IO>>>,
+    {
+        let auto_plan = ClientProtocolPlan::websocket(ProtocolPolicy::Auto);
+        validate_protocol_plan_feature(&auto_plan)?;
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let first = fresh_transport(cx).await?;
+        match Self::connect_with_reverse_request_handlers_with_cx(
+            cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            client_info.clone(),
+            client_capabilities.clone(),
+            ReverseRequestHandlers::new(),
+            first,
+        )
+        .await
+        {
+            Ok(mut client) => {
+                client.session = client
+                    .session
+                    .clone()
+                    .try_with_protocol_plan(auto_plan.clone())
+                    .map_err(|_| McpError::internal_error("Auto rejected final discovery"))?;
+                Ok(client)
+            }
+            Err(error) if error.code == McpErrorCode::MethodNotFound => {
+                cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                let fresh_legacy = fresh_transport(cx).await?;
+                let mut client = Self::connect_with_reverse_request_handlers_with_cx(
+                    cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                    client_info,
+                    client_capabilities,
+                    reverse_request_handlers,
+                    fresh_legacy,
+                )
+                .await?;
+                client.session = client
+                    .session
+                    .clone()
+                    .try_with_protocol_plan(auto_plan)
+                    .map_err(|_| {
+                        McpError::internal_error("Auto rejected exact legacy initialization")
+                    })?;
+                Ok(client)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns the immutable session established by the handshake.
+    #[must_use]
+    pub const fn session(&self) -> &ClientSession {
+        &self.session
+    }
+
+    /// Returns the era frozen by the completed handshake.
+    #[must_use]
+    pub const fn selected_protocol_era(&self) -> ProtocolEra {
+        self.session
+            .selected_era()
+            .expect("negotiated WebSocket clients always select an era")
+    }
+
+    /// Sends one admitted client request and retains the exact peer result source.
+    ///
+    /// The frozen negotiated era admits the method, direction, envelope, and
+    /// parameter shape before this method allocates an ID or writes a frame.
+    pub async fn request_with_raw_result(
+        &mut self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<WebSocketResponse> {
+        if cx.checkpoint().is_err() {
+            return Err(self.terminal_cancellation(cx).await);
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        let method = method.into();
+        self.admit_raw_client_request(&method, params.as_ref())?;
+        let id = self.allocate_request_id()?;
+        let request = JsonRpcRequest::new(method, params, id.clone());
+        self.request_admitted_with_raw_result(cx, request).await
+    }
+
+    async fn request_admitted_with_raw_result(
+        &mut self,
+        cx: &Cx,
+        request: JsonRpcRequest,
+    ) -> McpResult<WebSocketResponse> {
+        if cx.checkpoint().is_err() {
+            return Err(self.terminal_cancellation(cx).await);
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        let id = request.id.clone().ok_or_else(|| {
+            McpError::internal_error("WebSocket admitted request requires a JSON-RPC ID")
+        })?;
+        if let Err(error) = self
+            .sender
+            .send(cx, &JsonRpcMessage::Request(request))
+            .await
+        {
+            return Err(self.terminal_transport_error(cx, error).await);
+        }
+
+        loop {
+            let frame = match self.receiver.recv_with_source(cx).await {
+                Ok(frame) => frame,
+                Err(error) => return Err(self.terminal_transport_error(cx, error).await),
+            };
+            let JsonRpcMessage::Response(response) = frame.message() else {
+                let JsonRpcMessage::Request(request) = frame.message() else {
+                    return Err(self
+                        .close_after_protocol_error(
+                            cx,
+                            "WebSocket request received invalid ingress while no listener owns it",
+                        )
+                        .await);
+                };
+                if self.selected_protocol_era() != ProtocolEra::Legacy2024 {
+                    return Err(self
+                        .close_after_protocol_error(
+                            cx,
+                            "MCP 2026-07-28 WebSocket client rejected exact-2024 reverse RPC",
+                        )
+                        .await);
+                }
+                let reverse_response = match self.dispatch_legacy_reverse_request(cx, request).await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket exact-2024 reverse request was invalid",
+                            )
+                            .await);
+                    }
+                };
+                if let Err(error) = self.sender.send(cx, &reverse_response).await {
+                    return Err(self.terminal_transport_error(cx, error).await);
+                }
+                continue;
+            };
+            if !response
+                .id
+                .as_ref()
+                .is_some_and(|response_id| response_id.correlates_with(&id))
+            {
+                return Err(self
+                    .close_after_protocol_error(
+                        cx,
+                        "WebSocket response ID does not match the active request",
+                    )
+                    .await);
+            }
+            let response = response.clone();
+            let raw_result = raw_result_from_admitted_response(&response, frame, "WebSocket")?;
+            return Ok(WebSocketResponse {
+                response,
+                raw_result,
+            });
+        }
+    }
+
+    /// Closes both transport halves through the supplied caller context.
+    pub async fn close(&mut self, cx: &Cx) -> McpResult<()> {
+        if self.close_settled {
+            return Ok(());
+        }
+        self.closed = true;
+        self.settle_close(cx).await
+    }
+
+    /// Completes one prompt or resource-template argument in MCP 2026-07-28.
+    ///
+    /// Exact 2024 sessions reject before allocating an ID or writing a frame.
+    pub async fn complete(&mut self, cx: &Cx, params: CompletionParams) -> McpResult<CoreResult> {
+        match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => {
+                let params = serde_json::to_value(params).map_err(|_| {
+                    McpError::invalid_params(
+                        "Modern WebSocket completion parameters could not serialize",
+                    )
+                })?;
+                self.request_final_core(cx, "completion/complete", params)
+                    .await
+            }
+            ProtocolEra::Legacy2024 => {
+                let params = serde_json::to_value(params.into_legacy()?).map_err(|_| {
+                    McpError::invalid_params(
+                        "Exact legacy WebSocket completion parameters could not serialize",
+                    )
+                })?;
+                self.request_selected_core(cx, "completion/complete", params)
+                    .await
+            }
+        }
+    }
+
+    /// Calls a modern tool and follows bounded input-required MRTR rounds.
+    ///
+    /// The supplied deadline covers every request in the operation; a retry
+    /// cannot restart the caller's absolute time budget.
+    pub async fn call_tool_with_mrtr_retry<F>(
+        &mut self,
+        cx: &Cx,
+        deadline: Instant,
+        name: &str,
+        arguments: serde_json::Value,
+        mut respond: F,
+    ) -> McpResult<FinalCoreResult>
+    where
+        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+    {
+        self.require_modern("tools/call")?;
+        let limits =
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
+        let mut driver = MrtrDriver::new(cx, deadline, limits)?;
+        let original_parameters = serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        });
+        let mut parameters = original_parameters.clone();
+
+        loop {
+            driver.before_request()?;
+            let result = self
+                .request_final_core(cx, "tools/call", parameters)
+                .await?;
+            let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
+                let CoreResult::Final(result) = result else {
+                    return Err(McpError::invalid_request(
+                        "Modern WebSocket MRTR received an exact-legacy result",
+                    ));
+                };
+                return Ok(result);
+            };
+            driver.begin_continuation()?;
+            let input_responses = respond(input_required)?;
+            let input_response_count = input_responses.len();
+            parameters = mrtr_retry_parameters(
+                original_parameters.clone(),
+                input_required,
+                input_responses,
+            )?;
+            driver.admit_input_responses(input_response_count)?;
+        }
+    }
+
+    /// Collects a modern subscription stream through its terminal response.
+    ///
+    /// The receive half remains the only ingress owner for the complete
+    /// operation, so acknowledgement, live notifications, and termination
+    /// cannot be consumed by an unrelated request waiter.
+    pub async fn listen_subscriptions_typed(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<SubscriptionListenCollector> {
+        if cx.checkpoint().is_err() {
+            return Err(self.terminal_cancellation(cx).await);
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        self.require_modern("subscriptions/listen")?;
+        #[cfg(feature = "tasks")]
+        if task_subscription_ids(&notifications)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .is_some()
+        {
+            self.require_final_tasks_direction(
+                TASK_STATUS_NOTIFICATION,
+                ExtensionDirection::ServerToClient,
+            )?;
+        }
+        let parameters = serde_json::json!({
+            "notifications": notifications.clone(),
+        });
+        #[cfg(feature = "tasks")]
+        let parameters = if task_subscription_ids(&notifications)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .is_some()
+        {
+            self.with_final_tasks_client_capability(parameters)?
+        } else {
+            self.with_modern_request_metadata(parameters)?
+        };
+        #[cfg(not(feature = "tasks"))]
+        let parameters = self.with_modern_request_metadata(parameters)?;
+        let request_id = self.allocate_request_id()?;
+        let request = JsonRpcRequest::new(
+            "subscriptions/listen",
+            Some(parameters.clone()),
+            request_id.clone(),
+        );
+        if let Err(error) = self
+            .sender
+            .send(cx, &JsonRpcMessage::Request(request))
+            .await
+        {
+            return Err(self.terminal_transport_error(cx, error).await);
+        }
+
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "subscriptions/listen",
+            Some(&parameters),
+        )
+        .map_err(|_| {
+            McpError::invalid_params("Modern WebSocket subscription parameters are invalid")
+        })?;
+        let mut accepted_filter = None;
+        let mut retained_notifications = Vec::new();
+        #[cfg(feature = "tasks")]
+        let mut task_notifications = Vec::new();
+
+        loop {
+            let frame = match self.receiver.recv_with_source(cx).await {
+                Ok(frame) => frame,
+                Err(error) => return Err(self.terminal_transport_error(cx, error).await),
+            };
+            match frame.message() {
+                JsonRpcMessage::Response(response) => {
+                    if !response
+                        .id
+                        .as_ref()
+                        .is_some_and(|response_id| response_id.correlates_with(&request_id))
+                    {
+                        return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket subscription response ID does not match its listener",
+                            )
+                            .await);
+                    }
+                    if let Some(error) = response.error.clone() {
+                        return Err(json_rpc_error_to_mcp(error));
+                    }
+                    let response = response.clone();
+                    let source = raw_result_from_admitted_response(&response, frame, "WebSocket")?
+                        .ok_or_else(|| McpError::invalid_request(
+                            "WebSocket subscription terminal response has no admitted result source",
+                        ))?;
+                    let result = decode_core_result_from_source(
+                        &core_request,
+                        response.result.as_ref().ok_or_else(|| {
+                            McpError::invalid_request(
+                                "WebSocket subscription response has no result",
+                            )
+                        })?,
+                        Some(&source),
+                    )?;
+                    let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+                        result: terminal,
+                        subscription_id,
+                        ..
+                    }) = result
+                    else {
+                        return Err(McpError::invalid_request(
+                            "WebSocket subscription terminal result is not subscriptions/listen",
+                        ));
+                    };
+                    if !subscription_id.correlates_with(&request_id) {
+                        return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket subscription terminal ID does not match its listener",
+                            )
+                            .await);
+                    }
+                    let accepted_filter = accepted_filter.ok_or_else(|| {
+                        McpError::invalid_request(
+                            "WebSocket subscription terminated before acknowledgement",
+                        )
+                    })?;
+                    return Ok(SubscriptionListenCollector {
+                        subscription_id,
+                        accepted_filter,
+                        notifications: retained_notifications,
+                        #[cfg(feature = "tasks")]
+                        task_notifications,
+                        terminal,
+                    });
+                }
+                JsonRpcMessage::Request(request) => {
+                    #[cfg(feature = "tasks")]
+                    if request.id.is_none() && request.method == TASK_STATUS_NOTIFICATION {
+                        let accepted = accepted_filter.as_ref().ok_or_else(|| {
+                            McpError::invalid_request(
+                                "WebSocket subscription received a Tasks event before acknowledgement",
+                            )
+                        })?;
+                        let accepted_task_ids = task_subscription_ids(accepted).map_err(|_| {
+                            McpError::invalid_request(
+                                "WebSocket subscription received a Tasks event without an acknowledged Tasks filter",
+                            )
+                        })?.ok_or_else(|| McpError::invalid_request(
+                            "WebSocket subscription received a Tasks event without an acknowledged Tasks filter",
+                        ))?;
+                        let task_notification =
+                            serde_json::from_value::<FinalTaskStatusNotification>(
+                                serde_json::to_value(request).map_err(|_| {
+                                    McpError::invalid_request(
+                                        "WebSocket subscription received an invalid Tasks event",
+                                    )
+                                })?,
+                            )
+                            .map_err(|_| {
+                                McpError::invalid_request(
+                                    "WebSocket subscription received an invalid Tasks event",
+                                )
+                            })?;
+                        let subscription_id = task_notification
+                            .params
+                            .meta
+                            .as_ref()
+                            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                            .and_then(|value| {
+                                serde_json::from_value::<RequestId>(value.clone()).ok()
+                            });
+                        if !subscription_id.as_ref().is_some_and(|subscription_id| {
+                            subscription_id.correlates_with(&request_id)
+                        }) {
+                            return Err(self.close_after_protocol_error(
+                                cx,
+                                "WebSocket Tasks event subscription ID does not match the listener",
+                            ).await);
+                        }
+                        if !accepted_task_ids
+                            .iter()
+                            .any(|task_id| task_id == &task_notification.params.task.base().task_id)
+                        {
+                            return Err(self.close_after_protocol_error(
+                                cx,
+                                "WebSocket Tasks event taskId is outside the acknowledged filter",
+                            ).await);
+                        }
+                        task_notifications.push(task_notification);
+                        continue;
+                    }
+                    let notification = ServerNotification::decode(request).map_err(|_| {
+                        McpError::invalid_request(
+                            "WebSocket subscription received an invalid server notification",
+                        )
+                    })?;
+                    match notification {
+                        ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                            if accepted_filter.is_some() {
+                                return Err(McpError::invalid_request(
+                                    "WebSocket subscription received a duplicate acknowledgement",
+                                ));
+                            }
+                            if validate_subscription_acknowledgement(
+                                &request_id,
+                                &notifications,
+                                &acknowledgement,
+                            )
+                            .is_err()
+                            {
+                                return Err(self
+                                    .close_after_protocol_error(
+                                        cx,
+                                        "WebSocket subscription acknowledgement is invalid for its listener",
+                                    )
+                                    .await);
+                            }
+                            accepted_filter = Some(acknowledgement.notifications);
+                        }
+                        notification => {
+                            let accepted = accepted_filter.as_ref().ok_or_else(|| {
+                                McpError::invalid_request(
+                                    "WebSocket subscription emitted a notification before acknowledgement",
+                                )
+                            })?;
+                            validate_subscription_notification_filter(&notification, accepted)?;
+                            retained_notifications.push(notification);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Calls a Tasks-capable modern tool without projecting its result algebra.
+    #[cfg(feature = "tasks")]
+    pub async fn call_tool_final_outcome(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolCallOutcome> {
+        self.require_final_tasks_result(OFFICIAL_TASKS_RESULT_DISCRIMINATOR)?;
+        let parameters = self.with_final_tasks_client_capability(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+        }))?;
+        match self
+            .request_final_core_prepared(cx, "tools/call", parameters)
+            .await?
+        {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolCallOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                Ok(FinalToolCallOutcome::Task(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            _ => Err(unexpected_convenience_result("tools/call")),
+        }
+    }
+
+    /// Reads one task through the negotiated official Tasks extension.
+    #[cfg(feature = "tasks")]
+    pub async fn get_task_final(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalGetTaskResult> {
+        self.require_final_tasks_method(TASK_GET)?;
+        let result: FinalGetTaskResult = self
+            .request_final_tasks(
+                cx,
+                TASK_GET,
+                FinalGetTaskParams {
+                    request: self.final_task_request_meta()?,
+                    task_id: task_id.clone(),
+                },
+            )
+            .await?;
+        if result.task.base().task_id != task_id {
+            return Err(McpError::invalid_request(
+                "WebSocket tasks/get response taskId does not match its request",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Supplies typed inputs for one retained input-required task.
+    #[cfg(feature = "tasks")]
+    pub async fn update_task_final(
+        &mut self,
+        cx: &Cx,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        self.require_final_tasks_method(TASK_UPDATE)?;
+        let FinalTask::InputRequired {
+            base,
+            input_requests,
+        } = task
+        else {
+            return Err(McpError::invalid_params(
+                "tasks/update requires an input_required final task",
+            ));
+        };
+        TaskInputLedger::from_requests(input_requests)
+            .map_err(|_| McpError::invalid_params("Final task input requests are invalid"))?
+            .validate_responses(&input_responses)
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "tasks/update inputResponses do not match the retained task input requests",
+                )
+            })?;
+        self.request_final_tasks(
+            cx,
+            TASK_UPDATE,
+            FinalUpdateTaskParams {
+                request: self.final_task_request_meta()?,
+                task_id: base.task_id.clone(),
+                input_responses,
+            },
+        )
+        .await
+    }
+
+    /// Requests cancellation through the negotiated official Tasks extension.
+    #[cfg(feature = "tasks")]
+    pub async fn cancel_task_final(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalCancelTaskResult> {
+        self.require_final_tasks_method(TASK_CANCEL)?;
+        self.request_final_tasks(
+            cx,
+            TASK_CANCEL,
+            FinalCancelTaskParams {
+                request: self.final_task_request_meta()?,
+                task_id,
+            },
+        )
+        .await
+    }
+
+    fn require_modern(&self, method: &str) -> McpResult<()> {
+        if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            Ok(())
+        } else {
+            Err(McpError::invalid_params(format!(
+                "{method} is available only for MCP 2026-07-28 WebSocket sessions",
+            )))
+        }
+    }
+
+    fn with_modern_request_metadata(
+        &self,
+        mut params: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        self.require_modern("modern request metadata")?;
+        let object = params.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Modern WebSocket requests require object parameters")
+        })?;
+        let mut metadata = serde_json::to_value(FinalRequestMeta {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+            client_capabilities: self.session.client_capabilities().clone(),
+            client_info: Some(self.session.client_info().clone()),
+            additional_metadata: BTreeMap::new(),
+        })
+        .map_err(|_| McpError::internal_error("Modern WebSocket request metadata is invalid"))?;
+        if let Some(existing) = object.remove("_meta") {
+            let existing = existing.as_object().ok_or_else(|| {
+                McpError::invalid_params("Modern WebSocket request metadata must be an object")
+            })?;
+            let generated = metadata.as_object_mut().ok_or_else(|| {
+                McpError::internal_error("Modern WebSocket request metadata is not an object")
+            })?;
+            for (key, value) in existing {
+                generated
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        object.insert("_meta".to_owned(), metadata);
+        Ok(params)
+    }
+
+    async fn request_final_core(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        params: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.require_modern(method)?;
+        let params = self.with_modern_request_metadata(params)?;
+        self.request_final_core_prepared(cx, method, params).await
+    }
+
+    async fn request_selected_core(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        params: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let era = self.selected_protocol_era();
+        let request = CoreRequest::decode(era, method, Some(&params)).map_err(|_| {
+            McpError::invalid_params(
+                "WebSocket completion parameters do not match the negotiated method contract",
+            )
+        })?;
+        let received = self
+            .request_with_raw_result(cx, method, Some(params))
+            .await?;
+        if let Some(error) = received.response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        let result = received.response.result.as_ref().ok_or_else(|| {
+            McpError::invalid_request("WebSocket successful response has no result")
+        })?;
+        let source = received.raw_result.as_deref().ok_or_else(|| {
+            McpError::invalid_request("WebSocket response has no admitted result source")
+        })?;
+        decode_core_result_from_source(&request, result, Some(source))
+    }
+
+    /// Decodes and sends already-decorated final parameters without replacing
+    /// their negotiated extension capability metadata.
+    async fn request_final_core_prepared(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        params: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.require_modern(method)?;
+        let request =
+            CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).map_err(|_| {
+                McpError::invalid_params(
+                    "Modern WebSocket request parameters do not match the method contract",
+                )
+            })?;
+        let received = self
+            .request_with_raw_result(cx, method, Some(params))
+            .await?;
+        if let Some(error) = received.response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        let result = received.response.result.as_ref().ok_or_else(|| {
+            McpError::invalid_request("WebSocket successful response has no result")
+        })?;
+        let source = received.raw_result.as_deref().ok_or_else(|| {
+            McpError::invalid_request("Modern WebSocket response has no admitted result source")
+        })?;
+        decode_core_result_from_source(&request, result, Some(source))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn require_final_tasks_direction(
+        &self,
+        name: &str,
+        direction: ExtensionDirection,
+    ) -> McpResult<()> {
+        self.require_modern(name)?;
+        let discovery = self.session.server_discovery().ok_or_else(|| {
+            McpError::invalid_params(
+                "Modern Tasks requires the retained final server/discover response",
+            )
+        })?;
+        admit_final_tasks_discovery_surface(discovery, name, direction)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn require_final_tasks_method(&self, method: &str) -> McpResult<()> {
+        self.require_final_tasks_direction(method, ExtensionDirection::ClientToServer)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn require_final_tasks_result(&self, discriminator: &str) -> McpResult<()> {
+        self.require_modern("Tasks result")?;
+        let discovery = self.session.server_discovery().ok_or_else(|| {
+            McpError::invalid_params(
+                "Modern Tasks requires the retained final server/discover response",
+            )
+        })?;
+        admit_final_tasks_result_discriminator(discovery, discriminator)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn final_task_request_meta(&self) -> McpResult<TaskRequestMeta> {
+        let params = self.with_final_tasks_client_capability(serde_json::json!({}))?;
+        let meta = params
+            .get("_meta")
+            .cloned()
+            .ok_or_else(|| McpError::internal_error("Modern Tasks request metadata was omitted"))?;
+        serde_json::from_value(meta)
+            .map(|meta| TaskRequestMeta { meta })
+            .map_err(|_| {
+                McpError::internal_error(
+                    "Modern Tasks request metadata did not retain its final shape",
+                )
+            })
+    }
+
+    #[cfg(feature = "tasks")]
+    fn with_final_tasks_client_capability(
+        &self,
+        params: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        let mut params = self.with_modern_request_metadata(params)?;
+        let extensions = params
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|metadata| metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY))
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|capabilities| {
+                capabilities
+                    .entry("extensions")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+                    .as_object_mut()
+            })
+            .ok_or_else(|| {
+                McpError::internal_error("Modern Tasks client extensions must be an object")
+            })?;
+        extensions.insert(
+            fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+            serde_json::json!({}),
+        );
+        Ok(params)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn request_final_tasks<P, R>(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: P,
+    ) -> McpResult<R>
+    where
+        P: serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        if cx.checkpoint().is_err() {
+            return Err(self.terminal_cancellation(cx).await);
+        }
+        let params = serde_json::to_value(parameters).map_err(|_| {
+            McpError::invalid_params("Modern Tasks request parameters could not serialize")
+        })?;
+        let request_id = self.allocate_request_id()?;
+        let received = self
+            .request_admitted_with_raw_result(
+                cx,
+                JsonRpcRequest::new(method, Some(params), request_id),
+            )
+            .await?;
+        if let Some(error) = received.response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        let source = received.raw_result.ok_or_else(|| {
+            McpError::invalid_request("Modern Tasks response has no admitted result source")
+        })?;
+        serde_json::from_str(&source).map_err(|_| {
+            McpError::invalid_request("Modern Tasks response has an invalid result shape")
+        })
+    }
+
+    async fn dispatch_legacy_reverse_request(
+        &self,
+        cx: &Cx,
+        request: &JsonRpcRequest,
+    ) -> McpResult<JsonRpcMessage> {
+        let Some(id) = request.id.clone() else {
+            return Err(McpError::invalid_request(
+                "WebSocket exact-2024 reverse request requires a JSON-RPC ID",
+            ));
+        };
+        if request.method.starts_with("notifications/") {
+            return Ok(
+                invalid_notification_request_response(request).unwrap_or_else(|| {
+                    JsonRpcMessage::Response(JsonRpcResponse::error(
+                        Some(id),
+                        McpError::invalid_request("invalid reverse notification request").into(),
+                    ))
+                }),
+            );
+        }
+
+        let response = match request.method.as_str() {
+            "sampling/createMessage" => match self
+                .reverse_request_handlers
+                .sampling_create_message
+                .as_ref()
+            {
+                Some(handler) => {
+                    let params = decode_reverse_request_params::<CreateMessageParams>(request);
+                    match params {
+                        Ok(params) => {
+                            let cancellation = ReverseRequestCancellation::new();
+                            let result = handler(cx, cancellation, params).await;
+                            reverse_request_response(id, result)
+                        }
+                        Err(error) => {
+                            reverse_request_response::<CreateMessageResult>(id, Err(error))
+                        }
+                    }
+                }
+                None => reverse_request_response::<CreateMessageResult>(
+                    id,
+                    Err(McpError::method_not_found("sampling/createMessage")),
+                ),
+            },
+            "roots/list" => match self.reverse_request_handlers.roots_list.as_ref() {
+                Some(handler) => {
+                    let params = decode_reverse_request_params::<ListRootsParams>(request);
+                    match params {
+                        Ok(params) => {
+                            let cancellation = ReverseRequestCancellation::new();
+                            let result = handler(cx, cancellation, params).await;
+                            reverse_request_response(id, result)
+                        }
+                        Err(error) => reverse_request_response::<ListRootsResult>(id, Err(error)),
+                    }
+                }
+                None => reverse_request_response::<ListRootsResult>(
+                    id,
+                    Err(McpError::method_not_found("roots/list")),
+                ),
+            },
+            _ => method_not_found_response(request).unwrap_or_else(|| {
+                JsonRpcMessage::Response(JsonRpcResponse::error(
+                    Some(id),
+                    McpError::method_not_found(&request.method).into(),
+                ))
+            }),
+        };
+        Ok(response)
+    }
+
+    fn admit_raw_client_request(
+        &self,
+        method: &str,
+        params: Option<&serde_json::Value>,
+    ) -> McpResult<()> {
+        let era = self.selected_protocol_era();
+        if matches!(
+            method,
+            SERVER_DISCOVER_METHOD | "initialize" | "notifications/initialized"
+        ) {
+            return Err(McpError::invalid_params(
+                "WebSocket raw requests cannot replay negotiated control methods",
+            ));
+        }
+        if era == ProtocolEra::Modern2026 {
+            let method_definition = final_2026_07_28_method(method).ok_or_else(|| {
+                McpError::invalid_params(
+                    "WebSocket modern raw request method is not admitted by the final client union",
+                )
+            })?;
+            if !method_definition
+                .direction
+                .admits_sender(Final2026Peer::Client)
+                || method_definition.envelope != Final2026EnvelopeKind::Request
+            {
+                return Err(McpError::invalid_params(
+                    "WebSocket modern raw request method has the wrong direction or envelope",
+                ));
+            }
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        let request = CoreRequest::decode(era, method, params).map_err(|_| {
+            McpError::invalid_params(
+                "WebSocket raw request is not admitted by the negotiated protocol era",
+            )
+        })?;
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        CoreRequest::decode(era, method, params).map_err(|_| {
+            McpError::invalid_params(
+                "WebSocket raw request is not admitted by the negotiated protocol era",
+            )
+        })?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        if matches!(
+            request,
+            CoreRequest::Legacy(LegacyCoreRequest::SamplingCreateMessage(_))
+        ) {
+            return Err(McpError::invalid_params(
+                "WebSocket raw request method is server-to-client in MCP 2024-11-05",
+            ));
+        }
+        Ok(())
+    }
+
+    fn allocate_request_id(&mut self) -> McpResult<RequestId> {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("WebSocket client request ID space exhausted")
+        })?;
+        let id = i64::try_from(id)
+            .map_err(|_| McpError::internal_error("WebSocket client request ID exceeds i64"))?;
+        Ok(RequestId::Number(id))
+    }
+
+    async fn terminal_transport_error(&mut self, cx: &Cx, error: TransportError) -> McpError {
+        self.closed = true;
+        let _ = self.settle_close(cx).await;
+        transport_error_to_mcp(error)
+    }
+
+    async fn terminal_cancellation(&mut self, cx: &Cx) -> McpError {
+        self.closed = true;
+        let _ = self.settle_close(cx).await;
+        McpError::request_cancelled()
+    }
+
+    async fn close_after_protocol_error(&mut self, cx: &Cx, message: &str) -> McpError {
+        self.closed = true;
+        let _ = self.settle_close(cx).await;
+        McpError::invalid_request(message)
+    }
+
+    async fn settle_close(&mut self, cx: &Cx) -> McpResult<()> {
+        if self.close_settled {
+            return Ok(());
+        }
+        self.closed = true;
+        let sender_result = self.sender.close(cx).await.map_err(transport_error_to_mcp);
+        let receiver_result = self
+            .receiver
+            .close(cx)
+            .await
+            .map_err(transport_error_to_mcp);
+        match (sender_result, receiver_result) {
+            (Ok(()), Ok(())) => {
+                self.close_settled = true;
+                Ok(())
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+}
+
+async fn async_websocket_discover<IO>(
+    receiver: &mut AsyncWsClientRecvHalf<IO>,
+    sender: &mut AsyncWsClientSendHalf<IO>,
+    cx: &Cx,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    id: i64,
+) -> Result<WebSocketInitialization, WebSocketHandshakeError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut params = serde_json::to_value(ServerDiscoverRequest::default()).map_err(|_| {
+        WebSocketHandshakeError::Mcp(McpError::internal_error(
+            "Modern WebSocket discovery parameters could not be serialized",
+        ))
+    })?;
+    let metadata = params
+        .get_mut("_meta")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            WebSocketHandshakeError::Mcp(McpError::internal_error(
+                "Modern WebSocket discovery metadata is missing",
+            ))
+        })?;
+    metadata.insert(
+        FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+        serde_json::to_value(client_capabilities).map_err(|_| {
+            WebSocketHandshakeError::Mcp(McpError::internal_error(
+                "Modern WebSocket client capabilities could not be serialized",
+            ))
+        })?,
+    );
+    metadata.insert(
+        "io.modelcontextprotocol/clientInfo".to_owned(),
+        serde_json::to_value(client_info).map_err(|_| {
+            WebSocketHandshakeError::Mcp(McpError::internal_error(
+                "Modern WebSocket client identity could not be serialized",
+            ))
+        })?,
+    );
+    let response = async_websocket_exchange(
+        receiver,
+        sender,
+        cx,
+        JsonRpcRequest::new(SERVER_DISCOVER_METHOD, Some(params), id),
+    )
+    .await?;
+    let source = response.raw_result.ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "Modern WebSocket discovery response has no admitted result source",
+        ))
+    })?;
+    let discovery = serde_json::from_str::<ServerDiscoverResult>(&source).map_err(|_| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "Modern WebSocket discovery response has an invalid result",
+        ))
+    })?;
+    if !discovery
+        .supported_versions()
+        .iter()
+        .any(|version| version == MODERN_PROTOCOL_VERSION)
+    {
+        return Err(WebSocketHandshakeError::Mcp(McpError::internal_error(
+            UNSUPPORTED_PROTOCOL_VERSION_ERROR,
+        )));
+    }
+    let server_info = discovery.server_info().cloned().ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "Modern WebSocket discovery response has no server identity",
+        ))
+    })?;
+    Ok(WebSocketInitialization::Modern {
+        server_info,
+        discovery,
+    })
+}
+
+async fn async_websocket_initialize<IO>(
+    receiver: &mut AsyncWsClientRecvHalf<IO>,
+    sender: &mut AsyncWsClientSendHalf<IO>,
+    cx: &Cx,
+    client_info: &ClientInfo,
+    client_capabilities: &ClientCapabilities,
+    id: i64,
+) -> Result<InitializeResult, WebSocketHandshakeError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let response = async_websocket_exchange(
+        receiver,
+        sender,
+        cx,
+        JsonRpcRequest::new(
+            "initialize",
+            Some(
+                serde_json::to_value(InitializeParams {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    capabilities: client_capabilities.clone(),
+                    client_info: client_info.clone(),
+                })
+                .map_err(|_| {
+                    WebSocketHandshakeError::Mcp(McpError::internal_error(
+                        "WebSocket initialize parameters could not be serialized",
+                    ))
+                })?,
+            ),
+            id,
+        ),
+    )
+    .await?;
+    let result = response.result.ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket initialize response has no result",
+        ))
+    })?;
+    let result = serde_json::from_value::<InitializeResult>(result).map_err(|_| {
+        WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket initialize response has an invalid result",
+        ))
+    })?;
+    validate_initialize_result(&result).map_err(WebSocketHandshakeError::Mcp)?;
+    Ok(result)
+}
+
+async fn async_websocket_exchange<IO>(
+    receiver: &mut AsyncWsClientRecvHalf<IO>,
+    sender: &mut AsyncWsClientSendHalf<IO>,
+    cx: &Cx,
+    request: JsonRpcRequest,
+) -> Result<WebSocketHandshakeResponse, WebSocketHandshakeError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let request_id = request.id.clone().ok_or_else(|| {
+        WebSocketHandshakeError::Mcp(McpError::internal_error(
+            "WebSocket handshake request requires an ID",
+        ))
+    })?;
+    if let Err(error) = sender.send(cx, &JsonRpcMessage::Request(request)).await {
+        let _ = close_async_websocket_halves(receiver, sender, cx).await;
+        return Err(WebSocketHandshakeError::Mcp(transport_error_to_mcp(error)));
+    }
+    let frame = match receiver.recv_with_source(cx).await {
+        Ok(frame) => frame,
+        Err(error) => {
+            let _ = close_async_websocket_halves(receiver, sender, cx).await;
+            return Err(WebSocketHandshakeError::Mcp(transport_error_to_mcp(error)));
+        }
+    };
+    let JsonRpcMessage::Response(response) = frame.message() else {
+        let _ = close_async_websocket_halves(receiver, sender, cx).await;
+        return Err(WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket handshake received a non-response frame",
+        )));
+    };
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(&request_id))
+    {
+        let _ = close_async_websocket_halves(receiver, sender, cx).await;
+        return Err(WebSocketHandshakeError::Mcp(McpError::invalid_request(
+            "WebSocket handshake response ID does not match its request",
+        )));
+    }
+    if let Some(error) = response.error.clone() {
+        if error.code.as_i32() == Some(-32601) {
+            return Err(WebSocketHandshakeError::MethodNotFound);
+        }
+        return Err(WebSocketHandshakeError::Mcp(json_rpc_error_to_mcp(error)));
+    }
+    let response = response.clone();
+    let raw_result = raw_result_from_admitted_response(&response, frame, "WebSocket")
+        .map_err(WebSocketHandshakeError::Mcp)?;
+    Ok(WebSocketHandshakeResponse {
+        result: response.result,
+        raw_result,
+    })
+}
+
+async fn close_async_websocket_halves<IO>(
+    receiver: &mut AsyncWsClientRecvHalf<IO>,
+    sender: &mut AsyncWsClientSendHalf<IO>,
+    cx: &Cx,
+) -> Result<(), TransportError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let sender_result = sender.close(cx).await;
+    let receiver_result = receiver.close(cx).await;
+    sender_result.and(receiver_result)
 }
 
 fn validate_timeout_duration(
@@ -12772,8 +14195,12 @@ mod tests {
     use super::*;
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
+    use asupersync::io::AsyncWriteExt;
+    use asupersync::test_utils::run_test;
     use fastmcp_protocol::ExtensionDirection;
+    use fastmcp_transport::websocket::AsyncWsServerTransport;
     use std::collections::{BTreeMap, HashMap};
+    use std::net::SocketAddr;
 
     struct WebSocketTestRecv {
         frames: VecDeque<Box<[u8]>>,
@@ -12829,6 +14256,1166 @@ mod tests {
         ))
     }
 
+    fn async_websocket_pair() -> (
+        asupersync::net::tcp::VirtualTcpStream,
+        asupersync::net::tcp::VirtualTcpStream,
+    ) {
+        let client_addr: SocketAddr = "127.0.0.1:45101".parse().expect("client address");
+        let server_addr: SocketAddr = "127.0.0.1:45102".parse().expect("server address");
+        asupersync::net::tcp::VirtualTcpStream::pair(client_addr, server_addr)
+    }
+
+    fn async_modern_discovery_result() -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": [MODERN_PROTOCOL_VERSION],
+            "capabilities": {},
+            "_meta": {
+                "io.modelcontextprotocol/serverInfo": {
+                    "name": "async-websocket-test",
+                    "version": "1.0"
+                }
+            },
+            "ttlMs": 0,
+            "cacheScope": "private"
+        })
+    }
+
+    fn async_websocket_client_info() -> ClientInfo {
+        ClientInfo {
+            name: "async-websocket-client".to_owned(),
+            version: "1.0".to_owned(),
+        }
+    }
+
+    async fn write_server_text_frame(
+        peer: &mut asupersync::net::tcp::VirtualTcpStream,
+        source: &str,
+    ) {
+        let payload = source.as_bytes();
+        let mut frame = Vec::with_capacity(payload.len() + 10);
+        frame.push(0x81);
+        if payload.len() <= 125 {
+            frame.push(u8::try_from(payload.len()).expect("small WebSocket payload"));
+        } else {
+            frame.push(126);
+            frame.extend_from_slice(
+                &u16::try_from(payload.len())
+                    .expect("bounded test WebSocket payload")
+                    .to_be_bytes(),
+            );
+        }
+        frame.extend_from_slice(payload);
+        peer.write_all(&frame)
+            .await
+            .expect("write raw server WebSocket text frame");
+    }
+
+    fn raw_modern_discovery_source(id: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{}},"_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"raw-async-websocket-test","version":"1.0"}}}},"ttlMs":0,"cacheScope":"private"}}}}"#
+        )
+    }
+
+    #[test]
+    fn websocket_async_public_correlation_admits_equivalent_numeric_ids_and_raw_lexemes() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for response_id in ["2", "2.0", "2e0"] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1.0")).await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":{response_id},"result":{{"firstExtra":"a","number":1.20e+4,"lastExtra":"z"}}}}"#
+                    ),
+                )
+                .await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .expect("equivalent numeric discovery ID is admitted");
+                let parameters = client
+                    .with_modern_request_metadata(serde_json::json!({}))
+                    .expect("construct admitted final tools/list parameters");
+                let response = client
+                    .request_with_raw_result(&cx, "tools/list", Some(parameters))
+                    .await
+                    .expect("equivalent numeric response ID is admitted");
+                assert_eq!(
+                    response.raw_result.as_deref(),
+                    Some(r#"{"firstExtra":"a","number":1.20e+4,"lastExtra":"z"}"#),
+                    "raw result ordering and number spelling must remain peer-authored for ID {response_id}",
+                );
+                client.close(&cx).await.expect("close admitted client");
+            }
+        });
+    }
+
+    #[test]
+    fn websocket_async_public_true_response_id_mismatch_closes_and_cannot_be_reused() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"number":1.20e+4}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before mismatch");
+            let parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .expect("construct admitted final tools/list parameters");
+            let error = client
+                .request_with_raw_result(&cx, "tools/list", Some(parameters.clone()))
+                .await
+                .expect_err("true numeric mismatch is never admitted");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(client.closed, "mismatch terminalizes the connection");
+            assert!(client.close_settled, "mismatch settles a close attempt");
+            assert_eq!(
+                client.next_id, 3,
+                "the mismatched response never advances or aliases the active request state",
+            );
+            let reuse = client
+                .request_with_raw_result(&cx, "tools/list", Some(parameters))
+                .await
+                .expect_err("terminal client cannot consume a late response or send again");
+            assert_eq!(reuse.code, McpErrorCode::InternalError);
+        });
+    }
+
+    #[test]
+    fn websocket_async_modern_raw_control_and_server_methods_reject_before_contact() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before raw admission checks");
+            let next_id = client.next_id;
+            for method in ["initialize", "notifications/progress"] {
+                let error = client
+                    .request_with_raw_result(&cx, method, Some(serde_json::json!({})))
+                    .await
+                    .expect_err("control and server-only methods are never client raw requests");
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(
+                    client.next_id, next_id,
+                    "{method} made no transport contact"
+                );
+            }
+            client.close(&cx).await.expect("close rejected raw client");
+        });
+    }
+
+    #[test]
+    fn websocket_async_pending_cancellation_attempts_close_rejects_late_response_and_reuse() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let (ready_sender, mut ready_receiver) = oneshot::channel();
+            let (late_sender, mut late_receiver) = oneshot::channel();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives discovery")
+                    else {
+                        panic!("client must discover before an ordinary request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery has an ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends discovery result");
+                    let JsonRpcMessage::Request(request) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives pending request")
+                    else {
+                        panic!("pending client operation must be a request");
+                    };
+                    ready_sender
+                        .send(&peer_cx, request.id.expect("pending request has an ID"))
+                        .expect("signal pending request");
+                    let late_id = late_receiver
+                        .recv(&peer_cx)
+                        .await
+                        .expect("parent permits a deliberately late response");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                late_id,
+                                serde_json::json!({"late": true}),
+                            )),
+                        )
+                        .await
+                        .expect("peer writes late response after client cancellation");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn quiet WebSocket peer");
+
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("client negotiates before pending cancellation");
+            let parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .expect("construct admitted pending request");
+            let request_cx = Cx::for_testing();
+            let request_cx_for_task = request_cx.clone();
+            let mut pending = cx
+                .spawn(move |_| async move {
+                    let result = client
+                        .request_with_raw_result(
+                            &request_cx_for_task,
+                            "tools/list",
+                            Some(parameters),
+                        )
+                        .await;
+                    (client, result)
+                })
+                .expect("spawn pending client request");
+            let request_id = ready_receiver
+                .recv(&cx)
+                .await
+                .expect("peer observed committed request");
+            request_cx.set_cancel_requested(true);
+            let (mut client, result) = pending
+                .join(&cx)
+                .await
+                .expect("pending client task completes after cancellation");
+            let error = result.expect_err("quiet peer cannot turn cancellation into a response");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert!(client.closed, "cancelled receive terminalizes the client");
+            assert!(
+                !client.close_settled,
+                "a cancelled close attempt remains unsettled for an uncancelled close caller",
+            );
+            late_sender
+                .send(&cx, request_id)
+                .expect("permit peer late response only after cancellation completed");
+            client
+                .close(&cx)
+                .await
+                .expect("uncancelled caller settles the structured close");
+            assert!(client.close_settled);
+            let reuse = client
+                .request_with_raw_result(&cx, "tools/list", Some(serde_json::json!({})))
+                .await
+                .expect_err("closed client cannot admit a late response or new request");
+            assert_eq!(reuse.code, McpErrorCode::InternalError);
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[test]
+    fn websocket_async_public_mrtr_retries_through_real_split_transport() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"retry-1"}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[],"isError":false}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before MRTR");
+            let result = client
+                .call_tool_with_mrtr_retry(
+                    &cx,
+                    Instant::now() + Duration::from_secs(1),
+                    "retry-tool",
+                    serde_json::json!({"round": 1}),
+                    |_| {
+                        Ok(BTreeMap::from([(
+                            "roots".to_owned(),
+                            serde_json::json!({"roots": []}),
+                        )]))
+                    },
+                )
+                .await
+                .expect("MRTR retry consumes the peer input request and final result");
+            assert!(matches!(result, FinalCoreResult::ToolsCall { .. }));
+            client.close(&cx).await.expect("close MRTR client");
+        });
+    }
+
+    #[test]
+    fn websocket_async_public_typed_subscription_collects_ack_event_and_terminal() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for response_id in ["2", "2.0", "2e0"] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1e0")).await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+                )
+                .await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
+                )
+                .await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":{response_id},"result":{{"resultType":"complete","_meta":{{"io.modelcontextprotocol/subscriptionId":2}}}}}}"#
+                    ),
+                )
+                .await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .expect("modern client connects before subscription");
+                let collector = client
+                    .listen_subscriptions_typed(
+                        &cx,
+                        SubscriptionFilter {
+                            tools_list_changed: Some(true),
+                            ..SubscriptionFilter::default()
+                        },
+                    )
+                    .await
+                    .expect("typed subscription retains its admitted stream for every numeric ID spelling");
+                assert_eq!(collector.notifications.len(), 1);
+                client.close(&cx).await.expect("close subscription client");
+            }
+        });
+    }
+
+    #[test]
+    fn websocket_async_subscription_ack_id_mismatch_is_terminal_and_cannot_consume_later_frames() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before acknowledgement mismatch");
+            let error = client
+                .listen_subscriptions_typed(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .expect_err("one-dimension acknowledgement ID mismatch is terminal");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(client.closed);
+            assert!(client.close_settled);
+            let next_id = client.next_id;
+            let reuse = client
+                .listen_subscriptions_typed(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .expect_err("terminal listener cannot consume later valid-looking frames");
+            assert_eq!(reuse.code, McpErrorCode::InternalError);
+            assert_eq!(
+                client.next_id, next_id,
+                "terminal reuse makes no transport contact"
+            );
+        });
+    }
+
+    #[test]
+    fn websocket_async_subscription_terminal_id_mismatch_is_terminal_and_cannot_be_reused() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before terminal ID mismatch");
+            let error = client
+                .listen_subscriptions_typed(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .expect_err("one-dimension terminal subscription ID mismatch is terminal");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(client.closed);
+            assert!(client.close_settled);
+            let next_id = client.next_id;
+            let reuse = client
+                .request_with_raw_result(&cx, "tools/list", Some(serde_json::json!({})))
+                .await
+                .expect_err("terminal listener cannot consume its later valid-looking response");
+            assert_eq!(reuse.code, McpErrorCode::InternalError);
+            assert_eq!(
+                client.next_id, next_id,
+                "terminal reuse makes no transport contact"
+            );
+        });
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn websocket_async_public_tasks_get_uses_negotiated_extension_transport() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(
+                &mut peer_io,
+                &modern_tasks_discovery_response("websocket-tasks", serde_json::json!({})),
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-1","status":"input_required","createdAt":"2026-07-28T00:00:00Z","lastUpdatedAt":"2026-07-28T00:00:00Z","ttlMs":null,"inputRequests":{}}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("Tasks discovery negotiates on the real WebSocket transport");
+            let task = client
+                .get_task_final(
+                    &cx,
+                    FinalTaskId::parse("task-1").expect("valid final task ID"),
+                )
+                .await
+                .expect("typed tasks/get traverses the admitted extension transport");
+            assert!(matches!(task.task, FinalTask::InputRequired { .. }));
+            client.close(&cx).await.expect("close Tasks client");
+        });
+    }
+
+    #[test]
+    fn websocket_async_public_client_uses_real_split_transport_and_retains_result_source() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives final discovery")
+                    else {
+                        panic!("client must begin with final discovery");
+                    };
+                    assert_eq!(discover.method, SERVER_DISCOVER_METHOD);
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery has an ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends discovery response");
+
+                    let JsonRpcMessage::Request(request) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives one public client request")
+                    else {
+                        panic!("public client request must be a JSON-RPC request");
+                    };
+                    assert_eq!(request.method, "tools/list");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                request.id.expect("public request has an ID"),
+                                serde_json::json!({"peer": "exact"}),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends public response");
+
+                    let JsonRpcMessage::Request(completion) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives typed completion request")
+                    else {
+                        panic!("typed completion must be a JSON-RPC request");
+                    };
+                    assert_eq!(completion.method, "completion/complete");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                completion.id.expect("completion has an ID"),
+                                serde_json::json!({
+                                    "resultType": "complete",
+                                    "completion": {
+                                        "values": ["staging"],
+                                        "total": 1,
+                                        "hasMore": false
+                                    }
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends typed completion response");
+                })
+                .expect("spawn WebSocket peer");
+
+            let mut client = ClientBuilder::new()
+                .client_info("async-websocket-client", "1.0")
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .expect("public async client negotiates real WebSocket transport");
+            assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+
+            let raw_parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .expect("construct admitted public raw request parameters");
+            let response = client
+                .request_with_raw_result(&cx, "tools/list", Some(raw_parameters))
+                .await
+                .expect("public request uses the negotiated transport");
+            assert_eq!(response.raw_result.as_deref(), Some(r#"{"peer":"exact"}"#));
+            let completion = client
+                .complete(
+                    &cx,
+                    CompletionParams {
+                        reference: CompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: CompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
+                .await
+                .expect("typed completion uses the negotiated transport");
+            assert!(matches!(
+                completion,
+                CoreResult::Final(FinalCoreResult::Completion { .. })
+            ));
+            client.close(&cx).await.expect("close client transport");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn websocket_async_auto_wrong_error_never_attempts_a_fresh_legacy_transport() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let contacts = Arc::new(AtomicUsize::new(0));
+            let peer_contacts = Arc::clone(&contacts);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives Auto discovery")
+                    else {
+                        panic!("Auto must send discovery first");
+                    };
+                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(discover.method, SERVER_DISCOVER_METHOD);
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::error(
+                                Some(discover.id.expect("discovery has an ID")),
+                                JsonRpcError {
+                                    code: (-32600).into(),
+                                    message: "Method not found".to_owned(),
+                                    data: None,
+                                },
+                            )),
+                        )
+                        .await
+                        .expect("peer refuses discovery");
+                    let _ = server.recv(&peer_cx).await;
+                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                })
+                .expect("spawn refusing WebSocket peer");
+
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls_for_factory = Arc::clone(&factory_calls);
+            let mut first_transport = Some(AsyncWsClientTransport::from_upgraded(client_io));
+            let error = WebSocketClient::connect_auto_with_cx(
+                &cx,
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                move |_| {
+                    factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                    let transport = first_transport.take();
+                    async move {
+                        transport.ok_or_else(|| {
+                            McpError::internal_error("unexpected second Auto transport attempt")
+                        })
+                    }
+                },
+            )
+            .await
+            .expect_err("same refusal text with a non-MethodNotFound code is terminal");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(contacts.load(Ordering::SeqCst), 1);
+            assert!(
+                !peer.is_finished(),
+                "wrong discovery error must leave a peer-held connection without a second frame"
+            );
+            peer.abort();
+            let _ = peer.join(&cx).await;
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn websocket_async_auto_uses_one_fresh_legacy_transport_after_recognized_refusal() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (first_client_io, mut first_peer_io) = async_websocket_pair();
+            write_server_text_frame(
+                &mut first_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"peer-specific refusal text"}}"#,
+            )
+            .await;
+            let (legacy_client_io, mut legacy_peer_io) = async_websocket_pair();
+            write_server_text_frame(
+                &mut legacy_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fresh-legacy","version":"1.0"}}}"#,
+            )
+            .await;
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls_for_factory = Arc::clone(&factory_calls);
+            let mut transports = VecDeque::from([
+                AsyncWsClientTransport::from_upgraded(first_client_io),
+                AsyncWsClientTransport::from_upgraded(legacy_client_io),
+            ]);
+            let client = WebSocketClient::connect_auto_with_cx(
+                &cx,
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                move |_| {
+                    factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
+                    let transport = transports.pop_front();
+                    async move {
+                        transport.ok_or_else(|| {
+                            McpError::internal_error(
+                                "Auto exceeded its two fresh transport attempts",
+                            )
+                        })
+                    }
+                },
+            )
+            .await
+            .expect("recognized refusal retries only on a fresh exact legacy transport");
+            assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
+        });
+    }
+
+    #[test]
+    fn websocket_async_cancelled_connect_performs_no_transport_contact() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let contacts = Arc::new(AtomicUsize::new(0));
+            let peer_contacts = Arc::clone(&contacts);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let _ = server.recv(&peer_cx).await;
+                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                })
+                .expect("spawn idle WebSocket peer");
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+
+            let error = WebSocketClient::connect_with_cx(
+                &cancelled,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect_err("cancelled caller context must reject before discovery");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(contacts.load(Ordering::SeqCst), 0);
+            peer.abort();
+            let _ = peer.join(&cx).await;
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn websocket_async_exact_legacy_completion_is_isolated_and_callable() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let contacts = Arc::new(AtomicUsize::new(0));
+            let peer_contacts = Arc::clone(&contacts);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(initialize) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives exact initialize")
+                    else {
+                        panic!("exact legacy must initialize first");
+                    };
+                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(initialize.method, "initialize");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initialize.id.expect("initialize has an ID"),
+                                serde_json::json!({
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {},
+                                    "serverInfo": {
+                                        "name": "legacy-async-websocket-test",
+                                        "version": "1.0"
+                                    }
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends initialize response");
+                    let JsonRpcMessage::Request(initialized) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives initialized notification")
+                    else {
+                        panic!("exact legacy lifecycle frame must be a request notification");
+                    };
+                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(initialized.method, "notifications/initialized");
+                    assert!(initialized.id.is_none());
+                    let JsonRpcMessage::Request(completion) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives exact legacy completion")
+                    else {
+                        panic!("exact legacy completion must be a request");
+                    };
+                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(completion.method, "completion/complete");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                completion.id.expect("completion has an ID"),
+                                serde_json::json!({
+                                    "completion": {
+                                        "values": ["staging"],
+                                        "total": 1,
+                                        "hasMore": false
+                                    }
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends exact legacy completion response");
+                })
+                .expect("spawn exact legacy WebSocket peer");
+
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("exact legacy connection negotiates");
+            assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
+            let raw_next_id = client.next_id;
+            let raw_error = client
+                .request_with_raw_result(
+                    &cx,
+                    "tools/list",
+                    Some(serde_json::json!({
+                        "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+                    })),
+                )
+                .await
+                .expect_err("exact legacy raw request cannot send a final-only shape");
+            assert_eq!(raw_error.code, McpErrorCode::InvalidParams);
+            assert_eq!(
+                client.next_id, raw_next_id,
+                "wrong-era raw request must reject before allocating an ID or making contact",
+            );
+            let completion = client
+                .complete(
+                    &cx,
+                    CompletionParams {
+                        reference: CompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: CompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
+                .await
+                .expect("exact legacy completion remains callable after isolation");
+            assert!(matches!(
+                completion,
+                CoreResult::Legacy(LegacyCoreResult::Completion(_))
+            ));
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+            assert_eq!(contacts.load(Ordering::SeqCst), 3);
+            client
+                .close(&cx)
+                .await
+                .expect("close legacy client transport");
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn websocket_async_exact_legacy_reverse_handlers_are_caller_cx_owned() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(initialize) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives exact initialize")
+                    else {
+                        panic!("exact legacy must initialize first");
+                    };
+                    let initialize_source = serde_json::to_string(&initialize)
+                        .expect("initialize request serializes");
+                    assert!(initialize_source.contains("\"sampling\":{}"));
+                    assert!(initialize_source.contains("\"roots\":{\"listChanged\":false}"));
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initialize.id.expect("initialize has an ID"),
+                                serde_json::json!({
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {},
+                                    "serverInfo": {"name": "legacy-reverse", "version": "1.0"}
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer replies to initialize");
+                    let _ = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives initialized notification");
+                    let JsonRpcMessage::Request(completion) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives completion request")
+                    else {
+                        panic!("expected completion request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "sampling/createMessage",
+                                Some(serde_json::json!({"messages": [], "maxTokens": 3})),
+                                RequestId::Number(41),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends sampling request");
+                    let JsonRpcMessage::Response(sampling) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives sampling response")
+                    else {
+                        panic!("expected sampling response");
+                    };
+                    assert!(sampling.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(41))));
+                    assert!(sampling.error.is_none());
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "roots/list",
+                                Some(serde_json::json!({})),
+                                RequestId::Number(42),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends roots request");
+                    let JsonRpcMessage::Response(roots) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives roots response")
+                    else {
+                        panic!("expected roots response");
+                    };
+                    assert!(roots.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(42))));
+                    assert!(roots.error.is_none());
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                completion.id.expect("completion has an ID"),
+                                serde_json::json!({"completion": {"values": ["staging"], "total": 1, "hasMore": false}}),
+                            )),
+                        )
+                        .await
+                        .expect("peer replies to completion");
+                })
+                .expect("spawn exact legacy reverse peer");
+
+            let handlers = ReverseRequestHandlers::new()
+                .with_sampling_create_message(|callback_cx, _cancellation, _params| {
+                    Box::pin(async move {
+                        callback_cx
+                            .checkpoint()
+                            .map_err(|_| McpError::request_cancelled())?;
+                        Ok(CreateMessageResult::text("handled", "test-model"))
+                    })
+                })
+                .with_roots_list(|callback_cx, _cancellation, _params| {
+                    Box::pin(async move {
+                        callback_cx
+                            .checkpoint()
+                            .map_err(|_| McpError::request_cancelled())?;
+                        Ok(ListRootsResult::new(Vec::new()))
+                    })
+                });
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("exact legacy reverse client connects");
+            let result = client
+                .complete(
+                    &cx,
+                    CompletionParams {
+                        reference: CompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: CompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
+                .await
+                .expect("reverse callbacks remain within completion ownership");
+            assert!(matches!(
+                result,
+                CoreResult::Legacy(LegacyCoreResult::Completion(_))
+            ));
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+            client
+                .close(&cx)
+                .await
+                .expect("close exact legacy reverse client");
+        });
+    }
+
+    #[test]
+    fn websocket_async_modern_rejects_exact_legacy_reverse_rpc() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives discovery")
+                    else {
+                        panic!("expected discovery request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends discovery result");
+                    let _ = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives modern request");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "sampling/createMessage",
+                                Some(serde_json::json!({"messages": [], "maxTokens": 1})),
+                                RequestId::Number(99),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends forbidden legacy reverse request");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn modern reverse rejection peer");
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects");
+            let error = client
+                .request_with_raw_result(
+                    &cx,
+                    "tools/list",
+                    Some(
+                        client
+                            .with_modern_request_metadata(serde_json::json!({}))
+                            .expect("metadata"),
+                    ),
+                )
+                .await
+                .expect_err("modern rejects exact legacy reverse request");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(client.closed);
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
     #[test]
     fn websocket_modern_connection_multiplexes_progress_cancellation_and_exact_result_source() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -12849,7 +15436,7 @@ mod tests {
             sent: Arc::clone(&sent),
             closed: Arc::clone(&closed),
         };
-        let client = WebSocketClient::connect_with_cx(
+        let client = SynchronousWebSocketClient::connect_with_cx(
             Cx::for_testing(),
             ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
             ClientInfo {
@@ -12938,7 +15525,7 @@ mod tests {
                 r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
             )]),
         };
-        let error = WebSocketClient::connect_with_cx(
+        let error = SynchronousWebSocketClient::connect_with_cx(
             Cx::for_testing(),
             ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
             ClientInfo {
@@ -12980,7 +15567,7 @@ mod tests {
                 ),
             ]),
         };
-        let client = WebSocketClient::connect_with_cx(
+        let client = SynchronousWebSocketClient::connect_with_cx(
             Cx::for_testing(),
             ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
             ClientInfo {
