@@ -3,7 +3,8 @@
 //! This module extends the OAuth 2.0/2.1 server with OpenID Connect identity
 //! layer features:
 //!
-//! - **ID Token Issuance**: fail-closed until an FND-09 external signer is admitted
+//! - **ID Token Issuance**: fail-closed until an external signer completes
+//!   exact JWKS publication/read-back activation
 //! - **UserInfo Endpoint**: Standard endpoint for retrieving user claims
 //! - **Discovery Document**: `.well-known/openid-configuration` metadata
 //! - **Standard Claims**: OpenID Connect standard claim types
@@ -17,7 +18,8 @@
 //! The OIDC provider builds on top of [`OAuthServer`] by:
 //!
 //! 1. Adding the `openid` scope to enable OIDC flows
-//! 2. Reserving ID-token issuance for an FND-09 externally custodied signer
+//! 2. Reserving ID-token issuance for an externally custodied signer that has
+//!    completed JWKS publication/read-back activation
 //! 3. Providing standard endpoints for identity operations
 //!
 //! # Example
@@ -46,7 +48,18 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::oauth::{OAuthError, OAuthServer, OAuthServerConfig, OAuthToken, validate_oauth_issuer};
+use crate::oauth::{validate_oauth_issuer, OAuthError, OAuthServer, OAuthServerConfig, OAuthToken};
+
+/// Stable fail-closed diagnostic for ID-token issuance before a real external
+/// signer has completed the issuer's publication/read-back activation.
+///
+/// This is deliberately a constant rather than a configuration switch: an
+/// embedding host cannot enable ID-token signing by setting a boolean or by
+/// supplying a local key. The future activation path must bind a concrete
+/// external signer, its immutable generation, every advertised JWKS endpoint,
+/// and successful read-back before it can replace this refusal.
+pub const OIDC_ID_TOKEN_SIGNING_ACTIVATION_REQUIRED: &str =
+    "OIDC ID-token issuance is unavailable until an external signer completes JWKS publication/read-back activation";
 
 // =============================================================================
 // Configuration
@@ -802,8 +815,10 @@ impl OidcProvider {
         let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.clone());
         doc.scopes_supported = self.config.supported_scopes.clone();
         doc.claims_supported = Some(self.config.supported_claims.clone());
-        // Do not advertise an algorithm or JWKS while FND-09 external signer
-        // custody is unavailable.
+        // Do not advertise an algorithm or JWKS while there is no activated
+        // external signer. Constructing a protocol-level signer facade is
+        // insufficient: issuance requires exact JWKS publication/read-back
+        // activation in the owning server path.
         doc.id_token_signing_alg_values_supported = Vec::new();
         doc.jwks_uri = None;
         doc
@@ -813,16 +828,16 @@ impl OidcProvider {
     // ID Token Issuance
     // -------------------------------------------------------------------------
 
-    /// ID-token issuance is intentionally unavailable until FND-09 admits an
-    /// externally custodied signer. No local JWT is constructed or cached.
+    /// ID-token issuance is intentionally unavailable until an external
+    /// signer completes the issuer's JWKS publication/read-back activation.
+    /// No local JWT is constructed or cached.
     pub fn issue_id_token(
         &self,
         _access_token: &OAuthToken,
         _nonce: Option<&str>,
     ) -> Result<IdToken, OidcError> {
         Err(OidcError::SigningError(
-            "OIDC ID-token issuance is unavailable until the FND-09 external signer/provider is admitted"
-                .to_string(),
+            OIDC_ID_TOKEN_SIGNING_ACTIVATION_REQUIRED.to_string(),
         ))
     }
 
@@ -966,10 +981,54 @@ mod non_signing_tests {
             subject: Some("subject".to_string()),
             is_refresh_token: false,
         };
-        assert!(matches!(
-            provider.issue_id_token(&token, None),
-            Err(OidcError::SigningError(_))
-        ));
+        let error = provider
+            .issue_id_token(&token, None)
+            .expect_err("an unactivated signer must not issue an ID token");
+        assert!(matches!(error, OidcError::SigningError(_)));
+        assert_eq!(error.to_string(), "ID token signing failed");
+    }
+
+    #[test]
+    fn fnd_09_b_positive() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let provider = OidcProvider::with_defaults(oauth).expect("default provider");
+        let discovery = provider.discovery_document("https://issuer.example");
+
+        assert!(discovery.id_token_signing_alg_values_supported.is_empty());
+        assert!(discovery.jwks_uri.is_none());
+    }
+
+    #[test]
+    fn fnd_09_b_planted_negative() {
+        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
+        let provider = OidcProvider::with_defaults(oauth).expect("default provider");
+        let discovery_before = provider.discovery_document("https://issuer.example");
+        let token = OAuthToken {
+            token: "opaque".to_string(),
+            token_type: crate::oauth::TokenType::Bearer,
+            client_id: "client".to_string(),
+            scopes: vec!["openid".to_string()],
+            resource: None,
+            issued_at: std::time::Instant::now(),
+            expires_at: std::time::Instant::now(),
+            subject: Some("subject".to_string()),
+            is_refresh_token: false,
+        };
+
+        let error = provider
+            .issue_id_token(&token, None)
+            .expect_err("changing only the issuance attempt must remain fail-closed");
+        let discovery_after = provider.discovery_document("https://issuer.example");
+
+        let OidcError::SigningError(description) = error else {
+            panic!("unactivated issuance must return the signing activation error");
+        };
+        assert_eq!(description, OIDC_ID_TOKEN_SIGNING_ACTIVATION_REQUIRED);
+        assert_eq!(
+            discovery_after.id_token_signing_alg_values_supported,
+            discovery_before.id_token_signing_alg_values_supported
+        );
+        assert_eq!(discovery_after.jwks_uri, discovery_before.jwks_uri);
     }
 
     #[test]
