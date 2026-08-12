@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::{Implementation, JsonInteger, OpenMetadata};
-use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
+use crate::jsonrpc::{admit_raw_jsonrpc_document, RawJsonAdmissionError};
 use crate::protocol_policy::ProtocolEra;
 
 /// Maximum encoded bytes accepted by the result codec.
@@ -432,6 +432,18 @@ const FINAL_ONLY_METADATA_MEMBER_NAMES: [&str; 5] = [
     "io.modelcontextprotocol/subscriptionId",
 ];
 
+/// Reserved final metadata members that belong only to a request.
+///
+/// The protocol version and client facts select and constrain a request; a
+/// peer response must not be allowed to echo or redefine them as open result
+/// metadata. Server identity and subscription correlation remain valid
+/// response metadata and are therefore intentionally excluded here.
+const FINAL_REQUEST_ONLY_METADATA_MEMBER_NAMES: [&str; 3] = [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientCapabilities",
+    "io.modelcontextprotocol/clientInfo",
+];
+
 /// Returns whether an otherwise legacy result envelope carries a reserved
 /// final-era metadata member.
 ///
@@ -457,6 +469,16 @@ fn exact_result_carries_final_only_metadata(members: &ExactJsonObject) -> bool {
                 .iter()
                 .any(|member| metadata.get(member).is_some())
     )
+}
+
+fn exact_result_request_only_metadata_member(members: &ExactJsonObject) -> Option<&'static str> {
+    let ExactJsonValue::Object(metadata) = members.get("_meta")? else {
+        return None;
+    };
+    FINAL_REQUEST_ONLY_METADATA_MEMBER_NAMES
+        .iter()
+        .copied()
+        .find(|member| metadata.get(member).is_some())
 }
 
 fn validate_local_result_members(members: &[ExactJsonMember]) -> Result<(), ResultDecodeError> {
@@ -1008,6 +1030,14 @@ pub fn decode_peer_result(
             ResultDecodeErrorKind::InvalidKnownMember,
             "$._meta",
         ));
+    }
+    if era == ResultPeerEra::Modern {
+        if let Some(member) = exact_result_request_only_metadata_member(&members) {
+            return Err(ResultDecodeError::new(
+                ResultDecodeErrorKind::InvalidKnownMember,
+                format!("$._meta.{member}"),
+            ));
+        }
     }
     match policy.decide(&result_type.0) {
         ResultDiscriminatorDecision::Rejected => {
@@ -1958,6 +1988,41 @@ mod tests {
         .expect("rejections do not mutate final result admission");
         assert_eq!(encode_result(&baseline), accepted);
         assert_eq!(encode_result(&reaccepted), accepted);
+    }
+
+    #[test]
+    fn final_result_rejects_request_metadata_without_mutating_admission() {
+        let accepted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"},"com.example/trace":"retained"},"extension":true}"#;
+        let (baseline, diagnostic) = decode_peer_result(
+            accepted,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("response-only final metadata is admitted");
+        assert_eq!(diagnostic, None);
+        let baseline_wire = encode_result(&baseline);
+
+        let planted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"},"com.example/trace":"retained","io.modelcontextprotocol/protocolVersion":"2026-07-28"},"extension":true}"#;
+        let error = decode_peer_result(
+            planted,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect_err("adding only request protocol metadata rejects a final response");
+        assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+        assert_eq!(
+            error.path(),
+            "$._meta.io.modelcontextprotocol/protocolVersion"
+        );
+
+        let (reaccepted, diagnostic) = decode_peer_result(
+            accepted,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("rejection does not mutate subsequent final result admission");
+        assert_eq!(diagnostic, None);
+        assert_eq!(encode_result(&reaccepted), baseline_wire);
     }
 
     #[test]

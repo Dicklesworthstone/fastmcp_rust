@@ -9,14 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::SerializeMap};
+use serde::{de::Error as _, ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::OpenMetadata;
 use crate::result::CacheTtl;
 use crate::{
-    ExtensionId, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY,
-    ResultPeerDiagnostic, ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION,
+    protocol_version::FINAL_PROTOCOL_VERSION, ExtensionId, ResultPeerDiagnostic, ServerInfo,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY,
 };
 
 /// The exact JSON-RPC method for final server discovery.
@@ -277,6 +277,17 @@ const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 13] = [
     "pollIntervalMs",
     "result",
     "error",
+];
+
+/// Reserved final request metadata that is invalid in a discovery response.
+///
+/// `server/discover` is consumed directly by client initialization, instead
+/// of through the generic result codec, so it must enforce the same
+/// request/result metadata boundary itself.
+const DISCOVERY_REQUEST_ONLY_METADATA_MEMBERS: [&str; 3] = [
+    "io.modelcontextprotocol/protocolVersion",
+    "io.modelcontextprotocol/clientCapabilities",
+    "io.modelcontextprotocol/clientInfo",
 ];
 
 /// Required final caching hints for a `server/discover` result.
@@ -748,6 +759,15 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
                 "server/discover result contains a contradictory final result member",
             ));
         }
+        if wire.metadata.extras.keys().any(|name| {
+            DISCOVERY_REQUEST_ONLY_METADATA_MEMBERS
+                .iter()
+                .any(|forbidden| name == forbidden)
+        }) {
+            return Err(D::Error::custom(
+                "server/discover result contains request-only final metadata",
+            ));
+        }
         Ok(Self {
             result_type: COMPLETE_DISCOVERY_RESULT_TYPE.to_owned(),
             peer_missing_result_type,
@@ -835,13 +855,13 @@ impl Error for ServerDiscoveryError {}
 mod tests {
     use std::collections::BTreeMap;
 
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     use crate::{
-        DiscoveryCacheHints, ResultPeerDiagnostic, SERVER_DISCOVER_METHOD,
-        SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior, ServerBehaviorRegistry,
+        DiscoveryCacheHints, ResultPeerDiagnostic, ServerBehavior, ServerBehaviorRegistry,
         ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
-        ServerDiscoveryError, ServerInfo, ServerInstructions,
+        ServerDiscoveryError, ServerInfo, ServerInstructions, SERVER_DISCOVER_METHOD,
+        SERVER_DISCOVER_SUPPORTED_VERSIONS,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
@@ -1121,6 +1141,37 @@ mod tests {
             serde_json::to_vec(&admitted).expect("the admitted result still encodes"),
             unchanged_before,
             "rejecting a contradictory result cannot mutate locally admitted state"
+        );
+    }
+
+    #[test]
+    fn server_discover_rejects_request_metadata_without_mutating_admission() {
+        let admitted = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "contract-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let admitted_wire = serde_json::to_value(&admitted).expect("admitted discovery encodes");
+        let baseline = serde_json::from_value::<ServerDiscoverResult>(admitted_wire.clone())
+            .expect("response-only discovery metadata is admitted");
+        let baseline_wire = serde_json::to_value(&baseline).expect("baseline re-encodes");
+
+        let mut planted = admitted_wire.clone();
+        planted["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2026-07-28");
+        assert!(
+            serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
+            "adding only request protocol metadata rejects the discovery response"
+        );
+
+        let reaccepted = serde_json::from_value::<ServerDiscoverResult>(admitted_wire)
+            .expect("rejection does not mutate subsequent discovery admission");
+        assert_eq!(
+            serde_json::to_value(reaccepted).expect("reaccepted discovery re-encodes"),
+            baseline_wire
         );
     }
 
