@@ -5793,6 +5793,8 @@ const WEBSOCKET_HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 #[cfg(feature = "websocket")]
 const WEBSOCKET_DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(feature = "websocket")]
+const WEBSOCKET_DRIVER_POLL_INTERVAL_NANOS: u64 = 5_000_000;
+#[cfg(feature = "websocket")]
 const WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "websocket")]
 static NEXT_WEBSOCKET_AUTH_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -5825,7 +5827,7 @@ pub enum WebSocketServerShutdown {
 #[cfg(feature = "websocket")]
 #[must_use = "settle retained WebSocket connection children before discarding this outcome"]
 pub struct WebSocketNonquiescentShutdown {
-    children: Vec<asupersync::runtime::TaskHandle<()>>,
+    children: WebSocketConnectionChildren,
     server: Arc<Server>,
     listener_error: Option<McpError>,
     shutdown_complete: bool,
@@ -5836,7 +5838,7 @@ impl WebSocketNonquiescentShutdown {
     /// Number of accepted connections that still require caller-owned settlement.
     #[must_use]
     pub const fn remaining_connections(&self) -> usize {
-        self.children.len()
+        self.children.tasks.len()
     }
 
     /// Returns the listener failure that ended acceptance, when one occurred.
@@ -5846,48 +5848,55 @@ impl WebSocketNonquiescentShutdown {
     }
 
     /// Observes retained children for at most `timeout`, without detaching them.
-    pub async fn settle_for(&mut self, timeout: Duration) -> bool {
+    ///
+    /// Returns `Ok(true)` only when every child completed successfully. A
+    /// recorded child failure takes precedence over a listener failure after
+    /// all children have been observed and cleanup has run; `Ok(false)`
+    /// retains caller-owned work.
+    pub async fn settle_for(&mut self, timeout: Duration) -> McpResult<bool> {
         let deadline = Instant::now() + timeout;
-        while !self.children.is_empty() && Instant::now() < deadline {
-            reap_websocket_connection_children(&mut self.children);
-            if !self.children.is_empty() {
+        while !self.children.tasks.is_empty() && Instant::now() < deadline {
+            self.children.reap_finished();
+            if !self.children.tasks.is_empty() {
                 asupersync::runtime::yield_now().await;
             }
         }
-        if self.children.is_empty() {
+        if self.children.tasks.is_empty() {
+            let terminal_failure = self.children.terminal_failure();
+            let listener_error = self.listener_error.clone();
             if !self.shutdown_complete {
                 self.server.graceful_shutdown_returning();
                 self.shutdown_complete = true;
             }
-            true
+            if let Some(error) = terminal_failure {
+                Err(error)
+            } else if let Some(error) = listener_error {
+                Err(error)
+            } else {
+                Ok(true)
+            }
         } else {
-            false
+            Ok(false)
         }
     }
 
     /// Joins every retained connection in the caller's context.
     pub async fn settle(mut self, cx: &Cx) -> McpResult<()> {
-        let mut child_failures = Vec::new();
-        while let Some(mut child) = self.children.pop() {
+        self.children.reap_finished();
+        while let Some(mut child) = self.children.tasks.pop() {
             match child.join(cx).await {
-                Ok(()) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
-                Err(error) => child_failures.push(error.to_string()),
+                Ok(Ok(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Ok(Err(error)) => self.children.record_failure(error.to_string()),
+                Err(error) => self.children.record_failure(error.to_string()),
             }
         }
+        let terminal_failure = self.children.terminal_failure();
         if !self.shutdown_complete {
             self.server.graceful_shutdown_returning();
             self.shutdown_complete = true;
         }
-        if !child_failures.is_empty() {
-            let listener = self
-                .listener_error
-                .as_ref()
-                .map(|error| format!("; listener error: {error}"))
-                .unwrap_or_default();
-            return Err(McpError::internal_error(format!(
-                "WebSocket connection child settlement failure(s): {}{listener}",
-                child_failures.join("; ")
-            )));
+        if let Some(error) = terminal_failure {
+            return Err(error);
         }
         if let Some(error) = self.listener_error {
             return Err(error);
@@ -5919,9 +5928,9 @@ impl BoundWebSocketServer {
         }
 
         let connection_scope = cx.scope();
-        let mut children = Vec::new();
+        let mut children = WebSocketConnectionChildren::default();
         let accept_result = loop {
-            reap_websocket_connection_children(&mut children);
+            children.reap_finished();
             if cx.checkpoint().is_err() {
                 break Ok(());
             }
@@ -5946,13 +5955,9 @@ impl BoundWebSocketServer {
             let path = self.path.clone();
             match cx.spawn_in(&connection_scope, move |connection_cx| async move {
                 let _permit = permit;
-                if let Err(error) =
-                    serve_websocket_connection(&connection_cx, stream, server, &path).await
-                {
-                    debug!(target: targets::TRANSPORT, "WebSocket connection closed: {error}");
-                }
+                serve_websocket_connection(&connection_cx, stream, server, &path).await
             }) {
-                Ok(child) => children.push(child),
+                Ok(child) => children.tasks.push(child),
                 Err(error) => {
                     break Err(McpError::internal_error(format!(
                         "WebSocket connection task admission failed: {error}"
@@ -5961,18 +5966,26 @@ impl BoundWebSocketServer {
             }
         };
 
-        for child in &mut children {
+        // Capture failures that completed while `accept` was parked before
+        // aborting live children. Otherwise an abort could turn an already
+        // terminal task into an indistinguishable cancellation outcome.
+        children.reap_finished();
+        for child in &mut children.tasks {
             child.abort();
         }
         let deadline = Instant::now() + WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT;
-        while !children.is_empty() && Instant::now() < deadline {
-            reap_websocket_connection_children(&mut children);
-            if !children.is_empty() {
+        while !children.tasks.is_empty() && Instant::now() < deadline {
+            children.reap_finished();
+            if !children.tasks.is_empty() {
                 asupersync::runtime::yield_now().await;
             }
         }
-        if children.is_empty() {
+        if children.tasks.is_empty() {
+            let terminal_failure = children.terminal_failure();
             self.server.graceful_shutdown_returning();
+            if let Some(error) = terminal_failure {
+                return Err(error);
+            }
             accept_result?;
             Ok(WebSocketServerShutdown::Quiescent)
         } else {
@@ -5989,18 +6002,41 @@ impl BoundWebSocketServer {
 }
 
 #[cfg(feature = "websocket")]
-fn reap_websocket_connection_children(children: &mut Vec<asupersync::runtime::TaskHandle<()>>) {
-    let mut active = Vec::with_capacity(children.len());
-    for mut child in std::mem::take(children) {
-        match child.try_join() {
-            Ok(None) => active.push(child),
-            Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
-            Err(error) => {
-                debug!(target: targets::TRANSPORT, "WebSocket connection child failed: {error}")
+#[derive(Default)]
+struct WebSocketConnectionChildren {
+    tasks: Vec<asupersync::runtime::TaskHandle<McpResult<()>>>,
+    /// The first connection failure observed by a nonblocking reaper. Later
+    /// failures are still drained, but cannot overwrite the original causal
+    /// failure presented to the lifecycle caller.
+    terminal_failure: Option<String>,
+}
+
+#[cfg(feature = "websocket")]
+impl WebSocketConnectionChildren {
+    fn record_failure(&mut self, failure: String) {
+        self.terminal_failure.get_or_insert(failure);
+    }
+
+    fn terminal_failure(&self) -> Option<McpError> {
+        self.terminal_failure.as_ref().map(|failure| {
+            McpError::internal_error(format!(
+                "WebSocket connection child settlement failure: {failure}"
+            ))
+        })
+    }
+
+    fn reap_finished(&mut self) {
+        let mut active = Vec::with_capacity(self.tasks.len());
+        for mut child in std::mem::take(&mut self.tasks) {
+            match child.try_join() {
+                Ok(None) => active.push(child),
+                Ok(Some(Ok(()))) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Ok(Some(Err(error))) => self.record_failure(error.to_string()),
+                Err(error) => self.record_failure(error.to_string()),
             }
         }
+        self.tasks = active;
     }
-    *children = active;
 }
 
 #[cfg(feature = "websocket")]
@@ -6282,8 +6318,15 @@ fn raw_websocket_upgrade_authorization_is_admissible(head: &[u8]) -> Result<(), 
             }
             continue;
         };
-        if name.trim().eq_ignore_ascii_case("authorization") {
-            if value.trim().is_empty() || authorization.replace(value).is_some() {
+        let normalized_name = name.trim();
+        if normalized_name.eq_ignore_ascii_case("authorization") {
+            // OWS belongs after the colon, never in an HTTP field-name.
+            // Treat an Authorization-shaped malformed line as an auth denial
+            // so it cannot fall through to the generic Upgrade 400 path.
+            if name != normalized_name
+                || value.trim().is_empty()
+                || authorization.replace(value).is_some()
+            {
                 return Err(());
             }
         }
@@ -6340,7 +6383,9 @@ async fn run_websocket_dispatch_bridge(
         if cx.checkpoint().is_err() {
             break Ok(());
         }
-        let deadline = cx.now().saturating_add(WEBSOCKET_DRIVER_POLL_INTERVAL);
+        let deadline = cx
+            .now()
+            .saturating_add_nanos(WEBSOCKET_DRIVER_POLL_INTERVAL_NANOS);
         match asupersync::time::timeout_at(deadline, transport.recv(cx)).await {
             Ok(Ok(mut message)) => {
                 if let JsonRpcMessage::Request(request) = &mut message {
@@ -6741,13 +6786,13 @@ impl AuthDispatchCustody {
         ctx: &McpContext,
         inbound: &InboundRequestContext,
         request: &mut JsonRpcRequest,
-        websocket_connection_generation: Option<u64>,
+        _websocket_connection_generation: Option<u64>,
     ) -> Result<Sha256Digest, McpError> {
         match self {
             Self::Http(receipt) => receipt.commit(ctx, inbound, request),
             #[cfg(feature = "websocket")]
             Self::WebSocket(custody) => {
-                if websocket_connection_generation != Some(custody.connection_generation)
+                if _websocket_connection_generation != Some(custody.connection_generation)
                     || custody
                         .rejected_inband_request_ids
                         .lock()
@@ -7587,6 +7632,7 @@ impl ServerHttpSession {
                     endpoint_response,
                     transport_authorization,
                     raw_params,
+                    Some(auth_receipt),
                     None,
                 )
                 .map(Err);
@@ -10274,7 +10320,7 @@ impl Server {
     async fn dispatch_stateless_owned_with_cancellation(
         self: Arc<Self>,
         inbound: &InboundRequestContext,
-        request: JsonRpcRequest,
+        mut request: JsonRpcRequest,
         raw_params: Option<Arc<str>>,
         auth_receipt: Option<AuthDispatchCustody>,
         websocket_connection_generation: Option<u64>,
@@ -14247,12 +14293,15 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
+                        // This legacy stdio loop has no connection-level
+                        // native Authorization custody. `None` deliberately
+                        // selects ordinary per-request admission below; it
+                        // does not bypass configured authentication.
+                        let inbound = InboundRequestContext::with_modern_connection(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
-                            transport_authorization.clone().unwrap_or_default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
@@ -14260,8 +14309,8 @@ impl Server {
                             &inbound,
                             request,
                             None,
-                            auth_receipt.clone(),
-                            auth_custody_generation,
+                            None,
+                            None,
                             None,
                             request_cancellation,
                             None,
@@ -14651,12 +14700,14 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
+                        // This returning legacy stdio loop likewise owns no
+                        // native header receipt or WebSocket generation.
+                        // Per-request authentication remains mandatory.
+                        let inbound = InboundRequestContext::with_modern_connection(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
-                            transport_authorization.clone().unwrap_or_default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
@@ -14664,8 +14715,8 @@ impl Server {
                             &inbound,
                             request,
                             None,
-                            auth_receipt.clone(),
-                            auth_custody_generation,
+                            None,
+                            None,
                             None,
                             request_cancellation,
                             None,
@@ -16293,9 +16344,10 @@ impl Server {
             self.authenticate_request_without_commit(ctx, request)?;
         Self::enforce_request_context(ctx)?;
         match authenticated {
-            Some(auth) if ctx.set_auth(auth) => Ok(fingerprint),
-            Some(_) => {
-                if let Some(error) = Self::request_context_error(ctx) {
+            Some(auth) => {
+                if ctx.set_auth(auth) {
+                    Ok(fingerprint)
+                } else if let Some(error) = Self::request_context_error(ctx) {
                     Err(error)
                 } else {
                     Err(McpError::internal_error(
@@ -17745,6 +17797,199 @@ mod lib_unit_tests {
 
     #[cfg(feature = "websocket")]
     #[test]
+    fn live_websocket_successful_child_reports_quiescent_before_shutdown_cleanup() {
+        run_live_http_test(|cx| async move {
+            use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+            let peer_closed = Arc::new(AtomicBool::new(false));
+            let cleanup_after_peer_close = Arc::new(AtomicBool::new(false));
+            let shutdown_calls = Arc::new(AtomicUsize::new(0));
+            let observed_peer_close = Arc::clone(&peer_closed);
+            let observed_cleanup = Arc::clone(&cleanup_after_peer_close);
+            let observed_shutdown_calls = Arc::clone(&shutdown_calls);
+            let listener = Server::new("live-websocket-successful-child", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern-only policy is available")
+                .on_shutdown(move || {
+                    observed_shutdown_calls.fetch_add(1, Ordering::AcqRel);
+                    observed_cleanup.store(
+                        observed_peer_close.load(Ordering::Acquire),
+                        Ordering::Release,
+                    );
+                })
+                .build()
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("successful-child WebSocket bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("successful-child WebSocket address failed: {error}"))?;
+            let scope = cx.scope();
+            let mut listener_task = cx
+                .spawn_in(&scope, move |listener_cx| async move {
+                    listener.serve(&listener_cx).await
+                })
+                .map_err(|error| {
+                    format!("successful-child WebSocket listener admission failed: {error}")
+                })?;
+            let opening = concat!(
+                "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n",
+                "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            let (mut client, accepted) =
+                websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !accepted.starts_with(b"HTTP/1.1 101") {
+                return Err("successful WebSocket child was not upgraded".to_owned());
+            }
+            client
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("successful WebSocket close write failed: {error}"))?;
+            client
+                .flush()
+                .await
+                .map_err(|error| format!("successful WebSocket close flush failed: {error}"))?;
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            let mut close_reply = [0_u8; 32];
+            let close_read = asupersync::time::timeout_at(deadline, client.read(&mut close_reply))
+                .await
+                .map_err(|_| "successful WebSocket close reply timed out".to_owned())?
+                .map_err(|error| format!("successful WebSocket close reply failed: {error}"))?;
+            if close_read < 2 || close_reply[0] & 0x0f != 0x08 {
+                return Err("successful WebSocket child did not complete a close reply".to_owned());
+            }
+            peer_closed.store(true, Ordering::Release);
+            drop(client);
+            cx.cancel_with(
+                CancelKind::User,
+                Some("successful WebSocket child settlement proof complete"),
+            );
+            let join_cx = Cx::for_testing();
+            let shutdown = listener_task
+                .join(&join_cx)
+                .await
+                .map_err(|error| format!("successful WebSocket listener join failed: {error:?}"))?
+                .map_err(|error| format!("successful WebSocket listener failed: {error}"))?;
+            if !matches!(shutdown, WebSocketServerShutdown::Quiescent)
+                || shutdown_calls.load(Ordering::Acquire) != 1
+                || !cleanup_after_peer_close.load(Ordering::Acquire)
+            {
+                return Err(
+                    "successful WebSocket child did not settle before quiescent cleanup".to_owned(),
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn live_websocket_failing_child_is_reported_after_cleanup_observes_terminal_peer() {
+        run_live_http_test(|cx| async move {
+            use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+            let peer_terminal = Arc::new(AtomicBool::new(false));
+            let cleanup_after_peer_terminal = Arc::new(AtomicBool::new(false));
+            let shutdown_calls = Arc::new(AtomicUsize::new(0));
+            let observed_peer_terminal = Arc::clone(&peer_terminal);
+            let observed_cleanup = Arc::clone(&cleanup_after_peer_terminal);
+            let observed_shutdown_calls = Arc::clone(&shutdown_calls);
+            let listener = Server::new("live-websocket-failing-child", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern-only policy is available")
+                .on_shutdown(move || {
+                    observed_shutdown_calls.fetch_add(1, Ordering::AcqRel);
+                    observed_cleanup.store(
+                        observed_peer_terminal.load(Ordering::Acquire),
+                        Ordering::Release,
+                    );
+                })
+                .build()
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("failing-child WebSocket bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("failing-child WebSocket address failed: {error}"))?;
+            let scope = cx.scope();
+            let mut listener_task = cx
+                .spawn_in(&scope, move |listener_cx| async move {
+                    listener.serve(&listener_cx).await
+                })
+                .map_err(|error| {
+                    format!("failing-child WebSocket listener admission failed: {error}")
+                })?;
+            let opening = concat!(
+                "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n",
+                "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            let (mut client, accepted) =
+                websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !accepted.starts_with(b"HTTP/1.1 101") {
+                return Err("failing WebSocket child was not upgraded".to_owned());
+            }
+            // Reserved opcode 0x03 is a decoded-frame failure, not a clean
+            // peer close. The real connection child must return that failure
+            // to the listener-owned TaskHandle.
+            client
+                .write_all(&masked_websocket_frame(0x03, &[]))
+                .await
+                .map_err(|error| format!("failing WebSocket frame write failed: {error}"))?;
+            client
+                .flush()
+                .await
+                .map_err(|error| format!("failing WebSocket frame flush failed: {error}"))?;
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            let mut terminal = [0_u8; 32];
+            let terminal_read = asupersync::time::timeout_at(deadline, client.read(&mut terminal))
+                .await
+                .map_err(|_| "failing WebSocket terminal response timed out".to_owned())?
+                .map_err(|error| format!("failing WebSocket terminal response failed: {error}"))?;
+            if terminal_read != 0 && (terminal_read < 2 || terminal[0] & 0x0f != 0x08) {
+                return Err(
+                    "failing WebSocket child did not terminate the invalid frame".to_owned(),
+                );
+            }
+            peer_terminal.store(true, Ordering::Release);
+            drop(client);
+
+            // A second accepted socket makes the listener reap the first
+            // terminal child on its real accept-loop path before shutdown.
+            let reaper_trigger = opening.replace("Connection: Upgrade", "Connection: keep-alive");
+            let (_trigger, rejected) =
+                websocket_upgrade(&cx, address, reaper_trigger.as_bytes()).await?;
+            if !rejected.starts_with(b"HTTP/1.1 400") {
+                return Err("failing-child reaper trigger did not reach the listener".to_owned());
+            }
+            cx.cancel_with(
+                CancelKind::User,
+                Some("failing WebSocket child settlement proof complete"),
+            );
+            let join_cx = Cx::for_testing();
+            let error = listener_task
+                .join(&join_cx)
+                .await
+                .map_err(|error| format!("failing WebSocket listener join failed: {error:?}"))?
+                .expect_err("failing WebSocket child must prevent a quiescent success result");
+            if !error
+                .message
+                .contains("WebSocket connection child settlement failure")
+                || shutdown_calls.load(Ordering::Acquire) != 1
+                || !cleanup_after_peer_terminal.load(Ordering::Acquire)
+            {
+                return Err(
+                    "failing WebSocket child was hidden or cleanup preceded terminal settlement"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
     fn live_websocket_upgrade_owns_connection_teardown_and_preserves_peer_isolation() {
         run_live_http_test(|cx| async move {
             use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -18221,7 +18466,7 @@ mod lib_unit_tests {
 
     #[cfg(feature = "websocket")]
     #[test]
-    fn websocket_nonquiescent_settlement_drains_cancelled_and_failed_children_before_cleanup() {
+    fn websocket_nonquiescent_settle_for_retains_abort_race_and_reaped_panic() {
         run_live_http_test(|cx| async move {
             let shutdown_calls = Arc::new(AtomicUsize::new(0));
             let shutdown_observer = Arc::clone(&shutdown_calls);
@@ -18233,25 +18478,51 @@ mod lib_unit_tests {
                     .build(),
             );
             let scope = cx.scope();
-            let mut cancelled = cx
-                .spawn_in(&scope, move |child_cx| async move {
-                    loop {
-                        let _ = asupersync::time::sleep(child_cx.now(), Duration::from_millis(10))
-                            .await;
+            let release_live_child = Arc::new(AtomicBool::new(false));
+            let live_child_release = Arc::clone(&release_live_child);
+            let live_child_started = Arc::new(AtomicBool::new(false));
+            let live_child_started_observer = Arc::clone(&live_child_started);
+            let mut retained_live = cx
+                .spawn_in(&scope, move |_child_cx| async move {
+                    live_child_started_observer.store(true, Ordering::Release);
+                    while !live_child_release.load(Ordering::Acquire) {
+                        // Deliberately ignore the child Cx cancellation. This
+                        // is the shutdown-debt shape that must remain caller
+                        // owned after the listener aborts its child.
+                        asupersync::runtime::yield_now().await;
                     }
+                    Ok(())
                 })
-                .map_err(|error| format!("cancelled WebSocket child admission failed: {error}"))?;
+                .map_err(|error| format!("retained WebSocket child admission failed: {error}"))?;
+            let started_deadline = Instant::now() + Duration::from_secs(1);
+            while !live_child_started.load(Ordering::Acquire) && Instant::now() < started_deadline {
+                asupersync::runtime::yield_now().await;
+            }
+            if !live_child_started.load(Ordering::Acquire) {
+                return Err("WebSocket retained child did not begin before abort".to_owned());
+            }
             let failed = cx
                 .spawn_in(&scope, move |_child_cx| async move {
                     panic!("forced WebSocket child failure")
                 })
                 .map_err(|error| format!("failed WebSocket child admission failed: {error}"))?;
-            cancelled.abort();
-            // Let the explicit failure become terminal before settlement;
-            // `settle` must nevertheless drain the cancelled sibling too.
-            asupersync::runtime::yield_now().await;
+            retained_live.abort();
+            let mut children = WebSocketConnectionChildren {
+                tasks: vec![retained_live, failed],
+                terminal_failure: None,
+            };
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while children.terminal_failure.is_none() && Instant::now() < deadline {
+                children.reap_finished();
+                if children.terminal_failure.is_none() {
+                    asupersync::runtime::yield_now().await;
+                }
+            }
+            if children.terminal_failure.is_none() {
+                return Err("WebSocket child reaper did not retain the forced panic".to_owned());
+            }
             let retained = WebSocketServerShutdown::Nonquiescent(WebSocketNonquiescentShutdown {
-                children: vec![cancelled, failed],
+                children,
                 server,
                 listener_error: None,
                 shutdown_complete: false,
@@ -18259,13 +18530,29 @@ mod lib_unit_tests {
             let WebSocketServerShutdown::Nonquiescent(retained) = retained else {
                 return Err("forced WebSocket retained work did not report Nonquiescent".to_owned());
             };
-            if retained.remaining_connections() != 2 {
+            if retained.remaining_connections() != 1 {
                 return Err(
-                    "forced WebSocket retained work lost a child before settlement".to_owned(),
+                    "WebSocket abort race did not retain exactly one live caller-owned child"
+                        .to_owned(),
                 );
             }
+            let mut retained = retained;
+            if retained
+                .settle_for(Duration::ZERO)
+                .await
+                .map_err(|error| format!("WebSocket retained-child probe failed: {error}"))?
+            {
+                return Err(
+                    "WebSocket settle_for falsely reported an abort-race child as settled"
+                        .to_owned(),
+                );
+            }
+            if retained.remaining_connections() != 1 {
+                return Err("WebSocket settle_for detached or lost the abort-race child".to_owned());
+            }
+            release_live_child.store(true, Ordering::Release);
             let error = retained
-                .settle(&cx)
+                .settle_for(Duration::from_secs(1))
                 .await
                 .expect_err("a real child failure must be returned after all children drain");
             if !error
@@ -18276,6 +18563,40 @@ mod lib_unit_tests {
                 return Err(
                     "WebSocket settlement skipped cleanup or hid its recorded child failure"
                         .to_owned(),
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_settle_for_returns_listener_failure_after_cleanup() {
+        run_live_http_test(|cx| async move {
+            let shutdown_calls = Arc::new(AtomicUsize::new(0));
+            let shutdown_observer = Arc::clone(&shutdown_calls);
+            let server = Arc::new(
+                Server::new("websocket-settle-for-listener-error", "1.0.0")
+                    .on_shutdown(move || {
+                        shutdown_observer.fetch_add(1, Ordering::AcqRel);
+                    })
+                    .build(),
+            );
+            let mut retained = WebSocketNonquiescentShutdown {
+                children: WebSocketConnectionChildren::default(),
+                server,
+                listener_error: Some(McpError::internal_error("forced accept-loop failure")),
+                shutdown_complete: false,
+            };
+            let error = retained
+                .settle_for(Duration::ZERO)
+                .await
+                .expect_err("settle_for must not hide a recorded listener failure");
+            if !error.message.contains("forced accept-loop failure")
+                || shutdown_calls.load(Ordering::Acquire) != 1
+            {
+                return Err(
+                    "WebSocket settle_for did not preserve listener error after cleanup".to_owned(),
                 );
             }
             Ok(())
@@ -30799,9 +31120,11 @@ mod lib_unit_tests {
                             ),
                         )
                         .await?;
-                        let missing =
-                            live_http_exchange(address, live_http_post("/mcp", &request.body, &headers))
-                                .await?;
+                        let missing = live_http_exchange(
+                            address,
+                            live_http_post("/mcp", &request.body, &headers),
+                        )
+                        .await?;
                         let duplicate = live_http_exchange(
                             address,
                             live_http_post(
@@ -30836,7 +31159,8 @@ mod lib_unit_tests {
                         Ok::<_, String>((accepted, invalid, missing, duplicate, mixed))
                     }
                     .await;
-                    caller_cx.cancel_with(CancelKind::User, Some("JSON auth receipt proof complete"));
+                    caller_cx
+                        .cancel_with(CancelKind::User, Some("JSON auth receipt proof complete"));
                     result
                 })
                 .map_err(|error| format!("JSON auth receipt client admission failed: {error}"))?;
@@ -30845,10 +31169,13 @@ mod lib_unit_tests {
                 .join(&cx)
                 .await
                 .map_err(|error| format!("JSON auth receipt client failed: {error:?}"))??;
-            let shutdown = serve.map_err(|error| format!("JSON auth receipt server failed: {error}"))?;
+            let shutdown =
+                serve.map_err(|error| format!("JSON auth receipt server failed: {error}"))?;
             require_quiescent_http_shutdown(shutdown, "JSON auth receipt").await?;
-            let accepted: JsonRpcResponse = serde_json::from_slice(live_http_response_body(&accepted)?)
-                .map_err(|error| format!("accepted JSON auth receipt was not JSON-RPC: {error}"))?;
+            let accepted: JsonRpcResponse =
+                serde_json::from_slice(live_http_response_body(&accepted)?).map_err(|error| {
+                    format!("accepted JSON auth receipt was not JSON-RPC: {error}")
+                })?;
             if accepted.error.is_some()
                 || provider_calls.load(Ordering::Acquire) != 2
                 || handler_calls.load(Ordering::Acquire) != 1
@@ -30876,7 +31203,7 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_sse_auth_receipt_commits_one_provider_result_and_fences_denials() {
+    fn live_http_sse_auth_receipt_commits_one_accepted_provider_result_and_fences_denials() {
         run_live_http_test(|cx| async move {
             let provider_calls = Arc::new(AtomicUsize::new(0));
             let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -30903,6 +31230,20 @@ mod lib_unit_tests {
                 .local_addr()
                 .map_err(|error| format!("auth receipt address failed: {error}"))?;
             let request = modern_http_json_tool_request("modern_http_auth_counter", 938);
+            let mixed_body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "authorization": "Bearer in-band-never-echo",
+                    "name": "modern_http_auth_counter",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                942_i64,
+            ))
+            .map_err(|error| format!("mixed SSE auth receipt did not serialize: {error}"))?;
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
@@ -30964,7 +31305,22 @@ mod lib_unit_tests {
                             ),
                         )
                         .await?;
-                        Ok::<_, String>((accepted, invalid, missing, duplicate))
+                        let mixed = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &mixed_body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("Accept", "text/event-stream"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        Ok::<_, String>((accepted, invalid, missing, duplicate, mixed))
                     }
                     .await;
                     caller_cx.cancel_with(CancelKind::User, Some("auth receipt proof complete"));
@@ -30972,7 +31328,7 @@ mod lib_unit_tests {
                 })
                 .map_err(|error| format!("auth receipt client admission failed: {error}"))?;
             let serve = bound.serve(&cx).await;
-            let (accepted, invalid, missing, duplicate) = client
+            let (accepted, invalid, missing, duplicate, mixed) = client
                 .join(&cx)
                 .await
                 .map_err(|error| format!("auth receipt client failed: {error:?}"))??;
@@ -30992,10 +31348,11 @@ mod lib_unit_tests {
                         .to_owned(),
                 );
             }
-            for response in [invalid, missing, duplicate] {
+            for response in [invalid, missing, duplicate, mixed] {
                 if !response.starts_with(b"HTTP/1.1 401")
                     || live_http_response_header(&response, "www-authenticate")? != "Bearer"
                     || String::from_utf8_lossy(&response).contains("beta-never-echo")
+                    || String::from_utf8_lossy(&response).contains("in-band-never-echo")
                 {
                     return Err(
                         "denied native auth mutated dispatch or exposed a bearer".to_owned()
@@ -39471,7 +39828,7 @@ mod lib_unit_tests {
                 .expect("rejected SSE response must remain JSON-RPC"),
             JsonRpcMessage::Response(response)
                 if response.id == Some(934_i64.into())
-                    && response.error.is_some_and(|error| {
+                    && response.error.as_ref().is_some_and(|error| {
                         error.code == i32::from(McpErrorCode::ResourceForbidden).into()
                     })
         ));
@@ -40655,7 +41012,6 @@ mod lib_unit_tests {
                             serde_json::to_vec(&cancellation)
                                 .expect("typed cancellation notification must serialize"),
                         ),
-                    TransportAuthorization::default(),
                 )
                 .map_err(|error| format!("cancellation rejection failed: {error}"))?;
             let ServerHttpEndpointResponse::Immediate(rejected) = rejected else {

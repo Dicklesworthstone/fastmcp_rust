@@ -1883,7 +1883,7 @@ impl MrtrExchangeRegistry {
             request_state,
             Some(binding),
             entries.len(),
-            entries.iter(),
+            entries.iter().map(|(key, value)| (key, value)),
         )
     }
 
