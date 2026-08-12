@@ -664,9 +664,15 @@ where
         wire: Value,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
         self.require_binding(binding)?;
-        let response_shaped = wire
-            .as_object()
-            .is_some_and(|object| object.contains_key("result") || object.contains_key("error"));
+        let response_shaped = wire.as_object().is_some_and(|object| {
+            // A frame without a method is attempting to be a response, even
+            // when its result/error member is malformed or missing. Never
+            // manufacture a response to that peer response attempt.
+            !object.contains_key("method")
+                && (object.contains_key("id")
+                    || object.contains_key("result")
+                    || object.contains_key("error"))
+        });
         let request_id = response_id_from_wire(&wire);
         let envelope = match decode_legacy_2024_11_05_envelope_classified(wire) {
             Ok(envelope) => envelope,
@@ -1878,6 +1884,11 @@ mod tests {
                 "id": pending_id.clone(),
                 "result": {},
                 "error": {"code": -32603, "message": "failed"}
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": pending_id.clone(),
+                "params": {}
             }),
         ] {
             let before = adapter.snapshot();

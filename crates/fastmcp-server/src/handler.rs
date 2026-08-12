@@ -1320,6 +1320,17 @@ pub trait ToolHandler: Send + Sync {
         false
     }
 
+    /// Declares whether this handler can use final MRTR continuations.
+    ///
+    /// This is an immutable handler capability, rather than an inference from
+    /// a runtime outcome. A declared-capable handler requires a modern
+    /// connection partition before the router invokes it, so an
+    /// `InputRequired` outcome can never be produced without durable
+    /// continuation ownership.
+    fn declares_final_mrtr(&self) -> bool {
+        false
+    }
+
     /// Calls the tool through the final complete, input-required, or task-creation surface.
     ///
     /// Existing handlers remain complete-only. A task-capable handler
@@ -1433,6 +1444,15 @@ pub trait ResourceHandler: Send + Sync {
     /// at client-direct use sites. Exact MCP 2024-11-05 dispatch never consults
     /// this declaration.
     fn final_client_direct_https(&self) -> bool {
+        false
+    }
+
+    /// Declares whether this handler can use final MRTR continuations.
+    ///
+    /// The router consults this immutable capability before invoking a final
+    /// resource handler on a context that has no durable modern session
+    /// partition.
+    fn declares_final_mrtr(&self) -> bool {
         false
     }
 
@@ -1799,6 +1819,15 @@ pub trait PromptHandler: Send + Sync {
     /// may use client-direct HTTPS. Exact MCP 2024-11-05 dispatch never
     /// consults this declaration.
     fn final_client_direct_https(&self) -> bool {
+        false
+    }
+
+    /// Declares whether this handler can use final MRTR continuations.
+    ///
+    /// The router consults this immutable capability before invoking a final
+    /// prompt handler on a context that has no durable modern session
+    /// partition.
+    fn declares_final_mrtr(&self) -> bool {
         false
     }
 
@@ -2403,6 +2432,10 @@ impl ToolHandler for MountedToolHandler {
         self.inner.declares_final_tasks()
     }
 
+    fn declares_final_mrtr(&self) -> bool {
+        self.inner.declares_final_mrtr()
+    }
+
     fn timeout(&self) -> Option<Duration> {
         self.inner.timeout()
     }
@@ -2689,6 +2722,10 @@ impl ResourceHandler for MountedResourceHandler {
 
     fn final_client_direct_https(&self) -> bool {
         self.inner.final_client_direct_https()
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        self.inner.declares_final_mrtr()
     }
 
     fn template(&self) -> Option<ResourceTemplate> {
@@ -3011,6 +3048,10 @@ impl PromptHandler for MountedPromptHandler {
 
     fn final_client_direct_https(&self) -> bool {
         self.inner.final_client_direct_https()
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        self.inner.declares_final_mrtr()
     }
 
     fn final_title(&self) -> Option<&str> {

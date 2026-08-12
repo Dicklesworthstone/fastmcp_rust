@@ -49,11 +49,12 @@ use fastmcp_core::{
 };
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    CorrelationKey, JsonRpcError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
+    CorrelationKey, FinalInputResponses, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, RequestId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::ser::SerializeStruct;
+use serde::ser::{SerializeMap, SerializeStruct};
 
 /// Default maximum number of concurrent server-to-client requests.
 pub const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 1_024;
@@ -1438,7 +1439,7 @@ impl MrtrInputRequests {
             entries: self
                 .entries
                 .iter()
-                .filter(|(key, _)| !responses.entries.contains_key(key.as_str()))
+                .filter(|(key, _)| responses.get(key).is_none())
                 .map(|(key, request)| (key.clone(), request.clone()))
                 .collect(),
         }
@@ -1454,14 +1455,20 @@ impl Serialize for MrtrInputRequests {
     }
 }
 
-/// A unique, bounded map of final MRTR input response values.
+/// An ordered, unique, bounded collection of final MRTR input response values.
+///
+/// The vector preserves the exact accepted retry order all the way through
+/// [`MrtrCompletedInputs`]. A separate lookup index supports handler key
+/// access without normalizing the handler-visible response sequence into a
+/// sorted map.
 #[derive(Debug, Clone, Default)]
 pub struct MrtrInputResponses {
-    entries: BTreeMap<String, MrtrInputResponse>,
+    entries: Vec<(String, MrtrInputResponse)>,
+    index: HashMap<String, usize>,
 }
 
 impl MrtrInputResponses {
-    /// Creates a unique map of embedded input responses.
+    /// Creates a unique ordered collection of embedded input responses.
     ///
     /// # Errors
     ///
@@ -1476,7 +1483,7 @@ impl MrtrInputResponses {
         Ok(result)
     }
 
-    /// Returns whether this map contains no input responses.
+    /// Returns whether this collection contains no input responses.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -1491,7 +1498,10 @@ impl MrtrInputResponses {
     /// Looks up one response by its server-issued input key.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&MrtrInputResponse> {
-        self.entries.get(key)
+        self.index
+            .get(key)
+            .and_then(|index| self.entries.get(*index))
+            .map(|(_, response)| response)
     }
 
     /// Iterates over input-response keys and values.
@@ -1504,12 +1514,26 @@ impl MrtrInputResponses {
     fn insert(&mut self, key: String, response: MrtrInputResponse) -> McpResult<()> {
         if key.is_empty()
             || self.entries.len() >= HARD_MAX_MRTR_INPUT_REQUESTS_PER_ROUND
-            || self.entries.contains_key(&key)
+            || self.index.contains_key(&key)
         {
             return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
         }
-        self.entries.insert(key, response);
+        self.index.insert(key.clone(), self.entries.len());
+        self.entries.push((key, response));
         Ok(())
+    }
+
+    /// Appends one registry-admitted response only if this exchange has not
+    /// accepted its key already. The registry has separately bounded total
+    /// exchange growth, so this must not apply the single-round constructor
+    /// ceiling to accumulated partial retries.
+    fn append_accepted_if_absent(&mut self, key: &str, response: &MrtrInputResponse) -> bool {
+        if self.index.contains_key(key) {
+            return false;
+        }
+        self.index.insert(key.to_owned(), self.entries.len());
+        self.entries.push((key.to_owned(), response.clone()));
+        true
     }
 }
 
@@ -1518,7 +1542,11 @@ impl Serialize for MrtrInputResponses {
     where
         S: serde::Serializer,
     {
-        self.entries.serialize(serializer)
+        let mut map = serializer.serialize_map(Some(self.entries.len()))?;
+        for (key, response) in &self.entries {
+            map.serialize_entry(key, response)?;
+        }
+        map.end()
     }
 }
 
@@ -1825,6 +1853,40 @@ impl MrtrExchangeRegistry {
         self.accept_wire_with_binding(request_state, Some(binding), input_responses)
     }
 
+    /// Decodes and consumes ordered protocol response entries without first
+    /// collapsing them into a map.
+    ///
+    /// The final protocol decoder has already rejected duplicate keys and
+    /// retained their wire order. Keeping that representation through this
+    /// admission boundary ensures a raw retry cannot be normalized before the
+    /// continuation registry has validated it.
+    pub(crate) fn accept_final_input_responses_bound(
+        &self,
+        request_state: &str,
+        binding: &MrtrExchangeBinding,
+        input_responses: &FinalInputResponses,
+    ) -> McpResult<MrtrRetry> {
+        let entries = input_responses
+            .entries()
+            .iter()
+            .map(|(key, response)| {
+                serde_json::to_value(response)
+                    .map(|value| (key.clone(), value))
+                    .map_err(|_| {
+                        McpError::internal_error(
+                            "final MRTR response could not be encoded for registry admission",
+                        )
+                    })
+            })
+            .collect::<McpResult<Vec<_>>>()?;
+        self.accept_wire_entries_with_binding(
+            request_state,
+            Some(binding),
+            entries.len(),
+            entries.iter(),
+        )
+    }
+
     /// Consumes a retry whose `inputResponses` member was absent.
     ///
     /// The distinct entry point preserves the final wire contract: only an
@@ -1858,10 +1920,28 @@ impl MrtrExchangeRegistry {
         binding: Option<&MrtrExchangeBinding>,
         input_responses: &BTreeMap<String, serde_json::Value>,
     ) -> McpResult<MrtrRetry> {
+        self.accept_wire_entries_with_binding(
+            request_state,
+            binding,
+            input_responses.len(),
+            input_responses.iter(),
+        )
+    }
+
+    fn accept_wire_entries_with_binding<'a, I>(
+        &self,
+        request_state: &str,
+        binding: Option<&MrtrExchangeBinding>,
+        input_responses_len: usize,
+        input_responses: I,
+    ) -> McpResult<MrtrRetry>
+    where
+        I: IntoIterator<Item = (&'a String, &'a serde_json::Value)>,
+    {
         if request_state.len() > DEFAULT_MAX_MRTR_REQUEST_STATE_BYTES {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
-        if input_responses.len() > self.max_inputs_per_round {
+        if input_responses_len > self.max_inputs_per_round {
             return Err(McpError::invalid_params(MRTR_INPUT_MAP_ERROR));
         }
 
@@ -2010,10 +2090,7 @@ impl MrtrExchangeRegistry {
                 if expected_kind != response.kind() {
                     return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
                 }
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    accepted_responses.entries.entry(key.to_owned())
-                {
-                    entry.insert(response.clone());
+                if accepted_responses.append_accepted_if_absent(key, response) {
                     made_progress = true;
                 }
             }
@@ -2635,6 +2712,58 @@ mod tests {
             .accept_wire(&request_state, &matching)
             .expect_err("a consumed wire request state must not replay");
         assert_eq!(replay.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn mrtr_accepts_ordered_final_input_responses_without_map_normalization() {
+        let registry = MrtrExchangeRegistry::new();
+        let binding = MrtrExchangeBinding::new(
+            "tools/call",
+            "ordered-tool".to_owned(),
+            [3; 32],
+            [4; 32],
+            None,
+        );
+        let required = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                MrtrInputRequests::new([
+                    ("second".to_owned(), MrtrInputRequest::roots()),
+                    ("first".to_owned(), MrtrInputRequest::roots()),
+                ])
+                .expect("unique MRTR input keys"),
+            )
+            .expect("MRTR input result must issue");
+        let request_state = mrtr_state_from_wire(&required);
+        let responses: FinalInputResponses =
+            serde_json::from_str(r#"{"second":{"roots":[]},"first":{"roots":[]}}"#)
+                .expect("ordered final responses decode");
+        assert_eq!(
+            responses
+                .entries()
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second", "first"],
+            "the registry receives the protocol decoder's order-preserving representation"
+        );
+        let completed = registry
+            .accept_final_input_responses_bound(&request_state, &binding, &responses)
+            .expect("ordered protocol responses complete the exchange");
+        let MrtrRetry::Complete(completed) = completed else {
+            panic!("every expected ordered response completes the exchange");
+        };
+        assert_eq!(
+            completed
+                .responses()
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec!["second", "first"],
+            "handler delivery preserves the accepted wire order rather than BTreeMap key order"
+        );
+        assert_eq!(registry.active_len(), 0);
     }
 
     #[test]

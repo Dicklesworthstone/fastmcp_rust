@@ -1404,6 +1404,10 @@ fn generate_tool_mrtr_resume_method(
     };
 
     quote! {
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
         fn call_final_outcome_async_resuming_in_request<'a>(
             &'a self,
             ctx: &'a fastmcp_core::McpContext,
@@ -2099,6 +2103,10 @@ fn generate_prompt_mrtr_outcome_methods(
     };
 
     quote! {
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
         fn get_final_outcome_async_in_request<'a>(
             &'a self,
             ctx: &'a fastmcp_core::McpContext,
@@ -3590,6 +3598,10 @@ fn generate_resource_mrtr_outcome_methods(
     };
 
     quote! {
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
         fn read_final_outcome_async_with_uri_in_request<'a>(
             &'a self,
             ctx: &'a fastmcp_core::McpContext,
@@ -4091,6 +4103,10 @@ mod mrtr_resume_expansion_tests {
             tool.contains("completed_inputs : Option < & MrtrCompletedInputs > = resume_inputs"),
             "{tool}"
         );
+        assert!(
+            tool.contains("fn declares_final_mrtr (& self) -> bool { true }"),
+            "{tool}"
+        );
 
         let call_args = quote! { ctx, completed_inputs };
         let resource = generate_resource_mrtr_outcome_methods(
@@ -4108,6 +4124,10 @@ mod mrtr_resume_expansion_tests {
             "{resource}"
         );
         assert!(resource.contains("= resume_inputs"), "{resource}");
+        assert!(
+            resource.contains("fn declares_final_mrtr (& self) -> bool { true }"),
+            "{resource}"
+        );
 
         let prompt = generate_prompt_mrtr_outcome_methods(
             true,
@@ -4125,6 +4145,10 @@ mod mrtr_resume_expansion_tests {
             "{prompt}"
         );
         assert!(prompt.contains("= resume_inputs"), "{prompt}");
+        assert!(
+            prompt.contains("fn declares_final_mrtr (& self) -> bool { true }"),
+            "{prompt}"
+        );
     }
 
     #[test]

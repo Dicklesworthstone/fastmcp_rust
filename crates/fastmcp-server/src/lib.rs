@@ -166,8 +166,6 @@ use std::net::{SocketAddr, TcpListener};
 #[cfg(feature = "websocket")]
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-#[cfg(feature = "websocket")]
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, Once};
 #[cfg(feature = "websocket")]
 use std::task::{Context, Poll};
@@ -481,12 +479,10 @@ use fastmcp_console::banner::StartupBanner;
 use fastmcp_console::client::RequestResponseRenderer;
 use fastmcp_console::console::FastMcpConsole;
 use fastmcp_console::logging::RichLoggerBuilder;
-#[cfg(test)]
-use fastmcp_core::AuthContext;
 use fastmcp_core::logging::{debug, error, info, targets};
 use fastmcp_core::{
-    McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation, McpResult,
-    SessionState, Sha256Digest, block_on, sha256_bounded,
+    AuthContext, McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpRequestCancellation,
+    McpResult, SessionState, Sha256Digest, block_on, sha256_bounded,
 };
 #[cfg(any(feature = "apps", feature = "tasks"))]
 use fastmcp_protocol::ExtensionDescriptorRegistry;
@@ -1699,6 +1695,22 @@ fn decode_final_core_request_for_middleware(
     )
     .map(Some)
     .map_err(|error| McpError::invalid_params(error.to_string()))
+}
+
+/// A raw parameter sidecar is usable only while authentication and admission
+/// have left the materialized parameter value untouched.  In particular,
+/// stripping a recognized credential must sever the raw source before router
+/// MRTR decoding can observe it.
+fn retained_raw_params<'a>(
+    raw_params: Option<&'a str>,
+    request: &JsonRpcRequest,
+) -> Option<&'a str> {
+    raw_params.filter(|source| {
+        serde_json::from_str::<serde_json::Value>(source)
+            .ok()
+            .as_ref()
+            == request.params.as_ref()
+    })
 }
 
 /// Re-admits a middleware-produced final core response through the request's
@@ -5782,6 +5794,8 @@ const WEBSOCKET_HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 const WEBSOCKET_DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(feature = "websocket")]
 const WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "websocket")]
+static NEXT_WEBSOCKET_AUTH_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// A bound, caller-owned WebSocket listener.
 ///
@@ -5794,6 +5808,7 @@ pub struct BoundWebSocketServer {
     listener: AsyncTcpListener,
     server: Arc<Server>,
     path: String,
+    connection_limiter: Arc<HttpConnectionLimiter>,
 }
 
 /// Result of a WebSocket listener shutdown.
@@ -5811,7 +5826,9 @@ pub enum WebSocketServerShutdown {
 #[must_use = "settle retained WebSocket connection children before discarding this outcome"]
 pub struct WebSocketNonquiescentShutdown {
     children: Vec<asupersync::runtime::TaskHandle<()>>,
+    server: Arc<Server>,
     listener_error: Option<McpError>,
+    shutdown_complete: bool,
 }
 
 #[cfg(feature = "websocket")]
@@ -5837,17 +5854,40 @@ impl WebSocketNonquiescentShutdown {
                 asupersync::runtime::yield_now().await;
             }
         }
-        self.children.is_empty()
+        if self.children.is_empty() {
+            if !self.shutdown_complete {
+                self.server.graceful_shutdown_returning();
+                self.shutdown_complete = true;
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Joins every retained connection in the caller's context.
     pub async fn settle(mut self, cx: &Cx) -> McpResult<()> {
-        for child in &mut self.children {
-            child.join(cx).await.map_err(|error| {
-                McpError::internal_error(format!(
-                    "WebSocket connection child ended without a final status: {error}"
-                ))
-            })?;
+        let mut child_failures = Vec::new();
+        while let Some(mut child) = self.children.pop() {
+            match child.join(cx).await {
+                Ok(()) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Err(error) => child_failures.push(error.to_string()),
+            }
+        }
+        if !self.shutdown_complete {
+            self.server.graceful_shutdown_returning();
+            self.shutdown_complete = true;
+        }
+        if !child_failures.is_empty() {
+            let listener = self
+                .listener_error
+                .as_ref()
+                .map(|error| format!("; listener error: {error}"))
+                .unwrap_or_default();
+            return Err(McpError::internal_error(format!(
+                "WebSocket connection child settlement failure(s): {}{listener}",
+                child_failures.join("; ")
+            )));
         }
         if let Some(error) = self.listener_error {
             return Err(error);
@@ -5894,9 +5934,18 @@ impl BoundWebSocketServer {
                     )));
                 }
             };
+            // Acquire before spawning so an overflow peer cannot create a
+            // retained connection child.  The permit moves into that child
+            // and therefore covers handshake, upgraded socket, dispatch, and
+            // its caller-owned nonquiescent settlement lifetime.
+            let Some(permit) = self.connection_limiter.try_acquire() else {
+                drop(stream);
+                continue;
+            };
             let server = Arc::clone(&self.server);
             let path = self.path.clone();
             match cx.spawn_in(&connection_scope, move |connection_cx| async move {
+                let _permit = permit;
                 if let Err(error) =
                     serve_websocket_connection(&connection_cx, stream, server, &path).await
                 {
@@ -5912,8 +5961,6 @@ impl BoundWebSocketServer {
             }
         };
 
-        self.server
-            .cancel_active_requests(CancelKind::Shutdown, false);
         for child in &mut children {
             child.abort();
         }
@@ -5924,16 +5971,17 @@ impl BoundWebSocketServer {
                 asupersync::runtime::yield_now().await;
             }
         }
-        self.server.graceful_shutdown_returning();
-
         if children.is_empty() {
+            self.server.graceful_shutdown_returning();
             accept_result?;
             Ok(WebSocketServerShutdown::Quiescent)
         } else {
             Ok(WebSocketServerShutdown::Nonquiescent(
                 WebSocketNonquiescentShutdown {
                     children,
+                    server: Arc::clone(&self.server),
                     listener_error: accept_result.err(),
+                    shutdown_complete: false,
                 },
             ))
         }
@@ -6005,38 +6053,67 @@ impl AsyncWrite for PrefixedWebSocketStream {
 
 #[cfg(feature = "websocket")]
 struct WebSocketBridgeRecv {
-    receiver: Receiver<JsonRpcMessage>,
+    receiver: asupersync_mpsc::Receiver<JsonRpcMessage>,
 }
 
 #[cfg(feature = "websocket")]
 impl TransportRecvHalf for WebSocketBridgeRecv {
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
-        cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
-        self.receiver.recv().map_err(|_| TransportError::Closed)
+        loop {
+            cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
+            match self.receiver.try_recv() {
+                Ok(message) => return Ok(message),
+                Err(asupersync_mpsc::RecvError::Empty) => {
+                    // This bridge is polled only by the dispatcher blocking
+                    // worker. The owned async socket task retains admission
+                    // and cancellation authority; a short yield keeps this
+                    // compatibility boundary from parking a global thread.
+                    std::thread::sleep(WEBSOCKET_DRIVER_POLL_INTERVAL);
+                }
+                Err(asupersync_mpsc::RecvError::Disconnected) => {
+                    return Err(TransportError::Closed);
+                }
+                Err(asupersync_mpsc::RecvError::Cancelled) => {
+                    return Err(TransportError::Cancelled);
+                }
+            }
+        }
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
+        self.receiver.close();
         Ok(())
     }
 }
 
 #[cfg(feature = "websocket")]
 struct WebSocketBridgeSend {
-    sender: SyncSender<JsonRpcMessage>,
+    sender: asupersync_mpsc::Sender<JsonRpcMessage>,
 }
 
 #[cfg(feature = "websocket")]
 impl TransportSendHalf for WebSocketBridgeSend {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
-        self.sender
-            .try_send(message.clone())
-            .map_err(|error| match error {
-                TrySendError::Full(_) => {
-                    TransportError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))
-                }
-                TrySendError::Disconnected(_) => TransportError::Closed,
-            })
+        let result = match self.sender.try_reserve() {
+            Ok(permit) => permit.try_send(message.clone()),
+            Err(asupersync_mpsc::SendError::Full(())) => {
+                return Err(TransportError::Io(std::io::Error::from(
+                    std::io::ErrorKind::WouldBlock,
+                )));
+            }
+            Err(
+                asupersync_mpsc::SendError::Disconnected(())
+                | asupersync_mpsc::SendError::Cancelled(()),
+            ) => return Err(TransportError::Closed),
+        };
+        result.map_err(|error| match error {
+            asupersync_mpsc::SendError::Full(_) => {
+                TransportError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            asupersync_mpsc::SendError::Disconnected(_)
+            | asupersync_mpsc::SendError::Cancelled(_) => TransportError::Closed,
+        })
     }
 
     fn close(&mut self) -> Result<(), TransportError> {
@@ -6051,7 +6128,19 @@ async fn serve_websocket_connection(
     server: Arc<Server>,
     expected_path: &str,
 ) -> McpResult<()> {
-    let (request, trailing) = read_websocket_handshake(cx, &mut stream).await?;
+    let (request, trailing) = match read_websocket_handshake(cx, &mut stream).await {
+        Ok(handshake) => handshake,
+        Err(error) => {
+            let rejection = if error.message == "WebSocket Authorization admission failed" {
+                b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            } else {
+                asupersync::net::websocket::ServerHandshake::reject(400, "Bad Request")
+            };
+            let _ = stream.write_all(&rejection).await;
+            return Ok(());
+        }
+    };
     let path = request
         .path
         .split_once('?')
@@ -6068,6 +6157,28 @@ async fn serve_websocket_connection(
             })?;
         return Ok(());
     }
+    let transport_authorization =
+        TransportAuthorization::from_singleton_header(request.header("authorization"));
+    let connection_generation =
+        NEXT_WEBSOCKET_AUTH_CONNECTION_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let auth_custody = match server.authenticate_websocket_upgrade(
+        cx,
+        &transport_authorization,
+        connection_generation,
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => {
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .map_err(|_| {
+                    McpError::internal_error("WebSocket authorization rejection could not be written")
+                })?;
+            return Ok(());
+        }
+    };
     let response = match asupersync::net::websocket::ServerHandshake::new().accept(&request) {
         Ok(response) => response,
         Err(_) => {
@@ -6096,7 +6207,15 @@ async fn serve_websocket_connection(
         prefix: trailing,
         stream,
     });
-    run_websocket_dispatch_bridge(cx, server, transport).await
+    run_websocket_dispatch_bridge(
+        cx,
+        server,
+        transport,
+        transport_authorization,
+        auth_custody,
+        connection_generation,
+    )
+    .await
 }
 
 #[cfg(feature = "websocket")]
@@ -6128,6 +6247,13 @@ async fn read_websocket_handshake(
             ));
         }
         bytes.extend_from_slice(&chunk[..read]);
+        if let Some(header_end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            if raw_websocket_upgrade_authorization_is_admissible(&bytes[..header_end]).is_err() {
+                return Err(McpError::invalid_request(
+                    "WebSocket Authorization admission failed",
+                ));
+            }
+        }
         match asupersync::net::websocket::HttpRequest::parse_with_trailing(&bytes) {
             Ok((request, trailing)) => return Ok((request, trailing.to_vec())),
             Err(_) if !bytes.windows(4).any(|window| window == b"\r\n\r\n") => {}
@@ -6137,14 +6263,49 @@ async fn read_websocket_handshake(
 }
 
 #[cfg(feature = "websocket")]
+fn raw_websocket_upgrade_authorization_is_admissible(head: &[u8]) -> Result<(), ()> {
+    let Ok(head) = std::str::from_utf8(head) else {
+        // This is not an Authorization-specific admission failure; leave it
+        // to the handshake parser's generic bounded 400 path.
+        return Ok(());
+    };
+    let mut authorization = None;
+    for line in head.split("\r\n").skip(1) {
+        let malformed_authorization_intent = line
+            .split_once(':')
+            .map(|(name, _)| name.trim())
+            .or_else(|| line.split_ascii_whitespace().next())
+            .is_some_and(|name| name.eq_ignore_ascii_case("authorization"));
+        let Some((name, value)) = line.split_once(':') else {
+            if malformed_authorization_intent {
+                return Err(());
+            }
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("authorization") {
+            if value.trim().is_empty() || authorization.replace(value).is_some() {
+                return Err(());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "websocket")]
 async fn run_websocket_dispatch_bridge(
     cx: &Cx,
     server: Arc<Server>,
     mut transport: AsyncWsServerTransport<PrefixedWebSocketStream>,
+    transport_authorization: TransportAuthorization,
+    auth_custody: Arc<WebSocketAuthCustody>,
+    connection_generation: u64,
 ) -> McpResult<()> {
-    let (incoming_sender, incoming_receiver) = sync_channel(WEBSOCKET_BRIDGE_QUEUE_CAPACITY);
-    let (outgoing_sender, outgoing_receiver) = sync_channel(WEBSOCKET_BRIDGE_QUEUE_CAPACITY);
+    let (incoming_sender, incoming_receiver) =
+        asupersync_mpsc::channel(WEBSOCKET_BRIDGE_QUEUE_CAPACITY);
+    let (outgoing_sender, mut outgoing_receiver) =
+        asupersync_mpsc::channel(WEBSOCKET_BRIDGE_QUEUE_CAPACITY);
     let dispatch_cx = cx.clone();
+    let dispatcher_custody = Arc::clone(&auth_custody);
     let mut dispatcher = cx
         .spawn_blocking(move |pump_cx| {
             server.run_split_transport_returning_shared_with_dispatch_cx(
@@ -6156,30 +6317,57 @@ async fn run_websocket_dispatch_bridge(
                 WebSocketBridgeSend {
                     sender: outgoing_sender,
                 },
+                transport_authorization,
+                AuthDispatchCustody::WebSocket(dispatcher_custody),
+                connection_generation,
             )
         })
         .map_err(|error| {
             McpError::internal_error(format!("WebSocket dispatch admission failed: {error}"))
         })?;
 
-    let driver_result = loop {
-        while let Ok(message) = outgoing_receiver.try_recv() {
-            transport.send(cx, &message).await.map_err(|_| {
-                McpError::internal_error("WebSocket response could not be committed")
-            })?;
+    let driver_result = 'driver: loop {
+        loop {
+            match outgoing_receiver.try_recv() {
+                Ok(message) => transport.send(cx, &message).await.map_err(|_| {
+                    McpError::internal_error("WebSocket response could not be committed")
+                })?,
+                Err(asupersync_mpsc::RecvError::Empty) => break,
+                Err(asupersync_mpsc::RecvError::Disconnected) => break 'driver Ok(()),
+                Err(asupersync_mpsc::RecvError::Cancelled) => break 'driver Ok(()),
+            }
         }
         if cx.checkpoint().is_err() {
             break Ok(());
         }
         let deadline = cx.now().saturating_add(WEBSOCKET_DRIVER_POLL_INTERVAL);
         match asupersync::time::timeout_at(deadline, transport.recv(cx)).await {
-            Ok(Ok(message)) => match incoming_sender.try_send(message) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    break Err(McpError::internal_error("WebSocket ingress queue is full"));
+            Ok(Ok(mut message)) => {
+                if let JsonRpcMessage::Request(request) = &mut message {
+                    // Strict frame decode is the last point raw in-band
+                    // credentials exist. Sanitize before traffic rendering,
+                    // logs, queues, or router visibility; custody remembers a
+                    // rejected mixed-source frame for its later auth fence.
+                    sanitize_websocket_decoded_request(&auth_custody, request);
                 }
-                Err(TrySendError::Disconnected(_)) => break Ok(()),
-            },
+                let permit = match incoming_sender.reserve(cx).await {
+                    Ok(permit) => permit,
+                    Err(asupersync_mpsc::SendError::Disconnected(()))
+                    | Err(asupersync_mpsc::SendError::Cancelled(())) => break Ok(()),
+                    Err(asupersync_mpsc::SendError::Full(())) => {
+                        break Err(McpError::internal_error("WebSocket ingress queue is full"));
+                    }
+                };
+                if let Err(error) = permit.try_send(message) {
+                    break match error {
+                        asupersync_mpsc::SendError::Full(_) => {
+                            Err(McpError::internal_error("WebSocket ingress queue is full"))
+                        }
+                        asupersync_mpsc::SendError::Disconnected(_)
+                        | asupersync_mpsc::SendError::Cancelled(_) => Ok(()),
+                    };
+                }
+            }
             Ok(Err(TransportError::Closed)) | Ok(Err(TransportError::Cancelled)) => break Ok(()),
             Ok(Err(_)) => break Err(McpError::invalid_request("WebSocket frame was rejected")),
             Err(_) => {}
@@ -6218,6 +6406,9 @@ impl Server {
         Ok(BoundWebSocketServer {
             listener,
             path: self.http_config.handler_config.base_path.clone(),
+            connection_limiter: Arc::new(HttpConnectionLimiter::new(
+                self.http_config.max_connections,
+            )),
             server: Arc::new(self),
         })
     }
@@ -6480,6 +6671,132 @@ impl ServerHttpEndpoint {
     }
 }
 
+/// Private proof that native ingress evaluated authentication for one exact,
+/// strict-admitted modern request.  It is intentionally neither serializable
+/// nor publicly constructible: only this module can carry it from admission
+/// to the request context that dispatch owns.
+#[derive(Clone)]
+struct AuthAdmissionReceipt {
+    method: String,
+    request_id: u64,
+    sanitized_params: Option<serde_json::Value>,
+    fingerprint: Sha256Digest,
+    authenticated: Option<AuthContext>,
+}
+
+impl AuthAdmissionReceipt {
+    fn commit(
+        &self,
+        ctx: &McpContext,
+        inbound: &InboundRequestContext,
+        request: &mut JsonRpcRequest,
+    ) -> Result<Sha256Digest, McpError> {
+        if self.method != request.method
+            || request_id_to_u64(request.id.as_ref()) != self.request_id
+            || !inbound
+                .auth_request(&request.method, request.params.as_ref())
+                .credential_sources_are_admissible()
+        {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authentication failed",
+            ));
+        }
+        request.params = self.sanitized_params.clone();
+        let committed = match &self.authenticated {
+            Some(auth) => ctx.set_auth(auth.clone()),
+            None => ctx.commit_anonymous_auth(),
+        };
+        if committed {
+            Ok(self.fingerprint.clone())
+        } else {
+            Err(Server::request_context_error(ctx).unwrap_or_else(|| {
+                McpError::internal_error("authentication admission was already committed")
+            }))
+        }
+    }
+}
+
+/// Immutable, connection-owned WebSocket authentication facts.  Unlike an
+/// HTTP receipt, this is never an arbitrary request receipt: the exact
+/// accepted connection generation must be supplied at every frame dispatch.
+#[cfg(feature = "websocket")]
+struct WebSocketAuthCustody {
+    connection_generation: u64,
+    fingerprint: Sha256Digest,
+    authenticated: Option<AuthContext>,
+    rejected_inband_request_ids: Mutex<HashSet<u64>>,
+}
+
+#[derive(Clone)]
+enum AuthDispatchCustody {
+    Http(AuthAdmissionReceipt),
+    #[cfg(feature = "websocket")]
+    WebSocket(Arc<WebSocketAuthCustody>),
+}
+
+impl AuthDispatchCustody {
+    fn commit(
+        &self,
+        ctx: &McpContext,
+        inbound: &InboundRequestContext,
+        request: &mut JsonRpcRequest,
+        websocket_connection_generation: Option<u64>,
+    ) -> Result<Sha256Digest, McpError> {
+        match self {
+            Self::Http(receipt) => receipt.commit(ctx, inbound, request),
+            #[cfg(feature = "websocket")]
+            Self::WebSocket(custody) => {
+                if websocket_connection_generation != Some(custody.connection_generation)
+                    || custody
+                        .rejected_inband_request_ids
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&request_id_to_u64(request.id.as_ref()))
+                    || !inbound
+                        .auth_request(&request.method, request.params.as_ref())
+                        .credential_sources_are_admissible()
+                {
+                    return Err(McpError::new(
+                        McpErrorCode::ResourceForbidden,
+                        "Authentication failed",
+                    ));
+                }
+                // Frame decode/admission has just produced this request;
+                // strip before traffic rendering, middleware, logs, or router.
+                auth::strip_recognized_access_credentials(&mut request.params);
+                let committed = match &custody.authenticated {
+                    Some(auth) => ctx.set_auth(auth.clone()),
+                    None => ctx.commit_anonymous_auth(),
+                };
+                if committed {
+                    Ok(custody.fingerprint)
+                } else {
+                    Err(Server::request_context_error(ctx).unwrap_or_else(|| {
+                        McpError::internal_error("authentication admission was already committed")
+                    }))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "websocket")]
+fn sanitize_websocket_decoded_request(
+    custody: &WebSocketAuthCustody,
+    request: &mut JsonRpcRequest,
+) {
+    let original = request.params.clone();
+    auth::strip_recognized_access_credentials(&mut request.params);
+    if request.params != original {
+        custody
+            .rejected_inband_request_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(request_id_to_u64(request.id.as_ref()));
+    }
+}
+
 impl ServerHttpSession {
     /// Returns the exact opaque session value required by the legacy POST URI.
     #[must_use]
@@ -6506,8 +6823,10 @@ impl ServerHttpSession {
         request: HttpRequest,
         modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
-        let transport_authorization =
-            TransportAuthorization::from_singleton_header(request.header("authorization"));
+        let transport_authorization = match transport_authorization_from_http_request(&request) {
+            Ok(authorization) => authorization,
+            Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+        };
         self.handle_with_modern_request_cancellation_and_transport_authorization(
             cx,
             request,
@@ -6534,6 +6853,8 @@ impl ServerHttpSession {
 
         let is_modern = request.method == HttpMethod::Post
             && request.path == self.server.http_config.handler_config.base_path;
+        let mut raw_params = None;
+        let mut auth_receipt = None;
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         let is_legacy = (request.method == HttpMethod::Get
             && request.path == self.server.http_config.legacy_sse_path)
@@ -6571,6 +6892,28 @@ impl ServerHttpSession {
         } else {
             None
         };
+        if is_modern {
+            if request.header("mcp-session-id").is_some() {
+                return Ok(ServerHttpEndpointResponse::Immediate(
+                    HttpResponse::bad_request(),
+                ));
+            }
+            let (prepared_request, admitted_request, admitted_raw_params) =
+                match self.prepare_modern_http_request(request) {
+                    Ok(prepared) => prepared,
+                    Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+                };
+            request = prepared_request;
+            raw_params = admitted_raw_params;
+            auth_receipt = match self.preauthenticate_modern_http_request(
+                cx,
+                &admitted_request,
+                &transport_authorization,
+            ) {
+                Ok(receipt) => Some(AuthDispatchCustody::Http(receipt)),
+                Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+            };
+        }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         let request_era = if is_modern {
             Some(ProtocolEra::Modern2026)
@@ -6600,17 +6943,6 @@ impl ServerHttpSession {
         let defer_legacy_era_selection = false;
         if let Some(era) = request_era.filter(|_| !defer_legacy_era_selection) {
             self.selected_era.get_or_insert(era);
-        }
-        if is_modern {
-            if request.header("mcp-session-id").is_some() {
-                return Ok(ServerHttpEndpointResponse::Immediate(
-                    HttpResponse::bad_request(),
-                ));
-            }
-            request = match self.prepare_modern_http_request(request) {
-                Ok(request) => request,
-                Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
-            };
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
         if let Some(Legacy2024HttpPostEnvelope::Response(response)) = legacy_post_admission {
@@ -6650,6 +6982,8 @@ impl ServerHttpSession {
                 cx,
                 endpoint_response,
                 transport_authorization,
+                raw_params,
+                auth_receipt,
                 modern_request_cancellation,
             );
         }
@@ -6667,8 +7001,9 @@ impl ServerHttpSession {
     fn prepare_modern_http_request(
         &self,
         mut request: HttpRequest,
-    ) -> Result<HttpRequest, HttpResponse> {
+    ) -> Result<(HttpRequest, JsonRpcRequest, Option<Arc<str>>), HttpResponse> {
         let admitted = self.admit_modern_http_request(&request)?;
+        let raw_params = admitted.raw_params().map(Arc::<str>::from);
         if let Some(response) = self
             .server
             .preflight_modern_http_required_capability(admitted.request())
@@ -6693,7 +7028,7 @@ impl ServerHttpSession {
             .to_owned(),
         );
         if !request_requires_sse {
-            return Ok(request);
+            return Ok((request, admitted.request().clone(), raw_params));
         }
         if !request_accepts_sse {
             return Err(HttpResponse::new(HttpStatus::NOT_ACCEPTABLE));
@@ -6705,7 +7040,45 @@ impl ServerHttpSession {
         request
             .headers
             .insert("accept".to_owned(), "text/event-stream".to_owned());
-        Ok(request)
+        Ok((request, admitted.request().clone(), raw_params))
+    }
+
+    /// Authenticates a strict modern HTTP request before it can pin a public
+    /// session era, allocate an SSE body, or enter dispatch.  The returned
+    /// receipt carries the sole successful provider evaluation into the fresh
+    /// request context that dispatch owns; failed admission has no session,
+    /// handler, middleware, or log side effects.
+    fn preauthenticate_modern_http_request(
+        &self,
+        cx: &Cx,
+        request: &JsonRpcRequest,
+        transport_authorization: &TransportAuthorization,
+    ) -> Result<AuthAdmissionReceipt, HttpResponse> {
+        let auth_request = transport_authorization.auth_request(
+            &request.method,
+            request.params.as_ref(),
+            request_id_to_u64(request.id.as_ref()),
+        );
+        if self.server.auth_provider.is_some() && !auth_request.has_any_credential_source() {
+            return Err(native_http_authentication_rejection());
+        }
+        self.server
+            .authenticate_request_without_commit(
+                &McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref())),
+                auth_request,
+            )
+            .map(|(fingerprint, authenticated)| {
+                let mut sanitized = request.clone();
+                auth::strip_recognized_access_credentials(&mut sanitized.params);
+                AuthAdmissionReceipt {
+                    method: sanitized.method,
+                    request_id: request_id_to_u64(sanitized.id.as_ref()),
+                    sanitized_params: sanitized.params,
+                    fingerprint,
+                    authenticated,
+                }
+            })
+            .map_err(|_| native_http_authentication_rejection())
     }
 
     fn admit_modern_http_request(
@@ -6893,6 +7266,8 @@ impl ServerHttpSession {
         cx: &Cx,
         endpoint_response: DualEraHttpEndpointResponse,
         transport_authorization: TransportAuthorization,
+        raw_params: Option<Arc<str>>,
+        auth_receipt: Option<AuthDispatchCustody>,
         modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         let request = self
@@ -6933,6 +7308,8 @@ impl ServerHttpSession {
                 owner_generation,
                 inbound,
                 request,
+                raw_params,
+                auth_receipt,
                 sender,
                 Arc::clone(&terminal_delivery),
                 None,
@@ -6970,6 +7347,9 @@ impl ServerHttpSession {
                     &inbound,
                     &request,
                     modern_request_cancellation,
+                    raw_params.as_deref(),
+                    auth_receipt.as_ref(),
+                    None,
                 );
                 if let Some(response) = response {
                     if let Some(rejection) =
@@ -7073,6 +7453,9 @@ impl ServerHttpSession {
                         &inbound,
                         request,
                         None,
+                        auth_receipt,
+                        None,
+                        None,
                         request_cancellation.clone(),
                         None,
                         notification_sender,
@@ -7147,7 +7530,15 @@ impl ServerHttpSession {
         request: HttpRequest,
         transport_authorization: TransportAuthorization,
     ) -> Result<
-        Result<(JsonRpcRequest, DualEraHttpSseResponse), ServerHttpEndpointResponse>,
+        Result<
+            (
+                JsonRpcRequest,
+                DualEraHttpSseResponse,
+                Option<Arc<str>>,
+                AuthDispatchCustody,
+            ),
+            ServerHttpEndpointResponse,
+        >,
         DualEraHttpEndpointError,
     > {
         if matches!(self.server.protocol_policy, ProtocolPolicy::LegacyOnly) {
@@ -7155,8 +7546,17 @@ impl ServerHttpSession {
                 HttpResponse::new(HttpStatus::BAD_REQUEST),
             )));
         }
-        let request = match self.prepare_modern_http_request(request) {
-            Ok(request) => request,
+        let (request, admitted_request, raw_params) =
+            match self.prepare_modern_http_request(request) {
+                Ok(request) => request,
+                Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
+            };
+        let auth_receipt = match self.preauthenticate_modern_http_request(
+            cx,
+            &admitted_request,
+            &transport_authorization,
+        ) {
+            Ok(receipt) => AuthDispatchCustody::Http(receipt),
             Err(response) => return Ok(Err(ServerHttpEndpointResponse::Immediate(response))),
         };
         let endpoint_response = match self
@@ -7182,7 +7582,13 @@ impl ServerHttpSession {
         };
         let DualEraHttpEndpointResponse::ModernSse(sse) = endpoint_response else {
             return self
-                .handle_modern(cx, endpoint_response, transport_authorization, None)
+                .handle_modern(
+                    cx,
+                    endpoint_response,
+                    transport_authorization,
+                    raw_params,
+                    None,
+                )
                 .map(Err);
         };
         let request = self
@@ -7195,7 +7601,7 @@ impl ServerHttpSession {
                 HttpResponse::bad_request(),
             )));
         }
-        Ok(Ok((request, sse)))
+        Ok(Ok((request, sse, raw_params, auth_receipt)))
     }
 
     #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -7470,18 +7876,46 @@ fn h1_request_to_transport(
 }
 
 /// Captures exactly one native `Authorization` field before the H1 request is
-/// decoded into the transport representation. Duplicate fields remain absent
-/// from custody and are rejected by the cardinality-preserving conversion.
-fn h1_transport_authorization(request: &asupersync::http::h1::Request) -> TransportAuthorization {
+/// decoded into the transport representation.  The raw H1 field sequence is
+/// the only ingress that can represent duplicate case variants, so reject it
+/// here rather than silently dropping custody before transport authorization.
+fn h1_transport_authorization(
+    request: &asupersync::http::h1::Request,
+) -> Result<TransportAuthorization, HttpResponse> {
     let mut singleton = None;
     for (name, value) in &request.headers {
         if name.eq_ignore_ascii_case("authorization") {
             if singleton.replace(value.as_str()).is_some() {
-                return TransportAuthorization::default();
+                return Err(native_http_authentication_rejection());
             }
         }
     }
-    TransportAuthorization::from_singleton_header(singleton)
+    Ok(TransportAuthorization::from_singleton_header(singleton))
+}
+
+/// Retains the same singleton rule for direct public `HttpRequest` ingress.
+/// Native H1 performs this check before conversion; direct callers can build a
+/// header map themselves and must receive the identical case-insensitive
+/// rejection rather than an order-dependent credential choice.
+fn transport_authorization_from_http_request(
+    request: &HttpRequest,
+) -> Result<TransportAuthorization, HttpResponse> {
+    let mut singleton = None;
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            if singleton.replace(value.as_str()).is_some() {
+                return Err(native_http_authentication_rejection());
+            }
+        }
+    }
+    Ok(TransportAuthorization::from_singleton_header(singleton))
+}
+
+/// Produces the bounded native HTTP authentication challenge used before any
+/// public-session or SSE-body mutation.  It intentionally carries no provider
+/// detail and never reflects a credential.
+fn native_http_authentication_rejection() -> HttpResponse {
+    HttpResponse::new(HttpStatus::UNAUTHORIZED).with_header("www-authenticate", "Bearer")
 }
 
 fn h1_response(mut response: HttpResponse) -> Http1Response {
@@ -7734,6 +8168,8 @@ fn spawn_modern_sse_dispatch(
     http_stream_generation: u64,
     inbound: InboundRequestContext,
     request: JsonRpcRequest,
+    raw_params: Option<Arc<str>>,
+    auth_receipt: Option<AuthDispatchCustody>,
     response_sender: StreamableHttpRequestResponseSender,
     terminal_delivery: Arc<FinalSubscriptionTerminalDelivery>,
     outcome_gate: Option<Arc<ModernSseOutcomeGate>>,
@@ -7909,6 +8345,9 @@ fn spawn_modern_sse_dispatch(
                         policy,
                         &inbound,
                         request,
+                        raw_params,
+                        auth_receipt,
+                        None,
                         Some(http_stream_generation),
                         cancellation.clone(),
                         Some(Arc::clone(&terminal_delivery)),
@@ -8046,6 +8485,8 @@ async fn send_modern_sse_stream(
     http_stream_generation: u64,
     inbound: InboundRequestContext,
     request: JsonRpcRequest,
+    raw_params: Option<Arc<str>>,
+    auth_receipt: Option<AuthDispatchCustody>,
     response: DualEraHttpSseResponse,
 ) -> Result<(), ()> {
     let sender = response.sender();
@@ -8069,6 +8510,8 @@ async fn send_modern_sse_stream(
         http_stream_generation,
         inbound,
         request,
+        raw_params,
+        auth_receipt,
         sender,
         Arc::clone(&terminal_delivery),
         Some(Arc::clone(&outcome_gate)),
@@ -8303,8 +8746,10 @@ fn dispatch_modern_http_request(
     modern_sessions: &LiveModernHttpSessionRegistry,
     request: HttpRequest,
 ) -> HttpResponse {
-    let transport_authorization =
-        TransportAuthorization::from_singleton_header(request.header("authorization"));
+    let transport_authorization = match transport_authorization_from_http_request(&request) {
+        Ok(authorization) => authorization,
+        Err(response) => return response,
+    };
     dispatch_modern_http_request_with_cancellation_and_transport_authorization(
         cx,
         endpoint,
@@ -8322,8 +8767,10 @@ fn dispatch_modern_http_request_with_cancellation(
     request: HttpRequest,
     request_cancellation: Option<McpRequestCancellation>,
 ) -> HttpResponse {
-    let transport_authorization =
-        TransportAuthorization::from_singleton_header(request.header("authorization"));
+    let transport_authorization = match transport_authorization_from_http_request(&request) {
+        Ok(authorization) => authorization,
+        Err(response) => return response,
+    };
     dispatch_modern_http_request_with_cancellation_and_transport_authorization(
         cx,
         endpoint,
@@ -8593,7 +9040,13 @@ async fn serve_http_connection(
         let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
         return;
     }
-    let transport_authorization = h1_transport_authorization(&request);
+    let transport_authorization = match h1_transport_authorization(&request) {
+        Ok(authorization) => authorization,
+        Err(response) => {
+            let _ = send_h1_response(cx, &mut framed, response).await;
+            return;
+        }
+    };
     let raw_path = request
         .uri
         .split_once('?')
@@ -8644,7 +9097,7 @@ async fn serve_http_connection(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match session.begin_modern_sse(cx, request.clone(), transport_authorization.clone()) {
-                Ok(Ok((request, response))) => Ok(Ok((
+                Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
                     InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
                         request_id_to_u64(request.id.as_ref()),
@@ -8653,6 +9106,8 @@ async fn serve_http_connection(
                         transport_authorization.clone(),
                     ),
                     request,
+                    raw_params,
+                    auth_receipt,
                     response,
                 ))),
                 Ok(Err(response)) => Ok(Err(response)),
@@ -8660,7 +9115,7 @@ async fn serve_http_connection(
             }
         };
         match response {
-            Ok(Ok((inbound, request, response))) => {
+            Ok(Ok((inbound, request, raw_params, auth_receipt, response))) => {
                 let response_body_generation = next_live_modern_http_response_body_generation();
                 let live_session = match modern_sessions
                     .register_response_body(response_body_generation, Arc::clone(&live_session))
@@ -8687,6 +9142,8 @@ async fn serve_http_connection(
                     next_modern_http_stream_generation(),
                     inbound,
                     request,
+                    raw_params,
+                    Some(auth_receipt),
                     response,
                 )
                 .await;
@@ -8859,7 +9316,13 @@ async fn serve_modern_http_connection(
         let _ = send_h1_response(cx, &mut framed, HttpResponse::bad_request()).await;
         return;
     }
-    let transport_authorization = h1_transport_authorization(&request);
+    let transport_authorization = match h1_transport_authorization(&request) {
+        Ok(authorization) => authorization,
+        Err(response) => {
+            let _ = send_h1_response(cx, &mut framed, response).await;
+            return;
+        }
+    };
     let raw_path = request
         .uri
         .split_once('?')
@@ -8905,7 +9368,7 @@ async fn serve_modern_http_connection(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             match session.begin_modern_sse(cx, request.clone(), transport_authorization.clone()) {
-                Ok(Ok((request, response))) => Ok(Ok((
+                Ok(Ok((request, response, raw_params, auth_receipt))) => Ok(Ok((
                     InboundRequestContext::with_modern_connection_and_transport_authorization(
                         cx.clone(),
                         request_id_to_u64(request.id.as_ref()),
@@ -8914,6 +9377,8 @@ async fn serve_modern_http_connection(
                         transport_authorization.clone(),
                     ),
                     request,
+                    raw_params,
+                    auth_receipt,
                     response,
                 ))),
                 Ok(Err(response)) => Ok(Err(response)),
@@ -8921,7 +9386,7 @@ async fn serve_modern_http_connection(
             }
         };
         match response {
-            Ok(Ok((inbound, request, response))) => {
+            Ok(Ok((inbound, request, raw_params, auth_receipt, response))) => {
                 let response_body_generation = next_live_modern_http_response_body_generation();
                 let live_session = match modern_sessions
                     .register_response_body(response_body_generation, Arc::clone(&live_session))
@@ -8948,6 +9413,8 @@ async fn serve_modern_http_connection(
                     next_modern_http_stream_generation(),
                     inbound,
                     request,
+                    raw_params,
+                    Some(auth_receipt),
                     response,
                 )
                 .await;
@@ -9549,7 +10016,7 @@ impl Server {
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
-        self.dispatch_stateless_with_cancellation(inbound, request, None)
+        self.dispatch_stateless_with_cancellation(inbound, request, None, None, None, None)
     }
 
     fn dispatch_stateless_with_cancellation(
@@ -9557,6 +10024,9 @@ impl Server {
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
         request_cancellation: Option<McpRequestCancellation>,
+        raw_params: Option<&str>,
+        auth_receipt: Option<&AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
     ) -> Option<JsonRpcResponse> {
         let method = request.method.clone();
         let response_id = request.id.clone();
@@ -9632,9 +10102,13 @@ impl Server {
         };
 
         let mut admission_request = request.clone();
-        if let Err(error) =
-            self.authenticate_modern_request(&request_ctx, inbound, &mut admission_request)
-        {
+        if let Err(error) = self.authenticate_modern_request(
+            &request_ctx,
+            inbound,
+            &mut admission_request,
+            auth_receipt,
+            websocket_connection_generation,
+        ) {
             if let Some(stats) = &self.stats {
                 stats.record_request(&method, started_at.elapsed(), false);
             }
@@ -9690,9 +10164,10 @@ impl Server {
                     inbound.mrtr_continuation_cancellation().unwrap_or_default();
                 match self
                     .router
-                    .dispatch_stateless_with_continuation_cancellation(
+                    .dispatch_stateless_with_continuation_cancellation_and_raw_params(
                         &request_ctx,
                         &admission_request,
+                        retained_raw_params(raw_params, &admission_request),
                         &continuation_cancellation,
                     ) {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
@@ -9800,6 +10275,9 @@ impl Server {
         self: Arc<Self>,
         inbound: &InboundRequestContext,
         request: JsonRpcRequest,
+        raw_params: Option<Arc<str>>,
+        auth_receipt: Option<AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
         modern_http_owner: Option<u64>,
         request_cancellation: McpRequestCancellation,
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
@@ -9853,7 +10331,13 @@ impl Server {
                 "request scope could not be established",
             ));
         };
-        if let Err(error) = self.authenticate_modern_request(&request_ctx, inbound, &mut request) {
+        if let Err(error) = self.authenticate_modern_request(
+            &request_ctx,
+            inbound,
+            &mut request,
+            auth_receipt.as_ref(),
+            websocket_connection_generation,
+        ) {
             return response_for_error(error);
         }
 
@@ -9949,9 +10433,10 @@ impl Server {
                     .await
                 }
                 None => match Arc::clone(&self.router)
-                    .dispatch_stateless_owned_with_continuation_cancellation(
+                    .dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
                         request_ctx.clone(),
                         request.clone(),
+                        retained_raw_params(raw_params.as_deref(), &request).map(Arc::<str>::from),
                         inbound.mrtr_continuation_cancellation().unwrap_or_default(),
                     )
                     .await
@@ -10340,6 +10825,9 @@ impl Server {
         policy: ProtocolPolicy,
         inbound: &InboundRequestContext,
         request: JsonRpcRequest,
+        raw_params: Option<Arc<str>>,
+        auth_receipt: Option<AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
         modern_http_owner: Option<u64>,
         request_cancellation: McpRequestCancellation,
         terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
@@ -10364,6 +10852,9 @@ impl Server {
         self.dispatch_stateless_owned_with_cancellation(
             inbound,
             request,
+            raw_params,
+            auth_receipt,
+            websocket_connection_generation,
             modern_http_owner,
             request_cancellation,
             terminal_delivery,
@@ -10647,7 +11138,9 @@ impl Server {
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
     ) -> Option<JsonRpcResponse> {
-        self.dispatch_with_protocol_policy_and_cancellation(policy, inbound, request, None)
+        self.dispatch_with_protocol_policy_and_cancellation(
+            policy, inbound, request, None, None, None, None,
+        )
     }
 
     /// Processes a modern request and delivers its request-scoped final log
@@ -10678,6 +11171,9 @@ impl Server {
         inbound: &InboundRequestContext,
         request: &JsonRpcRequest,
         request_cancellation: Option<McpRequestCancellation>,
+        raw_params: Option<&str>,
+        auth_receipt: Option<&AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
     ) -> Option<JsonRpcResponse> {
         if matches!(policy, ProtocolPolicy::LegacyOnly)
             && modern_protocol_version(request).is_some()
@@ -10704,7 +11200,14 @@ impl Server {
                 )
             });
         }
-        self.dispatch_stateless_with_cancellation(inbound, request, request_cancellation)
+        self.dispatch_stateless_with_cancellation(
+            inbound,
+            request,
+            request_cancellation,
+            raw_params,
+            auth_receipt,
+            websocket_connection_generation,
+        )
     }
 
     /// Maps an explicit-policy modern dispatch result onto the HTTP response
@@ -11234,6 +11737,9 @@ impl Server {
         dispatch_cx: &Cx,
         recv_half: R,
         send_half: S,
+        transport_authorization: TransportAuthorization,
+        auth_receipt: AuthDispatchCustody,
+        websocket_connection_generation: u64,
     ) -> McpResult<()>
     where
         R: TransportRecvHalf + Send + 'static,
@@ -11257,6 +11763,9 @@ impl Server {
             notification_sender,
             Some(notification_failure),
             "websocket",
+            transport_authorization,
+            auth_receipt,
+            websocket_connection_generation,
         );
         let recv_close = recv_half
             .close()
@@ -11905,6 +12414,10 @@ impl Server {
             true,
             Some(connection_failure),
             true,
+            true,
+            None,
+            None,
+            None,
         )
     }
 
@@ -11967,6 +12480,10 @@ impl Server {
             false,
             connection_failure,
             true,
+            true,
+            None,
+            None,
+            None,
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
@@ -11987,6 +12504,9 @@ impl Server {
         notification_sender: NotificationSender,
         connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
+        transport_authorization: TransportAuthorization,
+        auth_receipt: AuthDispatchCustody,
+        websocket_connection_generation: u64,
     ) -> McpResult<()>
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
@@ -12002,6 +12522,10 @@ impl Server {
             false,
             connection_failure,
             true,
+            false,
+            Some(transport_authorization),
+            Some(auth_receipt),
+            Some(websocket_connection_generation),
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
@@ -12035,6 +12559,10 @@ impl Server {
             true,
             None,
             true,
+            true,
+            None,
+            None,
+            None,
         )
     }
 
@@ -12056,19 +12584,24 @@ impl Server {
         _detach_on_worker_timeout: bool,
         connection_failure: Option<Arc<AtomicBool>>,
         enforce_runtime_era: bool,
+        owns_server_lifecycle: bool,
+        transport_authorization: Option<TransportAuthorization>,
+        auth_receipt: Option<AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
     ) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + Sync + 'static,
     {
         let server = self;
+        let auth_custody_generation = websocket_connection_generation;
         if let Some(stats) = &server.stats {
             stats.connection_opened();
         }
         if server.console_config.show_banner && !banner_suppressed() {
             server.render_startup_banner(transport_label);
         }
-        if !server.run_startup_hook() {
+        if owns_server_lifecycle && !server.run_startup_hook() {
             server.graceful_shutdown_returning();
             return 1;
         }
@@ -12125,16 +12658,20 @@ impl Server {
                 exit_code = 1;
                 break;
             }
-            let inbound = InboundRequestContext::with_modern_connection(
+            let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                 cx.clone(),
                 request_id_to_u64(request.id.as_ref()),
                 InboundRequestTransport::Stdio,
                 &modern_connection,
+                transport_authorization.clone().unwrap_or_default(),
             );
             let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
                 server.protocol_policy,
                 &inbound,
                 request,
+                None,
+                auth_receipt.clone(),
+                auth_custody_generation,
                 None,
                 McpRequestCancellation::new(),
                 None,
@@ -12147,9 +12684,11 @@ impl Server {
                 break;
             }
         }
-        let _ = server.terminate_subscription_streams();
-        server.cancel_active_requests(CancelKind::Shutdown, false);
-        server.run_shutdown_hook();
+        if owns_server_lifecycle {
+            let _ = server.terminate_subscription_streams();
+            server.cancel_active_requests(CancelKind::Shutdown, false);
+            server.run_shutdown_hook();
+        }
         if let Some(stats) = &server.stats {
             stats.connection_closed();
         }
@@ -12180,6 +12719,10 @@ impl Server {
             true,
             None,
             true,
+            true,
+            None,
+            None,
+            None,
         )
     }
 
@@ -12196,6 +12739,10 @@ impl Server {
         detach_on_worker_timeout: bool,
         connection_failure: Option<Arc<AtomicBool>>,
         enforce_runtime_era: bool,
+        owns_server_lifecycle: bool,
+        transport_authorization: Option<TransportAuthorization>,
+        auth_receipt: Option<AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
     ) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
@@ -12204,10 +12751,12 @@ impl Server {
         if let Some(ref stats) = self.stats {
             stats.connection_opened();
         }
+
+        let auth_custody_generation = websocket_connection_generation;
         if self.console_config.show_banner && !banner_suppressed() {
             self.render_startup_banner(transport_label);
         }
-        if !self.run_startup_hook() {
+        if owns_server_lifecycle && !self.run_startup_hook() {
             error!(target: targets::SERVER, "Startup hook failed, stopping");
             self.graceful_shutdown_returning();
             return 1;
@@ -12258,6 +12807,9 @@ impl Server {
         let worker_renderer = traffic_renderer.clone();
         let worker_session_principal = session_principal.clone();
         let worker_legacy_runtime = legacy_runtime.clone();
+        let worker_transport_authorization = transport_authorization.clone().unwrap_or_default();
+        let worker_auth_receipt = auth_receipt.clone();
+        let worker_auth_custody_generation = auth_custody_generation;
         let (worker_completion_sender, worker_completion_receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let _completion = DispatchWorkerCompletionSignal(Some(worker_completion_sender));
@@ -12394,7 +12946,7 @@ impl Server {
                         request_id_to_u64(request.id.as_ref()),
                         InboundRequestTransport::Stdio,
                         &worker_modern_connection,
-                        TransportAuthorization::default(),
+                        worker_transport_authorization.clone(),
                     );
                     let request_cancellation = McpRequestCancellation::new();
                     let notification_send = Arc::clone(&worker_send);
@@ -12419,6 +12971,9 @@ impl Server {
                             worker_server.protocol_policy,
                             &inbound,
                             request.clone(),
+                            None,
+                            worker_auth_receipt.clone(),
+                            worker_auth_custody_generation,
                             None,
                             request_cancellation.clone(),
                             None,
@@ -12967,6 +13522,10 @@ impl Server {
                         let request_renderer = traffic_renderer.clone();
                         let task_principal_admission = Arc::clone(&principal_admission);
                         let task_modern_connection = dispatch_modern_connection.clone();
+                        let task_transport_authorization =
+                            transport_authorization.clone().unwrap_or_default();
+                        let task_auth_receipt = auth_receipt.clone();
+                        let task_auth_custody_generation = auth_custody_generation;
                         let submitted = dispatch_cx.spawn_blocking(move |request_cx| {
                             let mut reservation = reservation;
                             match task_principal_admission
@@ -13050,7 +13609,7 @@ impl Server {
                                                 request_id_to_u64(request.id.as_ref()),
                                                 InboundRequestTransport::Stdio,
                                                 &task_modern_connection,
-                                                TransportAuthorization::default(),
+                                                task_transport_authorization.clone(),
                                             );
                                             let started = Instant::now();
                                             let notification_send = Arc::clone(&request_send);
@@ -13098,6 +13657,9 @@ impl Server {
                                                         request_server.protocol_policy,
                                                         &inbound,
                                                         request.clone(),
+                                                        None,
+                                                        task_auth_receipt.clone(),
+                                                        task_auth_custody_generation,
                                                         None,
                                                         request_cancellation.clone(),
                                                         None,
@@ -13373,7 +13935,9 @@ impl Server {
         // its correlated stdio control, then wakes the listen future by
         // cancellation; cancelling children first would erase that completion
         // before the writer can commit it.
-        let _ = server.terminate_subscription_streams();
+        if owns_server_lifecycle {
+            let _ = server.terminate_subscription_streams();
+        }
         // Notification children have no response commit to protect, so they
         // are cancelled before the drain windows instead of being waited out.
         queue_state.cancel_uncorrelated_modern_children();
@@ -13384,7 +13948,9 @@ impl Server {
         }
         queue_state.stop();
         drop(dispatch_sender);
-        server.cancel_active_requests(CancelKind::Shutdown, false);
+        if owns_server_lifecycle {
+            server.cancel_active_requests(CancelKind::Shutdown, false);
+        }
         pending_requests.cancel_all();
         let modern_children_quiesced = if queue_state
             .wait_for_modern_drain(DISPATCH_WORKER_SHUTDOWN_TIMEOUT)
@@ -13459,13 +14025,15 @@ impl Server {
         {
             exit_code = 1;
         }
-        if worker_quiesced && modern_children_quiesced {
-            server.run_shutdown_hook();
-        } else {
-            error!(
-                target: targets::SERVER,
-                "Skipping shutdown hook because dispatch-child quiescence was not established"
-            );
+        if owns_server_lifecycle {
+            if worker_quiesced && modern_children_quiesced {
+                server.run_shutdown_hook();
+            } else {
+                error!(
+                    target: targets::SERVER,
+                    "Skipping shutdown hook because dispatch-child quiescence was not established"
+                );
+            }
         }
         if let Some(ref stats) = server.stats {
             stats.connection_closed();
@@ -13679,17 +14247,21 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        let inbound = InboundRequestContext::with_modern_connection(
+                        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
+                            transport_authorization.clone().unwrap_or_default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
                             server.protocol_policy,
                             &inbound,
                             request,
+                            None,
+                            auth_receipt.clone(),
+                            auth_custody_generation,
                             None,
                             request_cancellation,
                             None,
@@ -14079,17 +14651,21 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        let inbound = InboundRequestContext::with_modern_connection(
+                        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
+                            transport_authorization.clone().unwrap_or_default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
                             server.protocol_policy,
                             &inbound,
                             request,
+                            None,
+                            auth_receipt.clone(),
+                            auth_custody_generation,
                             None,
                             request_cancellation,
                             None,
@@ -15685,10 +16261,20 @@ impl Server {
         ctx: &McpContext,
         inbound: &InboundRequestContext,
         request: &mut JsonRpcRequest,
+        auth_receipt: Option<&AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
     ) -> McpResult<()> {
-        let auth_request = inbound.auth_request(&request.method, request.params.as_ref());
-        let fingerprint = self.authenticate_request(ctx, auth_request)?;
-        auth::strip_recognized_access_credentials(&mut request.params);
+        let fingerprint = match auth_receipt {
+            Some(receipt) => {
+                receipt.commit(ctx, inbound, request, websocket_connection_generation)?
+            }
+            None => {
+                let auth_request = inbound.auth_request(&request.method, request.params.as_ref());
+                let fingerprint = self.authenticate_request(ctx, auth_request)?;
+                auth::strip_recognized_access_credentials(&mut request.params);
+                fingerprint
+            }
+        };
         if !inbound.bind_or_verify_principal(fingerprint) {
             return Err(McpError::new(
                 McpErrorCode::ResourceForbidden,
@@ -15703,6 +16289,37 @@ impl Server {
         ctx: &McpContext,
         request: AuthRequest<'_>,
     ) -> Result<Sha256Digest, McpError> {
+        let (fingerprint, authenticated) =
+            self.authenticate_request_without_commit(ctx, request)?;
+        Self::enforce_request_context(ctx)?;
+        match authenticated {
+            Some(auth) if ctx.set_auth(auth) => Ok(fingerprint),
+            Some(_) => {
+                if let Some(error) = Self::request_context_error(ctx) {
+                    Err(error)
+                } else {
+                    Err(McpError::internal_error(
+                        "authentication context was already committed",
+                    ))
+                }
+            }
+            None if ctx.commit_anonymous_auth() => Ok(fingerprint),
+            None => Err(Self::request_context_error(ctx).unwrap_or_else(|| {
+                McpError::internal_error("authentication admission was already committed")
+            })),
+        }
+    }
+
+    /// Evaluates authentication without mutating the caller's request context.
+    /// Native HTTP and WebSocket ingress turn these private facts into an
+    /// [`AuthAdmissionReceipt`] before acquiring session or response-body
+    /// ownership; dispatch commits that receipt without re-evaluating a
+    /// provider.
+    fn authenticate_request_without_commit(
+        &self,
+        ctx: &McpContext,
+        request: AuthRequest<'_>,
+    ) -> Result<(Sha256Digest, Option<AuthContext>), McpError> {
         if !request.credential_sources_are_admissible() {
             return Err(McpError::new(
                 McpErrorCode::ResourceForbidden,
@@ -15717,13 +16334,7 @@ impl Server {
                     "Authentication failed",
                 ));
             }
-            Self::enforce_request_context(ctx)?;
-            if !ctx.commit_anonymous_auth() {
-                return Err(Self::request_context_error(ctx).unwrap_or_else(|| {
-                    McpError::internal_error("authentication admission was already committed")
-                }));
-            }
-            return auth::principal_fingerprint(None);
+            return auth::principal_fingerprint(None).map(|fingerprint| (fingerprint, None));
         };
         let auth = {
             let staged_ctx = ctx.clone().with_isolated_auth();
@@ -15756,16 +16367,36 @@ impl Server {
             );
             McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed")
         })?;
-        Self::enforce_request_context(ctx)?;
-        if !ctx.set_auth(auth) {
-            if let Some(error) = Self::request_context_error(ctx) {
-                return Err(error);
-            }
-            return Err(McpError::internal_error(
-                "authentication context was already committed",
+        Ok((fingerprint, Some(auth)))
+    }
+
+    /// Validates Upgrade authorization before the WebSocket `101` commits.
+    /// The resulting transport-private field is carried to every connection
+    /// request, where normal request-scoped authentication still strips any
+    /// recognized in-band fields before middleware can observe them.
+    #[cfg(feature = "websocket")]
+    fn authenticate_websocket_upgrade(
+        &self,
+        cx: &Cx,
+        transport_authorization: &TransportAuthorization,
+        connection_generation: u64,
+    ) -> McpResult<Arc<WebSocketAuthCustody>> {
+        let request = transport_authorization.auth_request("websocket/upgrade", None, 0);
+        if self.auth_provider.is_some() && !request.has_any_credential_source() {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authentication failed",
             ));
         }
-        Ok(fingerprint)
+        self.authenticate_request_without_commit(&McpContext::new(cx.clone(), 0), request)
+            .map(|(fingerprint, authenticated)| {
+                Arc::new(WebSocketAuthCustody {
+                    connection_generation,
+                    fingerprint,
+                    authenticated,
+                    rejected_inband_request_ids: Mutex::new(HashSet::new()),
+                })
+            })
     }
 
     /// Authenticates and parses an out-of-band cancellation before any queue,
@@ -17079,7 +17710,7 @@ mod lib_unit_tests {
     async fn websocket_upgrade(
         cx: &Cx,
         address: std::net::SocketAddr,
-        request: &str,
+        request: &[u8],
     ) -> Result<(AsyncTcpStream, Vec<u8>), String> {
         use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -17088,7 +17719,7 @@ mod lib_unit_tests {
             .await
             .map_err(|_| "WebSocket client connect timed out".to_owned())?
             .map_err(|error| format!("WebSocket client connect failed: {error}"))?;
-        asupersync::time::timeout_at(deadline, stream.write_all(request.as_bytes()))
+        asupersync::time::timeout_at(deadline, stream.write_all(request))
             .await
             .map_err(|_| "WebSocket handshake write timed out".to_owned())?
             .map_err(|error| format!("WebSocket handshake write failed: {error}"))?;
@@ -17114,14 +17745,14 @@ mod lib_unit_tests {
 
     #[cfg(feature = "websocket")]
     #[test]
-    fn live_websocket_upgrade_dispatches_modern_and_rejects_bad_header_and_era_without_state_change()
-     {
+    fn live_websocket_upgrade_owns_connection_teardown_and_preserves_peer_isolation() {
         run_live_http_test(|cx| async move {
             use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 
             let listener = Server::new("live-websocket", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("modern-only policy is available")
+                .http_config(HttpServerConfig::new().mcp_path("/qualified/mcp"))
                 .build()
                 .bind_websocket(&cx, "127.0.0.1:0")
                 .await
@@ -17137,29 +17768,30 @@ mod lib_unit_tests {
                 .map_err(|error| format!("WebSocket listener task admission failed: {error}"))?;
 
             let valid = concat!(
-                "GET /mcp HTTP/1.1\r\n",
+                "GET /qualified/mcp?ignored=query HTTP/1.1\r\n",
                 "Host: localhost\r\n",
                 "Upgrade: websocket\r\n",
                 "Connection: Upgrade\r\n",
                 "Sec-WebSocket-Version: 13\r\n",
                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
             );
-            let (mut client, accepted) = websocket_upgrade(&cx, address, valid).await?;
+            // The opening frame intentionally shares the Upgrade write. This
+            // proves that HTTP header parsing hands pre-read WebSocket bytes
+            // to the server-role frame decoder instead of losing them.
+            let mut opening = valid.as_bytes().to_vec();
+            opening.extend_from_slice(&masked_websocket_message(modern_discovery_request(7_101)));
+            let (mut client, accepted) = websocket_upgrade(&cx, address, &opening).await?;
             if !accepted.starts_with(b"HTTP/1.1 101") {
                 return Err(format!(
                     "valid WebSocket upgrade was not accepted: {accepted:?}"
                 ));
             }
-            client
-                .write_all(&masked_websocket_message(modern_discovery_request(7_101)))
-                .await
-                .map_err(|error| format!("modern WebSocket frame write failed: {error}"))?;
-            client
-                .flush()
-                .await
-                .map_err(|error| format!("modern WebSocket frame flush failed: {error}"))?;
             let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
-            let mut response = Vec::new();
+            let header_end = accepted
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map_or(accepted.len(), |position| position + 4);
+            let mut response = accepted[header_end..].to_vec();
             while !response.windows(10).any(|window| window == b"serverInfo") {
                 let mut chunk = [0_u8; 1024];
                 let read = asupersync::time::timeout_at(deadline, client.read(&mut chunk))
@@ -17175,15 +17807,28 @@ mod lib_unit_tests {
                 .write_all(&masked_websocket_frame(0x08, &[]))
                 .await
                 .map_err(|error| format!("WebSocket close write failed: {error}"))?;
+            client
+                .flush()
+                .await
+                .map_err(|error| format!("WebSocket close flush failed: {error}"))?;
+            let mut close_reply = [0_u8; 32];
+            let close_read = asupersync::time::timeout_at(deadline, client.read(&mut close_reply))
+                .await
+                .map_err(|_| "WebSocket close reply timed out".to_owned())?
+                .map_err(|error| format!("WebSocket close reply failed: {error}"))?;
+            if close_read < 2 || close_reply[0] & 0x0f != 0x08 || close_reply[1] & 0x80 != 0 {
+                return Err("server did not return an unmasked WebSocket close reply".to_owned());
+            }
 
             let malformed_header = valid.replace("Connection: Upgrade", "Connection: keep-alive");
             let (_bad_client, rejected) =
-                websocket_upgrade(&cx, address, &malformed_header).await?;
+                websocket_upgrade(&cx, address, malformed_header.as_bytes()).await?;
             if !rejected.starts_with(b"HTTP/1.1 400") {
                 return Err(format!("bad Upgrade header was not rejected: {rejected:?}"));
             }
 
-            let (mut era_client, era_accepted) = websocket_upgrade(&cx, address, valid).await?;
+            let (mut era_client, era_accepted) =
+                websocket_upgrade(&cx, address, valid.as_bytes()).await?;
             if !era_accepted.starts_with(b"HTTP/1.1 101") {
                 return Err("era-negative WebSocket handshake was not accepted".to_owned());
             }
@@ -17211,8 +17856,400 @@ mod lib_unit_tests {
                 return Err("wrong-era frame did not receive a JSON-RPC refusal".to_owned());
             }
 
-            listener_task.abort();
-            let _ = listener_task.join(&cx).await;
+            // RH-5 negative neighbor: a rejected legacy opening must not
+            // poison independent modern state or terminate its listener.
+            let (mut independent_client, independent_accepted) =
+                websocket_upgrade(&cx, address, valid.as_bytes()).await?;
+            if !independent_accepted.starts_with(b"HTTP/1.1 101") {
+                return Err("wrong-era peer changed listener admission state".to_owned());
+            }
+            independent_client
+                .write_all(&masked_websocket_message(modern_discovery_request(7_103)))
+                .await
+                .map_err(|error| format!("isolated modern frame write failed: {error}"))?;
+            independent_client
+                .flush()
+                .await
+                .map_err(|error| format!("isolated modern frame flush failed: {error}"))?;
+            let mut independent_response = Vec::new();
+            while !independent_response
+                .windows(10)
+                .any(|window| window == b"serverInfo")
+            {
+                let mut chunk = [0_u8; 1024];
+                let read =
+                    asupersync::time::timeout_at(deadline, independent_client.read(&mut chunk))
+                        .await
+                        .map_err(|_| "isolated modern WebSocket response timed out".to_owned())?
+                        .map_err(|error| {
+                            format!("isolated modern WebSocket response failed: {error}")
+                        })?;
+                if read == 0 {
+                    return Err("wrong-era peer closed an independent modern connection".to_owned());
+                }
+                independent_response.extend_from_slice(&chunk[..read]);
+            }
+            independent_client
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("isolated WebSocket close write failed: {error}"))?;
+            era_client
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("era-negative WebSocket close write failed: {error}"))?;
+
+            // Cooperative listener shutdown is a first-class result, not an
+            // abort-and-discard cleanup path.  The independent join context
+            // remains live after the serving context elects shutdown.
+            cx.cancel_with(
+                CancelKind::User,
+                Some("live WebSocket quiescent shutdown proof complete"),
+            );
+            let join_cx = Cx::for_testing();
+            let shutdown = listener_task
+                .join(&join_cx)
+                .await
+                .map_err(|error| format!("WebSocket listener join failed: {error:?}"))?
+                .map_err(|error| format!("WebSocket listener failed: {error}"))?;
+            if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                return Err("cooperative WebSocket shutdown retained a child".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn live_websocket_connection_limit_rejects_before_child_and_releases_its_permit() {
+        run_live_http_test(|cx| async move {
+            let listener = Server::new("live-websocket-limit", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern-only policy is available")
+                .http_config(HttpServerConfig::new().max_connections(1))
+                .build()
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("limited WebSocket bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("limited WebSocket address failed: {error}"))?;
+            let scope = cx.scope();
+            let mut listener_task = cx
+                .spawn_in(&scope, move |listener_cx| async move {
+                    listener.serve(&listener_cx).await
+                })
+                .map_err(|error| format!("limited WebSocket listener admission failed: {error}"))?;
+            let opening = concat!(
+                "GET /mcp HTTP/1.1\r\n",
+                "Host: localhost\r\n",
+                "Upgrade: websocket\r\n",
+                "Connection: Upgrade\r\n",
+                "Sec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            let (first, accepted) = websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !accepted.starts_with(b"HTTP/1.1 101") {
+                return Err("the first limited WebSocket connection was not accepted".to_owned());
+            }
+            let (_overflow, rejected) = websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if rejected.starts_with(b"HTTP/1.1 101") {
+                return Err(
+                    "N+1 WebSocket connection created a child despite the limiter".to_owned(),
+                );
+            }
+            drop(first);
+            // The permit belongs to the accepted child's full lifetime.  A
+            // later handshake proves it was released when that child ended.
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            let mut replacement = None;
+            while cx.now() < deadline {
+                let (stream, response) =
+                    websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+                if response.starts_with(b"HTTP/1.1 101") {
+                    replacement = Some(stream);
+                    break;
+                }
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            drop(replacement.ok_or_else(|| {
+                "WebSocket permit did not release with its connection child".to_owned()
+            })?);
+            cx.cancel_with(
+                CancelKind::User,
+                Some("WebSocket connection limiter proof complete"),
+            );
+            let join_cx = Cx::for_testing();
+            let shutdown = listener_task
+                .join(&join_cx)
+                .await
+                .map_err(|error| format!("limited WebSocket listener join failed: {error:?}"))?
+                .map_err(|error| format!("limited WebSocket listener failed: {error}"))?;
+            if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                return Err("limited WebSocket shutdown retained a child".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn live_websocket_upgrade_authentication_rejects_before_101_and_allows_bearer() {
+        run_live_http_test(|cx| async move {
+            use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let listener = Server::new("live-websocket-auth", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern-only policy is available")
+                .auth_provider(OneShotNativeAuthProvider {
+                    calls: Arc::clone(&provider_calls),
+                })
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&handler_calls),
+                })
+                .build()
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("WebSocket auth bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("WebSocket auth address failed: {error}"))?;
+            let scope = cx.scope();
+            let mut listener_task = cx
+                .spawn_in(&scope, move |listener_cx| async move {
+                    listener.serve(&listener_cx).await
+                })
+                .map_err(|error| format!("WebSocket auth listener admission failed: {error}"))?;
+            let unsigned = concat!(
+                "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n",
+                "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            let (_missing, missing) = websocket_upgrade(&cx, address, unsigned.as_bytes()).await?;
+            if !missing.starts_with(b"HTTP/1.1 401")
+                || !String::from_utf8_lossy(&missing)
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate: bearer")
+            {
+                return Err(
+                    "missing WebSocket bearer committed a 101 or omitted challenge".to_owned(),
+                );
+            }
+            let invalid = unsigned.replace(
+                "\r\n\r\n",
+                "\r\nAuthorization: Bearer invalid-never-echo\r\n\r\n",
+            );
+            let (_invalid, invalid_response) =
+                websocket_upgrade(&cx, address, invalid.as_bytes()).await?;
+            if !invalid_response.starts_with(b"HTTP/1.1 401")
+                || String::from_utf8_lossy(&invalid_response).contains("invalid-never-echo")
+            {
+                return Err("invalid WebSocket bearer was not rejected before 101".to_owned());
+            }
+            let duplicate = unsigned.replace(
+                "\r\n\r\n",
+                "\r\nAuthorization: Bearer alpha\r\naUtHoRiZaTiOn: Bearer beta\r\n\r\n",
+            );
+            let (_duplicate, duplicate_response) =
+                websocket_upgrade(&cx, address, duplicate.as_bytes()).await?;
+            if !duplicate_response.starts_with(b"HTTP/1.1 401")
+                || !String::from_utf8_lossy(&duplicate_response)
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate: bearer")
+            {
+                return Err(
+                    "duplicate WebSocket Authorization did not receive 401 before 101".to_owned(),
+                );
+            }
+            for malformed in [
+                unsigned.replace("\r\n\r\n", "\r\nAuthorization Bearer alpha\r\n\r\n"),
+                unsigned.replace("\r\n\r\n", "\r\nAuthorization : Bearer alpha\r\n\r\n"),
+            ] {
+                let (_malformed, response) =
+                    websocket_upgrade(&cx, address, malformed.as_bytes()).await?;
+                if !response.starts_with(b"HTTP/1.1 401")
+                    || !String::from_utf8_lossy(&response)
+                        .to_ascii_lowercase()
+                        .contains("www-authenticate: bearer")
+                {
+                    return Err(
+                        "malformed Authorization intent did not receive the bounded challenge"
+                            .to_owned(),
+                    );
+                }
+            }
+            let unrelated_malformed = unsigned.replace("\r\n\r\n", "\r\nX-Test malformed\r\n\r\n");
+            let (_unrelated, unrelated_response) =
+                websocket_upgrade(&cx, address, unrelated_malformed.as_bytes()).await?;
+            if !unrelated_response.starts_with(b"HTTP/1.1 400") {
+                return Err("unrelated malformed Upgrade header was not retained as 400".to_owned());
+            }
+            let valid = unsigned.replace("\r\n\r\n", "\r\nAuthorization: Bearer alpha\r\n\r\n");
+            let (mut accepted, response) =
+                websocket_upgrade(&cx, address, valid.as_bytes()).await?;
+            if !response.starts_with(b"HTTP/1.1 101") {
+                return Err("valid WebSocket bearer did not pass Upgrade admission".to_owned());
+            }
+            let request = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "modern_http_auth_counter",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                7_104_i64,
+            );
+            accepted
+                .write_all(&masked_websocket_message(request))
+                .await
+                .map_err(|error| format!("valid WebSocket tool write failed: {error}"))?;
+            accepted
+                .flush()
+                .await
+                .map_err(|error| format!("valid WebSocket tool flush failed: {error}"))?;
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            let mut response = Vec::new();
+            while !response
+                .windows("authenticated modern HTTP dispatch".len())
+                .any(|window| window == b"authenticated modern HTTP dispatch")
+            {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, accepted.read(&mut chunk))
+                    .await
+                    .map_err(|_| "valid WebSocket tool response timed out".to_owned())?
+                    .map_err(|error| format!("valid WebSocket tool response failed: {error}"))?;
+                if read == 0 {
+                    return Err("valid WebSocket bearer closed before handler dispatch".to_owned());
+                }
+                response.extend_from_slice(&chunk[..read]);
+            }
+            if handler_calls.load(Ordering::Acquire) != 1
+                || provider_calls.load(Ordering::Acquire) != 1
+            {
+                return Err(
+                    "valid WebSocket bearer did not consume exactly one custody evaluation"
+                        .to_owned(),
+                );
+            }
+            let mixed = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "authorization": "Bearer never-log-or-handle",
+                    "name": "modern_http_auth_counter",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                7_105_i64,
+            );
+            accepted
+                .write_all(&masked_websocket_message(mixed))
+                .await
+                .map_err(|error| format!("mixed WebSocket credential write failed: {error}"))?;
+            accepted
+                .flush()
+                .await
+                .map_err(|error| format!("mixed WebSocket credential flush failed: {error}"))?;
+            let mut rejection = [0_u8; 1024];
+            let rejected = asupersync::time::timeout_at(deadline, accepted.read(&mut rejection))
+                .await
+                .map_err(|_| "mixed WebSocket credential response timed out".to_owned())?
+                .map_err(|error| format!("mixed WebSocket credential response failed: {error}"))?;
+            if rejected == 0
+                || !rejection[..rejected]
+                    .windows(5)
+                    .any(|window| window == b"error")
+                || String::from_utf8_lossy(&rejection[..rejected]).contains("never-log-or-handle")
+                || handler_calls.load(Ordering::Acquire) != 1
+                || provider_calls.load(Ordering::Acquire) != 1
+            {
+                return Err(
+                    "mixed WebSocket credential escaped custody or reached dispatch".to_owned(),
+                );
+            }
+            drop(accepted);
+            cx.cancel_with(
+                CancelKind::User,
+                Some("WebSocket authentication admission proof complete"),
+            );
+            let join_cx = Cx::for_testing();
+            let shutdown = listener_task
+                .join(&join_cx)
+                .await
+                .map_err(|error| format!("WebSocket auth listener join failed: {error:?}"))?
+                .map_err(|error| format!("WebSocket auth listener failed: {error}"))?;
+            if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                return Err("WebSocket authentication shutdown retained a child".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_nonquiescent_settlement_drains_cancelled_and_failed_children_before_cleanup() {
+        run_live_http_test(|cx| async move {
+            let shutdown_calls = Arc::new(AtomicUsize::new(0));
+            let shutdown_observer = Arc::clone(&shutdown_calls);
+            let server = Arc::new(
+                Server::new("websocket-settlement-drain", "1.0.0")
+                    .on_shutdown(move || {
+                        shutdown_observer.fetch_add(1, Ordering::AcqRel);
+                    })
+                    .build(),
+            );
+            let scope = cx.scope();
+            let mut cancelled = cx
+                .spawn_in(&scope, move |child_cx| async move {
+                    loop {
+                        let _ = asupersync::time::sleep(child_cx.now(), Duration::from_millis(10))
+                            .await;
+                    }
+                })
+                .map_err(|error| format!("cancelled WebSocket child admission failed: {error}"))?;
+            let failed = cx
+                .spawn_in(&scope, move |_child_cx| async move {
+                    panic!("forced WebSocket child failure")
+                })
+                .map_err(|error| format!("failed WebSocket child admission failed: {error}"))?;
+            cancelled.abort();
+            // Let the explicit failure become terminal before settlement;
+            // `settle` must nevertheless drain the cancelled sibling too.
+            asupersync::runtime::yield_now().await;
+            let retained = WebSocketServerShutdown::Nonquiescent(WebSocketNonquiescentShutdown {
+                children: vec![cancelled, failed],
+                server,
+                listener_error: None,
+                shutdown_complete: false,
+            });
+            let WebSocketServerShutdown::Nonquiescent(retained) = retained else {
+                return Err("forced WebSocket retained work did not report Nonquiescent".to_owned());
+            };
+            if retained.remaining_connections() != 2 {
+                return Err(
+                    "forced WebSocket retained work lost a child before settlement".to_owned(),
+                );
+            }
+            let error = retained
+                .settle(&cx)
+                .await
+                .expect_err("a real child failure must be returned after all children drain");
+            if !error
+                .message
+                .contains("WebSocket connection child settlement failure")
+                || shutdown_calls.load(Ordering::Acquire) != 1
+            {
+                return Err(
+                    "WebSocket settlement skipped cleanup or hid its recorded child failure"
+                        .to_owned(),
+                );
+            }
             Ok(())
         });
     }
@@ -17743,6 +18780,10 @@ mod lib_unit_tests {
                         false,
                         None,
                         true,
+                        true,
+                        None,
+                        None,
+                        None,
                     )
                 }) {
                     Ok(mut pump) => pump
@@ -24282,6 +25323,10 @@ mod lib_unit_tests {
                         true,
                         None,
                         true,
+                        true,
+                        None,
+                        None,
+                        None,
                     );
                     let _ = pump_sender.send(Ok(code));
                 }) {
@@ -24360,6 +25405,10 @@ mod lib_unit_tests {
                 true,
                 Some(Arc::clone(&notification_failure)),
                 false,
+                true,
+                None,
+                None,
+                None,
             );
 
         assert!(notification_failure.load(Ordering::Acquire));
@@ -24802,6 +25851,38 @@ mod lib_unit_tests {
                     McpErrorCode::ResourceForbidden,
                     "unrecognized bearer",
                 )),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct OneShotNativeAuthProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AuthProvider for OneShotNativeAuthProvider {
+        fn authenticate(
+            &self,
+            _ctx: &McpContext,
+            request: AuthRequest<'_>,
+        ) -> McpResult<AuthContext> {
+            let access = request
+                .access_token()
+                .ok_or_else(|| McpError::new(McpErrorCode::ResourceForbidden, "missing bearer"))?;
+            if access.token.as_str() != "alpha" {
+                return Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "unrecognized bearer",
+                ));
+            }
+            let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if call == 1 {
+                Ok(AuthContext::with_subject("one-shot-alpha"))
+            } else {
+                Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "provider must not be evaluated twice",
+                ))
             }
         }
     }
@@ -29400,6 +30481,338 @@ mod lib_unit_tests {
                 return Err(
                     "allowed native bearer did not invoke the handler exactly once".to_owned(),
                 );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_native_authorization_rejects_before_owned_state_and_strips_valid_bearer() {
+        run_live_http_test(|cx| async move {
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let saw_credential = Arc::new(AtomicBool::new(false));
+            let bound = Server::new("live-http-native-auth-admission", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .auth_provider(ModernHttpAuthProvider)
+                .middleware(ModernHttpAuthMiddleware {
+                    calls: Arc::clone(&middleware_calls),
+                    saw_credential: Arc::clone(&saw_credential),
+                })
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&handler_calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("native auth admission bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("native auth admission address failed: {error}"))?;
+            let request = modern_http_json_tool_request("modern_http_auth_counter", 936);
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let common = [
+                        ("Accept", "application/json"),
+                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                        ("Mcp-Method", "tools/call"),
+                        ("Mcp-Name", "modern_http_auth_counter"),
+                    ];
+                    let result = async {
+                        let missing = live_http_exchange(
+                            address,
+                            live_http_post("/mcp", &request.body, &common),
+                        )
+                        .await?;
+                        let invalid = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer invalid-never-echo"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let malformed = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let duplicate = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("aUtHoRiZaTiOn", "Bearer beta"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let accepted = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        Ok::<_, String>((missing, invalid, malformed, duplicate, accepted))
+                    }
+                    .await;
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("native HTTP authorization admission proof complete"),
+                    );
+                    result
+                })
+                .map_err(|error| {
+                    format!("native auth admission client admission failed: {error}")
+                })?;
+            let serve = bound.serve(&cx).await;
+            let (missing, invalid, malformed, duplicate, accepted) = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("native auth admission client failed: {error:?}"))??;
+            let shutdown =
+                serve.map_err(|error| format!("native auth admission server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "native HTTP authorization admission")
+                .await?;
+            for (label, response) in [
+                ("missing", missing),
+                ("invalid", invalid),
+                ("malformed", malformed),
+                ("duplicate", duplicate),
+            ] {
+                if !response.starts_with(b"HTTP/1.1 401")
+                    || live_http_response_header(&response, "www-authenticate")? != "Bearer"
+                    || std::str::from_utf8(&response)
+                        .map_err(|error| format!("{label} auth response was not UTF-8: {error}"))?
+                        .contains("invalid-never-echo")
+                {
+                    return Err(format!(
+                        "{label} native Authorization was not a bounded pre-dispatch 401"
+                    ));
+                }
+            }
+            let accepted: JsonRpcResponse =
+                serde_json::from_slice(live_http_response_body(&accepted)?).map_err(|error| {
+                    format!("valid native Authorization did not return JSON-RPC: {error}")
+                })?;
+            if accepted.error.is_some()
+                || handler_calls.load(Ordering::Acquire) != 1
+                || middleware_calls.load(Ordering::Acquire) != 1
+                || saw_credential.load(Ordering::Acquire)
+            {
+                return Err(
+                    "native Authorization admission mutated owned state or leaked bearer"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn admitted_raw_params_are_withheld_after_sanitation_changes_the_request() {
+        // RH-5 neighbor of the retained-source positive: a byte-exact raw
+        // sidecar is legal only while it still decodes to the request that
+        // admission handed downstream.  Credential stripping changes that
+        // request, so continuation routing must receive no stale source.
+        let raw = r#"{"authorization":"Bearer never-forward","requestState":"state"}"#;
+        let mut request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::from_str(raw).expect("raw sidecar fixture must decode")),
+            937_i64,
+        );
+        assert_eq!(retained_raw_params(Some(raw), &request), Some(raw));
+        auth::strip_recognized_access_credentials(&mut request.params);
+        assert_eq!(retained_raw_params(Some(raw), &request), None);
+        assert_eq!(
+            request.params,
+            Some(serde_json::json!({"requestState": "state"})),
+            "stale raw parameters must be withheld without mutating the sanitized request",
+        );
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_auth_custody_rejects_a_stale_connection_generation_before_dispatch() {
+        let cx = Cx::for_testing();
+        let custody = AuthDispatchCustody::WebSocket(Arc::new(WebSocketAuthCustody {
+            connection_generation: 44,
+            fingerprint: auth::principal_fingerprint(None).expect("anonymous digest must exist"),
+            authenticated: None,
+            rejected_inband_request_ids: Mutex::new(HashSet::new()),
+        }));
+        let inbound = InboundRequestContext::new(cx.clone(), 939, InboundRequestTransport::Memory);
+        let mut request = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({
+                "_meta": {MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION},
+            })),
+            939_i64,
+        );
+        let error = custody
+            .commit(&McpContext::new(cx, 939), &inbound, &mut request, Some(45))
+            .expect_err("a stale WebSocket custody must not cross a connection generation");
+        assert_eq!(error.code, McpErrorCode::ResourceForbidden);
+        assert_eq!(request.method, "tools/list");
+        assert!(request.params.is_some());
+    }
+
+    #[test]
+    fn live_http_sse_auth_receipt_commits_one_provider_result_and_fences_denials() {
+        run_live_http_test(|cx| async move {
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let saw_credential = Arc::new(AtomicBool::new(false));
+            let bound = Server::new("live-http-auth-receipt", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .auth_provider(OneShotNativeAuthProvider {
+                    calls: Arc::clone(&provider_calls),
+                })
+                .middleware(ModernHttpAuthMiddleware {
+                    calls: Arc::clone(&middleware_calls),
+                    saw_credential: Arc::clone(&saw_credential),
+                })
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&handler_calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("auth receipt bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("auth receipt address failed: {error}"))?;
+            let request = modern_http_json_tool_request("modern_http_auth_counter", 938);
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let headers = [
+                        ("Accept", "text/event-stream"),
+                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                        ("Mcp-Method", "tools/call"),
+                        ("Mcp-Name", "modern_http_auth_counter"),
+                    ];
+                    let result = async {
+                        let accepted = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("Accept", "text/event-stream"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let invalid = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer beta-never-echo"),
+                                    ("Accept", "text/event-stream"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let missing = live_http_exchange(
+                            address,
+                            live_http_post("/mcp", &request.body, &headers),
+                        )
+                        .await?;
+                        let duplicate = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("AUTHORIZATION", "Bearer beta"),
+                                    ("Accept", "text/event-stream"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        Ok::<_, String>((accepted, invalid, missing, duplicate))
+                    }
+                    .await;
+                    caller_cx.cancel_with(CancelKind::User, Some("auth receipt proof complete"));
+                    result
+                })
+                .map_err(|error| format!("auth receipt client admission failed: {error}"))?;
+            let serve = bound.serve(&cx).await;
+            let (accepted, invalid, missing, duplicate) = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("auth receipt client failed: {error:?}"))??;
+            let shutdown = serve.map_err(|error| format!("auth receipt server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "auth receipt").await?;
+            if !accepted.starts_with(b"HTTP/1.1 200")
+                || provider_calls.load(Ordering::Acquire) != 1
+                || handler_calls.load(Ordering::Acquire) != 1
+                || middleware_calls.load(Ordering::Acquire) != 1
+                || saw_credential.load(Ordering::Acquire)
+            {
+                return Err(
+                    "successful native auth did not consume exactly one private receipt".to_owned(),
+                );
+            }
+            for response in [invalid, missing, duplicate] {
+                if !response.starts_with(b"HTTP/1.1 401")
+                    || live_http_response_header(&response, "www-authenticate")? != "Bearer"
+                    || String::from_utf8_lossy(&response).contains("beta-never-echo")
+                {
+                    return Err(
+                        "denied native auth mutated dispatch or exposed a bearer".to_owned()
+                    );
+                }
             }
             Ok(())
         });
@@ -37530,6 +38943,9 @@ mod lib_unit_tests {
             &inbound,
             request,
             None,
+            None,
+            None,
+            None,
             McpRequestCancellation::new(),
             None,
             notification_sender,
@@ -38561,6 +39977,9 @@ mod lib_unit_tests {
             &inbound,
             request,
             None,
+            None,
+            None,
+            None,
             request_cancellation,
             None,
             notification_sender,
@@ -39078,6 +40497,7 @@ mod lib_unit_tests {
                             serde_json::to_vec(&cancellation)
                                 .expect("typed cancellation notification must serialize"),
                         ),
+                    TransportAuthorization::default(),
                 )
                 .map_err(|error| format!("streaming cancellation rejection failed: {error}"))?;
             let Err(ServerHttpEndpointResponse::Immediate(streaming_rejected)) = streaming_rejected

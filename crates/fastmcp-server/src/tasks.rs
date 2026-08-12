@@ -4227,12 +4227,15 @@ struct FinalTaskServiceReadinessLease {
     ready_generation: u64,
 }
 
-/// One-shot framework runner for a caller-owned application Task service.
+/// Non-cloneable framework handle for a caller-owned application Task service.
 ///
 /// Only [`FinalTaskRuntime::install_task_service`] can construct this type.
 /// It is intentionally not cloneable: one runner owns one bounded wakeup
 /// receiver, while the durable store remains the recovery authority when a
-/// wakeup is missed, coalesced, or its service generation exits.
+/// wakeup is missed, coalesced, or its service generation exits. Its
+/// [`run_service`](Self::run_service) method borrows the handle so an
+/// application supervisor can retain it across a failed or cancelled service
+/// invocation and explicitly re-enter durable recovery.
 pub struct AuthorizedTaskServiceRunner {
     runtime: FinalTaskRuntime,
     service_id: u64,
@@ -4322,12 +4325,13 @@ impl FinalTaskRuntime {
     /// service and returns its non-cloneable runner.
     ///
     /// The caller must run the returned runner in an application-lifetime
-    /// asupersync region with [`AuthorizedTaskServiceRunner::run`]. A full
-    /// wakeup queue deliberately does not reject a durable transition: the
-    /// runner rescans the store's accepted-input handoffs after every wakeup
-    /// and when it starts, so the store rather than this process-local signal
-    /// remains authoritative for recovery. Installation alone is not a ready
-    /// creation authority; readiness begins only when `runner.run` is polled.
+    /// asupersync region with [`AuthorizedTaskServiceRunner::run_service`]. A
+    /// full wakeup queue deliberately does not reject a durable transition:
+    /// the runner rescans the store's accepted-input handoffs after every
+    /// wakeup and when it starts, so the store rather than this process-local
+    /// signal remains authoritative for recovery. Installation alone is not a
+    /// ready creation authority; readiness begins only when
+    /// `runner.run_service` is polled.
     pub fn install_task_service(
         &self,
         queue_capacity: usize,
@@ -4368,7 +4372,7 @@ impl FinalTaskRuntime {
             service_id,
             sender,
             // Installation reserves the one non-cloneable receiver, but only
-            // an entered `runner.run` that holds its readiness lease
+            // an entered `runner.run_service` that holds its readiness lease
             // establishes the ready creation authority.
             ready_generation: None,
             cancellation_wake: Arc::new(FinalTaskCancellationWake::default()),
@@ -5485,15 +5489,33 @@ impl FinalTaskRuntime {
     /// Verifies, without mutation, that a live entered task-service runner
     /// currently owns this runtime's readiness generation.
     ///
-    /// This is crate-visible so router integration can fail closed before it
-    /// accepts a Task-creating request. It is not a public service-control
-    /// surface and cannot install, start, stop, or wake a runner.
-    pub(crate) fn ensure_task_service_ready(&self) -> McpResult<()> {
+    /// This is the public readiness observation for an application-owned
+    /// task-service region. It becomes true only after a runner has passed its
+    /// entry checkpoint and keeps its exact readiness lease alive. Merely
+    /// installing a runner, retaining a runtime clone, or retaining durable
+    /// work is not readiness.
+    ///
+    /// The result is observational only: it cannot install, start, stop, or
+    /// wake a runner. Creation still takes the same lock through the durable
+    /// create boundary, so callers must not use this observation as a
+    /// substitute for the framework's fail-closed creation check.
+    #[must_use]
+    pub fn is_task_service_ready(&self) -> bool {
         let signal = self
             .service_signal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !Self::task_service_is_ready(signal.as_ref()) {
+        Self::task_service_is_ready(signal.as_ref())
+    }
+
+    /// Verifies, without mutation, that a live entered task-service runner
+    /// currently owns this runtime's readiness generation.
+    ///
+    /// Router integration uses this before accepting a Task-creating request.
+    /// It preserves the public observation's semantics while returning the
+    /// protocol-facing fail-closed error.
+    pub(crate) fn ensure_task_service_ready(&self) -> McpResult<()> {
+        if !self.is_task_service_ready() {
             return Err(McpError::invalid_params(
                 "Final task creation requires an installed ready task service",
             ));
@@ -5608,17 +5630,59 @@ impl FinalTaskRuntime {
 }
 
 impl AuthorizedTaskServiceRunner {
-    /// Runs recovery and bounded wakeup handling inside the caller's
-    /// structured application region.
+    /// Runs the service once, consuming this one-shot runner.
+    ///
+    /// New embeddings that supervise stdio or HTTP alongside Tasks should use
+    /// [`Self::run_service`] instead. That retained-runner surface can be
+    /// re-entered by the caller after its prior service future exits, allowing
+    /// recovery to remain inside one caller-owned structured region.
+    pub async fn run(mut self, cx: &Cx) -> McpResult<()> {
+        self.run_service(cx).await
+    }
+
+    /// Runs recovery and bounded wakeup handling while retaining this
+    /// caller-owned service runner.
     ///
     /// The durable store is scanned before the first wait and after every
     /// wakeup. A queue-full or missed synchronous signal therefore delays
     /// recovery but cannot erase a committed handoff. If the application
     /// supervisor returns an error, the exact current handoff is restored
-    /// before that error leaves the region; a subsequent installed service may
-    /// recover it. This is at-least-once handoff semantics, not an exactly-once
-    /// side-effect claim.
-    pub async fn run(mut self, cx: &Cx) -> McpResult<()> {
+    /// before that error leaves the region; a subsequent invocation on this
+    /// runner or a newly installed service may recover it. This is at-least-once
+    /// handoff semantics, not an exactly-once side-effect claim.
+    ///
+    /// This future borrows the runner, so an application cannot start two
+    /// service loops from one runner concurrently. When it exits because of a
+    /// supervisor error, caller-context cancellation, or a dropped future,
+    /// its readiness lease is revoked immediately and any unconsumed durable
+    /// handoff remains recoverable. The embedding may then call this method
+    /// again on the same runner to restart recovery, or drop it and install a
+    /// new runner generation. The latter is the process-restart path and
+    /// requires an application-provided durable [`FinalTaskStore`];
+    /// [`InMemoryFinalTaskStore`] intentionally cannot survive a process
+    /// restart.
+    ///
+    /// FastMCP neither creates a runtime nor spawns this future. Start it as a
+    /// child of the embedding's application region alongside `run_stdio` or
+    /// HTTP serving, and let that region own its cancellation and join.
+    ///
+    /// The mutable borrow is the API's non-concurrency boundary: one runner
+    /// cannot have two live service futures. Use separate runtimes and
+    /// separately installed runners only when the durable store supplies the
+    /// necessary cross-owner fencing.
+    ///
+    /// ```compile_fail
+    /// # use fastmcp_server::AuthorizedTaskServiceRunner;
+    /// # async fn cannot_start_two_service_loops(
+    /// #     runner: &mut AuthorizedTaskServiceRunner,
+    /// #     cx: &asupersync::Cx,
+    /// # ) {
+    /// let first = runner.run_service(cx);
+    /// let second = runner.run_service(cx);
+    /// let _ = (first, second);
+    /// # }
+    /// ```
+    pub async fn run_service(&mut self, cx: &Cx) -> McpResult<()> {
         cx.checkpoint()
             .map_err(|error| McpError::internal_error(error.to_string()))?;
         // A pre-cancelled runner must never publish readiness, even briefly.
@@ -6547,6 +6611,52 @@ mod tests {
                 Err(McpError::internal_error(
                     "planted caller-owned supervisor failure",
                 ))
+            })
+        }
+    }
+
+    const RUN_SERVICE_SUPERVISOR_FAIL: usize = 0;
+    const RUN_SERVICE_SUPERVISOR_PENDING: usize = 1;
+    const RUN_SERVICE_SUPERVISOR_COMPLETE: usize = 2;
+
+    /// Test-only supervisor whose next handoff outcome is selected by the
+    /// caller. It makes the retained-runner tests distinguish a supervisor
+    /// error, a dropped/cancelled pending service future, and a successful
+    /// retry without replacing the runner or the durable store.
+    struct SwitchableRunServiceSupervisor {
+        action: Arc<AtomicUsize>,
+    }
+
+    impl ApplicationTaskSupervisor for SwitchableRunServiceSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let action = Arc::clone(&self.action);
+            Box::pin(async move {
+                match action.load(AtomicOrdering::SeqCst) {
+                    RUN_SERVICE_SUPERVISOR_FAIL => {
+                        let _handoff = handoff;
+                        Err(McpError::internal_error(
+                            "planted retained-run-service supervisor failure",
+                        ))
+                    }
+                    RUN_SERVICE_SUPERVISOR_PENDING => {
+                        let _handoff = handoff;
+                        std::future::pending::<McpResult<()>>().await
+                    }
+                    RUN_SERVICE_SUPERVISOR_COMPLETE => {
+                        complete_final_task_handoff(handoff)?;
+                        // A caller-owned service region decides when this
+                        // long-lived loop exits after a successful retry.
+                        cx.cancel_with(CancelKind::User, None);
+                        Ok(())
+                    }
+                    _ => Err(McpError::internal_error(
+                        "invalid retained-run-service test supervisor action",
+                    )),
+                }
             })
         }
     }
@@ -7597,6 +7707,56 @@ mod tests {
             std::task::Poll::Pending
         ));
         running
+    }
+
+    fn poll_retained_task_service(
+        runner: &mut AuthorizedTaskServiceRunner,
+        cx: &Cx,
+    ) -> std::task::Poll<McpResult<()>> {
+        let mut running = Box::pin(runner.run_service(cx));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        Future::poll(running.as_mut(), &mut context)
+    }
+
+    fn assert_exact_initial_work_is_recoverable(
+        store: &InMemoryFinalTaskStore,
+        task_id: &FinalTaskId,
+        work_descriptor: &FinalTaskWorkDescriptor,
+    ) {
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.initial_work.get(task_id), Some(work_descriptor));
+        assert_eq!(state.work_descriptors.get(task_id), Some(work_descriptor));
+        assert!(
+            !state.handoff_leases.contains_key(task_id),
+            "a stopped retained service must not retain an initial-work lease"
+        );
+        assert!(
+            matches!(state.tasks.get(task_id), Some(FinalTask::Working(_))),
+            "a stopped retained service must leave the initial task working for retry"
+        );
+    }
+
+    fn assert_exact_accepted_input_is_recoverable(
+        store: &InMemoryFinalTaskStore,
+        task_id: &FinalTaskId,
+        input_responses: &FinalTaskInputResponses,
+    ) {
+        let state = store
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.accepted_inputs.get(task_id), Some(input_responses));
+        assert!(
+            !state.handoff_leases.contains_key(task_id),
+            "a stopped retained service must not retain an accepted-input lease"
+        );
+        assert!(
+            matches!(state.tasks.get(task_id), Some(FinalTask::Working(_))),
+            "a stopped retained service must leave the accepted input working for retry"
+        );
     }
 
     fn create_final_task_state_fixture(
@@ -9980,6 +10140,268 @@ mod tests {
         assert!(
             !advertised.load(AtomicOrdering::SeqCst),
             "the failed creation attempt emits no durable task advertisement"
+        );
+    }
+
+    #[test]
+    fn task_03_final_run_service_error_revokes_readiness_and_retries_exact_initial_work() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task = final_working_task_without_ttl("task-run-service-error-initial");
+        let task_id = task.base().task_id.clone();
+        let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
+            "handler": "run-service-error",
+            "payload": {"initial": true}
+        }))
+        .expect("non-null initial work descriptor is valid");
+        store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                work_descriptor.clone(),
+            )
+            .expect("initial work is durable before the service starts");
+
+        let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_FAIL));
+        let mut runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SwitchableRunServiceSupervisor {
+                    action: Arc::clone(&action),
+                }),
+            )
+            .expect("install retained task service runner");
+        let failed_cx = Cx::for_testing();
+
+        assert!(matches!(
+            poll_retained_task_service(&mut runner, &failed_cx),
+            std::task::Poll::Ready(Err(_))
+        ));
+        assert!(
+            !runtime.is_task_service_ready(),
+            "a supervisor error must revoke the entered retained service readiness"
+        );
+        assert_exact_initial_work_is_recoverable(&store, &task_id, &work_descriptor);
+
+        action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
+        let retry_cx = Cx::for_testing();
+        assert!(matches!(
+            poll_retained_task_service(&mut runner, &retry_cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(
+            !runtime.is_task_service_ready(),
+            "the caller-owned retry exit must revoke readiness again"
+        );
+        assert!(matches!(
+            store
+                .get_task(&task_id)
+                .expect("retried initial task is readable"),
+            Some(FinalTask::Completed { .. })
+        ));
+        assert!(
+            test_next_initial_work(&store)
+                .expect("completed initial recovery scan is valid")
+                .is_none(),
+            "the successful retry consumes the exact recovered initial handoff"
+        );
+    }
+
+    #[test]
+    fn task_03_final_run_service_cancellation_revokes_readiness_and_retries_exact_input() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses = serde_json::from_value(
+            serde_json::json!({"roots": {"roots": [{"uri": "file:///run-service-cancel"}]}}),
+        )
+        .expect("typed accepted input is valid");
+        let task_id = create_accepted_final_input(&runtime, input_responses.clone());
+        let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_PENDING));
+        let mut runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SwitchableRunServiceSupervisor {
+                    action: Arc::clone(&action),
+                }),
+            )
+            .expect("install retained task service runner");
+        let cancelled_cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run_service(&cancelled_cx));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            Future::poll(service.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            runtime.is_task_service_ready(),
+            "an entered retained service is the only live readiness authority"
+        );
+        cancelled_cx.cancel_with(CancelKind::User, None);
+        assert!(matches!(
+            Future::poll(service.as_mut(), &mut context),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        drop(service);
+
+        assert!(
+            !runtime.is_task_service_ready(),
+            "caller-context cancellation must revoke retained service readiness"
+        );
+        assert_exact_accepted_input_is_recoverable(&store, &task_id, &input_responses);
+
+        action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
+        let retry_cx = Cx::for_testing();
+        assert!(matches!(
+            poll_retained_task_service(&mut runner, &retry_cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            store
+                .get_task(&task_id)
+                .expect("retried accepted-input task is readable"),
+            Some(FinalTask::Completed { .. })
+        ));
+        assert!(
+            test_next_accepted_input(&store)
+                .expect("completed accepted-input recovery scan is valid")
+                .is_none(),
+            "the successful retry consumes the exact recovered accepted-input handoff"
+        );
+    }
+
+    #[test]
+    fn task_03_final_run_service_drop_revokes_readiness_and_retries_exact_initial_work() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let task = final_working_task_without_ttl("task-run-service-drop-initial");
+        let task_id = task.base().task_id.clone();
+        let work_descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({
+            "handler": "run-service-drop",
+            "payload": {"initial": true}
+        }))
+        .expect("non-null initial work descriptor is valid");
+        store
+            .create_task_with_work(
+                task.clone(),
+                final_task_notification(&task),
+                work_descriptor.clone(),
+            )
+            .expect("initial work is durable before the service starts");
+
+        let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_PENDING));
+        let mut runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SwitchableRunServiceSupervisor {
+                    action: Arc::clone(&action),
+                }),
+            )
+            .expect("install retained task service runner");
+        let service_cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run_service(&service_cx));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            Future::poll(service.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(runtime.is_task_service_ready());
+        drop(service);
+
+        assert!(
+            !runtime.is_task_service_ready(),
+            "dropping a retained service future must revoke readiness"
+        );
+        assert_exact_initial_work_is_recoverable(&store, &task_id, &work_descriptor);
+
+        action.store(RUN_SERVICE_SUPERVISOR_COMPLETE, AtomicOrdering::SeqCst);
+        let retry_cx = Cx::for_testing();
+        assert!(matches!(
+            poll_retained_task_service(&mut runner, &retry_cx),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            store
+                .get_task(&task_id)
+                .expect("retried dropped-service task is readable"),
+            Some(FinalTask::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn task_03_final_run_service_non_concurrent_runner_boundary_is_live() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let action = Arc::new(AtomicUsize::new(RUN_SERVICE_SUPERVISOR_PENDING));
+        let mut runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SwitchableRunServiceSupervisor {
+                    action: Arc::clone(&action),
+                }),
+            )
+            .expect("install the only retained service runner");
+        let service_cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run_service(&service_cx));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            Future::poll(service.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(runtime.is_task_service_ready());
+        assert!(
+            runtime
+                .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+                .is_err(),
+            "a live retained service generation rejects a second service owner"
+        );
+        // The compile-fail example on `run_service` proves that this same
+        // runner cannot be borrowed for a second live service future either.
+        drop(service);
+        assert!(!runtime.is_task_service_ready());
+    }
+
+    #[test]
+    fn task_03_final_run_service_reentry_republishes_readiness_on_the_same_runner() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let mut runner = runtime
+            .install_task_service(1, Arc::new(PendingFinalTaskSupervisor))
+            .expect("install retained task service runner");
+        let first_cx = Cx::for_testing();
+        let mut first_service = Box::pin(runner.run_service(&first_cx));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+
+        assert!(matches!(
+            Future::poll(first_service.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            runtime.is_task_service_ready(),
+            "the first retained service entry publishes readiness"
+        );
+        drop(first_service);
+        assert!(
+            !runtime.is_task_service_ready(),
+            "dropping the first service future revokes its readiness lease"
+        );
+
+        let second_cx = Cx::for_testing();
+        let mut second_service = Box::pin(runner.run_service(&second_cx));
+        assert!(matches!(
+            Future::poll(second_service.as_mut(), &mut context),
+            std::task::Poll::Pending
+        ));
+        assert!(
+            runtime.is_task_service_ready(),
+            "the same retained runner can re-enter and publish a new readiness lease"
+        );
+        drop(second_service);
+        assert!(
+            !runtime.is_task_service_ready(),
+            "the re-entered service future also revokes readiness on drop"
         );
     }
 

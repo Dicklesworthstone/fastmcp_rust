@@ -4169,13 +4169,7 @@ fn receive_modern_response(
                         "Proxy HTTP modern JSON response could not be read: {error}"
                     ))
                 })?;
-            response_for_request(
-                &body,
-                decode_strict_jsonrpc_message(&body, ProxyHttpClient::MAX_RESPONSE_BYTES).map_err(
-                    |_| McpError::invalid_request("Proxy HTTP modern response was not JSON-RPC"),
-                )?,
-                request_id,
-            )
+            response_for_request(&body, request_id)
         }
         ModernHttpResponseKind::Sse => {
             let mut stream = response
@@ -4213,7 +4207,7 @@ fn receive_modern_response(
                     )?;
                     continue;
                 }
-                return response_for_request(event.as_bytes(), message, request_id);
+                return response_for_request(event.as_bytes(), request_id);
             }
         }
         ModernHttpResponseKind::EmptyAcknowledgement => Err(McpError::invalid_request(
@@ -4365,13 +4359,7 @@ async fn receive_modern_response_with_cancellation(
                 }),
             )
             .await?;
-            response_for_request(
-                &body,
-                decode_strict_jsonrpc_message(&body, ProxyHttpClient::MAX_RESPONSE_BYTES).map_err(
-                    |_| McpError::invalid_request("Proxy HTTP modern response was not JSON-RPC"),
-                )?,
-                request_id,
-            )
+            response_for_request(&body, request_id)
         }
         ModernHttpResponseKind::Sse => {
             let mut stream = response
@@ -4411,7 +4399,7 @@ async fn receive_modern_response_with_cancellation(
                     forward_modern_progress_notification(event.as_bytes(), request, on_progress)?;
                     continue;
                 }
-                return response_for_request(event.as_bytes(), message, request_id);
+                return response_for_request(event.as_bytes(), request_id);
             }
         }
         ModernHttpResponseKind::EmptyAcknowledgement => Err(McpError::invalid_request(
@@ -4462,16 +4450,18 @@ fn forward_modern_progress_notification(
     Ok(())
 }
 
-fn response_for_request(
-    raw_frame: &[u8],
-    message: JsonRpcMessage,
-    request_id: &RequestId,
-) -> McpResult<ProxyHttpResponse> {
-    let JsonRpcMessage::Response(response) = message else {
-        return Err(McpError::invalid_request(
-            "Proxy HTTP upstream sent a request while its response was required",
-        ));
-    };
+fn response_for_request(raw_frame: &[u8], request_id: &RequestId) -> McpResult<ProxyHttpResponse> {
+    // Strict response admission owns both the typed envelope and the exact
+    // `result` member source. Keeping that pair together prevents a second,
+    // lossy typed decode from becoming the correlation authority.
+    let (response, raw_result) =
+        decode_strict_jsonrpc_response(raw_frame, ProxyHttpClient::MAX_RESPONSE_BYTES)
+            .map_err(|_| {
+                McpError::invalid_request(
+                    "Proxy HTTP modern response could not retain its admitted result source",
+                )
+            })?
+            .into_parts();
     if !response
         .id
         .as_ref()
@@ -4481,18 +4471,6 @@ fn response_for_request(
             "Proxy HTTP upstream response ID does not match its request",
         ));
     }
-    let admission = decode_strict_jsonrpc_response(raw_frame, ProxyHttpClient::MAX_RESPONSE_BYTES)
-        .map_err(|_| {
-            McpError::invalid_request(
-                "Proxy HTTP modern response could not retain its admitted result source",
-            )
-        })?;
-    if admission.response() != &response {
-        return Err(McpError::invalid_request(
-            "Proxy HTTP modern response differs from its admitted source frame",
-        ));
-    }
-    let (response, raw_result) = admission.into_parts();
     Ok(ProxyHttpResponse {
         response,
         raw_result,

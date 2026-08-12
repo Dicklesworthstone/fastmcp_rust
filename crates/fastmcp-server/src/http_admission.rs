@@ -34,12 +34,13 @@
 //! ceilings must be wired explicitly by the integration layer.
 
 use core::fmt;
+use std::sync::Arc;
 
 use fastmcp_protocol::{
     FINAL_PROTOCOL_VERSION_META_KEY, FinalHttpRequestMetadata, FinalProtocolVersion,
-    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, MCP_METHOD_HEADER, MCP_NAME_HEADER,
+    JsonRpcAdmissionError, JsonRpcRequest, MCP_METHOD_HEADER, MCP_NAME_HEADER,
     MCP_PROTOCOL_VERSION_HEADER, RawJsonAdmissionError, RequestAdmissionError,
-    RequestVersionMetadata, admit_final_http_request, decode_strict_jsonrpc_message,
+    RequestVersionMetadata, admit_final_http_request,
 };
 use serde_json::Value;
 
@@ -169,6 +170,7 @@ pub enum ResponseRepresentation {
 #[derive(Debug, Clone)]
 pub struct AdmittedModernPost {
     request: JsonRpcRequest,
+    raw_params: Option<Arc<str>>,
     protocol_version: FinalProtocolVersion,
     representation: ResponseRepresentation,
 }
@@ -178,6 +180,17 @@ impl AdmittedModernPost {
     #[must_use]
     pub const fn request(&self) -> &JsonRpcRequest {
         &self.request
+    }
+
+    /// Returns the exact `params` member source admitted with this request.
+    ///
+    /// This crate-private sidecar is intentionally distinct from the public
+    /// [`JsonRpcRequest`] shape. It is consumed only by modern dispatch,
+    /// which verifies it materializes to the retained request parameters
+    /// before it is used for ordered MRTR response decoding.
+    #[must_use]
+    pub(crate) fn raw_params(&self) -> Option<&str> {
+        self.raw_params.as_deref()
     }
 
     /// Returns the admitted final protocol version.
@@ -196,6 +209,13 @@ impl AdmittedModernPost {
     #[must_use]
     pub fn into_request(self) -> JsonRpcRequest {
         self.request
+    }
+
+    /// Consumes admission into the typed request and its exact parameter
+    /// source for request-owned modern dispatch.
+    #[must_use]
+    pub(crate) fn into_request_and_raw_params(self) -> (JsonRpcRequest, Option<Arc<str>>) {
+        (self.request, self.raw_params)
     }
 }
 
@@ -340,18 +360,16 @@ pub fn admit_modern_post(
 
     let representation = negotiate_representation(headers)?;
 
-    decode_strict_jsonrpc_message(body, limits.max_body_bytes())
+    JsonRpcRequest::decode_strict_with_raw_params(body, limits.max_body_bytes())
         .map_err(|error| match error {
             JsonRpcAdmissionError::Raw(raw) => ModernPostRejection::Raw(raw),
             _ => ModernPostRejection::InvalidEnvelope,
         })
-        .and_then(|message| match message {
-            JsonRpcMessage::Request(request) if request.id.is_some() => Ok(request),
-            JsonRpcMessage::Request(_) | JsonRpcMessage::Response(_) => {
-                Err(ModernPostRejection::NotARequest)
-            }
+        .and_then(|(request, raw_params)| match request.id.is_some() {
+            true => Ok((request, raw_params)),
+            false => Err(ModernPostRejection::NotARequest),
         })
-        .and_then(|request| {
+        .and_then(|(request, raw_params)| {
             let protocol_version = {
                 let metadata = FinalHttpRequestMetadata {
                     version: RequestVersionMetadata {
@@ -369,6 +387,7 @@ pub fn admit_modern_post(
             };
             Ok(AdmittedModernPost {
                 request,
+                raw_params: raw_params.map(Arc::<str>::from),
                 protocol_version,
                 representation,
             })
@@ -606,6 +625,34 @@ mod tests {
         assert_eq!(admitted.representation(), ResponseRepresentation::Json);
         assert_eq!(admitted.protocol_version().as_str(), FINAL_PROTOCOL_VERSION);
         assert_eq!(admitted.request().method, "server/discover");
+    }
+
+    #[test]
+    fn admission_retains_exact_params_source_beside_the_typed_request() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"ordered":{"second":2,"first":1}}}"#;
+        let admitted = admit(&canonical_headers(), body).expect("admission succeeds");
+        assert_eq!(
+            admitted.raw_params(),
+            Some(
+                r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"ordered":{"second":2,"first":1}}"#,
+            ),
+            "the sidecar is the admitted source, not a serialization of the typed request"
+        );
+        let (request, raw_params) = admitted.into_request_and_raw_params();
+        assert_eq!(
+            request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("ordered"))
+                .and_then(|ordered| ordered.get("second")),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            raw_params.as_deref(),
+            Some(
+                r#"{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"ordered":{"second":2,"first":1}}"#
+            )
+        );
     }
 
     #[test]

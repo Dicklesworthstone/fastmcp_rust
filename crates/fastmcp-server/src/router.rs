@@ -542,6 +542,8 @@ const MAX_MRTR_RAW_PARAMS_BYTES: usize = 256 * 1024;
 const MAX_MRTR_RAW_INPUT_RESPONSES_BYTES: usize = 192 * 1024;
 const MAX_MRTR_RAW_JSON_DEPTH: usize = 32;
 const MAX_MRTR_RAW_JSON_VALUES: usize = 4_096;
+const MRTR_REQUIRES_BOUND_MODERN_CONNECTION: &str =
+    "MRTR-capable handlers require a bound modern connection";
 
 struct MrtrRawJsonCounter {
     max_bytes: usize,
@@ -3658,16 +3660,54 @@ impl Router {
         )
     }
 
+    /// Dispatches a modern request with the exact admitted `params` source.
+    ///
+    /// Callers that received an ingress raw-parameter sidecar must use this
+    /// entry point so final MRTR retries retain ordered response entries and
+    /// reject duplicate keys before registry admission.
+    pub(crate) fn dispatch_stateless_with_raw_params(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+        raw_params: Option<&str>,
+    ) -> McpResult<serde_json::Value> {
+        let continuation_cancellation = fastmcp_core::McpRequestCancellation::new();
+        self.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+            request_ctx,
+            request,
+            raw_params,
+            &continuation_cancellation,
+        )
+    }
+
     pub(crate) fn dispatch_stateless_with_continuation_cancellation(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
+        self.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+            request_ctx,
+            request,
+            None,
+            continuation_cancellation,
+        )
+    }
+
+    /// Dispatches with connection-owned continuation cancellation and the
+    /// exact admitted parameter source retained by transport ingress.
+    pub(crate) fn dispatch_stateless_with_continuation_cancellation_and_raw_params(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+        raw_params: Option<&str>,
+        continuation_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<serde_json::Value> {
         block_on(self.dispatch_stateless_in_request(
             request_ctx,
             request_ctx.cx(),
             request,
+            raw_params,
             continuation_cancellation,
         ))
     }
@@ -3704,6 +3744,25 @@ impl Router {
         request: JsonRpcRequest,
         continuation_cancellation: fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
+        self.dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
+            request_ctx,
+            request,
+            None,
+            continuation_cancellation,
+        )
+        .await
+    }
+
+    /// Dispatches an owned modern request with its retained raw-parameter
+    /// sidecar. The sidecar is owned because a request child may outlive the
+    /// transport frame reader that admitted it.
+    pub(crate) async fn dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
+        self: Arc<Self>,
+        request_ctx: McpContext,
+        request: JsonRpcRequest,
+        raw_params: Option<Arc<str>>,
+        continuation_cancellation: fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<serde_json::Value> {
         if let Some(error) = budget_error(&request_ctx) {
             return Err(error);
         }
@@ -3712,6 +3771,7 @@ impl Router {
         let dispatch_ctx = request_ctx.clone();
         let spawn_self = Arc::clone(&self);
         let spawn_request = request.clone();
+        let spawn_raw_params = raw_params.clone();
         let spawn_continuation_cancellation = continuation_cancellation.clone();
         let mut task = match request_ctx.cx().spawn(move |child_cx| async move {
             spawn_self
@@ -3719,6 +3779,7 @@ impl Router {
                     &dispatch_ctx,
                     &child_cx,
                     &spawn_request,
+                    spawn_raw_params.as_deref(),
                     &spawn_continuation_cancellation,
                 )
                 .await
@@ -3735,6 +3796,7 @@ impl Router {
                         &request_ctx,
                         request_ctx.cx(),
                         &request,
+                        raw_params.as_deref(),
                         &continuation_cancellation,
                     )
                     .await;
@@ -3760,6 +3822,7 @@ impl Router {
         request_ctx: &McpContext,
         request_cx: &Cx,
         request: &JsonRpcRequest,
+        raw_params: Option<&str>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
         if request_cx.is_cancel_requested() {
@@ -3808,8 +3871,13 @@ impl Router {
             }
             "tools/call" => {
                 self.admit_final_mrtr_response_map(params)?;
-                let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", params)
-                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let request = CoreRequest::decode_with_raw_params(
+                    ProtocolEra::Modern2026,
+                    "tools/call",
+                    params,
+                    raw_params,
+                )
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::ToolsCall(params)) = request else {
                     return Err(McpError::internal_error(
                         "modern tools/call dispatch selected another core request",
@@ -3891,9 +3959,13 @@ impl Router {
             }
             "resources/read" => {
                 self.admit_final_mrtr_response_map(params)?;
-                let request =
-                    CoreRequest::decode(ProtocolEra::Modern2026, "resources/read", params)
-                        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let request = CoreRequest::decode_with_raw_params(
+                    ProtocolEra::Modern2026,
+                    "resources/read",
+                    params,
+                    raw_params,
+                )
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::ResourcesRead(params)) = &request else {
                     return Err(McpError::internal_error(
                         "modern resources/read dispatch selected another core request",
@@ -3953,8 +4025,13 @@ impl Router {
             }
             "prompts/get" => {
                 self.admit_final_mrtr_response_map(params)?;
-                let request = CoreRequest::decode(ProtocolEra::Modern2026, "prompts/get", params)
-                    .map_err(|error| McpError::invalid_params(error.to_string()))?;
+                let request = CoreRequest::decode_with_raw_params(
+                    ProtocolEra::Modern2026,
+                    "prompts/get",
+                    params,
+                    raw_params,
+                )
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 let CoreRequest::Final(FinalCoreRequest::PromptsGet(params)) = request else {
                     return Err(McpError::internal_error(
                         "modern prompts/get dispatch selected another core request",
@@ -4090,27 +4167,10 @@ impl Router {
                 let binding = binding.ok_or_else(|| {
                     McpError::invalid_params("MRTR retries require session state")
                 })?;
-                // The protocol decoder has already retained wire order and
-                // rejected duplicate keys. The registry's existing semantic
-                // boundary is keyed lookup, so materialize each typed value
-                // only here without changing any key/value correlation.
-                let input_responses = input_responses
-                    .entries()
-                    .iter()
-                    .map(|(key, response)| {
-                        serde_json::to_value(response)
-                            .map(|response| (key.clone(), response))
-                            .map_err(|_| {
-                                McpError::internal_error(
-                                    "final MRTR response could not be encoded for registry admission",
-                                )
-                            })
-                    })
-                    .collect::<McpResult<BTreeMap<_, _>>>()?;
-                match self.mrtr_exchanges.accept_wire_bound(
+                match self.mrtr_exchanges.accept_final_input_responses_bound(
                     request_state,
                     binding,
-                    &input_responses,
+                    input_responses,
                 )? {
                     MrtrRetry::Complete(inputs) => Ok(FinalMrtrDispatch::Resume(inputs)),
                     MrtrRetry::InputRequired(result) => encode_mrtr_input_required_result(result)
@@ -4820,6 +4880,11 @@ impl Router {
             .as_ref()
             .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
         let handler = &entry.handler;
+        if handler.declares_final_mrtr() && request_ctx.session_cache_partition().is_none() {
+            return Err(McpError::invalid_params(
+                MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
+            ));
+        }
         let input_schema = final_registration.schemas.input.as_ref();
         let output_schema = final_registration.schemas.output.as_ref();
         // FinalArguments deserialization rejects an explicit null before this
@@ -5256,6 +5321,12 @@ impl Router {
                 "resource is registered only for exact MCP 2024-11-05 dispatch",
             ));
         }
+        if resolved.handler.declares_final_mrtr() && request_ctx.session_cache_partition().is_none()
+        {
+            return Err(McpError::invalid_params(
+                MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
+            ));
+        }
         admit_final_resource_uri(
             resolved.uri_use_policy,
             &params.uri,
@@ -5617,6 +5688,11 @@ impl Router {
         let final_registration = self.final_prompts.get(&params.name).ok_or_else(|| {
             McpError::invalid_params("prompt is registered only for exact MCP 2024-11-05 dispatch")
         })?;
+        if handler.declares_final_mrtr() && request_ctx.session_cache_partition().is_none() {
+            return Err(McpError::invalid_params(
+                MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
+            ));
+        }
         // FinalArguments deserialization rejects an explicit null before this
         // point, so `arguments` is here always Absent or a typed value.
         let arguments = params.arguments.into_value().unwrap_or_default();
@@ -7766,6 +7842,7 @@ mod router_tests {
         CompletionHandler, DEFAULT_FINAL_RESOURCE_TTL_MS, FinalToolSchemaAuthority, PromptHandler,
         ResourceHandler, ToolHandler, UpstreamFinalToolSchemaRegistration,
     };
+    use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig, admit_modern_post};
     #[cfg(feature = "tasks")]
     use crate::tasks::{
         ApplicationTaskSupervisor, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
@@ -8560,6 +8637,28 @@ mod router_tests {
             })),
             id,
         )
+    }
+
+    fn admit_http_wire(
+        method: &str,
+        target: &str,
+        body: &[u8],
+    ) -> (JsonRpcRequest, Option<Arc<str>>) {
+        let endpoint = HttpEndpointConfig::new(
+            "/mcp",
+            HttpAdmissionLimits::new(16, 8_192, 65_536).expect("nonzero HTTP limits"),
+        )
+        .expect("HTTP endpoint config");
+        let headers = vec![
+            ("Content-Type".to_owned(), "application/json".to_owned()),
+            ("Accept".to_owned(), "application/json".to_owned()),
+            ("MCP-Protocol-Version".to_owned(), "2026-07-28".to_owned()),
+            ("Mcp-Method".to_owned(), method.to_owned()),
+            ("Mcp-Name".to_owned(), target.to_owned()),
+        ];
+        admit_modern_post(&endpoint, "POST", "/mcp", &headers, body)
+            .expect("wire request admits through HTTP")
+            .into_request_and_raw_params()
     }
 
     #[test]
@@ -9376,6 +9475,10 @@ mod router_tests {
             )])
         }
 
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
         fn call_final_outcome(
             &self,
             _ctx: &McpContext,
@@ -9439,6 +9542,10 @@ mod router_tests {
             Ok(vec![Content::text("legacy tool result")])
         }
 
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
         fn call_final_outcome(
             &self,
             _ctx: &McpContext,
@@ -9478,6 +9585,75 @@ mod router_tests {
         }
     }
 
+    struct OneShotMrtrTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for OneShotMrtrTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "one-shot-mrtr-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("one-shot legacy result")])
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::InputRequired(input_required_result(
+                "one-shot-handler-state",
+            )))
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                let Some(resume_inputs) = resume_inputs else {
+                    return match self.call_final_outcome(ctx, arguments) {
+                        Ok(result) => Outcome::Ok(result),
+                        Err(error) => Outcome::Err(error),
+                    };
+                };
+                match resume_inputs.roots("roots") {
+                    Ok(Some(_)) => {
+                        self.calls.fetch_add(1, Ordering::SeqCst);
+                        Outcome::Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                            FinalCallToolResult {
+                                content: vec![ContentBlock::text("one-shot resumed")],
+                                is_error: false,
+                                structured_content: None,
+                            },
+                        )))
+                    }
+                    Ok(None) => Outcome::Err(McpError::internal_error("MRTR roots input was lost")),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
+    }
+
     #[cfg(feature = "tasks")]
     struct TaskCapableInputRequiredTool {
         final_calls: Arc<AtomicUsize>,
@@ -9499,6 +9675,10 @@ mod router_tests {
         }
 
         fn declares_final_tasks(&self) -> bool {
+            true
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
             true
         }
 
@@ -9546,6 +9726,10 @@ mod router_tests {
                 text: Some("legacy resource result".to_owned()),
                 blob: None,
             }])
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
         }
 
         fn read_final_outcome(
@@ -9606,6 +9790,10 @@ mod router_tests {
         ) -> McpResult<Vec<PromptMessage>> {
             self.legacy_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Vec::new())
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
         }
 
         fn get_final_outcome(
@@ -17454,8 +17642,14 @@ mod router_tests {
             final_calls: Arc::clone(&prompt_final_calls),
         });
         let cx = Cx::for_testing();
-        let state = SessionState::new();
-        let request_ctx = request_context(&cx, 160, Budget::INFINITE, &state);
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            160,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
 
         let absent_tool_arguments = JsonRpcRequest::new(
             "tools/call",
@@ -17915,8 +18109,14 @@ mod router_tests {
         });
 
         let cx = Cx::for_testing();
-        let state = SessionState::new();
-        let request_ctx = request_context(&cx, 141, Budget::INFINITE, &state);
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            141,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
         let metadata = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
@@ -18024,6 +18224,480 @@ mod router_tests {
     }
 
     #[test]
+    fn http_admission_raw_sidecar_reaches_tool_resource_and_prompt_mrtr_retries() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&tool_calls),
+            })
+            .expect("tool registers");
+        router.add_resource(InputRequiredResource {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&resource_calls),
+        });
+        router.add_prompt(InputRequiredPrompt {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&prompt_calls),
+        });
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            1438,
+            InboundRequestTransport::Http,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
+        let cancellation = inbound
+            .mrtr_continuation_cancellation()
+            .expect("HTTP-bound modern context owns continuations");
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let roots = serde_json::to_string(&router_roots_response_wire())
+            .expect("roots response serializes");
+
+        let tool_initial_body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1438, "method": "tools/call",
+            "params": {"_meta": metadata.clone(), "name": "input-required-tool", "arguments": {}},
+        }))
+        .expect("tool body serializes");
+        let (tool_initial, tool_initial_raw) =
+            admit_http_wire("tools/call", "input-required-tool", &tool_initial_body);
+        let tool_issued = router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &tool_initial,
+                tool_initial_raw.as_deref(),
+                &cancellation,
+            )
+            .expect("HTTP-admitted tool issues state");
+        let tool_retry_body = format!(
+            r#"{{"jsonrpc":"2.0","id":1439,"method":"tools/call","params":{{"_meta":{},"name":"input-required-tool","arguments":{{}},"inputResponses":{{"inert":{},"roots":{}}},"requestState":{}}}}}"#,
+            serde_json::to_string(&metadata).expect("metadata serializes"),
+            roots,
+            roots,
+            serde_json::to_string(&tool_issued["requestState"]).expect("tool state serializes"),
+        );
+        let (tool_retry, tool_retry_raw) = admit_http_wire(
+            "tools/call",
+            "input-required-tool",
+            tool_retry_body.as_bytes(),
+        );
+        router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &tool_retry,
+                tool_retry_raw.as_deref(),
+                &cancellation,
+            )
+            .expect("HTTP-admitted ordered tool retry reaches the handler");
+
+        let resource_initial_body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1440, "method": "resources/read",
+            "params": {"_meta": metadata.clone(), "uri": "file:///input-required-resource"},
+        }))
+        .expect("resource body serializes");
+        let (resource_initial, resource_initial_raw) = admit_http_wire(
+            "resources/read",
+            "file:///input-required-resource",
+            &resource_initial_body,
+        );
+        let resource_issued = router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &resource_initial,
+                resource_initial_raw.as_deref(),
+                &cancellation,
+            )
+            .expect("HTTP-admitted resource issues state");
+        let resource_retry_body = format!(
+            r#"{{"jsonrpc":"2.0","id":1441,"method":"resources/read","params":{{"_meta":{},"uri":"file:///input-required-resource","inputResponses":{{"inert":{},"roots":{}}},"requestState":{}}}}}"#,
+            serde_json::to_string(&metadata).expect("metadata serializes"),
+            roots,
+            roots,
+            serde_json::to_string(&resource_issued["requestState"])
+                .expect("resource state serializes"),
+        );
+        let (resource_retry, resource_retry_raw) = admit_http_wire(
+            "resources/read",
+            "file:///input-required-resource",
+            resource_retry_body.as_bytes(),
+        );
+        let mut sanitized_resource_retry = resource_retry.clone();
+        sanitized_resource_retry
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("HTTP-admitted resource parameters are an object")
+            .insert(
+                "uri".to_owned(),
+                serde_json::json!("file:///sanitized-resource"),
+            );
+        let resource_sidecar_error = router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &sanitized_resource_retry,
+                resource_retry_raw.as_deref(),
+                &cancellation,
+            )
+            .expect_err(
+                "a resource raw sidecar cannot survive a one-field sanitized typed mismatch",
+            );
+        assert_eq!(resource_sidecar_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            resource_calls.load(Ordering::SeqCst),
+            1,
+            "the mismatched resource sidecar is rejected before handler invocation"
+        );
+        assert_eq!(
+            router.mrtr_exchanges.active_len(),
+            2,
+            "the rejected resource sidecar leaves its continuation available"
+        );
+        router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &resource_retry,
+                resource_retry_raw.as_deref(),
+                &cancellation,
+            )
+            .expect("HTTP-admitted ordered resource retry reaches the handler");
+
+        let prompt_initial_body = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 1442, "method": "prompts/get",
+            "params": {"_meta": metadata.clone(), "name": "input-required-prompt"},
+        }))
+        .expect("prompt body serializes");
+        let (prompt_initial, prompt_initial_raw) =
+            admit_http_wire("prompts/get", "input-required-prompt", &prompt_initial_body);
+        let prompt_issued = router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &prompt_initial,
+                prompt_initial_raw.as_deref(),
+                &cancellation,
+            )
+            .expect("HTTP-admitted prompt issues state");
+        let prompt_retry_body = format!(
+            r#"{{"jsonrpc":"2.0","id":1443,"method":"prompts/get","params":{{"_meta":{},"name":"input-required-prompt","inputResponses":{{"inert":{},"roots":{}}},"requestState":{}}}}}"#,
+            serde_json::to_string(&metadata).expect("metadata serializes"),
+            roots,
+            roots,
+            serde_json::to_string(&prompt_issued["requestState"]).expect("prompt state serializes"),
+        );
+        let (prompt_retry, prompt_retry_raw) = admit_http_wire(
+            "prompts/get",
+            "input-required-prompt",
+            prompt_retry_body.as_bytes(),
+        );
+        let mut sanitized_prompt_retry = prompt_retry.clone();
+        sanitized_prompt_retry
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("HTTP-admitted prompt parameters are an object")
+            .insert("name".to_owned(), serde_json::json!("sanitized-prompt"));
+        let prompt_sidecar_error = router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &sanitized_prompt_retry,
+                prompt_retry_raw.as_deref(),
+                &cancellation,
+            )
+            .expect_err("a prompt raw sidecar cannot survive a one-field sanitized typed mismatch");
+        assert_eq!(prompt_sidecar_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            prompt_calls.load(Ordering::SeqCst),
+            1,
+            "the mismatched prompt sidecar is rejected before handler invocation"
+        );
+        assert_eq!(
+            router.mrtr_exchanges.active_len(),
+            3,
+            "the rejected prompt sidecar leaves its continuation available"
+        );
+        router
+            .dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                &request_ctx,
+                &prompt_retry,
+                prompt_retry_raw.as_deref(),
+                &cancellation,
+            )
+            .expect("HTTP-admitted ordered prompt retry reaches the handler");
+
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stateless_final_dispatch_keeps_complete_only_handlers_available_for_all_families() {
+        let mut router = Router::new();
+        router
+            .add_tool(NamedTool::new("complete-only-tool"))
+            .expect("complete-only tool registers");
+        router.add_resource(NamedResource::new("file:///complete-only-resource"));
+        router.add_prompt(NamedPrompt::new("complete-only-prompt"));
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1430, Budget::INFINITE, &state);
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+
+        let tool = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("complete-only-tool", serde_json::json!({}), 1430_i64),
+            )
+            .expect("a complete-only tool remains available without a session partition");
+        assert_eq!(tool["resultType"], "complete");
+
+        let resource = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": metadata.clone(),
+                        "uri": "file:///complete-only-resource",
+                    })),
+                    1431_i64,
+                ),
+            )
+            .expect("a complete-only resource remains available without a session partition");
+        assert_eq!(resource["resultType"], "complete");
+
+        let prompt = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/get",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "name": "complete-only-prompt",
+                    })),
+                    1432_i64,
+                ),
+            )
+            .expect("a complete-only prompt remains available without a session partition");
+        assert_eq!(prompt["resultType"], "complete");
+    }
+
+    #[test]
+    fn stateless_mrtr_handlers_are_rejected_before_all_family_invocations() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&tool_calls),
+            })
+            .expect("MRTR tool registers");
+        router.add_resource(InputRequiredResource {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&resource_calls),
+        });
+        router.add_prompt(InputRequiredPrompt {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&prompt_calls),
+        });
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1433, Budget::INFINITE, &state);
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+
+        let tool_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("input-required-tool", serde_json::json!({}), 1433_i64),
+            )
+            .expect_err("a stateless MRTR tool is rejected before its handler runs");
+        assert_eq!(tool_error.code, McpErrorCode::InvalidParams);
+
+        let resource_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": metadata.clone(),
+                        "uri": "file:///input-required-resource",
+                    })),
+                    1434_i64,
+                ),
+            )
+            .expect_err("a stateless MRTR resource is rejected before its handler runs");
+        assert_eq!(resource_error.code, McpErrorCode::InvalidParams);
+
+        let prompt_error = router
+            .dispatch_stateless(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/get",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "name": "input-required-prompt",
+                    })),
+                    1435_i64,
+                ),
+            )
+            .expect_err("a stateless MRTR prompt is rejected before its handler runs");
+        assert_eq!(prompt_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(resource_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(prompt_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(router.mrtr_exchanges.active_len(), 0);
+    }
+
+    #[test]
+    fn bound_owned_mrtr_retry_rejects_foreign_and_stale_state_without_mutation_then_resumes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut unshared_router = Router::new();
+        unshared_router
+            .add_tool(OneShotMrtrTool {
+                calls: Arc::clone(&calls),
+            })
+            .expect("one-shot MRTR tool registers");
+        let router = Arc::new(unshared_router);
+        let cx = Cx::for_testing();
+        let origin_connection = ModernConnection::new();
+        let origin_inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            1436,
+            InboundRequestTransport::Memory,
+            &origin_connection,
+        );
+        let origin_ctx = origin_inbound.request_context();
+        let origin_cancellation = origin_inbound
+            .mrtr_continuation_cancellation()
+            .expect("a bound origin supplies continuation ownership");
+        let initial =
+            final_tools_call_request("one-shot-mrtr-tool", serde_json::json!({}), 1436_i64);
+        let issued = block_on(
+            Arc::clone(&router).dispatch_stateless_owned_with_continuation_cancellation(
+                origin_ctx,
+                initial,
+                origin_cancellation.clone(),
+            ),
+        )
+        .expect("the bound owned path issues one continuation");
+        let request_state = issued["requestState"]
+            .as_str()
+            .expect("issued continuation has opaque state")
+            .to_owned();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+
+        let retry = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                },
+                "name": "one-shot-mrtr-tool",
+                "arguments": {},
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": request_state,
+            })),
+            1437_i64,
+        );
+
+        let mismatched_sidecar = serde_json::to_string(
+            retry
+                .params
+                .as_ref()
+                .expect("retry has materialized parameters"),
+        )
+        .expect("retry parameters serialize")
+        .replacen("one-shot-mrtr-tool", "other-tool", 1);
+        let sidecar_error = block_on(
+            Arc::clone(&router)
+                .dispatch_stateless_owned_with_continuation_cancellation_and_raw_params(
+                    origin_inbound.request_context(),
+                    retry.clone(),
+                    Some(Arc::<str>::from(mismatched_sidecar)),
+                    origin_cancellation.clone(),
+                ),
+        )
+        .expect_err("a mismatched raw sidecar cannot reach continuation admission");
+        assert_eq!(sidecar_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+
+        let foreign_connection = ModernConnection::new();
+        let foreign_inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            1437,
+            InboundRequestTransport::Memory,
+            &foreign_connection,
+        );
+        let foreign_error = block_on(
+            Arc::clone(&router).dispatch_stateless_owned_with_continuation_cancellation(
+                foreign_inbound.request_context(),
+                retry.clone(),
+                foreign_inbound
+                    .mrtr_continuation_cancellation()
+                    .expect("a foreign connection still supplies its own cancellation"),
+            ),
+        )
+        .expect_err("a foreign connection cannot consume origin continuation state");
+        assert_eq!(foreign_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+
+        let mut stale_retry = retry.clone();
+        stale_retry
+            .params
+            .as_mut()
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("retry parameters are an object")
+            .insert(
+                "requestState".to_owned(),
+                serde_json::json!("stale-request-state"),
+            );
+        let stale_error = block_on(
+            Arc::clone(&router).dispatch_stateless_owned_with_continuation_cancellation(
+                origin_inbound.request_context(),
+                stale_retry,
+                origin_cancellation.clone(),
+            ),
+        )
+        .expect_err("a stale state cannot consume the live continuation");
+        assert_eq!(stale_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+
+        let completed = block_on(
+            Arc::clone(&router).dispatch_stateless_owned_with_continuation_cancellation(
+                origin_inbound.request_context(),
+                retry,
+                origin_cancellation,
+            ),
+        )
+        .expect("the unchanged origin retry resumes exactly one continuation");
+        assert_eq!(completed["resultType"], "complete");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(router.mrtr_exchanges.active_len(), 0);
+    }
+
+    #[test]
     fn modern_mrtr_state_only_retry_round_trips_only_when_input_responses_are_absent() {
         let initial_calls = Arc::new(AtomicUsize::new(0));
         let resumed_calls = Arc::new(AtomicUsize::new(0));
@@ -18036,8 +18710,14 @@ mod router_tests {
             .expect("state-only tool registration succeeds");
 
         let cx = Cx::for_testing();
-        let state = SessionState::new();
-        let request_ctx = request_context(&cx, 144, Budget::INFINITE, &state);
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            144,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
         let metadata = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
@@ -18089,15 +18769,33 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("retry parameters are an object")
             .insert("inputResponses".to_owned(), serde_json::json!({}));
+        let explicit_empty_raw_params = serde_json::to_string(
+            explicit_empty
+                .params
+                .as_ref()
+                .expect("explicit-empty retry has parameters"),
+        )
+        .expect("explicit-empty retry parameters serialize");
         let empty_error = router
-            .dispatch_stateless(&request_ctx, &explicit_empty)
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &explicit_empty,
+                Some(&explicit_empty_raw_params),
+            )
             .expect_err("an explicit empty inputResponses map cannot impersonate an absent member");
         assert_eq!(empty_error.code, McpErrorCode::InvalidParams);
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
 
+        let retry_raw_params = serde_json::to_string(
+            retry
+                .params
+                .as_ref()
+                .expect("absent-member retry has parameters"),
+        )
+        .expect("absent-member retry parameters serialize");
         let completed = router
-            .dispatch_stateless(&request_ctx, &retry)
+            .dispatch_stateless_with_raw_params(&request_ctx, &retry, Some(&retry_raw_params))
             .expect("the unchanged absent-member retry resumes exactly once");
         assert_eq!(completed["resultType"], "complete");
         assert_eq!(completed["content"][0]["text"], "state-only resumed");
@@ -18127,8 +18825,14 @@ mod router_tests {
         });
 
         let cx = Cx::for_testing();
-        let state = SessionState::new();
-        let request_ctx = request_context(&cx, 145, Budget::INFINITE, &state);
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            145,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
         let metadata = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
@@ -18161,6 +18865,10 @@ mod router_tests {
             })),
             145_i64,
         );
+        let raw_params_for = |request: &JsonRpcRequest| {
+            serde_json::to_string(request.params.as_ref().expect("retry has parameters"))
+                .expect("retry parameters serialize")
+        };
         let mut kind_mismatch = tool_retry.clone();
         kind_mismatch
             .params
@@ -18180,8 +18888,13 @@ mod router_tests {
                 )
                 .expect("sampling response converts to a wire value"),
             );
+        let kind_mismatch_raw_params = raw_params_for(&kind_mismatch);
         let kind_error = router
-            .dispatch_stateless(&request_ctx, &kind_mismatch)
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &kind_mismatch,
+                Some(&kind_mismatch_raw_params),
+            )
             .expect_err("changing only the response kind is refused before handler invocation");
         assert_eq!(kind_error.code, McpErrorCode::InvalidParams);
         assert_eq!(
@@ -18190,6 +18903,53 @@ mod router_tests {
             "a wrong-kind retry must leave the matching state unconsumed"
         );
 
+        let missing_responses = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "input-required-tool",
+                "arguments": {},
+                "inputResponses": {},
+                "requestState": tool_state,
+            })),
+            145_i64,
+        );
+        let missing_raw_params = raw_params_for(&missing_responses);
+        let missing_error = router
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &missing_responses,
+                Some(&missing_raw_params),
+            )
+            .expect_err("a missing roots response cannot consume a tool continuation");
+        assert_eq!(missing_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
+        let roots_wire = serde_json::to_string(&router_roots_response_wire())
+            .expect("roots response serializes for duplicate-key raw ingress");
+        let duplicate_raw_params = format!(
+            r#"{{"_meta":{},"name":"input-required-tool","arguments":{{}},"inputResponses":{{"roots":{roots_wire},"roots":{roots_wire}}},"requestState":{}}}"#,
+            serde_json::to_string(&metadata).expect("metadata serializes"),
+            serde_json::to_string(&tool_state).expect("opaque state serializes"),
+        );
+        let duplicate_retry = JsonRpcRequest::new(
+            "tools/call",
+            Some(
+                serde_json::from_str(&duplicate_raw_params)
+                    .expect("duplicate raw parameters materialize for source equality"),
+            ),
+            145_i64,
+        );
+        let duplicate_error = router
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &duplicate_retry,
+                Some(&duplicate_raw_params),
+            )
+            .expect_err("duplicate raw response keys cannot collapse before MRTR admission");
+        assert_eq!(duplicate_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
+
         let mut unknown_only = tool_retry.clone();
         *unknown_only
             .params
@@ -18197,8 +18957,13 @@ mod router_tests {
             .and_then(serde_json::Value::as_object_mut)
             .and_then(|params| params.get_mut("inputResponses"))
             .expect("tool retry contains inputResponses") = serde_json::json!({"inert": null});
+        let unknown_only_raw_params = raw_params_for(&unknown_only);
         let unknown_error = router
-            .dispatch_stateless(&request_ctx, &unknown_only)
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &unknown_only,
+                Some(&unknown_only_raw_params),
+            )
             .expect_err("unknown-only inputResponses cannot consume a tool continuation");
         assert_eq!(unknown_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
@@ -18251,15 +19016,21 @@ mod router_tests {
         assert_eq!(target_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
-        let other_session = SessionState::new();
-        let other_session_ctx = request_context(&cx, 145, Budget::INFINITE, &other_session);
+        let other_connection = ModernConnection::new();
+        let other_inbound = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            145,
+            InboundRequestTransport::Memory,
+            &other_connection,
+        );
+        let other_session_ctx = other_inbound.request_context();
         let session_error = router
             .dispatch_stateless(&other_session_ctx, &tool_retry)
             .expect_err("changing only the session cannot consume a tool state");
         assert_eq!(session_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
-        let principal_ctx = request_context(&cx, 145, Budget::INFINITE, &state);
+        let principal_ctx = inbound.request_context();
         assert!(principal_ctx.set_auth(fastmcp_core::AuthContext::with_subject("other-user")));
         let principal_error = router
             .dispatch_stateless(&principal_ctx, &tool_retry)
@@ -18267,8 +19038,13 @@ mod router_tests {
         assert_eq!(principal_error.code, McpErrorCode::InvalidParams);
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 1);
 
+        let tool_retry_raw_params = raw_params_for(&tool_retry);
         let tool_response = router
-            .dispatch_stateless(&request_ctx, &tool_retry)
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &tool_retry,
+                Some(&tool_retry_raw_params),
+            )
             .expect("a framework-minted tool state resumes through the final handler");
         assert_eq!(tool_response["resultType"], "input_required");
         assert_eq!(tool_final_calls.load(Ordering::SeqCst), 2);
@@ -18330,8 +19106,13 @@ mod router_tests {
         assert_eq!(resource_depth_error.code, McpErrorCode::InvalidParams);
         assert_eq!(resource_final_calls.load(Ordering::SeqCst), 1);
 
+        let resource_retry_raw_params = raw_params_for(&resource_retry);
         let resource_response = router
-            .dispatch_stateless(&request_ctx, &resource_retry)
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &resource_retry,
+                Some(&resource_retry_raw_params),
+            )
             .expect("a framework-minted resource state resumes through the final handler");
         assert_eq!(resource_response["resultType"], "input_required");
         assert_eq!(resource_final_calls.load(Ordering::SeqCst), 2);
@@ -18394,8 +19175,13 @@ mod router_tests {
         assert_eq!(prompt_values_error.code, McpErrorCode::InvalidParams);
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 1);
 
+        let prompt_retry_raw_params = raw_params_for(&prompt_retry);
         let prompt_response = router
-            .dispatch_stateless(&request_ctx, &prompt_retry)
+            .dispatch_stateless_with_raw_params(
+                &request_ctx,
+                &prompt_retry,
+                Some(&prompt_retry_raw_params),
+            )
             .expect("a framework-minted prompt state resumes through the final handler");
         assert_eq!(prompt_response["resultType"], "input_required");
         assert_eq!(prompt_final_calls.load(Ordering::SeqCst), 2);
@@ -19000,8 +19786,14 @@ mod router_tests {
             })
             .expect("task-capable input-required tool registration succeeds");
         let cx = Cx::for_testing();
-        let session_state = SessionState::new();
-        let request_ctx = request_context(&cx, 148, Budget::INFINITE, &session_state);
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            148,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
         let metadata_without_tasks = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
@@ -19055,8 +19847,14 @@ mod router_tests {
             })
             .expect("tool registration succeeds");
         let cx = Cx::for_testing();
-        let state = SessionState::new();
-        let request_ctx = request_context(&cx, 144, Budget::INFINITE, &state);
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            cx,
+            144,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let request_ctx = inbound.request_context();
         let baseline = JsonRpcRequest::new(
             "tools/call",
             Some(serde_json::json!({
