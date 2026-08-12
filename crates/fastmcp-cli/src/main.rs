@@ -97,31 +97,22 @@ const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
 );
 #[cfg(not(feature = "legacy-2024-11-05"))]
 const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = CLI_PROTOCOL_STATUS_HELP;
-/// Independently authored semantic contract for the root-help frame. The
-/// contract deliberately models fields instead of one rendered byte string:
-/// wrapping and one terminal sentence period are presentation details owned by
-/// Clap, while an extra root field remains a documentation-contract refusal.
-const CLI_ROOT_HELP_ABOUT: &str = "CLI tooling for FastMCP - run, inspect, and install MCP servers";
-const CLI_ROOT_HELP_USAGE: &str = "Usage: fastmcp <COMMAND>";
-const CLI_ROOT_HELP_COMMANDS: [(&str, &str); 7] = [
-    ("run", "Run an MCP server binary"),
-    ("inspect", "Inspect an MCP server's capabilities"),
-    (
-        "install",
-        "Install server configuration into Claude Desktop or other clients",
-    ),
-    ("list", "List configured MCP servers"),
-    ("test", "Test MCP server connectivity"),
-    ("dev", "Run server in development mode with hot reloading"),
-    (
-        "help",
-        "Print this message or the help of the given subcommand(s)",
-    ),
-];
-const CLI_ROOT_HELP_OPTIONS: [(&str, &str); 2] = [
-    ("-h, --help", "Print help"),
-    ("-V, --version", "Print version"),
-];
+/// Independently authored normalized root-help frame. It freezes every
+/// non-whitespace byte from the Clap construction below; normalization permits
+/// line wrapping only, not punctuation or wording variance.
+const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers. ",
+    "Usage: fastmcp <COMMAND> ",
+    "Commands: ",
+    "run Run an MCP server binary. ",
+    "inspect Inspect an MCP server's capabilities. ",
+    "install Install server configuration into Claude Desktop or other clients. ",
+    "list List configured MCP servers. ",
+    "test Test MCP server connectivity. ",
+    "dev Run server in development mode with hot reloading. ",
+    "help Print this message or the help of the given subcommand(s) ",
+    "Options: -h, --help Print help -V, --version Print version "
+);
 
 /// Typed refusal emitted when the public Clap help pipeline cannot produce an
 /// exactly provisional documentation contract.
@@ -269,60 +260,6 @@ fn validate_cli_documentation_contract(
     Ok(())
 }
 
-fn consume_root_help_field<'a>(
-    root_help: &'a str,
-    expected: &str,
-    accepts_terminal_period: bool,
-) -> Option<&'a str> {
-    let root_help = root_help.strip_prefix(expected)?;
-    let root_help = if accepts_terminal_period {
-        root_help.strip_prefix('.').unwrap_or(root_help)
-    } else {
-        root_help
-    };
-    root_help.strip_prefix(' ')
-}
-
-/// Validate the root frame as an ordered grammar rather than a byte-for-byte
-/// renderer snapshot. This preserves the no-free-form-claim boundary without
-/// making root `--help` availability depend on Clap's harmless typography.
-fn validate_cli_root_help_frame(root_help: &str) -> bool {
-    let Some(root_help) = consume_root_help_field(root_help, CLI_ROOT_HELP_ABOUT, true) else {
-        return false;
-    };
-    let Some(root_help) = consume_root_help_field(root_help, CLI_ROOT_HELP_USAGE, false) else {
-        return false;
-    };
-    let Some(mut root_help) = consume_root_help_field(root_help, "Commands:", false) else {
-        return false;
-    };
-
-    for (name, about) in CLI_ROOT_HELP_COMMANDS {
-        let Some(remainder) = consume_root_help_field(root_help, name, false) else {
-            return false;
-        };
-        let Some(remainder) = consume_root_help_field(remainder, about, true) else {
-            return false;
-        };
-        root_help = remainder;
-    }
-
-    let Some(mut root_help) = consume_root_help_field(root_help, "Options:", false) else {
-        return false;
-    };
-    for (flags, about) in CLI_ROOT_HELP_OPTIONS {
-        let Some(remainder) = consume_root_help_field(root_help, flags, false) else {
-            return false;
-        };
-        let Some(remainder) = consume_root_help_field(remainder, about, true) else {
-            return false;
-        };
-        root_help = remainder;
-    }
-
-    root_help.is_empty()
-}
-
 /// Validate the rendered public help against the independent semantic contract.
 /// Whitespace normalization makes wrapping width an output-only concern. The
 /// complete status stanza must be the final normalized root-help section, so
@@ -346,7 +283,7 @@ fn validate_public_cli_help(candidate: &CliHelpCandidate) -> Result<(), CliDocum
     {
         return Err(CliDocumentationRefusal::UnsafeRootHelpContent);
     }
-    if !validate_cli_root_help_frame(root_help) {
+    if root_help != EXPECTED_CLI_ROOT_HELP_PREFIX {
         return Err(CliDocumentationRefusal::RootHelpFrameMismatch);
     }
 
@@ -446,6 +383,18 @@ fn raw_help_with_root_claim(bytes: &[u8], claim: &str) -> Vec<u8> {
     forged
 }
 
+#[cfg(test)]
+fn raw_help_with_toggled_help_option_period(bytes: &[u8]) -> Vec<u8> {
+    let normalized = normalize_cli_help_whitespace(bytes);
+    let expected = "-h, --help Print help -V, --version Print version";
+    let toggled = "-h, --help Print help. -V, --version Print version";
+    assert!(
+        normalized.contains(expected),
+        "approved root-help frame must contain the unpunctuated generated help option"
+    );
+    normalized.replacen(expected, toggled, 1).into_bytes()
+}
+
 #[test]
 fn doc_01_b_positive() {
     let independently_authored_contract = CliDocumentationContract {
@@ -475,6 +424,10 @@ fn doc_01_b_positive() {
     ));
 
     let public_help = public_cli_help_candidate().expect("--help must reach Clap DisplayHelp");
+    assert_eq!(
+        normalize_cli_help_whitespace(&public_help.bytes),
+        format!("{EXPECTED_CLI_ROOT_HELP_PREFIX}{EXPECTED_CLI_PROTOCOL_STATUS_STANZA}")
+    );
     let mut state = ConsumerVisibleCliHelp::default();
 
     assert_eq!(
@@ -543,6 +496,20 @@ fn doc_01_b_planted_negative() {
     assert_eq!(
         state, accepted_before,
         "a rejected one-field raw-help mutation must leave evaluator and consumer-visible state unchanged"
+    );
+
+    let punctuation_mutation = CliHelpCandidate {
+        contract: baseline.contract,
+        bytes: raw_help_with_toggled_help_option_period(&baseline.bytes),
+    };
+    assert_eq!(
+        admit_public_cli_help(&mut state, punctuation_mutation),
+        Err(CliDocumentationRefusal::RootHelpFrameMismatch),
+        "a one-field terminal-punctuation mutation must be rejected"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected punctuation mutation must leave evaluator and consumer-visible state unchanged"
     );
     let mut emitted_after_rejection = Vec::new();
     assert_eq!(

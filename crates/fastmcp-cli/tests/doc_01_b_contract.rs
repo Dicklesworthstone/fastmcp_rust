@@ -42,30 +42,21 @@ const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
     "failures rather than fabricating an empty catalog or selection."
 );
 
-/// Independently authored semantic root-frame contract. It permits renderer
-/// formatting changes, but no added or omitted consumer-visible root field.
-const PUBLIC_ROOT_HELP_ABOUT: &str =
-    "CLI tooling for FastMCP - run, inspect, and install MCP servers";
-const PUBLIC_ROOT_HELP_USAGE: &str = "Usage: fastmcp <COMMAND>";
-const PUBLIC_ROOT_HELP_COMMANDS: [(&str, &str); 7] = [
-    ("run", "Run an MCP server binary"),
-    ("inspect", "Inspect an MCP server's capabilities"),
-    (
-        "install",
-        "Install server configuration into Claude Desktop or other clients",
-    ),
-    ("list", "List configured MCP servers"),
-    ("test", "Test MCP server connectivity"),
-    ("dev", "Run server in development mode with hot reloading"),
-    (
-        "help",
-        "Print this message or the help of the given subcommand(s)",
-    ),
-];
-const PUBLIC_ROOT_HELP_OPTIONS: [(&str, &str); 2] = [
-    ("-h, --help", "Print help"),
-    ("-V, --version", "Print version"),
-];
+/// Independently authored normalized frame for the public binary. It freezes
+/// every non-whitespace byte; wrapping is the only renderer variance allowed.
+const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers. ",
+    "Usage: fastmcp <COMMAND> ",
+    "Commands: ",
+    "run Run an MCP server binary. ",
+    "inspect Inspect an MCP server's capabilities. ",
+    "install Install server configuration into Claude Desktop or other clients. ",
+    "list List configured MCP servers. ",
+    "test Test MCP server connectivity. ",
+    "dev Run server in development mode with hot reloading. ",
+    "help Print this message or the help of the given subcommand(s) ",
+    "Options: -h, --help Print help -V, --version Print version "
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicHelpRefusal {
@@ -136,59 +127,6 @@ fn validate_public_help_oracle(oracle: PublicHelpOracle) -> Result<(), PublicHel
     Ok(())
 }
 
-fn consume_public_root_help_field<'a>(
-    root_help: &'a str,
-    expected: &str,
-    accepts_terminal_period: bool,
-) -> Option<&'a str> {
-    let root_help = root_help.strip_prefix(expected)?;
-    let root_help = if accepts_terminal_period {
-        root_help.strip_prefix('.').unwrap_or(root_help)
-    } else {
-        root_help
-    };
-    root_help.strip_prefix(' ')
-}
-
-fn validates_public_root_help_frame(root_help: &str) -> bool {
-    let Some(root_help) = consume_public_root_help_field(root_help, PUBLIC_ROOT_HELP_ABOUT, true)
-    else {
-        return false;
-    };
-    let Some(root_help) = consume_public_root_help_field(root_help, PUBLIC_ROOT_HELP_USAGE, false)
-    else {
-        return false;
-    };
-    let Some(mut root_help) = consume_public_root_help_field(root_help, "Commands:", false) else {
-        return false;
-    };
-
-    for (name, about) in PUBLIC_ROOT_HELP_COMMANDS {
-        let Some(remainder) = consume_public_root_help_field(root_help, name, false) else {
-            return false;
-        };
-        let Some(remainder) = consume_public_root_help_field(remainder, about, true) else {
-            return false;
-        };
-        root_help = remainder;
-    }
-
-    let Some(mut root_help) = consume_public_root_help_field(root_help, "Options:", false) else {
-        return false;
-    };
-    for (flags, about) in PUBLIC_ROOT_HELP_OPTIONS {
-        let Some(remainder) = consume_public_root_help_field(root_help, flags, false) else {
-            return false;
-        };
-        let Some(remainder) = consume_public_root_help_field(remainder, about, true) else {
-            return false;
-        };
-        root_help = remainder;
-    }
-
-    root_help.is_empty()
-}
-
 fn evaluate_public_root_help(
     output: &Output,
     oracle: PublicHelpOracle,
@@ -227,7 +165,7 @@ fn validate_public_root_help_bytes(bytes: &[u8]) -> Result<(), PublicHelpRefusal
     {
         return Err(PublicHelpRefusal::UnsafeRootHelpContent);
     }
-    if !validates_public_root_help_frame(root_help) {
+    if root_help != PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX {
         return Err(PublicHelpRefusal::RootHelpFrameMismatch);
     }
 
@@ -246,6 +184,20 @@ fn raw_help_with_root_claim(bytes: &[u8], claim: &str) -> Vec<u8> {
     forged.push(b' ');
     forged.extend_from_slice(&bytes[status_start..]);
     forged
+}
+
+fn raw_help_with_toggled_help_option_period(bytes: &[u8]) -> Vec<u8> {
+    let normalized = String::from_utf8_lossy(bytes)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let expected = "-h, --help Print help -V, --version Print version";
+    let toggled = "-h, --help Print help. -V, --version Print version";
+    assert!(
+        normalized.contains(expected),
+        "approved root-help frame must contain the unpunctuated generated help option"
+    );
+    normalized.replacen(expected, toggled, 1).into_bytes()
 }
 
 fn admit_public_root_help(
@@ -273,6 +225,10 @@ fn doc_01_b_public_binary_positive() {
     assert_eq!(
         normalized_stdout(&long_help),
         normalized_stdout(&short_help)
+    );
+    assert_eq!(
+        normalized_stdout(&long_help),
+        format!("{PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX}{PROVISIONAL_PUBLIC_STATUS_STANZA}")
     );
     let mut long_state = AcceptedPublicHelp::default();
     assert_eq!(
@@ -334,6 +290,20 @@ fn doc_01_b_public_binary_planted_negative() {
     assert_eq!(
         state, accepted_before,
         "a rejected one-field raw-help mutation must not alter accepted evaluator/output state"
+    );
+
+    let punctuation_mutation = PublicHelpCandidate {
+        oracle: baseline.oracle,
+        stdout: raw_help_with_toggled_help_option_period(&baseline.stdout),
+    };
+    assert_eq!(
+        admit_public_root_help(&mut state, punctuation_mutation),
+        Err(PublicHelpRefusal::RootHelpFrameMismatch),
+        "a one-field terminal-punctuation mutation must be rejected"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected punctuation mutation must not alter accepted evaluator/output state"
     );
     let long_help_after_rejection = fastmcp_output("--help");
     assert_eq!(
