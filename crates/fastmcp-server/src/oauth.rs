@@ -304,6 +304,154 @@ pub enum OAuthParameterName {
     TokenTypeHint,
 }
 
+/// Immutable public native-HTTP routes for an [`OAuthServer`].
+///
+/// This deliberately exposes OAuth authorization, token, and revocation only.
+/// OIDC discovery, UserInfo, JWKS, and ID-token issuance remain outside this
+/// route set until their signing lifecycle is installed as one transaction.
+#[derive(Clone)]
+pub struct OAuthHttpRoutes {
+    server: Arc<OAuthServer>,
+    public_endpoint_base: String,
+    authorization_path: String,
+    token_path: String,
+    revocation_path: String,
+}
+
+impl std::fmt::Debug for OAuthHttpRoutes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OAuthHttpRoutes")
+            .field("public_endpoint_base", &self.public_endpoint_base)
+            .field("authorization_path", &self.authorization_path)
+            .field("token_path", &self.token_path)
+            .field("revocation_path", &self.revocation_path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A public OAuth HTTP route configuration was unsafe or ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthHttpRouteConfigurationError {
+    /// The configured endpoint base was not a canonical HTTPS URL.
+    InvalidPublicEndpointBase,
+    /// The endpoint base did not share the configured OAuth issuer origin.
+    IssuerOriginMismatch,
+}
+
+impl std::fmt::Display for OAuthHttpRouteConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPublicEndpointBase => formatter.write_str(
+                "OAuth public endpoint base must be a canonical HTTPS URL without query or fragment",
+            ),
+            Self::IssuerOriginMismatch => formatter.write_str(
+                "OAuth public endpoint base must share the configured issuer origin",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OAuthHttpRouteConfigurationError {}
+
+impl OAuthHttpRoutes {
+    /// Creates the fixed authorization, token, and revocation routes below an
+    /// explicit public HTTPS endpoint base.
+    ///
+    /// For example, `https://auth.example.test/oauth` exposes
+    /// `/oauth/authorize`, `/oauth/token`, and `/oauth/revoke`. The base is
+    /// never inferred from a request Host or forwarded header.
+    pub fn new(
+        server: Arc<OAuthServer>,
+        public_endpoint_base: impl Into<String>,
+    ) -> Result<Self, OAuthHttpRouteConfigurationError> {
+        let public_endpoint_base = public_endpoint_base.into();
+        let Some(base) = parse_secure_endpoint(&public_endpoint_base, MAX_OAUTH_ISSUER_BYTES)
+        else {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        };
+        if base.scheme() != "https" || base.query().is_some() {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        }
+        let Some(issuer) = parse_secure_endpoint(&server.config().issuer, MAX_OAUTH_ISSUER_BYTES)
+        else {
+            return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
+        };
+        if base.scheme() != issuer.scheme()
+            || base.host_str() != issuer.host_str()
+            || base.port_or_known_default() != issuer.port_or_known_default()
+        {
+            return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
+        }
+
+        let base_path = base.path().trim_end_matches('/');
+        let route_path = |suffix: &str| {
+            if base_path.is_empty() {
+                format!("/{suffix}")
+            } else {
+                format!("{base_path}/{suffix}")
+            }
+        };
+        Ok(Self {
+            server,
+            public_endpoint_base,
+            authorization_path: route_path("authorize"),
+            token_path: route_path("token"),
+            revocation_path: route_path("revoke"),
+        })
+    }
+
+    /// Returns the configured public endpoint base.
+    #[must_use]
+    pub fn public_endpoint_base(&self) -> &str {
+        &self.public_endpoint_base
+    }
+
+    /// Returns the exact authorization endpoint path.
+    #[must_use]
+    pub fn authorization_path(&self) -> &str {
+        &self.authorization_path
+    }
+
+    /// Returns the exact token endpoint path.
+    #[must_use]
+    pub fn token_path(&self) -> &str {
+        &self.token_path
+    }
+
+    /// Returns the exact revocation endpoint path.
+    #[must_use]
+    pub fn revocation_path(&self) -> &str {
+        &self.revocation_path
+    }
+
+    pub(crate) fn server(&self) -> &Arc<OAuthServer> {
+        &self.server
+    }
+
+    pub(crate) fn has_path(&self, path: &str) -> bool {
+        path == self.authorization_path || path == self.token_path || path == self.revocation_path
+    }
+
+    pub(crate) fn validate_non_overlapping_paths<'a>(
+        &self,
+        occupied_paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), OAuthHttpRouteConfigurationError> {
+        let routes = [
+            self.authorization_path(),
+            self.token_path(),
+            self.revocation_path(),
+        ];
+        if occupied_paths
+            .into_iter()
+            .any(|occupied| routes.contains(&occupied))
+        {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        }
+        Ok(())
+    }
+}
+
 /// One decoded parameter retained in exact wire order.
 #[derive(Debug, Clone)]
 pub struct OAuthAdmittedParameter {

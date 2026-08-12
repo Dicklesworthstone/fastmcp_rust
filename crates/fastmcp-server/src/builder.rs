@@ -30,6 +30,7 @@ use crate::handler::CompletionHandler;
 use crate::handler::{
     FinalProxyPromptHandler, FinalProxyResourceHandler, FinalProxyResourceTemplateHandler,
 };
+use crate::oauth::OAuthHttpRoutes;
 #[cfg(feature = "apps")]
 use crate::providers::McpAppsUiResource;
 #[cfg(all(test, feature = "proxy"))]
@@ -173,6 +174,8 @@ pub struct ServerBuilder {
     launch_protocol_policy: Option<ProtocolPolicy>,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
+    /// Optional immutable OAuth-only public HTTP routes.
+    oauth_http_routes: Option<OAuthHttpRoutes>,
     /// Installed extension handlers and current server discovery settings.
     extension_runtime: Option<ServerExtensionRuntime>,
     /// Application-owned state for the configured final Tasks extension.
@@ -289,6 +292,7 @@ impl ServerBuilder {
             protocol_policy,
             launch_protocol_policy,
             http_config: HttpServerConfig::default(),
+            oauth_http_routes: None,
             extension_runtime: None,
             #[cfg(feature = "tasks")]
             final_task_runtime: None,
@@ -704,6 +708,18 @@ impl ServerBuilder {
     #[must_use]
     pub fn http_config(mut self, config: HttpServerConfig) -> Self {
         self.http_config = config;
+        self
+    }
+
+    /// Installs immutable OAuth authorization, token, and revocation routes
+    /// into the native HTTP listener.
+    ///
+    /// The routes retain an explicit public HTTPS endpoint base and are
+    /// admitted before MCP request conversion. OIDC/JWKS/ID-token routes are
+    /// deliberately not installed here.
+    #[must_use]
+    pub fn oauth_http_routes(mut self, routes: OAuthHttpRoutes) -> Self {
+        self.oauth_http_routes = Some(routes);
         self
     }
 
@@ -2240,6 +2256,7 @@ impl ServerBuilder {
                 .max_bidirectional_requests_per_connection,
             protocol_policy: self.protocol_policy,
             http_config: self.http_config,
+            oauth_http_routes: self.oauth_http_routes,
             extension_runtime,
             #[cfg(feature = "tasks")]
             final_task_runtime: self.final_task_runtime,

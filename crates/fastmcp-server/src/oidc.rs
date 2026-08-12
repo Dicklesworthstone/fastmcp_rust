@@ -3,8 +3,7 @@
 //! This module extends the OAuth 2.0/2.1 server with OpenID Connect identity
 //! layer features:
 //!
-//! - **ID Token Issuance**: fail-closed until an external signer completes
-//!   exact JWKS publication/read-back activation
+//! - **ID Token Issuance**: fail-closed until an FND-09 external signer is admitted
 //! - **UserInfo Endpoint**: Standard endpoint for retrieving user claims
 //! - **Discovery Document**: `.well-known/openid-configuration` metadata
 //! - **Standard Claims**: OpenID Connect standard claim types
@@ -18,8 +17,7 @@
 //! The OIDC provider builds on top of [`OAuthServer`] by:
 //!
 //! 1. Adding the `openid` scope to enable OIDC flows
-//! 2. Reserving ID-token issuance for an externally custodied signer that has
-//!    completed JWKS publication/read-back activation
+//! 2. Reserving ID-token issuance for an FND-09 externally custodied signer
 //! 3. Providing standard endpoints for identity operations
 //!
 //! # Example
@@ -47,19 +45,24 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+#[cfg(feature = "builtin-auth-server")]
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crate::oauth::{validate_oauth_issuer, OAuthError, OAuthServer, OAuthServerConfig, OAuthToken};
+#[cfg(feature = "builtin-auth-server")]
+use fastmcp_core::Cx;
+#[cfg(feature = "builtin-auth-server")]
+use fastmcp_protocol::jose::{
+    AdmittedRsaJwks, BoundedJwsClaims, CanonicalRs256PublicJwks, ExternalRs256Signer,
+    ExternalRs256SigningDeadline, JwsSigningError, JwsSigningProfile, Rs256SigningBinding,
+    verify_compact_jws_rs256,
+};
+#[cfg(feature = "builtin-auth-server")]
+use url::Url;
 
-/// Stable fail-closed diagnostic for ID-token issuance before a real external
-/// signer has completed the issuer's publication/read-back activation.
-///
-/// This is deliberately a constant rather than a configuration switch: an
-/// embedding host cannot enable ID-token signing by setting a boolean or by
-/// supplying a local key. The future activation path must bind a concrete
-/// external signer, its immutable generation, every advertised JWKS endpoint,
-/// and successful read-back before it can replace this refusal.
-pub const OIDC_ID_TOKEN_SIGNING_ACTIVATION_REQUIRED: &str =
-    "OIDC ID-token issuance is unavailable until an external signer completes JWKS publication/read-back activation";
+use crate::oauth::{OAuthError, OAuthServer, OAuthServerConfig, OAuthToken, validate_oauth_issuer};
+
+#[cfg(feature = "builtin-auth-server")]
+const MAX_OIDC_NONCE_BYTES: usize = 1_024;
 
 // =============================================================================
 // Configuration
@@ -664,7 +667,6 @@ impl ClaimsProvider for Arc<dyn ClaimsProvider> {
 // =============================================================================
 
 /// OIDC-specific errors.
-#[derive(Clone)]
 pub enum OidcError {
     /// Underlying OAuth error.
     OAuth(OAuthError),
@@ -676,6 +678,9 @@ pub enum OidcError {
     ClaimsSubjectMismatch,
     /// Token signing failed.
     SigningError(String),
+    /// An external signer outcome, including its dispatch knowledge.
+    #[cfg(feature = "builtin-auth-server")]
+    ExternalSigning(JwsSigningError),
     /// Invalid ID token.
     InvalidIdToken(String),
 }
@@ -694,6 +699,8 @@ impl std::fmt::Debug for OidcError {
                 .debug_struct("SigningError")
                 .field("description_len", &description.len())
                 .finish(),
+            #[cfg(feature = "builtin-auth-server")]
+            Self::ExternalSigning(error) => f.debug_tuple("ExternalSigning").field(error).finish(),
             Self::InvalidIdToken(description) => f
                 .debug_struct("InvalidIdToken")
                 .field("description_len", &description.len())
@@ -712,6 +719,8 @@ impl std::fmt::Display for OidcError {
                 write!(f, "claims provider returned a mismatched subject")
             }
             Self::SigningError(_) => f.write_str("ID token signing failed"),
+            #[cfg(feature = "builtin-auth-server")]
+            Self::ExternalSigning(error) => write!(f, "external ID token signing failed: {error}"),
             Self::InvalidIdToken(_) => f.write_str("invalid ID token"),
         }
     }
@@ -739,6 +748,46 @@ pub struct OidcProvider {
     config: OidcProviderConfig,
     /// Claims provider.
     claims_provider: RwLock<Option<Arc<dyn ClaimsProvider>>>,
+    /// A non-forgeable external-signer activation. It remains absent until a
+    /// caller supplies an exact publication/read-back of the selected public
+    /// JWKS under the same immutable signer binding.
+    #[cfg(feature = "builtin-auth-server")]
+    signing_activation: RwLock<Option<OidcIdTokenSigningActivation>>,
+}
+
+/// A server-held activation for one externally custodied ID-token signer.
+///
+/// Its fields are private and it has no public constructor. It can only be
+/// created after the selected signer's canonical public JWKS exactly matches
+/// both the bytes supplied for publication and the separately read-back bytes.
+/// This type neither publishes an endpoint nor implements a KMS/HSM adapter.
+#[cfg(feature = "builtin-auth-server")]
+pub struct OidcIdTokenSigningActivation {
+    signer: Arc<ExternalRs256Signer>,
+    binding: Rs256SigningBinding,
+    issuer: String,
+    advertised_jwks_uri: String,
+    advertised_jwks_origin: String,
+    published_jwks: Vec<u8>,
+    read_back_keys: AdmittedRsaJwks,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl std::fmt::Debug for OidcIdTokenSigningActivation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OidcIdTokenSigningActivation")
+            .field("binding", &self.binding)
+            .field("issuer_bytes", &self.issuer.len())
+            .field("advertised_jwks_uri_bytes", &self.advertised_jwks_uri.len())
+            .field(
+                "advertised_jwks_origin_bytes",
+                &self.advertised_jwks_origin.len(),
+            )
+            .field("published_jwks_bytes", &self.published_jwks.len())
+            .field("read_back_key_count", &self.read_back_keys.len())
+            .finish()
+    }
 }
 
 fn validate_oidc_config(config: &OidcProviderConfig) -> Result<(), OidcError> {
@@ -765,6 +814,8 @@ impl OidcProvider {
             oauth,
             config,
             claims_provider: RwLock::new(None),
+            #[cfg(feature = "builtin-auth-server")]
+            signing_activation: RwLock::new(None),
         })
     }
 
@@ -808,19 +859,114 @@ impl OidcProvider {
         self.set_claims_provider(FnClaimsProvider::new(func));
     }
 
+    /// Creates a sealed activation for an externally custodied RS256 signer.
+    ///
+    /// The caller must first publish `published_jwks` at `advertised_jwks_uri`,
+    /// then supply bytes read back from that exact HTTPS issuer-origin endpoint.
+    /// This crate does not manufacture a publisher, perform HTTP reads, or
+    /// treat a configuration flag as publication evidence.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn create_id_token_signing_activation(
+        &self,
+        signer: Arc<ExternalRs256Signer>,
+        published_jwks: CanonicalRs256PublicJwks,
+        advertised_jwks_uri: &str,
+        read_back_jwks: &[u8],
+    ) -> Result<OidcIdTokenSigningActivation, OidcError> {
+        let (advertised_jwks_uri, advertised_jwks_origin) =
+            validate_advertised_jwks_uri(&self.config.issuer, advertised_jwks_uri)?;
+        let expected_jwks = signer.canonical_public_jwks().map_err(|_| {
+            OidcError::SigningError("unable to canonicalize signing JWKS".to_string())
+        })?;
+        if published_jwks.binding() != signer.binding()
+            || expected_jwks.binding() != signer.binding()
+            || published_jwks.as_bytes() != expected_jwks.as_bytes()
+            || read_back_jwks != expected_jwks.as_bytes()
+        {
+            return Err(OidcError::SigningError(
+                "OIDC signing JWKS publication/read-back does not match the selected signer"
+                    .to_string(),
+            ));
+        }
+        let read_back_keys = AdmittedRsaJwks::from_json(read_back_jwks).map_err(|_| {
+            OidcError::SigningError("OIDC signing JWKS read-back is not admitted".to_string())
+        })?;
+
+        Ok(OidcIdTokenSigningActivation {
+            binding: signer.binding(),
+            signer,
+            issuer: self.config.issuer.clone(),
+            advertised_jwks_uri,
+            advertised_jwks_origin,
+            published_jwks: read_back_jwks.to_vec(),
+            read_back_keys,
+        })
+    }
+
+    /// Installs one sealed signer activation for this exact OIDC issuer.
+    ///
+    /// The activation is consumed. Replacing an active signer requires a
+    /// separate rotation/retirement path, so this narrow initial integration
+    /// refuses replacement rather than silently changing a live key.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn install_id_token_signing_activation(
+        &self,
+        activation: OidcIdTokenSigningActivation,
+    ) -> Result<(), OidcError> {
+        let endpoint_is_bound =
+            validate_advertised_jwks_uri(&activation.issuer, &activation.advertised_jwks_uri)
+                .is_ok_and(|(uri, origin)| {
+                    uri == activation.advertised_jwks_uri
+                        && origin == activation.advertised_jwks_origin
+                });
+        if activation.issuer != self.config.issuer
+            || activation.binding != activation.signer.binding()
+            || !endpoint_is_bound
+        {
+            return Err(OidcError::SigningError(
+                "OIDC signing activation does not match this issuer or signer binding".to_string(),
+            ));
+        }
+        let mut slot = self.signing_activation.write().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        if slot.is_some() {
+            return Err(OidcError::SigningError(
+                "OIDC signing activation is already installed".to_string(),
+            ));
+        }
+        *slot = Some(activation);
+        Ok(())
+    }
+
+    /// Returns exact public JWKS bytes only after their matching activation is
+    /// installed. An HTTP server may serve these bytes at its advertised JWKS
+    /// endpoint; this method does not bind, publish, or fetch HTTP itself.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn activated_jwks_document(&self) -> Result<Vec<u8>, OidcError> {
+        let slot = self.signing_activation.read().map_err(|_| {
+            OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+        })?;
+        let activation = slot.as_ref().ok_or_else(|| {
+            OidcError::SigningError("OIDC signing activation is required".to_string())
+        })?;
+        Ok(activation.published_jwks.clone())
+    }
+
     /// Generates the discovery document.
     #[must_use]
     pub fn discovery_document(&self, base_url: impl Into<String>) -> DiscoveryDocument {
         let base_url = base_url.into();
-        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url.clone());
+        let mut doc = DiscoveryDocument::new(&self.config.issuer, base_url);
         doc.scopes_supported = self.config.supported_scopes.clone();
         doc.claims_supported = Some(self.config.supported_claims.clone());
-        // Do not advertise an algorithm or JWKS while there is no activated
-        // external signer. Constructing a protocol-level signer facade is
-        // insufficient: issuance requires exact JWKS publication/read-back
-        // activation in the owning server path.
-        doc.id_token_signing_alg_values_supported = Vec::new();
-        doc.jwks_uri = None;
+        #[cfg(feature = "builtin-auth-server")]
+        if let Ok(slot) = self.signing_activation.read() {
+            if let Some(activation) = slot.as_ref() {
+                doc.id_token_signing_alg_values_supported = vec!["RS256".to_string()];
+                doc.jwks_uri = Some(activation.advertised_jwks_uri.clone());
+            }
+        }
         doc
     }
 
@@ -828,17 +974,103 @@ impl OidcProvider {
     // ID Token Issuance
     // -------------------------------------------------------------------------
 
-    /// ID-token issuance is intentionally unavailable until an external
-    /// signer completes the issuer's JWKS publication/read-back activation.
-    /// No local JWT is constructed or cached.
-    pub fn issue_id_token(
+    /// Issues one OIDC ID-token candidate through the active external RS256
+    /// signer. The returned compact JWS is self-verified by the signer facade
+    /// and then verified again against the exact JWKS publication read-back.
+    ///
+    /// This is intentionally asynchronous and accepts the caller's [`Cx`];
+    /// it never creates a runtime or substitutes an in-process signing key.
+    #[cfg(feature = "builtin-auth-server")]
+    pub async fn issue_id_token(
         &self,
-        _access_token: &OAuthToken,
-        _nonce: Option<&str>,
+        cx: &Cx,
+        access_token: &str,
+        nonce: Option<&str>,
+        deadline: ExternalRs256SigningDeadline,
     ) -> Result<IdToken, OidcError> {
-        Err(OidcError::SigningError(
-            OIDC_ID_TOKEN_SIGNING_ACTIVATION_REQUIRED.to_string(),
-        ))
+        let access_token_credential = access_token;
+        let access_token = self.validated_oidc_access_token(access_token)?;
+        let subject = access_token
+            .subject
+            .as_deref()
+            .ok_or_else(|| OidcError::ClaimsNotFound("no subject in access token".to_string()))?;
+        validate_oidc_nonce(nonce)?;
+        let user_claims = self.get_user_claims(subject, &access_token.scopes)?;
+        let now = oidc_unix_timestamp()?;
+        let expires_in = access_token
+            .expires_at
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        let expires_in = i64::try_from(expires_in).map_err(|_| {
+            OidcError::InvalidIdToken("access-token lifetime exceeds ID-token range".to_string())
+        })?;
+        let exp = now.checked_add(expires_in).ok_or_else(|| {
+            OidcError::InvalidIdToken("ID-token expiry exceeds timestamp range".to_string())
+        })?;
+        if exp <= now {
+            return Err(OidcError::InvalidIdToken(
+                "access token is expired before ID-token issuance".to_string(),
+            ));
+        }
+        let claims = IdTokenClaims {
+            iss: self.config.issuer.clone(),
+            sub: subject.to_string(),
+            aud: access_token.client_id.clone(),
+            exp,
+            iat: now,
+            auth_time: None,
+            nonce: nonce.map(str::to_string),
+            acr: None,
+            amr: None,
+            azp: None,
+            at_hash: None,
+            c_hash: None,
+            user_claims,
+        };
+        let signing_claims = id_token_signing_claims(&claims)?;
+        let (signer, binding, read_back_keys) = {
+            let slot = self.signing_activation.read().map_err(|_| {
+                OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
+            })?;
+            let activation = slot.as_ref().ok_or_else(|| {
+                OidcError::SigningError("OIDC signing activation is required".to_string())
+            })?;
+            if activation.issuer != self.config.issuer
+                || activation.binding != activation.signer.binding()
+            {
+                return Err(OidcError::SigningError(
+                    "OIDC signing activation no longer matches the selected signer".to_string(),
+                ));
+            }
+            (
+                Arc::clone(&activation.signer),
+                activation.binding,
+                activation.read_back_keys.clone(),
+            )
+        };
+        let signed = signer
+            .sign(cx, JwsSigningProfile::OidcIdToken, signing_claims, deadline)
+            .await
+            .map_err(OidcError::ExternalSigning)?;
+        if signed.binding() != binding {
+            return Err(OidcError::SigningError(
+                "external ID-token signing binding changed before exposure".to_string(),
+            ));
+        }
+        cx.checkpoint().map_err(|_| {
+            OidcError::SigningError("OIDC request cancelled after external signing".to_string())
+        })?;
+        let revalidated = self.validated_oidc_access_token(access_token_credential)?;
+        if !same_id_token_authorization(&access_token, &revalidated) {
+            return Err(OidcError::SigningError(
+                "OIDC access-token authorization changed during external signing".to_string(),
+            ));
+        }
+        let raw = signed.into_compact_jws();
+        verify_compact_jws_rs256(&raw, &read_back_keys).map_err(|_| {
+            OidcError::SigningError("ID-token failed published-JWKS verification".to_string())
+        })?;
+        Ok(IdToken { raw, claims })
     }
 
     // -------------------------------------------------------------------------
@@ -849,20 +1081,7 @@ impl OidcProvider {
     ///
     /// Returns the user's claims filtered by the access token's scopes.
     pub fn userinfo(&self, access_token: &str) -> Result<UserClaims, OidcError> {
-        // Validate access token
-        let validated = self
-            .oauth
-            .validate_access_token(access_token)
-            .ok_or_else(|| {
-                OidcError::OAuth(OAuthError::InvalidGrant(
-                    "invalid or expired access token".to_string(),
-                ))
-            })?;
-
-        // Verify openid scope
-        if !validated.scopes.iter().any(|s| s == "openid") {
-            return Err(OidcError::MissingOpenIdScope);
-        }
+        let validated = self.validated_oidc_access_token(access_token)?;
 
         let subject = validated
             .subject
@@ -870,6 +1089,26 @@ impl OidcProvider {
             .ok_or_else(|| OidcError::ClaimsNotFound("no subject in access token".to_string()))?;
 
         self.get_user_claims(subject, &validated.scopes)
+    }
+
+    fn validated_oidc_access_token(&self, access_token: &str) -> Result<OAuthToken, OidcError> {
+        let validated = self
+            .oauth
+            .validate_access_token(access_token)
+            .ok_or_else(|| {
+                OidcError::OAuth(OAuthError::InvalidGrant(
+                    "invalid, revoked, or expired OAuth access token".to_string(),
+                ))
+            })?;
+        if validated.is_refresh_token || validated.is_expired() {
+            return Err(OidcError::OAuth(OAuthError::InvalidGrant(
+                "invalid, revoked, or expired OAuth access token".to_string(),
+            )));
+        }
+        if !validated.scopes.iter().any(|scope| scope == "openid") {
+            return Err(OidcError::MissingOpenIdScope);
+        }
+        Ok(validated)
     }
 
     // -------------------------------------------------------------------------
@@ -907,6 +1146,153 @@ impl OidcProvider {
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+#[cfg(feature = "builtin-auth-server")]
+fn validate_advertised_jwks_uri(
+    issuer: &str,
+    advertised_jwks_uri: &str,
+) -> Result<(String, String), OidcError> {
+    let issuer = Url::parse(issuer).map_err(|_| {
+        OidcError::SigningError("OIDC issuer cannot bind an advertised JWKS endpoint".to_string())
+    })?;
+    let endpoint = Url::parse(advertised_jwks_uri).map_err(|_| {
+        OidcError::SigningError("advertised JWKS endpoint is not an absolute HTTPS URL".to_string())
+    })?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(OidcError::SigningError(
+            "advertised JWKS endpoint is not a canonical HTTPS origin path".to_string(),
+        ));
+    }
+    let issuer_origin = issuer.origin().ascii_serialization();
+    let endpoint_origin = endpoint.origin().ascii_serialization();
+    if endpoint_origin != issuer_origin {
+        return Err(OidcError::SigningError(
+            "advertised JWKS endpoint origin does not match the OIDC issuer".to_string(),
+        ));
+    }
+    Ok((endpoint.to_string(), endpoint_origin))
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn same_id_token_authorization(left: &OAuthToken, right: &OAuthToken) -> bool {
+    left.client_id == right.client_id
+        && left.scopes == right.scopes
+        && left.resource == right.resource
+        && left.issued_at == right.issued_at
+        && left.expires_at == right.expires_at
+        && left.subject == right.subject
+        && left.token_type == right.token_type
+        && !left.is_refresh_token
+        && !right.is_refresh_token
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn validate_oidc_nonce(nonce: Option<&str>) -> Result<(), OidcError> {
+    if nonce.is_some_and(|nonce| {
+        nonce.is_empty()
+            || nonce.len() > MAX_OIDC_NONCE_BYTES
+            || nonce.bytes().any(|byte| byte.is_ascii_control())
+    }) {
+        return Err(OidcError::InvalidIdToken(
+            "OIDC nonce is outside admitted bounds".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn oidc_unix_timestamp() -> Result<i64, OidcError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| OidcError::InvalidIdToken("system clock predates Unix epoch".to_string()))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| OidcError::InvalidIdToken("system clock exceeds ID-token range".to_string()))
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn id_token_signing_claims(claims: &IdTokenClaims) -> Result<BoundedJwsClaims, OidcError> {
+    let mut value = serde_json::to_value(&claims.user_claims)
+        .map_err(|_| OidcError::InvalidIdToken("user claims cannot be serialized".to_string()))?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        OidcError::InvalidIdToken("user claims must serialize as an object".to_string())
+    })?;
+    // A claims provider may supply arbitrary public profile claims, but it
+    // cannot overwrite the identity and lifetime facts that this server owns.
+    for name in [
+        "iss",
+        "sub",
+        "aud",
+        "exp",
+        "iat",
+        "auth_time",
+        "nonce",
+        "acr",
+        "amr",
+        "azp",
+        "at_hash",
+        "c_hash",
+    ] {
+        object.remove(name);
+    }
+    object.insert(
+        "iss".to_string(),
+        serde_json::Value::String(claims.iss.clone()),
+    );
+    object.insert(
+        "sub".to_string(),
+        serde_json::Value::String(claims.sub.clone()),
+    );
+    object.insert(
+        "aud".to_string(),
+        serde_json::Value::String(claims.aud.clone()),
+    );
+    object.insert("exp".to_string(), serde_json::Value::from(claims.exp));
+    object.insert("iat".to_string(), serde_json::Value::from(claims.iat));
+    if let Some(auth_time) = claims.auth_time {
+        object.insert("auth_time".to_string(), serde_json::Value::from(auth_time));
+    }
+    if let Some(nonce) = &claims.nonce {
+        object.insert(
+            "nonce".to_string(),
+            serde_json::Value::String(nonce.clone()),
+        );
+    }
+    if let Some(acr) = &claims.acr {
+        object.insert("acr".to_string(), serde_json::Value::String(acr.clone()));
+    }
+    if let Some(amr) = &claims.amr {
+        object.insert(
+            "amr".to_string(),
+            serde_json::to_value(amr).map_err(|_| {
+                OidcError::InvalidIdToken("authentication methods cannot be serialized".to_string())
+            })?,
+        );
+    }
+    if let Some(azp) = &claims.azp {
+        object.insert("azp".to_string(), serde_json::Value::String(azp.clone()));
+    }
+    if let Some(at_hash) = &claims.at_hash {
+        object.insert(
+            "at_hash".to_string(),
+            serde_json::Value::String(at_hash.clone()),
+        );
+    }
+    if let Some(c_hash) = &claims.c_hash {
+        object.insert(
+            "c_hash".to_string(),
+            serde_json::Value::String(c_hash.clone()),
+        );
+    }
+    BoundedJwsClaims::from_value(&value)
+        .map_err(|_| OidcError::InvalidIdToken("ID-token claims exceed signing bounds".to_string()))
+}
 
 // =============================================================================
 // Tests
@@ -964,71 +1350,6 @@ mod non_signing_tests {
             doc.code_challenge_methods_supported,
             Some(vec!["S256".to_string()])
         );
-    }
-
-    #[test]
-    fn issuance_fails_closed_without_external_signer() {
-        let oauth = Arc::new(OAuthServer::new(crate::oauth::OAuthServerConfig::default()));
-        let provider = OidcProvider::with_defaults(oauth).expect("default provider");
-        let token = OAuthToken {
-            token: "opaque".to_string(),
-            token_type: crate::oauth::TokenType::Bearer,
-            client_id: "client".to_string(),
-            scopes: vec!["openid".to_string()],
-            resource: None,
-            issued_at: std::time::Instant::now(),
-            expires_at: std::time::Instant::now(),
-            subject: Some("subject".to_string()),
-            is_refresh_token: false,
-        };
-        let error = provider
-            .issue_id_token(&token, None)
-            .expect_err("an unactivated signer must not issue an ID token");
-        assert!(matches!(error, OidcError::SigningError(_)));
-        assert_eq!(error.to_string(), "ID token signing failed");
-    }
-
-    #[test]
-    fn fnd_09_b_positive() {
-        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-        let provider = OidcProvider::with_defaults(oauth).expect("default provider");
-        let discovery = provider.discovery_document("https://issuer.example");
-
-        assert!(discovery.id_token_signing_alg_values_supported.is_empty());
-        assert!(discovery.jwks_uri.is_none());
-    }
-
-    #[test]
-    fn fnd_09_b_planted_negative() {
-        let oauth = Arc::new(OAuthServer::new(OAuthServerConfig::default()));
-        let provider = OidcProvider::with_defaults(oauth).expect("default provider");
-        let discovery_before = provider.discovery_document("https://issuer.example");
-        let token = OAuthToken {
-            token: "opaque".to_string(),
-            token_type: crate::oauth::TokenType::Bearer,
-            client_id: "client".to_string(),
-            scopes: vec!["openid".to_string()],
-            resource: None,
-            issued_at: std::time::Instant::now(),
-            expires_at: std::time::Instant::now(),
-            subject: Some("subject".to_string()),
-            is_refresh_token: false,
-        };
-
-        let error = provider
-            .issue_id_token(&token, None)
-            .expect_err("changing only the issuance attempt must remain fail-closed");
-        let discovery_after = provider.discovery_document("https://issuer.example");
-
-        let OidcError::SigningError(description) = error else {
-            panic!("unactivated issuance must return the signing activation error");
-        };
-        assert_eq!(description, OIDC_ID_TOKEN_SIGNING_ACTIVATION_REQUIRED);
-        assert_eq!(
-            discovery_after.id_token_signing_alg_values_supported,
-            discovery_before.id_token_signing_alg_values_supported
-        );
-        assert_eq!(discovery_after.jwks_uri, discovery_before.jwks_uri);
     }
 
     #[test]
@@ -1145,5 +1466,284 @@ mod non_signing_tests {
                 "sensitive canary leaked through Display: {display}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "builtin-auth-server"))]
+mod signer_activation_tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use base64::Engine as _;
+    use fastmcp_protocol::jose::{
+        AttestedRs256PublicKey, ExternalRs256OperationReceipt, ExternalRs256SignDisposition,
+        ExternalRs256SignerBackend, ExternalRs256SigningRequest, RawRs256Signature,
+        RedactedSignerProvenance,
+    };
+
+    use super::*;
+    use crate::oauth::{AuthorizationRequest, CodeChallengeMethod, OAuthClient, TokenRequest};
+
+    const TEST_CLIENT_ID: &str = "oidc-signing-test-client";
+    const TEST_REDIRECT_URI: &str = "http://127.0.0.1/oidc-callback";
+    const TEST_CODE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const TEST_CODE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    // This is a retained public RS256 verification vector; no private key is
+    // present here. Negative tests never ask their backend to produce a JWS.
+    const TEST_PUBLIC_MODULUS: &str = "jlHZ9nzuIuM4aiAQSAgEJMBaYS7qm7Z_3mtGYDdzReIkzxPHHr21oeXQyUJI89eQG13fsUdyoodcuh5kmndPCrODJekfr_zgor6sNspcB88iQEqEc9yf9YAf5v-cNH1Evh82KABuWb26LMaNAzZFR3BMhMEQ1FD6fLFGAbX76Drd5_UZ-1xcU07IXEc_9zvQvOwXckhO7P5Yil1fVzLTrHye_6zTbGWvdqi45095bKPnSqjrLBCTVrUW8o02Gi6mt7Ls9pZeWx2DXV8SqV06DdlqiovtKWRooQ1zV-v7BGsLsVk6T6d-8mNMGNrh0fpNb_5kdaHphAt_Ji6eE1wQPw";
+
+    struct UnexpectedBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ExternalRs256SignerBackend for UnexpectedBackend {
+        fn sign<'a>(
+            &'a self,
+            _: &'a Cx,
+            _: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::AcqRel);
+                panic!("a rejected OIDC issuance must not dispatch external signing")
+            })
+        }
+    }
+
+    struct CancellationAfterDispatchBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ExternalRs256SignerBackend for CancellationAfterDispatchBackend {
+        fn sign<'a>(
+            &'a self,
+            cx: &'a Cx,
+            request: ExternalRs256SigningRequest,
+        ) -> Pin<Box<dyn Future<Output = ExternalRs256SignDisposition> + Send + 'a>> {
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::AcqRel);
+                cx.set_cancel_requested(true);
+                let receipt = ExternalRs256OperationReceipt::new(
+                    request.binding(),
+                    1,
+                    RedactedSignerProvenance::new("oidc-cancellation-test")
+                        .expect("bounded redacted test provenance"),
+                )
+                .expect("valid dispatched-operation receipt");
+                // This is intentionally not a signature: cancellation must
+                // consume the dispatched attempt before any JWS can exist.
+                ExternalRs256SignDisposition::Dispatched(
+                    RawRs256Signature::from_bytes(vec![0_u8; 256])
+                        .expect("bounded cancellation-path bytes"),
+                    receipt,
+                )
+            })
+        }
+    }
+
+    fn test_signer(backend: Arc<dyn ExternalRs256SignerBackend>) -> Arc<ExternalRs256Signer> {
+        let binding =
+            Rs256SigningBinding::new(11, 12, 13, 14).expect("nonzero external signer generations");
+        let modulus = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(TEST_PUBLIC_MODULUS)
+            .expect("retained public verification modulus");
+        let key = AttestedRs256PublicKey::admit(
+            "fixed-rs256",
+            modulus,
+            binding,
+            RedactedSignerProvenance::new("oidc-test-adapter")
+                .expect("bounded redacted test provenance"),
+        )
+        .expect("retained public verification key admits");
+        Arc::new(ExternalRs256Signer::new(backend, key))
+    }
+
+    fn issue_access_token(scopes: &[&str]) -> (Arc<OAuthServer>, crate::oauth::TokenResponse) {
+        let oauth = Arc::new(OAuthServer::with_defaults());
+        oauth
+            .register_client(
+                OAuthClient::builder(TEST_CLIENT_ID)
+                    .redirect_uri(TEST_REDIRECT_URI)
+                    .scopes(scopes.iter().copied())
+                    .build()
+                    .expect("valid test client"),
+            )
+            .expect("register test client");
+        let (code, _) = oauth
+            .authorize(&AuthorizationRequest {
+                response_type: "code".to_string(),
+                client_id: TEST_CLIENT_ID.to_string(),
+                redirect_uri: TEST_REDIRECT_URI.to_string(),
+                scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
+                resource: None,
+                state: Some("oidc-test-state".to_string()),
+                code_challenge: TEST_CODE_CHALLENGE.to_string(),
+                code_challenge_method: CodeChallengeMethod::S256,
+            })
+            .expect("authorize test access token");
+        let response = oauth
+            .token(&TokenRequest {
+                grant_type: "authorization_code".to_string(),
+                code: Some(code),
+                redirect_uri: Some(TEST_REDIRECT_URI.to_string()),
+                client_id: TEST_CLIENT_ID.to_string(),
+                client_secret: None,
+                code_verifier: Some(TEST_CODE_VERIFIER.to_string()),
+                refresh_token: None,
+                scopes: None,
+                resource: None,
+            })
+            .expect("exchange test access token");
+        (oauth, response)
+    }
+
+    fn activated_provider(
+        oauth: Arc<OAuthServer>,
+        signer: Arc<ExternalRs256Signer>,
+    ) -> OidcProvider {
+        let provider = OidcProvider::with_defaults(oauth).expect("OIDC provider");
+        let canonical = signer
+            .canonical_public_jwks()
+            .expect("canonical external public JWKS");
+        let read_back = canonical.as_bytes().to_vec();
+        let activation = provider
+            .create_id_token_signing_activation(
+                signer,
+                canonical,
+                "https://fastmcp.invalid/oidc/jwks",
+                &read_back,
+            )
+            .expect("exact publication/read-back activation");
+        provider
+            .install_id_token_signing_activation(activation)
+            .expect("install activation");
+        provider
+    }
+
+    fn signing_deadline() -> ExternalRs256SigningDeadline {
+        ExternalRs256SigningDeadline::new(std::time::Duration::from_secs(1))
+            .expect("bounded test deadline")
+    }
+
+    #[test]
+    fn forged_revoked_refresh_and_non_openid_credentials_never_dispatch_signing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let refresh = issued
+            .refresh_token
+            .as_deref()
+            .expect("refresh credential")
+            .to_string();
+        let provider = activated_provider(Arc::clone(&oauth), signer);
+        let cx = Cx::for_testing();
+        let refresh_result = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &refresh,
+            None,
+            signing_deadline(),
+        ))
+        .0;
+        assert!(matches!(
+            refresh_result,
+            Err(OidcError::OAuth(OAuthError::InvalidGrant(_)))
+        ));
+        oauth
+            .revoke(&issued.access_token, TEST_CLIENT_ID, None)
+            .expect("revoke owned access credential");
+
+        for credential in ["forged-opaque-credential".to_string(), issued.access_token] {
+            let cx = Cx::for_testing();
+            let result = fastmcp_core::block_on(provider.issue_id_token(
+                &cx,
+                &credential,
+                None,
+                signing_deadline(),
+            ))
+            .0;
+            assert!(matches!(
+                result,
+                Err(OidcError::OAuth(OAuthError::InvalidGrant(_)))
+            ));
+        }
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let (oauth, issued) = issue_access_token(&[]);
+        let provider = activated_provider(oauth, signer);
+        let cx = Cx::for_testing();
+        let result = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ))
+        .0;
+        assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn mismatched_read_back_cannot_construct_activation_or_dispatch_signing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(UnexpectedBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let oauth = Arc::new(OAuthServer::with_defaults());
+        let provider = OidcProvider::with_defaults(oauth).expect("OIDC provider");
+        let canonical = signer
+            .canonical_public_jwks()
+            .expect("canonical external public JWKS");
+        let mut mismatched_read_back = canonical.as_bytes().to_vec();
+        let final_byte = mismatched_read_back
+            .last_mut()
+            .expect("canonical JWKS is nonempty");
+        *final_byte ^= 1;
+
+        assert!(matches!(
+            provider.create_id_token_signing_activation(
+                signer,
+                canonical,
+                "https://fastmcp.invalid/oidc/jwks",
+                &mismatched_read_back,
+            ),
+            Err(OidcError::SigningError(_))
+        ));
+        assert!(provider.activated_jwks_document().is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn cancellation_after_dispatch_exposes_no_id_token() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let signer = test_signer(Arc::new(CancellationAfterDispatchBackend {
+            calls: Arc::clone(&calls),
+        }));
+        let (oauth, issued) = issue_access_token(&["openid"]);
+        let provider = activated_provider(oauth, signer);
+        let cx = Cx::for_testing();
+
+        let result = fastmcp_core::block_on(provider.issue_id_token(
+            &cx,
+            &issued.access_token,
+            None,
+            signing_deadline(),
+        ))
+        .0;
+        assert!(matches!(
+            result,
+            Err(OidcError::ExternalSigning(
+                JwsSigningError::CancelledAfterDispatch(_)
+            ))
+        ));
+        assert!(cx.is_cancel_requested());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 }
