@@ -363,6 +363,33 @@ impl AttestedRs256PublicKey {
         self.binding
     }
 
+    /// Returns this key's one-key canonical public JWKS representation.
+    ///
+    /// The bytes contain public RSA material only. They are suitable for an
+    /// owning issuer to publish and later compare byte-for-byte with its
+    /// independently read-back JWKS response; they do not prove publication
+    /// or activate signing by themselves.
+    #[must_use]
+    pub fn canonical_public_jwks(&self) -> Result<CanonicalRs256PublicJwks, JoseError> {
+        let value = serde_json::json!({
+            "keys": [{
+                "alg": "RS256",
+                "e": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(ADMITTED_RSA_PUBLIC_EXPONENT),
+                "kid": &self.kid,
+                "kty": "RSA",
+                "n": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.modulus),
+                "use": "sig"
+            }]
+        });
+        let bytes =
+            serde_json::to_vec(&value).map_err(|_| JoseError::InvalidJson("canonical JWKS"))?;
+        Ok(CanonicalRs256PublicJwks {
+            bytes,
+            binding: self.binding,
+        })
+    }
+
     fn admitted_jwks(&self) -> AdmittedRsaJwks {
         let mut keys = BTreeMap::new();
         keys.insert(
@@ -373,6 +400,39 @@ impl AttestedRs256PublicKey {
             },
         );
         AdmittedRsaJwks { keys }
+    }
+}
+
+/// Canonical public JWKS bytes for exactly one externally custodied RS256 key.
+///
+/// This type intentionally carries no private material and has no public
+/// constructor. Only an admitted external signer key can mint it.
+pub struct CanonicalRs256PublicJwks {
+    bytes: Vec<u8>,
+    binding: Rs256SigningBinding,
+}
+
+impl CanonicalRs256PublicJwks {
+    /// Borrows the exact public JWKS bytes an issuer must publish and read back.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the immutable signing binding represented by these bytes.
+    #[must_use]
+    pub const fn binding(&self) -> Rs256SigningBinding {
+        self.binding
+    }
+}
+
+impl fmt::Debug for CanonicalRs256PublicJwks {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalRs256PublicJwks")
+            .field("bytes", &self.bytes.len())
+            .field("binding", &self.binding)
+            .finish()
     }
 }
 
@@ -465,6 +525,8 @@ impl fmt::Debug for BoundedJwsClaims {
 pub enum JwsSigningProfile {
     /// An RFC 9068 access-token candidate; emits the fixed `typ=at+jwt`.
     BuiltinAccessToken,
+    /// An OpenID Connect ID-token candidate; emits no optional JOSE `typ`.
+    OidcIdToken,
     /// An RFC 7523 client-assertion candidate; emits no JOSE `typ` header.
     ClientAssertion,
 }
@@ -834,6 +896,12 @@ impl ExternalRs256Signer {
         self.public_key.binding()
     }
 
+    /// Returns the sole canonical public JWKS that can activate this signer.
+    #[must_use]
+    pub fn canonical_public_jwks(&self) -> Result<CanonicalRs256PublicJwks, JoseError> {
+        self.public_key.canonical_public_jwks()
+    }
+
     /// Signs one bounded framework candidate through the sealed facade.
     pub async fn sign(
         &self,
@@ -912,7 +980,9 @@ fn protected_header(profile: JwsSigningProfile, kid: &str) -> Result<Vec<u8>, Jo
         JwsSigningProfile::BuiltinAccessToken => {
             serde_json::json!({"alg": "RS256", "kid": kid, "typ": "at+jwt"})
         }
-        JwsSigningProfile::ClientAssertion => serde_json::json!({"alg": "RS256", "kid": kid}),
+        JwsSigningProfile::OidcIdToken | JwsSigningProfile::ClientAssertion => {
+            serde_json::json!({"alg": "RS256", "kid": kid})
+        }
     };
     let header = serde_json::to_vec(&header).map_err(|_| JoseError::InvalidJson("header"))?;
     if header.len() > MAX_JWS_HEADER_BYTES {
@@ -1334,6 +1404,27 @@ mod tests {
     fn admitted_builtin_access_token_jwks() -> AdmittedRsaJwks {
         AdmittedRsaJwks::from_json(BUILTIN_ACCESS_TOKEN_JWK.as_bytes())
             .expect("builtin access-token public JWK admits")
+    }
+
+    #[test]
+    fn canonical_public_jwks_is_admitted_and_bound_to_its_external_key() {
+        let binding = fixed_binding();
+        let key = fixed_attested_key(binding);
+        let canonical = key
+            .canonical_public_jwks()
+            .expect("admitted external public key has canonical public JWKS");
+
+        assert_eq!(canonical.binding(), binding);
+        assert_eq!(
+            canonical.as_bytes(),
+            key.canonical_public_jwks()
+                .expect("canonicalization is stable")
+                .as_bytes()
+        );
+        let admitted = AdmittedRsaJwks::from_json(canonical.as_bytes())
+            .expect("canonical public JWKS remains locally verifiable");
+        assert_eq!(admitted.len(), 1);
+        assert!(admitted.contains_kid("fixed-rs256"));
     }
 
     #[test]

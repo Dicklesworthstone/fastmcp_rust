@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::{Implementation, JsonInteger, OpenMetadata};
-use crate::jsonrpc::{admit_raw_jsonrpc_document, RawJsonAdmissionError};
+use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
 use crate::protocol_policy::ProtocolEra;
 
 /// Maximum encoded bytes accepted by the result codec.
@@ -293,6 +293,18 @@ pub struct ResultMeta {
 }
 
 impl ResultMeta {
+    /// Creates empty metadata for a locally authored result.
+    ///
+    /// This preserves the absence of the optional `_meta` member on the wire.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            server_info: None,
+            meta: None,
+            exact_meta: None,
+        }
+    }
+
     /// Creates metadata for a locally constructed successful result.
     #[must_use]
     pub fn server_generated(server_info: Implementation) -> Self {
