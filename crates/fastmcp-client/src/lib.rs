@@ -101,6 +101,7 @@ pub use fastmcp_core::CanonicalHttpUrl;
 pub use fastmcp_protocol::common_types::LoggingLevel;
 #[cfg(feature = "apps")]
 pub use fastmcp_protocol::extensions::McpAppsClientSettings;
+#[cfg(feature = "websocket-experimental")]
 pub use fastmcp_transport::websocket::AsyncWsClientTransport;
 // The public re-export is feature-gated, while the client keeps this type
 // internally to reject configuration that names Apps when that feature is
@@ -136,10 +137,10 @@ pub use http_executor::{
 pub use http_executor::{
     LegacyHttpRequest, LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError,
 };
-/// Compatibility module for the caller-upgraded async WebSocket transport.
+/// Opt-in module for the caller-upgraded async WebSocket transport.
 ///
-/// New code can import [`AsyncWsClientTransport`] directly from this crate.
-/// The facade remains diagnostics-only.
+/// Enable `websocket-experimental` to use this module or import
+/// [`AsyncWsClientTransport`] directly from this crate.
 #[cfg(feature = "websocket-experimental")]
 pub mod websocket_experimental {
     pub use fastmcp_transport::websocket::AsyncWsClientTransport;
@@ -186,10 +187,11 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
+use asupersync::{Cx, channel::oneshot};
+#[cfg(feature = "websocket-experimental")]
 use asupersync::{
-    Cx,
-    channel::oneshot,
     io::{AsyncRead, AsyncWrite},
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard},
 };
 use execution::{MrtrDriver, MrtrDriverLimits};
 use fastmcp_core::{
@@ -377,6 +379,7 @@ impl ReverseRequestHandlers {
         Ok(())
     }
 }
+#[cfg(feature = "websocket-experimental")]
 use fastmcp_transport::websocket::{AsyncWsClientRecvHalf, AsyncWsClientSendHalf};
 use fastmcp_transport::{
     ClientTransportRecvHalf, ReceivedTransportFrame, StdioRecvHalf, StdioSendHalf, StdioTransport,
@@ -2258,6 +2261,7 @@ const MAX_REVERSE_CALLBACK_WORKERS: usize = 4;
 const MAX_QUEUED_REVERSE_CALLBACKS: usize = 16;
 const REVERSE_CALLBACK_POLL_SLICE: Duration = Duration::from_millis(10);
 const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const REVERSE_CALLBACK_SHUTDOWN_POLLS: usize = 25;
 const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR: &str =
     "Client reverse callback workers did not stop within the shutdown bound";
 
@@ -3666,6 +3670,7 @@ where
     }
 }
 
+#[cfg(any(test, feature = "websocket-experimental"))]
 enum WebSocketInitialization {
     Legacy(InitializeResult),
     Modern {
@@ -3674,6 +3679,7 @@ enum WebSocketInitialization {
     },
 }
 
+#[cfg(any(test, feature = "websocket-experimental"))]
 enum WebSocketHandshakeError {
     MethodNotFound,
     Mcp(McpError),
@@ -3801,6 +3807,7 @@ where
     Ok(result)
 }
 
+#[cfg(any(test, feature = "websocket-experimental"))]
 struct WebSocketHandshakeResponse {
     result: Option<serde_json::Value>,
     raw_result: Option<String>,
@@ -3861,11 +3868,440 @@ where
 /// It is extracted from the same bounded transport frame as `response`; it is
 /// never reconstructed from the decoded `serde_json::Value`.
 #[derive(Debug, Clone)]
+#[cfg(feature = "websocket-experimental")]
 pub struct WebSocketResponse {
     /// The typed JSON-RPC response admitted from the peer.
     pub response: JsonRpcResponse,
     /// The exact peer-authored JSON source of the response `result` member.
     pub raw_result: Option<String>,
+}
+
+/// Connection-owned exact-2024 callback workers for one split WebSocket.
+///
+/// The client retains the only receive half. Callback workers share only the
+/// independently serialized write half, so an inbound cancellation can abort
+/// and wake a parked callback without competing for frames.
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketReverseCallbackPool<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    state: Arc<ReverseCallbackState>,
+    terminal: Arc<WebSocketReverseCallbackTerminal>,
+    response_sender: Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
+    cx: Cx,
+    tasks: Mutex<Vec<(RequestId, asupersync::runtime::TaskHandle<()>)>>,
+}
+
+/// One-reader terminal wakeup for retained WebSocket callbacks.
+///
+/// Exactly one request/listener owns ingress at a time, so one cancel-correct
+/// oneshot waiter is sufficient. Publishing records the terminal error before
+/// waking that owner, preventing a silent peer read from hiding callback
+/// failure behind a later frame.
+#[derive(Default)]
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketReverseCallbackTerminal {
+    error: Mutex<Option<McpError>>,
+    waiter: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+/// Polls a callback future behind a panic boundary. The boundary is applied
+/// to every poll, so a panic after an await is published just as promptly as a
+/// panic on the first poll; no reader-side reap is required to wake ingress.
+#[cfg(feature = "websocket-experimental")]
+async fn websocket_callback_catch_unwind<F>(future: F) -> std::thread::Result<F::Output>
+where
+    F: Future,
+{
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(move |context| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future.as_mut().poll(context)
+        })) {
+            Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
+
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketReverseCallbackCompletionGuard {
+    terminal: Arc<WebSocketReverseCallbackTerminal>,
+    state: Arc<ReverseCallbackState>,
+    cancellation: ReverseRequestCancellation,
+    request_id: RequestId,
+    cx: Cx,
+    armed: bool,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl WebSocketReverseCallbackCompletionGuard {
+    fn new(
+        terminal: Arc<WebSocketReverseCallbackTerminal>,
+        state: Arc<ReverseCallbackState>,
+        cancellation: ReverseRequestCancellation,
+        request_id: RequestId,
+        cx: Cx,
+    ) -> Self {
+        Self {
+            terminal,
+            state,
+            cancellation,
+            request_id,
+            cx,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn fail(&mut self, error: McpError) {
+        self.armed = false;
+        self.terminal.publish(&self.cx, error.clone());
+        self.state.fail_connection(error);
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl Drop for WebSocketReverseCallbackCompletionGuard {
+    fn drop(&mut self) {
+        if self.armed && self.cancellation.is_open() {
+            let error = McpError::internal_error("WebSocket reverse callback task panicked");
+            self.terminal.publish(&self.cx, error.clone());
+            self.state.fail_connection(error);
+            self.state.complete(&self.request_id);
+        }
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl WebSocketReverseCallbackTerminal {
+    fn error(&self) -> Option<McpError> {
+        self.error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn subscribe(&self, cx: &Cx) -> oneshot::Receiver<()> {
+        let (sender, receiver) = oneshot::channel();
+        let already_terminal = self.error().is_some();
+        if already_terminal {
+            let _ = sender.send(cx, ());
+            return receiver;
+        }
+        let mut waiter = self
+            .waiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.error().is_some() {
+            let _ = sender.send(cx, ());
+        } else {
+            // The only receive owner replaces the stale sender left behind by
+            // its previously completed cancel-safe race.
+            *waiter = Some(sender);
+        }
+        receiver
+    }
+
+    fn publish(&self, cx: &Cx, error: McpError) {
+        let should_wake = {
+            let mut stored = self
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if stored.is_some() {
+                false
+            } else {
+                *stored = Some(error);
+                true
+            }
+        };
+        if should_wake
+            && let Some(sender) = self
+                .waiter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        {
+            let _ = sender.send(cx, ());
+        }
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+enum WebSocketReceiveRace<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    Frame {
+        receiver: AsyncWsClientRecvHalf<IO>,
+        result: Result<ReceivedTransportFrame, TransportError>,
+    },
+    CallbackTerminal,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> WebSocketReverseCallbackPool<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    fn new(response_sender: Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>, cx: Cx) -> Self {
+        Self {
+            state: Arc::new(ReverseCallbackState::default()),
+            terminal: Arc::new(WebSocketReverseCallbackTerminal::default()),
+            response_sender,
+            cx,
+            tasks: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn dispatch<P, R>(
+        &self,
+        request_id: RequestId,
+        params: P,
+        handler: Arc<
+            dyn for<'callback> Fn(
+                    &'callback Cx,
+                    ReverseRequestCancellation,
+                    P,
+                ) -> ReverseRequestFuture<'callback, R>
+                + Send
+                + Sync,
+        >,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+        P: Send + 'static,
+        R: serde::Serialize + Send + 'static,
+    {
+        self.reap_finished_tasks()?;
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            McpError::internal_error("WebSocket reverse callback task registry failed")
+        })?;
+        if tasks.len() >= MAX_QUEUED_REVERSE_CALLBACKS {
+            return Err(McpError::internal_error(
+                "WebSocket reverse callback capacity exceeded",
+            ));
+        }
+        let cancellation = self.state.admit(&request_id)?;
+        let callback_state = Arc::clone(&self.state);
+        let callback_terminal = Arc::clone(&self.terminal);
+        let terminal_cx = self.cx.clone();
+        let response_sender = Arc::clone(&self.response_sender);
+        let callback_id = request_id.clone();
+        let response_id = request_id.clone();
+        let invoke_cancellation = cancellation.clone();
+        let task_cx = Cx::current().unwrap_or_else(|| self.cx.clone());
+        let task = match task_cx.spawn(move |callback_cx| async move {
+            let mut completion_guard = WebSocketReverseCallbackCompletionGuard::new(
+                Arc::clone(&callback_terminal),
+                Arc::clone(&callback_state),
+                cancellation.clone(),
+                callback_id.clone(),
+                terminal_cx.clone(),
+            );
+            let result = match websocket_callback_catch_unwind(handler(
+                &callback_cx,
+                invoke_cancellation,
+                params,
+            ))
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    let error =
+                        McpError::internal_error("WebSocket reverse callback task panicked");
+                    completion_guard.fail(error);
+                    callback_state.complete(&callback_id);
+                    return;
+                }
+            };
+            let response = reverse_request_response(response_id, result);
+            match commit_websocket_reverse_callback_response(
+                &callback_state,
+                &callback_id,
+                &response_sender,
+                &callback_cx,
+                &cancellation,
+                &response,
+            )
+            .await
+            {
+                Ok(_) => {
+                    completion_guard.disarm();
+                    callback_state.complete(&callback_id);
+                }
+                // A matching protocol cancellation (or structured close)
+                // aborts this callback's Cx while it may be queued on the
+                // writer. That is a successful suppression, not a transport
+                // write failure and therefore not connection-terminal.
+                Err(TransportError::Cancelled) if !cancellation.is_open() => {
+                    completion_guard.disarm();
+                    callback_state.complete(&callback_id);
+                }
+                Err(error) => {
+                    let error = transport_error_to_mcp(error);
+                    completion_guard.fail(error);
+                    callback_state.complete(&callback_id);
+                }
+            }
+        }) {
+            Ok(task) => task,
+            Err(_) => {
+                self.state.complete(&request_id);
+                return Err(McpError::internal_error(
+                    "WebSocket reverse callback dispatcher is unavailable",
+                ));
+            }
+        };
+        tasks.push((request_id, task));
+        Ok(())
+    }
+
+    fn cancel(&self, request_id: &RequestId) -> bool {
+        let cancelled = self.state.cancel(request_id);
+        if cancelled {
+            let tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (task_id, task) in tasks.iter() {
+                if task_id.correlates_with(request_id) {
+                    task.abort();
+                }
+            }
+        }
+        cancelled
+    }
+
+    fn cancel_all(&self) {
+        self.state.cancel_all();
+        let tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, task) in tasks.iter() {
+            task.abort();
+        }
+    }
+
+    fn reap_finished_tasks(&self) -> McpResult<usize> {
+        let mut tasks = self.tasks.lock().map_err(|_| {
+            McpError::internal_error("WebSocket reverse callback task registry failed")
+        })?;
+        let mut active = Vec::with_capacity(tasks.len());
+        let mut panicked = false;
+        for (request_id, mut task) in std::mem::take(&mut *tasks) {
+            match task.try_join() {
+                Ok(None) => active.push((request_id, task)),
+                Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_)) => {}
+                Err(
+                    asupersync::runtime::JoinError::Panicked(_)
+                    | asupersync::runtime::JoinError::PolledAfterCompletion,
+                ) => panicked = true,
+            }
+        }
+        let active_count = active.len();
+        *tasks = active;
+        if panicked {
+            let error = McpError::internal_error("WebSocket reverse callback task panicked");
+            // Publish while the task registry remains locked: a subsequent
+            // reverse request cannot turn this observed panic into an
+            // immediate error response before the sole receive owner is woken.
+            self.terminal.publish(&self.cx, error.clone());
+            self.state.fail_connection(error.clone());
+            return Err(error);
+        }
+        Ok(active_count)
+    }
+
+    async fn join_bounded(&self, cx: &Cx) -> McpResult<()> {
+        self.cancel_all();
+        for _ in 0..REVERSE_CALLBACK_SHUTDOWN_POLLS {
+            if self.reap_finished_tasks()? == 0 {
+                return Ok(());
+            }
+            asupersync::time::sleep(cx.now(), REVERSE_CALLBACK_POLL_SLICE).await;
+        }
+        Err(McpError::internal_error(
+            "WebSocket reverse callback workers did not stop within the shutdown bound",
+        ))
+    }
+
+    fn terminal_error(&self) -> Option<McpError> {
+        self.terminal
+            .error()
+            .or_else(|| self.state.terminal_error())
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> Drop for WebSocketReverseCallbackPool<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    fn drop(&mut self) {
+        self.cancel_all();
+    }
+}
+
+/// Serializes an exact-2024 callback response with ordinary client writes.
+///
+/// Taking the writer lock before the response election lets the sole reader
+/// receive a matching cancellation while this callback is queued behind a
+/// write. That cancellation then aborts this task's `Cx` and removes the
+/// active election before any callback frame can be emitted.
+#[cfg(feature = "websocket-experimental")]
+async fn commit_websocket_reverse_callback_response<IO>(
+    state: &ReverseCallbackState,
+    request_id: &RequestId,
+    sender: &Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
+    cx: &Cx,
+    cancellation: &ReverseRequestCancellation,
+    response: &JsonRpcMessage,
+) -> Result<bool, TransportError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut sender = OwnedMutexGuard::lock(Arc::clone(sender), cx)
+        .await
+        .map_err(|error| match error {
+            asupersync::sync::LockError::Cancelled => TransportError::Cancelled,
+            asupersync::sync::LockError::TimedOut(_) => TransportError::Timeout,
+            asupersync::sync::LockError::Poisoned
+            | asupersync::sync::LockError::PolledAfterCompletion => TransportError::Closed,
+        })?;
+    if !state.claim_response_if_open(request_id, cancellation) {
+        return Ok(false);
+    }
+    sender.send(cx, response).await?;
+    Ok(true)
+}
+
+#[cfg(feature = "websocket-experimental")]
+async fn send_websocket_callback_message<IO>(
+    sender: &Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
+    cx: &Cx,
+    message: &JsonRpcMessage,
+) -> Result<(), TransportError>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut sender = OwnedMutexGuard::lock(Arc::clone(sender), cx)
+        .await
+        .map_err(|error| match error {
+            asupersync::sync::LockError::Cancelled => TransportError::Cancelled,
+            asupersync::sync::LockError::TimedOut(_) => TransportError::Timeout,
+            asupersync::sync::LockError::Poisoned
+            | asupersync::sync::LockError::PolledAfterCompletion => TransportError::Closed,
+        })?;
+    sender.send(cx, message).await
 }
 
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
@@ -3876,19 +4312,22 @@ pub struct WebSocketResponse {
 /// selected only by `LegacyOnly`; `Auto` requires a fresh-transport factory,
 /// performs final discovery once, and never replays a legacy initialize
 /// request on the refused connection.
+#[cfg(feature = "websocket-experimental")]
 pub struct WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    receiver: AsyncWsClientRecvHalf<IO>,
-    sender: AsyncWsClientSendHalf<IO>,
+    receiver: Option<AsyncWsClientRecvHalf<IO>>,
+    sender: Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
     session: ClientSession,
     reverse_request_handlers: ReverseRequestHandlers,
+    reverse_callback_pool: WebSocketReverseCallbackPool<IO>,
     next_id: u64,
     closed: bool,
     close_settled: bool,
 }
 
+#[cfg(feature = "websocket-experimental")]
 impl<IO> std::fmt::Debug for WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
@@ -3904,6 +4343,7 @@ where
     }
 }
 
+#[cfg(feature = "websocket-experimental")]
 impl<IO> WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
@@ -3960,9 +4400,9 @@ where
         }
 
         let (mut receiver, mut sender) = transport.into_split();
-        let initialization = match protocol_plan.policy() {
+        let handshake = match protocol_plan.policy() {
             ProtocolPolicy::ModernOnly => {
-                match async_websocket_discover(
+                async_websocket_discover(
                     &mut receiver,
                     &mut sender,
                     cx,
@@ -3971,14 +4411,6 @@ where
                     1,
                 )
                 .await
-                {
-                    Ok(initialization) => initialization,
-                    Err(WebSocketHandshakeError::MethodNotFound) => {
-                        let _ = close_async_websocket_halves(&mut receiver, &mut sender, cx).await;
-                        return Err(McpError::method_not_found(SERVER_DISCOVER_METHOD));
-                    }
-                    Err(WebSocketHandshakeError::Mcp(error)) => return Err(error),
-                }
             }
             ProtocolPolicy::LegacyOnly => async_websocket_initialize(
                 &mut receiver,
@@ -3989,14 +4421,31 @@ where
                 1,
             )
             .await
-            .map(WebSocketInitialization::Legacy)
-            .map_err(|error| match error {
-                WebSocketHandshakeError::MethodNotFound => {
-                    McpError::invalid_request("WebSocket initialize was not supported by the peer")
-                }
-                WebSocketHandshakeError::Mcp(error) => error,
-            })?,
+            .map(WebSocketInitialization::Legacy),
             ProtocolPolicy::Auto => unreachable!("Auto was rejected before transport ownership"),
+        };
+        let initialization = match handshake {
+            Ok(initialization) => initialization,
+            Err(error) => {
+                // The split connection is owned from this point onward. Every
+                // handshake failure therefore closes both halves before its
+                // original semantic error is returned to the caller.
+                let _ = close_async_websocket_halves(&mut receiver, &mut sender, cx).await;
+                return Err(match (protocol_plan.policy(), error) {
+                    (ProtocolPolicy::ModernOnly, WebSocketHandshakeError::MethodNotFound) => {
+                        McpError::method_not_found(SERVER_DISCOVER_METHOD)
+                    }
+                    (ProtocolPolicy::LegacyOnly, WebSocketHandshakeError::MethodNotFound) => {
+                        McpError::invalid_request(
+                            "WebSocket initialize was not supported by the peer",
+                        )
+                    }
+                    (_, WebSocketHandshakeError::Mcp(error)) => error,
+                    (ProtocolPolicy::Auto, _) => {
+                        unreachable!("Auto was rejected before transport ownership")
+                    }
+                });
+            }
         };
 
         if matches!(initialization, WebSocketInitialization::Legacy(_)) {
@@ -4032,17 +4481,25 @@ where
             )
             .map(|session| session.with_server_discovery(discovery)),
         }
-        .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
-        .try_with_protocol_plan(protocol_plan)
-        .map_err(|_| {
-            McpError::internal_error("Configured protocol policy rejects the negotiated era")
-        })?;
+        .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))
+        .and_then(|session| {
+            session.try_with_protocol_plan(protocol_plan).map_err(|_| {
+                McpError::internal_error("Configured protocol policy rejects the negotiated era")
+            })
+        });
+        let session =
+            admit_websocket_session_or_close(&mut receiver, &mut sender, cx, session).await?;
+
+        let sender = Arc::new(AsyncMutex::with_name("websocket-client-send", sender));
+        let reverse_callback_pool =
+            WebSocketReverseCallbackPool::new(Arc::clone(&sender), cx.clone());
 
         Ok(Self {
-            receiver,
+            receiver: Some(receiver),
             sender,
             session,
             reverse_request_handlers,
+            reverse_callback_pool,
             next_id: 2,
             closed: false,
             close_settled: false,
@@ -4147,7 +4604,10 @@ where
         cx: &Cx,
         method: impl Into<String>,
         params: Option<serde_json::Value>,
-    ) -> McpResult<WebSocketResponse> {
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
         if cx.checkpoint().is_err() {
             return Err(self.terminal_cancellation(cx).await);
         }
@@ -4165,7 +4625,10 @@ where
         &mut self,
         cx: &Cx,
         request: JsonRpcRequest,
-    ) -> McpResult<WebSocketResponse> {
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
         if cx.checkpoint().is_err() {
             return Err(self.terminal_cancellation(cx).await);
         }
@@ -4176,16 +4639,28 @@ where
             McpError::internal_error("WebSocket admitted request requires a JSON-RPC ID")
         })?;
         if let Err(error) = self
-            .sender
-            .send(cx, &JsonRpcMessage::Request(request))
+            .send_message(cx, &JsonRpcMessage::Request(request))
             .await
         {
             return Err(self.terminal_transport_error(cx, error).await);
         }
 
         loop {
-            let frame = match self.receiver.recv_with_source(cx).await {
+            if let Err(error) = self.drain_completed_reverse_callbacks() {
+                return Err(self.terminal_callback_error(cx, error).await);
+            }
+            let frame = match self.recv_with_callback_terminal(cx).await {
                 Ok(frame) => frame,
+                Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
+                    return Err(self
+                        .terminal_callback_error(
+                            cx,
+                            self.reverse_callback_pool
+                                .terminal_error()
+                                .expect("terminal callback error was observed"),
+                        )
+                        .await);
+                }
                 Err(error) => return Err(self.terminal_transport_error(cx, error).await),
             };
             let JsonRpcMessage::Response(response) = frame.message() else {
@@ -4205,9 +4680,12 @@ where
                         )
                         .await);
                 }
-                let reverse_response = match self.dispatch_legacy_reverse_request(cx, request).await
-                {
-                    Ok(response) => response,
+                if request.method == "notifications/cancelled" {
+                    let _ = self.cancel_legacy_reverse_callback(request);
+                    continue;
+                }
+                let reverse_dispatch = match self.dispatch_legacy_reverse_request(request) {
+                    Ok(dispatch) => dispatch,
                     Err(_) => {
                         return Err(self
                             .close_after_protocol_error(
@@ -4217,7 +4695,9 @@ where
                             .await);
                     }
                 };
-                if let Err(error) = self.sender.send(cx, &reverse_response).await {
+                if let LiveServerRequestDispatch::Immediate(reverse_response) = reverse_dispatch
+                    && let Err(error) = self.send_message(cx, &reverse_response).await
+                {
                     return Err(self.terminal_transport_error(cx, error).await);
                 }
                 continue;
@@ -4236,6 +4716,9 @@ where
             }
             let response = response.clone();
             let raw_result = raw_result_from_admitted_response(&response, frame, "WebSocket")?;
+            if let Err(error) = self.drain_completed_reverse_callbacks() {
+                return Err(self.terminal_callback_error(cx, error).await);
+            }
             return Ok(WebSocketResponse {
                 response,
                 raw_result,
@@ -4255,7 +4738,10 @@ where
     /// Completes one prompt or resource-template argument in MCP 2026-07-28.
     ///
     /// Exact 2024 sessions reject before allocating an ID or writing a frame.
-    pub async fn complete(&mut self, cx: &Cx, params: CompletionParams) -> McpResult<CoreResult> {
+    pub async fn complete(&mut self, cx: &Cx, params: CompletionParams) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         match self.selected_protocol_era() {
             ProtocolEra::Modern2026 => {
                 let params = serde_json::to_value(params).map_err(|_| {
@@ -4292,6 +4778,7 @@ where
     ) -> McpResult<FinalCoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        IO: Send + 'static,
     {
         self.require_modern("tools/call")?;
         let limits =
@@ -4337,7 +4824,10 @@ where
         &mut self,
         cx: &Cx,
         notifications: SubscriptionFilter,
-    ) -> McpResult<SubscriptionListenCollector> {
+    ) -> McpResult<SubscriptionListenCollector>
+    where
+        IO: Send + 'static,
+    {
         if cx.checkpoint().is_err() {
             return Err(self.terminal_cancellation(cx).await);
         }
@@ -4376,8 +4866,7 @@ where
             request_id.clone(),
         );
         if let Err(error) = self
-            .sender
-            .send(cx, &JsonRpcMessage::Request(request))
+            .send_message(cx, &JsonRpcMessage::Request(request))
             .await
         {
             return Err(self.terminal_transport_error(cx, error).await);
@@ -4397,8 +4886,21 @@ where
         let mut task_notifications = Vec::new();
 
         loop {
-            let frame = match self.receiver.recv_with_source(cx).await {
+            if let Err(error) = self.drain_completed_reverse_callbacks() {
+                return Err(self.terminal_callback_error(cx, error).await);
+            }
+            let frame = match self.recv_with_callback_terminal(cx).await {
                 Ok(frame) => frame,
+                Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
+                    return Err(self
+                        .terminal_callback_error(
+                            cx,
+                            self.reverse_callback_pool
+                                .terminal_error()
+                                .expect("terminal callback error was observed"),
+                        )
+                        .await);
+                }
                 Err(error) => return Err(self.terminal_transport_error(cx, error).await),
             };
             match frame.message() {
@@ -4570,7 +5072,10 @@ where
         cx: &Cx,
         name: &str,
         arguments: serde_json::Value,
-    ) -> McpResult<FinalToolCallOutcome> {
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        IO: Send + 'static,
+    {
         self.require_final_tasks_result(OFFICIAL_TASKS_RESULT_DISCRIMINATOR)?;
         let parameters = self.with_final_tasks_client_capability(serde_json::json!({
             "name": name,
@@ -4599,7 +5104,10 @@ where
         &mut self,
         cx: &Cx,
         task_id: FinalTaskId,
-    ) -> McpResult<FinalGetTaskResult> {
+    ) -> McpResult<FinalGetTaskResult>
+    where
+        IO: Send + 'static,
+    {
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
@@ -4632,7 +5140,10 @@ where
         cx: &Cx,
         task: &FinalTask,
         input_responses: FinalTaskInputResponses,
-    ) -> McpResult<FinalUpdateTaskResult> {
+    ) -> McpResult<FinalUpdateTaskResult>
+    where
+        IO: Send + 'static,
+    {
         self.require_final_tasks_method(TASK_UPDATE)?;
         let FinalTask::InputRequired {
             base,
@@ -4669,7 +5180,10 @@ where
         &mut self,
         cx: &Cx,
         task_id: FinalTaskId,
-    ) -> McpResult<FinalCancelTaskResult> {
+    ) -> McpResult<FinalCancelTaskResult>
+    where
+        IO: Send + 'static,
+    {
         self.require_final_tasks_method(TASK_CANCEL)?;
         self.request_final_tasks(
             cx,
@@ -4729,7 +5243,10 @@ where
         cx: &Cx,
         method: &str,
         params: serde_json::Value,
-    ) -> McpResult<CoreResult> {
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.require_modern(method)?;
         let params = self.with_modern_request_metadata(params)?;
         self.request_final_core_prepared(cx, method, params).await
@@ -4740,7 +5257,10 @@ where
         cx: &Cx,
         method: &str,
         params: serde_json::Value,
-    ) -> McpResult<CoreResult> {
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         let era = self.selected_protocol_era();
         let request = CoreRequest::decode(era, method, Some(&params)).map_err(|_| {
             McpError::invalid_params(
@@ -4769,7 +5289,10 @@ where
         cx: &Cx,
         method: &str,
         params: serde_json::Value,
-    ) -> McpResult<CoreResult> {
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.require_modern(method)?;
         let request =
             CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).map_err(|_| {
@@ -4876,6 +5399,7 @@ where
     where
         P: serde::Serialize,
         R: serde::de::DeserializeOwned,
+        IO: Send + 'static,
     {
         if cx.checkpoint().is_err() {
             return Err(self.terminal_cancellation(cx).await);
@@ -4901,76 +5425,204 @@ where
         })
     }
 
-    async fn dispatch_legacy_reverse_request(
+    fn dispatch_legacy_reverse_request(
         &self,
-        cx: &Cx,
         request: &JsonRpcRequest,
-    ) -> McpResult<JsonRpcMessage> {
+    ) -> McpResult<LiveServerRequestDispatch>
+    where
+        IO: Send + 'static,
+    {
+        if let Some(error) = self.reverse_callback_pool.terminal_error() {
+            return Err(error);
+        }
         let Some(id) = request.id.clone() else {
             return Err(McpError::invalid_request(
                 "WebSocket exact-2024 reverse request requires a JSON-RPC ID",
             ));
         };
         if request.method.starts_with("notifications/") {
-            return Ok(
+            return Ok(LiveServerRequestDispatch::Immediate(
                 invalid_notification_request_response(request).unwrap_or_else(|| {
                     JsonRpcMessage::Response(JsonRpcResponse::error(
                         Some(id),
                         McpError::invalid_request("invalid reverse notification request").into(),
                     ))
                 }),
-            );
+            ));
+        }
+        if request.method == "ping" {
+            return Ok(LiveServerRequestDispatch::Immediate(
+                JsonRpcMessage::Response(JsonRpcResponse::success(id, serde_json::json!({}))),
+            ));
         }
 
-        let response = match request.method.as_str() {
-            "sampling/createMessage" => match self
-                .reverse_request_handlers
-                .sampling_create_message
-                .as_ref()
-            {
-                Some(handler) => {
-                    let params = decode_reverse_request_params::<CreateMessageParams>(request);
-                    match params {
-                        Ok(params) => {
-                            let cancellation = ReverseRequestCancellation::new();
-                            let result = handler(cx, cancellation, params).await;
-                            reverse_request_response(id, result)
-                        }
-                        Err(error) => {
-                            reverse_request_response::<CreateMessageResult>(id, Err(error))
+        let dispatch =
+            match request.method.as_str() {
+                "sampling/createMessage" => match self
+                    .reverse_request_handlers
+                    .sampling_create_message
+                    .as_ref()
+                {
+                    Some(handler) => {
+                        let params = decode_reverse_request_params::<CreateMessageParams>(request);
+                        match params {
+                            Ok(params) => match self.reverse_callback_pool.dispatch(
+                                id.clone(),
+                                params,
+                                Arc::clone(handler),
+                            ) {
+                                Ok(()) => LiveServerRequestDispatch::CallbackAdmitted,
+                                Err(error)
+                                    if self.reverse_callback_pool.terminal_error().is_some() =>
+                                {
+                                    return Err(error);
+                                }
+                                Err(error) => LiveServerRequestDispatch::Immediate(
+                                    reverse_request_response::<CreateMessageResult>(id, Err(error)),
+                                ),
+                            },
+                            Err(error) => {
+                                LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                                    CreateMessageResult,
+                                >(
+                                    id, Err(error)
+                                ))
+                            }
                         }
                     }
-                }
-                None => reverse_request_response::<CreateMessageResult>(
-                    id,
-                    Err(McpError::method_not_found("sampling/createMessage")),
-                ),
-            },
-            "roots/list" => match self.reverse_request_handlers.roots_list.as_ref() {
-                Some(handler) => {
-                    let params = decode_reverse_request_params::<ListRootsParams>(request);
-                    match params {
-                        Ok(params) => {
-                            let cancellation = ReverseRequestCancellation::new();
-                            let result = handler(cx, cancellation, params).await;
-                            reverse_request_response(id, result)
+                    None => LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                        CreateMessageResult,
+                    >(
+                        id,
+                        Err(McpError::method_not_found("sampling/createMessage")),
+                    )),
+                },
+                "roots/list" => match self.reverse_request_handlers.roots_list.as_ref() {
+                    Some(handler) => {
+                        let params = decode_reverse_request_params::<ListRootsParams>(request);
+                        match params {
+                            Ok(params) => match self.reverse_callback_pool.dispatch(
+                                id.clone(),
+                                params,
+                                Arc::clone(handler),
+                            ) {
+                                Ok(()) => LiveServerRequestDispatch::CallbackAdmitted,
+                                Err(error)
+                                    if self.reverse_callback_pool.terminal_error().is_some() =>
+                                {
+                                    return Err(error);
+                                }
+                                Err(error) => LiveServerRequestDispatch::Immediate(
+                                    reverse_request_response::<ListRootsResult>(id, Err(error)),
+                                ),
+                            },
+                            Err(error) => {
+                                LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                                    ListRootsResult,
+                                >(
+                                    id, Err(error)
+                                ))
+                            }
                         }
-                        Err(error) => reverse_request_response::<ListRootsResult>(id, Err(error)),
                     }
-                }
-                None => reverse_request_response::<ListRootsResult>(
-                    id,
-                    Err(McpError::method_not_found("roots/list")),
+                    None => LiveServerRequestDispatch::Immediate(reverse_request_response::<
+                        ListRootsResult,
+                    >(
+                        id,
+                        Err(McpError::method_not_found("roots/list")),
+                    )),
+                },
+                _ => LiveServerRequestDispatch::Immediate(
+                    method_not_found_response(request).unwrap_or_else(|| {
+                        JsonRpcMessage::Response(JsonRpcResponse::error(
+                            Some(id),
+                            McpError::method_not_found(&request.method).into(),
+                        ))
+                    }),
                 ),
-            },
-            _ => method_not_found_response(request).unwrap_or_else(|| {
-                JsonRpcMessage::Response(JsonRpcResponse::error(
-                    Some(id),
-                    McpError::method_not_found(&request.method).into(),
-                ))
-            }),
+            };
+        Ok(dispatch)
+    }
+
+    fn cancel_legacy_reverse_callback(&self, request: &JsonRpcRequest) -> bool {
+        let Ok(CancellationWireMessage::Legacy2024 { params, .. }) =
+            CancellationWireMessage::decode(
+                ProtocolEra::Legacy2024,
+                CancellationSender::Server,
+                request,
+            )
+        else {
+            return false;
         };
-        Ok(response)
+        self.reverse_callback_pool.cancel(&params.request_id)
+    }
+
+    fn drain_completed_reverse_callbacks(&self) -> McpResult<()> {
+        if let Some(error) = self.reverse_callback_pool.terminal_error() {
+            return Err(error);
+        }
+        if let Err(error) = self.reverse_callback_pool.reap_finished_tasks() {
+            return Err(error);
+        }
+        self.reverse_callback_pool
+            .terminal_error()
+            .map_or(Ok(()), Err)
+    }
+
+    /// Races the one owned ingress half against a callback-terminal signal.
+    ///
+    /// The frame branch is the only branch that owns `receiver`; it returns
+    /// that half to this client on every non-terminal receive outcome. If a
+    /// retained callback publishes a terminal failure first, the receive future
+    /// is cancel-safely dropped without creating another WebSocket reader.
+    async fn recv_with_callback_terminal(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<ReceivedTransportFrame, TransportError>
+    where
+        IO: Send + 'static,
+    {
+        if self.reverse_callback_pool.terminal_error().is_some() {
+            return Err(TransportError::Closed);
+        }
+        let mut receiver = self.receiver.take().ok_or(TransportError::Closed)?;
+        let mut terminal = self.reverse_callback_pool.terminal.subscribe(cx);
+        let receive_cx = cx.clone();
+        let terminal_cx = cx.clone();
+        let raced = cx
+            .race(vec![
+                Box::pin(async move {
+                    let result = receiver.recv_with_source(&receive_cx).await;
+                    WebSocketReceiveRace::Frame { receiver, result }
+                }),
+                Box::pin(async move {
+                    let _ = terminal.recv(&terminal_cx).await;
+                    WebSocketReceiveRace::CallbackTerminal
+                }),
+            ])
+            .await;
+        match raced {
+            Ok(WebSocketReceiveRace::Frame { receiver, result }) => {
+                self.receiver = Some(receiver);
+                result
+            }
+            Ok(WebSocketReceiveRace::CallbackTerminal) => {
+                if cx.checkpoint().is_err() {
+                    Err(TransportError::Cancelled)
+                } else {
+                    Err(TransportError::Closed)
+                }
+            }
+            Err(_) if cx.checkpoint().is_err() => Err(TransportError::Cancelled),
+            Err(_) => Err(TransportError::Closed),
+        }
+    }
+
+    async fn send_message(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        if self.reverse_callback_pool.terminal_error().is_some() {
+            return Err(TransportError::Closed);
+        }
+        send_websocket_callback_message(&self.sender, cx, message).await
     }
 
     fn admit_raw_client_request(
@@ -5049,6 +5701,12 @@ where
         McpError::request_cancelled()
     }
 
+    async fn terminal_callback_error(&mut self, cx: &Cx, error: McpError) -> McpError {
+        self.closed = true;
+        let _ = self.settle_close(cx).await;
+        error
+    }
+
     async fn close_after_protocol_error(&mut self, cx: &Cx, message: &str) -> McpError {
         self.closed = true;
         let _ = self.settle_close(cx).await;
@@ -5060,12 +5718,22 @@ where
             return Ok(());
         }
         self.closed = true;
-        let sender_result = self.sender.close(cx).await.map_err(transport_error_to_mcp);
-        let receiver_result = self
-            .receiver
-            .close(cx)
+        // A panicked callback is already terminal, but its retained task has
+        // been observed and removed by `join_bounded`.  Continue closing both
+        // transport halves before surfacing that callback failure so every
+        // terminal path has the same structural close election.
+        let callbacks_result = self.reverse_callback_pool.join_bounded(cx).await;
+        let sender_result = self
+            .send_message_close(cx)
             .await
             .map_err(transport_error_to_mcp);
+        let receiver_result = match self.receiver.as_mut() {
+            Some(receiver) => receiver.close(cx).await.map_err(transport_error_to_mcp),
+            None => Ok(()),
+        };
+        if let Err(error) = callbacks_result {
+            return Err(error);
+        }
         match (sender_result, receiver_result) {
             (Ok(()), Ok(())) => {
                 self.close_settled = true;
@@ -5074,8 +5742,21 @@ where
             (Err(error), _) | (_, Err(error)) => Err(error),
         }
     }
+
+    async fn send_message_close(&self, cx: &Cx) -> Result<(), TransportError> {
+        let mut sender = OwnedMutexGuard::lock(Arc::clone(&self.sender), cx)
+            .await
+            .map_err(|error| match error {
+                asupersync::sync::LockError::Cancelled => TransportError::Cancelled,
+                asupersync::sync::LockError::TimedOut(_) => TransportError::Timeout,
+                asupersync::sync::LockError::Poisoned
+                | asupersync::sync::LockError::PolledAfterCompletion => TransportError::Closed,
+            })?;
+        sender.close(cx).await
+    }
 }
 
+#[cfg(feature = "websocket-experimental")]
 async fn async_websocket_discover<IO>(
     receiver: &mut AsyncWsClientRecvHalf<IO>,
     sender: &mut AsyncWsClientSendHalf<IO>,
@@ -5153,6 +5834,7 @@ where
     })
 }
 
+#[cfg(feature = "websocket-experimental")]
 async fn async_websocket_initialize<IO>(
     receiver: &mut AsyncWsClientRecvHalf<IO>,
     sender: &mut AsyncWsClientSendHalf<IO>,
@@ -5200,6 +5882,7 @@ where
     Ok(result)
 }
 
+#[cfg(feature = "websocket-experimental")]
 async fn async_websocket_exchange<IO>(
     receiver: &mut AsyncWsClientRecvHalf<IO>,
     sender: &mut AsyncWsClientSendHalf<IO>,
@@ -5215,18 +5898,13 @@ where
         ))
     })?;
     if let Err(error) = sender.send(cx, &JsonRpcMessage::Request(request)).await {
-        let _ = close_async_websocket_halves(receiver, sender, cx).await;
         return Err(WebSocketHandshakeError::Mcp(transport_error_to_mcp(error)));
     }
     let frame = match receiver.recv_with_source(cx).await {
         Ok(frame) => frame,
-        Err(error) => {
-            let _ = close_async_websocket_halves(receiver, sender, cx).await;
-            return Err(WebSocketHandshakeError::Mcp(transport_error_to_mcp(error)));
-        }
+        Err(error) => return Err(WebSocketHandshakeError::Mcp(transport_error_to_mcp(error))),
     };
     let JsonRpcMessage::Response(response) = frame.message() else {
-        let _ = close_async_websocket_halves(receiver, sender, cx).await;
         return Err(WebSocketHandshakeError::Mcp(McpError::invalid_request(
             "WebSocket handshake received a non-response frame",
         )));
@@ -5236,7 +5914,6 @@ where
         .as_ref()
         .is_some_and(|response_id| response_id.correlates_with(&request_id))
     {
-        let _ = close_async_websocket_halves(receiver, sender, cx).await;
         return Err(WebSocketHandshakeError::Mcp(McpError::invalid_request(
             "WebSocket handshake response ID does not match its request",
         )));
@@ -5256,6 +5933,7 @@ where
     })
 }
 
+#[cfg(feature = "websocket-experimental")]
 async fn close_async_websocket_halves<IO>(
     receiver: &mut AsyncWsClientRecvHalf<IO>,
     sender: &mut AsyncWsClientSendHalf<IO>,
@@ -5267,6 +5945,30 @@ where
     let sender_result = sender.close(cx).await;
     let receiver_result = receiver.close(cx).await;
     sender_result.and(receiver_result)
+}
+
+/// Completes session admission while this connection still owns both halves.
+///
+/// The handshake driver is the single teardown owner: wire exchange helpers
+/// only report semantic failures, and this boundary closes each split half
+/// once before preserving an admission failure for the caller.
+#[cfg(feature = "websocket-experimental")]
+async fn admit_websocket_session_or_close<IO>(
+    receiver: &mut AsyncWsClientRecvHalf<IO>,
+    sender: &mut AsyncWsClientSendHalf<IO>,
+    cx: &Cx,
+    session: McpResult<ClientSession>,
+) -> McpResult<ClientSession>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    match session {
+        Ok(session) => Ok(session),
+        Err(error) => {
+            let _ = close_async_websocket_halves(receiver, sender, cx).await;
+            Err(error)
+        }
+    }
 }
 
 fn validate_timeout_duration(
@@ -14191,12 +14893,21 @@ mod tests {
     use super::*;
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
-    use asupersync::io::AsyncWriteExt;
+    #[cfg(feature = "websocket-experimental")]
+    use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
     use asupersync::test_utils::run_test;
     use fastmcp_protocol::ExtensionDirection;
+    #[cfg(feature = "websocket-experimental")]
     use fastmcp_transport::websocket::AsyncWsServerTransport;
     use std::collections::{BTreeMap, HashMap};
+    #[cfg(feature = "websocket-experimental")]
+    use std::io;
+    #[cfg(feature = "websocket-experimental")]
     use std::net::SocketAddr;
+    #[cfg(feature = "websocket-experimental")]
+    use std::pin::Pin;
+    #[cfg(feature = "websocket-experimental")]
+    use std::task::{Context, Poll};
 
     struct WebSocketTestRecv {
         frames: VecDeque<Box<[u8]>>,
@@ -14252,6 +14963,7 @@ mod tests {
         ))
     }
 
+    #[cfg(feature = "websocket-experimental")]
     fn async_websocket_pair() -> (
         asupersync::net::tcp::VirtualTcpStream,
         asupersync::net::tcp::VirtualTcpStream,
@@ -14261,6 +14973,78 @@ mod tests {
         asupersync::net::tcp::VirtualTcpStream::pair(client_addr, server_addr)
     }
 
+    /// Counts terminal RFC 6455 Close-frame elections on the client writer.
+    /// The split receive and send halves share that writer, so exactly one
+    /// count proves teardown did not run twice after a handshake failure.
+    #[cfg(feature = "websocket-experimental")]
+    struct CloseCountingIo {
+        inner: asupersync::net::tcp::VirtualTcpStream,
+        close_frames: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl CloseCountingIo {
+        fn new(
+            inner: asupersync::net::tcp::VirtualTcpStream,
+            close_frames: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                inner,
+                close_frames,
+            }
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl AsyncRead for CloseCountingIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl AsyncWrite for CloseCountingIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if bytes.first().is_some_and(|byte| byte & 0x0F == 0x08) {
+                this.close_frames.fetch_add(1, Ordering::SeqCst);
+            }
+            Pin::new(&mut this.inner).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn close_counting_async_websocket_pair() -> (
+        CloseCountingIo,
+        asupersync::net::tcp::VirtualTcpStream,
+        Arc<AtomicUsize>,
+    ) {
+        let (client, peer) = async_websocket_pair();
+        let close_frames = Arc::new(AtomicUsize::new(0));
+        (
+            CloseCountingIo::new(client, Arc::clone(&close_frames)),
+            peer,
+            close_frames,
+        )
+    }
+
+    #[cfg(feature = "websocket-experimental")]
     fn async_modern_discovery_result() -> serde_json::Value {
         serde_json::json!({
             "resultType": "complete",
@@ -14277,6 +15061,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "websocket-experimental")]
     fn async_websocket_client_info() -> ClientInfo {
         ClientInfo {
             name: "async-websocket-client".to_owned(),
@@ -14284,6 +15069,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "websocket-experimental")]
     async fn write_server_text_frame(
         peer: &mut asupersync::net::tcp::VirtualTcpStream,
         source: &str,
@@ -14307,12 +15093,14 @@ mod tests {
             .expect("write raw server WebSocket text frame");
     }
 
+    #[cfg(feature = "websocket-experimental")]
     fn raw_modern_discovery_source(id: &str) -> String {
         format!(
             r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{}},"_meta":{{"io.modelcontextprotocol/serverInfo":{{"name":"raw-async-websocket-test","version":"1.0"}}}},"ttlMs":0,"cacheScope":"private"}}}}"#
         )
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_public_correlation_admits_equivalent_numeric_ids_and_raw_lexemes() {
         run_test(|| async {
@@ -14353,6 +15141,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_public_true_response_id_mismatch_closes_and_cannot_be_reused() {
         run_test(|| async {
@@ -14395,6 +15184,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_modern_raw_control_and_server_methods_reject_before_contact() {
         run_test(|| async {
@@ -14426,6 +15216,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_pending_cancellation_attempts_close_rejects_late_response_and_reuse() {
         run_test(|| async {
@@ -14543,6 +15334,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_public_mrtr_retries_through_real_split_transport() {
         run_test(|| async {
@@ -14588,6 +15380,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_public_typed_subscription_collects_ack_event_and_terminal() {
         run_test(|| async {
@@ -14637,6 +15430,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_subscription_ack_id_mismatch_is_terminal_and_cannot_consume_later_frames() {
         run_test(|| async {
@@ -14699,6 +15493,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_subscription_terminal_id_mismatch_is_terminal_and_cannot_be_reused() {
         run_test(|| async {
@@ -14755,7 +15550,7 @@ mod tests {
         });
     }
 
-    #[cfg(all(unix, feature = "tasks"))]
+    #[cfg(all(unix, feature = "tasks", feature = "websocket-experimental"))]
     #[test]
     fn websocket_async_public_tasks_get_uses_negotiated_extension_transport() {
         run_test(|| async {
@@ -14792,7 +15587,7 @@ mod tests {
         });
     }
 
-    #[cfg(all(unix, feature = "tasks"))]
+    #[cfg(all(unix, feature = "tasks", feature = "websocket-experimental"))]
     #[test]
     fn websocket_async_tasks_get_task_id_mismatch_is_terminal_and_cannot_be_reused() {
         run_test(|| async {
@@ -14848,6 +15643,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_public_client_uses_real_split_transport_and_retains_result_source() {
         run_test(|| async {
@@ -14963,14 +15759,16 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     #[test]
     fn websocket_async_auto_wrong_error_never_attempts_a_fresh_legacy_transport() {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
-            let (client_io, server_io) = async_websocket_pair();
+            let (client_io, server_io, close_frames) = close_counting_async_websocket_pair();
             let contacts = Arc::new(AtomicUsize::new(0));
             let peer_contacts = Arc::clone(&contacts);
+            let close_observed = Arc::new(AtomicBool::new(false));
+            let peer_close_observed = Arc::clone(&close_observed);
             let mut peer = cx
                 .spawn(move |peer_cx| async move {
                     let mut server = AsyncWsServerTransport::from_upgraded(server_io);
@@ -14990,15 +15788,18 @@ mod tests {
                                 Some(discover.id.expect("discovery has an ID")),
                                 JsonRpcError {
                                     code: (-32600).into(),
-                                    message: "Method not found".to_owned(),
+                                    message: "peer-specific refusal text".to_owned(),
                                     data: None,
                                 },
                             )),
                         )
                         .await
                         .expect("peer refuses discovery");
-                    let _ = server.recv(&peer_cx).await;
-                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                    peer_close_observed.store(true, Ordering::Release);
                 })
                 .expect("spawn refusing WebSocket peer");
 
@@ -15024,39 +15825,111 @@ mod tests {
             assert_eq!(error.code, McpErrorCode::InvalidRequest);
             assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
             assert_eq!(contacts.load(Ordering::SeqCst), 1);
+            assert!(matches!(peer.join(&cx).await, Ok(())));
             assert!(
-                !peer.is_finished(),
-                "wrong discovery error must leave a peer-held connection without a second frame"
+                close_observed.load(Ordering::Acquire),
+                "the refused transport is closed without creating a fallback transport"
             );
-            peer.abort();
-            let _ = peer.join(&cx).await;
+            assert_eq!(
+                close_frames.load(Ordering::SeqCst),
+                1,
+                "terminal refusal elects exactly one shared split close"
+            );
         });
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     #[test]
     fn websocket_async_auto_uses_one_fresh_legacy_transport_after_recognized_refusal() {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
-            let (first_client_io, mut first_peer_io) = async_websocket_pair();
-            write_server_text_frame(
-                &mut first_peer_io,
-                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"peer-specific refusal text"}}"#,
-            )
-            .await;
-            let (legacy_client_io, mut legacy_peer_io) = async_websocket_pair();
-            write_server_text_frame(
-                &mut legacy_peer_io,
-                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fresh-legacy","version":"1.0"}}}"#,
-            )
-            .await;
+            let (first_client_io, first_server_io, first_close_frames) =
+                close_counting_async_websocket_pair();
+            let (legacy_client_io, legacy_server_io, legacy_close_frames) =
+                close_counting_async_websocket_pair();
+            let first_contacts = Arc::new(AtomicUsize::new(0));
+            let first_contacts_for_peer = Arc::clone(&first_contacts);
+            let mut first_peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(first_server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives Auto discovery")
+                    else {
+                        panic!("Auto must send discovery first");
+                    };
+                    first_contacts_for_peer.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(discover.method, SERVER_DISCOVER_METHOD);
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::error(
+                                Some(discover.id.expect("discovery has an ID")),
+                                JsonRpcError {
+                                    code: (-32601).into(),
+                                    message: "peer-specific refusal text".to_owned(),
+                                    data: None,
+                                },
+                            )),
+                        )
+                        .await
+                        .expect("peer refuses discovery");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn recognized-refusal WebSocket peer");
+            let legacy_contacts = Arc::new(AtomicUsize::new(0));
+            let legacy_contacts_for_peer = Arc::clone(&legacy_contacts);
+            let mut legacy_peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(legacy_server_io);
+                    let JsonRpcMessage::Request(initialize) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("fresh peer receives exact legacy initialize")
+                    else {
+                        panic!("fresh connection must begin with exact legacy initialize");
+                    };
+                    legacy_contacts_for_peer.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(initialize.method, "initialize");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initialize.id.expect("initialize has an ID"),
+                                serde_json::json!({
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {},
+                                    "serverInfo": {"name": "fresh-legacy", "version": "1.0"}
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("fresh peer initializes exact legacy");
+                    let JsonRpcMessage::Request(initialized) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("fresh peer receives initialized notification")
+                    else {
+                        panic!("exact legacy connection must send initialized notification");
+                    };
+                    assert_eq!(initialized.method, "notifications/initialized");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn fresh exact-legacy WebSocket peer");
             let factory_calls = Arc::new(AtomicUsize::new(0));
             let factory_calls_for_factory = Arc::clone(&factory_calls);
             let mut transports = VecDeque::from([
                 AsyncWsClientTransport::from_upgraded(first_client_io),
                 AsyncWsClientTransport::from_upgraded(legacy_client_io),
             ]);
-            let client = WebSocketClient::connect_auto_with_cx(
+            let mut client = WebSocketClient::connect_auto_with_cx(
                 &cx,
                 async_websocket_client_info(),
                 ClientCapabilities::default(),
@@ -15076,9 +15949,181 @@ mod tests {
             .expect("recognized refusal retries only on a fresh exact legacy transport");
             assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
             assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(first_contacts.load(Ordering::SeqCst), 1);
+            assert_eq!(legacy_contacts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                first_close_frames.load(Ordering::SeqCst),
+                1,
+                "recognized refusal closes the first transport before fresh legacy admission"
+            );
+            client
+                .close(&cx)
+                .await
+                .expect("close fresh exact legacy client");
+            assert!(matches!(first_peer.join(&cx).await, Ok(())));
+            assert!(matches!(legacy_peer.join(&cx).await, Ok(())));
+            assert_eq!(
+                legacy_close_frames.load(Ordering::SeqCst),
+                1,
+                "the admitted fresh transport has one final split close"
+            );
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_failed_discovery_validation_closes_both_halves_and_keeps_error() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io, close_frames) = close_counting_async_websocket_pair();
+            let contacts = Arc::new(AtomicUsize::new(0));
+            let peer_contacts = Arc::clone(&contacts);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives Modern discovery")
+                    else {
+                        panic!("Modern connection must begin with discovery");
+                    };
+                    peer_contacts.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(discover.method, SERVER_DISCOVER_METHOD);
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery has an ID"),
+                                serde_json::json!({
+                                    "resultType": "complete",
+                                    "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                                    "capabilities": {},
+                                    "_meta": {},
+                                    "ttlMs": 0,
+                                    "cacheScope": "private"
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer returns a structurally incomplete discovery result");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn incomplete-discovery WebSocket peer");
+
+            let error = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect_err("incomplete discovery remains a handshake error");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "Modern WebSocket discovery response has no server identity"
+            );
+            assert_eq!(contacts.load(Ordering::SeqCst), 1);
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+            assert_eq!(
+                close_frames.load(Ordering::SeqCst),
+                1,
+                "discovery validation failure elects exactly one shared split close"
+            );
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_handshake_wire_failure_closes_each_split_half_once() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io, close_frames) = close_counting_async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives discovery before wire failure")
+                    else {
+                        panic!("Modern connection must begin with discovery");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "tools/list",
+                                Some(serde_json::json!({})),
+                                discover.id.expect("discovery has an ID"),
+                            )),
+                        )
+                        .await
+                        .expect("peer emits an invalid handshake envelope");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn wire-failure WebSocket peer");
+
+            let error = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect_err("a non-response handshake envelope is terminal");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "WebSocket handshake received a non-response frame"
+            );
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+            assert_eq!(
+                close_frames.load(Ordering::SeqCst),
+                1,
+                "wire failure elects exactly one shared split close"
+            );
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_session_admission_rejection_closes_each_split_half_once() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, _peer_io, close_frames) = close_counting_async_websocket_pair();
+            let (mut receiver, mut sender) =
+                AsyncWsClientTransport::from_upgraded(client_io).into_split();
+
+            let error = admit_websocket_session_or_close(
+                &mut receiver,
+                &mut sender,
+                &cx,
+                Err(McpError::internal_error(
+                    "injected session admission rejection",
+                )),
+            )
+            .await
+            .expect_err("the production session-admission seam preserves its error");
+            assert_eq!(error.message, "injected session admission rejection");
+            assert_eq!(
+                close_frames.load(Ordering::SeqCst),
+                1,
+                "session rejection elects exactly one shared split close"
+            );
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_cancelled_connect_performs_no_transport_contact() {
         run_test(|| async {
@@ -15112,7 +16157,7 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     #[test]
     fn websocket_async_exact_legacy_completion_is_isolated_and_callable() {
         run_test(|| async {
@@ -15242,7 +16287,7 @@ mod tests {
         });
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     #[test]
     fn websocket_async_exact_legacy_reverse_handlers_are_caller_cx_owned() {
         run_test(|| async {
@@ -15395,6 +16440,590 @@ mod tests {
         });
     }
 
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_async_legacy_reverse_callback_matching_cancellation_wakes_and_reuses_reader() {
+        run_test(|| async {
+            struct CallbackDrop(Arc<AtomicBool>);
+
+            impl Drop for CallbackDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let callback_started = Arc::new(AtomicBool::new(false));
+            let peer_callback_started = Arc::clone(&callback_started);
+            let callback_dropped = Arc::new(AtomicBool::new(false));
+            let callback_mutated = Arc::new(AtomicBool::new(false));
+            let callback_cx = Arc::new(Mutex::new(None::<Cx>));
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(initialize) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives exact initialize")
+                    else {
+                        panic!("exact legacy must initialize first");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initialize.id.expect("initialize has an ID"),
+                                serde_json::json!({
+                                    "protocolVersion": "2024-11-05",
+                                    "capabilities": {},
+                                    "serverInfo": {"name": "callback-cancel", "version": "1.0"}
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer replies to initialize");
+                    let _ = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives initialized notification");
+                    let JsonRpcMessage::Request(first) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives first completion")
+                    else {
+                        panic!("expected first completion request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "sampling/createMessage",
+                                Some(serde_json::json!({"messages": [], "maxTokens": 3})),
+                                RequestId::Number(41),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends parked callback");
+                    for _ in 0..1_024 {
+                        if peer_callback_started.load(Ordering::Acquire) {
+                            break;
+                        }
+                        asupersync::runtime::yield_now().await;
+                    }
+                    assert!(peer_callback_started.load(Ordering::Acquire));
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                "notifications/cancelled",
+                                Some(serde_json::json!({"requestId": 41})),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends matching callback cancellation");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                first.id.expect("first completion ID"),
+                                serde_json::json!({"completion": {"values": ["one"], "total": 1, "hasMore": false}}),
+                            )),
+                        )
+                        .await
+                        .expect("peer answers first completion without callback response");
+                    let JsonRpcMessage::Request(second) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives reusable follow-up completion")
+                    else {
+                        panic!("cancelled callback must not emit a late response frame");
+                    };
+                    assert_eq!(second.method, "completion/complete");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                second.id.expect("follow-up completion ID"),
+                                serde_json::json!({"completion": {"values": ["two"], "total": 1, "hasMore": false}}),
+                            )),
+                        )
+                        .await
+                        .expect("peer answers follow-up completion");
+                })
+                .expect("spawn matching-cancellation peer");
+
+            let (_park_sender, park_receiver) = oneshot::channel::<()>();
+            let parked_receiver = Arc::new(Mutex::new(Some(park_receiver)));
+            let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+                let callback_started = Arc::clone(&callback_started);
+                let callback_dropped = Arc::clone(&callback_dropped);
+                let callback_mutated = Arc::clone(&callback_mutated);
+                let callback_cx = Arc::clone(&callback_cx);
+                let parked_receiver = Arc::clone(&parked_receiver);
+                move |handler_cx, _cancellation, _params| {
+                    let receiver = parked_receiver
+                        .lock()
+                        .expect("callback receiver lock")
+                        .take()
+                        .expect("one callback receiver");
+                    let callback_started = Arc::clone(&callback_started);
+                    let callback_dropped = Arc::clone(&callback_dropped);
+                    let callback_mutated = Arc::clone(&callback_mutated);
+                    let callback_cx = Arc::clone(&callback_cx);
+                    Box::pin(async move {
+                        let _dropped = CallbackDrop(callback_dropped);
+                        callback_started.store(true, Ordering::Release);
+                        *callback_cx.lock().expect("callback Cx lock") = Some(handler_cx.clone());
+                        receiver
+                            .recv(handler_cx)
+                            .await
+                            .map_err(|_| McpError::request_cancelled())?;
+                        handler_cx
+                            .checkpoint()
+                            .map_err(|_| McpError::request_cancelled())?;
+                        callback_mutated.store(true, Ordering::Release);
+                        Ok(CreateMessageResult::text("late", "cancelled"))
+                    })
+                }
+            });
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("legacy callback client connects");
+            let completion = CompletionParams {
+                reference: CompletionReference::Prompt {
+                    name: "deploy".to_owned(),
+                },
+                argument: CompletionArgument {
+                    name: "environment".to_owned(),
+                    value: "sta".to_owned(),
+                },
+                context: None,
+            };
+            client
+                .complete(&cx, completion.clone())
+                .await
+                .expect("matching cancellation leaves the owner request readable");
+            for _ in 0..1_024 {
+                if callback_dropped.load(Ordering::Acquire) {
+                    break;
+                }
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(callback_dropped.load(Ordering::Acquire));
+            assert!(
+                callback_cx
+                    .lock()
+                    .expect("callback Cx lock")
+                    .as_ref()
+                    .is_some_and(|callback_cx| callback_cx.checkpoint().is_err()),
+                "aborting the retained callback must wake and cancel its task Cx"
+            );
+            assert!(
+                !callback_mutated.load(Ordering::Acquire),
+                "a cancelled callback cannot mutate after its parked await"
+            );
+            client
+                .complete(&cx, completion)
+                .await
+                .expect("cancelled callback leaves the sole reader reusable");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+            client.close(&cx).await.expect("close callback client");
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_async_legacy_reverse_callback_foreign_cancellation_emits_one_response() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let callback_started = Arc::new(AtomicBool::new(false));
+            let foreign_cancellation_sent = Arc::new(AtomicBool::new(false));
+            let peer_callback_started = Arc::clone(&callback_started);
+            let peer_foreign_cancellation_sent = Arc::clone(&foreign_cancellation_sent);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(initialize) = server.recv(&peer_cx).await.expect("initialize") else { panic!("expected initialize"); };
+                    server.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(initialize.id.expect("initialize ID"), serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"foreign-cancel","version":"1.0"}})))).await.expect("initialize response");
+                    let _ = server.recv(&peer_cx).await.expect("initialized");
+                    let JsonRpcMessage::Request(completion) = server.recv(&peer_cx).await.expect("completion") else { panic!("expected completion"); };
+                    server.send(&peer_cx, &JsonRpcMessage::Request(JsonRpcRequest::new("sampling/createMessage", Some(serde_json::json!({"messages":[],"maxTokens":3})), RequestId::Number(41)))).await.expect("callback request");
+                    for _ in 0..1_024 {
+                        if peer_callback_started.load(Ordering::Acquire) {
+                            break;
+                        }
+                        asupersync::runtime::yield_now().await;
+                    }
+                    assert!(peer_callback_started.load(Ordering::Acquire));
+                    server.send(&peer_cx, &JsonRpcMessage::Request(JsonRpcRequest::notification("notifications/cancelled", Some(serde_json::json!({"requestId":42}))))).await.expect("foreign cancellation");
+                    peer_foreign_cancellation_sent.store(true, Ordering::Release);
+                    let JsonRpcMessage::Response(callback) = server.recv(&peer_cx).await.expect("one callback response") else { panic!("foreign cancellation must not suppress callback response"); };
+                    assert!(callback.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(41))));
+                    server.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(completion.id.expect("completion ID"), serde_json::json!({"completion":{"values":["foreign"],"total":1,"hasMore":false}})))).await.expect("completion response");
+                })
+                .expect("spawn foreign-cancellation peer");
+
+            let (park_sender, park_receiver) = oneshot::channel::<()>();
+            let parked_receiver = Arc::new(Mutex::new(Some(park_receiver)));
+            let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+                let callback_started = Arc::clone(&callback_started);
+                let parked_receiver = Arc::clone(&parked_receiver);
+                move |handler_cx, cancellation, _params| {
+                    let receiver = parked_receiver
+                        .lock()
+                        .expect("callback receiver lock")
+                        .take()
+                        .expect("one callback receiver");
+                    let callback_started = Arc::clone(&callback_started);
+                    Box::pin(async move {
+                        callback_started.store(true, Ordering::Release);
+                        receiver
+                            .recv(handler_cx)
+                            .await
+                            .map_err(|_| McpError::request_cancelled())?;
+                        cancellation.checkpoint()?;
+                        Ok(CreateMessageResult::text("handled", "foreign-cancel"))
+                    })
+                }
+            });
+            let release = cx
+                .spawn({
+                    let callback_started = Arc::clone(&callback_started);
+                    let foreign_cancellation_sent = Arc::clone(&foreign_cancellation_sent);
+                    move |release_cx| async move {
+                        for _ in 0..1_024 {
+                            if callback_started.load(Ordering::Acquire)
+                                && foreign_cancellation_sent.load(Ordering::Acquire)
+                            {
+                                break;
+                            }
+                            asupersync::runtime::yield_now().await;
+                        }
+                        assert!(callback_started.load(Ordering::Acquire));
+                        assert!(foreign_cancellation_sent.load(Ordering::Acquire));
+                        park_sender.send(&release_cx, ()).expect("release callback");
+                    }
+                })
+                .expect("spawn callback releaser");
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("legacy callback client connects");
+            client
+                .complete(
+                    &cx,
+                    CompletionParams {
+                        reference: CompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: CompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
+                .await
+                .expect("foreign cancellation is inert to the live callback and owner request");
+            assert!(matches!(release.join(&cx).await, Ok(())));
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+            client
+                .close(&cx)
+                .await
+                .expect("close foreign-cancellation client");
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_async_legacy_reverse_callback_malformed_cancellation_is_inert() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let callback_started = Arc::new(AtomicBool::new(false));
+            let malformed_sent = Arc::new(AtomicBool::new(false));
+            let peer_callback_started = Arc::clone(&callback_started);
+            let peer_malformed_sent = Arc::clone(&malformed_sent);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(initialize) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("initialize")
+                    else {
+                        panic!("expected initialize");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initialize.id.expect("initialize ID"),
+                                serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"malformed-cancel","version":"1.0"}}),
+                            )),
+                        )
+                        .await
+                        .expect("initialize response");
+                    let _ = server.recv(&peer_cx).await.expect("initialized");
+                    let JsonRpcMessage::Request(first) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("first completion")
+                    else {
+                        panic!("expected first completion");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "sampling/createMessage",
+                                Some(serde_json::json!({"messages":[],"maxTokens":3})),
+                                RequestId::Number(41),
+                            )),
+                        )
+                        .await
+                        .expect("callback request");
+                    for _ in 0..1_024 {
+                        if peer_callback_started.load(Ordering::Acquire) {
+                            break;
+                        }
+                        asupersync::runtime::yield_now().await;
+                    }
+                    assert!(peer_callback_started.load(Ordering::Acquire));
+                    // `requestId: null` is the same control envelope as the
+                    // positive case, but fails exact legacy cancellation
+                    // parameter admission and must be inert.
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                "notifications/cancelled",
+                                Some(serde_json::json!({"requestId":null})),
+                            )),
+                        )
+                        .await
+                        .expect("malformed cancellation");
+                    peer_malformed_sent.store(true, Ordering::Release);
+                    let JsonRpcMessage::Response(callback) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("one callback response")
+                    else {
+                        panic!("malformed cancellation must not emit a control response");
+                    };
+                    assert!(callback.id.as_ref().is_some_and(|id| {
+                        id.correlates_with(&RequestId::Number(41))
+                    }));
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                first.id.expect("first completion ID"),
+                                serde_json::json!({"completion":{"values":["malformed"],"total":1,"hasMore":false}}),
+                            )),
+                        )
+                        .await
+                        .expect("first completion response");
+                    let JsonRpcMessage::Request(second) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("follow-up completion")
+                    else {
+                        panic!("malformed cancellation must leave the client reusable");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                second.id.expect("follow-up completion ID"),
+                                serde_json::json!({"completion":{"values":["reuse"],"total":1,"hasMore":false}}),
+                            )),
+                        )
+                        .await
+                        .expect("follow-up completion response");
+                })
+                .expect("spawn malformed-cancellation peer");
+
+            let (release_sender, release_receiver) = oneshot::channel::<()>();
+            let receiver = Arc::new(Mutex::new(Some(release_receiver)));
+            let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+                let callback_started = Arc::clone(&callback_started);
+                let receiver = Arc::clone(&receiver);
+                move |handler_cx, cancellation, _params| {
+                    let receiver = receiver
+                        .lock()
+                        .expect("callback receiver lock")
+                        .take()
+                        .expect("one callback receiver");
+                    let callback_started = Arc::clone(&callback_started);
+                    Box::pin(async move {
+                        callback_started.store(true, Ordering::Release);
+                        receiver
+                            .recv(handler_cx)
+                            .await
+                            .map_err(|_| McpError::request_cancelled())?;
+                        cancellation.checkpoint()?;
+                        Ok(CreateMessageResult::text("handled", "malformed-cancel"))
+                    })
+                }
+            });
+            let mut release = cx
+                .spawn({
+                    let callback_started = Arc::clone(&callback_started);
+                    let malformed_sent = Arc::clone(&malformed_sent);
+                    move |release_cx| async move {
+                        for _ in 0..1_024 {
+                            if callback_started.load(Ordering::Acquire)
+                                && malformed_sent.load(Ordering::Acquire)
+                            {
+                                break;
+                            }
+                            asupersync::runtime::yield_now().await;
+                        }
+                        assert!(callback_started.load(Ordering::Acquire));
+                        assert!(malformed_sent.load(Ordering::Acquire));
+                        release_sender
+                            .send(&release_cx, ())
+                            .expect("release callback after malformed control");
+                    }
+                })
+                .expect("spawn malformed callback releaser");
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("legacy callback client connects");
+            let completion = CompletionParams {
+                reference: CompletionReference::Prompt {
+                    name: "deploy".to_owned(),
+                },
+                argument: CompletionArgument {
+                    name: "environment".to_owned(),
+                    value: "sta".to_owned(),
+                },
+                context: None,
+            };
+            client
+                .complete(&cx, completion.clone())
+                .await
+                .expect("malformed cancellation leaves callback and owner live");
+            client
+                .complete(&cx, completion)
+                .await
+                .expect("malformed cancellation leaves reader reusable");
+            assert!(matches!(release.join(&cx).await, Ok(())));
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+            client
+                .close(&cx)
+                .await
+                .expect("close malformed-cancellation client");
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_async_legacy_reverse_callback_panic_is_terminal() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let callback_started = Arc::new(AtomicBool::new(false));
+            let peer_callback_started = Arc::clone(&callback_started);
+            let panic_terminal_observed = Arc::new(AtomicBool::new(false));
+            let peer_panic_terminal_observed = Arc::clone(&panic_terminal_observed);
+            let mut peer = cx.spawn(move |peer_cx| async move {
+                let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                let JsonRpcMessage::Request(initialize) = server.recv(&peer_cx).await.expect("initialize") else { panic!("expected initialize"); };
+                server.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(initialize.id.expect("initialize ID"), serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"callback-panic","version":"1.0"}})))).await.expect("initialize response");
+                let _ = server.recv(&peer_cx).await.expect("initialized");
+                let JsonRpcMessage::Request(completion) = server.recv(&peer_cx).await.expect("completion") else { panic!("expected completion"); };
+                server.send(&peer_cx, &JsonRpcMessage::Request(JsonRpcRequest::new("sampling/createMessage", Some(serde_json::json!({"messages":[],"maxTokens":3})), RequestId::Number(41)))).await.expect("callback request");
+                for _ in 0..1_024 {
+                    if peer_callback_started.load(Ordering::Acquire) {
+                        break;
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                assert!(peer_callback_started.load(Ordering::Acquire));
+                let _ = completion;
+                for _ in 0..1_024 {
+                    if peer_panic_terminal_observed.load(Ordering::Acquire) {
+                        break;
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                assert!(
+                    peer_panic_terminal_observed.load(Ordering::Acquire),
+                    "the client must surface callback panic without another peer frame"
+                );
+            }).expect("spawn panic peer");
+            let handlers = ReverseRequestHandlers::new().with_sampling_create_message({
+                let callback_started = Arc::clone(&callback_started);
+                move |_handler_cx, _cancellation, _params| {
+                    let callback_started = Arc::clone(&callback_started);
+                    Box::pin(async move {
+                        callback_started.store(true, Ordering::Release);
+                        panic!("websocket reverse callback panic canary");
+                        #[allow(unreachable_code)]
+                        Ok(CreateMessageResult::text("unreachable", "panic"))
+                    })
+                }
+            });
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("legacy callback client connects");
+            let completion = CompletionParams {
+                reference: CompletionReference::Prompt {
+                    name: "deploy".to_owned(),
+                },
+                argument: CompletionArgument {
+                    name: "environment".to_owned(),
+                    value: "sta".to_owned(),
+                },
+                context: None,
+            };
+            let error = client
+                .complete(&cx, completion.clone())
+                .await
+                .expect_err("callback panic is connection-terminal");
+            assert_eq!(error.message, "WebSocket reverse callback task panicked");
+            panic_terminal_observed.store(true, Ordering::Release);
+            let after = client
+                .complete(&cx, completion)
+                .await
+                .expect_err("terminal callback panic blocks reuse");
+            assert_eq!(after.message, "WebSocket client is closed");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_modern_rejects_exact_legacy_reverse_rpc() {
         run_test(|| async {

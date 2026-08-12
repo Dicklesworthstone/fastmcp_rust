@@ -145,6 +145,20 @@ pub fn probe() {
         absent_feature_diagnostic: Some("McpAppsClientSettings"),
     },
     DownstreamFeatureSymbolProbe {
+        name: "auto-server-policy-reset-escape",
+        features: &["legacy-2024-11-05"],
+        source: r#"
+use mcp::{ProtocolPolicy, auto};
+
+pub fn probe() {
+    let mut builder = auto::server_builder("auto", "1.0");
+    let _ = builder.try_set_protocol_policy(ProtocolPolicy::ModernOnly);
+}
+"#,
+        should_compile: false,
+        absent_feature_diagnostic: Some("try_set_protocol_policy"),
+    },
+    DownstreamFeatureSymbolProbe {
         name: "apps-absent-exact-legacy-namespace",
         features: &["apps", "legacy-2024-11-05"],
         source: r"
@@ -341,7 +355,6 @@ use mcp::{
     Cx,
     McpError,
     McpResult,
-    client::websocket_experimental,
     prelude,
     server,
     transport,
@@ -359,7 +372,7 @@ async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
     let modern_transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9001/mcp")
         .await
         .map_err(|error| McpError::internal_error(error.to_string()))?;
-    let modern_client = mcp::modern::ClientBuilder::new()
+    let modern_client: mcp::modern::WebSocketClient<_> = mcp::modern::ClientBuilder::new()
         .connect_websocket_with_cx(cx, modern_transport)
         .await?;
     let _ = modern_client.session();
@@ -375,16 +388,66 @@ async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
 pub fn probe<IO>() {
     let _: Option<AsyncWsClientTransport<IO>> = None;
     let _: Option<AsyncWsServerTransport<()>> = None;
-    let _: Option<websocket_experimental::AsyncWsClientTransport<IO>> = None;
     let _: Option<server::AsyncWsServerTransport<()>> = None;
     let _: Option<transport::websocket::AsyncWsClientTransport<IO>> = None;
     let _: Option<transport::websocket::AsyncWsServerTransport<()>> = None;
     let _: Option<transport::websocket::WebSocketListener> = None;
     let _: Option<transport::websocket::WebSocketUpgradeAdmission> = None;
-    let _: Option<prelude::AsyncWsClientTransport<IO>> = None;
-    let _: Option<prelude::AsyncWsServerTransport<()>> = None;
+    let _: Option<prelude::WebSocketResponse> = None;
+    let _: Option<prelude::BoundWebSocketServer> = None;
+    let _: Option<prelude::WebSocketServerShutdown> = None;
     let _ = mcp::modern::Server::bind_websocket;
     let _ = composes_actual_async_websocket_client;
+}
+"#,
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-legacy-wrapper-present",
+        features: &["websocket-experimental", "legacy-2024-11-05"],
+        source: r#"
+use mcp::{AsyncWsClientTransport, Cx, McpError, McpResult};
+
+async fn connects_only_through_legacy_builder(cx: &Cx) -> McpResult<()> {
+    let transport = AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9002/mcp")
+        .await
+        .map_err(|error| McpError::internal_error(error.to_string()))?;
+    let client: mcp::legacy_2024::WebSocketClient<_> =
+        mcp::legacy_2024::ClientBuilder::new()
+            .connect_websocket_with_cx(cx, transport)
+            .await?;
+    let _ = client.session();
+    Ok(())
+}
+
+pub fn probe() {
+    let _ = connects_only_through_legacy_builder;
+}
+"#,
+        should_compile: true,
+        absent_feature_diagnostic: None,
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-auto-wrapper-present",
+        features: &["websocket-experimental", "legacy-2024-11-05"],
+        source: r#"
+use mcp::{AsyncWsClientTransport, Cx, McpError, McpResult};
+
+async fn connects_only_through_auto_factory(cx: &Cx) -> McpResult<()> {
+    let client: mcp::auto::WebSocketClient<_> = mcp::auto::ClientBuilder::new()
+        .connect_websocket_auto_with_cx(cx, move |_| async move {
+            AsyncWsClientTransport::connect(cx, "ws://127.0.0.1:9003/mcp")
+                .await
+                .map_err(|error| McpError::internal_error(error.to_string()))
+        })
+        .await?;
+    let _ = client.session();
+    Ok(())
+}
+
+pub fn probe() {
+    let _ = connects_only_through_auto_factory;
 }
 "#,
         should_compile: true,
@@ -481,6 +544,38 @@ pub fn probe<IO>() {
         absent_feature_diagnostic: Some("AsyncWsClientTransport"),
     },
     DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-modern-generic-connect-escape",
+        features: &["websocket-experimental"],
+        source: r"
+use mcp::modern::WebSocketClient;
+
+pub fn probe<IO>()
+where
+    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+{
+    let _ = WebSocketClient::<IO>::connect_with_cx;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_with_cx"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-client-generic-connect-escape",
+        features: &["websocket-experimental"],
+        source: r"
+use mcp::client::WebSocketClient;
+
+pub fn probe<IO>()
+where
+    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+{
+    let _ = WebSocketClient::<IO>::connect_with_cx;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("WebSocketClient"),
+    },
+    DownstreamFeatureSymbolProbe {
         name: "websocket-experimental-root-old-sync-builder-escape",
         features: &["websocket-experimental"],
         source: r"
@@ -546,6 +641,22 @@ pub fn probe<IO>() {
         absent_feature_diagnostic: Some("AsyncWsClientTransport"),
     },
     DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-legacy-generic-connect-escape",
+        features: &["websocket-experimental", "legacy-2024-11-05"],
+        source: r"
+use mcp::legacy_2024::WebSocketClient;
+
+pub fn probe<IO>()
+where
+    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+{
+    let _ = WebSocketClient::<IO>::connect_with_cx;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_with_cx"),
+    },
+    DownstreamFeatureSymbolProbe {
         name: "websocket-experimental-auto-era-escape",
         features: &["websocket-experimental", "legacy-2024-11-05"],
         source: r"
@@ -557,6 +668,35 @@ pub fn probe<IO>() {
 ",
         should_compile: false,
         absent_feature_diagnostic: Some("AsyncWsClientTransport"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-auto-generic-connect-escape",
+        features: &["websocket-experimental", "legacy-2024-11-05"],
+        source: r"
+use mcp::auto::WebSocketClient;
+
+pub fn probe<IO>()
+where
+    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+{
+    let _ = WebSocketClient::<IO>::connect_with_cx;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_with_cx"),
+    },
+    DownstreamFeatureSymbolProbe {
+        name: "websocket-experimental-auto-single-transport-escape",
+        features: &["websocket-experimental", "legacy-2024-11-05"],
+        source: r"
+use mcp::auto::ClientBuilder;
+
+pub fn probe() {
+    let _ = ClientBuilder::connect_websocket_with_cx;
+}
+",
+        should_compile: false,
+        absent_feature_diagnostic: Some("connect_websocket_with_cx"),
     },
 ];
 
@@ -1359,8 +1499,8 @@ use mcp::{
     ClientHttpNegotiation, CompleteResult, ConfigLoader, Content, JsonSchema, McpConfig,
     McpResult, FinalRequestMeta, LegacySseHttpClient, ModernHttpClient, ModernHttpExecutor,
     ModernHttpRequest, MrtrExchangeRegistry, PromptHandler, PromptMessage, ProtocolPolicy,
-    ResourceHandler, Role, ServerConfig, ToolHandler, legacy_2024, modern, prompt, resource,
-    tool,
+    ResourceHandler, Role, ServerConfig, ToolHandler, auto, legacy_2024, modern, prompt,
+    resource, tool,
 };
 
 #[derive(JsonSchema)]
@@ -1446,6 +1586,7 @@ fn assert_generated_surface() -> McpResult<()> {
 }
 
 fn assert_renamed_facade_sealed_builders() {
+    let _: fn(auto::ServerBuilder) -> McpResult<auto::Server> = auto::ServerBuilder::try_build;
     let _: fn(modern::ServerBuilder) -> McpResult<modern::Server> =
         modern::ServerBuilder::try_build;
     let _: fn(legacy_2024::ServerBuilder) -> McpResult<legacy_2024::Server> =
@@ -1473,6 +1614,20 @@ fn assert_renamed_facade_sealed_builders() {
         .without_banner()
         .build();
     let _: modern::Server = modern_server;
+
+    let auto_server = auto::server_builder("auto-facade", "1.0")
+        .http_config(mcp::HttpServerConfig::new().mcp_path("/mcp"))
+        .without_stats()
+        .request_timeout(1)
+        .list_page_size(1)
+        .mask_error_details(true)
+        .strict_input_validation(true)
+        .resource_subscriptions()
+        .instructions("renamed facade auto server")
+        .without_banner()
+        .build();
+    assert_eq!(auto_server.protocol_policy(), auto::ProtocolPolicy::Auto);
+    let _: auto::Server = auto_server;
 
     let legacy_server = legacy_2024::server_builder("legacy-facade", "1.0")
         .without_stats()

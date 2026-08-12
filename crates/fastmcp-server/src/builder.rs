@@ -168,7 +168,8 @@ pub struct ServerBuilder {
     max_bidirectional_requests_per_connection: usize,
     /// Immutable protocol-era admission policy for live stdio/runtime connections.
     protocol_policy: ProtocolPolicy,
-    /// Reserved CLI launch policy, when one was selected before construction.
+    /// Reserved policy selected before construction by a launch setting or a
+    /// sealed embedding component.
     launch_protocol_policy: Option<ProtocolPolicy>,
     /// Immutable configuration for the live dual-era HTTP endpoint.
     http_config: HttpServerConfig,
@@ -213,17 +214,54 @@ impl ServerBuilder {
         )
     }
 
+    /// Creates a builder whose protocol policy is fixed by the embedding
+    /// component rather than the process launch environment.
+    ///
+    /// The selected policy is validated against the compiled feature set, but
+    /// this constructor deliberately does not read `FASTMCP_PROTOCOL_POLICY`.
+    /// It also reserves the selected policy, so a later
+    /// [`protocol_policy`](Self::protocol_policy) call validates its argument
+    /// without changing the fixed selection. This is intended for sealed
+    /// component facades that expose only one protocol era.
+    pub fn try_new_with_fixed_protocol_policy(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        policy: ProtocolPolicy,
+    ) -> Result<Self, ServerLaunchPolicyError> {
+        let policy = resolve_protocol_policy(Some(policy), legacy_protocol_is_available())?;
+        Ok(Self::with_protocol_policy(
+            name,
+            version,
+            policy,
+            Some(policy),
+        ))
+    }
+
     pub(crate) fn from_launch_protocol_policy(
         name: impl Into<String>,
         version: impl Into<String>,
         launch_protocol_policy: Result<Option<ProtocolPolicy>, ServerLaunchPolicyError>,
     ) -> Result<Self, ServerLaunchPolicyError> {
         let launch_protocol_policy = launch_protocol_policy?;
-        let console_config = ConsoleConfig::from_env();
-        let logging = LoggingConfig::from(&console_config);
         let protocol_policy =
             resolve_protocol_policy(launch_protocol_policy, legacy_protocol_is_available())?;
-        Ok(Self {
+        Ok(Self::with_protocol_policy(
+            name,
+            version,
+            protocol_policy,
+            launch_protocol_policy,
+        ))
+    }
+
+    fn with_protocol_policy(
+        name: impl Into<String>,
+        version: impl Into<String>,
+        protocol_policy: ProtocolPolicy,
+        launch_protocol_policy: Option<ProtocolPolicy>,
+    ) -> Self {
+        let console_config = ConsoleConfig::from_env();
+        let logging = LoggingConfig::from(&console_config);
+        Self {
             info: ServerInfo {
                 name: name.into(),
                 version: version.into(),
@@ -256,7 +294,7 @@ impl ServerBuilder {
             final_task_runtime: None,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
-        })
+        }
     }
 
     /// Sets the behavior when registering duplicate component names.
@@ -468,8 +506,8 @@ impl ServerBuilder {
     /// consuming the builder.
     ///
     /// A policy unavailable in the compiled feature set is rejected before
-    /// this builder is changed. A reserved launch policy still takes
-    /// precedence over an explicit builder selection.
+    /// this builder is changed. A reserved launch or component policy still
+    /// takes precedence over an explicit builder selection.
     pub fn try_set_protocol_policy(
         &mut self,
         policy: ProtocolPolicy,
@@ -3031,6 +3069,36 @@ mod tests {
         .expect("valid launch policy must build");
 
         assert_eq!(server.protocol_policy(), ProtocolPolicy::ModernOnly);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn fixed_policy_constructor_reserves_policy_against_later_setter() {
+        let server = ServerBuilder::try_new_with_fixed_protocol_policy(
+            "srv",
+            "1.0",
+            ProtocolPolicy::ModernOnly,
+        )
+        .expect("ModernOnly is available in every feature profile")
+        .protocol_policy(ProtocolPolicy::LegacyOnly)
+        .expect("the later policy is valid in this dual-era test build")
+        .try_build()
+        .expect("the fixed-policy builder remains buildable");
+
+        assert_eq!(
+            server.protocol_policy(),
+            ProtocolPolicy::ModernOnly,
+            "the fixed component policy must not be replaced by a later builder setter"
+        );
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    #[test]
+    fn fixed_policy_constructor_rejects_unavailable_policy_before_construction() {
+        assert!(matches!(
+            ServerBuilder::try_new_with_fixed_protocol_policy("srv", "1.0", ProtocolPolicy::Auto,),
+            Err(ServerLaunchPolicyError::FeatureUnavailable)
+        ));
     }
 
     #[test]

@@ -25,6 +25,7 @@
 //! ```
 
 use std::collections::HashMap;
+#[cfg(feature = "websocket-experimental")]
 use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
@@ -33,10 +34,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use asupersync::{
-    Cx,
-    io::{AsyncRead, AsyncWrite},
-};
+use asupersync::Cx;
+#[cfg(feature = "websocket-experimental")]
+use asupersync::io::{AsyncRead, AsyncWrite};
 use fastmcp_core::{McpError, McpResult, block_on};
 use fastmcp_protocol::extensions::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
@@ -45,17 +45,20 @@ use fastmcp_protocol::extensions::{
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use fastmcp_transport::StdioTransport;
+#[cfg(feature = "websocket-experimental")]
 use fastmcp_transport::websocket::AsyncWsClientTransport;
 
 #[cfg(all(test, unix, feature = "legacy-2024-11-05"))]
 use crate::ReverseRequestCancellation;
+#[cfg(feature = "websocket-experimental")]
+use crate::WebSocketClient;
 use crate::{
     AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationError, ClientProtocolPlan, ClientSession, HttpClient, HttpClientError,
     ModernHttpClientError, ProcessGroupAnchor, RequestTimeoutPolicy, ReverseRequestHandlers,
-    WebSocketClient, combine_operation_and_cleanup, combine_operation_with_cleanup,
-    is_cleanup_unverified, resolve_stdio_command, validate_protocol_plan_feature,
+    combine_operation_and_cleanup, combine_operation_with_cleanup, is_cleanup_unverified,
+    resolve_stdio_command, validate_protocol_plan_feature,
 };
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -722,6 +725,7 @@ impl ClientBuilder {
     /// The caller establishes the real `ws://` or `wss://` transport with
     /// [`AsyncWsClientTransport`] and passes its owned value here. This method
     /// never blocks, creates a runtime, or accepts synthetic transport halves.
+    #[cfg(feature = "websocket-experimental")]
     pub async fn connect_websocket_with_cx<IO>(
         self,
         cx: &Cx,
@@ -745,6 +749,7 @@ impl ClientBuilder {
 
     /// Negotiates Auto with a caller-owned factory that creates a fresh
     /// upgraded transport for the sole permitted exact-legacy retry.
+    #[cfg(feature = "websocket-experimental")]
     pub async fn connect_websocket_auto_with_cx<IO, F, Fut>(
         self,
         cx: &Cx,
@@ -772,6 +777,7 @@ impl ClientBuilder {
         .await
     }
 
+    #[cfg(feature = "websocket-experimental")]
     fn validate_websocket_configuration(&self) -> McpResult<()> {
         if matches!(self.protocol_plan.policy(), ProtocolPolicy::ModernOnly)
             && !self.reverse_request_handlers.is_empty()

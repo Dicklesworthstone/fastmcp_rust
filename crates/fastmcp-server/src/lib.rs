@@ -14300,6 +14300,7 @@ impl Server {
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
+                            transport_authorization.unwrap_or_default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
@@ -14307,8 +14308,8 @@ impl Server {
                             &inbound,
                             request,
                             None,
-                            None,
-                            None,
+                            auth_receipt,
+                            auth_custody_generation,
                             None,
                             request_cancellation,
                             None,
@@ -14708,6 +14709,7 @@ impl Server {
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
                             &modern_connection,
+                            transport_authorization.unwrap_or_default(),
                         );
                         let request_cancellation = McpRequestCancellation::new();
                         block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
@@ -14715,8 +14717,8 @@ impl Server {
                             &inbound,
                             request,
                             None,
-                            None,
-                            None,
+                            auth_receipt,
+                            auth_custody_generation,
                             None,
                             request_cancellation,
                             None,
@@ -18163,6 +18165,287 @@ mod lib_unit_tests {
         });
     }
 
+    #[cfg(all(feature = "websocket", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn live_websocket_auto_accepts_fresh_eras_and_fences_cross_era_traffic() {
+        run_live_http_test(|cx| async move {
+            use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+            fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+                haystack
+                    .windows(needle.len())
+                    .any(|window| window == needle)
+            }
+
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let listener = Server::new("live-websocket-auto-era-isolation", "1.0.0")
+                .protocol_policy(ProtocolPolicy::Auto)
+                .expect("Auto policy is available to the public WebSocket listener")
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&handler_calls),
+                })
+                .build()
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("Auto WebSocket bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("Auto WebSocket address failed: {error}"))?;
+            let scope = cx.scope();
+            let mut listener_task = cx
+                .spawn_in(&scope, move |listener_cx| async move {
+                    listener.serve(&listener_cx).await
+                })
+                .map_err(|error| format!("Auto WebSocket listener admission failed: {error}"))?;
+            let opening = concat!(
+                "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n",
+                "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+
+            // Positive: a final-era client selects final routing on its own
+            // fresh public WebSocket connection.
+            let (mut modern, modern_upgrade) =
+                websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !modern_upgrade.starts_with(b"HTTP/1.1 101") {
+                return Err("Auto WebSocket did not accept the final-era client".to_owned());
+            }
+            modern
+                .write_all(&masked_websocket_message(modern_discovery_request(7_201)))
+                .await
+                .map_err(|error| format!("Auto final-era discovery write failed: {error}"))?;
+            modern
+                .flush()
+                .await
+                .map_err(|error| format!("Auto final-era discovery flush failed: {error}"))?;
+            let mut modern_response = Vec::new();
+            while !contains_bytes(&modern_response, b"serverInfo") {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, modern.read(&mut chunk))
+                    .await
+                    .map_err(|_| "Auto final-era discovery timed out".to_owned())?
+                    .map_err(|error| format!("Auto final-era discovery read failed: {error}"))?;
+                if read == 0 {
+                    return Err("Auto final-era client closed before discovery response".to_owned());
+                }
+                modern_response.extend_from_slice(&chunk[..read]);
+            }
+            modern
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("Auto final-era close write failed: {error}"))?;
+            modern
+                .flush()
+                .await
+                .map_err(|error| format!("Auto final-era close flush failed: {error}"))?;
+            drop(modern);
+
+            // Positive: a separate exact-2024 peer may initialize, confirm
+            // initialization, and make an ordinary request on the same public
+            // listener without sharing the final-era connection namespace.
+            let (mut legacy, legacy_upgrade) =
+                websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !legacy_upgrade.starts_with(b"HTTP/1.1 101") {
+                return Err("Auto WebSocket did not accept the exact-2024 client".to_owned());
+            }
+            let legacy_initialize =
+                exact_legacy_initialize_request(7_202, serde_json::json!("1.0.0"));
+            let legacy_initialized = JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/initialized",
+                None,
+            ));
+            let legacy_list = JsonRpcMessage::Request(JsonRpcRequest::new(
+                "tools/list",
+                Some(serde_json::json!({})),
+                7_203_i64,
+            ));
+            let mut legacy_frames = masked_websocket_message(legacy_initialize);
+            legacy_frames.extend(masked_websocket_message(legacy_initialized));
+            legacy_frames.extend(masked_websocket_message(legacy_list));
+            legacy
+                .write_all(&legacy_frames)
+                .await
+                .map_err(|error| format!("Auto exact-2024 transcript write failed: {error}"))?;
+            legacy
+                .flush()
+                .await
+                .map_err(|error| format!("Auto exact-2024 transcript flush failed: {error}"))?;
+            let mut legacy_response = Vec::new();
+            while !(contains_bytes(&legacy_response, b"\"id\":7202")
+                && contains_bytes(&legacy_response, b"\"id\":7203")
+                && contains_bytes(&legacy_response, b"\"tools\""))
+            {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, legacy.read(&mut chunk))
+                    .await
+                    .map_err(|_| "Auto exact-2024 transcript timed out".to_owned())?
+                    .map_err(|error| format!("Auto exact-2024 transcript read failed: {error}"))?;
+                if read == 0 {
+                    return Err(
+                        "Auto exact-2024 client closed before its ordinary response".to_owned()
+                    );
+                }
+                legacy_response.extend_from_slice(&chunk[..read]);
+            }
+            legacy
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("Auto exact-2024 close write failed: {error}"))?;
+            legacy
+                .flush()
+                .await
+                .map_err(|error| format!("Auto exact-2024 close flush failed: {error}"))?;
+            drop(legacy);
+
+            // RH-5 neighbor: the only changed dimension is a legacy opening
+            // after this peer already selected final routing. Its refusal is
+            // connection-local and cannot poison a later independent final
+            // client on the listener.
+            let (mut mixed, mixed_upgrade) =
+                websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !mixed_upgrade.starts_with(b"HTTP/1.1 101") {
+                return Err("Auto WebSocket did not admit the cross-era probe peer".to_owned());
+            }
+            let mut mixed_frames = masked_websocket_message(modern_discovery_request(7_204));
+            mixed_frames.extend(masked_websocket_message(exact_legacy_initialize_request(
+                7_205,
+                serde_json::json!("1.0.0"),
+            )));
+            mixed
+                .write_all(&mixed_frames)
+                .await
+                .map_err(|error| format!("Auto cross-era frame write failed: {error}"))?;
+            mixed
+                .flush()
+                .await
+                .map_err(|error| format!("Auto cross-era frame flush failed: {error}"))?;
+            let mut mixed_response = Vec::new();
+            while !(contains_bytes(&mixed_response, b"\"id\":7205")
+                && contains_bytes(&mixed_response, b"\"error\""))
+            {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, mixed.read(&mut chunk))
+                    .await
+                    .map_err(|_| "Auto cross-era refusal timed out".to_owned())?
+                    .map_err(|error| format!("Auto cross-era refusal read failed: {error}"))?;
+                if read == 0 {
+                    return Err("Auto cross-era peer closed before its refusal".to_owned());
+                }
+                mixed_response.extend_from_slice(&chunk[..read]);
+            }
+
+            if handler_calls.load(Ordering::Acquire) != 0 {
+                return Err(
+                    "cross-era refusal dispatched a handler before the later modern request"
+                        .to_owned(),
+                );
+            }
+            let resumed_modern_request = JsonRpcMessage::Request(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "modern_http_auth_counter",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                7_206_i64,
+            ));
+            mixed
+                .write_all(&masked_websocket_message(resumed_modern_request))
+                .await
+                .map_err(|error| format!("Auto resumed modern frame write failed: {error}"))?;
+            mixed
+                .flush()
+                .await
+                .map_err(|error| format!("Auto resumed modern frame flush failed: {error}"))?;
+            while !(contains_bytes(&mixed_response, b"\"id\":7206")
+                && contains_bytes(&mixed_response, b"authenticated modern HTTP dispatch"))
+            {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, mixed.read(&mut chunk))
+                    .await
+                    .map_err(|_| "Auto resumed modern request timed out".to_owned())?
+                    .map_err(|error| format!("Auto resumed modern read failed: {error}"))?;
+                if read == 0 {
+                    return Err(
+                        "cross-era refusal closed the selected modern connection".to_owned()
+                    );
+                }
+                mixed_response.extend_from_slice(&chunk[..read]);
+            }
+            if handler_calls.load(Ordering::Acquire) != 1 {
+                return Err(
+                    "cross-era refusal changed the handler state seen by resumed modern traffic"
+                        .to_owned(),
+                );
+            }
+            mixed
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("Auto resumed modern close write failed: {error}"))?;
+            mixed
+                .flush()
+                .await
+                .map_err(|error| format!("Auto resumed modern close flush failed: {error}"))?;
+            drop(mixed);
+
+            let (mut isolated, isolated_upgrade) =
+                websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !isolated_upgrade.starts_with(b"HTTP/1.1 101") {
+                return Err("cross-era probe poisoned later listener admission".to_owned());
+            }
+            isolated
+                .write_all(&masked_websocket_message(modern_discovery_request(7_207)))
+                .await
+                .map_err(|error| format!("isolated final-era discovery write failed: {error}"))?;
+            isolated
+                .flush()
+                .await
+                .map_err(|error| format!("isolated final-era discovery flush failed: {error}"))?;
+            let mut isolated_response = Vec::new();
+            while !contains_bytes(&isolated_response, b"serverInfo") {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, isolated.read(&mut chunk))
+                    .await
+                    .map_err(|_| "isolated final-era discovery timed out".to_owned())?
+                    .map_err(|error| {
+                        format!("isolated final-era discovery read failed: {error}")
+                    })?;
+                if read == 0 {
+                    return Err("cross-era probe poisoned later final-era traffic".to_owned());
+                }
+                isolated_response.extend_from_slice(&chunk[..read]);
+            }
+            isolated
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| format!("isolated final-era close write failed: {error}"))?;
+            isolated
+                .flush()
+                .await
+                .map_err(|error| format!("isolated final-era close flush failed: {error}"))?;
+            drop(isolated);
+
+            cx.cancel_with(
+                CancelKind::User,
+                Some("Auto WebSocket era-isolation proof complete"),
+            );
+            let join_cx = Cx::for_testing();
+            let shutdown = listener_task
+                .join(&join_cx)
+                .await
+                .map_err(|error| format!("Auto WebSocket listener join failed: {error:?}"))?
+                .map_err(|error| format!("Auto WebSocket listener failed: {error}"))?;
+            if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                return Err("Auto WebSocket listener retained a child after era proof".to_owned());
+            }
+            Ok(())
+        });
+    }
+
     #[cfg(feature = "websocket")]
     #[test]
     fn live_websocket_connection_limit_rejects_before_child_and_releases_its_permit() {
@@ -18459,6 +18742,69 @@ mod lib_unit_tests {
                 .map_err(|error| format!("WebSocket auth listener failed: {error}"))?;
             if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
                 return Err("WebSocket authentication shutdown retained a child".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_nonquiescent_settle_for_drains_successful_retained_child_once() {
+        run_live_http_test(|cx| async move {
+            let shutdown_calls = Arc::new(AtomicUsize::new(0));
+            let shutdown_observer = Arc::clone(&shutdown_calls);
+            let server = Arc::new(
+                Server::new("websocket-settlement-success", "1.0.0")
+                    .on_shutdown(move || {
+                        shutdown_observer.fetch_add(1, Ordering::AcqRel);
+                    })
+                    .build(),
+            );
+            let release_child = Arc::new(AtomicBool::new(false));
+            let child_release = Arc::clone(&release_child);
+            let child_started = Arc::new(AtomicBool::new(false));
+            let child_started_observer = Arc::clone(&child_started);
+            let scope = cx.scope();
+            let child = cx
+                .spawn_in(&scope, move |_child_cx| async move {
+                    child_started_observer.store(true, Ordering::Release);
+                    while !child_release.load(Ordering::Acquire) {
+                        asupersync::runtime::yield_now().await;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| format!("successful retained child admission failed: {error}"))?;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !child_started.load(Ordering::Acquire) && Instant::now() < deadline {
+                asupersync::runtime::yield_now().await;
+            }
+            if !child_started.load(Ordering::Acquire) {
+                return Err("successful retained child did not begin".to_owned());
+            }
+            let mut retained = WebSocketNonquiescentShutdown {
+                children: WebSocketConnectionChildren {
+                    tasks: vec![child],
+                    terminal_failure: None,
+                },
+                server,
+                listener_error: None,
+                shutdown_complete: false,
+            };
+            if retained.remaining_connections() != 1 {
+                return Err("successful retained child was not caller-owned".to_owned());
+            }
+            release_child.store(true, Ordering::Release);
+            if !retained
+                .settle_for(Duration::from_secs(1))
+                .await
+                .map_err(|error| format!("successful retained child settlement failed: {error}"))?
+                || retained.remaining_connections() != 0
+                || shutdown_calls.load(Ordering::Acquire) != 1
+            {
+                return Err(
+                    "successful retained child did not drain to one cleanup-backed settlement"
+                        .to_owned(),
+                );
             }
             Ok(())
         });

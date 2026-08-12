@@ -290,11 +290,12 @@ impl ClientProtocolPlan {
 
     /// Creates an immutable protocol selection for one WebSocket connection.
     ///
-    /// A WebSocket is one long-lived bidirectional connection, so `Auto`
-    /// performs its final discovery probe and, only after a correlated
-    /// `MethodNotFound`, its exact-2024 initialization on this same owned
-    /// connection. The selected era is frozen before ordinary requests can be
-    /// issued.
+    /// A WebSocket is one long-lived bidirectional connection. `Auto` uses a
+    /// caller-owned fresh-transport factory: it performs final discovery on
+    /// the first connection and, only after a correlated `MethodNotFound`, may
+    /// establish one fresh connection for exact-2024 initialization. It never
+    /// replays initialization on the refused connection. The selected era is
+    /// frozen before ordinary requests can be issued.
     #[must_use]
     pub const fn websocket(policy: ProtocolPolicy) -> Self {
         Self::stdio(policy)

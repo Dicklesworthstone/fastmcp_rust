@@ -108,8 +108,7 @@ fn facade_final_input_response_surface_is_constructible() {
 #[test]
 fn facade_websocket_surface_is_namespace_consistent() {
     use fastmcp_rust::{
-        AsyncWsClientTransport, AsyncWsServerTransport, Cx, McpResult,
-        client::websocket_experimental, prelude, server, transport,
+        AsyncWsClientTransport, AsyncWsServerTransport, Cx, McpResult, prelude, server, transport,
     };
 
     async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
@@ -167,13 +166,13 @@ fn facade_websocket_surface_is_namespace_consistent() {
     fn exposes_async_websocket_types<IO>() {
         let _: Option<AsyncWsClientTransport<IO>> = None;
         let _: Option<AsyncWsServerTransport<()>> = None;
-        let _: Option<websocket_experimental::AsyncWsClientTransport<()>> = None;
         let _: Option<server::BoundWebSocketServer> = None;
         let _: Option<server::WebSocketServerShutdown> = None;
         let _: Option<transport::websocket::WebSocketListener> = None;
         let _: Option<transport::websocket::WebSocketUpgradeAdmission> = None;
-        let _: Option<prelude::AsyncWsClientTransport<IO>> = None;
+        let _: Option<prelude::WebSocketResponse> = None;
         let _: Option<prelude::BoundWebSocketServer> = None;
+        let _: Option<prelude::WebSocketServerShutdown> = None;
         let _ = fastmcp_rust::modern::Server::bind_websocket;
         #[cfg(feature = "legacy-2024-11-05")]
         {

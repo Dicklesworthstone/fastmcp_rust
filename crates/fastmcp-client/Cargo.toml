@@ -16,8 +16,8 @@ categories = ["network-programming"]
 legacy-2024-11-05 = ["fastmcp-protocol/legacy-2024-11-05", "fastmcp-transport/legacy-2024-11-05"]
 tasks = ["fastmcp-protocol/tasks"]
 apps = ["fastmcp-protocol/apps", "dep:html5ever"]
-# Embedding-only caller-upgraded async WebSocket adapter. This feature does
-# not add URI parsing, HTTP Upgrade, or a blocking byte-stream client.
+# Opt-in caller-upgraded async WebSocket client. This does not add URI parsing,
+# HTTP Upgrade, or a blocking byte-stream client.
 websocket-experimental = ["fastmcp-transport/websocket-experimental"]
 # Placeholder gated by the CLI's safe-icon-rendering feature. No client
 # code is gated on it yet; it exists so that CLI feature resolves.
