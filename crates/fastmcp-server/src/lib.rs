@@ -17999,11 +17999,17 @@ mod lib_unit_tests {
 
             let provider_calls = Arc::new(AtomicUsize::new(0));
             let handler_calls = Arc::new(AtomicUsize::new(0));
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let saw_credential = Arc::new(AtomicBool::new(false));
             let listener = Server::new("live-websocket-auth", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("modern-only policy is available")
                 .auth_provider(OneShotNativeAuthProvider {
                     calls: Arc::clone(&provider_calls),
+                })
+                .middleware(ModernHttpAuthMiddleware {
+                    calls: Arc::clone(&middleware_calls),
+                    saw_credential: Arc::clone(&saw_credential),
                 })
                 .tool(ModernHttpAuthCounterTool {
                     calls: Arc::clone(&handler_calls),
@@ -18035,17 +18041,6 @@ mod lib_unit_tests {
                 return Err(
                     "missing WebSocket bearer committed a 101 or omitted challenge".to_owned(),
                 );
-            }
-            let invalid = unsigned.replace(
-                "\r\n\r\n",
-                "\r\nAuthorization: Bearer invalid-never-echo\r\n\r\n",
-            );
-            let (_invalid, invalid_response) =
-                websocket_upgrade(&cx, address, invalid.as_bytes()).await?;
-            if !invalid_response.starts_with(b"HTTP/1.1 401")
-                || String::from_utf8_lossy(&invalid_response).contains("invalid-never-echo")
-            {
-                return Err("invalid WebSocket bearer was not rejected before 101".to_owned());
             }
             let duplicate = unsigned.replace(
                 "\r\n\r\n",
@@ -18084,6 +18079,15 @@ mod lib_unit_tests {
                 websocket_upgrade(&cx, address, unrelated_malformed.as_bytes()).await?;
             if !unrelated_response.starts_with(b"HTTP/1.1 400") {
                 return Err("unrelated malformed Upgrade header was not retained as 400".to_owned());
+            }
+            if provider_calls.load(Ordering::Acquire) != 0
+                || handler_calls.load(Ordering::Acquire) != 0
+                || middleware_calls.load(Ordering::Acquire) != 0
+            {
+                return Err(
+                    "pre-101 missing, duplicate, or malformed admission evaluated provider or dispatch"
+                        .to_owned(),
+                );
             }
             let valid = unsigned.replace("\r\n\r\n", "\r\nAuthorization: Bearer alpha\r\n\r\n");
             let (mut accepted, response) =
@@ -18129,9 +18133,31 @@ mod lib_unit_tests {
             }
             if handler_calls.load(Ordering::Acquire) != 1
                 || provider_calls.load(Ordering::Acquire) != 1
+                || middleware_calls.load(Ordering::Acquire) != 1
+                || saw_credential.load(Ordering::Acquire)
             {
                 return Err(
                     "valid WebSocket bearer did not consume exactly one custody evaluation"
+                        .to_owned(),
+                );
+            }
+            // The first provider evaluation above was the accepted bearer.
+            // This second evaluation must be counted and denied before 101;
+            // it must not produce another custody or dispatch mutation.
+            let invalid = unsigned.replace(
+                "\r\n\r\n",
+                "\r\nAuthorization: Bearer invalid-never-echo\r\n\r\n",
+            );
+            let (_invalid, invalid_response) =
+                websocket_upgrade(&cx, address, invalid.as_bytes()).await?;
+            if !invalid_response.starts_with(b"HTTP/1.1 401")
+                || String::from_utf8_lossy(&invalid_response).contains("invalid-never-echo")
+                || provider_calls.load(Ordering::Acquire) != 2
+                || handler_calls.load(Ordering::Acquire) != 1
+                || middleware_calls.load(Ordering::Acquire) != 1
+            {
+                return Err(
+                    "second provider evaluation did not reject invalid WebSocket bearer before 101"
                         .to_owned(),
                 );
             }
@@ -18167,7 +18193,9 @@ mod lib_unit_tests {
                     .any(|window| window == b"error")
                 || String::from_utf8_lossy(&rejection[..rejected]).contains("never-log-or-handle")
                 || handler_calls.load(Ordering::Acquire) != 1
-                || provider_calls.load(Ordering::Acquire) != 1
+                || provider_calls.load(Ordering::Acquire) != 2
+                || middleware_calls.load(Ordering::Acquire) != 1
+                || saw_credential.load(Ordering::Acquire)
             {
                 return Err(
                     "mixed WebSocket credential escaped custody or reached dispatch".to_owned(),
@@ -25866,17 +25894,13 @@ mod lib_unit_tests {
             _ctx: &McpContext,
             request: AuthRequest<'_>,
         ) -> McpResult<AuthContext> {
+            // This is deliberately an attempt counter, not an accepted-token
+            // counter: receipt custody must prove every provider evaluation.
+            let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
             let access = request
                 .access_token()
                 .ok_or_else(|| McpError::new(McpErrorCode::ResourceForbidden, "missing bearer"))?;
-            if access.token.as_str() != "alpha" {
-                return Err(McpError::new(
-                    McpErrorCode::ResourceForbidden,
-                    "unrecognized bearer",
-                ));
-            }
-            let call = self.calls.fetch_add(1, Ordering::AcqRel) + 1;
-            if call == 1 {
+            if call == 1 && access.token.as_str() == "alpha" {
                 Ok(AuthContext::with_subject("one-shot-alpha"))
             } else {
                 Err(McpError::new(
@@ -30692,6 +30716,166 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn live_http_json_auth_receipt_commits_one_accepted_provider_result() {
+        run_live_http_test(|cx| async move {
+            let provider_calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let saw_credential = Arc::new(AtomicBool::new(false));
+            let bound = Server::new("live-http-json-auth-receipt", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .auth_provider(OneShotNativeAuthProvider {
+                    calls: Arc::clone(&provider_calls),
+                })
+                .middleware(ModernHttpAuthMiddleware {
+                    calls: Arc::clone(&middleware_calls),
+                    saw_credential: Arc::clone(&saw_credential),
+                })
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&handler_calls),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("JSON auth receipt bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("JSON auth receipt address failed: {error}"))?;
+            let request = modern_http_json_tool_request("modern_http_auth_counter", 940);
+            let mixed_body = serde_json::to_vec(&JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "authorization": "Bearer in-band-never-echo",
+                    "name": "modern_http_auth_counter",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                941_i64,
+            ))
+            .map_err(|error| format!("mixed JSON auth receipt did not serialize: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let headers = [
+                        ("Accept", "application/json"),
+                        ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                        ("Mcp-Method", "tools/call"),
+                        ("Mcp-Name", "modern_http_auth_counter"),
+                    ];
+                    let result = async {
+                        // This is the first provider invocation and the only
+                        // invocation allowed to create an accepted receipt.
+                        let accepted = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let invalid = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer beta-never-echo"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let missing =
+                            live_http_exchange(address, live_http_post("/mcp", &request.body, &headers))
+                                .await?;
+                        let duplicate = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &request.body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("aUtHoRiZaTiOn", "Bearer beta"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        let mixed = live_http_exchange(
+                            address,
+                            live_http_post(
+                                "/mcp",
+                                &mixed_body,
+                                &[
+                                    ("Authorization", "Bearer alpha"),
+                                    ("Accept", "application/json"),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            ),
+                        )
+                        .await?;
+                        Ok::<_, String>((accepted, invalid, missing, duplicate, mixed))
+                    }
+                    .await;
+                    caller_cx.cancel_with(CancelKind::User, Some("JSON auth receipt proof complete"));
+                    result
+                })
+                .map_err(|error| format!("JSON auth receipt client admission failed: {error}"))?;
+            let serve = bound.serve(&cx).await;
+            let (accepted, invalid, missing, duplicate, mixed) = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("JSON auth receipt client failed: {error:?}"))??;
+            let shutdown = serve.map_err(|error| format!("JSON auth receipt server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "JSON auth receipt").await?;
+            let accepted: JsonRpcResponse = serde_json::from_slice(live_http_response_body(&accepted)?)
+                .map_err(|error| format!("accepted JSON auth receipt was not JSON-RPC: {error}"))?;
+            if accepted.error.is_some()
+                || provider_calls.load(Ordering::Acquire) != 2
+                || handler_calls.load(Ordering::Acquire) != 1
+                || middleware_calls.load(Ordering::Acquire) != 1
+                || saw_credential.load(Ordering::Acquire)
+            {
+                return Err(
+                    "JSON auth receipt expected two provider attempts and one sanitized dispatch"
+                        .to_owned(),
+                );
+            }
+            for response in [invalid, missing, duplicate, mixed] {
+                if !response.starts_with(b"HTTP/1.1 401")
+                    || live_http_response_header(&response, "www-authenticate")? != "Bearer"
+                    || String::from_utf8_lossy(&response).contains("beta-never-echo")
+                    || String::from_utf8_lossy(&response).contains("in-band-never-echo")
+                {
+                    return Err(
+                        "denied JSON auth receipt was not bounded before dispatch".to_owned()
+                    );
+                }
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
     fn live_http_sse_auth_receipt_commits_one_provider_result_and_fences_denials() {
         run_live_http_test(|cx| async move {
             let provider_calls = Arc::new(AtomicUsize::new(0));
@@ -30794,14 +30978,18 @@ mod lib_unit_tests {
                 .map_err(|error| format!("auth receipt client failed: {error:?}"))??;
             let shutdown = serve.map_err(|error| format!("auth receipt server failed: {error}"))?;
             require_quiescent_http_shutdown(shutdown, "auth receipt").await?;
+            let accepted_event = live_http_sse_jsonrpc_response(&accepted)?;
             if !accepted.starts_with(b"HTTP/1.1 200")
-                || provider_calls.load(Ordering::Acquire) != 1
+                || live_http_response_header(&accepted, "content-type")? != "text/event-stream"
+                || accepted_event.error.is_some()
+                || provider_calls.load(Ordering::Acquire) != 2
                 || handler_calls.load(Ordering::Acquire) != 1
                 || middleware_calls.load(Ordering::Acquire) != 1
                 || saw_credential.load(Ordering::Acquire)
             {
                 return Err(
-                    "successful native auth did not consume exactly one private receipt".to_owned(),
+                    "SSE auth receipt did not record exactly two provider attempts and one dispatch"
+                        .to_owned(),
                 );
             }
             for response in [invalid, missing, duplicate] {
