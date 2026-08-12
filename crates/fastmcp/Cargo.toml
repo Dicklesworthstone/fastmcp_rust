@@ -121,8 +121,9 @@ required-features = ["testing-lab"]
 [[test]]
 name = "e2e_workflow"
 path = "tests/e2e_workflow.rs"
-# The workflow harness requires deterministic test helpers and the Tasks API.
-required-features = ["testing-lab", "tasks"]
+# The workflow harness requires deterministic test helpers, the Tasks API, and
+# the Auto facade it exercises over both exact protocol eras.
+required-features = ["testing-lab", "tasks", "legacy-2024-11-05"]
 
 [lints]
 workspace = true

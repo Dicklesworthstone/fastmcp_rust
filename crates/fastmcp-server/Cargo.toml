@@ -53,7 +53,7 @@ jwt-resource-auth = ["fastmcp-protocol/jose"]
 
 [dependencies]
 fastmcp-core.workspace = true
-fastmcp-client = { workspace = true, optional = true }
+fastmcp-client = { workspace = true, default-features = false, optional = true }
 fastmcp-console.workspace = true
 fastmcp-protocol.workspace = true
 fastmcp-transport.workspace = true

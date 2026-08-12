@@ -1552,9 +1552,7 @@ fn workflow_public_http_state_only_mrtr_rejects_explicit_empty_without_consuming
         .expect("bounded fixture service installs");
     let initial_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let resumed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let server = Server::new("public-state-only-mrtr", "1.0.0")
-        .protocol_policy(ProtocolPolicy::ModernOnly)
-        .expect("the MRTR fixture selects the universally available modern policy")
+    let server = auto::server_builder("public-state-only-mrtr", "1.0.0")
         .tool(PublicStateOnlyMrtrTool {
             initial_calls: Arc::clone(&initial_calls),
             resumed_calls: Arc::clone(&resumed_calls),
