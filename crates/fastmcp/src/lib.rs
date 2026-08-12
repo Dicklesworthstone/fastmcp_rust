@@ -898,7 +898,10 @@ pub mod auto {
 
         /// Sets the idle and absolute timeout policy for ordinary requests.
         #[must_use]
-        pub fn request_timeout_policy(self, policy: fastmcp_client::RequestTimeoutPolicy) -> Self {
+        pub fn request_timeout_policy(
+            self,
+            policy: fastmcp_client::RequestTimeoutPolicy,
+        ) -> Self {
             Self::from_inner(self.inner.request_timeout_policy(policy))
         }
 

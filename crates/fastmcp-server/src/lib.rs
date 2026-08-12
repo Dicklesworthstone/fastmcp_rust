@@ -5793,7 +5793,6 @@ const WEBSOCKET_HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 #[cfg(feature = "websocket")]
 const WEBSOCKET_DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(feature = "websocket")]
-const WEBSOCKET_DRIVER_POLL_INTERVAL_NANOS: u64 = 5_000_000;
 #[cfg(feature = "websocket")]
 const WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "websocket")]
@@ -6383,9 +6382,7 @@ async fn run_websocket_dispatch_bridge(
         if cx.checkpoint().is_err() {
             break Ok(());
         }
-        let deadline = cx
-            .now()
-            .saturating_add_nanos(WEBSOCKET_DRIVER_POLL_INTERVAL_NANOS);
+        let deadline = cx.now() + WEBSOCKET_DRIVER_POLL_INTERVAL;
         match asupersync::time::timeout_at(deadline, transport.recv(cx)).await {
             Ok(Ok(mut message)) => {
                 if let JsonRpcMessage::Request(request) = &mut message {
@@ -14293,11 +14290,12 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        // This legacy stdio loop has no connection-level
-                        // native Authorization custody. `None` deliberately
-                        // selects ordinary per-request admission below; it
-                        // does not bypass configured authentication.
-                        let inbound = InboundRequestContext::with_modern_connection(
+                        // Stdio is a local trusted pipe with no transport-layer
+                        // authorization; dispatch carries no auth custody for it.
+                        let transport_authorization: Option<TransportAuthorization> = None;
+                        let auth_receipt: Option<AuthDispatchCustody> = None;
+                        let auth_custody_generation: Option<u64> = None;
+                        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,
@@ -14700,10 +14698,12 @@ impl Server {
                     };
 
                     if matches!(era, ProtocolEra::Modern2026) {
-                        // This returning legacy stdio loop likewise owns no
-                        // native header receipt or WebSocket generation.
-                        // Per-request authentication remains mandatory.
-                        let inbound = InboundRequestContext::with_modern_connection(
+                        // Stdio is a local trusted pipe with no transport-layer
+                        // authorization; dispatch carries no auth custody for it.
+                        let transport_authorization: Option<TransportAuthorization> = None;
+                        let auth_receipt: Option<AuthDispatchCustody> = None;
+                        let auth_custody_generation: Option<u64> = None;
+                        let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
                             cx.clone(),
                             request_id_to_u64(request.id.as_ref()),
                             InboundRequestTransport::Stdio,

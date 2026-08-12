@@ -411,7 +411,7 @@ impl std::fmt::Display for ClientProtocolPlanError {
 impl std::error::Error for ClientProtocolPlanError {}
 
 /// Client-side session state.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ClientSession {
     /// Client info sent during initialization.
     client_info: ClientInfo,
