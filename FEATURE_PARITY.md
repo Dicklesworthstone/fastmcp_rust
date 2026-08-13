@@ -25,17 +25,17 @@ Release publication remains quarantined. This document supplies neither publicat
   reliable cleanup qualification remain open across the aggregate surface.
 - Unix stdio can route sampling, elicitation, and roots responses while its
   dispatch worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths
-  reject or lack equivalent split routing, public HTTP remains fail-closed,
-  and end-to-end lifecycle qualification is incomplete.
+  reject or lack equivalent split routing. Public turnkey HTTP is live for
+  dual-era request/response; bidirectional lifecycle qualification remains
+  incomplete.
 - Eligible production cache entries are partitioned by committed authentication
   facts plus opaque session identity and revision. Ambiguous authentication,
   unsafe state views, allocation failure, and state mutation fail closed.
 - JSON-RPC credentials are a legacy fallback. Recognized fields are consumed by
   authentication and stripped before extension middleware and handlers. The
   quarantined private HTTP helper carries native `Authorization` metadata
-  separately through pre-dispatch admission, but public turnkey HTTP remains
-  fail-closed and no complete transport-boundary admission/challenge path is
-  qualified.
+  separately through pre-dispatch admission. Public turnkey HTTP is live;
+  transport-boundary admission and challenge behavior remain unqualified.
 - Legacy `tasks/list` and `tasks/submit` return `MethodNotFound`. Official
   `tasks/get`, `tasks/update`, and `tasks/cancel` are served by default
   (process-local in-memory store). `ServerBuilder::final_tasks` replaces
@@ -123,7 +123,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | `@tool` / `#[tool]` | ✅ | 🟡 | Macro implementation exists; the async form currently bridges through synchronous handler machinery |
-| `@resource` / `#[resource]` | ✅ | 🟡 | Macro and named-placeholder URI-template support exist; not full RFC 6570 coverage |
+| `@resource` / `#[resource]` | ✅ | 🟡 | Macro plus RFC 6570 reversible templates exist; lossy prefix/explode forms are refused rather than guessed |
 | `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; the async form currently bridges through synchronous handler machinery |
 | Auto JSON schema | ✅ | ✅ | `#[derive(JsonSchema)]` + inline generation |
 | Description from docstrings | ✅ | ✅ | Doc comments → descriptions |
@@ -147,10 +147,10 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Stdio transport** | ✅ | ✅ | NDJSON implementation present |
-| **SSE transport** | ✅ | 🟡 | Low-level `SseServerTransport`/`SseClientTransport` types exist; the public `Client` is not wired to SSE |
-| **WebSocket transport** | ✅ | 🟡 | `WsTransport` framing and caller-provided I/O integration exist; the public `Client` is not wired to WebSocket |
-| **HTTP transport** | ✅ | 🟡 | Low-level `HttpTransport` and `HttpRequestHandler` exist; `Server::run_http*` fails closed before bind |
-| **Streamable HTTP** | ✅ | 🟡 | Low-level `StreamableHttpTransport` exists; modern end-to-end qualification remains open |
+| **SSE transport** | ✅ | 🟡 | Low-level `SseServerTransport`/`SseClientTransport` types exist; public `Client` Auto uses SSE for exact-2024 HTTP fallback, with no standalone `Client::sse` constructor |
+| **WebSocket transport** | ✅ | 🟡 | `WsTransport` framing plus `ClientBuilder::connect_websocket_with_cx` exist behind `websocket-experimental`; aggregate lifecycle qualification remains open |
+| **HTTP transport** | ✅ | 🟡 | Public `Server::run_http*` binds a dual-era listener; `Client::http` is the high-level client. Aggregate admission/challenge and bidirectional qualification remain open |
+| **Streamable HTTP** | ✅ | 🟡 | `StreamableHttpTransport` and public modern/legacy HTTP paths exist; aggregate protocol qualification remains unverified |
 | **MemoryTransport (in-process)** | ✅ | ✅ | `memory.rs` for testing |
 | **Two-phase send** | ❌ | ✅ | `TwoPhaseTransport` reserve/commit support exists for stdio |
 | **Codec with size limits** | ✅ | ✅ | Configurable max message size |
@@ -169,12 +169,12 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `tools/call` | ✅ | ✅ | With progress token support |
 | `resources/list` | ✅ | ✅ | With cursor pagination |
 | `resources/read` | ✅ | ✅ | With progress token support |
-| `resources/templates/list` | ✅ | 🟡 | Listing and named-placeholder matching exist; the matcher is not a complete RFC 6570 implementation |
+| `resources/templates/list` | ✅ | 🟡 | Listing plus RFC 6570 reversible matching exist; lossy prefix/explode templates are refused rather than guessed |
 | `resources/subscribe` | ✅ | ✅ | Protocol support |
 | `resources/unsubscribe` | ✅ | ✅ | Protocol support |
 | `prompts/list` | ✅ | ✅ | With cursor pagination |
 | `prompts/get` | ✅ | ✅ | With argument support |
-| `completion/complete` | ✅ | ✅ | Session and stateless dispatch serve a registered handler; `initialize` advertises `capabilities.completions` |
+| `completion/complete` | ✅ | ✅ | Session and stateless dispatch serve a registered handler; both `completion_handler()` and `legacy_completion_handler()` advertise `capabilities.completions` on initialize. Final discover still requires a modern provider |
 | `logging/setLevel` | ✅ | ✅ | `LogLevel` request handling exists |
 | `notifications/cancelled` | ✅ | 🟡 | Stdio can receive and route the notification while its dispatch worker runs. Custom/SSE/WebSocket loops remain sequential; end-to-end interruption, request ownership, and reliable `awaitCleanup` remain unverified |
 | `notifications/progress` | ✅ | ✅ | Progress token support |
@@ -496,7 +496,8 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
 - Legacy `tasks/list` and `tasks/submit` return `MethodNotFound`; official `tasks/get`, `tasks/update`, and `tasks/cancel` are served by default
 - OAuth/OIDC source APIs remain public for development, but their production
   security/profile conformance is unverified and quarantined from support claims
-- The public client supports subprocess stdio, not SSE or WebSocket client
-  connections
+- The public client supports subprocess stdio and HTTP (`Client::http`).
+  WebSocket is behind `websocket-experimental`; SSE is used as the exact-2024
+  HTTP fallback and remains a lower-level transport type
 
 **Not production-certified for MCP 2026-07-28** until final attestation and GATE packages pass.
