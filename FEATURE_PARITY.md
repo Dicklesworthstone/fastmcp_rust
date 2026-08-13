@@ -122,9 +122,9 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| `@tool` / `#[tool]` | ✅ | 🟡 | Macro implementation exists; the async form currently bridges through synchronous handler machinery |
+| `@tool` / `#[tool]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch drives `call_async_in_request`. Exact-2024 session dispatch still uses the blocking `run_handler` bridge |
 | `@resource` / `#[resource]` | ✅ | 🟡 | Macro plus RFC 6570 reversible templates exist; lossy prefix/explode forms are refused rather than guessed |
-| `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; the async form currently bridges through synchronous handler machinery |
+| `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch drives async-in-request. Exact-2024 session dispatch still uses the blocking `run_handler` bridge |
 | Auto JSON schema | ✅ | ✅ | `#[derive(JsonSchema)]` + inline generation |
 | Description from docstrings | ✅ | ✅ | Doc comments → descriptions |
 | Default parameter values | ✅ | ✅ | Implemented via `defaults(...)` on `#[tool]`/`#[prompt]` (e.g. `#[tool(defaults(foo = 123, bar = \"baz\"))]`) |
