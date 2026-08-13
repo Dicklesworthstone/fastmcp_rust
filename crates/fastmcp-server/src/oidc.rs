@@ -1363,7 +1363,7 @@ impl OidcProvider {
             OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
         })?;
         let state = std::mem::replace(&mut *slot, OidcIdTokenSigningState::Inactive);
-        let OidcIdTokenSigningState::Active(active) = state else {
+        let OidcIdTokenSigningState::Active(mut active) = state else {
             *slot = state;
             return Err(OidcError::SigningError(
                 "OIDC signer rotation requires an Active generation".to_string(),

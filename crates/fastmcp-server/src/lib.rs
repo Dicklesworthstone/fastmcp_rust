@@ -6522,8 +6522,10 @@ async fn run_websocket_dispatch_bridge(
                 }
                 let permit = match incoming_sender.reserve(cx).await {
                     Ok(permit) => permit,
-                    Err(asupersync_mpsc::SendError::Disconnected(()))
-                    | Err(asupersync_mpsc::SendError::Cancelled(())) => break Ok(()),
+                    Err(
+                        asupersync_mpsc::SendError::Disconnected(())
+                        | asupersync_mpsc::SendError::Cancelled(()),
+                    ) => break Ok(()),
                     Err(asupersync_mpsc::SendError::Full(())) => {
                         break Err(McpError::internal_error("WebSocket ingress queue is full"));
                     }
@@ -6538,7 +6540,7 @@ async fn run_websocket_dispatch_bridge(
                     };
                 }
             }
-            Ok(Err(TransportError::Closed)) | Ok(Err(TransportError::Cancelled)) => break Ok(()),
+            Ok(Err(TransportError::Closed | TransportError::Cancelled)) => break Ok(()),
             Ok(Err(_)) => break Err(McpError::invalid_request("WebSocket frame was rejected")),
             Err(_) => {}
         }

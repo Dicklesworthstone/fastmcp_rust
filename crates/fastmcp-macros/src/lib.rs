@@ -3764,8 +3764,8 @@ fn parse_tool_apps_ui_metadata(
 
     let resource_uri = resource_uri
         .ok_or_else(|| syn::Error::new(ui_span, "ui metadata requires resource_uri"))?;
-    let parsed_uri =
-        fastmcp_protocol::AbsoluteUri::parse(&resource_uri.value()).map_err(|error| {
+    let parsed_uri = fastmcp_protocol::common_types::AbsoluteUri::parse(&resource_uri.value())
+        .map_err(|error| {
             syn::Error::new(
                 resource_uri.span(),
                 format!("ui resource_uri must be an absolute URI: {error}"),

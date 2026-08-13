@@ -1621,8 +1621,8 @@ impl ProxyBackend for Client {
 
     fn complete_result(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
         match Client::complete(self, params)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::Completion(_))
-            | result @ CoreResult::Final(FinalCoreResult::Completion { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::Completion(_))
+            | CoreResult::Final(FinalCoreResult::Completion { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("completion/complete")),
         }
     }
@@ -1666,16 +1666,16 @@ impl ProxyBackend for Client {
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
         match Client::call_tool_typed(self, name, arguments)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::ToolsCall(_))
-            | result @ CoreResult::Final(FinalCoreResult::ToolsCall { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::ToolsCall(_))
+            | CoreResult::Final(FinalCoreResult::ToolsCall { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("tools/call")),
         }
     }
 
     fn read_resource_result(&mut self, uri: &str) -> McpResult<CoreResult> {
         match Client::read_resource_typed(self, uri)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::ResourcesRead(_))
-            | result @ CoreResult::Final(FinalCoreResult::ResourcesRead { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::ResourcesRead(_))
+            | CoreResult::Final(FinalCoreResult::ResourcesRead { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("resources/read")),
         }
     }
@@ -1686,8 +1686,8 @@ impl ProxyBackend for Client {
         arguments: HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         match Client::get_prompt_typed(self, name, arguments)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::PromptsGet(_))
-            | result @ CoreResult::Final(FinalCoreResult::PromptsGet { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::PromptsGet(_))
+            | CoreResult::Final(FinalCoreResult::PromptsGet { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("prompts/get")),
         }
     }
