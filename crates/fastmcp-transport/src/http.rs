@@ -3134,6 +3134,8 @@ struct QueuedRequest {
 pub enum StreamableHttpRequestResponseMessage {
     /// A server-to-client JSON-RPC notification sent before the terminal response.
     Notification(JsonRpcRequest),
+    /// A server-to-client JSON-RPC reverse request sent before the terminal response.
+    Request(JsonRpcRequest),
     /// The single terminal JSON-RPC response for the owning request.
     Response(JsonRpcResponse),
 }
@@ -3380,8 +3382,11 @@ impl StreamableHttpResponseStream {
         })?;
         Ok(queued.map(|queued| match queued.message {
             StreamableHttpRequestResponseMessage::Response(response) => response,
-            StreamableHttpRequestResponseMessage::Notification(_) => {
-                unreachable!("the response matcher cannot dequeue a notification")
+            StreamableHttpRequestResponseMessage::Notification(_)
+            | StreamableHttpRequestResponseMessage::Request(_) => {
+                unreachable!(
+                    "the response matcher cannot dequeue a notification or reverse request"
+                )
             }
         }))
     }
@@ -3519,7 +3524,8 @@ impl StreamableHttpResponseStream {
         let _admission =
             begin_streamable_admission(&self.admissions_open, &self.active_admissions)?;
         let serialized_bytes = match &message {
-            StreamableHttpRequestResponseMessage::Notification(notification) => {
+            StreamableHttpRequestResponseMessage::Notification(notification)
+            | StreamableHttpRequestResponseMessage::Request(notification) => {
                 self.codec.encode_request(notification)?.len()
             }
             StreamableHttpRequestResponseMessage::Response(response) => {
@@ -3615,6 +3621,34 @@ impl StreamableHttpResponseStream {
                 cx,
                 cancellation,
                 StreamableHttpRequestResponseMessage::Notification(notification),
+            )
+        })
+    }
+
+    fn send_request_for_request(
+        &self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        request: JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        if request.is_notification() || request.id.is_none() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP reverse requests must carry a JSON-RPC ID",
+            )));
+        }
+        cancellation.checkpoint(cx)?;
+        if !self.request_response_guard_is_active(cancellation)? {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP reverse-request guard does not belong to this live transport request",
+            )));
+        }
+        cancellation.with_message_commit(cx, false, || {
+            self.enqueue_request_message(
+                cx,
+                cancellation,
+                StreamableHttpRequestResponseMessage::Request(request),
             )
         })
     }
@@ -4078,6 +4112,12 @@ impl StreamableHttpRequestResponseSender {
             .send_notification_for_request(cx, &self.cancellation, notification)
     }
 
+    /// Commits one reverse request before this body's terminal response.
+    pub fn send_request(&self, cx: &Cx, request: JsonRpcRequest) -> Result<(), TransportError> {
+        self.responses
+            .send_request_for_request(cx, &self.cancellation, request)
+    }
+
     /// Commits this body's one terminal response.
     pub fn send_response(&self, cx: &Cx, response: JsonRpcResponse) -> Result<(), TransportError> {
         self.responses
@@ -4128,8 +4168,9 @@ fn try_pop_streamable_response(
     })?;
     Ok(queued.map(|queued| match queued.message {
         StreamableHttpRequestResponseMessage::Response(response) => response,
-        StreamableHttpRequestResponseMessage::Notification(_) => {
-            unreachable!("the response matcher cannot dequeue a notification")
+        StreamableHttpRequestResponseMessage::Notification(_)
+        | StreamableHttpRequestResponseMessage::Request(_) => {
+            unreachable!("the response matcher cannot dequeue a notification or reverse request")
         }
     }))
 }
@@ -4158,10 +4199,11 @@ fn try_pop_streamable_request_response(
     if matches!(
         &mailbox.queue[position].message,
         StreamableHttpRequestResponseMessage::Notification(_)
+            | StreamableHttpRequestResponseMessage::Request(_)
     ) {
         return Err(TransportError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "a request-owned notification must be consumed before its terminal response",
+            "a request-owned notification or reverse request must be consumed before its terminal response",
         )));
     }
     let queued = mailbox
@@ -4176,8 +4218,9 @@ fn try_pop_streamable_request_response(
     debug_assert!(previous > 0, "response pending-count underflow");
     match queued.message {
         StreamableHttpRequestResponseMessage::Response(response) => Ok(Some(response)),
-        StreamableHttpRequestResponseMessage::Notification(_) => {
-            unreachable!("notification messages return before they are removed")
+        StreamableHttpRequestResponseMessage::Notification(_)
+        | StreamableHttpRequestResponseMessage::Request(_) => {
+            unreachable!("notification and reverse-request messages return before they are removed")
         }
     }
 }
@@ -4689,6 +4732,36 @@ impl StreamableHttpTransport {
         })
     }
 
+    /// Commits one server-to-client reverse request for one live modern SSE body.
+    pub fn send_request_for_request(
+        &mut self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        request: JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        if request.is_notification() || request.id.is_none() {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP reverse requests must carry a JSON-RPC ID",
+            )));
+        }
+        cancellation.checkpoint(cx)?;
+        if !self.request_response_guard_is_active(cancellation)? {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "streamable HTTP reverse-request guard does not belong to this live transport request",
+            )));
+        }
+        cancellation.with_message_commit(cx, false, || {
+            self.enqueue_message(
+                cx,
+                Some(cancellation.request_id().clone()),
+                StreamableHttpRequestResponseMessage::Request(request),
+                Some(cancellation),
+            )
+        })
+    }
+
     fn enqueue_message(
         &mut self,
         cx: &Cx,
@@ -4713,7 +4786,8 @@ impl StreamableHttpTransport {
             &self.response_active_admissions,
         )?;
         let serialized_bytes = match &message {
-            StreamableHttpRequestResponseMessage::Notification(notification) => {
+            StreamableHttpRequestResponseMessage::Notification(notification)
+            | StreamableHttpRequestResponseMessage::Request(notification) => {
                 self.codec.encode_request(notification)?.len()
             }
             StreamableHttpRequestResponseMessage::Response(response) => {
@@ -5347,7 +5421,8 @@ impl DualEraHttpSseResponse {
         message: StreamableHttpRequestResponseMessage,
     ) -> Result<SseEvent, DualEraHttpEndpointError> {
         let mut encoded = match message {
-            StreamableHttpRequestResponseMessage::Notification(notification) => {
+            StreamableHttpRequestResponseMessage::Notification(notification)
+            | StreamableHttpRequestResponseMessage::Request(notification) => {
                 codec.encode_request(&notification)?
             }
             StreamableHttpRequestResponseMessage::Response(response) => {
@@ -5891,6 +5966,21 @@ impl DualEraHttpSession {
         }
         self.modern_transport
             .send_notification_for_request(cx, cancellation, notification)?;
+        Ok(())
+    }
+
+    /// Sends one request-owned reverse request through a modern SSE response body.
+    pub fn send_modern_sse_request(
+        &mut self,
+        cx: &Cx,
+        cancellation: &StreamableHttpRequestCancellation,
+        request: JsonRpcRequest,
+    ) -> Result<(), DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        self.modern_transport
+            .send_request_for_request(cx, cancellation, request)?;
         Ok(())
     }
 

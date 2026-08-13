@@ -350,7 +350,10 @@ mod modern_http_only {
         let value = match message {
             fastmcp_transport::http::StreamableHttpRequestResponseMessage::Notification(
                 request,
-            ) => serde_json::to_string(&request),
+            )
+            | fastmcp_transport::http::StreamableHttpRequestResponseMessage::Request(request) => {
+                serde_json::to_string(&request)
+            }
             fastmcp_transport::http::StreamableHttpRequestResponseMessage::Response(response) => {
                 serde_json::to_string(&response)
             }
@@ -456,6 +459,16 @@ mod modern_http_only {
         ) -> Result<(), DualEraHttpEndpointError> {
             self.transport
                 .send_notification_for_request(cx, cancellation, notification)?;
+            Ok(())
+        }
+        pub fn send_modern_sse_request(
+            &mut self,
+            cx: &Cx,
+            cancellation: &StreamableHttpRequestCancellation,
+            request: JsonRpcRequest,
+        ) -> Result<(), DualEraHttpEndpointError> {
+            self.transport
+                .send_request_for_request(cx, cancellation, request)?;
             Ok(())
         }
         pub fn close(&mut self) {
