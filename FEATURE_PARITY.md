@@ -37,8 +37,9 @@ Release publication remains quarantined. This document supplies neither publicat
   fail-closed and no complete transport-boundary admission/challenge path is
   qualified.
 - Legacy `tasks/list` and `tasks/submit` return `MethodNotFound`. Official
-  `tasks/get`, `tasks/update`, and `tasks/cancel` are served when
-  `ServerBuilder::final_tasks` is installed.
+  `tasks/get`, `tasks/update`, and `tasks/cancel` are served by default
+  (process-local in-memory store). `ServerBuilder::final_tasks` replaces
+  that store; `with_task_manager` still does not install official Tasks.
 - OAuth/OIDC public source APIs exist for development, but production security
   and profile conformance remain unverified and quarantined from support claims.
 - Explicit client close now returns process/transport cleanup failures. The
@@ -182,9 +183,9 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
 | `tasks/list` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
-| `tasks/get` | ✅ | 🟡 | Served when `ServerBuilder::final_tasks` is installed |
+| `tasks/get` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
 | `tasks/submit` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
-| `tasks/cancel` | ✅ | 🟡 | Served when `ServerBuilder::final_tasks` is installed |
+| `tasks/cancel` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
 
 The historical `TaskManager` source remains test-only for implementation
 archaeology. Production builds expose neither a manager constructor/builder
@@ -205,7 +206,7 @@ edge nor a network capability while TASK-01/TASK-02 remain open.
 
 ### Bidirectional Communication Infrastructure
 
-The following bidirectional building blocks exist in source. This inventory does not certify end-to-end behavior for MCP 2026-07-28. On Unix, the primary stdio path keeps a receive pump active while its dispatch worker runs. Non-Unix stdio and custom/SSE/WebSocket paths retain sequential/blocking boundaries and do not provide equivalent response routing; public HTTP remains fail-closed, and request-owned lifecycle evidence is incomplete.
+The following bidirectional building blocks exist in source. This inventory does not certify end-to-end behavior for MCP 2026-07-28. On Unix, the primary stdio path keeps a receive pump active while its dispatch worker runs. Non-Unix stdio and custom/SSE/WebSocket paths retain sequential/blocking boundaries and do not provide equivalent response routing. Public turnkey HTTP is live for dual-era request/response; request-owned bidirectional lifecycle qualification remains incomplete.
 
 1. ✅ `PendingRequests` - Tracks server-to-client requests with response routing
 2. ✅ `RequestSender` - Sends requests through transport with response awaiting
@@ -222,7 +223,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | Subprocess spawning | ✅ | 🟡 | Stdio subprocess integration exists. Explicit `Client::close` returns cleanup failures; opt-in anchored group ownership is Unix-only and is not portable process-tree containment |
-| Client transport integration | ✅ | 🟡 | Public `Client` construction is subprocess stdio only; lower-level SSE/WebSocket transport types are not connected to it |
+| Client transport integration | ✅ | 🟡 | Public `Client` covers subprocess stdio and HTTP (`Client::http`); WebSocket is behind `websocket-experimental`; SSE remains a lower-level transport type |
 | Tool invocation | ✅ | ✅ | `call_tool()` |
 | Resource reading | ✅ | ✅ | `read_resource()` |
 | Prompt fetching | ✅ | ✅ | `get_prompt()` |
@@ -241,7 +242,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Auto-initialize** | ✅ | ✅ | Implemented in client builder.rs |
-| **Task client methods** | ✅ | 🚧 | Client methods exist as source inventory, but this server does not advertise Tasks and returns `MethodNotFound` for every task RPC |
+| **Task client methods** | ✅ | 🟡 | Client methods exist; the default server serves official `tasks/get`, `tasks/update`, and `tasks/cancel` |
 
 ---
 
@@ -375,7 +376,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | **`fastmcp dev`** | ✅ | 🟡 | Unix file-watching/restart paths use bounded owned-group cleanup plus an in-group watchdog tied to an owner-held control pipe, covering CLI owner death and child-handle drop. Descriptor copies made by a host fork and group/session escape remain outside the boundary; non-Unix fails closed |
 | **`fastmcp list`** | ✅ | ✅ | List available servers |
 | **`fastmcp test`** | ✅ | 🟡 | Tests connectivity using anchored Unix process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible; non-Unix fails before spawn until a Job Object/equivalent ownership path exists |
-| **`fastmcp tasks`** | ✅ | 🚧 | CLI command paths exist, but the server task capability is quarantined and all task RPC methods return `MethodNotFound` |
+| **`fastmcp tasks`** | ✅ | 🟡 | CLI command paths exist; official `tasks/get`/`update`/`cancel` are served by default, while legacy `list`/`submit` stay `MethodNotFound` |
 
 ---
 
@@ -383,7 +384,7 @@ The following bidirectional building blocks exist in source. This inventory does
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Docket (distributed tasks)** | ✅ | 🚧 | Historical/test-only task-manager source remains; production task RPC returns `MethodNotFound`, while Redis Docket is gated by TASKR-01 and absent from the default FND-01 graph |
+| **Docket (distributed tasks)** | ✅ | 🚧 | Historical/test-only task-manager source remains; official in-process Tasks RPC is served by default, while Redis Docket is gated by TASKR-01 and absent from the default FND-01 graph |
 | **EventStore** | ✅ | ✅ | `event_store.rs` - SSE resumability with TTL |
 | **Rich content types** | ✅ | ✅ | `Content` supports `audio` and includes helpers: `Content::{text,image_base64,image_bytes,audio_base64,audio_bytes,resource_text,resource_blob_base64,resource_blob_bytes}` |
 
@@ -479,8 +480,8 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
   group/session escape, fork-copied descriptors, or hostile/global reapers
 - Unix stdio can route sampling, elicitation, and roots responses while its
   worker is occupied. Non-Unix stdio and custom/SSE/WebSocket paths lack
-  equivalent split routing, public HTTP is fail-closed, and end-to-end
-  lifecycle qualification remains open
+  equivalent split routing. Public turnkey HTTP is live; end-to-end
+  bidirectional lifecycle qualification remains open
 - Request work still needs an independently owned child `Cx`; cancellation is
   not a sibling-isolated guarantee until that boundary exists
 - Eligible response-cache entries use committed-auth plus opaque
@@ -490,7 +491,7 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
   handlers, but they remain a legacy fallback. The quarantined private HTTP
   helper carries native authorization separately; public transport-boundary
   admission and challenge behavior remain unqualified
-- Task RPC is not advertised and all four methods return `MethodNotFound`
+- Legacy `tasks/list` and `tasks/submit` return `MethodNotFound`; official `tasks/get`, `tasks/update`, and `tasks/cancel` are served by default
 - OAuth/OIDC source APIs remain public for development, but their production
   security/profile conformance is unverified and quarantined from support claims
 - The public client supports subprocess stdio, not SSE or WebSocket client

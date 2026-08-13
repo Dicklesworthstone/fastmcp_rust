@@ -57,9 +57,12 @@
   admission/challenge integration is qualified.
 - **Legacy Tasks RPC stays dead:** `tasks/list` and `tasks/submit` return
   JSON-RPC `MethodNotFound`. Official MCP 2026-07-28 methods `tasks/get`,
-  `tasks/update`, and `tasks/cancel` are served when the server is built
-  with `ServerBuilder::final_tasks`. Without that install they stay
-  `MethodNotFound`.
+  `tasks/update`, and `tasks/cancel` are served by default (process-local
+  in-memory store). Call `ServerBuilder::final_tasks` to supply an
+  application-owned store. Creating new tasks still requires the
+  application to run a caller-owned task supervisor in its own `Cx`
+  region. The historical `with_task_manager` path does not install the
+  official methods.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.
@@ -636,7 +639,7 @@ fn commit_revision(
 | **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
 | **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. Public turnkey HTTP is live, but no complete transport-boundary native `Authorization` admission/challenge path is qualified |
-| **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run when `ServerBuilder::final_tasks` is installed |
+| **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store |
 | **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
 | **Early Development** | API may change before 1.0 |
 
