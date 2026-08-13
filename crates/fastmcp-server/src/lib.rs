@@ -24109,6 +24109,7 @@ mod lib_unit_tests {
         );
 
         let mut session = initialized_test_session(&server);
+        let notification_sender: NotificationSender = Arc::new(|_| {});
         let session_get = server
             .dispatch_request(
                 &Cx::for_testing(),
@@ -24118,7 +24119,7 @@ mod lib_unit_tests {
                     Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
                     72_i64,
                 ),
-                &Arc::new(|_| {}),
+                &notification_sender,
                 &test_request_sender(),
             )
             .expect("session tasks/get must produce a JSON-RPC response");
@@ -24138,7 +24139,7 @@ mod lib_unit_tests {
                     Some(final_tasks_get_params(&missing, serde_json::json!({}))),
                     73_i64,
                 ),
-                &Arc::new(|_| {}),
+                &notification_sender,
                 &test_request_sender(),
             )
             .expect("session tasks/get of an unknown id must respond");
@@ -24202,6 +24203,72 @@ mod lib_unit_tests {
             runtime
                 .is_cancellation_requested(&task_id)
                 .expect("final cancellation intent must remain in application storage")
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn default_built_server_serves_official_tasks_get() {
+        let server = Server::new("default-tasks-server", "1.0.0").build();
+        let runtime = server
+            .final_task_runtime()
+            .expect("default build must install an in-memory official Tasks runtime");
+        let _service = start_final_tasks_test_service(runtime);
+        let task_id = runtime
+            .create_task_with_work(
+                final_tasks_test_work_descriptor(),
+                Some("accepted".to_owned()),
+            )
+            .expect("default store must accept a task once its service is ready")
+            .task
+            .base()
+            .task_id
+            .clone();
+
+        let mut session = initialized_test_session(&server);
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let session_get = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
+                    80_i64,
+                ),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("default session tasks/get must produce a JSON-RPC response");
+        assert_eq!(
+            session_get.result.as_ref().map(|result| &result["taskId"]),
+            Some(&serde_json::json!(task_id.as_str())),
+            "Server::new().build() must serve official tasks/get without final_tasks()"
+        );
+
+        let missing = fastmcp_protocol::FinalTaskId::parse("missing-default-task-0001")
+            .expect("planted missing task id");
+        let session_missing = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(final_tasks_get_params(&missing, serde_json::json!({}))),
+                    81_i64,
+                ),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("unknown default-runtime task id must still be a Tasks response");
+        let missing_error = session_missing
+            .error
+            .as_ref()
+            .expect("unknown task id must fail");
+        assert_ne!(
+            missing_error.code,
+            i32::from(McpErrorCode::MethodNotFound).into(),
+            "unknown id is not MethodNotFound once default official Tasks is installed"
         );
     }
 

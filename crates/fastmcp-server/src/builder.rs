@@ -43,6 +43,8 @@ use crate::proxy::{
     ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
     ProxyTypedCatalog,
 };
+#[cfg(feature = "tasks")]
+use crate::tasks::FinalTaskRuntimeConfig;
 #[cfg(all(test, feature = "tasks"))]
 use crate::tasks::SharedTaskManager;
 use crate::{
@@ -692,6 +694,39 @@ impl ServerBuilder {
         }
         self.final_task_runtime = Some(task_runtime);
         Ok(self)
+    }
+
+    /// Installs a process-local official Tasks runtime when the builder has
+    /// no Tasks owner yet.
+    ///
+    /// A caller-supplied [`Self::final_tasks`] runtime, a proxy Tasks relay,
+    /// or the quarantined [`Self::with_task_manager`] path all suppress this
+    /// default. If an existing extension registry already owns the official
+    /// Tasks methods, the default is left uninstalled rather than panicking.
+    #[cfg(feature = "tasks")]
+    fn install_default_in_memory_final_tasks(&mut self) {
+        if self.final_task_runtime.is_some() {
+            return;
+        }
+        #[cfg(all(test, feature = "tasks"))]
+        if self.task_manager.is_some() {
+            return;
+        }
+        #[cfg(feature = "proxy")]
+        if self.final_task_relay.is_some() {
+            return;
+        }
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                .expect("default in-memory Tasks timing policy is valid"),
+            Arc::new(|_| {}),
+        );
+        if let Some(extension_runtime) = self.extension_runtime.as_mut() {
+            if extension_runtime.install_final_tasks(&runtime).is_err() {
+                return;
+            }
+        }
+        self.final_task_runtime = Some(runtime);
     }
 
     /// Sets configuration for the live dual-era HTTP endpoint.
@@ -2195,6 +2230,14 @@ impl ServerBuilder {
     ///
     /// Both [`Self::try_new`] and [`Self::protocol_policy`] reject invalid or
     /// unavailable policy selections before a builder exists.
+    ///
+    /// When the `tasks` feature is enabled and the builder has not already
+    /// installed a local or proxy Tasks owner, this installs a process-local
+    /// in-memory official Tasks runtime so `tasks/get`, `tasks/update`, and
+    /// `tasks/cancel` are served. Call [`Self::final_tasks`] to replace that
+    /// default with an application-owned store. The historical
+    /// [`Self::with_task_manager`] path stays quarantined and does not receive
+    /// the official methods.
     #[must_use]
     pub fn build(mut self) -> Server {
         // Configure router with strict input validation setting
@@ -2204,6 +2247,8 @@ impl ServerBuilder {
             self.console_config.should_use_rich(),
         );
         let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
+        #[cfg(feature = "tasks")]
+        self.install_default_in_memory_final_tasks();
         #[cfg(feature = "tasks")]
         let final_task_runtime = self.final_task_runtime.clone();
         #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -6491,6 +6536,15 @@ mod tests {
         // ── Task manager ──────────────────────────────────────────────────
 
         #[test]
+        fn default_build_installs_in_memory_official_tasks() {
+            let server = ServerBuilder::new("srv", "1.0").build();
+            assert!(
+                server.final_task_runtime().is_some(),
+                "default build must install official in-memory Tasks"
+            );
+        }
+
+        #[test]
         fn builder_with_task_manager_retains_manager_without_advertising_capability() {
             use crate::tasks::TaskManager;
             let tm = TaskManager::new().into_shared();
@@ -6499,6 +6553,10 @@ mod tests {
                 .build();
             assert!(server.task_manager().is_some());
             assert!(server.capabilities().tasks.is_none());
+            assert!(
+                server.final_task_runtime().is_none(),
+                "quarantined task manager must not receive official Tasks"
+            );
         }
 
         #[test]
