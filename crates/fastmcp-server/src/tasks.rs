@@ -3324,7 +3324,7 @@ fn next_in_memory_final_task_recovery_id<'a>(
             task_ids
                 .iter()
                 .copied()
-                .find(|task_id| task_id > after_task_id && eligible(task_id))
+                .find(|task_id| *task_id > after_task_id && eligible(task_id))
         })
         .or_else(|| task_ids.into_iter().find(|task_id| eligible(task_id)))
         .cloned()

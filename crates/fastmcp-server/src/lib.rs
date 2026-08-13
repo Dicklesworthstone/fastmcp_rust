@@ -8534,7 +8534,7 @@ impl NativeHttp1Codec {
             self.pre_body_admission = NativeHttp1PreBodyAdmission::Complete;
             return Ok(());
         };
-        if raw_path == limits.authorization_path {
+        if raw_path == limits.authorization {
             let query = target.split_once('?').map_or("", |(_, query)| query);
             if query.len() > oauth::MAX_OAUTH_AUTHORIZATION_QUERY_BYTES {
                 return Err(Http1DecodeError::BodyTooLarge);
