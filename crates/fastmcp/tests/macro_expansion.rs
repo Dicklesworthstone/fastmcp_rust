@@ -1827,6 +1827,34 @@ fn tool_no_annotations_no_version_stays_none() {
     let def = handler.definition();
     assert!(def.version.is_none());
     assert!(def.annotations.is_none());
+    assert!(def.icon.is_none());
+}
+
+/// Tool with an explicit icon source.
+#[tool(icon = "https://example.com/tool.png")]
+fn icon_tool(_ctx: &McpContext) -> String {
+    "icon".to_string()
+}
+
+#[test]
+fn tool_icon_is_advertised_on_definition() {
+    let handler = IconTool;
+    let def = handler.definition();
+    assert_eq!(
+        def.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some("https://example.com/tool.png")
+    );
+    let final_icons = handler
+        .final_icons()
+        .expect("modern catalog must see the icon");
+    assert_eq!(final_icons.len(), 1);
+    assert_eq!(final_icons[0].src.as_str(), "https://example.com/tool.png");
+}
+
+#[test]
+fn tool_without_icon_does_not_invent_one() {
+    let def = PlainTool.definition();
+    assert!(def.icon.is_none());
 }
 
 /// Tool with annotations, version, and tags combined.
@@ -2414,6 +2442,31 @@ fn resource_version_and_tags() {
     let def = handler.definition();
     assert_eq!(def.version.as_deref(), Some("3.0.0"));
     assert_eq!(def.tags, vec!["monitoring", "metrics"]);
+    assert!(def.icon.is_none());
+}
+
+/// Resource with an explicit icon source.
+#[resource(uri = "data://icon", icon = "https://example.com/resource.svg")]
+fn icon_resource() -> String {
+    "icon-resource".to_string()
+}
+
+#[test]
+fn resource_icon_is_advertised_on_definition() {
+    let handler = IconResourceResource;
+    let def = handler.definition();
+    assert_eq!(
+        def.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some("https://example.com/resource.svg")
+    );
+    let final_icons = handler
+        .final_icons()
+        .expect("modern catalog must see the resource icon");
+    assert_eq!(final_icons.len(), 1);
+    assert_eq!(
+        final_icons[0].src.as_str(),
+        "https://example.com/resource.svg"
+    );
 }
 
 /// Resource with version only.
@@ -2482,6 +2535,36 @@ fn prompt_definition_arguments() {
     assert!(def.arguments[0].required);
     // No doc comment on parameter, so description is None
     assert!(def.arguments[0].description.is_none());
+    assert!(def.icon.is_none());
+}
+
+/// Prompt with an explicit icon source.
+#[prompt(icon = "https://example.com/prompt.png")]
+fn icon_prompt(name: String) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::Text {
+            text: format!("Greet {name}"),
+        },
+    }]
+}
+
+#[test]
+fn prompt_icon_is_advertised_on_definition() {
+    let handler = IconPromptPrompt;
+    let def = handler.definition();
+    assert_eq!(
+        def.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some("https://example.com/prompt.png")
+    );
+    let final_icons = handler
+        .final_icons()
+        .expect("modern catalog must see the prompt icon");
+    assert_eq!(final_icons.len(), 1);
+    assert_eq!(
+        final_icons[0].src.as_str(),
+        "https://example.com/prompt.png"
+    );
 }
 
 /// A greeting prompt with a default argument.

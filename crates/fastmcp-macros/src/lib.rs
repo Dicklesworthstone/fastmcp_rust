@@ -3660,6 +3660,8 @@ struct ToolAttrs {
     output_schema: Option<syn::Expr>,
     /// Tool version string (e.g., "1.0.0").
     version: Option<String>,
+    /// Optional icon source URL or data URI.
+    icon: Option<String>,
     /// Annotation flags: `read_only`, `idempotent`, `destructive`, `open_world_hint`.
     /// Each is a boolean hint: bare (`read_only`) means `true`, or set explicitly
     /// (`open_world_hint = false`).
@@ -3807,6 +3809,7 @@ impl Parse for ToolAttrs {
         let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut output_schema = None;
         let mut version = None;
+        let mut icon = None;
         let mut annotations_read_only = None;
         let mut annotations_idempotent = None;
         let mut annotations_destructive = None;
@@ -3848,6 +3851,10 @@ impl Parse for ToolAttrs {
                         return Err(syn::Error::new(ident.span(), "duplicate tasks opt-in"));
                     }
                     tasks = true;
+                }
+                "icon" => {
+                    input.parse::<Token![=]>()?;
+                    icon = Some(parse_icon_src(input)?);
                 }
                 "ui" => {
                     #[cfg(feature = "apps")]
@@ -3953,11 +3960,70 @@ impl Parse for ToolAttrs {
             defaults,
             output_schema,
             version,
+            icon,
             annotations_read_only,
             annotations_idempotent,
             annotations_destructive,
             annotations_open_world_hint,
         })
+    }
+}
+
+/// Parses and admits one icon source URI for `#[tool]`, `#[resource]`, and
+/// `#[prompt]`. The source must be a valid final `RawIcon` URI so the
+/// generated handler can advertise both the legacy singular icon and the
+/// modern icon set.
+fn parse_icon_src(input: ParseStream<'_>) -> syn::Result<String> {
+    let lit: LitStr = input.parse()?;
+    let src = lit.value();
+    fastmcp_protocol::common_types::RawIcon::try_new(&src)
+        .map_err(|error| syn::Error::new(lit.span(), format!("invalid icon URI: {error}")))?;
+    Ok(src)
+}
+
+fn generated_icon_field(icon: Option<&str>) -> TokenStream2 {
+    icon.map_or_else(
+        || quote! { None },
+        |src| quote! { Some(fastmcp_protocol::Icon::new(#src)) },
+    )
+}
+
+fn generated_icon_hooks(icon: Option<&str>) -> TokenStream2 {
+    let Some(src) = icon else {
+        return TokenStream2::new();
+    };
+    quote! {
+        fn icon(&self) -> Option<&fastmcp_protocol::Icon> {
+            static ICON: std::sync::OnceLock<fastmcp_protocol::Icon> = std::sync::OnceLock::new();
+            Some(ICON.get_or_init(|| fastmcp_protocol::Icon::new(#src)))
+        }
+
+        fn final_icons(&self) -> Option<&[fastmcp_protocol::common_types::RawIcon]> {
+            static ICONS: std::sync::OnceLock<Vec<fastmcp_protocol::common_types::RawIcon>> =
+                std::sync::OnceLock::new();
+            Some(
+                ICONS
+                    .get_or_init(|| {
+                        vec![fastmcp_protocol::common_types::RawIcon::try_new(#src)
+                            .expect("macro-validated icon source")]
+                    })
+                    .as_slice(),
+            )
+        }
+    }
+}
+
+fn generated_resource_icon_hooks(icon: Option<&str>) -> TokenStream2 {
+    let Some(src) = icon else {
+        return TokenStream2::new();
+    };
+    let shared = generated_icon_hooks(Some(src));
+    quote! {
+        #shared
+
+        fn final_template_icons(&self) -> Option<&[fastmcp_protocol::common_types::RawIcon]> {
+            self.final_icons()
+        }
     }
 }
 
@@ -4247,6 +4313,7 @@ mod schema_bound_tool_expansion_tests {
 /// - `name` - Override the tool name (default: function name)
 /// - `description` - Tool description (default: doc comment)
 /// - `tags` - List of tool tags for filtering (`tags = ["api", "read"]`)
+/// - `icon` - Icon source URL or data URI (`icon = "https://example.com/icon.png"`)
 /// - `output_schema` - An inline JSON object (legacy form), or a bare return
 ///   type path with `json_schema()` (typed result form)
 /// - `tasks` - With the `fastmcp-derive/tasks` feature enabled, opt a
@@ -4389,6 +4456,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         .version
         .as_ref()
         .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+    let icon_tokens = generated_icon_field(attrs.icon.as_deref());
+    let icon_hooks = generated_icon_hooks(attrs.icon.as_deref());
 
     // Generate annotations token
     let has_annotations = attrs.annotations_read_only.is_some()
@@ -4676,7 +4745,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                             "required": required,
                         }),
                         output_schema: #output_schema_field,
-                        icon: None,
+                        icon: #icon_tokens,
                         version: #version_tokens,
                         tags: vec![#(#tag_entries),*],
                         annotations: #annotations_tokens,
@@ -4684,6 +4753,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
 
                 #timeout_tokens
+
+                #icon_hooks
 
                 #output_schema_method
 
@@ -4713,6 +4784,7 @@ struct ResourceAttrs {
     mime_type: Option<String>,
     timeout: Option<String>,
     version: Option<String>,
+    icon: Option<String>,
     tags: Vec<String>,
 }
 
@@ -4724,6 +4796,7 @@ impl Parse for ResourceAttrs {
         let mut mime_type = None;
         let mut timeout = None;
         let mut version = None;
+        let mut icon = None;
         let mut tags = Vec::new();
 
         while !input.is_empty() {
@@ -4774,6 +4847,9 @@ impl Parse for ResourceAttrs {
                             let lit: LitStr = input.parse()?;
                             version = Some(lit.value());
                         }
+                        "icon" => {
+                            icon = Some(parse_icon_src(input)?);
+                        }
                         _ => {
                             return Err(syn::Error::new(ident.span(), "unknown attribute"));
                         }
@@ -4793,6 +4869,7 @@ impl Parse for ResourceAttrs {
             mime_type,
             timeout,
             version,
+            icon,
             tags,
         })
     }
@@ -4806,6 +4883,7 @@ impl Parse for ResourceAttrs {
 /// - `name` - Display name (default: function name)
 /// - `description` - Resource description (default: doc comment)
 /// - `mime_type` - MIME type (default: "text/plain")
+/// - `icon` - Icon source URL or data URI (`icon = "https://example.com/icon.png"`)
 #[proc_macro_attribute]
 #[allow(clippy::too_many_lines)]
 pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -4886,6 +4964,8 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         .version
         .as_ref()
         .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+    let icon_tokens = generated_icon_field(attrs.icon.as_deref());
+    let icon_hooks = generated_resource_icon_hooks(attrs.icon.as_deref());
 
     // Generate tags
     let tag_entries: Vec<TokenStream2> = attrs
@@ -5054,7 +5134,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #resource_name.to_string(),
                 description: #description_tokens,
                 mime_type: Some(#mime_type.to_string()),
-                icon: None,
+                icon: #icon_tokens,
                 version: #version_tokens,
                 tags: vec![#(#tag_entries),*],
             })
@@ -5130,7 +5210,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                         name: #resource_name.to_string(),
                         description: #description_tokens,
                         mime_type: Some(#mime_type.to_string()),
-                        icon: None,
+                        icon: #icon_tokens,
                         version: #version_tokens,
                         tags: vec![#(#tag_entries),*],
                     }
@@ -5141,6 +5221,8 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
 
                 #timeout_tokens
+
+                #icon_hooks
 
                 #execution_methods
 
@@ -5163,6 +5245,7 @@ struct PromptAttrs {
     timeout: Option<String>,
     defaults: HashMap<String, Lit>,
     version: Option<String>,
+    icon: Option<String>,
     tags: Vec<String>,
 }
 
@@ -5173,6 +5256,7 @@ impl Parse for PromptAttrs {
         let mut timeout = None;
         let mut defaults: HashMap<String, Lit> = HashMap::new();
         let mut version = None;
+        let mut icon = None;
         let mut tags = Vec::new();
 
         while !input.is_empty() {
@@ -5198,6 +5282,10 @@ impl Parse for PromptAttrs {
                     input.parse::<Token![=]>()?;
                     let lit: LitStr = input.parse()?;
                     version = Some(lit.value());
+                }
+                "icon" => {
+                    input.parse::<Token![=]>()?;
+                    icon = Some(parse_icon_src(input)?);
                 }
                 "tags" => {
                     input.parse::<Token![=]>()?;
@@ -5245,6 +5333,7 @@ impl Parse for PromptAttrs {
             timeout,
             defaults,
             version,
+            icon,
             tags,
         })
     }
@@ -5256,6 +5345,7 @@ impl Parse for PromptAttrs {
 ///
 /// - `name` - Override the prompt name (default: function name)
 /// - `description` - Prompt description (default: doc comment)
+/// - `icon` - Icon source URL or data URI (`icon = "https://example.com/icon.png"`)
 ///
 /// # Argument Defaults
 ///
@@ -5528,6 +5618,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         .version
         .as_ref()
         .map_or_else(|| quote! { None }, |v| quote! { Some(#v.to_string()) });
+    let icon_tokens = generated_icon_field(attrs.icon.as_deref());
+    let icon_hooks = generated_icon_hooks(attrs.icon.as_deref());
 
     // Generate tags
     let tag_entries: Vec<TokenStream2> = attrs
@@ -5557,13 +5649,15 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
                         name: #prompt_name.to_string(),
                         description: #description_tokens,
                         arguments: vec![#(#prompt_args),*],
-                        icon: None,
+                        icon: #icon_tokens,
                         version: #version_tokens,
                         tags: vec![#(#tag_entries),*],
                     }
                 }
 
                 #timeout_tokens
+
+                #icon_hooks
 
                 #execution_methods
 
