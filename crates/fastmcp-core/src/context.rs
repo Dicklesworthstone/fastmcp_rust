@@ -186,6 +186,92 @@ pub trait NotificationSender: Send + Sync {
         _message: Option<&str>,
     ) {
     }
+
+    /// Sends one `notifications/message` log frame to the client.
+    ///
+    /// The default emits nothing so progress-only senders stay inert. Server
+    /// dispatch installs a sender that writes the MCP log notification after
+    /// the client has selected a minimum level with `logging/setLevel`.
+    fn send_log(&self, _level: McpLogLevel, _logger: Option<&str>, _data: serde_json::Value) {}
+
+    /// Sends one catalog `list_changed` notification after a session mutation.
+    ///
+    /// The default emits nothing so progress-only senders stay inert. Server
+    /// dispatch installs a sender that writes the matching
+    /// `notifications/{tools,resources,prompts}/list_changed` frame.
+    fn send_catalog_changed(&self, _kind: McpCatalogKind) {}
+
+    /// Sends `notifications/resources/updated` for one subscribed URI.
+    ///
+    /// The default emits nothing. Server dispatch installs a sender that
+    /// writes the resource-update frame to the current session.
+    fn send_resource_updated(&self, _uri: &str) {}
+}
+
+/// Which MCP catalog changed after a session enable/disable mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpCatalogKind {
+    Tools,
+    Resources,
+    Prompts,
+}
+
+/// Publishes catalog and resource-update events to modern `subscriptions/listen`
+/// streams. Session JSON-RPC notifications stay on [`NotificationSender`].
+pub trait CatalogChangePublisher: Send + Sync {
+    /// Returns whether at least one live listener accepted the catalog event.
+    fn publish_catalog_changed(&self, kind: McpCatalogKind) -> bool;
+    /// Returns whether at least one live listener accepted the resource update.
+    fn publish_resource_updated(&self, uri: &str) -> bool;
+}
+
+/// MCP syslog-style log severity used by handler `ctx.info()` and friends.
+///
+/// Ranking matches the protocol `LogLevel` order: debug is lowest, emergency
+/// is highest. A server must not emit a notification until the client has
+/// selected a minimum level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpLogLevel {
+    Debug,
+    Info,
+    Notice,
+    Warning,
+    Error,
+    Critical,
+    Alert,
+    Emergency,
+}
+
+impl McpLogLevel {
+    /// Wire token used by `notifications/message`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Notice => "notice",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Critical => "critical",
+            Self::Alert => "alert",
+            Self::Emergency => "emergency",
+        }
+    }
+
+    /// Syslog-style rank used to compare a message against the client floor.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Debug => 1,
+            Self::Info => 2,
+            Self::Notice => 3,
+            Self::Warning => 4,
+            Self::Error => 5,
+            Self::Critical => 6,
+            Self::Alert => 7,
+            Self::Emergency => 8,
+        }
+    }
 }
 
 // ============================================================================
@@ -1263,6 +1349,17 @@ pub struct McpContext {
     client_capabilities: Option<ClientCapabilityInfo>,
     /// Server capability information.
     server_capabilities: Option<ServerCapabilityInfo>,
+    /// Optional log sender for `notifications/message`.
+    log_sender: Option<Arc<dyn NotificationSender>>,
+    /// Minimum severity the connected client asked to receive.
+    ///
+    /// `None` means the client has not sent `logging/setLevel`; MCP forbids
+    /// emitting log notifications until that floor exists.
+    min_log_level: Option<McpLogLevel>,
+    /// Resource URIs this session has subscribed to.
+    resource_subscriptions: Option<Arc<std::collections::HashSet<String>>>,
+    /// Optional publisher for modern `subscriptions/listen` catalog events.
+    catalog_publisher: Option<Arc<dyn CatalogChangePublisher>>,
 }
 
 impl std::fmt::Debug for McpContext {
@@ -1327,6 +1424,16 @@ impl std::fmt::Debug for McpContext {
             .field("tool_call_depth", &self.tool_call_depth)
             .field("client_capabilities", &self.client_capabilities)
             .field("server_capabilities", &self.server_capabilities)
+            .field("log_sender", &self.log_sender.is_some())
+            .field("min_log_level", &self.min_log_level)
+            .field(
+                "resource_subscription_count",
+                &self
+                    .resource_subscriptions
+                    .as_ref()
+                    .map_or(0, |uris| uris.len()),
+            )
+            .field("catalog_publisher", &self.catalog_publisher.is_some())
             .finish()
     }
 }
@@ -1438,6 +1545,10 @@ impl McpContext {
             tool_call_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
+            log_sender: None,
+            min_log_level: None,
+            resource_subscriptions: None,
+            catalog_publisher: None,
         }
     }
 
@@ -1472,6 +1583,10 @@ impl McpContext {
             tool_call_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
+            log_sender: None,
+            min_log_level: None,
+            resource_subscriptions: None,
+            catalog_publisher: None,
         }
     }
 
@@ -1507,6 +1622,10 @@ impl McpContext {
             tool_call_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
+            log_sender: None,
+            min_log_level: None,
+            resource_subscriptions: None,
+            catalog_publisher: None,
         }
     }
 
@@ -1546,6 +1665,10 @@ impl McpContext {
             tool_call_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
+            log_sender: None,
+            min_log_level: None,
+            resource_subscriptions: None,
+            catalog_publisher: None,
         }
     }
 
@@ -1558,6 +1681,40 @@ impl McpContext {
     #[must_use]
     pub fn with_progress_reporter(mut self, reporter: ProgressReporter) -> Self {
         self.progress_reporter = Some(reporter);
+        self
+    }
+
+    /// Installs the sender used by [`Self::info`] and the other log helpers.
+    #[must_use]
+    pub fn with_log_sender(mut self, sender: Arc<dyn NotificationSender>) -> Self {
+        self.log_sender = Some(sender);
+        self
+    }
+
+    /// Sets the client-selected minimum log level for this request.
+    ///
+    /// `None` keeps log notifications suppressed, matching MCP's rule that a
+    /// server must not emit `notifications/message` until `logging/setLevel`.
+    #[must_use]
+    pub fn with_min_log_level(mut self, level: Option<McpLogLevel>) -> Self {
+        self.min_log_level = level;
+        self
+    }
+
+    /// Records the resource URIs this session has subscribed to.
+    #[must_use]
+    pub fn with_resource_subscriptions(
+        mut self,
+        uris: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.resource_subscriptions = Some(Arc::new(uris.into_iter().map(Into::into).collect()));
+        self
+    }
+
+    /// Installs the modern `subscriptions/listen` catalog publisher.
+    #[must_use]
+    pub fn with_catalog_publisher(mut self, publisher: Arc<dyn CatalogChangePublisher>) -> Self {
+        self.catalog_publisher = Some(publisher);
         self
     }
 
@@ -2199,6 +2356,86 @@ impl McpContext {
         }
     }
 
+    /// Emits a debug `notifications/message` when the client asked for that floor.
+    pub fn debug(&self, message: impl AsRef<str>) {
+        self.log(McpLogLevel::Debug, message);
+    }
+
+    /// Emits an info `notifications/message` when the client asked for that floor.
+    pub fn info(&self, message: impl AsRef<str>) {
+        self.log(McpLogLevel::Info, message);
+    }
+
+    /// Emits a notice `notifications/message` when the client asked for that floor.
+    pub fn notice(&self, message: impl AsRef<str>) {
+        self.log(McpLogLevel::Notice, message);
+    }
+
+    /// Emits a warning `notifications/message` when the client asked for that floor.
+    pub fn warning(&self, message: impl AsRef<str>) {
+        self.log(McpLogLevel::Warning, message);
+    }
+
+    /// Emits an error `notifications/message` when the client asked for that floor.
+    pub fn error(&self, message: impl AsRef<str>) {
+        self.log(McpLogLevel::Error, message);
+    }
+
+    /// Emits one MCP log notification if the client floor admits `level`.
+    ///
+    /// Missing floor, missing sender, or a cancelled request are silent
+    /// no-ops so handlers can log without branching on transport wiring.
+    pub fn log(&self, level: McpLogLevel, message: impl AsRef<str>) {
+        self.log_data(
+            level,
+            serde_json::Value::String(message.as_ref().to_owned()),
+        );
+    }
+
+    /// Emits one MCP log notification with caller-owned JSON data.
+    pub fn log_data(&self, level: McpLogLevel, data: serde_json::Value) {
+        if self.ensure_live().is_err() {
+            return;
+        }
+        let Some(min_level) = self.min_log_level else {
+            return;
+        };
+        if level.rank() < min_level.rank() {
+            return;
+        }
+        if let Some(sender) = self.log_sender.as_ref() {
+            sender.send_log(level, Some("fastmcp"), data);
+        }
+    }
+
+    /// Notifies subscribers that `uri` changed.
+    ///
+    /// Returns `true` when a 2024 session subscriber received
+    /// `notifications/resources/updated` or at least one modern
+    /// `subscriptions/listen` stream accepted the event.
+    pub fn notify_resource_updated(&self, uri: impl AsRef<str>) -> bool {
+        if self.ensure_live().is_err() {
+            return false;
+        }
+        let uri = uri.as_ref();
+        let mut delivered = false;
+        if self
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| uris.contains(uri))
+            && let Some(sender) = self.log_sender.as_ref()
+        {
+            sender.send_resource_updated(uri);
+            delivered = true;
+        }
+        if let Some(publisher) = self.catalog_publisher.as_ref()
+            && publisher.publish_resource_updated(uri)
+        {
+            delivered = true;
+        }
+        delivered
+    }
+
     /// Returns a reference to the underlying asupersync Cx.
     ///
     /// Use this when you need direct access to asupersync primitives,
@@ -2654,14 +2891,14 @@ impl McpContext {
     /// }
     /// ```
     pub fn disable_tool(&self, name: impl Into<String>) -> bool {
-        self.add_to_disabled_set(Self::DISABLED_TOOLS_KEY, name.into())
+        self.add_to_disabled_set(Self::DISABLED_TOOLS_KEY, name.into(), McpCatalogKind::Tools)
     }
 
     /// Enables a previously disabled tool for this session.
     ///
     /// Returns `true` if the operation succeeded, `false` if session state is unavailable.
     pub fn enable_tool(&self, name: &str) -> bool {
-        self.remove_from_disabled_set(Self::DISABLED_TOOLS_KEY, name)
+        self.remove_from_disabled_set(Self::DISABLED_TOOLS_KEY, name, McpCatalogKind::Tools)
     }
 
     /// Returns whether a tool is enabled (not disabled) for this session.
@@ -2679,14 +2916,18 @@ impl McpContext {
     ///
     /// Returns `true` if the operation succeeded, `false` if session state is unavailable.
     pub fn disable_resource(&self, uri: impl Into<String>) -> bool {
-        self.add_to_disabled_set(Self::DISABLED_RESOURCES_KEY, uri.into())
+        self.add_to_disabled_set(
+            Self::DISABLED_RESOURCES_KEY,
+            uri.into(),
+            McpCatalogKind::Resources,
+        )
     }
 
     /// Enables a previously disabled resource for this session.
     ///
     /// Returns `true` if the operation succeeded, `false` if session state is unavailable.
     pub fn enable_resource(&self, uri: &str) -> bool {
-        self.remove_from_disabled_set(Self::DISABLED_RESOURCES_KEY, uri)
+        self.remove_from_disabled_set(Self::DISABLED_RESOURCES_KEY, uri, McpCatalogKind::Resources)
     }
 
     /// Returns whether a resource is enabled (not disabled) for this session.
@@ -2705,14 +2946,18 @@ impl McpContext {
     ///
     /// Returns `true` if the operation succeeded, `false` if session state is unavailable.
     pub fn disable_prompt(&self, name: impl Into<String>) -> bool {
-        self.add_to_disabled_set(Self::DISABLED_PROMPTS_KEY, name.into())
+        self.add_to_disabled_set(
+            Self::DISABLED_PROMPTS_KEY,
+            name.into(),
+            McpCatalogKind::Prompts,
+        )
     }
 
     /// Enables a previously disabled prompt for this session.
     ///
     /// Returns `true` if the operation succeeded, `false` if session state is unavailable.
     pub fn enable_prompt(&self, name: &str) -> bool {
-        self.remove_from_disabled_set(Self::DISABLED_PROMPTS_KEY, name)
+        self.remove_from_disabled_set(Self::DISABLED_PROMPTS_KEY, name, McpCatalogKind::Prompts)
     }
 
     /// Returns whether a prompt is enabled (not disabled) for this session.
@@ -2742,7 +2987,7 @@ impl McpContext {
     }
 
     // Helper: Add a name to a disabled set
-    fn add_to_disabled_set(&self, key: &str, name: String) -> bool {
+    fn add_to_disabled_set(&self, key: &str, name: String, kind: McpCatalogKind) -> bool {
         if self.ensure_live().is_err() {
             return false;
         }
@@ -2750,12 +2995,16 @@ impl McpContext {
             return false;
         };
         let mut set: std::collections::HashSet<String> = state.get(key).unwrap_or_default();
-        set.insert(name);
-        state.set(key, set)
+        let changed = set.insert(name);
+        let stored = state.set(key, set);
+        if stored && changed {
+            self.emit_catalog_changed(kind);
+        }
+        stored
     }
 
     // Helper: Remove a name from a disabled set
-    fn remove_from_disabled_set(&self, key: &str, name: &str) -> bool {
+    fn remove_from_disabled_set(&self, key: &str, name: &str, kind: McpCatalogKind) -> bool {
         if self.ensure_live().is_err() {
             return false;
         }
@@ -2763,8 +3012,21 @@ impl McpContext {
             return false;
         };
         let mut set: std::collections::HashSet<String> = state.get(key).unwrap_or_default();
-        set.remove(name);
-        state.set(key, set)
+        let changed = set.remove(name);
+        let stored = state.set(key, set);
+        if stored && changed {
+            self.emit_catalog_changed(kind);
+        }
+        stored
+    }
+
+    fn emit_catalog_changed(&self, kind: McpCatalogKind) {
+        if let Some(sender) = self.log_sender.as_ref() {
+            sender.send_catalog_changed(kind);
+        }
+        if let Some(publisher) = self.catalog_publisher.as_ref() {
+            let _ = publisher.publish_catalog_changed(kind);
+        }
     }
 
     // Helper: Check if a name is in a disabled set
@@ -4198,6 +4460,121 @@ mod tests {
     fn test_cancelled_error_display() {
         let err = CancelledError;
         assert_eq!(err.to_string(), "request cancelled");
+    }
+
+    #[test]
+    fn handler_log_respects_client_floor_and_missing_floor() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        struct CaptureSender(Arc<Mutex<Vec<(McpLogLevel, String)>>>);
+        impl NotificationSender for CaptureSender {
+            fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {}
+            fn send_log(&self, level: McpLogLevel, _logger: Option<&str>, data: serde_json::Value) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((level, data.as_str().unwrap_or_default().to_owned()));
+            }
+        }
+
+        let silent = McpContext::new(Cx::for_testing(), 1)
+            .with_log_sender(Arc::new(CaptureSender(Arc::clone(&captured))));
+        silent.info("before-floor");
+        assert!(captured.lock().expect("lock").is_empty());
+
+        let ctx = silent.with_min_log_level(Some(McpLogLevel::Info));
+        ctx.debug("too-low");
+        ctx.info("admitted");
+        ctx.warning("also-admitted");
+        let emitted = captured.lock().expect("lock").clone();
+        assert_eq!(
+            emitted,
+            vec![
+                (McpLogLevel::Info, "admitted".to_owned()),
+                (McpLogLevel::Warning, "also-admitted".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_change_emits_only_when_the_disabled_set_mutates() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        struct CaptureSender(Arc<Mutex<Vec<McpCatalogKind>>>);
+        impl NotificationSender for CaptureSender {
+            fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {}
+            fn send_catalog_changed(&self, kind: McpCatalogKind) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(kind);
+            }
+        }
+
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
+            .with_log_sender(Arc::new(CaptureSender(Arc::clone(&captured))));
+        assert!(ctx.disable_tool("admin"));
+        assert!(ctx.disable_tool("admin"));
+        assert!(ctx.enable_tool("admin"));
+        assert!(ctx.enable_tool("admin"));
+        assert!(ctx.disable_resource("file://secret"));
+        assert!(ctx.disable_prompt("hidden"));
+        assert_eq!(
+            *captured.lock().expect("lock"),
+            vec![
+                McpCatalogKind::Tools,
+                McpCatalogKind::Tools,
+                McpCatalogKind::Resources,
+                McpCatalogKind::Prompts,
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_publisher_receives_mutations_even_without_a_session_sender() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        struct CapturePublisher(Arc<Mutex<Vec<McpCatalogKind>>>);
+        impl CatalogChangePublisher for CapturePublisher {
+            fn publish_catalog_changed(&self, kind: McpCatalogKind) -> bool {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(kind);
+                true
+            }
+            fn publish_resource_updated(&self, _uri: &str) -> bool {
+                false
+            }
+        }
+
+        let ctx = McpContext::with_state(Cx::for_testing(), 1, SessionState::new())
+            .with_catalog_publisher(Arc::new(CapturePublisher(Arc::clone(&captured))));
+        assert!(ctx.disable_tool("admin"));
+        assert!(ctx.disable_tool("admin"));
+        assert_eq!(*captured.lock().expect("lock"), vec![McpCatalogKind::Tools]);
+    }
+
+    #[test]
+    fn notify_resource_updated_requires_a_live_subscription() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        struct CaptureSender(Arc<Mutex<Vec<String>>>);
+        impl NotificationSender for CaptureSender {
+            fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {}
+            fn send_resource_updated(&self, uri: &str) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(uri.to_owned());
+            }
+        }
+
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_log_sender(Arc::new(CaptureSender(Arc::clone(&captured))))
+            .with_resource_subscriptions(["file:///watched.txt"]);
+        assert!(!ctx.notify_resource_updated("file:///other.txt"));
+        assert!(ctx.notify_resource_updated("file:///watched.txt"));
+        assert_eq!(
+            *captured.lock().expect("lock"),
+            vec!["file:///watched.txt".to_owned()]
+        );
     }
 
     #[test]
