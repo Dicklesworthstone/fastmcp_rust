@@ -326,15 +326,16 @@ pub use asupersync::{LabConfig, LabRuntime};
 
 // Re-export core types
 pub use fastmcp_core::{
-    AccessToken, AuthContext, Budget, CancelledError, ClientCapabilityInfo, ClientRoot, Cx,
-    ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
-    IntoOutcome, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard,
-    McpError, McpErrorCode, McpOutcome, McpRequestCancellation, McpResult, NoOpElicitationSender,
-    NoOpNotificationSender, NoOpSamplingSender, Outcome, OutcomeExt, ProgressReporter, RegionId,
-    ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt, RootsProvider,
-    SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
-    SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
-    ToolContentItem, cancelled, err, ok,
+    AccessToken, AuthContext, Budget, CancelledError, CatalogChangePublisher, ClientCapabilityInfo,
+    ClientRoot, Cx, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
+    ElicitationSender, IntoOutcome, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind,
+    McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpLogLevel, McpOutcome,
+    McpRequestCancellation, McpResult, NoOpElicitationSender, NoOpNotificationSender,
+    NoOpSamplingSender, Outcome, OutcomeExt, ProgressReporter, RegionId, ResourceContentItem,
+    ResourceReadResult, ResourceReader, ResultExt, RootsProvider, SamplingRequest,
+    SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
+    Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller, ToolContentItem, cancelled,
+    err, ok,
 };
 pub use fastmcp_core::{
     DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
@@ -664,8 +665,8 @@ pub use fastmcp_server::{
     PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
     Router, ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
     ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
-    StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
-    ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+    StaticTokenVerifier, StatsSnapshot, SubscriptionListenHandle, TagFilters, TokenAuthProvider,
+    TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
     TransportRootsProvider, TransportSamplingSender, create_context_with_progress,
     create_context_with_progress_and_senders,
 };
@@ -1656,6 +1657,16 @@ pub mod auto {
             self.inner.publish_subscription_notification(notification)
         }
 
+        pub fn open_subscription_listen(
+            &self,
+            subscription_id: crate::RequestId,
+            notifications: crate::SubscriptionFilter,
+            notification_sender: crate::NotificationSender,
+        ) -> McpResult<fastmcp_server::SubscriptionListenHandle> {
+            self.inner
+                .open_subscription_listen(subscription_id, notifications, notification_sender)
+        }
+
         #[cfg(feature = "tasks")]
         pub fn publish_task_status_notification(
             &self,
@@ -1859,10 +1870,10 @@ pub mod modern {
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_RESOURCE_READ_DEPTH,
-        MAX_TOOL_CALL_DEPTH, McpContext, McpContextLeaseGuard, McpError, McpOutcome, McpResult,
-        NoOpNotificationSender, NotificationSender, Outcome, ProgressReporter, ResourceContentItem,
-        ResourceReadResult, ResourceReader, RootsProvider, ServerCapabilityInfo, ToolCallResult,
-        ToolCaller, ToolContentItem,
+        MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext, McpContextLeaseGuard, McpError,
+        McpLogLevel, McpOutcome, McpResult, NoOpNotificationSender, NotificationSender, Outcome,
+        ProgressReporter, ResourceContentItem, ResourceReadResult, ResourceReader, RootsProvider,
+        ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
@@ -3930,6 +3941,17 @@ pub mod modern {
             self.inner.publish_subscription_notification(notification)
         }
 
+        /// Opens one in-process `subscriptions/listen` stream.
+        pub fn open_subscription_listen(
+            &self,
+            subscription_id: RequestId,
+            notifications: SubscriptionFilter,
+            notification_sender: crate::NotificationSender,
+        ) -> McpResult<fastmcp_server::SubscriptionListenHandle> {
+            self.inner
+                .open_subscription_listen(subscription_id, notifications, notification_sender)
+        }
+
         /// Publishes one typed final Tasks status notification.
         #[cfg(feature = "tasks")]
         pub fn publish_task_status_notification(
@@ -5733,6 +5755,7 @@ pub mod prelude {
         CancellationWireCodecError,
         CancellationWireMessage,
         CanonicalHttpUrl,
+        CatalogChangePublisher,
         Client,
         ClientBuilder,
         ClientCapabilities,
@@ -5829,9 +5852,11 @@ pub mod prelude {
         JsonValue,
         ListPageLimits,
         LoggingConfig,
+        McpCatalogKind,
         McpConfig,
         McpContext,
         McpError,
+        McpLogLevel,
         McpOutcome,
         McpResult,
         MemoryRecvHalf,
@@ -5896,6 +5921,7 @@ pub mod prelude {
         StreamableHttpRequestResponseSender,
         SubscriptionFilter,
         SubscriptionListenCollector,
+        SubscriptionListenHandle,
         TemplateValue,
         TemplateValues,
         TokenAuthProvider,
