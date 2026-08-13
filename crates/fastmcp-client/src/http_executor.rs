@@ -45,8 +45,10 @@ use fastmcp_protocol::tasks_extension::{
 };
 use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
-    CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCoreResult, FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
+    CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, ElicitRequestParams, ElicitResult,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalCreateMessageParams,
+    FinalCreateMessageResult, FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult,
+    FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
@@ -108,6 +110,10 @@ pub const MAX_MODERN_HTTP_PROBE_BODY_BYTES: usize = 64 * 1024;
 /// This is independent of the per-event [`SseLimits`] bound: one valid body
 /// frame can contain many individually valid events.
 pub const MAX_PENDING_MODERN_HTTP_SSE_EVENTS: usize = 128;
+
+/// Maximum interleaved notifications and reverse requests accepted while one
+/// modern HTTP request waits for its correlated terminal response on SSE.
+const MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES: usize = 64;
 
 /// Maximum UTF-8 encoded bytes retained by pending modern HTTP SSE payloads
 /// from one or more native body frames before a caller receives the next
@@ -190,6 +196,7 @@ pub struct ModernHttpRequest {
     method: String,
     name: Option<String>,
     authorization: Option<String>,
+    include_method_header: bool,
 }
 
 impl fmt::Debug for ModernHttpRequest {
@@ -201,6 +208,7 @@ impl fmt::Debug for ModernHttpRequest {
             .field("method", &self.method)
             .field("name", &self.name)
             .field("body_bytes", &self.body.len())
+            .field("include_method_header", &self.include_method_header)
             .field(
                 "authorization",
                 &self.authorization.as_ref().map(|_| "<redacted>"),
@@ -238,6 +246,38 @@ impl ModernHttpRequest {
             method,
             name,
             authorization: None,
+            include_method_header: true,
+        })
+    }
+
+    /// POSTs one JSON-RPC response answering a server-initiated reverse request.
+    ///
+    /// Reverse-response POSTs omit `Mcp-Method` because they are not client
+    /// requests. The body is the exact JSON-RPC response envelope.
+    pub fn for_jsonrpc_response(
+        target: impl Into<String>,
+        protocol_version: impl Into<String>,
+        body: Vec<u8>,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        let target = target.into();
+        let protocol_version = protocol_version.into();
+        if target.is_empty() || protocol_version.is_empty() {
+            return Err(ModernHttpExecutorError::InvalidRequestMetadata);
+        }
+        if [target.as_str(), protocol_version.as_str()]
+            .into_iter()
+            .any(contains_header_control)
+        {
+            return Err(ModernHttpExecutorError::InvalidRequestMetadata);
+        }
+        Ok(Self {
+            target,
+            body,
+            protocol_version,
+            method: String::new(),
+            name: None,
+            authorization: None,
+            include_method_header: false,
         })
     }
 
@@ -288,8 +328,10 @@ impl ModernHttpRequest {
                 "MCP-Protocol-Version".to_owned(),
                 self.protocol_version.clone(),
             ),
-            ("Mcp-Method".to_owned(), self.method.clone()),
         ];
+        if self.include_method_header {
+            headers.push(("Mcp-Method".to_owned(), self.method.clone()));
+        }
         if let Some(name) = &self.name {
             headers.push(("Mcp-Name".to_owned(), name.clone()));
         }
@@ -2056,6 +2098,7 @@ pub struct ModernHttpClient {
     /// property instead of a convention.
     discovery_state: Arc<ModernHttpDiscoveryState>,
     executor: ModernHttpExecutor,
+    reverse_request_handlers: ReverseRequestHandlers,
 }
 
 #[derive(Clone)]
@@ -3028,6 +3071,20 @@ impl ClientHttpConnection {
         Ok(())
     }
 
+    /// Installs modern reverse-request handlers on a selected modern HTTP client.
+    pub fn set_modern_reverse_request_handlers(
+        &mut self,
+        handlers: ReverseRequestHandlers,
+    ) -> fastmcp_core::McpResult<()> {
+        let Self::Modern(client) = self else {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "modern reverse request handlers require the modern HTTP transport",
+            ));
+        };
+        client.reverse_request_handlers = handlers;
+        Ok(())
+    }
+
     /// Sends one active client request through the selected transport.
     ///
     /// Modern requests execute as one stateless final POST. Exact legacy
@@ -3420,47 +3477,155 @@ impl ClientHttpConnection {
             }
             ClientHttpResponse::Modern(response) => {
                 let kind = response.metadata().kind();
-                if !matches!(kind, ModernHttpResponseKind::Json) {
-                    return Err(ClientHttpConnectionError::ExpectedJsonResponse { actual: kind });
-                }
-                let body = match cancellation {
-                    Some(cancellation) => {
-                        response
-                            .read_to_end_with_cancellation(cx, cancellation, maximum_response_bytes)
-                            .await
+                match kind {
+                    ModernHttpResponseKind::Json => {
+                        let body = match cancellation {
+                            Some(cancellation) => {
+                                response
+                                    .read_to_end_with_cancellation(
+                                        cx,
+                                        cancellation,
+                                        maximum_response_bytes,
+                                    )
+                                    .await
+                            }
+                            None => response.read_to_end(cx, maximum_response_bytes).await,
+                        }
+                        .map_err(|error| {
+                            ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+                                error,
+                            ))
+                        })?;
+                        admit_modern_json_response_body(&body, &request_id, maximum_response_bytes)
                     }
-                    None => response.read_to_end(cx, maximum_response_bytes).await,
+                    ModernHttpResponseKind::Sse => {
+                        self.drain_modern_sse_json_response(
+                            cx,
+                            cancellation,
+                            response,
+                            request_id,
+                            maximum_response_bytes,
+                        )
+                        .await
+                    }
+                    actual => Err(ClientHttpConnectionError::ExpectedJsonResponse { actual }),
                 }
-                .map_err(|error| {
-                    ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
-                })?;
-                let message = decode_strict_jsonrpc_message(&body, maximum_response_bytes)
-                    .map_err(ClientHttpConnectionError::ResponseAdmission)?;
-                let JsonRpcMessage::Response(response) = message else {
+            }
+        }
+    }
+
+    async fn drain_modern_sse_json_response(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        response: ModernHttpResponseStream,
+        request_id: RequestId,
+        maximum_response_bytes: usize,
+    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+        let Self::Modern(client) = self else {
+            return Err(ClientHttpConnectionError::ExpectedJsonResponse {
+                actual: ModernHttpResponseKind::Sse,
+            });
+        };
+        let limits = SseLimits::new(
+            maximum_response_bytes.max(1_024),
+            maximum_response_bytes.max(4_096),
+            32,
+        )
+        .ok_or(ClientHttpConnectionError::ExpectedJsonResponse {
+            actual: ModernHttpResponseKind::Sse,
+        })?;
+        let mut stream = response.into_sse_stream(limits).map_err(|error| {
+            ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
+        })?;
+        let mut interleaved_control_frames = 0_usize;
+        loop {
+            if cx.checkpoint().is_err()
+                || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            {
+                return Err(ClientHttpConnectionError::Modern(
+                    ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled),
+                ));
+            }
+            let event = match stream.next_event(cx).await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
                     return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
                         request_id,
                     });
-                };
-                let admission = decode_strict_jsonrpc_response(&body, maximum_response_bytes)
-                    .map_err(ClientHttpConnectionError::ResponseAdmission)?;
-                let receipt = Instant::now();
-                if admission.response() != &response {
-                    return Err(ClientHttpConnectionError::ResponseAdmission(
-                        JsonRpcAdmissionError::InvalidEnvelope,
+                }
+                Err(error) => {
+                    return Err(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::Executor(error),
                     ));
                 }
-                if !response
-                    .id
-                    .as_ref()
-                    .is_some_and(|response_id| response_id.correlates_with(&request_id))
-                {
-                    return Err(ClientHttpConnectionError::ResponseIdMismatch {
-                        expected: request_id,
-                        actual: response.id,
-                    });
+            };
+            let message = decode_strict_jsonrpc_message(event.as_bytes(), maximum_response_bytes)
+                .map_err(ClientHttpConnectionError::ResponseAdmission)?;
+            match message {
+                JsonRpcMessage::Response(response) => {
+                    if !response
+                        .id
+                        .as_ref()
+                        .is_some_and(|response_id| response_id.correlates_with(&request_id))
+                    {
+                        return Err(ClientHttpConnectionError::ResponseIdMismatch {
+                            expected: request_id,
+                            actual: response.id,
+                        });
+                    }
+                    return admit_modern_json_response_body(
+                        event.as_bytes(),
+                        &request_id,
+                        maximum_response_bytes,
+                    );
                 }
-                let (_, result_source) = admission.into_parts();
-                Ok((response, result_source, receipt))
+                JsonRpcMessage::Request(request) if request.is_notification() => {
+                    interleaved_control_frames = interleaved_control_frames.checked_add(1).ok_or(
+                        ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
+                            limit: MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES,
+                        },
+                    )?;
+                    if interleaved_control_frames > MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES {
+                        return Err(
+                            ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
+                                limit: MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES,
+                            },
+                        );
+                    }
+                }
+                JsonRpcMessage::Request(server_request) => {
+                    interleaved_control_frames = interleaved_control_frames.checked_add(1).ok_or(
+                        ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
+                            limit: MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES,
+                        },
+                    )?;
+                    if interleaved_control_frames > MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES {
+                        return Err(
+                            ClientHttpConnectionError::LegacyInterleavedControlFrameLimitExceeded {
+                                limit: MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES,
+                            },
+                        );
+                    }
+                    let Some(reverse_response) = modern_http_server_request_response(
+                        cx,
+                        &client.reverse_request_handlers,
+                        &server_request,
+                    ) else {
+                        return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
+                            request_id,
+                        });
+                    };
+                    let JsonRpcMessage::Response(reverse_response) = reverse_response else {
+                        return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
+                            request_id,
+                        });
+                    };
+                    client
+                        .post_jsonrpc_response(cx, &reverse_response)
+                        .await
+                        .map_err(ClientHttpConnectionError::Modern)?;
+                }
             }
         }
     }
@@ -3961,6 +4126,114 @@ fn legacy_http_server_request_response(
     }
 }
 
+fn admit_modern_json_response_body(
+    body: &[u8],
+    request_id: &RequestId,
+    maximum_response_bytes: usize,
+) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+    let message = decode_strict_jsonrpc_message(body, maximum_response_bytes)
+        .map_err(ClientHttpConnectionError::ResponseAdmission)?;
+    let JsonRpcMessage::Response(response) = message else {
+        return Err(ClientHttpConnectionError::UnexpectedResponseMessage {
+            request_id: request_id.clone(),
+        });
+    };
+    let admission = decode_strict_jsonrpc_response(body, maximum_response_bytes)
+        .map_err(ClientHttpConnectionError::ResponseAdmission)?;
+    let receipt = Instant::now();
+    if admission.response() != &response {
+        return Err(ClientHttpConnectionError::ResponseAdmission(
+            JsonRpcAdmissionError::InvalidEnvelope,
+        ));
+    }
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(request_id))
+    {
+        return Err(ClientHttpConnectionError::ResponseIdMismatch {
+            expected: request_id.clone(),
+            actual: response.id,
+        });
+    }
+    let (_, result_source) = admission.into_parts();
+    Ok((response, result_source, receipt))
+}
+
+/// Answers one modern server-initiated request received on a request-owned SSE
+/// body by invoking the matching typed reverse handler.
+fn modern_http_server_request_response(
+    cx: &Cx,
+    handlers: &ReverseRequestHandlers,
+    request: &JsonRpcRequest,
+) -> Option<JsonRpcMessage> {
+    let request_id = request.id.clone()?;
+    if request.method.starts_with("notifications/") {
+        return crate::invalid_notification_request_response(request);
+    }
+    if request.method == "ping" {
+        return Some(JsonRpcMessage::Response(JsonRpcResponse::success(
+            request_id,
+            serde_json::json!({}),
+        )));
+    }
+    match request.method.as_str() {
+        "sampling/createMessage" => {
+            let Some(handler) = handlers.modern_sampling_create_message.as_ref() else {
+                return crate::method_not_found_response(request);
+            };
+            let result = crate::decode_reverse_request_params::<FinalCreateMessageParams>(request)
+                .and_then(|params| {
+                    crate::invoke_locked_reverse_request_handler(
+                        cx,
+                        handler,
+                        ReverseRequestCancellation::new(),
+                        params,
+                    )
+                });
+            Some(crate::reverse_request_response::<FinalCreateMessageResult>(
+                request_id, result,
+            ))
+        }
+        "roots/list" => {
+            let Some(handler) = handlers.modern_roots_list.as_ref() else {
+                return crate::method_not_found_response(request);
+            };
+            let result =
+                crate::decode_reverse_request_params::<FinalEmbeddedRootsListParams>(request)
+                    .and_then(|params| {
+                        crate::invoke_locked_reverse_request_handler(
+                            cx,
+                            handler,
+                            ReverseRequestCancellation::new(),
+                            params,
+                        )
+                    });
+            Some(crate::reverse_request_response::<
+                FinalEmbeddedRootsListResult,
+            >(request_id, result))
+        }
+        "elicitation/create" => {
+            let Some(handler) = handlers.modern_elicitation_create.as_ref() else {
+                return crate::method_not_found_response(request);
+            };
+            let result = crate::decode_reverse_request_params::<ElicitRequestParams>(request)
+                .and_then(|params| {
+                    crate::invoke_locked_reverse_request_handler(
+                        cx,
+                        handler,
+                        ReverseRequestCancellation::new(),
+                        params,
+                    )
+                });
+            Some(crate::reverse_request_response::<ElicitResult>(
+                request_id, result,
+            ))
+        }
+        _ => crate::method_not_found_response(request),
+    }
+}
+
 fn reject_final_only_legacy_request_metadata(
     parameters: &serde_json::Value,
 ) -> Result<(), ClientHttpConnectionError> {
@@ -3986,6 +4259,13 @@ fn reject_final_only_legacy_request_metadata(
 pub enum ModernHttpClientError {
     /// A public constructor selected a protocol policy compiled out of this client.
     FeatureUnavailable(McpError),
+    /// A modern reverse request could not be dispatched or encoded.
+    ReverseRequestDispatch(McpError),
+    /// The reverse-response POST was not accepted by the peer.
+    ReverseResponsePostRejected {
+        /// HTTP status observed on the reverse-response POST.
+        status: u16,
+    },
     /// The supplied plan has no configured modern HTTP POST target.
     MissingModernPostTarget,
     /// A normal modern request requires object parameters so final metadata can
@@ -4113,6 +4393,11 @@ impl fmt::Display for ModernHttpClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FeatureUnavailable(error) => error.fmt(formatter),
+            Self::ReverseRequestDispatch(error) => error.fmt(formatter),
+            Self::ReverseResponsePostRejected { status } => write!(
+                formatter,
+                "modern HTTP reverse-response POST was rejected with status {status}"
+            ),
             Self::MissingModernPostTarget => {
                 formatter.write_str("the protocol plan has no modern MCP POST target")
             }
@@ -4254,6 +4539,7 @@ impl std::error::Error for ModernHttpClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::FeatureUnavailable(error) => Some(error),
+            Self::ReverseRequestDispatch(error) => Some(error),
             Self::Executor(error) => Some(error),
             Self::Negotiation(error) => Some(error),
             #[cfg(feature = "legacy-2024-11-05")]
@@ -4262,6 +4548,7 @@ impl std::error::Error for ModernHttpClientError {
             Self::InvalidJsonRpcResponse(error) => Some(error),
             Self::TypedResult(error) => Some(error),
             Self::MissingModernPostTarget
+            | Self::ReverseResponsePostRejected { .. }
             | Self::RequestParametersMustBeObject
             | Self::MissingRequestName { .. }
             | Self::UnsupportedFinalMethod { .. }
@@ -4443,6 +4730,7 @@ impl ModernHttpClient {
                         negotiated_extensions,
                     }),
                     executor: ModernHttpExecutor::new(),
+                    reverse_request_handlers: ReverseRequestHandlers::new(),
                 }))
             }
             #[cfg(feature = "legacy-2024-11-05")]
@@ -4471,6 +4759,38 @@ impl ModernHttpClient {
     #[must_use]
     pub fn modern_post_target(&self) -> &str {
         &self.modern_post_target
+    }
+
+    async fn post_jsonrpc_response(
+        &self,
+        cx: &Cx,
+        response: &JsonRpcResponse,
+    ) -> Result<(), ModernHttpClientError> {
+        let body = serde_json::to_vec(response).map_err(|_| {
+            ModernHttpClientError::ReverseRequestDispatch(McpError::internal_error(
+                "modern reverse response could not serialize",
+            ))
+        })?;
+        let request = ModernHttpRequest::for_jsonrpc_response(
+            &self.modern_post_target,
+            MODERN_PROTOCOL_VERSION,
+            body,
+        )
+        .map_err(ModernHttpClientError::Executor)?;
+        let response = self
+            .executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let status = response.metadata().status();
+        let _ = response
+            .read_to_end(cx, 4_096)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        if status != 202 && status != 200 {
+            return Err(ModernHttpClientError::ReverseResponsePostRejected { status });
+        }
+        Ok(())
     }
 
     /// Returns the exact typed discovery result that selected modern HTTP.
@@ -9830,6 +10150,111 @@ mod tests {
         server
             .join()
             .expect("missing-resultType modern server must join");
+    }
+
+    #[test]
+    fn modern_http_answers_sampling_reverse_request_on_sse_and_completes_tools_list() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind modern HTTP reverse-sampling listener");
+        let address = listener
+            .local_addr()
+            .expect("read modern HTTP reverse-sampling address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept modern discovery");
+            let discovery_request = read_request(&mut discovery);
+            assert!(discovery_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-http-reverse","version":"1.0"}}}}"#,
+            );
+
+            let (mut listed, _) = listener.accept().expect("accept modern tools/list");
+            let list_request = read_request(&mut listed);
+            assert!(list_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            let list_body = serde_json::from_slice::<serde_json::Value>(&list_request.body)
+                .expect("tools/list is JSON-RPC");
+            assert_eq!(list_body["method"], "tools/list");
+            begin_chunked_sse(&mut listed);
+            write_chunked_sse_event(
+                &mut listed,
+                "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"sampling/createMessage\",\"params\":{\"_meta\":{},\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"hello\"}}],\"maxTokens\":8}}\n\n",
+            );
+
+            let (mut reverse, _) = listener
+                .accept()
+                .expect("accept modern reverse-response POST");
+            let reverse_request = read_request(&mut reverse);
+            assert!(reverse_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert!(
+                !reverse_request.head.contains("Mcp-Method:"),
+                "reverse-response POST must omit Mcp-Method: {}",
+                reverse_request.head
+            );
+            let reverse_body = serde_json::from_slice::<serde_json::Value>(&reverse_request.body)
+                .expect("reverse response is JSON-RPC");
+            assert_eq!(reverse_body["id"], 99);
+            assert_eq!(
+                reverse_body["result"]["model"],
+                serde_json::json!("modern-http-model")
+            );
+            write_response(&mut reverse, 202, "application/json", b"");
+
+            write_chunked_sse_event(
+                &mut listed,
+                "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[],\"ttlMs\":0,\"cacheScope\":\"private\"}}\n\n",
+            );
+            finish_chunked_sse(&mut listed);
+        });
+
+        let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
+            |_cx, _cancellation, params| {
+                Box::pin(async move {
+                    assert_eq!(params.max_tokens.to_string(), "8");
+                    Ok(fastmcp_protocol::FinalCreateMessageResult {
+                        content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                            fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                                text: "sampled".to_owned(),
+                                annotations: None,
+                                meta: None,
+                                additional: std::collections::BTreeMap::new(),
+                            },
+                        ),
+                        model: "modern-http-model".to_owned(),
+                        role: fastmcp_protocol::Role::Assistant,
+                        stop_reason: None,
+                        meta: None,
+                    })
+                })
+            },
+        );
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .reverse_request_handlers(handlers)
+                .connect_http_with_cx(&cx),
+        )
+        .expect("modern HTTP connects with reverse sampling handlers");
+        let response = runtime_block_on(connection.request_json(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect("tools/list completes after modern HTTP sampling is answered");
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+        server
+            .join()
+            .expect("modern HTTP reverse-sampling server must join");
     }
 
     #[test]
