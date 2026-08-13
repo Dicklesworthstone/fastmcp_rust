@@ -2275,6 +2275,10 @@ pub enum ClientHttpConnection {
 }
 
 /// One response returned through `ClientHttpConnection::request`.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public dual-era response deliberately returns each typed transport payload directly; boxing the modern stream would add an avoidable allocation and alter the established public match surface"
+)]
 pub enum ClientHttpResponse {
     /// The still-live HTTP response from a stateless modern POST.
     Modern(ModernHttpResponseStream),
@@ -11129,16 +11133,20 @@ mod tests {
         });
 
         let cx = Cx::for_request();
-        let mut connection = runtime_block_on(
-            ClientBuilder::new()
-                .protocol_plan(plan(
-                    "http://127.0.0.1:9/mcp",
-                    &sse_target,
-                    &message_target,
-                    ProtocolPolicy::LegacyOnly,
-                ))
-                .connect_http_with_cx(&cx),
-        )
+        let mut connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/mcp",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            ClientInfo {
+                name: "public-legacy-http-connection".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
         .expect("legacy-only opens the exact configured SSE route");
         assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
         assert_eq!(
@@ -11167,6 +11175,99 @@ mod tests {
             Some(serde_json::json!({"requestId": 2})),
         ))
         .expect("a legacy notification posts without an ID to the exact endpoint");
+        server.join().expect("local legacy server must join");
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_connection_rejects_one_final_metadata_member_without_contact_or_mutation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local legacy listener");
+        let address = listener.local_addr().expect("read local legacy address");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let server = thread::spawn(move || {
+            let (mut sse, _) = listener.accept().expect("accept legacy SSE GET");
+            let sse_request = read_request(&mut sse);
+            assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
+            let sse_body = format!(
+                "event: endpoint\ndata: {advertised_message_target}\n\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{}}}}\n\n"
+            );
+            write_response(&mut sse, 200, "text/event-stream", sse_body.as_bytes());
+
+            // The negative carries only a final-only metadata member. It must
+            // not post or advance the connection: this is the one accepted
+            // request, using the same ID after the rejection.
+            let (mut message_post, _) = listener
+                .accept()
+                .expect("accept unchanged exact legacy message POST");
+            let message_request = read_request(&mut message_post);
+            assert!(
+                message_request
+                    .head
+                    .starts_with("POST /legacy-message HTTP/1.1\r\n")
+            );
+            let message = serde_json::from_slice::<serde_json::Value>(&message_request.body)
+                .expect("unchanged legacy message POST must contain JSON-RPC");
+            assert_eq!(message["id"], 2);
+            assert_eq!(message["method"], "ping");
+            assert!(
+                message["params"].get("_meta").is_none(),
+                "rejected final metadata must never reach the legacy endpoint"
+            );
+            write_response(&mut message_post, 202, "application/json", b"");
+        });
+
+        let cx = Cx::for_request();
+        let mut connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                "http://127.0.0.1:9/mcp",
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::LegacyOnly,
+            ),
+            ClientInfo {
+                name: "public-legacy-http-connection".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("legacy-only opens the exact configured SSE route");
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
+        assert_eq!(connection.protocol_version(), None);
+
+        let rejected = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({
+                "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+            }),
+            RequestId::Number(2),
+            4_096,
+        ));
+        assert!(matches!(
+            rejected,
+            Err(ClientHttpConnectionError::LegacyFinalMetadata {
+                member: "io.modelcontextprotocol/protocolVersion"
+            })
+        ));
+        assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
+        assert_eq!(
+            connection.protocol_version(),
+            None,
+            "rejected final metadata cannot record a legacy initialization version"
+        );
+
+        let response = runtime_block_on(connection.request_json(
+            &cx,
+            "ping",
+            serde_json::json!({}),
+            RequestId::Number(2),
+            4_096,
+        ))
+        .expect("changing only final metadata leaves the raw legacy connection usable");
+        assert_eq!(response.id, Some(RequestId::Number(2)));
         server.join().expect("local legacy server must join");
     }
 

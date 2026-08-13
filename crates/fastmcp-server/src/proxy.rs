@@ -5086,6 +5086,33 @@ impl ProxyClient {
         ))))
     }
 
+    /// Returns the route-local relayed Tasks state for a unit-test
+    /// unchanged-state assertion. This deliberately exposes only a stable
+    /// serialized snapshot, never the mutable registry or its retention
+    /// clocks.
+    #[cfg(all(test, feature = "tasks"))]
+    pub(crate) fn final_task_registry_snapshot_for_test(&self) -> McpResult<serde_json::Value> {
+        let registry = self
+            .final_task_registry
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
+        let mut tasks = BTreeMap::new();
+        for (task_id, retained) in &registry.tasks {
+            tasks.insert(
+                task_id.to_string(),
+                serde_json::to_value(&retained.task).map_err(|_| {
+                    McpError::internal_error(
+                        "Proxy relayed final Task snapshot serialization failed",
+                    )
+                })?,
+            );
+        }
+        Ok(serde_json::json!({
+            "pendingCreations": registry.pending_creations,
+            "tasks": tasks,
+        }))
+    }
+
     /// Fetches a catalog by querying the backend.
     pub fn catalog(&self) -> McpResult<ProxyCatalog> {
         let catalog = self.with_backend(|backend| ProxyCatalog::from_backend(backend))?;

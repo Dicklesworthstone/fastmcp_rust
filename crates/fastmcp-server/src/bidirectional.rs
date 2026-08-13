@@ -1076,7 +1076,7 @@ impl RootsProvider for TransportRootsProvider {
 pub enum MrtrInputKind {
     /// `elicitation/create` with an [`fastmcp_protocol::ElicitResult`] response.
     Elicitation,
-    /// `sampling/createMessage` with a [`fastmcp_protocol::CreateMessageResult`] response.
+    /// `sampling/createMessage` with a [`fastmcp_protocol::FinalCreateMessageResult`] response.
     Sampling,
     /// `roots/list` with a [`fastmcp_protocol::ListRootsResult`] response.
     Roots,
@@ -1107,10 +1107,25 @@ pub enum DualEraElicitationParams {
     Modern2026(fastmcp_protocol::FinalEmbeddedElicitationParams),
 }
 
+/// Sampling parameters selected by the negotiated protocol era.
+///
+/// Exact-2024 reverse JSON-RPC retains its legacy request model. Final MRTR
+/// descriptors use the distinct embedded final model so tool declarations,
+/// tool-choice controls, and final sampling content cannot be lost at the
+/// era boundary.
+#[derive(Debug, Clone)]
+pub enum DualEraSamplingParams {
+    /// Exact-2024 reverse JSON-RPC sampling parameters.
+    Legacy2024(fastmcp_protocol::CreateMessageParams),
+    /// Final embedded MRTR sampling parameters.
+    Modern2026(fastmcp_protocol::FinalEmbeddedCreateMessageParams),
+}
+
 #[derive(Debug, Clone)]
 enum MrtrInputParams {
     LegacyElicitation(fastmcp_protocol::ElicitRequestParams),
     FinalElicitation(fastmcp_protocol::FinalEmbeddedElicitationParams),
+    FinalSampling(fastmcp_protocol::FinalEmbeddedCreateMessageParams),
     Json(serde_json::Value),
 }
 
@@ -1159,9 +1174,13 @@ impl MrtrInputRequest {
     ///
     /// Returns an internal error only if its protocol parameters cannot be
     /// represented as JSON.
-    pub fn sampling(mut params: fastmcp_protocol::CreateMessageParams) -> McpResult<Self> {
-        params.meta = None;
-        Self::with_params(MrtrInputKind::Sampling, params)
+    pub fn sampling(params: fastmcp_protocol::FinalEmbeddedCreateMessageParams) -> McpResult<Self> {
+        serde_json::to_value(&params)
+            .map_err(|_| McpError::internal_error(REQUEST_PAYLOAD_ERROR))?;
+        Ok(Self {
+            kind: MrtrInputKind::Sampling,
+            params: Some(MrtrInputParams::FinalSampling(params)),
+        })
     }
 
     /// Creates a final roots input descriptor with omitted parameters.
@@ -1234,6 +1253,9 @@ impl MrtrInputRequest {
             Some(MrtrInputParams::FinalElicitation(_)) => {
                 Err(McpError::invalid_params(INVALID_ELICITATION_REQUEST_ERROR))
             }
+            Some(MrtrInputParams::FinalSampling(_)) => Err(McpError::invalid_params(
+                "Final sampling cannot be sent as exact-2024 reverse JSON-RPC",
+            )),
             Some(MrtrInputParams::Json(params)) => Ok(params),
         }
     }
@@ -1255,6 +1277,9 @@ impl Serialize for MrtrInputRequest {
                     descriptor.serialize_field("params", params)?;
                 }
                 MrtrInputParams::FinalElicitation(params) => {
+                    descriptor.serialize_field("params", params)?;
+                }
+                MrtrInputParams::FinalSampling(params) => {
                     descriptor.serialize_field("params", params)?;
                 }
                 MrtrInputParams::Json(params) => {
@@ -1291,7 +1316,7 @@ impl MrtrInputResponse {
     ///
     /// Returns an internal error only if its protocol value cannot be
     /// represented as JSON.
-    pub fn sampling(value: fastmcp_protocol::CreateMessageResult) -> McpResult<Self> {
+    pub fn sampling(value: fastmcp_protocol::FinalCreateMessageResult) -> McpResult<Self> {
         Self::with_value(MrtrInputKind::Sampling, value)
     }
 
@@ -1326,7 +1351,7 @@ impl MrtrInputResponse {
     }
 
     /// Returns this value as the sampling result it was admitted as.
-    pub fn sampling_result(&self) -> McpResult<fastmcp_protocol::CreateMessageResult> {
+    pub fn sampling_result(&self) -> McpResult<fastmcp_protocol::FinalCreateMessageResult> {
         if self.kind != MrtrInputKind::Sampling {
             return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
         }
@@ -1642,7 +1667,10 @@ impl MrtrCompletedInputs {
     }
 
     /// Returns one framework-admitted sampling response by its issued key.
-    pub fn sampling(&self, key: &str) -> McpResult<Option<fastmcp_protocol::CreateMessageResult>> {
+    pub fn sampling(
+        &self,
+        key: &str,
+    ) -> McpResult<Option<fastmcp_protocol::FinalCreateMessageResult>> {
         self.responses
             .get(key)
             .map(MrtrInputResponse::sampling_result)
@@ -2281,15 +2309,23 @@ impl DualEraServerToClient {
         cx: &Cx,
         owner_cancellation: McpRequestCancellation,
         input_key: impl Into<String>,
-        params: fastmcp_protocol::CreateMessageParams,
+        params: DualEraSamplingParams,
     ) -> McpResult<DualEraServerToClientResult<fastmcp_protocol::CreateMessageResult>> {
-        self.dispatch(
-            cx,
-            owner_cancellation,
-            input_key.into(),
-            MrtrInputRequest::sampling(params)?,
-        )
-        .await
+        let input = match (self, params) {
+            (Self::Legacy2024 { .. }, DualEraSamplingParams::Legacy2024(params)) => {
+                MrtrInputRequest::with_params(MrtrInputKind::Sampling, params)?
+            }
+            (Self::Modern2026 { .. }, DualEraSamplingParams::Modern2026(params)) => {
+                MrtrInputRequest::sampling(params)?
+            }
+            _ => {
+                return Err(McpError::invalid_params(
+                    "Sampling parameters do not match the negotiated protocol era",
+                ));
+            }
+        };
+        self.dispatch(cx, owner_cancellation, input_key.into(), input)
+            .await
     }
 
     /// Requests client elicitation input.
@@ -2441,6 +2477,41 @@ mod tests {
         .expect("final URL elicitation parameters must admit")
     }
 
+    fn final_sampling_params() -> fastmcp_protocol::FinalEmbeddedCreateMessageParams {
+        serde_json::from_value(serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": {
+                    "type": "tool_use",
+                    "id": "weather-1",
+                    "name": "weather",
+                    "input": {"city": "Boston"},
+                },
+            }],
+            "maxTokens": 16,
+            "tools": [{
+                "name": "weather",
+                "inputSchema": {"type": "object"},
+            }],
+            "toolChoice": {"mode": "required"},
+        }))
+        .expect("final sampling parameters with tool use must admit")
+    }
+
+    fn final_sampling_result() -> fastmcp_protocol::FinalCreateMessageResult {
+        serde_json::from_value(serde_json::json!({
+            "content": {
+                "type": "tool_use",
+                "id": "weather-2",
+                "name": "weather",
+                "input": {"city": "Cambridge"},
+            },
+            "role": "assistant",
+            "model": "test-model",
+        }))
+        .expect("final sampling result with tool use must admit")
+    }
+
     #[test]
     fn mrtr_embeds_exact_input_maps_and_completes_with_bound_responses() {
         let registry = MrtrExchangeRegistry::new();
@@ -2453,11 +2524,8 @@ mod tests {
             ),
             (
                 "sample".to_owned(),
-                MrtrInputRequest::sampling(fastmcp_protocol::CreateMessageParams::new(
-                    Vec::new(),
-                    fastmcp_protocol::JsonInteger::from(16_i64),
-                ))
-                .expect("sampling request must serialize"),
+                MrtrInputRequest::sampling(final_sampling_params())
+                    .expect("sampling request must serialize"),
             ),
             ("roots".to_owned(), MrtrInputRequest::roots()),
         ])
@@ -2492,6 +2560,15 @@ mod tests {
             wire["inputRequests"]["sample"]["params"]
                 .get("_meta")
                 .is_none()
+        );
+        assert_eq!(
+            wire["inputRequests"]["sample"]["params"]["toolChoice"],
+            serde_json::json!({"mode": "required"}),
+            "final sampling tool-choice controls must survive MRTR issuance"
+        );
+        assert_eq!(
+            wire["inputRequests"]["sample"]["params"]["tools"][0]["name"], "weather",
+            "final sampling tool declarations must survive MRTR issuance"
         );
 
         let request_state = mrtr_state_from_wire(&required);
@@ -2543,11 +2620,8 @@ mod tests {
                 MrtrInputResponses::new([
                     (
                         "sample".to_owned(),
-                        MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
-                            "done",
-                            "test-model",
-                        ))
-                        .expect("sampling response must serialize"),
+                        MrtrInputResponse::sampling(final_sampling_result())
+                            .expect("sampling response must serialize"),
                     ),
                     ("roots".to_owned(), mrtr_roots_response()),
                 ])
@@ -2572,6 +2646,15 @@ mod tests {
                 .map(MrtrInputResponse::kind),
             Some(MrtrInputKind::Sampling)
         );
+        assert!(matches!(
+            complete.sampling("sample"),
+            Ok(Some(fastmcp_protocol::FinalCreateMessageResult {
+                content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                    fastmcp_protocol::FinalSamplingMessageContentBlock::ToolUse { .. }
+                ),
+                ..
+            }))
+        ));
         assert_eq!(
             complete
                 .responses()
@@ -2595,11 +2678,8 @@ mod tests {
 
         let wrong_kind = MrtrInputResponses::new([(
             "roots".to_owned(),
-            MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
-                "not roots",
-                "test-model",
-            ))
-            .expect("sampling response must serialize"),
+            MrtrInputResponse::sampling(final_sampling_result())
+                .expect("sampling response must serialize"),
         )])
         .expect("unique MRTR response map");
         let error = registry
@@ -2679,11 +2759,8 @@ mod tests {
         let wrong_kind = BTreeMap::from([(
             "roots".to_owned(),
             serde_json::to_value(
-                MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
-                    "not roots",
-                    "test-model",
-                ))
-                .expect("sampling response must serialize"),
+                MrtrInputResponse::sampling(final_sampling_result())
+                    .expect("sampling response must serialize"),
             )
             .expect("sampling response must convert to a wire value"),
         )]);
@@ -2917,10 +2994,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(
+            DualEraSamplingParams::Legacy2024(fastmcp_protocol::CreateMessageParams::new(
                 Vec::new(),
                 fastmcp_protocol::JsonInteger::from(16_i64),
-            ),
+            )),
         ))
         .expect("legacy sampling must await a direct response");
         let DualEraServerToClientResult::Legacy(sampling) = sampling else {
@@ -3193,10 +3270,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(
+            DualEraSamplingParams::Legacy2024(fastmcp_protocol::CreateMessageParams::new(
                 Vec::new(),
                 fastmcp_protocol::JsonInteger::from(16_i64),
-            ),
+            )),
         ))
         .expect("legacy sampling must preserve an absent stopReason");
         let DualEraServerToClientResult::Legacy(result) = result else {
@@ -3225,10 +3302,10 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(
+            DualEraSamplingParams::Legacy2024(fastmcp_protocol::CreateMessageParams::new(
                 Vec::new(),
                 fastmcp_protocol::JsonInteger::from(16_i64),
-            ),
+            )),
         ))
         .expect("legacy sampling must preserve an open provider stopReason");
         let DualEraServerToClientResult::Legacy(result) = result else {
@@ -3255,10 +3332,7 @@ mod tests {
             &cx,
             McpRequestCancellation::new(),
             "sample",
-            fastmcp_protocol::CreateMessageParams::new(
-                Vec::new(),
-                fastmcp_protocol::JsonInteger::from(16_i64),
-            ),
+            DualEraSamplingParams::Modern2026(final_sampling_params()),
         ))
         .expect("modern sampling must create an MRTR input result");
         let DualEraServerToClientResult::InputRequired(required) = sampling else {
@@ -3279,11 +3353,8 @@ mod tests {
                 &mrtr_state_from_wire(&required),
                 MrtrInputResponses::new([(
                     "sample".to_owned(),
-                    MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
-                        "modern completion",
-                        "modern-model",
-                    ))
-                    .expect("sampling response must serialize"),
+                    MrtrInputResponse::sampling(final_sampling_result())
+                        .expect("sampling response must serialize"),
                 )])
                 .expect("one matching final response"),
             )

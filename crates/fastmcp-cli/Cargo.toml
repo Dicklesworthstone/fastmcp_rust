@@ -93,7 +93,7 @@ e2e-fixture = ["dep:fastmcp-rust"]
 
 [dependencies]
 # Internal crates
-fastmcp-client = { workspace = true }
+fastmcp-client = { workspace = true, default-features = false }
 fastmcp-core = { workspace = true }
 fastmcp-protocol = { workspace = true }
 fastmcp-console = { workspace = true }

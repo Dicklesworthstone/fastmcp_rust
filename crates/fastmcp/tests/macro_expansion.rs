@@ -27,7 +27,7 @@ use fastmcp_rust::serde_json::json;
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
     ApplicationTaskSupervisor, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE,
 };
 use fastmcp_rust::{
@@ -42,6 +42,8 @@ use fastmcp_rust::{
 use fastmcp_server::Server;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+#[cfg(feature = "tasks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "tasks")]
 use std::task::Poll;
 
@@ -1294,9 +1296,13 @@ fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
 #[cfg(feature = "tasks")]
 #[test]
 fn facade_final_tool_outcome_creates_task_through_modern_wire() {
+    let notifications = std::sync::Arc::new(AtomicUsize::new(0));
+    let emitted_notifications = std::sync::Arc::clone(&notifications);
     let runtime = FinalTaskRuntime::in_memory(
         FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
-        std::sync::Arc::new(|_| {}),
+        std::sync::Arc::new(move |_| {
+            emitted_notifications.fetch_add(1, Ordering::SeqCst);
+        }),
     );
     let service_runner = runtime
         .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
@@ -1310,7 +1316,7 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
     ));
     let server = Server::new("facade-final-task", "1.0.0")
         .tool(FinalToolOutcomeDirect)
-        .final_tasks(runtime)
+        .final_tasks(runtime.clone())
         .expect("final Tasks install through the facade builder")
         .build();
     let response = server
@@ -1325,14 +1331,39 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
     assert_eq!(result["resultType"], "task");
     assert_eq!(result["status"], "working");
     assert_eq!(result["statusMessage"], "queued");
+    let task_id = fastmcp_rust::FinalTaskId::parse(
+        result["taskId"]
+            .as_str()
+            .expect("task creation wire result includes its public task identifier"),
+    )
+    .expect("task creation wire result has a valid public task identifier");
+    let retained = runtime
+        .get_task(&task_id)
+        .expect("the created task remains readable from the caller-owned runtime");
+    assert_eq!(
+        serde_json::to_value(retained.task).expect("created task serializes"),
+        result,
+        "the public task result is the exact durable caller-owned task state"
+    );
+    assert_eq!(
+        notifications.load(Ordering::SeqCst),
+        1,
+        "creation advertises one durable task state transition"
+    );
 }
 
 #[cfg(feature = "tasks")]
 #[test]
 fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
-    let runtime = FinalTaskRuntime::in_memory(
+    let notifications = std::sync::Arc::new(AtomicUsize::new(0));
+    let emitted_notifications = std::sync::Arc::clone(&notifications);
+    let task_store = std::sync::Arc::new(InMemoryFinalTaskStore::default());
+    let runtime = FinalTaskRuntime::new(
+        task_store.clone(),
         FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
-        std::sync::Arc::new(|_| {}),
+        std::sync::Arc::new(move |_| {
+            emitted_notifications.fetch_add(1, Ordering::SeqCst);
+        }),
     );
     let service_runner = runtime
         .install_task_service(1, std::sync::Arc::new(NoopFinalTaskSupervisor))
@@ -1344,9 +1375,29 @@ fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
         Future::poll(running_service.as_mut(), &mut task_cx),
         Poll::Pending
     ));
+    let retained_task = runtime
+        .create_task_with_work(
+            FinalTaskWorkDescriptor::new(json!({
+                "operation": "retained-state-for-capability-rejection"
+            }))
+            .expect("non-null retained task work descriptor"),
+            Some("retained before capability rejection".to_owned()),
+        )
+        .expect("the ready caller-owned runtime creates retained work")
+        .task;
+    let retained_task_id = retained_task.base().task_id.clone();
+    let state_before = serde_json::to_value(
+        runtime
+            .get_task(&retained_task_id)
+            .expect("read retained task before the capability rejection")
+            .task,
+    )
+    .expect("retained task serializes before the capability rejection");
+    let task_count_before = task_store.task_count();
+    let notifications_before = notifications.load(Ordering::SeqCst);
     let server = Server::new("facade-final-task", "1.0.0")
         .tool(FinalToolOutcomeDirect)
-        .final_tasks(runtime)
+        .final_tasks(runtime.clone())
         .expect("final Tasks install through the facade builder")
         .build();
     let response = server
@@ -1371,6 +1422,27 @@ fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
                 "extensions": { "io.modelcontextprotocol/tasks": {} },
             },
         }))
+    );
+    assert_eq!(
+        serde_json::to_value(
+            runtime
+                .get_task(&retained_task_id)
+                .expect("read retained task after the capability rejection")
+                .task,
+        )
+        .expect("retained task serializes after the capability rejection"),
+        state_before,
+        "removing only the client Tasks capability leaves durable task state unchanged"
+    );
+    assert_eq!(
+        task_store.task_count(),
+        task_count_before,
+        "removing only the client Tasks capability cannot add another durable task"
+    );
+    assert_eq!(
+        notifications.load(Ordering::SeqCst),
+        notifications_before,
+        "removing only the client Tasks capability emits no task transition"
     );
 }
 

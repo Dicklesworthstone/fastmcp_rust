@@ -97,31 +97,22 @@ const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = concat!(
 );
 #[cfg(not(feature = "legacy-2024-11-05"))]
 const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = CLI_PROTOCOL_STATUS_HELP;
-/// Independently authored semantic contract for the root-help frame. The
-/// contract deliberately models fields instead of one rendered byte string:
-/// wrapping and one terminal sentence period are presentation details owned by
-/// Clap, while an extra root field remains a documentation-contract refusal.
-const CLI_ROOT_HELP_ABOUT: &str = "CLI tooling for FastMCP - run, inspect, and install MCP servers";
-const CLI_ROOT_HELP_USAGE: &str = "Usage: fastmcp <COMMAND>";
-const CLI_ROOT_HELP_COMMANDS: [(&str, &str); 7] = [
-    ("run", "Run an MCP server binary"),
-    ("inspect", "Inspect an MCP server's capabilities"),
-    (
-        "install",
-        "Install server configuration into Claude Desktop or other clients",
-    ),
-    ("list", "List configured MCP servers"),
-    ("test", "Test MCP server connectivity"),
-    ("dev", "Run server in development mode with hot reloading"),
-    (
-        "help",
-        "Print this message or the help of the given subcommand(s)",
-    ),
-];
-const CLI_ROOT_HELP_OPTIONS: [(&str, &str); 2] = [
-    ("-h, --help", "Print help"),
-    ("-V, --version", "Print version"),
-];
+/// Independently authored normalized root-help frame. It freezes every
+/// non-whitespace byte from the Clap construction below; normalization permits
+/// line wrapping only, not punctuation or wording variance.
+const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers. ",
+    "Usage: fastmcp <COMMAND> ",
+    "Commands: ",
+    "run Run an MCP server binary. ",
+    "inspect Inspect an MCP server's capabilities. ",
+    "install Install server configuration into Claude Desktop or other clients. ",
+    "list List configured MCP servers. ",
+    "test Test MCP server connectivity. ",
+    "dev Run server in development mode with hot reloading. ",
+    "help Print this message or the help of the given subcommand(s) ",
+    "Options: -h, --help Print help -V, --version Print version "
+);
 
 /// Typed refusal emitted when the public Clap help pipeline cannot produce an
 /// exactly provisional documentation contract.
@@ -269,60 +260,6 @@ fn validate_cli_documentation_contract(
     Ok(())
 }
 
-fn consume_root_help_field<'a>(
-    root_help: &'a str,
-    expected: &str,
-    accepts_terminal_period: bool,
-) -> Option<&'a str> {
-    let root_help = root_help.strip_prefix(expected)?;
-    let root_help = if accepts_terminal_period {
-        root_help.strip_prefix('.').unwrap_or(root_help)
-    } else {
-        root_help
-    };
-    root_help.strip_prefix(' ')
-}
-
-/// Validate the root frame as an ordered grammar rather than a byte-for-byte
-/// renderer snapshot. This preserves the no-free-form-claim boundary without
-/// making root `--help` availability depend on Clap's harmless typography.
-fn validate_cli_root_help_frame(root_help: &str) -> bool {
-    let Some(root_help) = consume_root_help_field(root_help, CLI_ROOT_HELP_ABOUT, true) else {
-        return false;
-    };
-    let Some(root_help) = consume_root_help_field(root_help, CLI_ROOT_HELP_USAGE, false) else {
-        return false;
-    };
-    let Some(mut root_help) = consume_root_help_field(root_help, "Commands:", false) else {
-        return false;
-    };
-
-    for (name, about) in CLI_ROOT_HELP_COMMANDS {
-        let Some(remainder) = consume_root_help_field(root_help, name, false) else {
-            return false;
-        };
-        let Some(remainder) = consume_root_help_field(remainder, about, true) else {
-            return false;
-        };
-        root_help = remainder;
-    }
-
-    let Some(mut root_help) = consume_root_help_field(root_help, "Options:", false) else {
-        return false;
-    };
-    for (flags, about) in CLI_ROOT_HELP_OPTIONS {
-        let Some(remainder) = consume_root_help_field(root_help, flags, false) else {
-            return false;
-        };
-        let Some(remainder) = consume_root_help_field(remainder, about, true) else {
-            return false;
-        };
-        root_help = remainder;
-    }
-
-    root_help.is_empty()
-}
-
 /// Validate the rendered public help against the independent semantic contract.
 /// Whitespace normalization makes wrapping width an output-only concern. The
 /// complete status stanza must be the final normalized root-help section, so
@@ -346,7 +283,7 @@ fn validate_public_cli_help(candidate: &CliHelpCandidate) -> Result<(), CliDocum
     {
         return Err(CliDocumentationRefusal::UnsafeRootHelpContent);
     }
-    if !validate_cli_root_help_frame(root_help) {
+    if root_help != EXPECTED_CLI_ROOT_HELP_PREFIX {
         return Err(CliDocumentationRefusal::RootHelpFrameMismatch);
     }
 
@@ -446,6 +383,18 @@ fn raw_help_with_root_claim(bytes: &[u8], claim: &str) -> Vec<u8> {
     forged
 }
 
+#[cfg(test)]
+fn raw_help_with_toggled_help_option_period(bytes: &[u8]) -> Vec<u8> {
+    let normalized = normalize_cli_help_whitespace(bytes);
+    let expected = "-h, --help Print help -V, --version Print version";
+    let toggled = "-h, --help Print help. -V, --version Print version";
+    assert!(
+        normalized.contains(expected),
+        "approved root-help frame must contain the unpunctuated generated help option"
+    );
+    normalized.replacen(expected, toggled, 1).into_bytes()
+}
+
 #[test]
 fn doc_01_b_positive() {
     let independently_authored_contract = CliDocumentationContract {
@@ -475,6 +424,10 @@ fn doc_01_b_positive() {
     ));
 
     let public_help = public_cli_help_candidate().expect("--help must reach Clap DisplayHelp");
+    assert_eq!(
+        normalize_cli_help_whitespace(&public_help.bytes),
+        format!("{EXPECTED_CLI_ROOT_HELP_PREFIX}{EXPECTED_CLI_PROTOCOL_STATUS_STANZA}")
+    );
     let mut state = ConsumerVisibleCliHelp::default();
 
     assert_eq!(
@@ -543,6 +496,20 @@ fn doc_01_b_planted_negative() {
     assert_eq!(
         state, accepted_before,
         "a rejected one-field raw-help mutation must leave evaluator and consumer-visible state unchanged"
+    );
+
+    let punctuation_mutation = CliHelpCandidate {
+        contract: baseline.contract,
+        bytes: raw_help_with_toggled_help_option_period(&baseline.bytes),
+    };
+    assert_eq!(
+        admit_public_cli_help(&mut state, punctuation_mutation),
+        Err(CliDocumentationRefusal::RootHelpFrameMismatch),
+        "a one-field terminal-punctuation mutation must be rejected"
+    );
+    assert_eq!(
+        state, accepted_before,
+        "a rejected punctuation mutation must leave evaluator and consumer-visible state unchanged"
     );
     let mut emitted_after_rejection = Vec::new();
     assert_eq!(
@@ -5322,49 +5289,67 @@ fn cmd_inspect(
     // Preserve the negotiated era's capability model. Modern discovery is an
     // open final model, so rendering it through the legacy capability struct
     // would silently discard advertised final members.
-    let server_info = client.server_info().clone();
-    let capabilities = stdio_inspect_capabilities(&client)?;
+    let inspection = (|| {
+        let server_info = client.server_info().clone();
+        let capabilities = stdio_inspect_capabilities(&client)?;
 
-    // Acquire one bounded page per category. MCP's list requests have no item
-    // limit, so the transport may still receive one bounded protocol message,
-    // but inspect never follows cursors into the client's much larger default
-    // auto-pagination budget.
-    let limits = ListPageLimits::new(CLI_OUTPUT_MAX_ITEMS, INSPECT_CATEGORY_MAX_BYTES);
-    let mut acquisition_truncated = false;
-    let tools = if capabilities.advertises("tools") {
-        let page = client.list_tools_page(None, limits)?;
-        acquisition_truncated |= page.local_truncated || page.peer_has_more;
-        page.items
-    } else {
-        Vec::new()
-    };
+        // Acquire one bounded page per category. MCP's list requests have no item
+        // limit, so the transport may still receive one bounded protocol message,
+        // but inspect never follows cursors into the client's much larger default
+        // auto-pagination budget.
+        let limits = ListPageLimits::new(CLI_OUTPUT_MAX_ITEMS, INSPECT_CATEGORY_MAX_BYTES);
+        let mut acquisition_truncated = false;
+        let tools = if capabilities.advertises("tools") {
+            let page = client.list_tools_page(None, limits)?;
+            acquisition_truncated |= page.local_truncated || page.peer_has_more;
+            page.items
+        } else {
+            Vec::new()
+        };
 
-    let resources = if capabilities.advertises("resources") {
-        let page = client.list_resources_page(None, limits)?;
-        acquisition_truncated |= page.local_truncated || page.peer_has_more;
-        page.items
-    } else {
-        Vec::new()
-    };
+        let resources = if capabilities.advertises("resources") {
+            let page = client.list_resources_page(None, limits)?;
+            acquisition_truncated |= page.local_truncated || page.peer_has_more;
+            page.items
+        } else {
+            Vec::new()
+        };
 
-    let resource_templates = if capabilities.advertises("resources") {
-        let page = client.list_resource_templates_page(None, limits)?;
-        acquisition_truncated |= page.local_truncated || page.peer_has_more;
-        page.items
-    } else {
-        Vec::new()
-    };
+        let resource_templates = if capabilities.advertises("resources") {
+            let page = client.list_resource_templates_page(None, limits)?;
+            acquisition_truncated |= page.local_truncated || page.peer_has_more;
+            page.items
+        } else {
+            Vec::new()
+        };
 
-    let prompts = if capabilities.advertises("prompts") {
-        let page = client.list_prompts_page(None, limits)?;
-        acquisition_truncated |= page.local_truncated || page.peer_has_more;
-        page.items
-    } else {
-        Vec::new()
-    };
+        let prompts = if capabilities.advertises("prompts") {
+            let page = client.list_prompts_page(None, limits)?;
+            acquisition_truncated |= page.local_truncated || page.peer_has_more;
+            page.items
+        } else {
+            Vec::new()
+        };
 
-    // Close the client
-    client.close()?;
+        Ok((
+            server_info,
+            capabilities,
+            tools,
+            resources,
+            resource_templates,
+            prompts,
+            acquisition_truncated,
+        ))
+    })();
+    let (
+        server_info,
+        capabilities,
+        tools,
+        resources,
+        resource_templates,
+        prompts,
+        acquisition_truncated,
+    ) = finish_inspect_acquisition(inspection, || client.close())?;
     let protocol_status =
         InspectProtocolStatus::new(protocol_policy, &negotiated_protocol_version)?;
 
@@ -5380,6 +5365,44 @@ fn cmd_inspect(
         format,
         output,
     )
+}
+
+/// Ensures a live stdio inspect client is explicitly closed after either a
+/// successful catalog acquisition or a rejected capability/list response.
+///
+/// `Client::drop` is only a best-effort backstop: a command must surface an
+/// unverified cleanup rather than silently replacing a bounded lifecycle
+/// outcome with destructor behavior.
+fn finish_inspect_acquisition<T, F>(acquisition: McpResult<T>, cleanup: F) -> McpResult<T>
+where
+    F: FnOnce() -> McpResult<()>,
+{
+    let cleanup_started = std::time::Instant::now();
+    match (acquisition, cleanup()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(acquisition_error), Ok(())) => Err(acquisition_error),
+        (Ok(_), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
+            fastmcp_core::McpErrorCode::InternalError,
+            format!("inspect client cleanup failed: {cleanup_error}"),
+            serde_json::json!({
+                CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
+                "cleanup": cleanup_error,
+                CLIENT_CLEANUP_DURATION_MS_DATA_KEY:
+                    cleanup_started.elapsed().as_secs_f64() * 1_000.0,
+            }),
+        )),
+        (Err(acquisition_error), Err(cleanup_error)) => Err(fastmcp_core::McpError::with_data(
+            fastmcp_core::McpErrorCode::InternalError,
+            format!("inspect client cleanup failed after an acquisition failure: {cleanup_error}"),
+            serde_json::json!({
+                CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true,
+                "operation": acquisition_error,
+                "cleanup": cleanup_error,
+                CLIENT_CLEANUP_DURATION_MS_DATA_KEY:
+                    cleanup_started.elapsed().as_secs_f64() * 1_000.0,
+            }),
+        )),
+    }
 }
 
 /// Capability representation retained by inspect for the negotiated protocol
@@ -13643,6 +13666,54 @@ mod tests {
             .expect_err("failed output must be returned after verified cleanup");
             assert_eq!(error.message, "output sentinel");
             assert_eq!(cleanup_calls.get(), 1);
+        }
+
+        #[test]
+        fn inspect_acquisition_closes_after_success_and_rejection() {
+            let cleanup_calls = std::cell::Cell::new(0_u8);
+            let value = finish_inspect_acquisition(Ok(17_u8), || {
+                cleanup_calls.set(cleanup_calls.get() + 1);
+                Ok(())
+            })
+            .expect("a successful acquisition with successful cleanup is retained");
+            assert_eq!(value, 17);
+            assert_eq!(cleanup_calls.get(), 1);
+
+            let acquisition_error = fastmcp_core::McpError::invalid_params("list sentinel");
+            let error = finish_inspect_acquisition::<(), _>(Err(acquisition_error.clone()), || {
+                cleanup_calls.set(cleanup_calls.get() + 1);
+                Ok(())
+            })
+            .expect_err("a rejected list response remains an inspect failure");
+            assert_eq!(cleanup_calls.get(), 2);
+            assert_eq!(error.code, acquisition_error.code);
+            assert_eq!(error.message, acquisition_error.message);
+        }
+
+        #[test]
+        fn inspect_acquisition_rh5_preserves_the_same_rejection_when_cleanup_is_unverified() {
+            let cleanup_calls = std::cell::Cell::new(0_u8);
+            let acquisition_error = fastmcp_core::McpError::invalid_params("list sentinel");
+            let cleanup_error = fastmcp_core::McpError::internal_error("cleanup sentinel");
+
+            // RH-5: changing only cleanup from a success to a failure must
+            // retain the rejected acquisition and make lifecycle uncertainty
+            // machine-visible instead of relying on Client::drop.
+            let error = finish_inspect_acquisition::<(), _>(Err(acquisition_error.clone()), || {
+                cleanup_calls.set(cleanup_calls.get() + 1);
+                Err(cleanup_error.clone())
+            })
+            .expect_err("cleanup uncertainty must remain visible");
+
+            assert_eq!(cleanup_calls.get(), 1);
+            assert!(fastmcp_client::is_cleanup_unverified(&error));
+            let data = error
+                .data
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .expect("unverified cleanup must retain structured inspect evidence");
+            assert_eq!(data["operation"]["message"], "list sentinel");
+            assert_eq!(data["cleanup"]["message"], "cleanup sentinel");
         }
 
         #[test]

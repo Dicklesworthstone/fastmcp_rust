@@ -1790,7 +1790,7 @@ mod tests {
             "changing only the decoded additional value must select canonical fallback emission"
         );
         assert!(
-            !changed.contains(r#"escaped\/key"#),
+            !changed.contains(r"escaped\/key"),
             "fallback emission must not replay stale escaped peer source after mutation"
         );
 
@@ -1831,9 +1831,9 @@ mod tests {
             assert!(serde_json::from_str::<CancelTaskResult>(input).is_err());
         }
         for result in [
-            serde_json::from_str::<UpdateTaskResult>(r#"{}"#)
+            serde_json::from_str::<UpdateTaskResult>("{}")
                 .expect("update omission defaults complete"),
-            serde_json::from_str::<CancelTaskResult>(r#"{}"#)
+            serde_json::from_str::<CancelTaskResult>("{}")
                 .expect("cancel omission defaults complete"),
         ] {
             assert_eq!(

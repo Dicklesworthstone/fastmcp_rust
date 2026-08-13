@@ -27,9 +27,9 @@ use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
 use crate::result::{
     CompleteResult, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonObject, ExactJsonValue,
-    InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic, UnknownResultMembers,
-    decode_peer_result_for_era, deserialize_exact_object, encode_complete_result, encode_result,
-    exact_json_to_serde, has_final_only_metadata,
+    FinalResultMetadataRole, InputRequiredResult, ResultDecodeError, ResultPeerDiagnostic,
+    UnknownResultMembers, decode_peer_result_for_era_with_metadata_role, deserialize_exact_object,
+    encode_complete_result, encode_result, exact_json_to_serde, has_final_only_metadata,
 };
 use crate::types::{
     ClientCapabilities, ClientInfo, LegacyContent, LegacyMetadata, LegacyPromptMessage,
@@ -4565,10 +4565,16 @@ fn decode_final_complete_or_input_required<T: DeserializeOwned>(
     if wire.get("resultType").and_then(Value::as_str) == Some("task") {
         return Err(CoreDispatchError::UnexpectedFinalResultType { method });
     }
-    let (decoded, diagnostic) = decode_peer_result_for_era(
+    let metadata_role = if method == SUBSCRIPTIONS_LISTEN {
+        FinalResultMetadataRole::SubscriptionsListen
+    } else {
+        FinalResultMetadataRole::Ordinary
+    };
+    let (decoded, diagnostic) = decode_peer_result_for_era_with_metadata_role(
         input,
         ProtocolEra::Modern2026,
         &CoreResultDiscriminatorPolicy,
+        metadata_role,
     )?;
     let complete = match decoded {
         DecodedResult::Complete(complete) => complete,
@@ -9363,6 +9369,25 @@ mod tests {
             .decode_response(&accepted)
             .expect("matching subscription response id is admitted");
 
+        let mut wrong_role_result = result.clone();
+        wrong_role_result["_meta"]["io.modelcontextprotocol/logLevel"] =
+            serde_json::json!("notice");
+        let wrong_role =
+            JsonRpcResponse::success(RequestId::from("subscription-7"), wrong_role_result);
+        assert!(
+            matches!(
+                request.decode_response(&wrong_role),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: SUBSCRIPTIONS_LISTEN,
+                })
+            ),
+            "only request-only logLevel changes the valid subscriptions/listen terminal result"
+        );
+        request
+            .decode_response(&accepted)
+            .expect("the wrong-role member cannot mutate the accepted subscription binding");
+
         let planted = JsonRpcResponse::success(RequestId::from("subscription-8"), result);
         assert!(
             matches!(
@@ -9422,6 +9447,30 @@ mod tests {
             "only the mathematical subscription identifier changes"
         );
 
+        let missing_identifier_frame =
+            r#"{"jsonrpc":"2.0","id":2e0,"result":{"resultType":"complete","_meta":{}}}"#;
+        let missing_identifier = crate::decode_strict_jsonrpc_response(
+            missing_identifier_frame.as_bytes(),
+            missing_identifier_frame.len(),
+        )
+        .expect("the one-member-absent response remains valid JSON-RPC");
+        let missing_identifier_result_source = missing_identifier
+            .raw_result()
+            .expect("successful response retains its exact result source");
+        assert!(
+            matches!(
+                request.decode_response_result(
+                    missing_identifier.response(),
+                    missing_identifier_result_source,
+                ),
+                Err(CoreDispatchError::InvalidResult {
+                    era: ProtocolEra::Modern2026,
+                    method: SUBSCRIPTIONS_LISTEN,
+                })
+            ),
+            "removing only the required subscriptionId rejects the terminal result"
+        );
+
         let reaccepted = request
             .decode_response_result(accepted.response(), accepted_result_source)
             .expect("the numeric near-miss cannot mutate correlation state");
@@ -9429,7 +9478,8 @@ mod tests {
             reaccepted
                 .encode()
                 .expect("the reaccepted subscription result re-encodes"),
-            encoded
+            accepted_result_source,
+            "the subscriptionId-absent rejection leaves the accepted exact result unchanged"
         );
     }
 

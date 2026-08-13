@@ -992,6 +992,84 @@ fn e2e_cli_run_sets_env_vars_and_rejects_invalid_format() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn e2e_cli_run_passes_each_enabled_protocol_policy_to_the_child() {
+    #[cfg(feature = "legacy-2024-11-05")]
+    let policies = ["modern-only", "auto", "legacy-only"];
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    let policies = ["modern-only"];
+
+    for policy in policies {
+        let output = run_cli(&[
+            "run",
+            "--protocol-policy",
+            policy,
+            "-e",
+            "FASTMCP_CLI_POLICY_E2E_MARKER=run-child",
+            "sh",
+            "--",
+            "-c",
+            "printf '%s:%s\\n' \"$FASTMCP_PROTOCOL_POLICY\" \"$FASTMCP_CLI_POLICY_E2E_MARKER\"",
+        ]);
+
+        assert!(
+            output.status.success(),
+            "run must launch a child for {policy}: {}",
+            stderr_str(&output)
+        );
+        assert_eq!(
+            stdout_str(&output).trim(),
+            format!("{policy}:run-child"),
+            "run must provide the selected policy as the child's authoritative environment value"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_run_rh5_reserved_protocol_policy_override_does_not_spawn_the_child() {
+    let positive = run_cli(&[
+        "run",
+        "--protocol-policy",
+        "modern-only",
+        "-e",
+        "FASTMCP_CLI_POLICY_E2E_MARKER=run-child",
+        "sh",
+        "--",
+        "-c",
+        "printf '%s:%s\\n' \"$FASTMCP_PROTOCOL_POLICY\" \"$FASTMCP_CLI_POLICY_E2E_MARKER\"",
+    ]);
+    assert!(positive.status.success());
+    assert_eq!(stdout_str(&positive).trim(), "modern-only:run-child");
+
+    // RH-5: adding only the caller-controlled reserved policy assignment
+    // must reject before the otherwise identical child can mutate its marker.
+    let negative = run_cli(&[
+        "run",
+        "--protocol-policy",
+        "modern-only",
+        "-e",
+        "FASTMCP_CLI_POLICY_E2E_MARKER=run-child",
+        "-e",
+        "FASTMCP_PROTOCOL_POLICY=legacy-only",
+        "sh",
+        "--",
+        "-c",
+        "printf '%s:%s\\n' \"$FASTMCP_PROTOCOL_POLICY\" \"$FASTMCP_CLI_POLICY_E2E_MARKER\"",
+    ]);
+    assert!(!negative.status.success());
+    assert!(
+        !stdout_str(&negative).contains("run-child"),
+        "the rejected override must leave the child marker unchanged by preventing spawn"
+    );
+    assert!(
+        stderr_str(&negative)
+            .contains("FASTMCP_PROTOCOL_POLICY is controlled by --protocol-policy"),
+        "the rejected override must report the reserved policy boundary"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn e2e_cli_dev_rejects_invalid_environment_assignment_before_spawn() {
@@ -999,6 +1077,90 @@ fn e2e_cli_dev_rejects_invalid_environment_assignment_before_spawn() {
 
     assert!(!output.status.success());
     assert!(stderr_str(&output).contains("expected KEY=VALUE"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_dev_passes_each_enabled_protocol_policy_to_the_child() {
+    #[cfg(feature = "legacy-2024-11-05")]
+    let policies = ["modern-only", "auto", "legacy-only"];
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    let policies = ["modern-only"];
+
+    for policy in policies {
+        let output = run_cli(&[
+            "dev",
+            "--no-reload",
+            "--protocol-policy",
+            policy,
+            "-e",
+            "FASTMCP_CLI_POLICY_E2E_MARKER=dev-child",
+            "/usr/bin/env",
+        ]);
+
+        assert!(
+            output.status.success(),
+            "dev must launch a child for {policy}: {}",
+            stderr_str(&output)
+        );
+        let stdout = stdout_str(&output);
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == format!("FASTMCP_PROTOCOL_POLICY={policy}")),
+            "dev must provide the selected policy as the child's authoritative environment value: {stdout}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == "FASTMCP_CLI_POLICY_E2E_MARKER=dev-child"),
+            "dev must run the child that observes its inherited environment: {stdout}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_dev_rh5_reserved_protocol_policy_override_does_not_spawn_the_child() {
+    let positive = run_cli(&[
+        "dev",
+        "--no-reload",
+        "--protocol-policy",
+        "modern-only",
+        "-e",
+        "FASTMCP_CLI_POLICY_E2E_MARKER=dev-child",
+        "/usr/bin/env",
+    ]);
+    assert!(positive.status.success());
+    assert!(
+        stdout_str(&positive)
+            .lines()
+            .any(|line| line == "FASTMCP_CLI_POLICY_E2E_MARKER=dev-child")
+    );
+
+    // RH-5: adding only the caller-controlled reserved policy assignment
+    // must reject before the otherwise identical child can mutate its marker.
+    let negative = run_cli(&[
+        "dev",
+        "--no-reload",
+        "--protocol-policy",
+        "modern-only",
+        "-e",
+        "FASTMCP_CLI_POLICY_E2E_MARKER=dev-child",
+        "-e",
+        "FASTMCP_PROTOCOL_POLICY=legacy-only",
+        "/usr/bin/env",
+    ]);
+    assert!(!negative.status.success());
+    assert!(
+        !stdout_str(&negative).contains("FASTMCP_CLI_POLICY_E2E_MARKER=dev-child"),
+        "the rejected override must leave the child marker unchanged by preventing spawn"
+    );
+    assert!(
+        stderr_str(&negative)
+            .contains("FASTMCP_PROTOCOL_POLICY is controlled by --protocol-policy"),
+        "the rejected override must report the reserved policy boundary"
+    );
 }
 
 #[cfg(target_os = "linux")]

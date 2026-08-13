@@ -1094,6 +1094,7 @@ dependencies = [
  "html5ever",
  "log",
  "redis",
+ "ring",
  "serde",
  "serde_json",
  "url",

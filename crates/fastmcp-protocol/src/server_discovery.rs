@@ -9,14 +9,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-use serde::{de::Error as _, ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::Error as _,
+    ser::{Error as _, SerializeMap},
+};
+use serde_json::{Value, value::RawValue};
 
 use crate::common_types::OpenMetadata;
-use crate::result::CacheTtl;
+use crate::result::{
+    CacheTtl, ExactJsonObject, FinalResultMetadataRole, encode_exact_object,
+    parse_exact_result_object, validate_final_result_metadata_entries,
+};
 use crate::{
-    protocol_version::FINAL_PROTOCOL_VERSION, ExtensionId, ResultPeerDiagnostic, ServerInfo,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY,
+    ExtensionId, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY,
+    ResultPeerDiagnostic, ServerInfo, protocol_version::FINAL_PROTOCOL_VERSION,
 };
 
 /// The exact JSON-RPC method for final server discovery.
@@ -277,17 +284,6 @@ const DISCOVERY_CONTRADICTORY_RESULT_MEMBERS: [&str; 13] = [
     "pollIntervalMs",
     "result",
     "error",
-];
-
-/// Reserved final request metadata that is invalid in a discovery response.
-///
-/// `server/discover` is consumed directly by client initialization, instead
-/// of through the generic result codec, so it must enforce the same
-/// request/result metadata boundary itself.
-const DISCOVERY_REQUEST_ONLY_METADATA_MEMBERS: [&str; 3] = [
-    "io.modelcontextprotocol/protocolVersion",
-    "io.modelcontextprotocol/clientCapabilities",
-    "io.modelcontextprotocol/clientInfo",
 ];
 
 /// Required final caching hints for a `server/discover` result.
@@ -562,6 +558,8 @@ impl<'de> Deserialize<'de> for ServerDiscoverResultMetadata {
         D: Deserializer<'de>,
     {
         let mut members = BTreeMap::<String, Value>::deserialize(deserializer)?;
+        validate_final_result_metadata_entries(&members, FinalResultMetadataRole::Ordinary)
+            .map_err(D::Error::custom)?;
         let server_info = members
             .remove(SERVER_DISCOVER_SERVER_INFO_META_KEY)
             .map(serde_json::from_value)
@@ -591,27 +589,22 @@ impl<'de> Deserialize<'de> for OptionalServerInstructions {
 }
 
 /// Typed `server/discover` result whose wire vocabulary is fixed to final MCP.
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug)]
 pub struct ServerDiscoverResult {
-    #[serde(rename = "resultType")]
     result_type: String,
-    #[serde(skip)]
     peer_missing_result_type: bool,
-    #[serde(rename = "supportedVersions")]
     supported_versions: Vec<String>,
     capabilities: ServerDiscoverCapabilities,
-    #[serde(
-        rename = "_meta",
-        skip_serializing_if = "ServerDiscoverResultMetadata::is_empty"
-    )]
     metadata: ServerDiscoverResultMetadata,
-    #[serde(skip_serializing_if = "Option::is_none")]
     instructions: Option<ServerInstructions>,
-    #[serde(flatten)]
     cache_hints: DiscoveryCacheHints,
-    #[serde(flatten)]
     extras: BTreeMap<String, Value>,
+    /// Exact peer source retained after typed discovery admission.
+    ///
+    /// This covers both schema-open top-level siblings and nested `_meta`
+    /// members, whose order and number lexemes are otherwise lost by typed
+    /// `BTreeMap<String, Value>` validation.
+    exact_peer_result: Option<ExactJsonObject>,
 }
 
 impl ServerDiscoverResult {
@@ -636,6 +629,7 @@ impl ServerDiscoverResult {
             instructions,
             cache_hints,
             extras: BTreeMap::new(),
+            exact_peer_result: None,
         }
     }
 
@@ -695,6 +689,51 @@ impl ServerDiscoverResult {
     }
 }
 
+impl Serialize for ServerDiscoverResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if let Some(exact_peer_result) = &self.exact_peer_result {
+            let raw = RawValue::from_string(encode_exact_object(exact_peer_result))
+                .map_err(S::Error::custom)?;
+            return raw.serialize(serializer);
+        }
+
+        ServerDiscoverResultCanonical {
+            result_type: &self.result_type,
+            supported_versions: &self.supported_versions,
+            capabilities: &self.capabilities,
+            metadata: &self.metadata,
+            instructions: self.instructions.as_ref(),
+            cache_hints: &self.cache_hints,
+            extras: &self.extras,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServerDiscoverResultCanonical<'a> {
+    #[serde(rename = "resultType")]
+    result_type: &'a str,
+    #[serde(rename = "supportedVersions")]
+    supported_versions: &'a [String],
+    capabilities: &'a ServerDiscoverCapabilities,
+    #[serde(
+        rename = "_meta",
+        skip_serializing_if = "ServerDiscoverResultMetadata::is_empty"
+    )]
+    metadata: &'a ServerDiscoverResultMetadata,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a ServerInstructions>,
+    #[serde(flatten)]
+    cache_hints: &'a DiscoveryCacheHints,
+    #[serde(flatten)]
+    extras: &'a BTreeMap<String, Value>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServerDiscoverResultWire {
@@ -738,7 +777,10 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
     where
         D: Deserializer<'de>,
     {
-        let wire = ServerDiscoverResultWire::deserialize(deserializer)?;
+        let raw = Box::<RawValue>::deserialize(deserializer)?;
+        let exact_peer_result = parse_exact_result_object(raw.get()).map_err(D::Error::custom)?;
+        let wire = serde_json::from_str::<ServerDiscoverResultWire>(raw.get())
+            .map_err(D::Error::custom)?;
         let peer_missing_result_type = wire.result_type.0.is_none();
         if wire
             .result_type
@@ -759,15 +801,6 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
                 "server/discover result contains a contradictory final result member",
             ));
         }
-        if wire.metadata.extras.keys().any(|name| {
-            DISCOVERY_REQUEST_ONLY_METADATA_MEMBERS
-                .iter()
-                .any(|forbidden| name == forbidden)
-        }) {
-            return Err(D::Error::custom(
-                "server/discover result contains request-only final metadata",
-            ));
-        }
         Ok(Self {
             result_type: COMPLETE_DISCOVERY_RESULT_TYPE.to_owned(),
             peer_missing_result_type,
@@ -777,6 +810,7 @@ impl<'de> Deserialize<'de> for ServerDiscoverResult {
             instructions: wire.instructions.0,
             cache_hints: DiscoveryCacheHints::from_peer_wire(wire.ttl_ms, wire.cache_scope),
             extras: wire.extras,
+            exact_peer_result: (!peer_missing_result_type).then_some(exact_peer_result),
         })
     }
 }
@@ -855,13 +889,13 @@ impl Error for ServerDiscoveryError {}
 mod tests {
     use std::collections::BTreeMap;
 
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use crate::{
-        DiscoveryCacheHints, ResultPeerDiagnostic, ServerBehavior, ServerBehaviorRegistry,
-        ServerDiscoverCapabilities, ServerDiscoverRequest, ServerDiscoverResult,
-        ServerDiscoveryError, ServerInfo, ServerInstructions, SERVER_DISCOVER_METHOD,
-        SERVER_DISCOVER_SUPPORTED_VERSIONS,
+        DiscoveryCacheHints, ResultPeerDiagnostic, SERVER_DISCOVER_METHOD,
+        SERVER_DISCOVER_SERVER_INFO_META_KEY, SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior,
+        ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
+        ServerDiscoverResult, ServerDiscoveryError, ServerInfo, ServerInstructions,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
@@ -1012,6 +1046,26 @@ mod tests {
     }
 
     #[test]
+    fn server_discover_retains_exact_admitted_source_for_open_members() {
+        let source = r#"{"com.example/top":{"second":1.20e+4,"first":0e0},"cacheScope":"private","_meta":{"io.modelcontextprotocol/futureResultMetadata":{"later":1.20e+4,"earlier":0e0},"io.modelcontextprotocol/serverInfo":{"version":"1.0.0","name":"contract-server"}},"capabilities":{"tools":{"listChanged":true}},"ttlMs":0,"supportedVersions":["2026-07-28"],"resultType":"complete"}"#;
+
+        let decoded = serde_json::from_str::<ServerDiscoverResult>(source)
+            .expect("typed final discovery fields admit the exact peer source");
+        assert_eq!(
+            decoded
+                .server_info()
+                .map(|server_info| (server_info.name.as_str(), server_info.version.as_str())),
+            Some(("contract-server", "1.0.0")),
+            "exact retention does not bypass serverInfo validation"
+        );
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("admitted discovery result replays"),
+            source,
+            "top-level and nested schema-open member order and number lexemes replay exactly"
+        );
+    }
+
+    #[test]
     fn server_discover_accepts_schema_valid_supported_versions() {
         let admitted = ServerDiscoverResult::new(
             fully_installed_capabilities(),
@@ -1145,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn server_discover_rejects_request_metadata_without_mutating_admission() {
+    fn server_discover_matches_ordinary_result_metadata_roles_without_mutating_admission() {
         let admitted = ServerDiscoverResult::new(
             fully_installed_capabilities(),
             ServerInfo {
@@ -1160,11 +1214,46 @@ mod tests {
             .expect("response-only discovery metadata is admitted");
         let baseline_wire = serde_json::to_value(&baseline).expect("baseline re-encodes");
 
-        let mut planted = admitted_wire.clone();
-        planted["_meta"]["io.modelcontextprotocol/protocolVersion"] = json!("2026-07-28");
+        for (member, value) in [
+            (
+                "io.modelcontextprotocol/protocolVersion",
+                json!("2026-07-28"),
+            ),
+            ("io.modelcontextprotocol/clientCapabilities", json!({})),
+            (
+                "io.modelcontextprotocol/clientInfo",
+                json!({"name": "client", "version": "1"}),
+            ),
+            ("io.modelcontextprotocol/logLevel", json!("notice")),
+            (
+                "io.modelcontextprotocol/subscriptionId",
+                json!("subscription-7"),
+            ),
+        ] {
+            let mut planted = admitted_wire.clone();
+            planted["_meta"][member] = value;
+            assert!(
+                serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
+                "adding only {member} rejects the ordinary discovery response"
+            );
+        }
+
+        let mut invalid_server_info = admitted_wire.clone();
+        invalid_server_info["_meta"][SERVER_DISCOVER_SERVER_INFO_META_KEY] = Value::Null;
         assert!(
-            serde_json::from_value::<ServerDiscoverResult>(planted).is_err(),
-            "adding only request protocol metadata rejects the discovery response"
+            serde_json::from_value::<ServerDiscoverResult>(invalid_server_info).is_err(),
+            "only a null reserved serverInfo type rejects discovery"
+        );
+
+        let mut schema_open = admitted_wire.clone();
+        schema_open["_meta"]["io.modelcontextprotocol/futureResultMetadata"] =
+            json!({"future": true});
+        let accepted_open = serde_json::from_value::<ServerDiscoverResult>(schema_open.clone())
+            .expect("unknown reserved result metadata remains inert and admitted");
+        assert_eq!(
+            serde_json::to_value(accepted_open).expect("schema-open discovery re-encodes"),
+            schema_open,
+            "direct discovery retains inert reserved metadata"
         );
 
         let reaccepted = serde_json::from_value::<ServerDiscoverResult>(admitted_wire)

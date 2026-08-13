@@ -74,6 +74,8 @@ use url::{Host, Url};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::auth::{AuthRequest, TokenVerifier};
+#[cfg(feature = "builtin-auth-server")]
+use crate::oidc::OidcProvider;
 
 const PKCE_CODE_VERIFIER_MIN_BYTES: usize = 43;
 const PKCE_CODE_VERIFIER_MAX_BYTES: usize = 128;
@@ -302,6 +304,281 @@ pub enum OAuthParameterName {
     Token,
     /// `token_type_hint`
     TokenTypeHint,
+}
+
+/// Immutable public native-HTTP routes for an [`OAuthServer`].
+///
+/// OAuth authorization, token, and revocation are always available. An OIDC
+/// provider can add its fixed discovery and JWKS routes only after it has
+/// bound an exact advertised public JWKS URI to an external signer.
+#[derive(Clone)]
+pub struct OAuthHttpRoutes {
+    server: Arc<OAuthServer>,
+    public_endpoint_base: String,
+    authorization_path: String,
+    token_path: String,
+    revocation_path: String,
+    #[cfg(feature = "builtin-auth-server")]
+    oidc: Option<OidcHttpRoutes>,
+}
+
+/// Native public OIDC metadata routes bound to one OAuth server and issuer.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone)]
+pub(crate) struct OidcHttpRoutes {
+    provider: Arc<OidcProvider>,
+    discovery_path: String,
+    jwks_path: String,
+    jwks_uri: String,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl OidcHttpRoutes {
+    pub(crate) fn provider(&self) -> &Arc<OidcProvider> {
+        &self.provider
+    }
+
+    pub(crate) fn discovery_path(&self) -> &str {
+        &self.discovery_path
+    }
+
+    pub(crate) fn jwks_path(&self) -> &str {
+        &self.jwks_path
+    }
+
+    pub(crate) fn jwks_uri(&self) -> &str {
+        &self.jwks_uri
+    }
+}
+
+impl std::fmt::Debug for OAuthHttpRoutes {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("OAuthHttpRoutes");
+        debug
+            .field("public_endpoint_base", &self.public_endpoint_base)
+            .field("authorization_path", &self.authorization_path)
+            .field("token_path", &self.token_path)
+            .field("revocation_path", &self.revocation_path);
+        #[cfg(feature = "builtin-auth-server")]
+        debug
+            .field(
+                "oidc_discovery_path",
+                &self.oidc.as_ref().map(|oidc| oidc.discovery_path.as_str()),
+            )
+            .field(
+                "oidc_jwks_path",
+                &self.oidc.as_ref().map(|oidc| oidc.jwks_path.as_str()),
+            );
+        debug.finish_non_exhaustive()
+    }
+}
+
+/// A public OAuth HTTP route configuration was unsafe or ambiguous.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OAuthHttpRouteConfigurationError {
+    /// The configured endpoint base was not a canonical HTTPS URL.
+    InvalidPublicEndpointBase,
+    /// The endpoint base did not share the configured OAuth issuer origin.
+    IssuerOriginMismatch,
+}
+
+impl std::fmt::Display for OAuthHttpRouteConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPublicEndpointBase => formatter.write_str(
+                "OAuth public endpoint base must be a canonical HTTPS URL without query or fragment",
+            ),
+            Self::IssuerOriginMismatch => formatter.write_str(
+                "OAuth public endpoint base must share the configured issuer origin",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OAuthHttpRouteConfigurationError {}
+
+impl OAuthHttpRoutes {
+    /// Creates the fixed authorization, token, and revocation routes below an
+    /// explicit public HTTPS endpoint base.
+    ///
+    /// For example, `https://auth.example.test/oauth` exposes
+    /// `/oauth/authorize`, `/oauth/token`, and `/oauth/revoke`. The base is
+    /// never inferred from a request Host or forwarded header.
+    pub fn new(
+        server: Arc<OAuthServer>,
+        public_endpoint_base: impl Into<String>,
+    ) -> Result<Self, OAuthHttpRouteConfigurationError> {
+        let public_endpoint_base = public_endpoint_base.into();
+        let Some(base) = parse_secure_endpoint(&public_endpoint_base, MAX_OAUTH_ISSUER_BYTES)
+        else {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        };
+        if base.scheme() != "https" || base.query().is_some() {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        }
+        let Some(issuer) = parse_secure_endpoint(&server.config().issuer, MAX_OAUTH_ISSUER_BYTES)
+        else {
+            return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
+        };
+        if base.scheme() != issuer.scheme()
+            || base.host_str() != issuer.host_str()
+            || base.port_or_known_default() != issuer.port_or_known_default()
+        {
+            return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
+        }
+
+        let base_path = base.path().trim_end_matches('/');
+        let route_path = |suffix: &str| {
+            if base_path.is_empty() {
+                format!("/{suffix}")
+            } else {
+                format!("{base_path}/{suffix}")
+            }
+        };
+        Ok(Self {
+            server,
+            public_endpoint_base,
+            authorization_path: route_path("authorize"),
+            token_path: route_path("token"),
+            revocation_path: route_path("revoke"),
+            #[cfg(feature = "builtin-auth-server")]
+            oidc: None,
+        })
+    }
+
+    /// Adds fixed OIDC discovery and JWKS routes for a provider that has
+    /// already entered signer activation. The provider must be layered over
+    /// this exact OAuth server; neither issuer nor endpoint paths are inferred
+    /// from requests.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn with_oidc(
+        mut self,
+        provider: Arc<OidcProvider>,
+    ) -> Result<Self, OAuthHttpRouteConfigurationError> {
+        if !Arc::ptr_eq(provider.oauth(), &self.server) {
+            return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
+        }
+        let jwks_uri = provider
+            .advertised_id_token_jwks_uri()
+            .map_err(|_| OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase)?;
+        let jwks = Url::parse(&jwks_uri)
+            .map_err(|_| OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase)?;
+        let issuer = Url::parse(&provider.config().issuer)
+            .map_err(|_| OAuthHttpRouteConfigurationError::IssuerOriginMismatch)?;
+        if jwks.origin() != issuer.origin() || jwks.path().is_empty() {
+            return Err(OAuthHttpRouteConfigurationError::IssuerOriginMismatch);
+        }
+        let issuer_path = issuer.path().trim_matches('/');
+        let discovery_path = if issuer_path.is_empty() {
+            "/.well-known/openid-configuration".to_string()
+        } else {
+            format!("/.well-known/openid-configuration/{issuer_path}")
+        };
+        let candidate = OidcHttpRoutes {
+            provider,
+            discovery_path,
+            jwks_path: jwks.path().to_string(),
+            jwks_uri,
+        };
+        if [
+            self.authorization_path(),
+            self.token_path(),
+            self.revocation_path(),
+        ]
+        .contains(&candidate.discovery_path.as_str())
+            || [
+                self.authorization_path(),
+                self.token_path(),
+                self.revocation_path(),
+            ]
+            .contains(&candidate.jwks_path.as_str())
+            || candidate.discovery_path == candidate.jwks_path
+        {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        }
+        self.oidc = Some(candidate);
+        Ok(self)
+    }
+
+    /// Returns the configured public endpoint base.
+    #[must_use]
+    pub fn public_endpoint_base(&self) -> &str {
+        &self.public_endpoint_base
+    }
+
+    /// Returns the exact authorization endpoint path.
+    #[must_use]
+    pub fn authorization_path(&self) -> &str {
+        &self.authorization_path
+    }
+
+    /// Returns the exact token endpoint path.
+    #[must_use]
+    pub fn token_path(&self) -> &str {
+        &self.token_path
+    }
+
+    /// Returns the exact revocation endpoint path.
+    #[must_use]
+    pub fn revocation_path(&self) -> &str {
+        &self.revocation_path
+    }
+
+    pub(crate) fn server(&self) -> &Arc<OAuthServer> {
+        &self.server
+    }
+
+    pub(crate) fn has_path(&self, path: &str) -> bool {
+        path == self.authorization_path
+            || path == self.token_path
+            || path == self.revocation_path
+            || {
+                #[cfg(feature = "builtin-auth-server")]
+                {
+                    self.oidc
+                        .as_ref()
+                        .is_some_and(|oidc| path == oidc.discovery_path || path == oidc.jwks_path)
+                }
+                #[cfg(not(feature = "builtin-auth-server"))]
+                {
+                    false
+                }
+            }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    pub(crate) fn oidc_routes(&self) -> Option<&OidcHttpRoutes> {
+        self.oidc.as_ref()
+    }
+
+    pub(crate) fn validate_non_overlapping_paths<'a>(
+        &self,
+        occupied_paths: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), OAuthHttpRouteConfigurationError> {
+        if occupied_paths.into_iter().any(|occupied| {
+            [
+                self.authorization_path(),
+                self.token_path(),
+                self.revocation_path(),
+            ]
+            .contains(&occupied)
+                || {
+                    #[cfg(feature = "builtin-auth-server")]
+                    {
+                        self.oidc.as_ref().is_some_and(|oidc| {
+                            occupied == oidc.discovery_path || occupied == oidc.jwks_path
+                        })
+                    }
+                    #[cfg(not(feature = "builtin-auth-server"))]
+                    {
+                        false
+                    }
+                }
+        }) {
+            return Err(OAuthHttpRouteConfigurationError::InvalidPublicEndpointBase);
+        }
+        Ok(())
+    }
 }
 
 /// One decoded parameter retained in exact wire order.
@@ -1914,6 +2191,10 @@ impl std::fmt::Debug for AuthorizationApprovalDecision {
 }
 
 /// Result of a synchronous authorization/consent backend invocation.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the decision is a deliberate one-shot, non-cloneable approval capability payload"
+)]
 pub enum AuthorizationApprovalDisposition {
     /// The backend approved the exact redacted request.
     Approved(AuthorizationApprovalDecision),
@@ -2736,6 +3017,54 @@ impl OAuthServer {
         request: &AuthorizationRequest,
     ) -> Result<(String, String), OAuthError> {
         self.authorize_with_token_draw(request, draw_security_identifier)
+    }
+
+    /// Builds a safe authorization-error redirect after an authorization
+    /// request failed.
+    ///
+    /// RFC 6749 permits a direct error only when the client or redirect URI
+    /// cannot be trusted. This helper therefore re-validates exactly those
+    /// two routing inputs without mutating OAuth state. A caller must use the
+    /// returned URI only for an authorization-endpoint error response.
+    pub(crate) fn authorization_error_redirect(
+        &self,
+        request: &AuthorizationRequest,
+        error: &OAuthError,
+    ) -> Option<String> {
+        if matches!(error, OAuthError::InvalidClient(_))
+            || validate_client_id_admission(&request.client_id).is_err()
+            || parse_redirect_uri(&request.redirect_uri).is_none()
+            || validate_optional_authorization_value(
+                request.state.as_deref(),
+                MAX_OAUTH_STATE_BYTES,
+                OAUTH_AUTHORIZATION_STATE_RETENTION_ERROR,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        let state = self.state.read().ok()?;
+        let client = state.clients.get(&request.client_id)?;
+        if !client.validate_redirect_uri(&request.redirect_uri) {
+            return None;
+        }
+        drop(state);
+
+        let mut redirect = request.redirect_uri.clone();
+        let separator = if redirect.contains('?') { '&' } else { '?' };
+        redirect.push(separator);
+        redirect.push_str("error=");
+        redirect.push_str(error.error_code());
+        if let Some(state) = &request.state {
+            redirect.push_str("&state=");
+            redirect.push_str(&url_encode(state));
+        }
+        // Match successful authorization responses: the issuer identifier is
+        // part of the authorization response, including failures.
+        redirect.push_str("&iss=");
+        redirect.push_str(&url_encode(&self.config.issuer));
+        Some(redirect)
     }
 
     fn authorize_with_token_draw<F, E>(

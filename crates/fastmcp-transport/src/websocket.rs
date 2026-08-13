@@ -295,9 +295,9 @@ fn decode_native_websocket_message(
         // asupersync consumes ping/pong control frames internally before
         // returning from recv; reaching either branch is therefore a protocol
         // boundary violation rather than an application message.
-        Some(NativeWsMessage::Ping(_)) | Some(NativeWsMessage::Pong(_)) => Err(
-            websocket_invalid_data("Unexpected WebSocket control message after native handling"),
-        ),
+        Some(NativeWsMessage::Ping(_) | NativeWsMessage::Pong(_)) => Err(websocket_invalid_data(
+            "Unexpected WebSocket control message after native handling",
+        )),
     }
 }
 
@@ -545,9 +545,7 @@ where
         let close_code = match &message {
             Some(NativeWsMessage::Text(_)) => CloseCode::InvalidPayload,
             Some(NativeWsMessage::Binary(_)) => CloseCode::Unsupported,
-            Some(NativeWsMessage::Ping(_)) | Some(NativeWsMessage::Pong(_)) => {
-                CloseCode::ProtocolError
-            }
+            Some(NativeWsMessage::Ping(_) | NativeWsMessage::Pong(_)) => CloseCode::ProtocolError,
             Some(NativeWsMessage::Close(_)) | None => unreachable!("handled above"),
         };
         match decode_native_websocket_message(message) {
@@ -649,9 +647,7 @@ where
         let close_code = match &message {
             Some(NativeWsMessage::Text(_)) => CloseCode::InvalidPayload,
             Some(NativeWsMessage::Binary(_)) => CloseCode::Unsupported,
-            Some(NativeWsMessage::Ping(_)) | Some(NativeWsMessage::Pong(_)) => {
-                CloseCode::ProtocolError
-            }
+            Some(NativeWsMessage::Ping(_) | NativeWsMessage::Pong(_)) => CloseCode::ProtocolError,
             Some(NativeWsMessage::Close(_)) | None => unreachable!("handled above"),
         };
         match decode_native_websocket_message(message) {
@@ -3818,10 +3814,9 @@ mod tests {
 
     #[test]
     fn xport_01_experimental_profile_requires_a_caller_upgraded_byte_stream() {
-        let _constructor: fn(
+        let _: fn(
             asupersync::net::tcp::VirtualTcpStream,
-        )
-            -> AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream> =
+        ) -> AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream> =
             AsyncWsServerTransport::from_upgraded;
     }
 

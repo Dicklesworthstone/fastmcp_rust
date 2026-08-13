@@ -4,13 +4,14 @@
 //! message structs.  It admits one JSON object, preserves open members in their
 //! received order, and does not activate an unrecognised discriminator.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::common_types::{Implementation, JsonInteger, OpenMetadata};
-use crate::jsonrpc::{admit_raw_jsonrpc_document, RawJsonAdmissionError};
+use crate::jsonrpc::{RawJsonAdmissionError, admit_raw_jsonrpc_document};
 use crate::protocol_policy::ProtocolEra;
 
 /// Maximum encoded bytes accepted by the result codec.
@@ -248,7 +249,12 @@ pub fn exact_json_to_serde(value: &ExactJsonValue) -> Result<serde_json::Value, 
     }
 }
 
-fn parse_exact_result_object(input: &str) -> Result<ExactJsonObject, ResultDecodeError> {
+/// Parses one bounded, duplicate-free exact final-result object.
+///
+/// Method-specific direct decoders use this same admission boundary before
+/// validating their typed fields, so their public replay paths retain the
+/// source object rather than reserializing it through `serde_json::Value`.
+pub(crate) fn parse_exact_result_object(input: &str) -> Result<ExactJsonObject, ResultDecodeError> {
     admit_raw_jsonrpc_document(input.as_bytes(), MAX_RESULT_ENCODED_BYTES)
         .map_err(result_raw_admission_error)?;
     let ExactJsonValue::Object(object) = parse_exact_json(input)? else {
@@ -293,6 +299,18 @@ pub struct ResultMeta {
 }
 
 impl ResultMeta {
+    /// Creates empty metadata for a locally authored result.
+    ///
+    /// This preserves the absence of the optional `_meta` member on the wire.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            server_info: None,
+            meta: None,
+            exact_meta: None,
+        }
+    }
+
     /// Creates metadata for a locally constructed successful result.
     #[must_use]
     pub fn server_generated(server_info: Implementation) -> Self {
@@ -424,25 +442,42 @@ const COMMON_RESULT_MEMBER_NAMES: [&str; 3] = ["resultType", "_meta", "serverInf
 ///
 /// Legacy envelopes may retain application-defined metadata, but cannot carry
 /// any of these protocol-defined members without crossing protocol eras.
-const FINAL_ONLY_METADATA_MEMBER_NAMES: [&str; 5] = [
+const FINAL_ONLY_METADATA_MEMBER_NAMES: [&str; 6] = [
     "io.modelcontextprotocol/protocolVersion",
     "io.modelcontextprotocol/clientCapabilities",
     "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/logLevel",
     "io.modelcontextprotocol/serverInfo",
     "io.modelcontextprotocol/subscriptionId",
 ];
 
-/// Reserved final metadata members that belong only to a request.
+/// Reserved final metadata members that do not belong on an ordinary result.
 ///
 /// The protocol version and client facts select and constrain a request; a
 /// peer response must not be allowed to echo or redefine them as open result
-/// metadata. Server identity and subscription correlation remain valid
-/// response metadata and are therefore intentionally excluded here.
-const FINAL_REQUEST_ONLY_METADATA_MEMBER_NAMES: [&str; 3] = [
+/// metadata. `logLevel` is likewise request-only, while `subscriptionId`
+/// belongs to notification metadata except for the dedicated
+/// `subscriptions/listen` terminal result.
+const FINAL_ORDINARY_RESULT_FORBIDDEN_METADATA_MEMBER_NAMES: [&str; 5] = [
     "io.modelcontextprotocol/protocolVersion",
     "io.modelcontextprotocol/clientCapabilities",
     "io.modelcontextprotocol/clientInfo",
+    "io.modelcontextprotocol/logLevel",
+    "io.modelcontextprotocol/subscriptionId",
 ];
+
+/// The method-owned metadata shape selected for a final result.
+///
+/// Ordinary final results reject request and notification metadata. Only the
+/// terminal `subscriptions/listen` result has the schema-defined
+/// `subscriptionId` exception.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FinalResultMetadataRole {
+    /// Every ordinary final result, including `server/discover`.
+    Ordinary,
+    /// The terminal `subscriptions/listen` result.
+    SubscriptionsListen,
+}
 
 /// Returns whether an otherwise legacy result envelope carries a reserved
 /// final-era metadata member.
@@ -471,14 +506,47 @@ fn exact_result_carries_final_only_metadata(members: &ExactJsonObject) -> bool {
     )
 }
 
-fn exact_result_request_only_metadata_member(members: &ExactJsonObject) -> Option<&'static str> {
-    let ExactJsonValue::Object(metadata) = members.get("_meta")? else {
-        return None;
+fn exact_result_metadata_entries(
+    metadata: &ExactJsonObject,
+) -> Result<BTreeMap<String, Value>, ResultDecodeError> {
+    let Value::Object(entries) = exact_json_to_serde(&ExactJsonValue::Object(metadata.clone()))?
+    else {
+        unreachable!("exact result metadata always converts to an object");
     };
-    FINAL_REQUEST_ONLY_METADATA_MEMBER_NAMES
+    Ok(entries.into_iter().collect())
+}
+
+/// Validates the reserved members of final result metadata without assigning
+/// behavior to schema-open names. Exact callers retain the original metadata
+/// object separately, so this typed check never rewrites member order or
+/// number lexemes.
+pub(crate) fn validate_final_result_metadata_entries(
+    entries: &BTreeMap<String, Value>,
+    role: FinalResultMetadataRole,
+) -> Result<(), ResultDecodeError> {
+    if let Some(member) = FINAL_ORDINARY_RESULT_FORBIDDEN_METADATA_MEMBER_NAMES
         .iter()
         .copied()
-        .find(|member| metadata.get(member).is_some())
+        .find(|member| {
+            entries.contains_key(*member)
+                && (role == FinalResultMetadataRole::Ordinary
+                    || *member != "io.modelcontextprotocol/subscriptionId")
+        })
+    {
+        return Err(ResultDecodeError::new(
+            ResultDecodeErrorKind::InvalidKnownMember,
+            format!("$._meta.{member}"),
+        ));
+    }
+    if let Some(server_info) = entries.get("io.modelcontextprotocol/serverInfo") {
+        serde_json::from_value::<Implementation>(server_info.clone()).map_err(|_| {
+            ResultDecodeError::new(
+                ResultDecodeErrorKind::InvalidKnownMember,
+                "$._meta.io.modelcontextprotocol/serverInfo",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_local_result_members(members: &[ExactJsonMember]) -> Result<(), ResultDecodeError> {
@@ -1010,6 +1078,19 @@ pub fn decode_peer_result(
     era: ResultPeerEra,
     policy: &dyn ResultDiscriminatorPolicy,
 ) -> Result<(DecodedResult, Option<ResultPeerDiagnostic>), ResultDecodeError> {
+    decode_peer_result_with_metadata_role(input, era, policy, FinalResultMetadataRole::Ordinary)
+}
+
+/// Decodes one peer result with the selected method-owned metadata role.
+///
+/// This remains crate-visible because core method decoding is the sole caller
+/// permitted to select the `subscriptions/listen` terminal-result exception.
+pub(crate) fn decode_peer_result_with_metadata_role(
+    input: &str,
+    era: ResultPeerEra,
+    policy: &dyn ResultDiscriminatorPolicy,
+    metadata_role: FinalResultMetadataRole,
+) -> Result<(DecodedResult, Option<ResultPeerDiagnostic>), ResultDecodeError> {
     let mut members = parse_exact_result_object(input)?;
     let result_type = match members.get("resultType") {
         None if era == ResultPeerEra::Legacy => ("complete".to_owned(), None),
@@ -1031,11 +1112,19 @@ pub fn decode_peer_result(
             "$._meta",
         ));
     }
-    if era == ResultPeerEra::Modern {
-        if let Some(member) = exact_result_request_only_metadata_member(&members) {
+    if era == ResultPeerEra::Modern
+        && let Some(ExactJsonValue::Object(metadata)) = members.get("_meta")
+    {
+        let metadata_entries = exact_result_metadata_entries(metadata)?;
+        validate_final_result_metadata_entries(&metadata_entries, metadata_role)?;
+        if metadata_role == FinalResultMetadataRole::SubscriptionsListen
+            && let Some(subscription_id) =
+                metadata_entries.get("io.modelcontextprotocol/subscriptionId")
+            && serde_json::from_value::<crate::jsonrpc::RequestId>(subscription_id.clone()).is_err()
+        {
             return Err(ResultDecodeError::new(
                 ResultDecodeErrorKind::InvalidKnownMember,
-                format!("$._meta.{member}"),
+                "$._meta.io.modelcontextprotocol/subscriptionId",
             ));
         }
     }
@@ -1058,7 +1147,7 @@ pub fn decode_peer_result(
         ResultDiscriminatorDecision::Core => {}
     }
     let _ = members.take("resultType");
-    let meta = decode_result_meta(&mut members)?;
+    let meta = decode_result_meta(&mut members, metadata_role)?;
     match result_type.0.as_str() {
         "complete" => Ok((
             DecodedResult::Complete(CompleteResult {
@@ -1134,6 +1223,18 @@ pub fn decode_peer_result_for_era(
     decode_peer_result(input, era.into(), policy)
 }
 
+/// Decodes a peer result through the selected era and method-owned metadata
+/// role. The special role is crate-private to prevent unrelated public result
+/// consumers from accepting notification-only subscription metadata.
+pub(crate) fn decode_peer_result_for_era_with_metadata_role(
+    input: &str,
+    era: ProtocolEra,
+    policy: &dyn ResultDiscriminatorPolicy,
+    metadata_role: FinalResultMetadataRole,
+) -> Result<(DecodedResult, Option<ResultPeerDiagnostic>), ResultDecodeError> {
+    decode_peer_result_with_metadata_role(input, era.into(), policy, metadata_role)
+}
+
 /// Decodes a selected method-specific `complete` composition.
 ///
 /// The core result envelope is admitted first. The selected payload then
@@ -1200,20 +1301,20 @@ fn validate_known_member_names(names: &[&str]) -> Result<(), ResultDecodeError> 
     Ok(())
 }
 
-fn decode_result_meta(members: &mut ExactJsonObject) -> Result<ResultMeta, ResultDecodeError> {
+fn decode_result_meta(
+    members: &mut ExactJsonObject,
+    metadata_role: FinalResultMetadataRole,
+) -> Result<ResultMeta, ResultDecodeError> {
     let (meta, exact_meta) = match members.take("_meta") {
         None => (None, None),
-        Some(ExactJsonValue::Object(value)) => (
-            Some(
-                serde_json::from_value(exact_json_to_serde(&ExactJsonValue::Object(
-                    value.clone(),
-                ))?)
-                .map_err(|_| {
-                    ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$._meta")
-                })?,
-            ),
-            Some(value),
-        ),
+        Some(ExactJsonValue::Object(value)) => {
+            let entries = exact_result_metadata_entries(&value)?;
+            validate_final_result_metadata_entries(&entries, metadata_role)?;
+            let metadata = OpenMetadata::try_from_notification_entries(entries).map_err(|_| {
+                ResultDecodeError::new(ResultDecodeErrorKind::InvalidKnownMember, "$._meta")
+            })?;
+            (Some(metadata), Some(value))
+        }
         Some(_) => {
             return Err(ResultDecodeError::new(
                 ResultDecodeErrorKind::InvalidKnownMember,
@@ -1991,8 +2092,8 @@ mod tests {
     }
 
     #[test]
-    fn final_result_rejects_request_metadata_without_mutating_admission() {
-        let accepted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"},"com.example/trace":"retained"},"extension":true}"#;
+    fn final_result_metadata_roles_preserve_open_entries_and_reject_one_field_variants() {
+        let accepted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"},"io.modelcontextprotocol/futureResult":{"second":1.20e+4,"first":null},"com.example/trace":"retained"},"extension":true}"#;
         let (baseline, diagnostic) = decode_peer_result(
             accepted,
             ResultPeerEra::Modern,
@@ -2001,19 +2102,56 @@ mod tests {
         .expect("response-only final metadata is admitted");
         assert_eq!(diagnostic, None);
         let baseline_wire = encode_result(&baseline);
+        assert_eq!(
+            baseline_wire, accepted,
+            "open metadata retains its exact source"
+        );
 
-        let planted = r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"},"com.example/trace":"retained","io.modelcontextprotocol/protocolVersion":"2026-07-28"},"extension":true}"#;
+        for (member, value) in [
+            (
+                "io.modelcontextprotocol/protocolVersion",
+                Value::String("2026-07-28".to_owned()),
+            ),
+            (
+                "io.modelcontextprotocol/clientCapabilities",
+                serde_json::json!({}),
+            ),
+            (
+                "io.modelcontextprotocol/clientInfo",
+                serde_json::json!({"name": "client", "version": "1"}),
+            ),
+            (
+                "io.modelcontextprotocol/logLevel",
+                Value::String("notice".to_owned()),
+            ),
+            (
+                "io.modelcontextprotocol/subscriptionId",
+                Value::String("subscription-7".to_owned()),
+            ),
+        ] {
+            let mut planted: Value = serde_json::from_str(accepted).expect("baseline is JSON");
+            planted["_meta"][member] = value;
+            let error = decode_peer_result(
+                &serde_json::to_string(&planted).expect("one-field variant encodes"),
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .expect_err("one wrong-role metadata member rejects a final response");
+            assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
+            assert_eq!(error.path(), format!("$._meta.{member}"));
+        }
+
+        let mut invalid_server_info: Value =
+            serde_json::from_str(accepted).expect("baseline is JSON");
+        invalid_server_info["_meta"]["io.modelcontextprotocol/serverInfo"] = Value::Null;
         let error = decode_peer_result(
-            planted,
+            &serde_json::to_string(&invalid_server_info).expect("null variant encodes"),
             ResultPeerEra::Modern,
             &CoreResultDiscriminatorPolicy,
         )
-        .expect_err("adding only request protocol metadata rejects a final response");
+        .expect_err("only a null serverInfo type rejects the otherwise valid response");
         assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidKnownMember);
-        assert_eq!(
-            error.path(),
-            "$._meta.io.modelcontextprotocol/protocolVersion"
-        );
+        assert_eq!(error.path(), "$._meta.io.modelcontextprotocol/serverInfo");
 
         let (reaccepted, diagnostic) = decode_peer_result(
             accepted,

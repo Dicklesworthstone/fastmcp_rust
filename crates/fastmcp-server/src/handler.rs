@@ -25,13 +25,15 @@ use fastmcp_protocol::common_types::{
     AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 use fastmcp_protocol::{
-    CacheScope, CacheTtl, CompleteResult, CompletionValues, Content, CoreResultDiscriminatorPolicy,
-    DecodedResult, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
-    FinalGetPromptResult, FinalProgressNotificationParams, FinalPrompt, FinalPromptMessage,
-    FinalReadResourceResult, FinalResource, FinalResourceTemplate, FinalTool, Icon,
-    InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, ProgressMarker, ProgressParams,
-    Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra,
-    Tool, ToolAnnotations, decode_peer_result, encode_result,
+    AdmittedFinalFormSchema, CacheScope, CacheTtl, CompleteResult, CompletionValues, Content,
+    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue, FinalCallToolResult,
+    FinalCompletionParams, FinalCompletionValues, FinalEmbeddedCreateMessageParams,
+    FinalEmbeddedElicitationParams, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest,
+    FinalEmbeddedUrlElicitationParams, FinalGetPromptResult, FinalProgressNotificationParams,
+    FinalPrompt, FinalPromptMessage, FinalReadResourceResult, FinalResource, FinalResourceTemplate,
+    FinalTool, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, ProgressMarker,
+    ProgressParams, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta,
+    ResultPeerEra, Tool, ToolAnnotations, decode_peer_result, encode_result, exact_json_from_serde,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -790,6 +792,216 @@ impl From<CompleteResult<FinalCallToolResult>> for FinalToolOutcome {
 impl From<InputRequiredResult> for FinalToolOutcome {
     fn from(result: InputRequiredResult) -> Self {
         Self::InputRequired(result)
+    }
+}
+
+/// One final-era elicitation request that a handler returns as MRTR input.
+///
+/// This is deliberately not an async request/response operation. MCP
+/// 2026-07-28 carries server-to-client input in the original method's
+/// `input_required` result, then reinvokes the handler with
+/// [`MrtrCompletedInputs`] after the client retries. A normal
+/// [`McpContext::elicit_form`] future cannot preserve its stack frame across
+/// that protocol boundary.
+#[derive(Debug, Clone)]
+pub struct FinalElicitation {
+    input_key: String,
+    parameters: FinalEmbeddedElicitationParams,
+}
+
+impl FinalElicitation {
+    fn new(
+        context: &McpContext,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedElicitationParams,
+    ) -> McpResult<Self> {
+        let supported = match &parameters {
+            FinalEmbeddedElicitationParams::Form(_) => context.client_supports_elicitation_form(),
+            FinalEmbeddedElicitationParams::Url(_) => context.client_supports_elicitation_url(),
+        };
+        if !supported {
+            return Err(McpError::invalid_request(
+                "Final elicitation mode is not advertised by the client",
+            ));
+        }
+        let input_key = input_key.into();
+        if input_key.is_empty() {
+            return Err(McpError::invalid_params(
+                "Final elicitation input key must not be empty",
+            ));
+        }
+        Ok(Self {
+            input_key,
+            parameters,
+        })
+    }
+
+    /// Returns the opaque map key that correlates this elicitation on retry.
+    #[must_use]
+    pub fn input_key(&self) -> &str {
+        &self.input_key
+    }
+
+    /// Converts this request into the only handler outcome accepted by final
+    /// MRTR dispatch. The router validates the descriptor and replaces any
+    /// handler-selected retry state with a framework-minted value.
+    pub fn into_input_required(self) -> McpResult<InputRequiredResult> {
+        let descriptor = FinalEmbeddedInputRequest::Elicitation(self.parameters);
+        let wire = serde_json::json!({self.input_key: descriptor});
+        let ExactJsonValue::Object(input_requests) = exact_json_from_serde(&wire)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?
+        else {
+            return Err(McpError::internal_error(
+                "Final elicitation input requests must encode as an object",
+            ));
+        };
+        InputRequiredResult::new(Some(input_requests), None, ResultMeta::empty())
+            .map_err(|error| McpError::invalid_params(error.to_string()))
+    }
+}
+
+/// Final-only elicitation construction for [`McpContext`].
+///
+/// Import this trait to use [`Self::final_elicitation_form`] or
+/// [`Self::final_elicitation_url`] inside a final handler. Return the resulting
+/// [`FinalElicitation`] through [`FinalToolOutcome::InputRequired`], then read
+/// the accepted value with [`MrtrCompletedInputs::elicitation`] on the resumed
+/// invocation.
+pub trait FinalElicitationContextExt {
+    /// Builds an embedded final form elicitation request.
+    fn final_elicitation_form(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        requested_schema: serde_json::Value,
+    ) -> McpResult<FinalElicitation>;
+
+    /// Builds an embedded final URL elicitation request.
+    fn final_elicitation_url(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        url: impl Into<String>,
+    ) -> McpResult<FinalElicitation>;
+}
+
+impl FinalElicitationContextExt for McpContext {
+    fn final_elicitation_form(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        requested_schema: serde_json::Value,
+    ) -> McpResult<FinalElicitation> {
+        let requested_schema = AdmittedFinalFormSchema::admit(requested_schema)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        FinalElicitation::new(
+            self,
+            input_key,
+            FinalEmbeddedElicitationParams::Form(FinalEmbeddedFormElicitationParams {
+                mode: fastmcp_protocol::ElicitMode::Form,
+                message: message.into(),
+                requested_schema,
+            }),
+        )
+    }
+
+    fn final_elicitation_url(
+        &self,
+        input_key: impl Into<String>,
+        message: impl Into<String>,
+        url: impl Into<String>,
+    ) -> McpResult<FinalElicitation> {
+        let url =
+            AbsoluteUri::parse(url).map_err(|error| McpError::invalid_params(error.to_string()))?;
+        FinalElicitation::new(
+            self,
+            input_key,
+            FinalEmbeddedElicitationParams::Url(FinalEmbeddedUrlElicitationParams {
+                mode: fastmcp_protocol::ElicitMode::Url,
+                message: message.into(),
+                url,
+            }),
+        )
+    }
+}
+
+/// One final-era sampling request that a handler returns as MRTR input.
+///
+/// The request retains the exact final embedded sampling schema, including
+/// tool declarations and tool-choice controls. It is intentionally separate
+/// from the legacy reverse-request sampling API.
+#[derive(Debug, Clone)]
+pub struct FinalSampling {
+    input_key: String,
+    parameters: FinalEmbeddedCreateMessageParams,
+}
+
+impl FinalSampling {
+    fn new(
+        context: &McpContext,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedCreateMessageParams,
+    ) -> McpResult<Self> {
+        if !context.client_supports_sampling() {
+            return Err(McpError::invalid_request(
+                "Final sampling is not advertised by the client",
+            ));
+        }
+        let input_key = input_key.into();
+        if input_key.is_empty() {
+            return Err(McpError::invalid_params(
+                "Final sampling input key must not be empty",
+            ));
+        }
+        Ok(Self {
+            input_key,
+            parameters,
+        })
+    }
+
+    /// Returns the opaque map key that correlates this sampling request on retry.
+    #[must_use]
+    pub fn input_key(&self) -> &str {
+        &self.input_key
+    }
+
+    /// Converts this sampling request into framework-admitted final MRTR input.
+    pub fn into_input_required(self) -> McpResult<InputRequiredResult> {
+        let descriptor = FinalEmbeddedInputRequest::Sampling(self.parameters);
+        let wire = serde_json::json!({self.input_key: descriptor});
+        let ExactJsonValue::Object(input_requests) = exact_json_from_serde(&wire)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?
+        else {
+            return Err(McpError::internal_error(
+                "Final sampling input requests must encode as an object",
+            ));
+        };
+        InputRequiredResult::new(Some(input_requests), None, ResultMeta::empty())
+            .map_err(|error| McpError::invalid_params(error.to_string()))
+    }
+}
+
+/// Final-only sampling construction for [`McpContext`].
+///
+/// Import this trait to build a final embedded sampling request inside a final
+/// handler. Return it through [`FinalToolOutcome::InputRequired`], then read
+/// the typed final response with [`MrtrCompletedInputs::sampling`] after retry.
+pub trait FinalSamplingContextExt {
+    /// Builds one capability-gated final MRTR sampling descriptor.
+    fn final_sampling(
+        &self,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedCreateMessageParams,
+    ) -> McpResult<FinalSampling>;
+}
+
+impl FinalSamplingContextExt for McpContext {
+    fn final_sampling(
+        &self,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedCreateMessageParams,
+    ) -> McpResult<FinalSampling> {
+        FinalSampling::new(self, input_key, parameters)
     }
 }
 
@@ -5481,5 +5693,64 @@ mod tests {
         assert_eq!(def.name, "renamed");
         assert_eq!(def.description.as_deref(), Some("a stub tool"));
         assert_eq!(def.input_schema, serde_json::json!({"type": "object"}));
+    }
+
+    fn final_sampling_parameters_for_test() -> FinalEmbeddedCreateMessageParams {
+        serde_json::from_value(serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": {
+                    "type": "tool_use",
+                    "id": "weather-1",
+                    "name": "weather",
+                    "input": {"city": "Boston"},
+                },
+            }],
+            "maxTokens": 16,
+            "tools": [{"name": "weather", "inputSchema": {"type": "object"}}],
+            "toolChoice": {"mode": "required"},
+        }))
+        .expect("final sampling fixture must admit")
+    }
+
+    #[test]
+    fn final_sampling_context_preserves_tool_choice_and_tool_use() {
+        let context = McpContext::new(Cx::for_testing(), 71)
+            .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_sampling());
+        let input_required = context
+            .final_sampling("sample", final_sampling_parameters_for_test())
+            .expect("advertised sampling builds final MRTR input")
+            .into_input_required()
+            .expect("final sampling input serializes");
+        let wire: serde_json::Value = serde_json::from_str(&encode_result(
+            &DecodedResult::InputRequired(input_required),
+        ))
+        .expect("input-required result encodes through its exact wire path");
+        assert_eq!(
+            wire["inputRequests"]["sample"]["params"]["toolChoice"],
+            serde_json::json!({"mode": "required"})
+        );
+        assert_eq!(
+            wire["inputRequests"]["sample"]["params"]["messages"][0]["content"]["type"],
+            "tool_use"
+        );
+    }
+
+    #[test]
+    fn final_sampling_context_rejects_only_removed_sampling_capability() {
+        let parameters = final_sampling_parameters_for_test();
+        let admitted = McpContext::new(Cx::for_testing(), 72)
+            .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_sampling());
+        assert!(
+            admitted
+                .final_sampling("sample", parameters.clone())
+                .is_ok()
+        );
+
+        let rejected = McpContext::new(Cx::for_testing(), 72);
+        let error = rejected
+            .final_sampling("sample", parameters)
+            .expect_err("removing only sampling capability rejects final sampling");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
     }
 }

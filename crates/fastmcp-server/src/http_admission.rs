@@ -365,9 +365,12 @@ pub fn admit_modern_post(
             JsonRpcAdmissionError::Raw(raw) => ModernPostRejection::Raw(raw),
             _ => ModernPostRejection::InvalidEnvelope,
         })
-        .and_then(|(request, raw_params)| match request.id.is_some() {
-            true => Ok((request, raw_params)),
-            false => Err(ModernPostRejection::NotARequest),
+        .and_then(|(request, raw_params)| {
+            if request.id.is_some() {
+                Ok((request, raw_params))
+            } else {
+                Err(ModernPostRejection::NotARequest)
+            }
         })
         .and_then(|(request, raw_params)| {
             let protocol_version = {

@@ -12,8 +12,8 @@ use crate::FinalTaskRuntime;
 use crate::Session;
 use crate::auth::AuthRequest;
 use crate::bidirectional::{
-    MrtrCompletedInputs, MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputRequest,
-    MrtrInputRequests, MrtrInputRequired, MrtrRetry,
+    MrtrCompletedInputs, MrtrExchangeBinding, MrtrExchangeRegistry, MrtrInputKind,
+    MrtrInputRequest, MrtrInputRequests, MrtrInputRequired, MrtrRetry,
 };
 use crate::handler::{
     BidirectionalSenders, BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
@@ -654,7 +654,10 @@ fn final_mrtr_binding(
     )))
 }
 
-fn handler_mrtr_input_requests(result: &InputRequiredResult) -> McpResult<MrtrInputRequests> {
+fn handler_mrtr_input_requests(
+    request_ctx: &McpContext,
+    result: &InputRequiredResult,
+) -> McpResult<MrtrInputRequests> {
     let Some(input_requests) = result.input_requests() else {
         return Ok(MrtrInputRequests::default());
     };
@@ -670,7 +673,15 @@ fn handler_mrtr_input_requests(result: &InputRequiredResult) -> McpResult<MrtrIn
             .map(|member| {
                 let value = exact_json_to_serde(&member.value)
                     .map_err(|_| McpError::invalid_params("invalid MRTR input request"))?;
-                Ok((member.name.clone(), MrtrInputRequest::from_wire(&value)?))
+                let request = MrtrInputRequest::from_wire(&value)?;
+                if request.kind() == MrtrInputKind::Sampling
+                    && !request_ctx.client_supports_sampling()
+                {
+                    return Err(McpError::invalid_request(
+                        "Final sampling is not advertised by the client",
+                    ));
+                }
+                Ok((member.name.clone(), request))
             })
             .collect::<McpResult<Vec<_>>>()?,
     )
@@ -1901,6 +1912,12 @@ impl Router {
             final_task_relay: None,
             mrtr_exchanges: Arc::new(MrtrExchangeRegistry::new()),
         }
+    }
+
+    /// Returns the number of framework-minted MRTR exchanges for crate tests.
+    #[cfg(test)]
+    pub(crate) fn test_active_mrtr_exchange_count(&self) -> usize {
+        self.mrtr_exchanges.active_len()
     }
 
     #[cfg(feature = "tasks")]
@@ -4122,6 +4139,7 @@ impl Router {
 
     fn issue_final_mrtr_input_required(
         &self,
+        request_ctx: &McpContext,
         continuation_cancellation: fastmcp_core::McpRequestCancellation,
         binding: MrtrExchangeBinding,
         handler_result: InputRequiredResult,
@@ -4129,7 +4147,7 @@ impl Router {
         // The handler may describe the input it needs, but it never controls
         // requestState. Its former state member and open result siblings are
         // intentionally not forwarded across this framework boundary.
-        let input_requests = handler_mrtr_input_requests(&handler_result)?;
+        let input_requests = handler_mrtr_input_requests(request_ctx, &handler_result)?;
         let required =
             self.mrtr_exchanges
                 .issue_bound(continuation_cancellation, binding, input_requests)?;
@@ -4214,6 +4232,7 @@ impl Router {
                     )
                 })?;
                 self.issue_final_mrtr_input_required(
+                    request_ctx,
                     continuation_cancellation.clone(),
                     binding,
                     result,
@@ -4279,6 +4298,7 @@ impl Router {
                     )
                 })?;
                 self.issue_final_mrtr_input_required(
+                    request_ctx,
                     continuation_cancellation.clone(),
                     binding,
                     result,
@@ -4316,6 +4336,7 @@ impl Router {
                     )
                 })?;
                 self.issue_final_mrtr_input_required(
+                    request_ctx,
                     continuation_cancellation.clone(),
                     binding,
                     result,
@@ -7839,8 +7860,9 @@ mod router_tests {
     use super::*;
     use crate::bidirectional::MrtrInputResponse;
     use crate::handler::{
-        CompletionHandler, DEFAULT_FINAL_RESOURCE_TTL_MS, FinalToolSchemaAuthority, PromptHandler,
-        ResourceHandler, ToolHandler, UpstreamFinalToolSchemaRegistration,
+        CompletionHandler, DEFAULT_FINAL_RESOURCE_TTL_MS, FinalElicitationContextExt,
+        FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
+        UpstreamFinalToolSchemaRegistration,
     };
     use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig, admit_modern_post};
     #[cfg(feature = "tasks")]
@@ -7853,7 +7875,7 @@ mod router_tests {
     use asupersync::channel::oneshot;
     use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
     use asupersync::types::CancelKind;
-    use fastmcp_core::{McpContext, McpResult, SessionState};
+    use fastmcp_core::{ClientCapabilityInfo, McpContext, McpResult, SessionState};
     use fastmcp_protocol::common_types::{
         Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
     };
@@ -9417,6 +9439,44 @@ mod router_tests {
         result
     }
 
+    fn sampling_input_required_result(forged_request_state: &str) -> InputRequiredResult {
+        let encoded = serde_json::json!({
+            "resultType": "input_required",
+            "inputRequests": {
+                "sample": {
+                    "method": "sampling/createMessage",
+                    "params": {
+                        "messages": [{
+                            "role": "assistant",
+                            "content": {
+                                "type": "tool_use",
+                                "id": "weather-1",
+                                "name": "weather",
+                                "input": {"city": "Boston"},
+                            },
+                        }],
+                        "maxTokens": 16,
+                        "tools": [{"name": "weather", "inputSchema": {"type": "object"}}],
+                        "toolChoice": {"mode": "required"},
+                    },
+                },
+            },
+            "requestState": forged_request_state,
+        })
+        .to_string();
+        let (decoded, diagnostic) = decode_peer_result(
+            &encoded,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("final sampling input-required result decodes");
+        assert!(diagnostic.is_none());
+        let DecodedResult::InputRequired(result) = decoded else {
+            panic!("test result is sampling input_required");
+        };
+        result
+    }
+
     fn state_only_input_required_result(forged_request_state: &str) -> InputRequiredResult {
         let encoded = serde_json::json!({
             "resultType": "input_required",
@@ -9587,6 +9647,137 @@ mod router_tests {
 
     struct OneShotMrtrTool {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct ContextElicitationTool {
+        initial_calls: Arc<AtomicUsize>,
+        resumed_calls: Arc<AtomicUsize>,
+    }
+
+    struct ContextSamplingTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for ContextElicitationTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "context-elicitation-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy result")])
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
+        fn call_final_outcome(
+            &self,
+            ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.initial_calls.fetch_add(1, Ordering::SeqCst);
+            let elicitation = ctx.final_elicitation_form(
+                "approval",
+                "Approve this operation",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"approved": {"type": "boolean"}},
+                    "required": ["approved"],
+                }),
+            )?;
+            Ok(FinalToolOutcome::InputRequired(
+                elicitation.into_input_required()?,
+            ))
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                let Some(resume_inputs) = resume_inputs else {
+                    return match self.call_final_outcome(ctx, arguments) {
+                        Ok(result) => Outcome::Ok(result),
+                        Err(error) => Outcome::Err(error),
+                    };
+                };
+                let response = match resume_inputs.elicitation("approval") {
+                    Ok(Some(response)) => response,
+                    Ok(None) => {
+                        return Outcome::Err(McpError::internal_error(
+                            "MRTR elicitation response was lost",
+                        ));
+                    }
+                    Err(error) => return Outcome::Err(error),
+                };
+                if response.action != fastmcp_protocol::ElicitAction::Accept
+                    || response
+                        .content
+                        .as_ref()
+                        .and_then(|content| content.get("approved"))
+                        != Some(&fastmcp_protocol::ElicitContentValue::Bool(true))
+                {
+                    return Outcome::Err(McpError::invalid_params(
+                        "MRTR elicitation response did not approve the operation",
+                    ));
+                }
+                self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+                Outcome::Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                    FinalCallToolResult {
+                        content: vec![ContentBlock::text("approved")],
+                        is_error: false,
+                        structured_content: None,
+                    },
+                )))
+            })
+        }
+    }
+
+    impl ToolHandler for ContextSamplingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "context-sampling-tool".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("legacy result")])
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::InputRequired(
+                sampling_input_required_result("handler-forged-state"),
+            ))
+        }
     }
 
     impl ToolHandler for OneShotMrtrTool {
@@ -18224,6 +18415,184 @@ mod router_tests {
     }
 
     #[test]
+    fn final_context_elicitation_round_trips_through_tools_call_mrtr() {
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let resumed_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(ContextElicitationTool {
+                initial_calls: Arc::clone(&initial_calls),
+                resumed_calls: Arc::clone(&resumed_calls),
+            })
+            .expect("context elicitation tool registers");
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let mut initial_request =
+            final_tools_call_request("context-elicitation-tool", serde_json::json!({}), 940_i64);
+        initial_request
+            .params
+            .as_mut()
+            .expect("tool params are present")["_meta"]["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
+            "elicitation": {"form": {}},
+        });
+        let initial_context = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            940,
+            InboundRequestTransport::Memory,
+            &connection,
+        )
+        .request_context()
+        .with_client_capabilities(ClientCapabilityInfo::new().with_elicitation(true, false));
+
+        let initial = router
+            .dispatch_stateless(&initial_context, &initial_request)
+            .expect("an elicitation-capable final client receives MRTR input_required");
+        assert_eq!(initial["resultType"], "input_required");
+        assert_eq!(
+            initial["inputRequests"]["approval"]["method"],
+            "elicitation/create"
+        );
+        assert_eq!(
+            initial["inputRequests"]["approval"]["params"]["mode"],
+            "form"
+        );
+        assert!(
+            initial["inputRequests"]["approval"]
+                .get("jsonrpc")
+                .is_none()
+                && initial["inputRequests"]["approval"].get("id").is_none(),
+            "final elicitation must be embedded input, never a reverse JSON-RPC request"
+        );
+        let request_state = initial["requestState"]
+            .as_str()
+            .expect("router mints an opaque MRTR request state")
+            .to_owned();
+
+        let mut retry_request =
+            final_tools_call_request("context-elicitation-tool", serde_json::json!({}), 941_i64);
+        let retry_params = retry_request
+            .params
+            .as_mut()
+            .expect("tool params are present");
+        retry_params["_meta"]["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({
+            "elicitation": {"form": {}},
+        });
+        retry_params["inputResponses"] = serde_json::json!({
+            "approval": {"action": "accept", "content": {"approved": true}},
+        });
+        retry_params["requestState"] = serde_json::Value::String(request_state);
+        let retry_context = InboundRequestContext::with_modern_connection(
+            cx,
+            941,
+            InboundRequestTransport::Memory,
+            &connection,
+        )
+        .request_context()
+        .with_client_capabilities(ClientCapabilityInfo::new().with_elicitation(true, false));
+
+        let completed = router
+            .dispatch_stateless(&retry_context, &retry_request)
+            .expect("the accepted final elicitation resumes the original tools/call");
+        assert_eq!(completed["resultType"], "complete");
+        assert_eq!(completed["content"][0]["text"], "approved");
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_context_elicitation_without_capability_rejects_before_mrtr_state_mutation() {
+        let initial_calls = Arc::new(AtomicUsize::new(0));
+        let resumed_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(ContextElicitationTool {
+                initial_calls: Arc::clone(&initial_calls),
+                resumed_calls: Arc::clone(&resumed_calls),
+            })
+            .expect("context elicitation tool registers");
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let request =
+            final_tools_call_request("context-elicitation-tool", serde_json::json!({}), 942_i64);
+        let context = InboundRequestContext::with_modern_connection(
+            cx,
+            942,
+            InboundRequestTransport::Memory,
+            &connection,
+        )
+        .request_context();
+
+        let error = router
+            .dispatch_stateless(&context, &request)
+            .expect_err("changing only client elicitation capability must refuse the request");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            router.mrtr_exchanges.active_len(),
+            0,
+            "capability refusal cannot mint MRTR continuation state"
+        );
+    }
+
+    #[test]
+    fn final_sampling_capability_preserves_tool_choice_and_rejection_leaves_registry_unchanged() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(ContextSamplingTool {
+                calls: Arc::clone(&calls),
+            })
+            .expect("context sampling tool registers");
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let request =
+            final_tools_call_request("context-sampling-tool", serde_json::json!({}), 943_i64);
+        let admitted_context = InboundRequestContext::with_modern_connection(
+            cx.clone(),
+            943,
+            InboundRequestTransport::Memory,
+            &connection,
+        )
+        .request_context()
+        .with_client_capabilities(ClientCapabilityInfo::new().with_sampling());
+        let admitted = router
+            .dispatch_stateless(&admitted_context, &request)
+            .expect("sampling capability admits final MRTR sampling");
+        assert_eq!(admitted["resultType"], "input_required");
+        assert_eq!(
+            admitted["inputRequests"]["sample"]["params"]["toolChoice"],
+            serde_json::json!({"mode": "required"})
+        );
+        assert_eq!(
+            admitted["inputRequests"]["sample"]["params"]["messages"][0]["content"]["type"],
+            "tool_use"
+        );
+        assert_eq!(router.mrtr_exchanges.active_len(), 1);
+
+        let removed_capability_context = InboundRequestContext::with_modern_connection(
+            cx,
+            944,
+            InboundRequestTransport::Memory,
+            &connection,
+        )
+        .request_context();
+        let rejection = router
+            .dispatch_stateless(&removed_capability_context, &request)
+            .expect_err("removing only sampling capability rejects the descriptor");
+        assert_eq!(rejection.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            router.mrtr_exchanges.active_len(),
+            1,
+            "the one-field capability removal cannot mutate the admitted registry"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn http_admission_raw_sidecar_reaches_tool_resource_and_prompt_mrtr_retries() {
         let tool_calls = Arc::new(AtomicUsize::new(0));
         let resource_calls = Arc::new(AtomicUsize::new(0));
@@ -18880,10 +19249,14 @@ mod router_tests {
             .insert(
                 "roots".to_owned(),
                 serde_json::to_value(
-                    MrtrInputResponse::sampling(fastmcp_protocol::CreateMessageResult::text(
-                        "not roots",
-                        "test-model",
-                    ))
+                    MrtrInputResponse::sampling(
+                        serde_json::from_value(serde_json::json!({
+                            "content": {"type": "text", "text": "not roots"},
+                            "role": "assistant",
+                            "model": "test-model",
+                        }))
+                        .expect("final sampling response must decode"),
+                    )
                     .expect("sampling response serializes"),
                 )
                 .expect("sampling response converts to a wire value"),

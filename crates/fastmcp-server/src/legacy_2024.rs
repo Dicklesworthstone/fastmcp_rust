@@ -1024,9 +1024,10 @@ where
                 match method {
                     TOOLS_CALL | RESOURCES_READ | PROMPTS_GET => {
                         translate_legacy_2024_result(method, result).map_err(|_| {
-                            Legacy2024AdapterError::invalid_params(
-                                "handler result is not losslessly representable in exact MCP 2024-11-05",
-                            )
+                            Legacy2024AdapterError {
+                                code: JsonInteger::from(-32603),
+                                message: "handler result is not losslessly representable in exact MCP 2024-11-05",
+                            }
                         })
                     }
                     _ => Ok(result),
@@ -1839,7 +1840,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "error": {
-                    "code": -32602,
+                    "code": -32603,
                     "message": "handler result is not losslessly representable in exact MCP 2024-11-05",
                 }
             })))

@@ -1084,10 +1084,7 @@ mod trust_std {
         ))
     }
 
-    #[allow(
-        clippy::struct_field_names,
-        reason = "field names mirror frozen policy keys consumed by the evidence parser"
-    )]
+    #[allow(clippy::struct_field_names)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct BootstrapLockLexicalLimits {
         pub max_bytes: u64,
@@ -1897,10 +1894,7 @@ mod trust_std {
         }
     }
 
-    #[allow(
-        clippy::struct_field_names,
-        reason = "field names mirror frozen policy keys consumed by the evidence parser"
-    )]
+    #[allow(clippy::struct_field_names)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct PhaseBSpaceBudget {
         pub max_tree_entry_count: u64,
@@ -18901,10 +18895,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     }
 
     mod produce_acquisition_permit {
-        #[allow(
-            clippy::wildcard_imports,
-            reason = "this private evidence submodule consumes the complete frozen phase-B authority surface"
-        )]
+        #[allow(clippy::wildcard_imports)]
         use super::*;
 
         #[derive(Debug)]
@@ -31527,10 +31518,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     }
 
     #[cfg(test)]
-    #[allow(
-        clippy::items_after_test_module,
-        reason = "this large frozen evidence module keeps its typed-result fixtures near their parser"
-    )]
+    #[allow(clippy::items_after_test_module)]
     mod typed_result_tests {
         use super::*;
 
@@ -35451,10 +35439,7 @@ activate = 1\n";
     }
 
     #[derive(Debug, Deserialize)]
-    #[allow(
-        clippy::struct_field_names,
-        reason = "policy_id is a frozen evidence-schema field name"
-    )]
+    #[allow(clippy::struct_field_names)]
     struct Policy {
         format: String, schema_version: u32, policy_id: String,
         protocol_version: String, recorded_on: String, hash_algorithm: String,
@@ -35559,10 +35544,7 @@ activate = 1\n";
     }
 
     #[derive(Debug, Clone, Copy)]
-    #[allow(
-        clippy::struct_field_names,
-        reason = "archive-bound field names mirror the frozen evidence schema"
-    )]
+    #[allow(clippy::struct_field_names)]
     struct ArchiveBounds {
         max_archive_compressed_bytes: u64,
         max_archive_expanded_bytes: u64,
@@ -35577,10 +35559,7 @@ activate = 1\n";
     }
 
     #[derive(Debug, Clone, Copy)]
-    #[allow(
-        clippy::struct_field_names,
-        reason = "lock-bound field names mirror the frozen evidence schema"
-    )]
+    #[allow(clippy::struct_field_names)]
     struct FixedCargoLockBounds {
         max_source_file_bytes: u64,
         max_record_array_items: usize,
@@ -41918,10 +41897,7 @@ activate = 1\n";
     const SERDE_JSON_PRIVATE_NUMBER_KEY: &str = "$serde_json::private::Number";
 
     #[derive(Debug, Clone, Copy)]
-    #[allow(
-        clippy::struct_field_names,
-        reason = "JSON-bound field names mirror the frozen evidence schema"
-    )]
+    #[allow(clippy::struct_field_names)]
     struct JsonPreallocationBounds {
         max_depth: usize,
         max_object_members: usize,
@@ -60021,10 +59997,7 @@ activate = 1\n";
         package_union_sha256: String,
     }
 
-    #[allow(
-        clippy::used_underscore_binding,
-        reason = "the underscore-prefixed field is a frozen flattened evidence-schema catch-all"
-    )]
+    #[allow(clippy::used_underscore_binding)]
     fn policy_unmodeled_table<'a>(
         policy: &'a Policy,
         name: &str,
@@ -60036,10 +60009,7 @@ activate = 1\n";
             .ok_or_else(|| Diagnostic::error("E_POLICY_TYPED_EXTRACTION", name))
     }
 
-    #[allow(
-        clippy::used_underscore_binding,
-        reason = "the underscore-prefixed field is a frozen flattened evidence-schema catch-all"
-    )]
+    #[allow(clippy::used_underscore_binding)]
     fn policy_unmodeled_array<'a>(policy: &'a Policy, name: &str) -> VResult<&'a [toml::Value]> {
         policy
             ._validated_unmodeled
@@ -65849,10 +65819,7 @@ activate = 1\n";
         Ok(())
     }
 
-    #[allow(
-        clippy::naive_bytecount,
-        reason = "the frozen verifier remains dependency-minimal and this bounded scan is not a hot path"
-    )]
+    #[allow(clippy::naive_bytecount)]
     fn source_line_location(
         bytes: &[u8],
         anchor: usize,
@@ -94580,22 +94547,13 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(test)]
-    #[allow(
-        clippy::upper_case_acronyms,
-        reason = "compact aliases keep the large frozen failure-route oracle readable"
-    )]
+    #[allow(clippy::upper_case_acronyms)]
     type OFS = OrdinaryFailureSite;
     #[cfg(test)]
-    #[allow(
-        clippy::upper_case_acronyms,
-        reason = "compact aliases keep the large frozen failure-route oracle readable"
-    )]
+    #[allow(clippy::upper_case_acronyms)]
     type OFR = OrdinaryFailureRoute;
     #[cfg(test)]
-    #[allow(
-        clippy::upper_case_acronyms,
-        reason = "compact aliases keep the large frozen failure-route oracle readable"
-    )]
+    #[allow(clippy::upper_case_acronyms)]
     type ORO = (OFR, &'static str, &'static str, &'static str, &'static str);
 
     #[cfg(test)]
@@ -96771,39 +96729,37 @@ fn fallible(value: Option<u8>) {
         );
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[test]
-    fn ordinary_b_r3_live_matrix() {
-        let pure = ordinary_reprobe_dual_path_pure_authority().expect("B-R3 live pure half first");
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn qualified_linux_live_reprobe(label: &str) {
+        let pure = ordinary_reprobe_dual_path_pure_authority().expect(label);
         assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
-        let subject =
-            ordinary_attest_self_reexec_subject().expect("B-R3 live fresh Attest subject");
+        let subject = ordinary_attest_self_reexec_subject().expect(label);
         let fresh = super::phase_b_std::inventory_fresh_native_tools(
             &subject.root,
             BootstrapMode::Attest,
             &subject.run_id,
             &subject.closed_path,
         )
-        .expect("B-R3 live CreateFresh inventory");
+        .expect(label);
         let reprobe = ordinary_reprobe_tool_set_shared(
             &subject.root,
             BootstrapMode::Attest,
             &subject.run_id,
             &subject.closed_path,
         )
-        .expect("qualified Linux must complete all ordinary native-tool reprobes");
-        assert_eq!(
-            reprobe.inventory.native_tool_count(),
-            ORDINARY_NATIVE_TOOL_COUNT
-        );
-        assert_eq!(
-            reprobe.inventory.native_tool_count(),
-            pure.native_tool_count
-        );
+        .expect(label);
+        assert_eq!(reprobe.inventory.native_tool_count(), ORDINARY_NATIVE_TOOL_COUNT);
+        assert_eq!(reprobe.inventory.native_tool_count(), pure.native_tool_count);
         assert_ne!(reprobe.tool_set_sha256, [0; 32]);
         assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
         assert_eq!(reprobe.tool_set_sha256, fresh.tool_set_sha256());
         assert_eq!(reprobe.execution_bin_sha256, fresh.execution_bin_sha256());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn ordinary_b_r3_live_matrix() {
+        qualified_linux_live_reprobe("B-R3 live dual-path");
         assert_eq!(
             OrdinaryFailureSite::ProbeToolSet.route().stage().as_str(),
             "reprobe",
@@ -96845,35 +96801,7 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_b_r1_qualified_linux_dual_path_tool_reprobe() {
-        let pure = ordinary_reprobe_dual_path_pure_authority()
-            .expect("qualified Linux pure dual-path authority");
-        let subject = ordinary_attest_self_reexec_subject().expect("B-R1 fresh Attest subject");
-        let fresh = super::phase_b_std::inventory_fresh_native_tools(
-            &subject.root,
-            BootstrapMode::Attest,
-            &subject.run_id,
-            &subject.closed_path,
-        )
-        .expect("B-R1 CreateFresh inventory");
-        let reprobe = ordinary_reprobe_tool_set_shared(
-            &subject.root,
-            BootstrapMode::Attest,
-            &subject.run_id,
-            &subject.closed_path,
-        )
-        .expect("qualified Linux must complete the ordinary twenty-tool reprobe");
-        assert_eq!(
-            reprobe.inventory.native_tool_count(),
-            ORDINARY_NATIVE_TOOL_COUNT
-        );
-        assert_eq!(
-            reprobe.inventory.native_tool_count(),
-            pure.native_tool_count
-        );
-        assert_ne!(reprobe.tool_set_sha256, [0; 32]);
-        assert_ne!(reprobe.execution_bin_sha256, [0; 32]);
-        assert_eq!(reprobe.tool_set_sha256, fresh.tool_set_sha256());
-        assert_eq!(reprobe.execution_bin_sha256, fresh.execution_bin_sha256());
+        qualified_linux_live_reprobe("B-R1 qualified Linux dual-path");
     }
 
     #[derive(Default)]

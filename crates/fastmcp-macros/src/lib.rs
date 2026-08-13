@@ -2063,6 +2063,7 @@ fn generate_prompt_mrtr_outcome_methods(
         quote! {
             let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = async move {
                 #(#param_extractions)*
+                let #resume_name: #resume_type = None;
                 let result = #async_invocation;
                 #conversion
             }.await;
@@ -2071,6 +2072,7 @@ fn generate_prompt_mrtr_outcome_methods(
         quote! {
             let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>> = (|| {
                 #(#param_extractions)*
+                let #resume_name: #resume_type = None;
                 let result = #sync_invocation;
                 #conversion
             })();
@@ -3558,6 +3560,7 @@ fn generate_resource_mrtr_outcome_methods(
         quote! {
             let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = async move {
                 #(#param_extractions)*
+                let #resume_name: #resume_type = None;
                 let result = #fn_name(#call_args).await;
                 #conversion
             }.await;
@@ -3566,6 +3569,7 @@ fn generate_resource_mrtr_outcome_methods(
         quote! {
             let result: fastmcp_core::McpResult<fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>> = (|| {
                 #(#param_extractions)*
+                let #resume_name: #resume_type = None;
                 let result = #fn_name(#call_args);
                 #conversion
             })();
@@ -4082,7 +4086,7 @@ mod mrtr_resume_expansion_tests {
         let resume = format_ident!("completed_inputs");
         let resume_type: syn::Type = syn::parse_quote!(Option<&MrtrCompletedInputs>);
         let handler = format_ident!("resumable");
-        let extraction = quote! { let completed_inputs: Option<&MrtrCompletedInputs> = None; };
+        let extraction = quote! { let argument = "admitted"; };
 
         let tool = generate_tool_mrtr_resume_method(
             true,
@@ -4125,6 +4129,10 @@ mod mrtr_resume_expansion_tests {
         );
         assert!(resource.contains("= resume_inputs"), "{resource}");
         assert!(
+            resource.contains("completed_inputs : Option < & MrtrCompletedInputs > = None"),
+            "{resource}"
+        );
+        assert!(
             resource.contains("fn declares_final_mrtr (& self) -> bool { true }"),
             "{resource}"
         );
@@ -4145,6 +4153,10 @@ mod mrtr_resume_expansion_tests {
             "{prompt}"
         );
         assert!(prompt.contains("= resume_inputs"), "{prompt}");
+        assert!(
+            prompt.contains("completed_inputs : Option < & MrtrCompletedInputs > = None"),
+            "{prompt}"
+        );
         assert!(
             prompt.contains("fn declares_final_mrtr (& self) -> bool { true }"),
             "{prompt}"
