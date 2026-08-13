@@ -379,8 +379,8 @@ pub use fastmcp_core::logging;
 // types live in `legacy_2024`; modern discovery types live in `modern`.
 pub use fastmcp_protocol::{
     CallToolParams, CallToolResult, ClientCapabilities, ClientInfo, ClientIngressFailureScope,
-    Content, CorrelationKey, GetPromptParams, GetPromptResult, JSONRPC_VERSION,
-    JsonRpcAdmissionError, JsonRpcEndpointRole, JsonRpcError, JsonRpcMessage,
+    CompletionsCapability, Content, CorrelationKey, GetPromptParams, GetPromptResult,
+    JSONRPC_VERSION, JsonRpcAdmissionError, JsonRpcEndpointRole, JsonRpcError, JsonRpcMessage,
     JsonRpcMessageDirection, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseAdmission,
     ListPromptsParams, ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, LogLevel,
@@ -4065,9 +4065,9 @@ pub mod legacy_2024 {
     pub use fastmcp_protocol::{
         CallToolParams, CallToolResult, CancellationSender, CancellationWireCodecError,
         CancellationWireMessage, CancelledParams, ClientCapabilities, ClientInfo, CompletionValues,
-        CreateMessageParams, CreateMessageResult, GetPromptParams, GetPromptResult, Icon,
-        IncludeContext, InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest,
-        JsonRpcResponse, LegacyCompletionArgument, LegacyCompletionParams,
+        CompletionsCapability, CreateMessageParams, CreateMessageResult, GetPromptParams,
+        GetPromptResult, Icon, IncludeContext, InitializeParams, InitializeResult, JsonRpcMessage,
+        JsonRpcRequest, JsonRpcResponse, LegacyCompletionArgument, LegacyCompletionParams,
         LegacyCompletionReference, LegacyCompletionResult, LegacyContent, LegacyCoreRequest,
         LegacyCoreResult, LegacyEmptyResult, LegacyMetadata, LegacyOpaqueMetadata,
         LegacyPromptMessage, LegacyResourceContent, ListPromptsParams, ListPromptsResult,
