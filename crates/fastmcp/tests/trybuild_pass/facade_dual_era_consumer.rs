@@ -703,6 +703,8 @@ fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::read_resource;
     let _ = modern::HttpClient::get_prompt;
     let _ = modern::HttpClient::complete;
+    let _ = modern::HttpClient::call_tool_result;
+    let _ = modern::HttpClient::call_tool_result_with_cancellation;
     let _ = modern::HttpClient::call_tool_with_mrtr_retry;
     let _ = modern::HttpClient::read_resource_with_mrtr_retry;
     let _ = modern::HttpClient::get_prompt_with_mrtr_retry;

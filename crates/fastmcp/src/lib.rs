@@ -2568,6 +2568,11 @@ pub mod modern {
         }
 
         /// Calls one tool through the pinned modern WebSocket session.
+        ///
+        /// When modern reverse handlers are installed, a peer `input_required`
+        /// result is fulfilled locally and retried until a terminal
+        /// `tools/call` result arrives. Without those handlers, use
+        /// [`Self::call_tool_result`] to keep a live `input_required` branch.
         pub async fn call_tool(
             &mut self,
             cx: &Cx,
@@ -2577,10 +2582,30 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
+            match self.call_tool_result(cx, name, arguments).await? {
+                fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. } => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final tools/call result",
+                )),
+            }
+        }
+
+        /// Calls one tool and retains either a complete result or a live
+        /// `input_required` branch on this modern WebSocket session.
+        pub async fn call_tool_result(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<fastmcp_protocol::FinalCoreResult>
+        where
+            IO: Send + 'static,
+        {
             match self.inner.call_tool(cx, name, arguments).await? {
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
-                ) => Ok(result.payload),
+                    result @ (fastmcp_protocol::FinalCoreResult::ToolsCall { .. }
+                    | fastmcp_protocol::FinalCoreResult::ToolsCallInputRequired { .. }),
+                ) => Ok(result),
                 _ => Err(McpError::internal_error(
                     "Modern WebSocket client received a non-final tools/call result",
                 )),
@@ -3297,16 +3322,41 @@ pub mod modern {
         }
 
         /// Calls one tool and retains the exact final content vocabulary.
+        ///
+        /// When modern reverse handlers are installed, a peer `input_required`
+        /// result is fulfilled locally and retried until a terminal
+        /// `tools/call` result arrives. Without those handlers, use
+        /// [`Self::call_tool_result`] to keep a live `input_required` branch.
         pub async fn call_tool(
             &mut self,
             cx: &Cx,
             name: &str,
             arguments: JsonValue,
         ) -> Result<FinalCallToolResult, HttpClientError> {
+            match self.call_tool_result(cx, name, arguments).await? {
+                fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. } => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("tools/call")),
+            }
+        }
+
+        /// Calls one tool and retains either a complete result or a live
+        /// `input_required` branch.
+        ///
+        /// Installed modern reverse handlers still fulfill `input_required`
+        /// locally. Without them, a bind_http `ctx.final_sampling` tool returns
+        /// the typed `ToolsCallInputRequired` result instead of a cancelled or
+        /// unexpected-result error.
+        pub async fn call_tool_result(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<fastmcp_protocol::FinalCoreResult, HttpClientError> {
             match self.inner.call_tool(cx, name, arguments).await? {
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
-                ) => Ok(result.payload),
+                    result @ (fastmcp_protocol::FinalCoreResult::ToolsCall { .. }
+                    | fastmcp_protocol::FinalCoreResult::ToolsCallInputRequired { .. }),
+                ) => Ok(result),
                 _ => Err(unexpected_modern_http_result("tools/call")),
             }
         }
@@ -3339,13 +3389,32 @@ pub mod modern {
             arguments: JsonValue,
         ) -> Result<FinalCallToolResult, HttpClientError> {
             match self
+                .call_tool_result_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. } => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("tools/call")),
+            }
+        }
+
+        /// Calls one tool under a caller-owned cancellation domain and retains
+        /// either a complete result or a live `input_required` branch.
+        pub async fn call_tool_result_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<fastmcp_protocol::FinalCoreResult, HttpClientError> {
+            match self
                 .inner
                 .call_tool_with_cancellation(cx, cancellation, name, arguments)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
-                ) => Ok(result.payload),
+                    result @ (fastmcp_protocol::FinalCoreResult::ToolsCall { .. }
+                    | fastmcp_protocol::FinalCoreResult::ToolsCallInputRequired { .. }),
+                ) => Ok(result),
                 _ => Err(unexpected_modern_http_result("tools/call")),
             }
         }
@@ -7826,6 +7895,27 @@ mod tests {
             arguments: JsonValue,
         ) -> Result<modern::FinalCallToolResult, modern::HttpClientError> {
             client.call_tool(cx, name, arguments).await
+        }
+
+        async fn call_modern_http_tool_result(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<modern::FinalCoreResult, modern::HttpClientError> {
+            client.call_tool_result(cx, name, arguments).await
+        }
+
+        async fn call_modern_http_tool_result_with_cancellation(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            cancellation: &modern::McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<modern::FinalCoreResult, modern::HttpClientError> {
+            client
+                .call_tool_result_with_cancellation(cx, cancellation, name, arguments)
+                .await
         }
 
         async fn call_modern_http_tool_with_cancellation(
