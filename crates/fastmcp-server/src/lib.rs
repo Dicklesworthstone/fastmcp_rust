@@ -15313,6 +15313,13 @@ impl Server {
                 }
                 Err(error) => match classify_receive_error(&error) {
                     ReceiveErrorDisposition::ReplyWithParseError => {
+                        // Opening garbage on an unclassified stdio connection is
+                        // skipped so a following valid initialize can recover.
+                        // After era selection, parse errors stay visible.
+                        if negotiated_era.is_none() {
+                            error!(target: targets::TRANSPORT, "Skipped malformed opening transport message");
+                            continue;
+                        }
                         error!(target: targets::TRANSPORT, "Rejected malformed transport message");
                         if let Err(send_error) = send_uncorrelated_parse_error(&send, cx) {
                             error!(target: targets::TRANSPORT, "Failed to send parse-error response; terminating transport");

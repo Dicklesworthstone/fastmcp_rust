@@ -600,7 +600,16 @@ impl StdioEraClassifier {
                 self.reject_and_close(StdioEraRejection::MixedEraMarkers)
             }
             StdioOpeningFrame::RequestWithoutModernMetadata => {
-                self.reject_and_close(StdioEraRejection::MissingModernMetadata)
+                // Auto: a first frame with no modern metadata is implicit
+                // exact-2024 traffic, not a close. JSON-RPC clients (and
+                // Agent Mail protocol_compliance) may send tools/list or an
+                // unknown method before initialize; that must stay
+                // MethodNotFound / dispatch, not InvalidRequest+close.
+                self.state = StdioEraState::Selected(ProtocolEra::Legacy2024);
+                StdioEraDecision::Selected {
+                    era: ProtocolEra::Legacy2024,
+                    modern_version: None,
+                }
             }
             StdioOpeningFrame::Notification => {
                 self.reject_and_close(StdioEraRejection::NotificationCannotClassify)
@@ -662,6 +671,14 @@ impl StdioEraClassifier {
                     modern_version: None,
                 }
             }
+            (
+                ProtocolEra::Legacy2024,
+                StdioOpeningFrame::RequestWithoutModernMetadata
+                | StdioOpeningFrame::Notification,
+            ) => StdioEraDecision::Selected {
+                era,
+                modern_version: None,
+            },
             (
                 ProtocolEra::Legacy2024,
                 StdioOpeningFrame::ModernRequest { .. }
@@ -1078,6 +1095,30 @@ pub(crate) mod tests {
         assert_eq!(
             serde_json::to_value(accepted).expect("accepted version remains serializable"),
             accepted_wire_value,
+        );
+    }
+
+    #[test]
+    #[test]
+    fn auto_stdio_request_without_modern_metadata_selects_legacy() {
+        let mut classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
+        assert_eq!(
+            classifier.classify_opening(StdioOpeningFrame::RequestWithoutModernMetadata),
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Legacy2024,
+                modern_version: None,
+            }
+        );
+        assert_eq!(
+            classifier.state(),
+            &StdioEraState::Selected(ProtocolEra::Legacy2024)
+        );
+        assert_eq!(
+            classifier.classify_opening(StdioOpeningFrame::RequestWithoutModernMetadata),
+            StdioEraDecision::Selected {
+                era: ProtocolEra::Legacy2024,
+                modern_version: None,
+            }
         );
     }
 
