@@ -762,12 +762,30 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     ) -> fastmcp_rust::McpResult<modern::SubscriptionListenCollector> =
         fastmcp_rust::Client::listen_subscriptions_typed;
     let _: fn(
+        &mut fastmcp_rust::Client,
+        modern::SubscriptionFilter,
+    ) -> fastmcp_rust::McpResult<()> = fastmcp_rust::Client::open_subscriptions_listener;
+    let _: fn(
+        &mut fastmcp_rust::Client,
+        &fastmcp_rust::Cx,
+        &fastmcp_rust::McpRequestCancellation,
+    ) -> fastmcp_rust::McpResult<fastmcp_rust::StdioSubscriptionEvent> =
+        fastmcp_rust::Client::next_subscription_event;
+    let _: fn(
         &mut auto::Client,
         &str,
         auto::JsonValue,
     ) -> auto::McpResult<auto::FinalCallToolResult> = auto::Client::call_tool_final;
     let _: fn(&mut modern::Client, &str) -> modern::McpResult<modern::FinalReadResourceResult> =
         modern::Client::read_resource;
+    let _: fn(&mut modern::Client, modern::SubscriptionFilter) -> modern::McpResult<()> =
+        modern::Client::open_subscriptions_listener;
+    let _: fn(
+        &mut modern::Client,
+        &modern::Cx,
+        &fastmcp_rust::McpRequestCancellation,
+    ) -> modern::McpResult<modern::StdioSubscriptionEvent> =
+        modern::Client::next_subscription_event;
 
     let auto_builder = auto::client_builder();
     assert_eq!(

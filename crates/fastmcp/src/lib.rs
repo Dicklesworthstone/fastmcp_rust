@@ -197,7 +197,8 @@ pub mod client {
         MAX_FINAL_CACHE_MAX_BYTES, OpaquePagination, PaginationBounds, PendingRequestRecord,
         ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
         RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
-        StdioRequestExecutor, SubscriptionFilter, SubscriptionListenCollector,
+        StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
+        SubscriptionListenCollector,
     };
     /// Tasks client APIs are available only with the official Tasks extension.
     #[cfg(feature = "tasks")]
@@ -743,8 +744,8 @@ pub use fastmcp_client::{
     HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
     OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
     RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
-    ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor, SubscriptionFilter,
-    SubscriptionListenCollector,
+    ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
+    StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
@@ -816,7 +817,8 @@ pub mod auto {
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession, HttpClient,
         HttpClientError, HttpSubscriptionListener, Request, RequestExecution, RequestExecutor,
         ReverseRequest, ReverseRequestCancellation, ReverseRequestHandlers, StdioRequestExecution,
-        StdioRequestExecutor, SubscriptionFilter, SubscriptionListenCollector,
+        StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
+        SubscriptionListenCollector,
     };
     pub use fastmcp_core::{CanonicalHttpUrl, Cx, McpError, McpResult};
     pub use fastmcp_protocol::extensions::{
@@ -1866,14 +1868,16 @@ pub mod modern {
         MAX_FINAL_CACHE_MAX_BYTES, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
         MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, OpaquePagination, PaginationBounds,
         PendingRequestRecord, ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource,
-        SubscriptionFilter, SubscriptionListenCollector,
+        ReverseRequestHandlers, StdioSubscriptionEvent, SubscriptionFilter,
+        SubscriptionListenCollector,
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_RESOURCE_READ_DEPTH,
         MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext, McpContextLeaseGuard, McpError,
-        McpLogLevel, McpOutcome, McpResult, NoOpNotificationSender, NotificationSender, Outcome,
-        ProgressReporter, ResourceContentItem, ResourceReadResult, ResourceReader, RootsProvider,
-        ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
+        McpLogLevel, McpOutcome, McpRequestCancellation, McpResult, NoOpNotificationSender,
+        NotificationSender, Outcome, ProgressReporter, ResourceContentItem, ResourceReadResult,
+        ResourceReader, RootsProvider, ServerCapabilityInfo, ToolCallResult, ToolCaller,
+        ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
@@ -2216,6 +2220,20 @@ pub mod modern {
             }
         }
 
+        /// Installs modern reverse-request handlers before a WebSocket connect.
+        ///
+        /// Exact-2024 sampling/roots callbacks remain rejected on this
+        /// ModernOnly builder. Use
+        /// [`ReverseRequestHandlers::with_modern_sampling_create_message`],
+        /// [`ReverseRequestHandlers::with_modern_roots_list`], or
+        /// [`ReverseRequestHandlers::with_modern_elicitation_create`].
+        #[must_use]
+        pub fn modern_reverse_request_handlers(self, handlers: ReverseRequestHandlers) -> Self {
+            Self {
+                inner: self.inner.reverse_request_handlers(handlers),
+            }
+        }
+
         /// Configures the MCP Apps MIME types advertised during final discovery.
         #[must_use]
         #[cfg(feature = "apps")]
@@ -2433,6 +2451,191 @@ pub mod modern {
             }
         }
 
+        /// Lists one exact final page of tools through the pinned WebSocket session.
+        pub async fn list_tools(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListToolsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_tools(cx, cursor).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final tools/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of resources through the pinned WebSocket session.
+        pub async fn list_resources(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListResourcesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_resources(cx, cursor).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of resource templates through the pinned
+        /// WebSocket session.
+        pub async fn list_resource_templates(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListResourceTemplatesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_resource_templates(cx, cursor).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/templates/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of prompts through the pinned WebSocket session.
+        pub async fn list_prompts(
+            &mut self,
+            cx: &Cx,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListPromptsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_prompts(cx, cursor).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final prompts/list result",
+                )),
+            }
+        }
+
+        /// Reads one resource through the pinned modern WebSocket session.
+        pub async fn read_resource(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+        ) -> McpResult<FinalReadResourceResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.read_resource(cx, uri).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/read result",
+                )),
+            }
+        }
+
+        /// Gets one prompt through the pinned modern WebSocket session.
+        pub async fn get_prompt(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<FinalGetPromptResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.get_prompt(cx, name, arguments).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final prompts/get result",
+                )),
+            }
+        }
+
+        /// Calls one tool through the pinned modern WebSocket session.
+        pub async fn call_tool(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalCallToolResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.call_tool(cx, name, arguments).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final tools/call result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of tools under a caller-owned cancellation domain.
+        pub async fn list_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListToolsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_tools_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final tools/list result",
+                )),
+            }
+        }
+
+        /// Calls one tool under a caller-owned cancellation domain.
+        pub async fn call_tool_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalCallToolResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .call_tool_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final tools/call result",
+                )),
+            }
+        }
+
         /// Sends one generic final extension request after bilateral
         /// discovery admission, retaining the exact JSON result source.
         pub async fn request_final_extension(
@@ -2522,6 +2725,38 @@ pub mod modern {
                     .map(ServerNotification::Progress),
             );
             notifications
+        }
+
+        /// Starts an incremental final catalog listener on this WebSocket
+        /// client.
+        ///
+        /// Unlike collect-to-terminal listen, this does not occupy ingress
+        /// until the stream ends. Call [`Self::next_subscription_event`] so
+        /// the same client can keep issuing requests such as `tools/list`.
+        pub async fn open_subscriptions_listener(
+            &mut self,
+            cx: &Cx,
+            notifications: SubscriptionFilter,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .open_subscriptions_listener(cx, notifications)
+                .await
+        }
+
+        /// Drives one incremental catalog listener event without occupying
+        /// ingress until the stream ends.
+        pub async fn next_subscription_event(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<StdioSubscriptionEvent>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.next_subscription_event(cx, cancellation).await
         }
     }
 
@@ -2762,6 +2997,28 @@ pub mod modern {
             notifications: SubscriptionFilter,
         ) -> McpResult<SubscriptionListenCollector> {
             self.inner.listen_subscriptions_typed(notifications)
+        }
+
+        /// Starts an incremental final catalog listener on this stdio client.
+        ///
+        /// Unlike [`Self::listen_subscriptions`], this does not collect the
+        /// stream to terminal. Call [`Self::next_subscription_event`] so the
+        /// same client can keep issuing requests such as `tools/call`.
+        pub fn open_subscriptions_listener(
+            &mut self,
+            notifications: SubscriptionFilter,
+        ) -> McpResult<()> {
+            self.inner.open_subscriptions_listener(notifications)
+        }
+
+        /// Drives one incremental catalog listener event without occupying
+        /// ingress until the stream ends.
+        pub fn next_subscription_event(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<StdioSubscriptionEvent> {
+            self.inner.next_subscription_event(cx, cancellation)
         }
 
         /// Drains exact final progress notifications, preserving JSON number lexemes.
@@ -3039,6 +3296,60 @@ pub mod modern {
                 .map_err(HttpClientError::Connection)
         }
 
+        /// Calls one tool and retains the exact final content vocabulary.
+        pub async fn call_tool(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<FinalCallToolResult, HttpClientError> {
+            match self.inner.call_tool(cx, name, arguments).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("tools/call")),
+            }
+        }
+
+        /// Lists one page of tools under a caller-owned cancellation domain.
+        pub async fn list_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> Result<FinalListToolsResult, HttpClientError> {
+            match self
+                .inner
+                .list_tools_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("tools/list")),
+            }
+        }
+
+        /// Calls one tool under a caller-owned cancellation domain.
+        pub async fn call_tool_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<FinalCallToolResult, HttpClientError> {
+            match self
+                .inner
+                .call_tool_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("tools/call")),
+            }
+        }
+
         /// Lists one exact final page of tools through the policy-bound HTTP client.
         ///
         /// ```compile_fail
@@ -3233,6 +3544,24 @@ pub mod modern {
             }
         }
 
+        /// Sends one supported final core request under a caller-owned
+        /// cancellation domain.
+        ///
+        /// Ordinary `tools/call` and `tools/list` callers can cancel the HTTP
+        /// exchange, including the wait for response headers, without enabling
+        /// the Apps feature.
+        pub async fn request_final_core_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            method: impl AsRef<str>,
+            parameters: JsonValue,
+        ) -> Result<fastmcp_protocol::CoreResult, HttpClientError> {
+            self.inner
+                .request_final_core_with_cancellation(cx, cancellation, method, parameters)
+                .await
+        }
+
         /// Calls a tool through modern HTTP until one terminal final result arrives.
         ///
         /// `deadline` bounds the initial request and every continuation. The
@@ -3353,6 +3682,26 @@ pub mod modern {
             self.inner
                 .open_subscriptions_listener(cx, notifications, limits)
                 .await
+        }
+
+        /// Starts an incremental HTTP catalog listener on this client.
+        pub async fn start_subscriptions_listener(
+            &mut self,
+            cx: &Cx,
+            notifications: SubscriptionFilter,
+            limits: SseLimits,
+        ) -> Result<(), HttpClientError> {
+            self.inner
+                .start_subscriptions_listener(cx, notifications, limits)
+                .await
+        }
+
+        /// Drives one incremental HTTP catalog listener event.
+        pub async fn next_http_subscription_event(
+            &mut self,
+            cx: &Cx,
+        ) -> Result<Option<ModernHttpSubscriptionListenEvent>, HttpClientError> {
+            self.inner.next_http_subscription_event(cx).await
         }
 
         /// Opens and collects one typed final subscriptions listener.
@@ -5916,6 +6265,7 @@ pub mod prelude {
         SseLimits,
         SseParseError,
         StaticTokenVerifier,
+        StdioSubscriptionEvent,
         StreamableHttpRequestIngress,
         StreamableHttpRequestResponseMessage,
         StreamableHttpRequestResponseSender,
@@ -7318,6 +7668,20 @@ mod tests {
             &mut Client,
             modern::SubscriptionFilter,
         ) -> McpResult<modern::SubscriptionListenCollector> = Client::listen_subscriptions_typed;
+        let _: fn(&mut Client, modern::SubscriptionFilter) -> McpResult<()> =
+            Client::open_subscriptions_listener;
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let _: fn(
+                crate::CanonicalHttpUrl,
+                crate::CanonicalHttpUrl,
+            ) -> Result<crate::HttpClient, crate::HttpClientError> = Client::sse;
+        }
+        let _: fn(
+            &mut Client,
+            &modern::Cx,
+            &modern::McpRequestCancellation,
+        ) -> McpResult<modern::StdioSubscriptionEvent> = Client::next_subscription_event;
         let _: fn(
             &mut auto::Client,
             &str,
@@ -7351,6 +7715,64 @@ mod tests {
             modern::SubscriptionFilter,
         ) -> modern::McpResult<modern::SubscriptionListenCollector> =
             modern::Client::listen_subscriptions;
+        let _: fn(&mut modern::Client, modern::SubscriptionFilter) -> modern::McpResult<()> =
+            modern::Client::open_subscriptions_listener;
+        let _: fn(
+            &mut modern::Client,
+            &modern::Cx,
+            &modern::McpRequestCancellation,
+        ) -> modern::McpResult<modern::StdioSubscriptionEvent> =
+            modern::Client::next_subscription_event;
+        #[cfg(feature = "websocket-experimental")]
+        {
+            async fn open_modern_websocket_catalog_listener<IO>(
+                client: &mut modern::WebSocketClient<IO>,
+                cx: &modern::Cx,
+                filter: modern::SubscriptionFilter,
+            ) -> modern::McpResult<()>
+            where
+                IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
+            {
+                client.open_subscriptions_listener(cx, filter).await
+            }
+            async fn next_modern_websocket_catalog_event<IO>(
+                client: &mut modern::WebSocketClient<IO>,
+                cx: &modern::Cx,
+                cancellation: &modern::McpRequestCancellation,
+            ) -> modern::McpResult<modern::StdioSubscriptionEvent>
+            where
+                IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
+            {
+                client.next_subscription_event(cx, cancellation).await
+            }
+            async fn public_websocket_client_typed_verbs<IO>(
+                client: &mut modern::WebSocketClient<IO>,
+                cx: &modern::Cx,
+                cancellation: &modern::McpRequestCancellation,
+            ) -> modern::McpResult<modern::FinalCallToolResult>
+            where
+                IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
+            {
+                let _ = client.list_tools(cx, None).await?;
+                let _ = client.list_resources(cx, None).await?;
+                let _ = client.list_resource_templates(cx, None).await?;
+                let _ = client.list_prompts(cx, None).await?;
+                let _ = client.read_resource(cx, "resource://example").await?;
+                let _ = client
+                    .get_prompt(cx, "example", std::collections::HashMap::new())
+                    .await?;
+                let _ = client
+                    .list_tools_with_cancellation(cx, cancellation, None)
+                    .await?;
+                client
+                    .call_tool_with_cancellation(cx, cancellation, "example", serde_json::json!({}))
+                    .await
+            }
+            let _ =
+                open_modern_websocket_catalog_listener::<asupersync::net::tcp::VirtualTcpStream>;
+            let _ = next_modern_websocket_catalog_event::<asupersync::net::tcp::VirtualTcpStream>;
+            let _ = public_websocket_client_typed_verbs::<asupersync::net::tcp::VirtualTcpStream>;
+        }
         let _: for<'a> fn(
             &'a mut modern::Client,
         ) -> modern::McpResult<&'a modern::ServerDiscoverResult> = modern::Client::server_discovery;
@@ -7395,6 +7817,65 @@ mod tests {
             cursor: Option<&str>,
         ) -> Result<modern::FinalListToolsResult, modern::HttpClientError> {
             client.list_tools(cx, cursor).await
+        }
+
+        async fn call_modern_http_tool(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<modern::FinalCallToolResult, modern::HttpClientError> {
+            client.call_tool(cx, name, arguments).await
+        }
+
+        async fn call_modern_http_tool_with_cancellation(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            cancellation: &modern::McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<modern::FinalCallToolResult, modern::HttpClientError> {
+            client
+                .call_tool_with_cancellation(cx, cancellation, name, arguments)
+                .await
+        }
+
+        async fn public_http_client_typed_verbs(
+            client: &mut crate::HttpClient,
+            cx: &modern::Cx,
+            cancellation: &modern::McpRequestCancellation,
+        ) -> Result<fastmcp_protocol::CoreResult, crate::HttpClientError> {
+            let _ = client.list_resources(cx, None).await?;
+            let _ = client.list_resource_templates(cx, None).await?;
+            let _ = client.list_prompts(cx, None).await?;
+            let _ = client.read_resource(cx, "resource://example").await?;
+            let _ = client
+                .get_prompt(cx, "example", std::collections::HashMap::new())
+                .await?;
+            let _ = client
+                .call_tool(cx, "example", serde_json::json!({}))
+                .await?;
+            let _ = client
+                .list_tools_with_cancellation(cx, cancellation, None)
+                .await?;
+            client
+                .call_tool_with_cancellation(cx, cancellation, "example", serde_json::json!({}))
+                .await
+        }
+
+        async fn request_modern_http_core_with_cancellation(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            cancellation: &modern::McpRequestCancellation,
+        ) -> Result<fastmcp_protocol::CoreResult, modern::HttpClientError> {
+            client
+                .request_final_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    "tools/list",
+                    serde_json::json!({}),
+                )
+                .await
         }
 
         async fn list_modern_http_prompts(
@@ -7465,10 +7946,27 @@ mod tests {
             Ok(event)
         }
 
+        async fn receive_modern_http_subscription_event_without_dropping_listener(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            filter: modern::SubscriptionFilter,
+            limits: modern::SseLimits,
+        ) -> Result<Option<modern::ModernHttpSubscriptionListenEvent>, modern::HttpClientError>
+        {
+            client
+                .start_subscriptions_listener(cx, filter, limits)
+                .await?;
+            let event = client.next_http_subscription_event(cx).await?;
+            let _: modern::FinalListToolsResult = client.list_tools(cx, None).await?;
+            Ok(event)
+        }
+
         let _ = modern::HttpClient::connect;
         let _ = bind_modern_http;
         let _ = serve_modern_http;
         let _ = list_modern_http_tools;
+        let _ = call_modern_http_tool;
+        let _ = call_modern_http_tool_with_cancellation;
         let _ = list_modern_http_prompts;
         let _ = get_modern_http_prompt;
         let _ = get_modern_http_prompt_with_mrtr::<
@@ -7476,6 +7974,7 @@ mod tests {
         >;
         let _ = open_modern_http_subscriptions_listener;
         let _ = receive_modern_http_subscription_event;
+        let _ = receive_modern_http_subscription_event_without_dropping_listener;
 
         let auto_builder = auto::client_builder();
         assert_eq!(
