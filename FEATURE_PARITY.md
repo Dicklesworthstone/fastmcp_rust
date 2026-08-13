@@ -122,9 +122,9 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| `@tool` / `#[tool]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch drives `call_async_in_request`. Exact-2024 session dispatch still uses the blocking `run_handler` bridge |
+| `@tool` / `#[tool]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch and exact-2024 session dispatch both drive `call_async_in_request`. The session path still `block_on`s that request-owned future |
 | `@resource` / `#[resource]` | ✅ | 🟡 | Macro plus RFC 6570 reversible templates exist; lossy prefix/explode forms are refused rather than guessed |
-| `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch drives async-in-request. Exact-2024 session dispatch still uses the blocking `run_handler` bridge |
+| `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch and exact-2024 session dispatch both drive `get_async_in_request`. The session path still `block_on`s that request-owned future |
 | Auto JSON schema | ✅ | ✅ | `#[derive(JsonSchema)]` + inline generation |
 | Description from docstrings | ✅ | ✅ | Doc comments → descriptions |
 | Default parameter values | ✅ | ✅ | Implemented via `defaults(...)` on `#[tool]`/`#[prompt]` (e.g. `#[tool(defaults(foo = 123, bar = \"baz\"))]`) |
@@ -147,7 +147,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Stdio transport** | ✅ | ✅ | NDJSON implementation present |
-| **SSE transport** | ✅ | 🟡 | Low-level `SseServerTransport`/`SseClientTransport` types exist; public `Client` Auto uses SSE for exact-2024 HTTP fallback, with no standalone `Client::sse` constructor |
+| **SSE transport** | ✅ | 🟡 | Low-level `SseServerTransport`/`SseClientTransport` types exist; public `Client::sse` / `Client::sse_with_cx` connect an exact-2024 HTTP+SSE client without probing modern HTTP. Auto still uses SSE only as a fallback |
 | **WebSocket transport** | ✅ | 🟡 | `WsTransport` framing plus `ClientBuilder::connect_websocket_with_cx` exist behind `websocket-experimental`; aggregate lifecycle qualification remains open |
 | **HTTP transport** | ✅ | 🟡 | Public `Server::run_http*` binds a dual-era listener; `Client::http` is the high-level client. Aggregate admission/challenge and bidirectional qualification remain open |
 | **Streamable HTTP** | ✅ | 🟡 | `StreamableHttpTransport` and public modern/legacy HTTP paths exist; aggregate protocol qualification remains unverified |
@@ -182,7 +182,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `notifications/resources/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
 | `notifications/prompts/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
 | `notifications/resources/updated` | ✅ | ✅ | `ctx.notify_resource_updated` plus matching listen filters |
-| `subscriptions/listen` | ✅ | 🟡 | Owned HTTP/stdio dispatch, detached sequential pumps, and `Server::open_subscription_listen` for in-process callers. `dispatch_stateless` rejects listen instead of returning `MethodNotFound` |
+| `subscriptions/listen` | ✅ | 🟡 | Owned HTTP incremental listener (`start_subscriptions_listener` keeps the same `HttpClient` free to issue requests), stdio incremental catalog/Tasks listeners on the same `Client`, `ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams, WebSocket incremental catalog listen (`WebSocketClient::open_subscriptions_listener`), detached sequential pumps, and `Server::open_subscription_listen` for in-process callers. `dispatch_stateless` rejects listen instead of returning `MethodNotFound`. Collect-to-terminal stdio/WebSocket and the borrowing HTTP listener remain available |
 
 ### Background Tasks (Docket/SEP-1686; network surface quarantined)
 
@@ -202,14 +202,14 @@ edge nor a network capability while TASK-01/TASK-02 remain open.
 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
-| `sampling/createMessage` | ✅ | 🟡 | Protocol/context/send/response routing exists on the stdio receive-pump path; custom/SSE/WebSocket paths lack equivalent split routing and end-to-end lifecycle qualification remains open |
+| `sampling/createMessage` | ✅ | 🟡 | Protocol/context/send/response routing exists on the stdio receive-pump path. Modern WebSocket answers typed `sampling/createMessage` reverse requests when a modern handler is installed; exact-2024 reverse handlers stay rejected on ModernOnly. Modern HTTP now answers those reverse requests on a request-owned SSE body by POSTing the JSON-RPC response. Server-side modern HTTP reverse issuance and custom/stdio lifecycle qualification remain open |
 
 ### Server-to-Client Protocols
 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
-| **Elicitation** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` plus stdio response routing exist; custom/SSE/WebSocket paths lack equivalent split routing and end-to-end lifecycle qualification remains open |
-| **Roots** | ✅ | 🟡 | `TransportRootsProvider` exists, but it shares the same unqualified bidirectional receive-path constraint |
+| **Elicitation** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` plus stdio response routing exist. Modern WebSocket and modern HTTP now answer typed `elicitation/create` reverse requests when a modern handler is installed; server-side modern HTTP reverse issuance and custom-loop qualification remain open |
+| **Roots** | ✅ | 🟡 | `TransportRootsProvider` exists. Modern WebSocket and modern HTTP now answer typed `roots/list` reverse requests when a modern handler is installed; server-side modern HTTP reverse issuance still lacks equivalent split routing |
 
 ### Bidirectional Communication Infrastructure
 
@@ -220,7 +220,7 @@ The following bidirectional building blocks exist in source. This inventory does
 3. ✅ `TransportSamplingSender` - Implements `SamplingSender` trait
 4. ✅ `TransportElicitationSender` - Implements `ElicitationSender` trait
 5. ✅ `TransportRootsProvider` - Provides `roots/list` requests
-6. 🟡 The Unix primary-stdio receive pump continues routing responses during handler dispatch; non-Unix stdio and custom/SSE/WebSocket loops do not yet provide equivalent split routing
+6. 🟡 The Unix primary-stdio receive pump continues routing responses during handler dispatch; modern WebSocket and modern HTTP now answer typed `sampling/createMessage` reverse requests when a modern handler is installed. Non-Unix stdio and custom loops do not yet provide equivalent split routing
 7. ✅ `Server` struct has `pending_requests` field for tracking
 
 ---
@@ -230,13 +230,13 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | Subprocess spawning | ✅ | 🟡 | Stdio subprocess integration exists. Explicit `Client::close` returns cleanup failures; opt-in anchored group ownership is Unix-only and is not portable process-tree containment |
-| Client transport integration | ✅ | 🟡 | Public `Client` covers subprocess stdio and HTTP (`Client::http`); WebSocket is behind `websocket-experimental`; SSE remains a lower-level transport type |
+| Client transport integration | ✅ | 🟡 | Public `Client` covers subprocess stdio, HTTP (`Client::http` with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` plus cancellation variants), and exact-2024 SSE (`Client::sse`); WebSocket (`websocket-experimental`) has incremental catalog listen plus the same typed verbs and `list_tools_with_cancellation`/`call_tool_with_cancellation` so the same connection can keep issuing or cancel ordinary requests |
 | Tool invocation | ✅ | ✅ | `call_tool()` |
 | Resource reading | ✅ | ✅ | `read_resource()` |
 | Prompt fetching | ✅ | ✅ | `get_prompt()` |
 | Progress callbacks | ✅ | ✅ | `call_tool_with_progress()` |
 | List operations | ✅ | ✅ | Tool/resource/prompt list methods exist |
-| Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the Unix stdio receive pump can route it during dispatch. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries; reliable interruption, cleanup waiting, and request-owned isolation remain open |
+| Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the Unix stdio receive pump can route it during dispatch. Public HTTP `request_final_core_with_cancellation` plus typed `list_tools_with_cancellation`/`call_tool_with_cancellation` honor a caller-owned cancellation domain for ordinary core requests. WebSocket typed `list_tools_with_cancellation`/`call_tool_with_cancellation` reject before send and retire after send; a blocked ingress wait still belongs to the connection `Cx` until the next frame. Non-Unix stdio and custom/SSE loops retain sequential/blocking boundaries; reliable interruption, cleanup waiting, and request-owned isolation remain open |
 | Log level setting | ✅ | ✅ | `set_log_level()` |
 | Response ID validation | ✅ | ✅ | Validates response IDs |
 | Client request idle/absolute deadlines | ✅ | 🟡 | Ordinary requests use monotonic `Instant` deadlines that begin after send commit (30-second idle and 120-second non-resettable absolute defaults). Unix subprocess stdout receives, including silent and partial frames, are bounded; generic blocking `recv`, non-Unix child pipes, synchronous writes, and best-effort Drop prevent a portable end-to-end wall-clock guarantee (FND-04) |
@@ -271,7 +271,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Auth context | ✅ | ✅ | `auth()` / `set_auth()` |
 | Parallel combinators | ❌ | ✅ | `join_all()`, `race()`, `quorum()`, `first_ok()` |
 | Sampling from handler | ✅ | 🟡 | `ctx.sample()` and `ctx.sample_with_request()` exist with stdio response routing; other transports and end-to-end lifecycle remain unverified |
-| **Elicitation from handler** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` exist with stdio response routing; other transports and end-to-end lifecycle remain unverified |
+| **Elicitation from handler** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` exist with stdio response routing. Modern WebSocket clients can answer `elicitation/create`; HTTP/SSE and end-to-end lifecycle remain unverified |
 
 ### Historical context gap-closure inventory
 
@@ -414,7 +414,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 7. ✅ **Auto-initialize** - Client auto-initialization (client/builder.rs)
 8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs)
 9. ✅ **Capabilities access** - ctx.client_capabilities(), ctx.server_capabilities() (context.rs)
-10. 🟡 **Per-handler timeout** - Handler-level configuration exists; enforcement hardening remains active
+10. 🟡 **Per-handler timeout** - Handler-level configuration exists and both modern and exact-2024 session dispatch now enforce it through `run_handler_in_request`; panic-boundary hardening remains active
 11. ✅ **Output schema** - Tool output schema support (macros, handler.rs)
 12. ✅ **Tool annotations** - MCP tool annotations (types.rs, handler.rs)
 13. ✅ **Strict validation** - strict_input_validation setting (router.rs, builder.rs)
@@ -503,8 +503,10 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
 - Legacy `tasks/list` and `tasks/submit` return `MethodNotFound`; official `tasks/get`, `tasks/update`, and `tasks/cancel` are served by default
 - OAuth/OIDC source APIs remain public for development, but their production
   security/profile conformance is unverified and quarantined from support claims
-- The public client supports subprocess stdio and HTTP (`Client::http`).
-  WebSocket is behind `websocket-experimental`; SSE is used as the exact-2024
-  HTTP fallback and remains a lower-level transport type
+- The public client supports subprocess stdio and HTTP (`Client::http` with
+  typed list/call/read/get verbs). WebSocket is behind
+  `websocket-experimental` and now has incremental catalog listen plus the
+  same typed verbs; SSE is used as the exact-2024 HTTP fallback and remains a
+  lower-level transport type
 
 **Not production-certified for MCP 2026-07-28** until final attestation and GATE packages pass.

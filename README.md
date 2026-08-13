@@ -380,6 +380,23 @@ fn connect() -> McpResult<Client> {
 }
 ```
 
+A live modern `subscriptions/listen` can stay open on the same stdio
+`Client` while other requests complete. Call
+`Client::open_subscriptions_listener` and then
+`Client::next_subscription_event` to drain acknowledgement, catalog, and
+resource-update events without collecting the stream to terminal.
+`listen_subscriptions_typed` remains the collect-to-terminal adapter.
+The same incremental pattern exists on HTTP (`HttpClient::start_subscriptions_listener`),
+modern WebSocket (`WebSocketClient::open_subscriptions_listener`), and
+`ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams.
+HTTP and WebSocket clients also expose typed `list_tools`/`call_tool`/
+`read_resource`/`get_prompt` verbs so callers do not have to decode a raw
+core result for ordinary catalog and invocation traffic. HTTP and WebSocket
+`list_tools_with_cancellation`/`call_tool_with_cancellation` honor a
+caller-owned cancellation domain for those ordinary verbs.
+Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse` when the GET event
+stream and POST message endpoints are already known.
+
 The published 0.3.2 CLI predates these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
@@ -625,7 +642,7 @@ fn commit_revision(
 | **Protocol Modernization** | The root compatibility `PROTOCOL_VERSION` remains `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. MCP 2026-07-28 implementation and verification are incomplete |
 | **Runtime-context migration** | Production entry points obtain an ambient `Cx` from the runtime; `test-internals` is confined to test-only dependencies and the facade's opt-in `testing-lab` feature |
 | **Network Transports** | The turnkey `run_http*` entry points provide a caller-owned dual-era HTTP listener and dispatch lifecycle. The experimental `websocket-experimental` facade profile also provides native async `bind_websocket` and `serve_websocket` listener lifecycles, plus caller-driven client connection. These surfaces do not establish aggregate conformance or complete lifecycle qualification |
-| **Client Transport Coverage** | `fastmcp-client::Client` is subprocess-stdio only; public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration. With `websocket-experimental`, the facade exposes `WebSocketClient`: ModernOnly and LegacyOnly builders accept an owned async WebSocket transport, while Auto accepts a caller-owned factory that yields a fresh upgraded transport for initial modern discovery and its sole permitted exact-2024 retry |
+| **Client Transport Coverage** | `fastmcp-client::Client` is subprocess-stdio only; public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` verbs. Modern HTTP answers typed reverse `sampling/createMessage`, `roots/list`, and `elicitation/create` requests that arrive on a request-owned SSE body by POSTing the JSON-RPC response. With `websocket-experimental`, the facade exposes `WebSocketClient` with incremental catalog listen, the same typed verbs, and the same modern reverse handlers: ModernOnly and LegacyOnly builders accept an owned async WebSocket transport, while Auto accepts a caller-owned factory that yields a fresh upgraded transport for initial modern discovery and its sole permitted exact-2024 retry |
 | **Experimental WebSocket TLS** | The experimental async transport supports `ws://` and `wss://`. `wss://` can use the built-in WebPKI-rooted connector or a caller-supplied TLS connector for private roots, pinning, or client certificates; this connection support does not imply complete TLS, lifecycle, or MCP conformance qualification |
 | **HTTP Dispatch Qualification** | Public `run_http*` binds and serves the caller-owned dual-era HTTP lifecycle. `ModernOnly` selects the exact MCP 2026-07-28 era and `LegacyOnly` selects the exact MCP 2024-11-05 era; MCP 2025-11-25 is not an adapter or supported policy. This executable surface does not establish aggregate MCP conformance or complete lifecycle qualification |
 | **Wire Cancellation** | On Unix, stdio has a continuous receive pump and bounded concurrent modern request-owned children, so it can route `notifications/cancelled` during handler execution. Response and notification commits are serialized at the output writer; exact MCP 2024-11-05 traffic remains serialized through its lifecycle worker. Non-Unix stdio and custom/SSE/WebSocket loops retain sequential/blocking boundaries, while a non-cooperative handler can exceed the bounded process-exit drain and reliable `awaitCleanup` semantics remain unverified |
