@@ -222,6 +222,10 @@ impl AdmittedRsaJwks {
 /// rotation, ring publication change, or deployment configuration change must
 /// never be mistaken for another kind of continuity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the repeated suffix distinguishes four independent security generations at the API boundary"
+)]
 pub struct Rs256SigningBinding {
     provider_generation: u64,
     key_generation: u64,
@@ -369,7 +373,6 @@ impl AttestedRs256PublicKey {
     /// owning issuer to publish and later compare byte-for-byte with its
     /// independently read-back JWKS response; they do not prove publication
     /// or activate signing by themselves.
-    #[must_use]
     pub fn canonical_public_jwks(&self) -> Result<CanonicalRs256PublicJwks, JoseError> {
         let value = serde_json::json!({"keys": [self.canonical_jwk_value()]});
         let bytes =
@@ -526,13 +529,11 @@ impl Rs256PublicKeyRing {
         };
         self.active
             .canonical_public_jwks()
-            .ok()
-            .is_some_and(|active| active.as_bytes() == expected.as_bytes())
+            .is_ok_and(|active| active.as_bytes() == expected.as_bytes())
             || self.retained.iter().any(|retained| {
                 retained
                     .canonical_public_jwks()
-                    .ok()
-                    .is_some_and(|candidate| candidate.as_bytes() == expected.as_bytes())
+                    .is_ok_and(|candidate| candidate.as_bytes() == expected.as_bytes())
             })
     }
 
@@ -592,6 +593,14 @@ impl Rs256PublicKeyRing {
     #[must_use]
     pub fn len(&self) -> usize {
         self.retained.len() + 1
+    }
+
+    /// Reports whether this ring has no verification keys.
+    ///
+    /// A valid ring always owns one active key, so this is always false.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
     }
 
     /// Creates the exact canonical JWKS for the active plus retained keys.
@@ -1363,7 +1372,6 @@ impl ExternalRs256Signer {
     }
 
     /// Returns the sole canonical public JWKS that can activate this signer.
-    #[must_use]
     pub fn canonical_public_jwks(&self) -> Result<CanonicalRs256PublicJwks, JoseError> {
         self.public_key.canonical_public_jwks()
     }
