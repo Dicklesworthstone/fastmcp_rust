@@ -986,6 +986,10 @@ struct DecodedFinalResponse {
 enum AdmittedFinalResult {
     Core(Box<DecodedResult>, Option<ResultPeerDiagnostic>),
     Task,
+    /// `subscriptions/listen` completion is method-shaped, not a generic
+    /// complete-result payload. Keep the admitted source for the typed
+    /// listener instead of forcing it through [`CoreResultDiscriminatorPolicy`].
+    SubscriptionListen,
 }
 
 impl DecodedFinalResponse {
@@ -994,6 +998,7 @@ impl DecodedFinalResponse {
         raw_result: Option<String>,
         peer_era: ResultPeerEra,
         accepts_task_result: bool,
+        retain_subscription_listen: bool,
     ) -> McpResult<Self> {
         if raw_result.is_some() && response.result.is_none() {
             return Err(McpError::invalid_request(
@@ -1014,6 +1019,9 @@ impl DecodedFinalResponse {
             .result
             .as_ref()
             .map(|result| {
+                if retain_subscription_listen {
+                    return Ok(AdmittedFinalResult::SubscriptionListen);
+                }
                 if accepts_task_result
                     && result.get("resultType").and_then(Value::as_str) == Some("task")
                 {
@@ -1050,6 +1058,9 @@ impl DecodedFinalResponse {
             Some(AdmittedFinalResult::Core(decoded, diagnostic)) => Ok((*decoded, diagnostic)),
             Some(AdmittedFinalResult::Task) => Err(McpError::invalid_request(
                 "Tasks result requires its typed Tasks execution surface",
+            )),
+            Some(AdmittedFinalResult::SubscriptionListen) => Err(McpError::invalid_request(
+                "Listen result requires its typed subscription surface",
             )),
             None => {
                 let error = self
@@ -2552,11 +2563,13 @@ where
         );
         let accepts_task_result =
             state.result_peer_era == ResultPeerEra::Modern && pending.method == TOOLS_CALL;
+        let retain_subscription_listen = pending.method == SUBSCRIPTIONS_LISTEN;
         let decoded = match DecodedFinalResponse::admit(
             response,
             raw_result,
             state.result_peer_era,
             accepts_task_result,
+            retain_subscription_listen,
         ) {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -4267,6 +4280,70 @@ mod tests {
             .expect("the request owner retains its admitted source result");
         assert_eq!(response.id, Some(RequestId::Number(84)));
         assert_eq!(retained_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    fn drive_frame_retains_a_listen_complete_source_instead_of_generic_complete_decode() {
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":2,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("one listen terminal source frame is admitted before executor routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut listen = executor
+            .execute(
+                &cx,
+                JsonRpcRequest::new(
+                    SUBSCRIPTIONS_LISTEN,
+                    Some(serde_json::json!({"notifications":{"toolsListChanged":true}})),
+                    2,
+                ),
+            )
+            .expect("listen request commits before its terminal frame");
+        executor
+            .drive_frame(&cx, frame)
+            .expect("a listen terminal is not forced through generic complete-result decoding");
+        let (response, retained_source) = executor
+            .try_take_response_with_raw_result(&mut listen)
+            .expect("typed listen surface can take the retained source")
+            .expect("the listen terminal is already routed");
+        assert_eq!(response.id, Some(RequestId::Number(2)));
+        assert_eq!(retained_source.as_deref(), Some(raw_result));
+    }
+
+    #[test]
+    fn drive_frame_rejects_a_listen_complete_payload_on_an_ordinary_tools_call() {
+        let cx = Cx::for_testing();
+        let raw_result =
+            r#"{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}"#;
+        let frame = ReceivedTransportFrame::admit(
+            format!(r#"{{"jsonrpc":"2.0","id":2,"result":{raw_result}}}"#)
+                .into_bytes()
+                .into_boxed_slice(),
+        )
+        .expect("one listen-shaped complete frame is admitted before executor routing");
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new(std::iter::empty()),
+            ResultPeerEra::Modern,
+        );
+        let mut call = executor
+            .execute(&cx, request(2))
+            .expect("ordinary tools/call commits before the listen-shaped payload");
+        executor
+            .drive_frame(&cx, frame)
+            .expect("the protocol failure is retained on the request owner");
+        let error = executor
+            .try_take_response_with_raw_result(&mut call)
+            .expect_err("changing only the method must reject a listen complete payload");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(error.message, "Peer final result failed protocol decoding");
     }
 
     #[test]
