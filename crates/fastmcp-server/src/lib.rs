@@ -8534,7 +8534,7 @@ impl NativeHttp1Codec {
             self.pre_body_admission = NativeHttp1PreBodyAdmission::Complete;
             return Ok(());
         };
-        if raw_path == limits.authorization_path {
+        if raw_path == limits.authorization {
             let query = target.split_once('?').map_or("", |(_, query)| query);
             if query.len() > oauth::MAX_OAUTH_AUTHORIZATION_QUERY_BYTES {
                 return Err(Http1DecodeError::BodyTooLarge);
@@ -21793,7 +21793,8 @@ mod lib_unit_tests {
         let expired = state
             .handoff_leases
             .iter()
-            .filter_map(|(task_id, lease)| (lease.expires_at <= now).then(|| task_id.clone()))
+            .filter(|(_, lease)| lease.expires_at <= now)
+            .map(|(task_id, _)| task_id.clone())
             .collect::<Vec<_>>();
         for task_id in expired {
             let Some(lease_generation) = state
@@ -21829,7 +21830,8 @@ mod lib_unit_tests {
         let expired_task_ids = state
             .expires_at
             .iter()
-            .filter_map(|(task_id, expires_at)| (*expires_at <= now).then(|| task_id.clone()))
+            .filter(|(_, expires_at)| **expires_at <= now)
+            .map(|(task_id, _)| task_id.clone())
             .collect::<Vec<_>>();
         for task_id in expired_task_ids {
             state.expires_at.remove(&task_id);
@@ -21887,10 +21889,8 @@ mod lib_unit_tests {
         task_ids
             .iter()
             .copied()
-            .find(|task_id| {
-                after_task_id.is_none_or(|after| *task_id > after) && eligible(*task_id)
-            })
-            .or_else(|| task_ids.into_iter().find(|task_id| eligible(*task_id)))
+            .find(|task_id| after_task_id.is_none_or(|after| *task_id > after) && eligible(task_id))
+            .or_else(|| task_ids.into_iter().find(|task_id| eligible(task_id)))
             .cloned()
     }
 
@@ -32410,16 +32410,12 @@ mod lib_unit_tests {
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
-                    let denied = format!(
-                        "GET /oauth/authorize?response_type=code&client_id=live-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=denied&state=opaque-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
-                    );
+                    let denied = "GET /oauth/authorize?response_type=code&client_id=live-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=denied&state=opaque-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n".to_owned();
                     // RH-5: this differs from the successful request only in
                     // its requested scope. A valid redirect must carry the
                     // OAuth error and the original opaque state.
                     let denied = live_http_exchange(address, denied.into_bytes()).await?;
-                    let authorize = format!(
-                        "GET /oauth/authorize?response_type=code&client_id=live-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&state=opaque-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
-                    );
+                    let authorize = "GET /oauth/authorize?response_type=code&client_id=live-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&state=opaque-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n".to_owned();
                     let authorize = live_http_exchange(address, authorize.into_bytes()).await?;
                     let location = live_http_response_header(&authorize, "location")?;
                     let redirect = url::Url::parse(&location)
@@ -32544,9 +32540,7 @@ mod lib_unit_tests {
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
-                    let authorize = format!(
-                        "GET /oauth/authorize?response_type=code&client_id=live-redirect-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
-                    );
+                    let authorize = "GET /oauth/authorize?response_type=code&client_id=live-redirect-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n".to_owned();
                     let authorize = live_http_exchange(address, authorize.into_bytes()).await?;
                     let location = live_http_response_header(&authorize, "location")?;
                     let redirect = url::Url::parse(&location)

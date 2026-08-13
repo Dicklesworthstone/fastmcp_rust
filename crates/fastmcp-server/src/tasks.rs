@@ -1400,21 +1400,15 @@ fn can_transition_official_task(from: OfficialTaskStatus, to: OfficialTaskStatus
         (
             OfficialTaskStatus::Working,
             OfficialTaskStatus::InputRequired
-        ) | (OfficialTaskStatus::Working, OfficialTaskStatus::Completed)
-            | (OfficialTaskStatus::Working, OfficialTaskStatus::Failed)
-            | (OfficialTaskStatus::Working, OfficialTaskStatus::Cancelled)
-            | (
-                OfficialTaskStatus::InputRequired,
-                OfficialTaskStatus::Working
-            )
-            | (
-                OfficialTaskStatus::InputRequired,
-                OfficialTaskStatus::Failed
-            )
-            | (
-                OfficialTaskStatus::InputRequired,
-                OfficialTaskStatus::Cancelled
-            )
+                | OfficialTaskStatus::Completed
+                | OfficialTaskStatus::Failed
+                | OfficialTaskStatus::Cancelled
+        ) | (
+            OfficialTaskStatus::InputRequired,
+            OfficialTaskStatus::Working
+                | OfficialTaskStatus::Failed
+                | OfficialTaskStatus::Cancelled
+        )
     )
 }
 
@@ -3324,7 +3318,7 @@ fn next_in_memory_final_task_recovery_id<'a>(
             task_ids
                 .iter()
                 .copied()
-                .find(|task_id| task_id > after_task_id && eligible(task_id))
+                .find(|task_id| *task_id > after_task_id && eligible(task_id))
         })
         .or_else(|| task_ids.into_iter().find(|task_id| eligible(task_id)))
         .cloned()
@@ -7373,14 +7367,14 @@ mod tests {
                 None,
             )?);
             if current.generation() != generation
-                || !self
+                || self
                     .inner
                     .request_cancellation_and_clear_input_if_current(
                         &current,
                         cancelled_task.clone(),
                         final_task_notification(&cancelled_task),
                     )?
-                    .is_some()
+                    .is_none()
             {
                 return Ok(None);
             }
