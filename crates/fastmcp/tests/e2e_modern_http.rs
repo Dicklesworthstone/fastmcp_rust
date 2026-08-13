@@ -23,11 +23,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_rust::{
-    AuthContext, CanonicalHttpUrl, ClientHttpConnectionError, ClientHttpResponse,
-    ClientProtocolPlan, Content, Cx, HttpNonquiescentShutdown, HttpServerShutdown,
-    HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpResult,
-    Middleware, MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream,
-    PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy, ResourceHandler, Role, SseLimits,
+    AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientHttpConnectionError,
+    ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content, CoreResult, Cx,
+    FinalCoreResult, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
+    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware,
+    MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler,
+    PromptMessage, ProtocolEra, ProtocolPolicy, ResourceHandler, Role, SseLimits,
     StaticTokenVerifier, TokenAuthProvider, ToolHandler, auto, core, legacy_2024, modern, prompt,
     resource, tool,
 };
@@ -35,17 +36,32 @@ use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
 const PUBLIC_HTTP_TOOL_NAME: &str = "public-http-e2e-tool";
+const PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME: &str = "public-http-e2e-cursor-secondary";
 const PUBLIC_HTTP_RESOURCE_URI: &str = "test://public-http-e2e/resource";
 const PUBLIC_HTTP_PROMPT_NAME: &str = "public-http-e2e-prompt";
 const PUBLIC_HTTP_TOOL_ARGUMENT: &str = "cross-era";
 const PUBLIC_HTTP_TOOL_TEXT: &str = "tool:cross-era";
 const PUBLIC_HTTP_RESOURCE_TEXT: &str = "resource:deterministic";
 const PUBLIC_HTTP_PROMPT_TEXT: &str = "prompt:cross-era";
+const PUBLIC_HTTP_COMPLETION_VALUE: &str = "cross-era-completion";
 
 /// The deterministic user handler exercised through both public HTTP facades.
-#[tool(name = "public-http-e2e-tool")]
+#[tool(name = "public-http-e2e-tool", tags = ["cursor"])]
 fn public_http_value(_ctx: &McpContext, value: String) -> String {
     format!("tool:{value}")
+}
+
+/// Additional catalog entries make the public cursor test cross a real page
+/// boundary while keeping the ordinary tool handler deterministic.
+#[tool(name = "public-http-e2e-cursor-secondary", tags = ["cursor"])]
+fn public_http_cursor_secondary(_ctx: &McpContext) -> String {
+    "cursor-secondary".to_owned()
+}
+
+/// Deliberately outside the cursor query used by the positive continuation.
+#[tool(name = "public-http-e2e-cursor-other", tags = ["other"])]
+fn public_http_cursor_other(_ctx: &McpContext) -> String {
+    "cursor-other".to_owned()
 }
 
 /// The deterministic resource exercised through both public HTTP facades.
@@ -70,6 +86,7 @@ struct PublicHttpHandlerCallCounters {
     tool: AtomicUsize,
     resource: AtomicUsize,
     prompt: AtomicUsize,
+    completion: AtomicUsize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -77,6 +94,7 @@ struct PublicHttpHandlerCallSnapshot {
     tool: usize,
     resource: usize,
     prompt: usize,
+    completion: usize,
 }
 
 impl PublicHttpHandlerCallCounters {
@@ -85,6 +103,7 @@ impl PublicHttpHandlerCallCounters {
             tool: self.tool.load(Ordering::SeqCst),
             resource: self.resource.load(Ordering::SeqCst),
             prompt: self.prompt.load(Ordering::SeqCst),
+            completion: self.completion.load(Ordering::SeqCst),
         }
     }
 }
@@ -135,6 +154,55 @@ impl PromptHandler for CountingPublicHttpInstruction {
     ) -> McpResult<Vec<PromptMessage>> {
         self.counters.prompt.fetch_add(1, Ordering::SeqCst);
         PublicHttpInstructionPrompt.get(context, arguments)
+    }
+}
+
+struct CountingPublicHttpCompletion {
+    counters: Arc<PublicHttpHandlerCallCounters>,
+}
+
+impl CompletionHandler for CountingPublicHttpCompletion {
+    fn complete_legacy(
+        &self,
+        _context: &McpContext,
+        _params: legacy_2024::LegacyCompletionParams,
+    ) -> McpResult<legacy_2024::CompletionValues> {
+        Ok(legacy_2024::CompletionValues {
+            values: vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+            total: Some(1),
+            has_more: Some(false),
+        })
+    }
+
+    fn complete_final(
+        &self,
+        _context: &McpContext,
+        params: modern::FinalCompletionParams,
+    ) -> McpResult<modern::FinalCompletionValues> {
+        self.counters.completion.fetch_add(1, Ordering::SeqCst);
+        if !matches!(
+            &params.reference,
+            modern::FinalCompletionReference::PromptWithTitle { name, title }
+                if name == PUBLIC_HTTP_PROMPT_NAME && title == "Public HTTP E2E Prompt"
+        ) || params.argument.name != "subject"
+            || params.argument.value != "cross-era"
+            || params
+                .context
+                .as_ref()
+                .and_then(|context| context.arguments.as_ref())
+                .and_then(|arguments| arguments.get("region"))
+                .map(String::as_str)
+                != Some("us-east-1")
+        {
+            return Err(McpError::invalid_params(
+                "the completion fixture requires the exact modern request shape",
+            ));
+        }
+        Ok(modern::FinalCompletionValues {
+            values: vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+            total: Some(modern::JsonInteger::from(1_i64)),
+            has_more: Some(false),
+        })
     }
 }
 
@@ -267,6 +335,10 @@ impl HttpServerFixture {
         Self::spawn_with_policy_and_middleware(protocol_policy, None)
     }
 
+    fn spawn_modern_with_page_size(page_size: usize) -> Self {
+        spawn_modern_facade_http_server(false, Some(page_size))
+    }
+
     fn spawn_with_middleware(middleware: Option<Arc<dyn Middleware>>) -> Self {
         Self::spawn_with_policy_and_middleware(ProtocolPolicy::Auto, middleware)
     }
@@ -274,6 +346,14 @@ impl HttpServerFixture {
     fn spawn_with_policy_and_middleware(
         protocol_policy: ProtocolPolicy,
         middleware: Option<Arc<dyn Middleware>>,
+    ) -> Self {
+        Self::spawn_with_configuration(protocol_policy, middleware, None)
+    }
+
+    fn spawn_with_configuration(
+        protocol_policy: ProtocolPolicy,
+        middleware: Option<Arc<dyn Middleware>>,
+        page_size: Option<usize>,
     ) -> Self {
         let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
         let tool_calls = Arc::clone(&handler_calls);
@@ -295,10 +375,16 @@ impl HttpServerFixture {
                 let builder = ServerBuilder::new("facade-http-example", "1.0.0")
                     .protocol_policy(protocol_policy)
                     .expect("the fixture selects an available protocol policy");
+                let builder = match page_size {
+                    Some(page_size) => builder.list_page_size(page_size),
+                    None => builder,
+                };
                 let builder = builder
                     .tool(CountingPublicHttpValue {
                         counters: tool_calls,
                     })
+                    .tool(PublicHttpCursorSecondary)
+                    .tool(PublicHttpCursorOther)
                     .resource(CountingPublicHttpSnapshot {
                         counters: resource_calls,
                     })
@@ -421,13 +507,18 @@ impl HttpServerFixture {
     }
 }
 
-/// Starts the public ModernOnly facade with native bearer admission enabled.
+/// Starts the public ModernOnly facade with optional native bearer admission.
 ///
 /// This fixture intentionally uses the facade builder instead of the lower
 /// server crate so the test covers the public modern API's HTTP delegation.
-fn spawn_authenticated_modern_facade_http_server() -> HttpServerFixture {
+fn spawn_modern_facade_http_server(
+    with_native_bearer_auth: bool,
+    page_size: Option<usize>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let tool_calls = Arc::clone(&handler_calls);
+    let prompt_calls = Arc::clone(&handler_calls);
+    let completion_calls = Arc::clone(&handler_calls);
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
     let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
@@ -440,18 +531,39 @@ fn spawn_authenticated_modern_facade_http_server() -> HttpServerFixture {
                 cx.set_cancel_requested(true);
                 return Err("authenticated HTTP server control receiver went away".to_owned());
             }
-            let verifier = StaticTokenVerifier::new([(
-                "alpha",
-                AuthContext::with_subject("e2e-native-http-principal"),
-            )])
-            .expect("the deterministic native bearer verifier is valid")
-            .with_allowed_schemes(["Bearer"])
-            .expect("the bearer scheme allowlist is valid");
-            let server = modern::ServerBuilder::new("facade-native-http-auth", "1.0.0")
-                .auth_provider(TokenAuthProvider::new(verifier))
-                .tool(CountingPublicHttpValue {
-                    counters: tool_calls,
+            let builder = modern::ServerBuilder::new("facade-native-http-auth", "1.0.0");
+            let builder = if with_native_bearer_auth {
+                let verifier = StaticTokenVerifier::new([(
+                    "alpha",
+                    AuthContext::with_subject("e2e-native-http-principal"),
+                )])
+                .expect("the deterministic native bearer verifier is valid")
+                .with_allowed_schemes(["Bearer"])
+                .expect("the bearer scheme allowlist is valid");
+                builder.auth_provider(TokenAuthProvider::new(verifier))
+            } else {
+                builder
+            };
+            let builder = builder.tool(CountingPublicHttpValue {
+                counters: tool_calls,
+            });
+            let builder = match page_size {
+                Some(page_size) => builder
+                    .list_page_size(page_size)
+                    .tool(PublicHttpCursorSecondary)
+                    .tool(PublicHttpCursorOther),
+                None => builder,
+            };
+            let server = builder
+                .prompt(CountingPublicHttpInstruction {
+                    counters: prompt_calls,
                 })
+                .prompt_completion_handler(
+                    PUBLIC_HTTP_PROMPT_NAME,
+                    CountingPublicHttpCompletion {
+                        counters: completion_calls,
+                    },
+                )
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -1048,7 +1160,10 @@ fn invoke_legacy_public_handlers(cx: &Cx, address: SocketAddr) -> PublicHttpHand
         .connect_http_client_with_cx(cx),
     )
     .expect("the LegacyOnly public facade connects to the live exact-legacy routes");
-    assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
+    assert_eq!(
+        client.protocol_policy(),
+        legacy_2024::ProtocolPolicy::LegacyOnly
+    );
 
     let tool = runtime_block_on_bounded(
         cx,
@@ -1497,7 +1612,7 @@ fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool()
         body.to_vec()
     }
 
-    let server = spawn_authenticated_modern_facade_http_server();
+    let server = spawn_modern_facade_http_server(true, None);
     let discovery = JsonRpcRequest::new(
         "server/discover",
         Some(json!({
@@ -1529,6 +1644,32 @@ fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool()
     assert!(
         discovery.get("error").is_none(),
         "authenticated discovery must negotiate the modern era: {discovery}"
+    );
+    assert_eq!(discovery["result"]["resultType"], json!("complete"));
+    assert_eq!(
+        discovery["result"]["supportedVersions"],
+        json!([modern::PROTOCOL_VERSION]),
+        "the public server advertises only its exact final wire version"
+    );
+    assert_eq!(
+        discovery["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        json!("facade-native-http-auth"),
+        "final server identity belongs in result metadata, never a legacy initialize field"
+    );
+    assert_eq!(
+        discovery["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
+        json!("1.0.0")
+    );
+    assert_eq!(discovery["result"]["capabilities"]["tools"], json!({}));
+    assert_eq!(discovery["result"]["capabilities"]["prompts"], json!({}));
+    assert_eq!(
+        discovery["result"]["capabilities"]["completions"],
+        json!({})
+    );
+    assert_eq!(discovery["result"]["cacheScope"], json!("private"));
+    assert!(
+        discovery["result"]["ttlMs"].is_u64(),
+        "final discovery exposes a nonnegative cache lifetime"
     );
 
     let tool = JsonRpcRequest::new(
@@ -1590,6 +1731,288 @@ fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool()
         1,
         "changing only MCP-Protocol-Version must not invoke the authenticated handler"
     );
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_closed() {
+    fn tools_page(result: CoreResult) -> fastmcp_rust::FinalListToolsResult {
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
+            panic!("tools/list must retain its exact final result vocabulary");
+        };
+        result.payload
+    }
+
+    fn typed_page_identity(page: &fastmcp_rust::FinalListToolsResult) -> serde_json::Value {
+        serde_json::to_value(page).expect("a typed final tools page retains an exact JSON identity")
+    }
+
+    let cx = Cx::for_request();
+    let server = HttpServerFixture::spawn_modern_with_page_size(1);
+
+    let admitted_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-final-cursor-cache-admission-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the public typed HTTP client admits the live final discovery response");
+    let discovery = admitted_client.server_discovery();
+    assert_eq!(discovery.result_type(), "complete");
+    assert_eq!(discovery.supported_versions().len(), 1);
+    assert_eq!(
+        discovery.supported_versions().first().map(String::as_str),
+        Some(modern::PROTOCOL_VERSION),
+        "typed HTTP admission retains the exact live final discovery version"
+    );
+    assert_eq!(
+        discovery
+            .server_info()
+            .expect("typed HTTP admission retains the discovered server identity")
+            .name,
+        "facade-native-http-auth"
+    );
+    drop(admitted_client);
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("e2e-final-cursor-cache-client", "1.0.0")
+            .protocol_plan(plan(server.address(), ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("the public HTTP client completes live modern discovery");
+
+    let first = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+        )
+        .expect("the filtered first public tools page is admitted"),
+    );
+    assert_eq!(
+        first.tools.len(),
+        1,
+        "page size creates a real continuation"
+    );
+    assert_eq!(
+        first.ttl_ms,
+        CacheTtl::milliseconds(5 * 60 * 1_000),
+        "the typed first page retains its exact final ttlMs"
+    );
+    assert_eq!(
+        first.cache_scope,
+        CacheScope::Private,
+        "the typed first page retains its exact final cacheScope"
+    );
+    let first_identity = typed_page_identity(&first);
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first filtered page carries an opaque cursor");
+    assert_eq!(client.final_result_cache_stats().fills, 1);
+    assert_eq!(client.final_result_cache_stats().hits, 0);
+
+    let replay = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+        )
+        .expect("the identical public list request uses its local final cache"),
+    );
+    assert_eq!(
+        typed_page_identity(&replay),
+        first_identity,
+        "the cache replay retains the complete typed first-page identity"
+    );
+    assert_eq!(client.final_result_cache_stats().fills, 1);
+    assert_eq!(
+        client.final_result_cache_stats().hits,
+        1,
+        "an identical final request is a public cache hit"
+    );
+
+    let second = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(
+                &cx,
+                "tools/list",
+                json!({ "cursor": cursor.clone(), "includeTags": ["cursor"] }),
+            ),
+        )
+        .expect("the exact cursor/query continuation reaches the second live page"),
+    );
+    assert_eq!(second.tools.len(), 1);
+    assert_eq!(
+        second.tools[0].name, PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME,
+        "the sole valid continuation retains the exact cursor-secondary tool identity"
+    );
+    assert!(second.next_cursor.is_none());
+    assert_eq!(
+        second.ttl_ms,
+        CacheTtl::milliseconds(5 * 60 * 1_000),
+        "the typed continuation page retains its exact final ttlMs"
+    );
+    assert_eq!(
+        second.cache_scope,
+        CacheScope::Private,
+        "the typed continuation page retains its exact final cacheScope"
+    );
+    assert_ne!(
+        typed_page_identity(&second),
+        first_identity,
+        "the continuation must retain a complete typed page identity distinct from page one"
+    );
+
+    // RH-5: only the query changes. The retained cursor must not cross into a
+    // different filtered catalog, and the prior cached first page stays live.
+    let query_rejection = runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/list",
+            json!({ "cursor": cursor.clone(), "includeTags": ["other"] }),
+        ),
+    )
+    .expect_err("changing only includeTags rejects the cursor before page projection");
+    assert!(matches!(
+        query_rejection,
+        fastmcp_rust::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::InvalidParams
+    ));
+
+    // RH-5: only the catalog method changes. A tools cursor cannot select a
+    // resources page, and this rejection must not flush the cached tools page.
+    let kind_rejection = runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/list",
+            json!({ "cursor": cursor.clone(), "includeTags": ["cursor"] }),
+        ),
+    )
+    .expect_err("changing only the catalog kind rejects the tools cursor");
+    assert!(matches!(
+        kind_rejection,
+        fastmcp_rust::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::InvalidParams
+    ));
+
+    // RH-5: only wire presence changes from an absent cursor to the explicitly
+    // present empty cursor. The cache must not replay the absent-cursor page.
+    let empty_cursor_rejection = runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/list",
+            json!({ "cursor": "", "includeTags": ["cursor"] }),
+        ),
+    )
+    .expect_err("an explicit empty cursor is not the absent-cursor cache identity");
+    assert!(matches!(
+        empty_cursor_rejection,
+        fastmcp_rust::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::InvalidParams
+    ));
+
+    let before_unchanged_retry = client.final_result_cache_stats();
+    let unchanged_retry = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+        )
+        .expect("cursor rejections leave the already-cached first page unchanged"),
+    );
+    assert_eq!(
+        typed_page_identity(&unchanged_retry),
+        first_identity,
+        "cursor rejections leave the complete cached typed first-page identity unchanged"
+    );
+    assert_eq!(
+        client.final_result_cache_stats().fills,
+        before_unchanged_retry.fills,
+        "rejected cursor variations cannot overwrite the admitted cached page"
+    );
+    assert_eq!(
+        client.final_result_cache_stats().hits,
+        before_unchanged_retry.hits + 1,
+        "the unchanged original request still resolves from its prior cache entry"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_modern_facade_native_http_completion_returns_typed_result_and_rejects_undeclared_argument() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_facade_http_server(false, None);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-modern-completion-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the live completion provider");
+    let params = modern::CompletionParams {
+        reference: modern::CompletionReference::PromptWithTitle {
+            name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+            title: "Public HTTP E2E Prompt".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "subject".to_owned(),
+            value: "cross-era".to_owned(),
+        },
+        context: Some(modern::FinalCompletionContext {
+            arguments: Some(std::collections::BTreeMap::from([(
+                "region".to_owned(),
+                "us-east-1".to_owned(),
+            )])),
+        }),
+    };
+
+    let result = runtime_block_on_bounded(&cx, client.complete(&cx, params.clone()))
+        .expect("the typed modern HTTP completion reaches the live facade provider");
+    assert_eq!(
+        result.completion.values,
+        vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+        "the exact FinalCompletionResult retains the provider values"
+    );
+    assert_eq!(
+        result.completion.total,
+        Some(modern::JsonInteger::from(1_i64)),
+        "the exact FinalCompletionResult retains its JSON-integer total"
+    );
+    assert_eq!(
+        result.completion.has_more,
+        Some(false),
+        "the exact FinalCompletionResult retains the terminal pagination flag"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().completion,
+        1,
+        "the accepted typed completion invokes the registered provider once"
+    );
+
+    // RH-5 near-negative: retain the target, title, completion context, and
+    // prefix, changing only the completion argument name. Router validation
+    // must reject before the registered provider can run again.
+    let mut undeclared_argument = params;
+    undeclared_argument.argument.name = "undeclared".to_owned();
+    let error = runtime_block_on_bounded(&cx, client.complete(&cx, undeclared_argument))
+        .expect_err("only an undeclared completion argument is rejected");
+    assert!(matches!(
+        error,
+        modern::HttpClientError::CoreResult(error) if error.code == McpErrorCode::InvalidParams
+    ));
+    assert_eq!(
+        server.handler_call_snapshot().completion,
+        1,
+        "changing only the argument name leaves provider state unchanged"
+    );
+
+    drop(client);
     server.shutdown();
 }
 

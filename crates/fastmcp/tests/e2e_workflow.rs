@@ -12,29 +12,87 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::task::Poll;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
+use fastmcp_rust::prelude::{MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES};
+use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, BoxFuture, CanonicalHttpUrl,
-    ClientHttpConnectionError, ClientProtocolPlan, CompleteResult, ContentBlock, CoreResult,
-    CoreResultDiscriminatorPolicy, Cx, DecodedResult, FinalCallToolResult, FinalCoreResult,
-    FinalTask, FinalTaskInputRequests, FinalTaskInputResponses, FinalTaskRuntime,
-    FinalTaskRuntimeConfig, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-    FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome, HttpServerShutdown,
-    Implementation, InputRequiredResult, McpContext, McpError, McpErrorCode, McpOutcome, McpResult,
-    MrtrCompletedInputs, Outcome, PromptMessage, ProtocolPolicy, RequestId, ResourceContent,
-    ResourceTemplate, ResultMeta, ResultPeerEra, Role, SseLimits, ToolHandler, auto,
-    decode_peer_result, prompt, resource, tool,
+    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, BoxFuture, CacheScope, CacheTtl,
+    CanonicalHttpUrl, ClientHttpConnectionError, ClientProtocolPlan, CompleteResult, ContentBlock,
+    CoreResult, CoreResultDiscriminatorPolicy, Cx, DecodedResult, FinalCallToolResult,
+    FinalCoreResult, FinalGetPromptResult, FinalPromptMessage, FinalReadResourceResult,
+    FinalResourceReadCacheHintProvenance, FinalTask, FinalTaskInputRequests,
+    FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWatchEvent, FinalTaskWorkDescriptor, FinalToolCallOutcome,
+    FinalToolOutcome, HttpServerShutdown, Implementation, InMemoryFinalTaskStore,
+    InputRequiredResult, McpContext, McpError, McpErrorCode, McpOutcome, McpResult,
+    MrtrCompletedInputs, MrtrInputRequest, MrtrInputRequests, Outcome, Prompt, PromptHandler,
+    PromptMessage, ProtocolPolicy, RequestId, Resource, ResourceContent, ResourceHandler,
+    ResourceTemplate, ResultMeta, ResultPeerEra, Role, SseLimits, ToolHandler, Transport, auto,
+    decode_peer_result, legacy_2024, modern, prompt, resource, tool,
 };
 use fastmcp_server::Server;
 use serde_json::json;
+
+#[cfg(feature = "proxy")]
+struct FacadeProxyBoundaryBackend;
+
+#[cfg(feature = "proxy")]
+impl fastmcp_rust::ProxyBackend for FacadeProxyBoundaryBackend {
+    fn list_tools(&mut self) -> McpResult<Vec<fastmcp_rust::Tool>> {
+        Ok(Vec::new())
+    }
+
+    fn list_resources(&mut self) -> McpResult<Vec<fastmcp_rust::Resource>> {
+        Ok(Vec::new())
+    }
+
+    fn list_resource_templates(&mut self) -> McpResult<Vec<fastmcp_rust::ResourceTemplate>> {
+        Ok(Vec::new())
+    }
+
+    fn list_prompts(&mut self) -> McpResult<Vec<fastmcp_rust::Prompt>> {
+        Ok(Vec::new())
+    }
+
+    fn call_tool(
+        &mut self,
+        _name: &str,
+        _arguments: serde_json::Value,
+    ) -> McpResult<Vec<fastmcp_rust::Content>> {
+        Ok(Vec::new())
+    }
+
+    fn call_tool_with_progress(
+        &mut self,
+        _name: &str,
+        _arguments: serde_json::Value,
+        _on_progress: fastmcp_rust::ProxyProgressCallback<'_>,
+    ) -> McpResult<Vec<fastmcp_rust::Content>> {
+        Ok(Vec::new())
+    }
+
+    fn read_resource(&mut self, _uri: &str) -> McpResult<Vec<ResourceContent>> {
+        Ok(Vec::new())
+    }
+
+    fn get_prompt(
+        &mut self,
+        _name: &str,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Ok(Vec::new())
+    }
+}
 
 // ============================================================================
 // Shared handler implementations (macro-based)
@@ -295,6 +353,464 @@ fn setup_workflow_server() -> TestHarness {
     });
 
     TestHarness::new(TestClient::new(client_transport), handle)
+}
+
+const CALLER_OWNED_LIFECYCLE_TOOL: &str = "caller_owned_lifecycle_tool";
+
+/// A real handler whose call count makes era admission observable before any
+/// handler state can be mutated.
+struct CallerOwnedLifecycleTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for CallerOwnedLifecycleTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: CALLER_OWNED_LIFECYCLE_TOOL.to_owned(),
+            description: Some("counts caller-owned lifecycle test calls".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![Content::text("caller-owned lifecycle call")])
+    }
+}
+
+fn lifecycle_modern_opening(id: i64) -> JsonRpcMessage {
+    JsonRpcMessage::Request(JsonRpcRequest::new(
+        "server/discover",
+        Some(json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        id,
+    ))
+}
+
+fn lifecycle_legacy_opening(id: i64) -> JsonRpcMessage {
+    JsonRpcMessage::Request(JsonRpcRequest::new(
+        "initialize",
+        Some(json!({
+            "protocolVersion": legacy_2024::PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "caller-owned-lifecycle-peer", "version": "1.0.0"},
+        })),
+        id,
+    ))
+}
+
+fn lifecycle_tool_request(id: i64, modern_era: bool) -> JsonRpcMessage {
+    let mut params = json!({
+        "name": CALLER_OWNED_LIFECYCLE_TOOL,
+        "arguments": {},
+    });
+    if modern_era {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+    }
+    JsonRpcMessage::Request(JsonRpcRequest::new("tools/call", Some(params), id))
+}
+
+fn lifecycle_response(
+    peer: &mut fastmcp_rust::memory::MemoryTransport,
+    cx: &Cx,
+    id: i64,
+    description: &str,
+) -> JsonRpcResponse {
+    let JsonRpcMessage::Response(response) = peer
+        .recv(cx)
+        .unwrap_or_else(|error| panic!("{description}: peer did not receive a response: {error}"))
+    else {
+        panic!("{description}: peer received a request instead of a response");
+    };
+    assert_eq!(response.id, Some(id.into()), "{description}: response id");
+    response
+}
+
+/// Couples a live peer with its worker so assertions cannot detach the worker
+/// on an unwind path. The peer is dropped before `ThreadJoins`, which makes
+/// EOF available before its bounded settlement runs.
+struct LifecycleThreadHarness {
+    peer: Option<fastmcp_rust::memory::MemoryTransport>,
+    joins: ThreadJoins,
+    outcome: mpsc::Receiver<McpResult<()>>,
+}
+
+impl LifecycleThreadHarness {
+    fn spawn<F>(cx: &Cx, runner: F) -> Self
+    where
+        F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+    {
+        let (peer, server_transport) = create_memory_transport_pair();
+        // This must be unbounded: an assertion can unwind before it observes
+        // the result, and the worker must still be able to exit so the RAII
+        // join guard can settle it instead of waiting on a blocked send.
+        let (outcome_tx, outcome) = mpsc::channel();
+        let server_cx = cx.clone();
+        let handle = spawn_thread(move || {
+            let _ = outcome_tx.send(runner(&server_cx, server_transport));
+        });
+        Self {
+            peer: Some(peer),
+            joins: ThreadJoins::new(vec![handle]),
+            outcome,
+        }
+    }
+
+    fn peer_mut(&mut self) -> &mut fastmcp_rust::memory::MemoryTransport {
+        self.peer
+            .as_mut()
+            .expect("lifecycle peer must remain owned")
+    }
+
+    fn settle(mut self, owner: &str) -> McpResult<()> {
+        let outcome = self
+            .outcome
+            .recv_timeout(MEMORY_SERVER_TEARDOWN_BOUND)
+            .unwrap_or_else(|error| panic!("{owner} did not report a bounded result: {error}"));
+        self.peer.take();
+        drop(self);
+        outcome
+    }
+}
+
+impl Drop for LifecycleThreadHarness {
+    fn drop(&mut self) {
+        // Fields then drop in declaration order: peer (closed) before joins.
+        self.peer.take();
+    }
+}
+
+fn assert_lifecycle_opening(
+    peer: &mut fastmcp_rust::memory::MemoryTransport,
+    cx: &Cx,
+    facade: &str,
+    server_name: &str,
+    opening: JsonRpcMessage,
+    opening_is_modern: bool,
+) {
+    peer.send(cx, &opening)
+        .unwrap_or_else(|error| panic!("{facade}: send era-correct opening: {error}"));
+    let opening_response = lifecycle_response(peer, cx, 1, "era-correct opening response");
+    assert!(
+        opening_response.error.is_none(),
+        "{facade}: era-correct opening must succeed: {opening_response:?}"
+    );
+    let opening_result = opening_response
+        .result
+        .as_ref()
+        .expect("era-correct opening must carry a result");
+    if opening_is_modern {
+        assert_eq!(opening_result["resultType"], json!("complete"));
+        assert_eq!(
+            opening_result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            json!(server_name),
+            "{facade}: final discovery must identify its facade server"
+        );
+    } else {
+        assert_eq!(
+            opening_result["protocolVersion"],
+            json!(legacy_2024::PROTOCOL_VERSION),
+            "{facade}: exact-2024 initialize response must pin 2024-11-05"
+        );
+    }
+}
+
+fn assert_live_facade_era_admission<F>(
+    facade: &str,
+    server_name: &str,
+    opening: JsonRpcMessage,
+    opening_is_modern: bool,
+    calls: Arc<AtomicUsize>,
+    runner: F,
+) where
+    F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+{
+    let cx = Cx::for_testing();
+    let mut harness = LifecycleThreadHarness::spawn(&cx, runner);
+
+    assert_lifecycle_opening(
+        harness.peer_mut(),
+        &cx,
+        facade,
+        server_name,
+        opening,
+        opening_is_modern,
+    );
+
+    if !opening_is_modern {
+        harness
+            .peer_mut()
+            .send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+            )
+            .unwrap_or_else(|error| panic!("{facade}: send exact-2024 initialized: {error}"));
+    }
+
+    // RH-5: the accepted request and the refused request below have the same
+    // id, method, tool name, and arguments. Only the prohibited era metadata
+    // changes, so the counter is an unchanged-state proof of early refusal.
+    harness
+        .peer_mut()
+        .send(&cx, &lifecycle_tool_request(2, opening_is_modern))
+        .unwrap_or_else(|error| panic!("{facade}: send era-correct tool request: {error}"));
+    let accepted = lifecycle_response(harness.peer_mut(), &cx, 2, "era-correct tool response");
+    assert!(
+        accepted.error.is_none(),
+        "{facade}: era-correct tool request must reach the handler: {accepted:?}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "{facade}: era-correct tool request must mutate the real handler exactly once"
+    );
+    assert_eq!(
+        accepted
+            .result
+            .as_ref()
+            .and_then(|result| result.get("resultType")),
+        if opening_is_modern {
+            Some(&json!("complete"))
+        } else {
+            None
+        },
+        "{facade}: successful tool response must retain its era-specific framing"
+    );
+
+    harness
+        .peer_mut()
+        .send(&cx, &lifecycle_tool_request(2, !opening_is_modern))
+        .unwrap_or_else(|error| panic!("{facade}: send opposite-era tool request: {error}"));
+    let refused = lifecycle_response(harness.peer_mut(), &cx, 2, "opposite-era refusal response");
+    let error = refused
+        .error
+        .as_ref()
+        .expect("opposite-era request must receive a JSON-RPC refusal");
+    assert_eq!(
+        error.code.as_i32(),
+        Some(McpErrorCode::InvalidRequest.into())
+    );
+    assert_eq!(
+        error.message,
+        "Request does not match the connection's negotiated MCP protocol era"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "{facade}: opposite-era refusal must not mutate the handler"
+    );
+    let outcome = harness.settle("caller-owned facade era refusal");
+    assert!(
+        outcome.is_err(),
+        "{facade}: opposite-era refusal must terminate the mismatched connection"
+    );
+}
+
+fn assert_live_facade_cancellation<F>(
+    facade: &str,
+    server_name: &str,
+    opening: JsonRpcMessage,
+    opening_is_modern: bool,
+    runner: F,
+) where
+    F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
+{
+    let cx = Cx::for_testing();
+    let mut harness = LifecycleThreadHarness::spawn(&cx, runner);
+
+    assert_lifecycle_opening(
+        harness.peer_mut(),
+        &cx,
+        facade,
+        server_name,
+        opening,
+        opening_is_modern,
+    );
+    if !opening_is_modern {
+        harness
+            .peer_mut()
+            .send(
+                &cx,
+                &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+            )
+            .unwrap_or_else(|error| panic!("{facade}: send exact-2024 initialized: {error}"));
+    }
+
+    // Keep the peer open through cancellation settlement: the completed
+    // worker must have observed this exact caller Cx rather than peer EOF.
+    cx.set_cancel_requested(true);
+    assert!(
+        cx.is_cancel_requested(),
+        "{facade}: cancellation must be requested on the caller-owned Cx"
+    );
+    let deadline = Instant::now() + MEMORY_SERVER_TEARDOWN_BOUND;
+    while !harness.joins.0[0].is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "{facade}: caller-owned cancellation exceeded its bounded settlement window"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let outcome = harness.settle("caller-owned facade cancellation");
+    outcome.unwrap_or_else(|error| {
+        panic!("{facade}: cancellation of the supplied Cx must settle cleanly: {error}")
+    });
+}
+
+#[test]
+fn public_facade_servers_forward_caller_owned_structured_lifecycles() {
+    // These function-item references prove the terminal, caller-owned stdio
+    // entry point remains available from every policy-pinned facade. The
+    // returning transport checks below are the runtime proof because they can
+    // settle without terminating the test process.
+    let _ = auto::Server::run_stdio_with_cx;
+    let _ = modern::Server::run_stdio_with_cx;
+    let _ = legacy_2024::Server::run_stdio_with_cx;
+
+    let auto_calls = Arc::new(AtomicUsize::new(0));
+    let auto_handler_calls = Arc::clone(&auto_calls);
+    assert_live_facade_era_admission(
+        "Auto facade",
+        "facade-auto-lifecycle",
+        lifecycle_modern_opening(1),
+        true,
+        auto_calls,
+        move |cx, transport| {
+            auto::server_builder("facade-auto-lifecycle", "1.0.0")
+                .tool(CallerOwnedLifecycleTool {
+                    calls: auto_handler_calls,
+                })
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+    assert_live_facade_cancellation(
+        "Auto facade",
+        "facade-auto-cancellation",
+        lifecycle_modern_opening(1),
+        true,
+        |cx, transport| {
+            auto::server_builder("facade-auto-cancellation", "1.0.0")
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+
+    let modern_calls = Arc::new(AtomicUsize::new(0));
+    let modern_handler_calls = Arc::clone(&modern_calls);
+    assert_live_facade_era_admission(
+        "modern facade",
+        "facade-modern-lifecycle",
+        lifecycle_modern_opening(1),
+        true,
+        modern_calls,
+        move |cx, transport| {
+            modern::server_builder("facade-modern-lifecycle", "1.0.0")
+                .tool(CallerOwnedLifecycleTool {
+                    calls: modern_handler_calls,
+                })
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+    assert_live_facade_cancellation(
+        "modern facade",
+        "facade-modern-cancellation",
+        lifecycle_modern_opening(1),
+        true,
+        |cx, transport| {
+            modern::server_builder("facade-modern-cancellation", "1.0.0")
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+
+    let legacy_calls = Arc::new(AtomicUsize::new(0));
+    let legacy_handler_calls = Arc::clone(&legacy_calls);
+    assert_live_facade_era_admission(
+        "exact-2024 facade",
+        "facade-legacy-lifecycle",
+        lifecycle_legacy_opening(1),
+        false,
+        legacy_calls,
+        move |cx, transport| {
+            legacy_2024::server_builder("facade-legacy-lifecycle", "1.0.0")
+                .tool(CallerOwnedLifecycleTool {
+                    calls: legacy_handler_calls,
+                })
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+    assert_live_facade_cancellation(
+        "exact-2024 facade",
+        "facade-legacy-cancellation",
+        lifecycle_legacy_opening(1),
+        false,
+        |cx, transport| {
+            legacy_2024::server_builder("facade-legacy-cancellation", "1.0.0")
+                .build()
+                .run_transport_returning_with_cx(cx, transport)
+        },
+    );
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn public_facade_proxy_builders_preserve_pinned_eras() {
+    // Compile-proof every advertised proxy registration path from each public
+    // builder. The runtime checks below exercise the policy boundaries before
+    // the unbound fixture backend can be consulted.
+    let _ = auto::ServerBuilder::proxy;
+    let _ = auto::ServerBuilder::as_proxy;
+    let _ = auto::ServerBuilder::as_proxy_raw;
+    let _ = auto::ServerBuilder::proxy_typed;
+    let _ = modern::ServerBuilder::proxy;
+    let _ = modern::ServerBuilder::as_proxy;
+    let _ = modern::ServerBuilder::as_proxy_raw;
+    let _ = modern::ServerBuilder::proxy_typed;
+    let _ = legacy_2024::ServerBuilder::proxy;
+    let _ = legacy_2024::ServerBuilder::as_proxy;
+    let _ = legacy_2024::ServerBuilder::as_proxy_raw;
+    let _ = legacy_2024::ServerBuilder::proxy_typed;
+
+    let legacy_catalog = fastmcp_rust::ProxyCatalog {
+        tool_catalog_era: Some(fastmcp_rust::ProtocolEra::Legacy2024),
+        ..Default::default()
+    };
+    assert!(
+        modern::server_builder("facade-modern-proxy", "1.0.0")
+            .proxy(
+                fastmcp_rust::ProxyClient::from_backend(FacadeProxyBoundaryBackend),
+                legacy_catalog,
+            )
+            .is_err()
+    );
+
+    let final_catalog = fastmcp_rust::ProxyCatalog {
+        tool_catalog_era: Some(fastmcp_rust::ProtocolEra::Modern2026),
+        ..Default::default()
+    };
+    assert!(
+        legacy_2024::server_builder("facade-legacy-proxy", "1.0.0")
+            .proxy(
+                fastmcp_rust::ProxyClient::from_backend(FacadeProxyBoundaryBackend),
+                final_catalog,
+            )
+            .is_err()
+    );
 }
 
 // ============================================================================
@@ -847,6 +1363,7 @@ impl LegacyContentExt for LegacyContent {
 // ============================================================================
 
 const FINAL_TASKS_E2E_BOUND: Duration = Duration::from_secs(2);
+const FINAL_TASKS_HTTP_RESPONSE_MAX_BYTES: usize = 1 << 20;
 const FINAL_TASKS_SERVER_BOUND: Duration = Duration::from_secs(4);
 
 fn final_tasks_runtime_block_on<F: Future>(future: F) -> F::Output {
@@ -1364,7 +1881,228 @@ impl ToolHandler for PublicStateOnlyMrtrTool {
     }
 }
 
-struct PublicFinalTaskTool;
+fn typed_roots_input_required() -> InputRequiredResult {
+    let requests = MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())])
+        .expect("the E2E handler's typed roots request is valid");
+    let wire = serde_json::json!({
+        "resultType": "input_required",
+        "inputRequests": requests,
+        // This handler-authored value is deliberately forged. The framework
+        // must replace it with its session-bound opaque request state.
+        "requestState": "handler-forged-resource-prompt-state",
+    })
+    .to_string();
+    let (decoded, diagnostic) =
+        decode_peer_result(&wire, ResultPeerEra::Modern, &CoreResultDiscriminatorPolicy)
+            .expect("typed resource/prompt input-required result decodes");
+    assert!(diagnostic.is_none());
+    let DecodedResult::InputRequired(result) = decoded else {
+        panic!("the typed resource/prompt result remains input_required");
+    };
+    assert!(
+        result
+            .input_requests()
+            .and_then(|requests| requests.get("roots"))
+            .is_some(),
+        "the handler emits one typed roots request"
+    );
+    result
+}
+
+fn public_mrtr_result_meta() -> ResultMeta {
+    ResultMeta::server_generated(Implementation {
+        name: "public-resource-prompt-mrtr-e2e".to_owned(),
+        version: "1.0.0".to_owned(),
+        title: None,
+        description: None,
+        website_url: None,
+        icons: Vec::new(),
+        additional: BTreeMap::new(),
+    })
+}
+
+struct PublicTypedMrtrResource {
+    uri: &'static str,
+    name: &'static str,
+    initial_calls: Arc<AtomicUsize>,
+    resumed_calls: Arc<AtomicUsize>,
+    legacy_calls: Arc<AtomicUsize>,
+    input_required_after_resume: Arc<AtomicUsize>,
+}
+
+impl ResourceHandler for PublicTypedMrtrResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: self.uri.to_owned(),
+            name: self.name.to_owned(),
+            description: Some("public modern typed MRTR resource proof".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![ResourceContent {
+            uri: self.uri.to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            text: Some("exact legacy resource result".to_owned()),
+            blob: None,
+        }])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        FinalResourceReadCacheHintProvenance::Explicit
+    }
+
+    fn read_final_outcome(
+        &self,
+        _ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.initial_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(FinalMethodOutcome::InputRequired(
+            typed_roots_input_required(),
+        ))
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _uri: &'a str,
+        _params: &'a HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let Some(resume_inputs) = resume_inputs else {
+                return Outcome::Err(McpError::internal_error(
+                    "resource MRTR resume inputs were not supplied",
+                ));
+            };
+            match resume_inputs.roots("roots") {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Outcome::Err(McpError::internal_error(
+                        "resource MRTR typed roots input was not supplied",
+                    ));
+                }
+                Err(error) => return Outcome::Err(error),
+            }
+            self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .input_required_after_resume
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Outcome::Ok(FinalMethodOutcome::InputRequired(
+                    typed_roots_input_required(),
+                ));
+            }
+            Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+                FinalReadResourceResult {
+                    contents: Vec::new(),
+                    ttl_ms: CacheTtl::milliseconds(17),
+                    cache_scope: CacheScope::Private,
+                },
+                public_mrtr_result_meta(),
+            )))
+        })
+    }
+}
+
+struct PublicTypedMrtrPrompt {
+    initial_calls: Arc<AtomicUsize>,
+    resumed_calls: Arc<AtomicUsize>,
+    legacy_calls: Arc<AtomicUsize>,
+}
+
+impl PromptHandler for PublicTypedMrtrPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: "public-typed-mrtr-prompt".to_owned(),
+            description: Some("public modern typed MRTR prompt proof".to_owned()),
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![PromptMessage {
+            role: Role::Assistant,
+            content: Content::text("exact legacy prompt result"),
+        }])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn get_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        self.initial_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(FinalMethodOutcome::InputRequired(
+            typed_roots_input_required(),
+        ))
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        _ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _arguments: HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            let Some(resume_inputs) = resume_inputs else {
+                return Outcome::Err(McpError::internal_error(
+                    "prompt MRTR resume inputs were not supplied",
+                ));
+            };
+            match resume_inputs.roots("roots") {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Outcome::Err(McpError::internal_error(
+                        "prompt MRTR typed roots input was not supplied",
+                    ));
+                }
+                Err(error) => return Outcome::Err(error),
+            }
+            self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+            Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+                FinalGetPromptResult {
+                    description: Some("exact final prompt result".to_owned()),
+                    messages: vec![FinalPromptMessage {
+                        role: Role::Assistant,
+                        content: ContentBlock::text("exact final prompt content"),
+                    }],
+                },
+                public_mrtr_result_meta(),
+            )))
+        })
+    }
+}
+
+struct PublicFinalTaskTool {
+    calls: Arc<AtomicUsize>,
+}
 
 impl ToolHandler for PublicFinalTaskTool {
     fn definition(&self) -> Tool {
@@ -1393,6 +2131,7 @@ impl ToolHandler for PublicFinalTaskTool {
         _ctx: &McpContext,
         _arguments: serde_json::Value,
     ) -> McpResult<FinalToolOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(FinalToolOutcome::CreateTask {
             work_descriptor: FinalTaskWorkDescriptor::new(json!({
                 "operation": "public-final-task-e2e",
@@ -1402,11 +2141,170 @@ impl ToolHandler for PublicFinalTaskTool {
     }
 }
 
+fn final_tasks_native_http_post(
+    address: SocketAddr,
+    mcp_name: &str,
+    body: &serde_json::Value,
+) -> (u16, Option<serde_json::Value>) {
+    let body = serde_json::to_vec(body).expect("final Tasks native HTTP request serializes");
+    let mut stream = std::net::TcpStream::connect_timeout(&address, FINAL_TASKS_E2E_BOUND)
+        .expect("native final Tasks probe connects to the facade listener");
+    stream
+        .set_read_timeout(Some(FINAL_TASKS_E2E_BOUND))
+        .expect("native final Tasks probe read deadline configures");
+    stream
+        .set_write_timeout(Some(FINAL_TASKS_E2E_BOUND))
+        .expect("native final Tasks probe write deadline configures");
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {mcp_name}\r\nContent-Length: {}\r\n\r\n",
+        modern::PROTOCOL_VERSION,
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.write_all(&body))
+        .expect("native final Tasks probe commits one bounded request");
+
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .expect("native final Tasks probe reads within its configured deadline");
+        if read == 0 {
+            break;
+        }
+        assert!(
+            response
+                .len()
+                .checked_add(read)
+                .is_some_and(|size| size <= FINAL_TASKS_HTTP_RESPONSE_MAX_BYTES),
+            "native final Tasks response exceeds its bounded response budget"
+        );
+        response.extend_from_slice(&buffer[..read]);
+    }
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("native final Tasks response has complete headers");
+    let headers = std::str::from_utf8(&response[..header_end])
+        .expect("native final Tasks response headers are ASCII");
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .expect("native final Tasks response has a status")
+        .parse::<u16>()
+        .expect("native final Tasks response status is numeric");
+    let mut content_length = None;
+    let mut chunked = false;
+    for header in headers.lines().skip(1) {
+        let (name, value) = header
+            .split_once(':')
+            .expect("native final Tasks response header has a field delimiter");
+        if name.eq_ignore_ascii_case("content-length") {
+            assert!(
+                content_length.is_none(),
+                "native final Tasks response has one Content-Length field"
+            );
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("native final Tasks response Content-Length is valid"),
+            );
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
+    }
+    let body = &response[header_end + 4..];
+    let body = if chunked {
+        assert!(
+            content_length.is_none(),
+            "chunked native final Tasks response does not carry Content-Length"
+        );
+        final_tasks_chunked_response_body(body)
+    } else {
+        let content_length = content_length
+            .expect("native final Tasks response uses Content-Length or chunked framing");
+        assert_eq!(
+            body.len(),
+            content_length,
+            "native final Tasks response body is complete"
+        );
+        body.to_vec()
+    };
+    let json = (!body.is_empty())
+        .then(|| serde_json::from_slice(&body).expect("native final Tasks JSON response parses"));
+    (status, json)
+}
+
+fn final_tasks_chunked_response_body(body: &[u8]) -> Vec<u8> {
+    let mut cursor = 0;
+    let mut decoded = Vec::new();
+    loop {
+        let size_end = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|offset| cursor + offset)
+            .expect("chunked final Tasks response has a complete chunk-size line");
+        let size_line = std::str::from_utf8(&body[cursor..size_end])
+            .expect("chunked final Tasks chunk size is ASCII");
+        let size = usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+            .expect("chunked final Tasks chunk size is hexadecimal");
+        cursor = size_end + 2;
+        if size == 0 {
+            loop {
+                let trailer_end = body[cursor..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                    .map(|offset| cursor + offset)
+                    .expect("chunked final Tasks response has a complete trailer line");
+                let trailer = &body[cursor..trailer_end];
+                cursor = trailer_end + 2;
+                if trailer.is_empty() {
+                    assert_eq!(
+                        cursor,
+                        body.len(),
+                        "chunked final Tasks response has no bytes after trailers"
+                    );
+                    return decoded;
+                }
+                assert!(
+                    trailer.contains(&b':'),
+                    "chunked final Tasks trailer has an HTTP field delimiter"
+                );
+            }
+        }
+        let chunk_end = cursor
+            .checked_add(size)
+            .expect("chunked final Tasks chunk length does not overflow");
+        assert!(
+            chunk_end.checked_add(2).is_some_and(|terminator_end| {
+                terminator_end <= body.len() && &body[chunk_end..terminator_end] == b"\r\n"
+            }),
+            "chunked final Tasks response has a complete chunk body and terminator"
+        );
+        decoded.extend_from_slice(&body[cursor..chunk_end]);
+        cursor = chunk_end + 2;
+    }
+}
+
 #[test]
 fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
-    let runtime = FinalTaskRuntime::in_memory(
+    let store = Arc::new(InMemoryFinalTaskStore::new(8).expect("bounded public final Task store"));
+    let delivered_notifications = Arc::new(AtomicUsize::new(0));
+    let notification_counter = Arc::clone(&delivered_notifications);
+    let runtime = FinalTaskRuntime::new(
+        store.clone(),
         FinalTaskRuntimeConfig::new(60_000, Some(1_000)).expect("finite final Tasks policy"),
-        Arc::new(|_| {}),
+        Arc::new(move |_| {
+            notification_counter.fetch_add(1, Ordering::SeqCst);
+        }),
     );
     let (input_required_tx, input_required_rx) = mpsc::sync_channel(1);
     let (cancelled_tx, cancelled_rx) = mpsc::sync_channel(1);
@@ -1420,13 +2318,84 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         )
         .expect("application-owned final Task service installs");
 
+    let task_handler_calls = Arc::new(AtomicUsize::new(0));
     let server = auto::server_builder("final-tasks-e2e", "1.0.0")
-        .tool(PublicFinalTaskTool)
+        .tool(PublicFinalTaskTool {
+            calls: Arc::clone(&task_handler_calls),
+        })
         .final_tasks(runtime.clone())
         .expect("official final Tasks extension installs through the public facade")
         .build();
     let fixture = FinalTasksHttpFixture::spawn(server, runner);
     let cx = Cx::for_request();
+    let admitted_request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                },
+            },
+            "name": "public-final-task",
+            "arguments": {},
+        },
+    });
+    let mut missing_capability = admitted_request.clone();
+    missing_capability["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] = json!({});
+    let (status, missing_capability_response) =
+        final_tasks_native_http_post(fixture.address, "public-final-task", &missing_capability);
+    assert_eq!(
+        status, 400,
+        "the native HTTP boundary maps missing Tasks capability to its canonical refusal"
+    );
+    assert!(
+        missing_capability_response
+            .as_ref()
+            .and_then(|response| response.get("error"))
+            .is_some(),
+        "changing only the Tasks capability rejects task creation"
+    );
+    assert_eq!(
+        task_handler_calls.load(Ordering::SeqCst),
+        0,
+        "missing Tasks capability rejects before the task-capable handler"
+    );
+    assert_eq!(
+        store.task_count(),
+        0,
+        "rejected capability preserves the task store"
+    );
+    assert_eq!(
+        delivered_notifications.load(Ordering::SeqCst),
+        0,
+        "rejected capability emits no task notification"
+    );
+
+    let (status, _) =
+        final_tasks_native_http_post(fixture.address, "other-task", &admitted_request);
+    assert_eq!(
+        status, 400,
+        "changing only Mcp-Name rejects before final dispatch"
+    );
+    assert_eq!(
+        task_handler_calls.load(Ordering::SeqCst),
+        0,
+        "Mcp-Name rejection does not invoke the task-capable handler"
+    );
+    assert_eq!(
+        store.task_count(),
+        0,
+        "Mcp-Name rejection preserves the task store"
+    );
+    assert_eq!(
+        delivered_notifications.load(Ordering::SeqCst),
+        0,
+        "Mcp-Name rejection emits no task notification"
+    );
+
     let modern_builder = auto::client_builder()
         .client_info("final-tasks-e2e-client", "1.0.0")
         .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly));
@@ -1450,6 +2419,7 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
     };
     let task_id = created.task.base().task_id.clone();
     assert!(matches!(created.task, FinalTask::Working(_)));
+    assert_eq!(task_handler_calls.load(Ordering::SeqCst), 1);
 
     input_required_rx
         .recv_timeout(FINAL_TASKS_E2E_BOUND)
@@ -1466,6 +2436,35 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         FinalTask::InputRequired { .. }
     ));
 
+    let modern_endpoint = CanonicalHttpUrl::parse(&format!("http://{}/mcp", fixture.address))
+        .expect("public modern final Tasks endpoint is canonical");
+    let mut task_watcher_client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        modern::client_builder()
+            .client_info("final-tasks-watch-client", "1.0.0")
+            .connect_http_with_cx(modern_endpoint, &cx),
+    )
+    .expect("modern facade connects to the real final Tasks listener");
+    let mut task_handle = final_tasks_runtime_block_on_bounded(
+        &cx,
+        task_watcher_client.attach_final_task(&cx, task_id.clone()),
+    )
+    .expect("modern facade attaches the exact input-required task");
+    let mut task_watch = final_tasks_runtime_block_on_bounded(
+        &cx,
+        task_watcher_client.watch_final_task(
+            &cx,
+            &mut task_handle,
+            SseLimits::new(1_024, 8_192, 16).expect("bounded final Tasks SSE limits"),
+        ),
+    )
+    .expect("modern facade opens one live task subscription");
+    assert!(matches!(
+        final_tasks_runtime_block_on_bounded(&cx, task_watch.next_event(&cx))
+            .expect("live task subscription acknowledgement is admitted"),
+        Some(FinalTaskWatchEvent::Acknowledged { .. })
+    ));
+
     let responses: FinalTaskInputResponses =
         serde_json::from_value(json!({"roots": {"roots": []}}))
             .expect("the public final roots response is typed");
@@ -1480,6 +2479,14 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         ),
     )
     .expect("official tasks/update accepts matching typed input");
+    let task_notification = final_tasks_runtime_block_on_bounded(&cx, task_watch.next_event(&cx))
+        .expect("live task subscription observes the post-update status");
+    assert!(matches!(
+        task_notification,
+        Some(FinalTaskWatchEvent::TaskUpdated(ref notification))
+            if matches!(&notification.params.task, FinalTask::Working(_))
+    ));
+    drop(task_watch);
     let resumed = final_tasks_runtime_block_on_bounded(
         &cx,
         modern
@@ -1526,7 +2533,212 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
         ClientHttpConnectionError::FinalTasksRequiresModern { .. }
     ));
 
+    drop(legacy);
+    drop(modern);
+    drop(task_handle);
+    drop(task_watcher_client);
     fixture.shutdown();
+}
+
+struct HoldingInitialTaskSupervisor;
+
+impl ApplicationTaskSupervisor for HoldingInitialTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            // Keep the first server's claim live until its caller-owned
+            // service context is cancelled. The runner then returns the
+            // durable work to the retained store for the reconstructed server.
+            let _handoff = handoff;
+            loop {
+                cx.checkpoint()
+                    .map_err(|error| McpError::internal_error(error.to_string()))?;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+        })
+    }
+}
+
+#[test]
+fn workflow_final_tasks_public_facade_rebuild_recovers_retained_work() {
+    let store = Arc::new(InMemoryFinalTaskStore::new(8).expect("bounded retained task store"));
+    let policy = FinalTaskRuntimeConfig::new(60_000, Some(1_000))
+        .expect("finite retained final Tasks policy");
+    let first_runtime = FinalTaskRuntime::new(store.clone(), policy.clone(), Arc::new(|_| {}));
+    let first_runner = first_runtime
+        .install_task_service(1, Arc::new(HoldingInitialTaskSupervisor))
+        .expect("first caller-owned service installs");
+    let first_server = auto::server_builder("final-tasks-rebuild-a", "1.0.0")
+        .tool(PublicFinalTaskTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .final_tasks(first_runtime)
+        .expect("first public facade server installs final Tasks")
+        .build();
+    let first_fixture = FinalTasksHttpFixture::spawn(first_server, first_runner);
+    let cx = Cx::for_request();
+    let first_client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("final-tasks-rebuild-client", "1.0.0")
+            .protocol_plan(first_fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("first public facade client discovers final Tasks");
+    let created = final_tasks_runtime_block_on_bounded(
+        &cx,
+        first_client.connection().call_tool_final_outcome(
+            &cx,
+            RequestId::Number(2),
+            "public-final-task",
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("first facade server durably creates the task before caller-owned service shutdown");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!("first public facade call returns the final Task branch");
+    };
+    let task_id = created.task.base().task_id.clone();
+    assert_eq!(
+        store.task_count(),
+        1,
+        "the retained application store owns the task"
+    );
+    drop(first_client);
+    first_fixture.shutdown();
+
+    let (input_required_tx, input_required_rx) = mpsc::sync_channel(1);
+    let (cancelled_tx, _cancelled_rx) = mpsc::sync_channel(1);
+    let recovered_runtime = FinalTaskRuntime::new(store.clone(), policy, Arc::new(|_| {}));
+    let recovered_runner = recovered_runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                input_required: input_required_tx,
+                cancelled: cancelled_tx,
+            }),
+        )
+        .expect("reconstructed caller-owned service installs");
+    let recovered_server = auto::server_builder("final-tasks-rebuild-b", "1.0.0")
+        .tool(PublicFinalTaskTool {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+        .final_tasks(recovered_runtime)
+        .expect("reconstructed public facade server installs final Tasks")
+        .build();
+    let recovered_fixture = FinalTasksHttpFixture::spawn(recovered_server, recovered_runner);
+    input_required_rx
+        .recv_timeout(FINAL_TASKS_E2E_BOUND)
+        .expect("reconstructed service recovers the retained initial work");
+    let recovered_client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("final-tasks-rebuild-client", "1.0.0")
+            .protocol_plan(recovered_fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("reconstructed public facade client discovers final Tasks");
+    let recovered = final_tasks_runtime_block_on_bounded(
+        &cx,
+        recovered_client
+            .connection()
+            .get_task_final(&cx, RequestId::Number(4), task_id, 1 << 20),
+    )
+    .expect("reconstructed public facade server reads the retained task");
+    assert!(matches!(recovered.task, FinalTask::InputRequired { .. }));
+    assert_eq!(
+        store.task_count(),
+        1,
+        "reconstructed server preserves the one retained task without duplication"
+    );
+    drop(recovered_client);
+    recovered_fixture.shutdown();
+}
+
+struct LegacyTasksIsolationTool {
+    calls: Arc<AtomicUsize>,
+}
+
+impl ToolHandler for LegacyTasksIsolationTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "legacy-task-isolation-tool".to_owned(),
+            description: Some("proves exact legacy Tasks isolation".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![Content::text("exact legacy tool")])
+    }
+}
+
+#[test]
+fn workflow_exact_legacy_facade_rejects_final_tasks_without_mutation() {
+    let cx = Cx::for_testing();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let mut harness = LifecycleThreadHarness::spawn(&cx, move |cx, transport| {
+        legacy_2024::server_builder("legacy-tasks-isolation", "1.0.0")
+            .tool(LegacyTasksIsolationTool {
+                calls: handler_calls,
+            })
+            .build()
+            .run_transport_returning_with_cx(cx, transport)
+    });
+    assert_lifecycle_opening(
+        harness.peer_mut(),
+        &cx,
+        "exact legacy Tasks isolation",
+        "legacy-tasks-isolation",
+        lifecycle_legacy_opening(1),
+        false,
+    );
+    harness
+        .peer_mut()
+        .send(
+            &cx,
+            &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+        )
+        .expect("send exact-2024 initialized before the legacy Tasks rejection");
+    harness
+        .peer_mut()
+        .send(
+            &cx,
+            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                "tasks/get",
+                Some(json!({"taskId": "legacy-forbidden-task"})),
+                2_i64,
+            )),
+        )
+        .expect("send the exact final Tasks RPC to the legacy facade server");
+    let response = lifecycle_response(harness.peer_mut(), &cx, 2, "legacy Tasks refusal");
+    let error = response
+        .error
+        .expect("exact legacy Tasks RPC must receive a refusal");
+    assert_eq!(
+        error.code.as_i32(),
+        Some(McpErrorCode::MethodNotFound.into())
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "exact legacy Tasks rejection does not reach an application handler"
+    );
+    harness.peer.take();
+    harness
+        .settle("exact legacy Tasks isolation")
+        .expect("exact legacy server settles after the peer closes");
 }
 
 #[test]
@@ -1659,6 +2871,368 @@ fn workflow_public_http_state_only_mrtr_rejects_explicit_empty_without_consuming
     assert_eq!(initial_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(resumed_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
 
+    fixture.shutdown();
+}
+
+#[test]
+fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds() {
+    let runtime = FinalTaskRuntime::in_memory(
+        FinalTaskRuntimeConfig::new(60_000, Some(1_000)).expect("finite fixture task policy"),
+        Arc::new(|_| {}),
+    );
+    let (input_required, _input_required_observer) = mpsc::sync_channel::<()>(1);
+    let (cancelled, _cancelled_observer) = mpsc::sync_channel::<()>(1);
+    let runner = runtime
+        .install_task_service(
+            1,
+            Arc::new(E2eFinalTaskSupervisor {
+                input_required,
+                cancelled,
+            }),
+        )
+        .expect("bounded fixture service installs");
+
+    let resource_initial = Arc::new(AtomicUsize::new(0));
+    let resource_resumed = Arc::new(AtomicUsize::new(0));
+    let resource_legacy = Arc::new(AtomicUsize::new(0));
+    let round_initial = Arc::new(AtomicUsize::new(0));
+    let round_resumed = Arc::new(AtomicUsize::new(0));
+    let prompt_initial = Arc::new(AtomicUsize::new(0));
+    let prompt_resumed = Arc::new(AtomicUsize::new(0));
+    let prompt_legacy = Arc::new(AtomicUsize::new(0));
+    let server = auto::server_builder("public-resource-prompt-mrtr", "1.0.0")
+        .resource(PublicTypedMrtrResource {
+            uri: "file:///public-typed-mrtr-resource",
+            name: "public-typed-mrtr-resource",
+            initial_calls: Arc::clone(&resource_initial),
+            resumed_calls: Arc::clone(&resource_resumed),
+            legacy_calls: Arc::clone(&resource_legacy),
+            input_required_after_resume: Arc::new(AtomicUsize::new(0)),
+        })
+        .resource(PublicTypedMrtrResource {
+            uri: "file:///public-round-bound-mrtr-resource",
+            name: "public-round-bound-mrtr-resource",
+            initial_calls: Arc::clone(&round_initial),
+            resumed_calls: Arc::clone(&round_resumed),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            input_required_after_resume: Arc::new(AtomicUsize::new(MAX_MRTR_CONTINUATION_ROUNDS)),
+        })
+        .prompt(PublicTypedMrtrPrompt {
+            initial_calls: Arc::clone(&prompt_initial),
+            resumed_calls: Arc::clone(&prompt_resumed),
+            legacy_calls: Arc::clone(&prompt_legacy),
+        })
+        .build();
+    let fixture = FinalTasksHttpFixture::spawn(server, runner);
+    let cx = Cx::for_request();
+    let mut client = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("public-resource-prompt-mrtr-client", "1.0.0")
+            .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("public HTTP client selects the live modern server");
+
+    let resource_initial_result = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({"uri": "file:///public-typed-mrtr-resource"}),
+        ),
+    )
+    .expect("modern resource handler emits typed input_required");
+    let CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }) =
+        resource_initial_result
+    else {
+        panic!("public resource result remains a typed input_required result");
+    };
+    let resource_state = result
+        .request_state()
+        .expect("framework issues public resource retry state")
+        .to_owned();
+    assert_ne!(resource_state, "handler-forged-resource-prompt-state");
+    assert!(
+        result
+            .input_requests()
+            .and_then(|requests| requests.get("roots"))
+            .is_some(),
+        "public resource input_required retains the typed roots descriptor"
+    );
+
+    let bad_resource_state = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({
+                "uri": "file:///public-typed-mrtr-resource",
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": format!("{resource_state}-bad"),
+            }),
+        ),
+    )
+    .expect_err("changing only resource requestState rejects without consuming the exchange");
+    let auto::HttpClientError::CoreResult(bad_resource_state) = bad_resource_state else {
+        panic!("resource requestState rejection remains a public core error");
+    };
+    assert_eq!(bad_resource_state.code, McpErrorCode::InvalidParams);
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 0);
+
+    let resource_complete = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({
+                "uri": "file:///public-typed-mrtr-resource",
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": resource_state,
+            }),
+        ),
+    )
+    .expect("same-session resource retry consumes the retained typed exchange");
+    let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = resource_complete else {
+        panic!("resource continuation returns FinalReadResourceResult");
+    };
+    let FinalReadResourceResult {
+        contents,
+        ttl_ms,
+        cache_scope,
+    } = result.payload;
+    assert!(contents.is_empty());
+    assert_eq!(ttl_ms, CacheTtl::milliseconds(17));
+    assert_eq!(cache_scope, CacheScope::Private);
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 1);
+    assert_eq!(resource_legacy.load(Ordering::SeqCst), 0);
+
+    let prompt_initial_result = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "prompts/get",
+            json!({"name": "public-typed-mrtr-prompt", "arguments": {}}),
+        ),
+    )
+    .expect("modern prompt handler emits typed input_required");
+    let CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) =
+        prompt_initial_result
+    else {
+        panic!("public prompt result remains a typed input_required result");
+    };
+    let prompt_state = result
+        .request_state()
+        .expect("framework issues public prompt retry state")
+        .to_owned();
+
+    let bad_prompt_inputs = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "prompts/get",
+            json!({
+                "name": "public-typed-mrtr-prompt",
+                "arguments": {},
+                "inputResponses": {"not-roots": {"roots": []}},
+                "requestState": prompt_state,
+            }),
+        ),
+    )
+    .expect_err("changing only prompt inputResponses rejects without consuming the exchange");
+    let auto::HttpClientError::CoreResult(bad_prompt_inputs) = bad_prompt_inputs else {
+        panic!("prompt inputResponses rejection remains a public core error");
+    };
+    assert_eq!(bad_prompt_inputs.code, McpErrorCode::InvalidParams);
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 0);
+
+    let prompt_complete = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "prompts/get",
+            json!({
+                "name": "public-typed-mrtr-prompt",
+                "arguments": {},
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": prompt_state,
+            }),
+        ),
+    )
+    .expect("same-session prompt retry consumes the retained typed exchange");
+    let CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) = prompt_complete else {
+        panic!("prompt continuation returns FinalGetPromptResult");
+    };
+    let FinalGetPromptResult {
+        description,
+        messages,
+    } = result.payload;
+    assert_eq!(description.as_deref(), Some("exact final prompt result"));
+    assert!(matches!(
+        messages.as_slice(),
+        [FinalPromptMessage {
+            role: Role::Assistant,
+            content: ContentBlock::Text { text, .. },
+        }] if text == "exact final prompt content"
+    ));
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_legacy.load(Ordering::SeqCst), 0);
+
+    let mut oversized_state = None;
+    let oversized = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.read_resource_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "file:///public-typed-mrtr-resource",
+            SseLimits::new(1_024, 8_192, 8).expect("bounded resource MRTR SSE limits"),
+            1 << 20,
+            |input_required| {
+                oversized_state = input_required.request_state().map(str::to_owned);
+                Ok((0..=MAX_MRTR_INPUT_RESPONSES)
+                    .map(|index| (format!("roots-{index}"), json!({"roots": []})))
+                    .collect())
+            },
+        ),
+    )
+    .expect_err("shared client input-response bound rejects before a retry POST");
+    assert!(
+        oversized
+            .to_string()
+            .contains("inputResponses must not exceed")
+    );
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 2);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 1);
+    let oversized_state = oversized_state.expect("bounded input rejection retains issued state");
+
+    let retained_after_input_bound = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "resources/read",
+            json!({
+                "uri": "file:///public-typed-mrtr-resource",
+                "inputResponses": {"roots": {"roots": []}},
+                "requestState": oversized_state,
+            }),
+        ),
+    )
+    .expect("input-bound rejection preserves the issued resource exchange");
+    assert!(matches!(
+        retained_after_input_bound,
+        CoreResult::Final(FinalCoreResult::ResourcesRead { .. })
+    ));
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 2);
+
+    let mut round_callbacks = 0;
+    let round_bound = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.read_resource_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "file:///public-round-bound-mrtr-resource",
+            SseLimits::new(1_024, 8_192, 8).expect("bounded round-limit SSE limits"),
+            1 << 20,
+            |_| {
+                round_callbacks += 1;
+                Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))]))
+            },
+        ),
+    )
+    .expect_err("shared client round bound stops before a fifth response callback");
+    assert!(
+        round_bound
+            .to_string()
+            .contains("continuation-round limit exceeded")
+    );
+    assert_eq!(round_callbacks, MAX_MRTR_CONTINUATION_ROUNDS);
+    assert_eq!(round_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        round_resumed.load(Ordering::SeqCst),
+        MAX_MRTR_CONTINUATION_ROUNDS,
+        "the shared driver never dispatches a fifth continuation"
+    );
+
+    let cancelled_cx = Cx::for_request();
+    cancelled_cx.set_cancel_requested(true);
+    let cancelled = final_tasks_runtime_block_on_bounded(
+        &cx,
+        client.get_prompt_with_mrtr_retry(
+            &cancelled_cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "public-typed-mrtr-prompt",
+            HashMap::new(),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded cancellation SSE limits"),
+            1 << 20,
+            |_| Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))])),
+        ),
+    )
+    .expect_err("a cancelled caller context cannot dispatch more prompt MRTR work");
+    assert!(cancelled.to_string().contains("cancel"));
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 1);
+
+    let mut legacy = final_tasks_runtime_block_on_bounded(
+        &cx,
+        auto::client_builder()
+            .client_info("public-resource-prompt-mrtr-legacy-client", "1.0.0")
+            .protocol_plan(fixture.plan(ProtocolPolicy::LegacyOnly))
+            .connect_http_client_with_cx(&cx),
+    )
+    .expect("the fixture retains its exact legacy HTTP route");
+    let legacy_resource = final_tasks_runtime_block_on_bounded(
+        &cx,
+        legacy.read_resource_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "file:///public-typed-mrtr-resource",
+            SseLimits::new(1_024, 8_192, 8).expect("bounded legacy resource SSE limits"),
+            1 << 20,
+            |_| Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))])),
+        ),
+    )
+    .expect_err("exact legacy selection rejects public resource MRTR before dispatch");
+    assert!(matches!(
+        legacy_resource,
+        auto::HttpClientError::Connection(ClientHttpConnectionError::MrtrRequiresModern)
+    ));
+    let legacy_prompt = final_tasks_runtime_block_on_bounded(
+        &cx,
+        legacy.get_prompt_with_mrtr_retry(
+            &cx,
+            Instant::now() + FINAL_TASKS_E2E_BOUND,
+            "public-typed-mrtr-prompt",
+            HashMap::new(),
+            SseLimits::new(1_024, 8_192, 8).expect("bounded legacy prompt SSE limits"),
+            1 << 20,
+            |_| Ok(BTreeMap::from([("roots".to_owned(), json!({"roots": []}))])),
+        ),
+    )
+    .expect_err("exact legacy selection rejects public prompt MRTR before dispatch");
+    assert!(matches!(
+        legacy_prompt,
+        auto::HttpClientError::Connection(ClientHttpConnectionError::MrtrRequiresModern)
+    ));
+    assert_eq!(
+        resource_legacy.load(Ordering::SeqCst),
+        0,
+        "exact legacy resource MRTR rejection must not enter the legacy resource handler"
+    );
+    assert_eq!(
+        prompt_legacy.load(Ordering::SeqCst),
+        0,
+        "exact legacy prompt MRTR rejection must not enter the legacy prompt handler"
+    );
+    assert_eq!(resource_initial.load(Ordering::SeqCst), 2);
+    assert_eq!(resource_resumed.load(Ordering::SeqCst), 2);
+    assert_eq!(prompt_initial.load(Ordering::SeqCst), 1);
+    assert_eq!(prompt_resumed.load(Ordering::SeqCst), 1);
+
+    drop(legacy);
     fixture.shutdown();
 }
 

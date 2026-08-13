@@ -277,18 +277,19 @@ pub mod server {
         ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
         FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
-        FinalResourceReadCacheHintProvenance, FinalToolOutcome, FinalToolSchemaAuthority,
-        HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement,
-        InboundRequestContext, InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware,
-        MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
-        ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
-        ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
-        ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
-        ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier,
-        StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler,
-        TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender, caching, create_context_with_progress,
-        create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting, transform,
+        FinalResourceReadCacheHintProvenance, FinalSampling, FinalSamplingContextExt,
+        FinalToolOutcome, FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig,
+        HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport,
+        LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision, MountResult,
+        NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler,
+        RequestSender, ResourceHandler, Router, ServerExtensionConfigurationError,
+        ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
+        ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse,
+        ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
+        TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
+        TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, caching,
+        create_context_with_progress, create_context_with_progress_and_senders, oauth, oidc,
+        providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
@@ -408,6 +409,10 @@ pub use fastmcp_protocol::{
     McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
 };
 
+/// Bounded public-JWKS and external-signer primitives for the opt-in OIDC
+/// server profile. These APIs intentionally contain no private key material.
+#[cfg(feature = "builtin-auth-server")]
+pub use fastmcp_protocol::jose;
 pub use fastmcp_protocol::{
     MAX_URI_TEMPLATE_BYTES, MAX_URI_TEMPLATE_COMPOSITE_ITEMS,
     MAX_URI_TEMPLATE_EXPANSION_OUTPUT_BYTES, MAX_URI_TEMPLATE_EXPRESSIONS, MAX_URI_TEMPLATE_PARTS,
@@ -652,12 +657,12 @@ pub use fastmcp_transport::{event_store, http, memory};
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
     BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
-    FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
-    FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
-    HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, Middleware,
-    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
-    ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
-    ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
+    FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalSampling,
+    FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority, HttpNonquiescentShutdown,
+    HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext,
+    InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
+    PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
+    Router, ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
     ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
     StaticTokenVerifier, StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier,
     ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
@@ -824,11 +829,11 @@ pub mod auto {
     pub use fastmcp_protocol::schema;
     pub use fastmcp_protocol::schema::FINAL_JSON_SCHEMA_DIALECT;
     pub use fastmcp_protocol::{
-        AdmittedSchema, ClientCapabilities, ClientInfo, FinalCallToolResult, FinalCoreResultType,
-        FinalGetPromptResult, FinalReadResourceResult, JsonRpcRequest, JsonRpcResponse, RequestId,
-        ReversibleResourceTemplate, SchemaAdmissionError, TemplateValue, TemplateValues,
-        UriTemplate, UriTemplateError, UriTemplateExpansionLimits, ValidationError,
-        ValidationResult, admit_final_schema, validate_final_core_result,
+        AdmittedSchema, ClientCapabilities, ClientInfo, CoreResult, FinalCallToolResult,
+        FinalCoreResultType, FinalGetPromptResult, FinalReadResourceResult, JsonRpcRequest,
+        JsonRpcResponse, RequestId, ReversibleResourceTemplate, SchemaAdmissionError,
+        TemplateValue, TemplateValues, UriTemplate, UriTemplateError, UriTemplateExpansionLimits,
+        ValidationError, ValidationResult, admit_final_schema, validate_final_core_result,
     };
     pub use fastmcp_transport::Transport;
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -908,6 +913,96 @@ pub mod auto {
             IO: Send + 'static,
         {
             self.inner.request_with_raw_result(cx, method, params).await
+        }
+
+        /// Completes through the era selected by Auto negotiation.
+        ///
+        /// The returned tagged result preserves whether the fresh transport
+        /// selected MCP 2026-07-28 or exact MCP 2024-11-05; callers must not
+        /// project it to a final-only completion type.
+        pub async fn complete(
+            &mut self,
+            cx: &Cx,
+            params: crate::FinalCompletionParams,
+        ) -> McpResult<CoreResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.complete(cx, params).await
+        }
+
+        /// Sends one generic final extension request after bilateral
+        /// discovery admission. Auto sessions selected to exact 2024 reject
+        /// before allocating an ID or writing a frame.
+        pub async fn request_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<JsonValue>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .request_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+        /// Reads a resource through an Auto-selected modern WebSocket session,
+        /// following bounded MRTR continuations to its typed terminal result.
+        ///
+        /// An Auto connection frozen to exact 2024-11-05 rejects before a
+        /// continuation is sent because that era has no final MRTR surface.
+        pub async fn read_resource_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            uri: &str,
+            respond: F,
+        ) -> McpResult<crate::FinalReadResourceResult>
+        where
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<crate::MrtrInputResponses>,
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .read_resource_with_mrtr_retry(cx, deadline, uri, respond)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. } => {
+                    Ok(result.payload)
+                }
+                _ => Err(McpError::internal_error(
+                    "Auto WebSocket MRTR resources/read received a non-terminal result",
+                )),
+            }
+        }
+
+        /// Gets a prompt through an Auto-selected modern WebSocket session,
+        /// following bounded MRTR continuations to its typed terminal result.
+        pub async fn get_prompt_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            respond: F,
+        ) -> McpResult<crate::FinalGetPromptResult>
+        where
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<crate::MrtrInputResponses>,
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .get_prompt_with_mrtr_retry(cx, deadline, name, arguments, respond)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. } => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Auto WebSocket MRTR prompts/get received a non-terminal result",
+                )),
+            }
         }
     }
 
@@ -1288,11 +1383,61 @@ pub mod auto {
             }
         }
 
+        /// Installs the configured OAuth authorization, token, and revocation
+        /// routes on the native HTTP listener.
+        ///
+        /// This forwards only OAuth route configuration; it makes no OIDC or
+        /// JWKS capability claim.
+        #[must_use]
+        pub fn oauth_http_routes(self, routes: crate::oauth::OAuthHttpRoutes) -> Self {
+            Self {
+                inner: self.inner.oauth_http_routes(routes),
+            }
+        }
+
         #[must_use]
         pub fn middleware<M: crate::Middleware + 'static>(self, middleware: M) -> Self {
             Self {
                 inner: self.inner.middleware(middleware),
             }
+        }
+
+        /// Registers an already-admitted proxy catalog without changing Auto admission.
+        #[cfg(feature = "proxy")]
+        pub fn proxy(
+            self,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyCatalog,
+        ) -> McpResult<Self> {
+            self.inner
+                .proxy(client, catalog)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers a prefixed proxy from an Auto-selected upstream client.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy(self, prefix: &str, client: fastmcp_client::Client) -> McpResult<Self> {
+            self.inner
+                .as_proxy(prefix, client)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers an unprefixed proxy from an Auto-selected upstream client.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy_raw(self, client: fastmcp_client::Client) -> McpResult<Self> {
+            self.inner.as_proxy_raw(client).map(|inner| Self { inner })
+        }
+
+        /// Registers one typed proxy catalog while retaining Auto's selected-era routing.
+        #[cfg(feature = "proxy")]
+        pub fn proxy_typed(
+            self,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyTypedCatalog,
+        ) -> McpResult<Self> {
+            self.inner
+                .proxy_typed(client, catalog)
+                .map(|inner| Self { inner })
         }
 
         #[cfg(feature = "apps")]
@@ -1554,6 +1699,27 @@ pub mod auto {
 
         pub fn run_stdio(self) -> ! {
             self.inner.run_stdio()
+        }
+
+        /// Runs this Auto server over stdio on the supplied caller-owned context.
+        ///
+        /// The facade does not create a runtime or detach the stdio pump; the
+        /// provided context remains the owner of cancellation and structured
+        /// shutdown.
+        pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+            self.inner.run_stdio_with_cx(cx).await
+        }
+
+        /// Runs this Auto server on a caller-owned transport until it closes.
+        ///
+        /// Unlike [`Self::run_stdio_with_cx`], this returning lifecycle does
+        /// not terminate the process, so embedding applications retain
+        /// structured shutdown and error handling.
+        pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
+        where
+            T: crate::Transport + Send + 'static,
+        {
+            self.inner.run_transport_returning_with_cx(cx, transport)
         }
     }
 
@@ -1843,12 +2009,12 @@ pub mod modern {
         DuplicateBehavior, ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
         FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
-        FinalResourceReadCacheHintProvenance, FinalToolOutcome, FinalToolSchemaAuthority,
-        HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, LifespanHooks,
-        LoggingConfig, Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender,
-        PromptHandler, ResourceHandler, ServerExtensionConfigurationError, ShutdownHook,
-        StartupHook, TagFilters, ToolErrorKind, ToolHandler, TrafficVerbosity,
-        create_context_with_progress,
+        FinalResourceReadCacheHintProvenance, FinalSampling, FinalSamplingContextExt,
+        FinalToolOutcome, FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerShutdown,
+        HttpShutdownSettlement, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
+        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler,
+        ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
+        ToolHandler, TrafficVerbosity, create_context_with_progress,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
@@ -2234,6 +2400,117 @@ pub mod modern {
             IO: Send + 'static,
         {
             self.inner.request_with_raw_result(cx, method, params).await
+        }
+
+        /// Completes a prompt or resource-template argument through the
+        /// pinned MCP 2026-07-28 WebSocket connection.
+        pub async fn complete(
+            &mut self,
+            cx: &Cx,
+            params: CompletionParams,
+        ) -> McpResult<FinalCompletionResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.complete(cx, params).await? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final completion/complete result",
+                )),
+            }
+        }
+
+        /// Sends one generic final extension request after bilateral
+        /// discovery admission, retaining the exact JSON result source.
+        pub async fn request_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<JsonValue>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .request_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+        /// Reads a resource through the pinned modern WebSocket session,
+        /// following bounded MRTR continuations to its typed terminal result.
+        pub async fn read_resource_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            uri: &str,
+            respond: F,
+        ) -> McpResult<FinalReadResourceResult>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .read_resource_with_mrtr_retry(cx, deadline, uri, respond)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. } => {
+                    Ok(result.payload)
+                }
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket MRTR resources/read received a non-terminal result",
+                )),
+            }
+        }
+
+        /// Gets a prompt through the pinned modern WebSocket session,
+        /// following bounded MRTR continuations to its typed terminal result.
+        pub async fn get_prompt_with_mrtr_retry<F>(
+            &mut self,
+            cx: &Cx,
+            deadline: std::time::Instant,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            respond: F,
+        ) -> McpResult<FinalGetPromptResult>
+        where
+            F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .get_prompt_with_mrtr_retry(cx, deadline, name, arguments, respond)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. } => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket MRTR prompts/get received a non-terminal result",
+                )),
+            }
+        }
+
+        /// Drains exact final progress notifications received while serving
+        /// modern WebSocket requests.
+        #[must_use]
+        pub fn take_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
+            self.inner.take_final_progress_notifications()
+        }
+
+        /// Drains all admitted final server notifications received while
+        /// serving modern WebSocket requests.
+        #[must_use]
+        pub fn take_server_notifications(&mut self) -> Vec<ServerNotification> {
+            let mut notifications = self.inner.take_final_server_notifications();
+            notifications.extend(
+                self.inner
+                    .take_final_progress_notifications()
+                    .into_iter()
+                    .map(ServerNotification::Progress),
+            );
+            notifications
         }
     }
 
@@ -3328,12 +3605,74 @@ pub mod modern {
             }
         }
 
+        /// Installs the configured OAuth authorization, token, and revocation
+        /// routes on the native HTTP listener.
+        ///
+        /// This forwards only OAuth route configuration; it makes no OIDC or
+        /// JWKS capability claim.
+        #[must_use]
+        pub fn oauth_http_routes(self, routes: crate::oauth::OAuthHttpRoutes) -> Self {
+            Self {
+                inner: self.inner.oauth_http_routes(routes),
+            }
+        }
+
         /// Installs era-neutral middleware without exposing a legacy dispatcher.
         #[must_use]
         pub fn middleware<M: Middleware + 'static>(self, middleware: M) -> Self {
             Self {
                 inner: self.inner.middleware(middleware),
             }
+        }
+
+        /// Registers an exact-final proxy catalog without exposing a legacy route.
+        #[cfg(feature = "proxy")]
+        pub fn proxy(
+            self,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyCatalog,
+        ) -> McpResult<Self> {
+            if catalog.era()? != fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026 {
+                return Err(McpError::invalid_request(
+                    "ModernOnly facade rejects an exact-2024 proxy catalog",
+                ));
+            }
+            self.inner
+                .proxy(client, catalog)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers a prefixed proxy from this facade's sealed final client.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy(self, prefix: &str, client: Client) -> McpResult<Self> {
+            self.inner
+                .as_proxy(prefix, client.inner)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers an unprefixed proxy from this facade's sealed final client.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy_raw(self, client: Client) -> McpResult<Self> {
+            self.inner
+                .as_proxy_raw(client.inner)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers an exact-final typed proxy catalog without a legacy projection.
+        #[cfg(feature = "proxy")]
+        pub fn proxy_typed(
+            self,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyTypedCatalog,
+        ) -> McpResult<Self> {
+            if catalog.era()? != fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026 {
+                return Err(McpError::invalid_request(
+                    "ModernOnly facade rejects an exact-2024 typed proxy catalog",
+                ));
+            }
+            self.inner
+                .proxy_typed(client, catalog)
+                .map(|inner| Self { inner })
         }
 
         /// Installs the official MCP Apps discovery marker.
@@ -3641,6 +3980,27 @@ pub mod modern {
         pub fn run_stdio(self) -> ! {
             self.inner.run_stdio()
         }
+
+        /// Runs this final-only server over stdio on the supplied caller-owned context.
+        ///
+        /// The facade does not create a runtime or detach the stdio pump; the
+        /// provided context remains the owner of cancellation and structured
+        /// shutdown.
+        pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+            self.inner.run_stdio_with_cx(cx).await
+        }
+
+        /// Runs this final-only server on a caller-owned transport until it closes.
+        ///
+        /// Unlike [`Self::run_stdio_with_cx`], this returning lifecycle does
+        /// not terminate the process, so embedding applications retain
+        /// structured shutdown and error handling.
+        pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
+        where
+            T: crate::Transport + Send + 'static,
+        {
+            self.inner.run_transport_returning_with_cx(cx, transport)
+        }
     }
 
     /// Creates a client builder pinned to the ModernOnly stdio plan.
@@ -3683,7 +4043,7 @@ pub mod modern {
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod legacy_2024 {
     pub use fastmcp_client::{
-        ClientProtocolPlan, CreateMessageParams as LegacyCreateMessageParams,
+        CreateMessageParams as LegacyCreateMessageParams,
         CreateMessageResult as LegacyCreateMessageResult, HttpClientError,
         ListRootsParams as LegacyListRootsParams, ListRootsResult as LegacyListRootsResult,
         RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation,
@@ -3700,7 +4060,7 @@ pub mod legacy_2024 {
     pub use fastmcp_protocol::protocol_policy::{
         HttpEndpointBundleError, LEGACY_PROTOCOL_VERSION, LegacyAdapterReceiptIssuer,
         LegacyClientAdapterInstalledReceipt, LegacyReceiptBinding,
-        LegacyServerAdapterInstalledReceipt as PolicyServerAdapterInstalledReceipt, ProtocolPolicy,
+        LegacyServerAdapterInstalledReceipt as PolicyServerAdapterInstalledReceipt,
     };
     pub use fastmcp_protocol::{
         CallToolParams, CallToolResult, CancellationSender, CancellationWireCodecError,
@@ -3744,6 +4104,17 @@ pub mod legacy_2024 {
         LegacySseClientTransport, LegacySseMessagePost, LegacySsePostSink, LegacySseServerTransport,
     };
     pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
+
+    /// The only protocol policy representable through the exact-2024 facade.
+    ///
+    /// This is deliberately not the root [`crate::ProtocolPolicy`]: the latter
+    /// also represents Auto and modern-only negotiation, neither of which can
+    /// be constructed in this namespace.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProtocolPolicy {
+        /// Exact MCP 2024-11-05 only.
+        LegacyOnly,
+    }
 
     /// The exact client-originated legacy notification exposed by this
     /// facade.
@@ -4041,12 +4412,74 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Installs the configured OAuth authorization, token, and revocation
+        /// routes on the native HTTP listener.
+        ///
+        /// This forwards only OAuth route configuration; it makes no OIDC or
+        /// JWKS capability claim.
+        #[must_use]
+        pub fn oauth_http_routes(self, routes: crate::oauth::OAuthHttpRoutes) -> Self {
+            Self {
+                inner: self.inner.oauth_http_routes(routes),
+            }
+        }
+
         /// Installs era-neutral middleware.
         #[must_use]
         pub fn middleware<M: Middleware + 'static>(self, middleware: M) -> Self {
             Self {
                 inner: self.inner.middleware(middleware),
             }
+        }
+
+        /// Registers an exact-2024 proxy catalog without exposing a final route.
+        #[cfg(feature = "proxy")]
+        pub fn proxy(
+            self,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyCatalog,
+        ) -> McpResult<Self> {
+            if catalog.era()? != fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024 {
+                return Err(McpError::invalid_request(
+                    "LegacyOnly facade rejects an exact-final proxy catalog",
+                ));
+            }
+            self.inner
+                .proxy(client, catalog)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers a prefixed proxy from this facade's sealed exact-2024 client.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy(self, prefix: &str, client: Client) -> McpResult<Self> {
+            self.inner
+                .as_proxy(prefix, client.inner)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers an unprefixed proxy from this facade's sealed exact-2024 client.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy_raw(self, client: Client) -> McpResult<Self> {
+            self.inner
+                .as_proxy_raw(client.inner)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers an exact-2024 typed proxy catalog without a final projection.
+        #[cfg(feature = "proxy")]
+        pub fn proxy_typed(
+            self,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyTypedCatalog,
+        ) -> McpResult<Self> {
+            if catalog.era()? != fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024 {
+                return Err(McpError::invalid_request(
+                    "LegacyOnly facade rejects an exact-final typed proxy catalog",
+                ));
+            }
+            self.inner
+                .proxy_typed(client, catalog)
+                .map(|inner| Self { inner })
         }
 
         /// Registers an exact-2024-only tool handler.
@@ -4200,6 +4633,27 @@ pub mod legacy_2024 {
             self.inner.run_stdio()
         }
 
+        /// Runs this exact-2024 server over stdio on the supplied caller-owned context.
+        ///
+        /// The facade does not create a runtime or detach the stdio pump; the
+        /// provided context remains the owner of cancellation and structured
+        /// shutdown.
+        pub async fn run_stdio_with_cx(self, cx: &Cx) -> ! {
+            self.inner.run_stdio_with_cx(cx).await
+        }
+
+        /// Runs this exact-2024 server on a caller-owned transport until it closes.
+        ///
+        /// Unlike [`Self::run_stdio_with_cx`], this returning lifecycle does
+        /// not terminate the process, so embedding applications retain
+        /// structured shutdown and error handling.
+        pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
+        where
+            T: crate::Transport + Send + 'static,
+        {
+            self.inner.run_transport_returning_with_cx(cx, transport)
+        }
+
         /// Binds this `LegacyOnly` server to the exact 2024 HTTP+SSE route
         /// pair on a caller-owned context.
         pub async fn bind_http(self, cx: &Cx, addr: impl Into<String>) -> McpResult<HttpServer> {
@@ -4274,7 +4728,9 @@ pub mod legacy_2024 {
             fastmcp_client::Client::stdio_with_protocol_plan(
                 command,
                 args,
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+                fastmcp_client::ClientProtocolPlan::stdio(
+                    fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly,
+                ),
             )
             .map(Self::from_inner)
         }
@@ -4284,7 +4740,9 @@ pub mod legacy_2024 {
             fastmcp_client::Client::stdio_with_protocol_plan_with_cx(
                 command,
                 args,
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+                fastmcp_client::ClientProtocolPlan::stdio(
+                    fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly,
+                ),
                 cx,
             )
             .map(Self::from_inner)
@@ -4496,6 +4954,22 @@ pub mod legacy_2024 {
     /// that need modern or Auto negotiation must select the root, `modern`,
     /// or `auto` namespace explicitly.
     ///
+    /// ```
+    /// use fastmcp_rust::legacy_2024;
+    ///
+    /// let builder = legacy_2024::ClientBuilder::new();
+    /// assert_eq!(
+    ///     builder.protocol_policy(),
+    ///     legacy_2024::ProtocolPolicy::LegacyOnly,
+    /// );
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::legacy_2024;
+    ///
+    /// let _ = legacy_2024::ProtocolPolicy::ModernOnly;
+    /// ```
+    ///
     /// ```compile_fail
     /// use fastmcp_rust::{legacy_2024, ProtocolPolicy};
     ///
@@ -4527,7 +5001,9 @@ pub mod legacy_2024 {
         #[must_use]
         pub fn new() -> Self {
             Self::from_inner(fastmcp_client::ClientBuilder::new().protocol_plan(
-                fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+                fastmcp_client::ClientProtocolPlan::stdio(
+                    fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly,
+                ),
             ))
         }
 
@@ -4696,6 +5172,18 @@ pub mod legacy_2024 {
     }
 
     /// Exact-2024 WebSocket client constructed only by the pinned builder.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::legacy_2024;
+    ///
+    /// fn cannot_observe_mixed_session<IO>(client: &legacy_2024::WebSocketClient<IO>)
+    /// where
+    ///     IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
+    /// {
+    ///     let _ = client.session();
+    ///     let _ = client.selected_protocol_era();
+    /// }
+    /// ```
     #[cfg(feature = "websocket-experimental")]
     pub struct WebSocketClient<IO>
     where
@@ -4713,18 +5201,16 @@ pub mod legacy_2024 {
             Self { inner }
         }
 
-        /// Returns the session pinned to MCP 2024-11-05.
+        /// Returns the only policy representable by this sealed socket.
         #[must_use]
-        pub const fn session(&self) -> &fastmcp_client::ClientSession {
-            self.inner.session()
+        pub const fn protocol_policy(&self) -> ProtocolPolicy {
+            ProtocolPolicy::LegacyOnly
         }
 
-        /// Returns the sealed exact-2024 era.
+        /// Returns the exact wire version admitted by this sealed socket.
         #[must_use]
-        pub const fn selected_protocol_era(
-            &self,
-        ) -> fastmcp_protocol::protocol_policy::ProtocolEra {
-            self.inner.selected_protocol_era()
+        pub const fn protocol_version(&self) -> &'static str {
+            LEGACY_PROTOCOL_VERSION
         }
 
         /// Structurally closes the connection through the caller Cx.
@@ -4743,6 +5229,54 @@ pub mod legacy_2024 {
             IO: Send + 'static,
         {
             self.inner.request_with_raw_result(cx, method, params).await
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument.
+        ///
+        /// The facade converts only the legacy parameter vocabulary and
+        /// rejects any unexpected final result rather than leaking a mixed-era
+        /// completion type.
+        pub async fn complete(
+            &mut self,
+            cx: &Cx,
+            params: LegacyCompletionParams,
+        ) -> McpResult<LegacyCompletionResult>
+        where
+            IO: Send + 'static,
+        {
+            let reference = match params.reference {
+                LegacyCompletionReference::Prompt { name } => {
+                    fastmcp_client::CompletionReference::Prompt { name }
+                }
+                LegacyCompletionReference::Resource { uri } => {
+                    fastmcp_client::CompletionReference::Resource { uri }
+                }
+            };
+            match self
+                .inner
+                .complete(
+                    cx,
+                    fastmcp_client::CompletionParams {
+                        reference,
+                        argument: fastmcp_client::CompletionArgument {
+                            name: params.argument.name,
+                            value: params.argument.value,
+                        },
+                        context: None,
+                    },
+                )
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                fastmcp_protocol::CoreResult::Final(_) => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a final completion result",
+                )),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received an unexpected completion result",
+                )),
+            }
         }
     }
 
@@ -5158,7 +5692,7 @@ pub mod legacy_2024 {
         fastmcp_protocol::protocol_policy::HttpEndpointBundleError,
     > {
         fastmcp_client::ClientProtocolPlan::http(
-            ProtocolPolicy::LegacyOnly,
+            fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly,
             None,
             Some(sse_endpoint),
             Some(message_post_endpoint),
@@ -5461,19 +5995,23 @@ mod tests {
 
     use super::{RequestTimeoutPolicy, RequestTimeoutSource};
 
-    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[cfg(feature = "websocket-experimental")]
     use asupersync::io::AsyncWriteExt;
     #[cfg(feature = "websocket-experimental")]
     use asupersync::test_utils::run_test;
+    #[cfg(feature = "websocket-experimental")]
+    use std::collections::BTreeMap;
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    use std::collections::VecDeque;
+    #[cfg(feature = "websocket-experimental")]
+    use std::net::SocketAddr;
     #[cfg(feature = "websocket-experimental")]
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
-    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
-    use std::{collections::VecDeque, net::SocketAddr};
 
-    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[cfg(feature = "websocket-experimental")]
     fn facade_async_websocket_pair() -> (
         asupersync::net::tcp::VirtualTcpStream,
         asupersync::net::tcp::VirtualTcpStream,
@@ -5483,7 +6021,7 @@ mod tests {
         asupersync::net::tcp::VirtualTcpStream::pair(client_addr, server_addr)
     }
 
-    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[cfg(feature = "websocket-experimental")]
     async fn write_facade_server_text_frame(
         peer: &mut asupersync::net::tcp::VirtualTcpStream,
         source: &str,
@@ -5505,6 +6043,64 @@ mod tests {
         peer.write_all(&frame)
             .await
             .expect("write raw server WebSocket text frame");
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn facade_websocket_extension_configuration() -> (
+        super::ExtensionId,
+        super::ExtensionDescriptorRegistry,
+        super::ClientExtensionDiscovery,
+    ) {
+        let extension_id =
+            super::ExtensionId::parse("com.example/facade").expect("facade extension ID is valid");
+        let mut registry = super::ExtensionDescriptorRegistry::new();
+        registry
+            .register(super::ExtensionDescriptor {
+                id: extension_id.clone(),
+                client_settings: super::ExtensionSettingsSchema {
+                    schema_id: "facade-client-settings-v1".to_owned(),
+                    codec_id: "facade-client-codec-v1".to_owned(),
+                },
+                server_settings: super::ExtensionSettingsSchema {
+                    schema_id: "facade-server-settings-v1".to_owned(),
+                    codec_id: "facade-server-codec-v1".to_owned(),
+                },
+                resolver: super::ExtensionNegotiationResolver {
+                    id: "facade-settings-v1".to_owned(),
+                    version: 1,
+                    fallback: super::ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: Some(super::ExtensionMethodDescriptor {
+                    name: "example/facadeEcho".to_owned(),
+                    direction: super::ExtensionDirection::ClientToServer,
+                    http_era_disposition: Some(super::ExtensionHttpEraDisposition::ModernExclusive),
+                    legacy_fallback: false,
+                }),
+                notification: None,
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: None,
+            })
+            .expect("facade extension descriptor is valid");
+        let settings = super::ExtensionSettings::new(serde_json::json!({"mode": "facade"}))
+            .expect("facade extension settings are an object");
+        (
+            extension_id.clone(),
+            registry,
+            super::ClientExtensionDiscovery {
+                extensions: BTreeMap::from([(extension_id, settings)]),
+            },
+        )
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[allow(clippy::unnecessary_wraps)]
+    fn accept_facade_websocket_extension_settings(
+        _descriptor: &super::ExtensionDescriptor,
+        client: &super::ExtensionSettings,
+        _server: &super::ExtensionSettings,
+    ) -> Result<super::ExtensionSettings, super::ExtensionNegotiationError> {
+        Ok(client.clone())
     }
 
     #[test]
@@ -5536,7 +6132,7 @@ mod tests {
             .await;
             write_facade_server_text_frame(
                 &mut legacy_peer_io,
-                r#"{"jsonrpc":"2.0","id":2,"result":{}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
             )
             .await;
 
@@ -5567,10 +6163,25 @@ mod tests {
             );
             assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
             let response = client
-                .request_with_raw_result(&cx, "ping", Some(serde_json::json!({})))
+                .complete(
+                    &cx,
+                    super::FinalCompletionParams {
+                        reference: super::CompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: super::FinalCompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
                 .await
-                .expect("sealed Auto WebSocket client sends an admitted request");
-            assert_eq!(response.raw_result.as_deref(), Some("{}"));
+                .expect("Auto wrapper preserves its selected exact-legacy completion result");
+            assert!(matches!(
+                response,
+                super::CoreResult::Legacy(super::LegacyCoreResult::Completion(_))
+            ));
 
             let mut peer = super::AsyncWsServerTransport::from_upgraded(legacy_peer_io);
             let _ = peer
@@ -5581,18 +6192,178 @@ mod tests {
                 .recv(&cx)
                 .await
                 .expect("peer receives initialized notification");
-            let super::JsonRpcMessage::Request(ping) = peer
+            let super::JsonRpcMessage::Request(completion) = peer
                 .recv(&cx)
                 .await
                 .expect("peer receives Auto wrapper request")
             else {
                 panic!("Auto wrapper must send a JSON-RPC request");
             };
-            assert_eq!(ping.method, "ping");
+            assert_eq!(completion.method, "completion/complete");
             client
                 .close(&cx)
                 .await
                 .expect("Auto wrapper forwards structural close");
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn facade_modern_websocket_final_extension_uses_bilateral_registry() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = facade_async_websocket_pair();
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"com.example/facade":{"mode":"facade"}}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"facade-extension","version":"1.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+            )
+            .await;
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"echoed":{"input":"ok"}}}"#,
+            )
+            .await;
+            let (extension_id, registry, discovery) = facade_websocket_extension_configuration();
+            let mut client = super::modern::ClientBuilder::new()
+                .extension_registry(registry, discovery, || {
+                    accept_facade_websocket_extension_settings
+                })
+                .expect("facade freezes the bilateral extension registry")
+                .connect_websocket_with_cx(
+                    &cx,
+                    super::AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .expect("public modern facade completes extension discovery");
+            let result = client
+                .request_final_extension(
+                    &cx,
+                    &extension_id,
+                    "example/facadeEcho",
+                    serde_json::json!({"input": "ok"}),
+                )
+                .await
+                .expect("public modern facade forwards the admitted extension request");
+            assert_eq!(result["echoed"]["input"], "ok");
+
+            let mut peer = super::AsyncWsServerTransport::from_upgraded(peer_io);
+            let super::JsonRpcMessage::Request(discover) = peer
+                .recv(&cx)
+                .await
+                .expect("peer receives facade discovery")
+            else {
+                panic!("facade discovery must be a request");
+            };
+            assert_eq!(discover.method, "server/discover");
+            assert_eq!(
+                discover.params.expect("discovery has params")["_meta"]
+                    [super::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]["com.example/facade"],
+                serde_json::json!({"mode": "facade"})
+            );
+            let super::JsonRpcMessage::Request(extension) = peer
+                .recv(&cx)
+                .await
+                .expect("peer receives the facade extension request")
+            else {
+                panic!("facade extension call must be a request");
+            };
+            assert_eq!(extension.method, "example/facadeEcho");
+            assert_eq!(
+                extension.params.expect("extension has params")["_meta"]
+                    [super::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]["com.example/facade"],
+                serde_json::json!({"mode": "facade"})
+            );
+            client
+                .close(&cx)
+                .await
+                .expect("close public modern facade client");
+            assert!(matches!(
+                peer.recv(&cx).await,
+                Err(super::TransportError::Closed)
+            ));
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn rh5_facade_auto_legacy_rejects_final_extension_without_legacy_contact() {
+        run_test(|| async {
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (modern_client_io, mut modern_peer_io) = facade_async_websocket_pair();
+            write_facade_server_text_frame(
+                &mut modern_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"modern discovery refused"}}"#,
+            )
+            .await;
+            let (legacy_client_io, legacy_peer_io) = facade_async_websocket_pair();
+            let mut legacy_peer_io = legacy_peer_io;
+            write_facade_server_text_frame(
+                &mut legacy_peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"facade-legacy","version":"1.0"}}}"#,
+            )
+            .await;
+            let (extension_id, registry, discovery) = facade_websocket_extension_configuration();
+            let mut transports = VecDeque::from([
+                super::AsyncWsClientTransport::from_upgraded(modern_client_io),
+                super::AsyncWsClientTransport::from_upgraded(legacy_client_io),
+            ]);
+            let mut client = super::auto::client_builder()
+                .extension_registry(registry, discovery, || {
+                    accept_facade_websocket_extension_settings
+                })
+                .expect("Auto facade freezes the extension registry before discovery")
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    let transport = transports.pop_front();
+                    async move {
+                        transport.ok_or_else(|| {
+                            super::McpError::internal_error(
+                                "Auto attempted an unexpected third transport",
+                            )
+                        })
+                    }
+                })
+                .await
+                .expect("Auto facade reaches a fresh exact legacy connection");
+            assert_eq!(
+                client.selected_protocol_era(),
+                super::ProtocolEra::Legacy2024
+            );
+            let error = client
+                .request_final_extension(
+                    &cx,
+                    &extension_id,
+                    "example/facadeEcho",
+                    serde_json::json!({"input": "forbidden"}),
+                )
+                .await
+                .expect_err("exact legacy Auto selection rejects a final extension before contact");
+            assert_eq!(error.code, super::McpErrorCode::InvalidParams);
+            client
+                .close(&cx)
+                .await
+                .expect("close Auto facade after no-contact rejection");
+
+            let mut legacy_peer = super::AsyncWsServerTransport::from_upgraded(legacy_peer_io);
+            let super::JsonRpcMessage::Request(initialize) = legacy_peer
+                .recv(&cx)
+                .await
+                .expect("peer receives exact legacy initialization")
+            else {
+                panic!("exact legacy lifecycle starts with initialize");
+            };
+            assert_eq!(initialize.method, "initialize");
+            let super::JsonRpcMessage::Request(initialized) = legacy_peer
+                .recv(&cx)
+                .await
+                .expect("peer receives exact legacy initialized notification")
+            else {
+                panic!("exact legacy lifecycle sends initialized notification");
+            };
+            assert_eq!(initialized.method, "notifications/initialized");
+            assert!(matches!(
+                legacy_peer.recv(&cx).await,
+                Err(super::TransportError::Closed)
+            ));
         });
     }
 
@@ -5663,7 +6434,7 @@ mod tests {
             .await;
             write_facade_server_text_frame(
                 &mut legacy_peer_io,
-                r#"{"jsonrpc":"2.0","id":2,"result":{}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
             )
             .await;
             let mut legacy_client = super::legacy_2024::ClientBuilder::new()
@@ -5673,10 +6444,22 @@ mod tests {
                 )
                 .await
                 .expect("LegacyOnly wrapper completes exact initialization");
-            let _ = legacy_client
-                .request_with_raw_result(&cx, "ping", Some(serde_json::json!({})))
+            let completion = legacy_client
+                .complete(
+                    &cx,
+                    super::legacy_2024::LegacyCompletionParams {
+                        reference: super::legacy_2024::LegacyCompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: super::legacy_2024::LegacyCompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                    },
+                )
                 .await
-                .expect("LegacyOnly wrapper sends an admitted request");
+                .expect("LegacyOnly wrapper returns its exact completion result");
+            assert_eq!(completion.completion.values, vec!["staging"]);
             let mut legacy_peer = super::AsyncWsServerTransport::from_upgraded(legacy_peer_io);
             let _ = legacy_peer
                 .recv(&cx)
@@ -5686,22 +6469,119 @@ mod tests {
                 .recv(&cx)
                 .await
                 .expect("peer receives exact initialized notification");
-            let super::JsonRpcMessage::Request(ping) = legacy_peer
+            let super::JsonRpcMessage::Request(completion) = legacy_peer
                 .recv(&cx)
                 .await
                 .expect("peer receives LegacyOnly wrapper request")
             else {
                 panic!("LegacyOnly wrapper must send a JSON-RPC request");
             };
-            assert_eq!(ping.method, "ping");
+            assert_eq!(completion.method, "completion/complete");
             assert_eq!(
-                legacy_client.selected_protocol_era(),
-                super::ProtocolEra::Legacy2024
+                legacy_client.protocol_policy(),
+                super::legacy_2024::ProtocolPolicy::LegacyOnly
+            );
+            assert_eq!(
+                legacy_client.protocol_version(),
+                super::legacy_2024::LEGACY_PROTOCOL_VERSION
             );
             legacy_client
                 .close(&cx)
                 .await
                 .expect("LegacyOnly wrapper forwards structural close");
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn facade_modern_websocket_mrtr_resource_and_prompt_return_typed_terminals() {
+        run_test(|| async {
+            use std::collections::{BTreeMap, HashMap};
+
+            let cx = super::Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = facade_async_websocket_pair();
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"facade-mrtr","version":"1.0"}},"ttlMs":0,"cacheScope":"private"}}"#,
+            )
+            .await;
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"resource-round"}}"#,
+            )
+            .await;
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            )
+            .await;
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"prompt-round"}}"#,
+            )
+            .await;
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","messages":[]}}"#,
+            )
+            .await;
+            write_facade_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","completion":{"values":["staging"],"total":1,"hasMore":false}}}"#,
+            )
+            .await;
+
+            let mut client = super::modern::ClientBuilder::new()
+                .connect_websocket_with_cx(
+                    &cx,
+                    super::AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .expect("facade modern WebSocket discovery completes");
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let resource = client
+                .read_resource_with_mrtr_retry(&cx, deadline, "file:///typed.txt", |_| {
+                    Ok(BTreeMap::from([(
+                        "roots".to_owned(),
+                        serde_json::json!({"roots": []}),
+                    )]))
+                })
+                .await
+                .expect("resource MRTR returns only a typed terminal payload");
+            assert!(resource.contents.is_empty());
+            let prompt = client
+                .get_prompt_with_mrtr_retry(&cx, deadline, "typed-prompt", HashMap::new(), |_| {
+                    Ok(BTreeMap::from([(
+                        "roots".to_owned(),
+                        serde_json::json!({"roots": []}),
+                    )]))
+                })
+                .await
+                .expect("prompt MRTR returns only a typed terminal payload");
+            assert!(prompt.messages.is_empty());
+            let completion = client
+                .complete(
+                    &cx,
+                    super::modern::CompletionParams {
+                        reference: super::modern::CompletionReference::Prompt {
+                            name: "typed-prompt".to_owned(),
+                        },
+                        argument: super::FinalCompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
+                .await
+                .expect("typed modern WebSocket completion returns its final payload");
+            assert_eq!(completion.completion.values, vec!["staging".to_owned()]);
+            assert_eq!(
+                completion.completion.total,
+                Some(super::JsonInteger::from(1_i64))
+            );
+            assert_eq!(completion.completion.has_more, Some(false));
+            client.close(&cx).await.expect("facade MRTR client closes");
         });
     }
 
@@ -6367,6 +7247,29 @@ mod tests {
     }
 
     #[test]
+    fn facade_public_oauth_routes_and_sampling_surface_compile() {
+        let _: Option<super::FinalSampling> = None;
+        fn assert_final_sampling_context_ext<T: super::FinalSamplingContextExt>() {}
+        assert_final_sampling_context_ext::<super::McpContext>();
+        let _: fn(
+            super::modern::ServerBuilder,
+            super::oauth::OAuthHttpRoutes,
+        ) -> super::modern::ServerBuilder = super::modern::ServerBuilder::oauth_http_routes;
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let _: fn(
+                super::auto::ServerBuilder,
+                super::oauth::OAuthHttpRoutes,
+            ) -> super::auto::ServerBuilder = super::auto::ServerBuilder::oauth_http_routes;
+            let _: fn(
+                super::legacy_2024::ServerBuilder,
+                super::oauth::OAuthHttpRoutes,
+            ) -> super::legacy_2024::ServerBuilder =
+                super::legacy_2024::ServerBuilder::oauth_http_routes;
+        }
+    }
+
+    #[test]
     #[cfg(all(feature = "legacy-2024-11-05", feature = "tasks"))]
     fn modern_facade_exposes_final_only_client_and_http_contracts() {
         use std::collections::HashMap;
@@ -6573,7 +7476,10 @@ mod tests {
         use super::{ClientBuilder as RootClientBuilder, ProtocolPolicy, auto, legacy_2024};
 
         let legacy = legacy_2024::Client::builder();
-        assert_eq!(legacy.protocol_policy(), ProtocolPolicy::LegacyOnly);
+        assert_eq!(
+            legacy.protocol_policy(),
+            legacy_2024::ProtocolPolicy::LegacyOnly
+        );
         let _: fn(&str, &[&str]) -> super::McpResult<legacy_2024::Client> =
             legacy_2024::Client::stdio;
         let _: fn(&str, &[&str], super::Cx) -> super::McpResult<legacy_2024::Client> =

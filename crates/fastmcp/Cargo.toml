@@ -12,6 +12,7 @@ documentation = "https://docs.rs/fastmcp-rust"
 keywords = ["mcp", "json-rpc", "async", "ai", "protocol"]
 categories = ["network-programming", "api-bindings", "development-tools"]
 exclude = ["tests/fnd_01_dependency_evidence.rs.*"]
+autoexamples = false
 
 [features]
 # Official 2026 Tasks are available from the default facade graph.  The
@@ -53,6 +54,13 @@ proxy-tasks = [
     "tasks",
     "fastmcp-server/proxy-tasks",
     "fastmcp-console/proxy-tasks",
+]
+# OIDC signing remains opt-in: it forwards the protocol's bounded JOSE facade
+# and the server's external-signer admission without selecting a local key.
+builtin-auth-server = [
+    "fastmcp-protocol/jose",
+    "fastmcp-server/builtin-auth-server",
+    "fastmcp-console/builtin-auth-server",
 ]
 # Full WebSocket support: URI client transport, negotiated MCP client, and
 # server-owned listener/Upgrade bridge. The facade keeps raw framing adapters
@@ -109,8 +117,15 @@ required-features = ["testing-lab"]
 [[test]]
 name = "e2e_protocol"
 path = "tests/e2e_protocol.rs"
-# The protocol harness requires deterministic `TestClient` and `Cx::for_testing`.
-required-features = ["testing-lab"]
+# The protocol harness uses deterministic testing, exact-2024 callbacks, and
+# the public final Tasks lifecycle against the shipped echo example.
+required-features = ["testing-lab", "legacy-2024-11-05", "tasks"]
+
+[[test]]
+name = "e2e_modern_http"
+path = "tests/e2e_modern_http.rs"
+# This dual-era HTTP harness directly names the sealed exact-2024 facade.
+required-features = ["legacy-2024-11-05"]
 
 [[test]]
 name = "e2e_stress"
@@ -124,6 +139,37 @@ path = "tests/e2e_workflow.rs"
 # The workflow harness requires deterministic test helpers, the Tasks API, and
 # the Auto facade it exercises over both exact protocol eras.
 required-features = ["testing-lab", "tasks", "legacy-2024-11-05"]
+
+[[bin]]
+name = "echo_server"
+path = "examples/echo_server.rs"
+# The integration target launches this shipped executable through Cargo's
+# deterministic CARGO_BIN_EXE_echo_server environment binding.
+required-features = ["legacy-2024-11-05", "tasks"]
+
+[[example]]
+name = "bench"
+path = "examples/bench.rs"
+
+[[example]]
+name = "calculator_server"
+path = "examples/calculator_server.rs"
+
+[[example]]
+name = "fnd_01_evidence_harness"
+path = "examples/fnd_01_evidence_harness.rs"
+
+[[example]]
+name = "fnd_01_sdk_batch"
+path = "examples/fnd_01_sdk_batch.rs"
+
+[[example]]
+name = "notes_server"
+path = "examples/notes_server.rs"
+
+[[example]]
+name = "weather_server"
+path = "examples/weather_server.rs"
 
 [lints]
 workspace = true
