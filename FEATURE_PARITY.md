@@ -106,7 +106,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Dynamic enable/disable** | ✅ | ✅ | Per-session visibility via state.rs, context.rs |
+| **Dynamic enable/disable** | ✅ | ✅ | Per-session visibility via state.rs, context.rs; `disable_*`/`enable_*` emit 2024 `list_changed` and publish the same events to modern `subscriptions/listen` |
 | **Component versioning** | ✅ | ✅ | Version fields on Tool, Resource, Prompt types |
 | **Tags for filtering** | ✅ | ✅ | `include_tags`/`exclude_tags` in router.rs |
 | **Icons support** | ✅ | ✅ | Icon metadata in types.rs, handler.rs |
@@ -178,6 +178,11 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `logging/setLevel` | ✅ | ✅ | `LogLevel` request handling exists |
 | `notifications/cancelled` | ✅ | 🟡 | Stdio can receive and route the notification while its dispatch worker runs. Custom/SSE/WebSocket loops remain sequential; end-to-end interruption, request ownership, and reliable `awaitCleanup` remain unverified |
 | `notifications/progress` | ✅ | ✅ | Progress token support |
+| `notifications/tools/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
+| `notifications/resources/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
+| `notifications/prompts/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
+| `notifications/resources/updated` | ✅ | ✅ | `ctx.notify_resource_updated` plus matching listen filters |
+| `subscriptions/listen` | ✅ | 🟡 | Owned HTTP/stdio dispatch, detached sequential pumps, and `Server::open_subscription_listen` for in-process callers. `dispatch_stateless` rejects listen instead of returning `MethodNotFound` |
 
 ### Background Tasks (Docket/SEP-1686; network surface quarantined)
 
@@ -254,6 +259,8 @@ The following bidirectional building blocks exist in source. This inventory does
 |---------|--------|------|-------|
 | Context object | ✅ | ✅ | `McpContext` |
 | Progress reporting | ✅ | ✅ | `report_progress()`, `report_progress_with_total()` |
+| Handler log notifications | ✅ | ✅ | `ctx.debug()`/`info()`/`notice()`/`warning()`/`error()` emit `notifications/message` after `logging/setLevel` |
+| Resource update notifications | ✅ | ✅ | `ctx.notify_resource_updated(uri)` emits 2024 `resources/updated` to session subscribers and publishes the same event to matching `subscriptions/listen` streams |
 | Checkpoint for cancellation | ✅ | ✅ | `checkpoint()` |
 | Budget access | ✅ | ✅ | `budget()` |
 | Request ID access | ✅ | ✅ | `request_id()` |
@@ -398,7 +405,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 
 ### Source areas formerly listed as gaps
 
-1. ✅ **Dynamic enable/disable** - Per-session visibility control (state.rs, context.rs)
+1. ✅ **Dynamic enable/disable** - Per-session visibility plus mutation-only `list_changed` notifications
 2. ✅ **Component metadata** - Tags, icons, and version fields are present
 3. ✅ **Error masking** - `mask_error_details` setting (builder.rs)
 4. ✅ **Server composition** - mount(), as_proxy() (builder.rs, proxy.rs, router.rs)
