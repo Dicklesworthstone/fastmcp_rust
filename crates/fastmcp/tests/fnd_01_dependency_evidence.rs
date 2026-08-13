@@ -96759,11 +96759,8 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_b_r3_live_matrix() {
-        qualified_linux_live_reprobe("B-R3 live dual-path");
-        assert_eq!(
-            OrdinaryFailureSite::ProbeToolSet.route().stage().as_str(),
-            "reprobe",
-        );
+        qualified_linux_live_reprobe("B-R3");
+        assert_eq!(OrdinaryFailureSite::ProbeToolSet.route().stage().as_str(), "reprobe");
     }
 
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -96784,24 +96781,18 @@ fn fallible(value: Option<u8>) {
             &run_id,
             &closed_path,
         )
-        .expect_err("unqualified platforms must fail before live reprobe work");
+        .expect_err("unqualified");
         assert_eq!(error.code(), "E_UNQUALIFIED_PLATFORM");
         assert_eq!(error.site, OrdinaryFailureSite::ProbeToolPlatform);
         assert_eq!(error.route(), OrdinaryFailureRoute::ToolPlatform);
-        assert_eq!(
-            error.observed,
-            "ordinary native-tool probes require Linux x86_64"
-        );
-        assert_eq!(
-            error.route().stage().as_str(),
-            "reprobe"
-        );
+        assert_eq!(error.observed, "ordinary native-tool probes require Linux x86_64");
+        assert_eq!(error.route().stage().as_str(), "reprobe");
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_b_r1_qualified_linux_dual_path_tool_reprobe() {
-        qualified_linux_live_reprobe("B-R1 qualified Linux dual-path");
+        qualified_linux_live_reprobe("B-R1");
     }
 
     #[derive(Default)]
@@ -97327,6 +97318,26 @@ fn fallible(value: Option<u8>) {
     fn ordinary_b_r5_post_consume_runtime_uses_evidence_code() {
         assert_ordinary_attest_self_reexec(ORDINARY_B_R5_POST_CONSUME_RUNTIME_TEST_ID,
             OrdinaryPlant::SourceBinding);
+    }
+
+    #[test]
+    fn ordinary_wrapper_settled_source_inputs_positive() {
+        let r = repository_root();
+        let (p, _) = read_policy(&r).unwrap();
+        let f = load_sources(&r, &p).unwrap();
+        validate_source_tree(&f, &p).unwrap();
+        let _ = run_verifier();
+    }
+    #[test]
+    fn ordinary_wrapper_one_binding_mutation_fails_closed() {
+        let r = repository_root();
+        let (p, _) = read_policy(&r).unwrap();
+        let f = load_sources(&r, &p).unwrap();
+        let t = validate_source_tree(&f, &p).unwrap();
+        let mut x = f.clone();
+        x[0].bytes[0] ^= 1;
+        assert_eq!(validate_source_tree(&x, &p).unwrap_err().code, "E_TREE_DIGEST_MISMATCH");
+        assert_eq!(validate_source_tree(&f, &p).unwrap(), t);
     }
 
     fn ordinary_environment_set_digest() -> [u8; 32] {
