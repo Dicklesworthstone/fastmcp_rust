@@ -2529,6 +2529,10 @@ pub mod modern {
         }
 
         /// Reads one resource through the pinned modern WebSocket session.
+        ///
+        /// Installed modern reverse handlers fulfill `input_required` locally.
+        /// Without them, use [`Self::read_resource_result`] to keep a live
+        /// `input_required` branch.
         pub async fn read_resource(
             &mut self,
             cx: &Cx,
@@ -2537,10 +2541,33 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
+            match self.read_resource_result(cx, uri).await? {
+                fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. } => {
+                    Ok(result.payload)
+                }
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/read result",
+                )),
+            }
+        }
+
+        /// Reads one resource and retains either a complete result or a live
+        /// `input_required` branch on this modern WebSocket session.
+        pub async fn read_resource_result(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+        ) -> McpResult<fastmcp_protocol::FinalCoreResult>
+        where
+            IO: Send + 'static,
+        {
             match self.inner.read_resource(cx, uri).await? {
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
-                ) => Ok(result.payload),
+                    result @ (fastmcp_protocol::FinalCoreResult::ResourcesRead { .. }
+                    | fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired {
+                        ..
+                    }),
+                ) => Ok(result),
                 _ => Err(McpError::internal_error(
                     "Modern WebSocket client received a non-final resources/read result",
                 )),
@@ -2548,6 +2575,10 @@ pub mod modern {
         }
 
         /// Gets one prompt through the pinned modern WebSocket session.
+        ///
+        /// Installed modern reverse handlers fulfill `input_required` locally.
+        /// Without them, use [`Self::get_prompt_result`] to keep a live
+        /// `input_required` branch.
         pub async fn get_prompt(
             &mut self,
             cx: &Cx,
@@ -2557,10 +2588,30 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
+            match self.get_prompt_result(cx, name, arguments).await? {
+                fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. } => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final prompts/get result",
+                )),
+            }
+        }
+
+        /// Gets one prompt and retains either a complete result or a live
+        /// `input_required` branch on this modern WebSocket session.
+        pub async fn get_prompt_result(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<fastmcp_protocol::FinalCoreResult>
+        where
+            IO: Send + 'static,
+        {
             match self.inner.get_prompt(cx, name, arguments).await? {
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
-                ) => Ok(result.payload),
+                    result @ (fastmcp_protocol::FinalCoreResult::PromptsGet { .. }
+                    | fastmcp_protocol::FinalCoreResult::PromptsGetInputRequired { .. }),
+                ) => Ok(result),
                 _ => Err(McpError::internal_error(
                     "Modern WebSocket client received a non-final prompts/get result",
                 )),
@@ -3520,19 +3571,37 @@ pub mod modern {
         }
 
         /// Reads one resource and retains its exact final cache metadata and contents.
+        ///
+        /// Installed modern reverse handlers fulfill `input_required` locally.
+        /// Without them, use [`Self::read_resource_result`] to keep a live
+        /// `input_required` branch.
         pub async fn read_resource(
             &mut self,
             cx: &Cx,
             uri: &str,
         ) -> Result<FinalReadResourceResult, HttpClientError> {
-            match self
-                .inner
-                .request_final_core(cx, "resources/read", serde_json::json!({ "uri": uri }))
-                .await?
-            {
+            match self.read_resource_result(cx, uri).await? {
+                fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. } => {
+                    Ok(result.payload)
+                }
+                _ => Err(unexpected_modern_http_result("resources/read")),
+            }
+        }
+
+        /// Reads one resource and retains either a complete result or a live
+        /// `input_required` branch.
+        pub async fn read_resource_result(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+        ) -> Result<fastmcp_protocol::FinalCoreResult, HttpClientError> {
+            match self.inner.read_resource(cx, uri).await? {
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
-                ) => Ok(result.payload),
+                    result @ (fastmcp_protocol::FinalCoreResult::ResourcesRead { .. }
+                    | fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired {
+                        ..
+                    }),
+                ) => Ok(result),
                 _ => Err(unexpected_modern_http_result("resources/read")),
             }
         }
@@ -3562,30 +3631,25 @@ pub mod modern {
             name: &str,
             arguments: std::collections::HashMap<String, String>,
         ) -> Result<FinalGetPromptResult, HttpClientError> {
-            let mut parameters = serde_json::json!({ "name": name });
-            if !arguments.is_empty() {
-                let parameters = parameters.as_object_mut().ok_or_else(|| {
-                    HttpClientError::CoreResult(McpError::internal_error(
-                        "final HTTP prompt parameters must remain an object",
-                    ))
-                })?;
-                parameters.insert(
-                    "arguments".to_owned(),
-                    serde_json::to_value(arguments).map_err(|error| {
-                        HttpClientError::CoreResult(McpError::internal_error(format!(
-                            "final HTTP prompt arguments could not serialize: {error}"
-                        )))
-                    })?,
-                );
+            match self.get_prompt_result(cx, name, arguments).await? {
+                fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. } => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("prompts/get")),
             }
-            match self
-                .inner
-                .request_final_core(cx, "prompts/get", parameters)
-                .await?
-            {
+        }
+
+        /// Gets one prompt and retains either a complete result or a live
+        /// `input_required` branch.
+        pub async fn get_prompt_result(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> Result<fastmcp_protocol::FinalCoreResult, HttpClientError> {
+            match self.inner.get_prompt(cx, name, arguments).await? {
                 fastmcp_protocol::CoreResult::Final(
-                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
-                ) => Ok(result.payload),
+                    result @ (fastmcp_protocol::FinalCoreResult::PromptsGet { .. }
+                    | fastmcp_protocol::FinalCoreResult::PromptsGetInputRequired { .. }),
+                ) => Ok(result),
                 _ => Err(unexpected_modern_http_result("prompts/get")),
             }
         }
