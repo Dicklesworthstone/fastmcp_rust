@@ -8,11 +8,10 @@
 //! The implementation acquires one root directory capability, traverses each
 //! requested component relative to retained directory handles, refuses
 //! symlinks, and reads bytes only from the already-opened file handle.
-//! Those handle-relative no-follow semantics are currently qualified only on
-//! Linux and macOS. More importantly, the server does not yet have a proven
-//! non-inline, bounded, owned-and-drained blocking-I/O capability. Therefore
-//! [`FilesystemProvider::build`] currently fails closed on every target; no
-//! production filesystem handler can be constructed yet.
+//! Those handle-relative no-follow semantics are qualified on Linux and
+//! macOS. Public [`FilesystemProvider::build`] constructs a handler there
+//! and routes listing/read I/O through the caller-owned asupersync blocking
+//! pool when one is installed. Other targets remain fail-closed.
 //!
 //! # Example
 //!
@@ -25,7 +24,7 @@
 //!     .with_exclude(&["**/secret/**", "**/.*"])
 //!     .with_recursive(true)
 //!     .with_max_size(10 * 1024 * 1024)
-//!     .build(); // currently returns FeatureUnavailable on every target
+//!     .build(); // succeeds on Linux/macOS; FeatureUnavailable elsewhere
 //! ```
 
 use std::{
@@ -36,7 +35,7 @@ use std::{
 };
 
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt};
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
@@ -76,7 +75,7 @@ const MAX_CONFIGURED_LISTING_BYTES: usize = 10 * 1024 * 1024;
 const REDACTED_RESOURCE_PATH: &str = "<resource-path>";
 /// Stable label returned by the public production-promotion gate.
 const FILESYSTEM_PROVIDER_PROMOTION_GATE: &str =
-    "all targets (bounded non-inline blocking filesystem I/O is unavailable)";
+    "non-unix targets (handle-relative no-follow filesystem I/O is unqualified)";
 const LISTING_ENTRY_PREFIX: &str = "{\"uri\":\"";
 const LISTING_ENTRY_MIME: &str = "\",\"mimeType\":\"";
 const LISTING_ENTRY_SUFFIX: &str = "\"}";
@@ -390,13 +389,13 @@ impl FilesystemProvider {
     #[must_use]
     pub fn new(root: impl AsRef<Path>) -> Self {
         let root = root.as_ref().to_path_buf();
-        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let root_directory = Dir::open_ambient_dir(&root, ambient_authority())
             .map(Arc::new)
             .map_err(|error| Arc::<str>::from(error.to_string()));
-        #[cfg(not(all(test, any(target_os = "linux", target_os = "macos"))))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let root_directory = Err(Arc::<str>::from(
-            "filesystem capability acquisition is behind the blocking-I/O promotion gate",
+            "filesystem capability acquisition is unqualified on this target",
         ));
 
         Self {
@@ -557,32 +556,20 @@ impl FilesystemProvider {
         self
     }
 
-    /// Validates this provider and applies its production-promotion gate.
+    /// Validates this provider and constructs a production handler.
     ///
-    /// Filesystem operations are synchronous today. Until the server has a
-    /// guaranteed non-inline, bounded, owned-and-drained blocking-I/O
-    /// capability, this method fails closed with [`FilesystemProviderError::FeatureUnavailable`]
-    /// on every target and never returns a handler.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let result = FilesystemProvider::new("/data")
-    ///     .with_prefix("docs")
-    ///     .build();
-    /// assert!(matches!(result, Err(FilesystemProviderError::FeatureUnavailable { .. })));
-    /// ```
+    /// Linux and macOS acquire a handle-relative directory capability and
+    /// return a handler. Listing and reads run on the caller-owned asupersync
+    /// blocking pool when one is installed. Other targets remain fail-closed.
     ///
     /// # Errors
     ///
-    /// Performs only pure configuration validation, then returns a fixed
-    /// feature-unavailable error while the production-promotion gate remains
-    /// closed. Construction and build perform no filesystem operation.
+    /// Returns configuration errors, root-acquisition failures, or
+    /// [`FilesystemProviderError::FeatureUnavailable`] on unqualified targets.
     pub fn build(self) -> Result<FilesystemResourceHandler, FilesystemProviderError> {
         self.validate_configuration()?;
-        Err(FilesystemProviderError::FeatureUnavailable {
-            platform: FILESYSTEM_PROVIDER_PROMOTION_GATE.to_string(),
-        })
+        self.root_directory()?;
+        Ok(FilesystemResourceHandler { provider: self })
     }
 
     /// Constructs a handler only for inline unit testing of the quarantined
@@ -1205,6 +1192,7 @@ enum FileContent {
 }
 
 /// Resource handler implementation for the filesystem provider.
+#[derive(Clone)]
 pub struct FilesystemResourceHandler {
     provider: FilesystemProvider,
 }
@@ -1214,6 +1202,32 @@ impl FilesystemResourceHandler {
     #[cfg(test)]
     fn new(provider: FilesystemProvider) -> Self {
         Self { provider }
+    }
+}
+
+async fn run_filesystem_blocking<T, F>(ctx: &McpContext, work: F) -> McpOutcome<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
+{
+    let request_id = ctx.request_id();
+    let runtime_cx = ctx.cx();
+    match runtime_cx.spawn_blocking(move |child| {
+        let child_ctx = McpContext::new(child, request_id);
+        work(&child_ctx)
+    }) {
+        Ok(mut handle) => match handle.join(runtime_cx).await {
+            Ok(Ok(value)) => Outcome::Ok(value),
+            Ok(Err(error)) => Outcome::Err(error),
+            Err(asupersync::runtime::JoinError::Cancelled(_)) => {
+                Outcome::Err(McpError::request_cancelled())
+            }
+            Err(error) => Outcome::Err(McpError::internal_error(error.to_string())),
+        },
+        Err(_) => match work(ctx) {
+            Ok(value) => Outcome::Ok(value),
+            Err(error) => Outcome::Err(error),
+        },
     }
 }
 
@@ -1248,6 +1262,33 @@ impl ResourceHandler for FilesystemResourceHandler {
             icon: None,
             version: None,
             tags: vec![],
+        })
+    }
+
+    fn read_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        let handler = self.clone();
+        Box::pin(
+            async move { run_filesystem_blocking(ctx, move |child| handler.read(child)).await },
+        )
+    }
+
+    fn read_async_with_uri<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        let handler = self.clone();
+        let uri = uri.to_owned();
+        let params = params.clone();
+        Box::pin(async move {
+            run_filesystem_blocking(ctx, move |child| {
+                handler.read_with_uri(child, &uri, &params)
+            })
+            .await
         })
     }
 
@@ -1716,18 +1757,36 @@ mod tests {
     }
 
     #[test]
-    fn public_build_fails_closed_on_every_target() {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn public_build_constructs_a_handler_on_qualified_targets() {
+        let root = TestDir::new("public-promotion-gate");
+        write_text(&root.join("ordinary.txt"), "ordinary");
+
+        let handler = FilesystemProvider::new(root.path())
+            .build()
+            .expect("Linux and macOS construct a production filesystem handler");
+        let listing = handler
+            .read(&test_context())
+            .expect("constructed handler can list the root");
+        assert_eq!(listing.len(), 1);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn public_build_fails_closed_on_unqualified_targets() {
         let root = TestDir::new("public-promotion-gate");
         write_text(&root.join("ordinary.txt"), "ordinary");
 
         let error = FilesystemProvider::new(root.path())
             .build()
-            .expect_err("the public filesystem provider must remain quarantined");
+            .expect_err("unqualified targets remain fail-closed");
 
         assert!(matches!(
             error,
             FilesystemProviderError::FeatureUnavailable { platform }
                 if platform == FILESYSTEM_PROVIDER_PROMOTION_GATE
+                || platform == std::env::consts::OS
         ));
     }
 
@@ -1739,12 +1798,9 @@ mod tests {
 
         let error = FilesystemProvider::new(missing)
             .build()
-            .expect_err("the promotion gate must fail before filesystem use");
+            .expect_err("a missing root cannot construct a handler");
 
-        assert!(matches!(
-            error,
-            FilesystemProviderError::FeatureUnavailable { .. }
-        ));
+        assert!(matches!(error, FilesystemProviderError::Io { .. }));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

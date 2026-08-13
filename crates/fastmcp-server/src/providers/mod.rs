@@ -5,10 +5,9 @@
 //!
 //! # Available Providers
 //!
-//! - [`FilesystemProvider`]: Quarantined implementation for exposing files as
-//!   resources. Its public `build` method currently fails closed on every
-//!   target because the server does not yet provide a guaranteed non-inline,
-//!   bounded, owned-and-drained blocking-I/O capability.
+//! - [`FilesystemProvider`]: Exposes a directory as MCP resources on Linux and
+//!   macOS. Public `build` fails closed on other targets. Listing and reads
+//!   use the caller-owned asupersync blocking pool when one is installed.
 //! - With the `apps` feature, `McpAppsUiResource`: one immutable final-only
 //!   `ui://` HTML document for a negotiated MCP Apps View.
 //!
@@ -23,7 +22,7 @@
 //!     .with_patterns(&["**/*.md", "**/*.txt"])
 //!     .with_recursive(true)
 //!     .build();
-//! assert!(matches!(result, Err(FilesystemProviderError::FeatureUnavailable { .. })));
+//! // On Linux/macOS this is `Ok(handler)`. Other targets remain FeatureUnavailable.
 //! ```
 
 #![forbid(unsafe_code)]
