@@ -10572,6 +10572,7 @@ mod tests {
                 None
             },
             logging: None,
+            completions: None,
             tasks: None,
         }
     }

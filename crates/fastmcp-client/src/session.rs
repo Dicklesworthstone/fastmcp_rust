@@ -895,6 +895,7 @@ mod tests {
                     list_changed: false,
                 }),
                 logging: None,
+                completions: None,
                 tasks: None,
             },
             protocol_version.to_owned(),

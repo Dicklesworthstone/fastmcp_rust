@@ -34,10 +34,17 @@ pub struct ServerCapabilities {
     /// Logging capability.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logging: Option<LoggingCapability>,
+    /// Argument-completion capability (`completion/complete`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completions: Option<CompletionsCapability>,
     /// Background tasks capability (Docket/SEP-1686).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tasks: Option<TasksCapability>,
 }
+
+/// Empty object advertised when `completion/complete` is installed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CompletionsCapability {}
 
 /// Tool capabilities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2300,6 +2307,7 @@ mod tests {
             }),
             prompts: Some(PromptsCapability { list_changed: true }),
             logging: Some(LoggingCapability {}),
+            completions: Some(CompletionsCapability {}),
             tasks: Some(TasksCapability { list_changed: true }),
         };
         let value = serde_json::to_value(&caps).expect("serialize");
@@ -2308,6 +2316,7 @@ mod tests {
         assert_eq!(value["resources"]["listChanged"], true);
         assert_eq!(value["prompts"]["listChanged"], true);
         assert!(value.get("logging").is_some());
+        assert!(value.get("completions").is_some());
         assert_eq!(value["tasks"]["listChanged"], true);
     }
 
@@ -2335,6 +2344,7 @@ mod tests {
             }),
             prompts: None,
             logging: Some(LoggingCapability {}),
+            completions: None,
             tasks: None,
         };
         let json_str = serde_json::to_string(&caps).expect("serialize");
