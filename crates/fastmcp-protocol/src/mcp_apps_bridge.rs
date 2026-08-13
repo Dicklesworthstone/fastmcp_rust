@@ -2244,13 +2244,19 @@ mod tests {
 
     #[test]
     fn sandbox_signals_remain_outside_the_host_view_message_unions() {
-        let _proxy = McpAppsSandboxSignal::ProxyReady;
-        let _resource = McpAppsSandboxSignal::ResourceReady {
+        let proxy = McpAppsSandboxSignal::ProxyReady;
+        let resource = McpAppsSandboxSignal::ResourceReady {
             html: "<main></main>".to_owned(),
             sandbox: None,
             csp: None,
             permissions: None,
         };
+
+        assert!(matches!(proxy, McpAppsSandboxSignal::ProxyReady));
+        assert!(matches!(
+            resource,
+            McpAppsSandboxSignal::ResourceReady { .. }
+        ));
 
         // `McpAppsSandboxSignal` is intentionally a different type from both
         // regular carrier unions, so it cannot be dispatched accidentally.
