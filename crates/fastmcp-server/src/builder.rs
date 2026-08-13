@@ -1025,6 +1025,33 @@ impl ServerBuilder {
             || self.on_duplicate == DuplicateBehavior::Replace
     }
 
+    /// Installs one route-bound modern Tasks relay into every server surface
+    /// that owns Tasks discovery and dispatch. Exact-2024 never supplies a
+    /// relay, so callers pass `None` for its selected upstream era.
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    fn install_proxy_final_tasks_relay(
+        &mut self,
+        task_relay: Option<Arc<ProxyFinalTaskRelay>>,
+    ) -> McpResult<()> {
+        let Some(task_relay) = task_relay else {
+            return Ok(());
+        };
+        if self.final_task_runtime.is_some() || self.final_task_relay.is_some() {
+            return Err(fastmcp_core::McpError::invalid_request(
+                "a server may install only one local or route-bound final Tasks service",
+            ));
+        }
+        if let Some(extension_runtime) = self.extension_runtime.as_mut() {
+            extension_runtime
+                .install_proxy_final_tasks(Arc::clone(&task_relay))
+                .map_err(|error| fastmcp_core::McpError::invalid_request(error.to_string()))?;
+        }
+        self.router
+            .set_final_task_relay(Some(Arc::clone(&task_relay)));
+        self.final_task_relay = Some(task_relay);
+        Ok(())
+    }
+
     /// Registers proxy handlers for a remote MCP server.
     ///
     /// Use [`ProxyClient::catalog`] to fetch definitions before calling this
@@ -1051,12 +1078,40 @@ impl ServerBuilder {
                 false
             }
         };
-        // Preserve the existing legacy capability behavior. Exact-final tools
-        // contribute only after immutable final registration succeeds.
-        let has_tools = !catalog.tools.is_empty();
-        let has_resources = !catalog.resources.is_empty() || !catalog.resource_templates.is_empty();
-        let has_prompts = !catalog.prompts.is_empty();
+        // An admitted final-only catalog owns the same public core capability
+        // claims as its legacy counterpart. Registration below remains era
+        // separated; this only makes discovery reflect the handlers that were
+        // actually installed.
+        let has_tools = !catalog.tools.is_empty() || !catalog.final_tools.is_empty();
+        let has_resources = !catalog.resources.is_empty()
+            || !catalog.resource_templates.is_empty()
+            || !catalog.final_resources.is_empty()
+            || !catalog.final_resource_templates.is_empty();
+        let has_prompts = !catalog.prompts.is_empty() || !catalog.final_prompts.is_empty();
+        #[cfg(feature = "tasks")]
+        let task_relay = if catalog_era == ProtocolEra::Modern2026 {
+            client.final_tasks_relay()?
+        } else {
+            None
+        };
+        #[cfg(feature = "tasks")]
+        self.install_proxy_final_tasks_relay(task_relay.clone())?;
+        #[cfg(not(feature = "tasks"))]
         let final_handlers = catalog.final_tool_handlers(client.clone())?;
+        #[cfg(feature = "tasks")]
+        let final_handlers = catalog
+            .final_tools
+            .iter()
+            .cloned()
+            .map(|tool| match task_relay.as_ref() {
+                Some(task_relay) => ProxyToolHandler::from_final_with_task_relay(
+                    tool,
+                    client.clone(),
+                    Arc::clone(task_relay),
+                ),
+                None => ProxyToolHandler::from_final(tool, client.clone()),
+            })
+            .collect::<McpResult<Vec<_>>>()?;
 
         // Legacy catalog entries register exact-2024-only: dual-era proxy
         // composition must not promote a legacy upstream's components into
@@ -1521,21 +1576,7 @@ impl ServerBuilder {
             None
         };
         #[cfg(feature = "tasks")]
-        if let Some(task_relay) = task_relay.as_ref() {
-            if self.final_task_runtime.is_some() || self.final_task_relay.is_some() {
-                return Err(fastmcp_core::McpError::invalid_request(
-                    "a server may install only one local or route-bound final Tasks service",
-                ));
-            }
-            if let Some(extension_runtime) = self.extension_runtime.as_mut() {
-                extension_runtime
-                    .install_proxy_final_tasks(Arc::clone(task_relay))
-                    .map_err(|error| fastmcp_core::McpError::invalid_request(error.to_string()))?;
-            }
-            self.router
-                .set_final_task_relay(Some(Arc::clone(task_relay)));
-            self.final_task_relay = Some(Arc::clone(task_relay));
-        }
+        self.install_proxy_final_tasks_relay(task_relay.clone())?;
         match (
             catalog.tools,
             catalog.resources,
@@ -2278,8 +2319,14 @@ impl ServerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    use crate::proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
     #[cfg(feature = "proxy")]
     use asupersync::Cx;
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    use fastmcp_client::FinalToolCallOutcome;
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    use fastmcp_core::block_on;
     use fastmcp_core::{McpContext, McpResult};
     #[cfg(feature = "apps")]
     use fastmcp_protocol::FinalTool;
@@ -2298,6 +2345,11 @@ mod tests {
         JsonRpcRequest, LegacyContent, LegacyCoreResult, ResultMeta,
     };
     use fastmcp_protocol::{Content, Prompt, Resource, ResourceContent, Tool};
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    use fastmcp_protocol::{
+        CoreResultDiscriminatorPolicy, CreateTaskResult, DecodedResult, EmptyTaskResult,
+        ResultPeerEra, SubscriptionFilter, decode_peer_result,
+    };
 
     // ── Stub handlers ────────────────────────────────────────────────
 
@@ -2665,6 +2717,153 @@ mod tests {
             _: std::collections::HashMap<String, String>,
         ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
             Ok(vec![])
+        }
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    struct OrdinaryProxyTasksListener {
+        accepted: Option<SubscriptionFilter>,
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    impl ProxyFinalTaskListener for OrdinaryProxyTasksListener {
+        fn next(
+            &mut self,
+            _cx: &Cx,
+            _request_cancellation: &fastmcp_core::McpRequestCancellation,
+        ) -> McpResult<ProxyFinalTaskListenerEvent> {
+            match self.accepted.take() {
+                Some(accepted) => Ok(ProxyFinalTaskListenerEvent::Acknowledged(accepted)),
+                None => Ok(ProxyFinalTaskListenerEvent::Terminal),
+            }
+        }
+    }
+
+    /// A modern-only upstream whose public final tools/call path can return
+    /// either official Tasks or MRTR input_required results. The test uses it
+    /// only through the ordinary public `ServerBuilder::proxy` entry point.
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    struct OrdinaryProxyTasksBackend {
+        calls: Arc<Mutex<Vec<String>>>,
+        updates: Arc<Mutex<Vec<serde_json::Value>>>,
+        task: CreateTaskResult,
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    impl crate::proxy::ProxyBackend for OrdinaryProxyTasksBackend {
+        fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+            Ok(Vec::new())
+        }
+
+        fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+            Ok(Vec::new())
+        }
+
+        fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+            Ok(Vec::new())
+        }
+
+        fn call_tool(
+            &mut self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Err(fastmcp_core::McpError::internal_error(
+                "ordinary Tasks proxy test must retain the final result algebra",
+            ))
+        }
+
+        fn call_tool_with_progress(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+            _on_progress: crate::proxy::ProgressCallback<'_>,
+        ) -> McpResult<Vec<Content>> {
+            self.call_tool(name, arguments)
+        }
+
+        fn read_resource(&mut self, _uri: &str) -> McpResult<Vec<ResourceContent>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn get_prompt(
+            &mut self,
+            _name: &str,
+            _arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+            Err(fastmcp_core::McpError::internal_error("not used"))
+        }
+
+        fn supports_final_tasks_relay(&mut self) -> McpResult<bool> {
+            Ok(true)
+        }
+
+        fn call_tool_final_outcome(
+            &mut self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> McpResult<FinalToolCallOutcome> {
+            self.calls
+                .lock()
+                .expect("ordinary proxy task call log is not poisoned")
+                .push(format!("tools/call:{name}"));
+            if arguments.get("outcome") == Some(&serde_json::json!("task")) {
+                return Ok(FinalToolCallOutcome::Task(self.task.clone()));
+            }
+            let (decoded, diagnostic) = decode_peer_result(
+                r#"{"resultType":"input_required","requestState":"upstream-forged-state"}"#,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .map_err(|error| fastmcp_core::McpError::invalid_request(error.to_string()))?;
+            assert!(diagnostic.is_none(), "the fixed final fixture is explicit");
+            let DecodedResult::InputRequired(result) = decoded else {
+                return Err(fastmcp_core::McpError::internal_error(
+                    "ordinary proxy test fixture must decode as input_required",
+                ));
+            };
+            Ok(FinalToolCallOutcome::InputRequired(result))
+        }
+
+        fn update_final_task(
+            &mut self,
+            task: &fastmcp_protocol::Task,
+            input_responses: fastmcp_protocol::TaskInputResponses,
+        ) -> McpResult<fastmcp_protocol::UpdateTaskResult> {
+            self.calls
+                .lock()
+                .expect("ordinary proxy task call log is not poisoned")
+                .push("tasks/update".to_owned());
+            assert_eq!(
+                task.base().task_id.as_str(),
+                self.task.task.base().task_id.as_str(),
+                "the relay supplies the retained upstream task rather than admitting an arbitrary id"
+            );
+            self.updates
+                .lock()
+                .expect("ordinary proxy task update receipt is not poisoned")
+                .push(
+                    serde_json::to_value(&input_responses)
+                        .expect("the exact public Tasks input response map serializes"),
+                );
+            Ok(EmptyTaskResult::default())
+        }
+
+        fn open_final_task_listener(
+            &mut self,
+            notifications: SubscriptionFilter,
+        ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
+            self.calls
+                .lock()
+                .expect("ordinary proxy task call log is not poisoned")
+                .push("subscriptions/listen".to_owned());
+            Ok(Box::new(OrdinaryProxyTasksListener {
+                accepted: Some(notifications),
+            }))
         }
     }
 
@@ -4339,6 +4538,31 @@ mod tests {
             bound_proxy_client(DuplicatePolicyProxyBackend, era)
         }
 
+        #[cfg(feature = "tasks")]
+        fn ordinary_proxy_tasks_client(
+            calls: Arc<Mutex<Vec<String>>>,
+            updates: Arc<Mutex<Vec<serde_json::Value>>>,
+        ) -> ProxyClient {
+            let task = serde_json::from_value(serde_json::json!({
+                "resultType": "task",
+                "taskId": "ordinary-proxy-task-71",
+                "status": "input_required",
+                "createdAt": "2026-07-28T12:00:00Z",
+                "lastUpdatedAt": "2026-07-28T12:00:00Z",
+                "ttlMs": null,
+                "inputRequests": {},
+            }))
+            .expect("the ordinary proxy Task fixture is exact");
+            bound_proxy_client(
+                OrdinaryProxyTasksBackend {
+                    calls,
+                    updates,
+                    task,
+                },
+                ProtocolEra::Modern2026,
+            )
+        }
+
         fn discovered_duplicate_policy_proxy() -> (ProxyClient, ProxyCatalog) {
             let client = ProxyClient::from_backend(DuplicatePolicyProxyBackend);
             let catalog = client
@@ -4611,7 +4835,7 @@ mod tests {
         }
 
         #[test]
-        fn builder_proxy_registers_the_exact_final_tool_catalog() {
+        fn public_builder_proxy_advertises_and_lists_the_exact_final_tool_catalog() {
             let catalog = final_proxy_catalog();
             let expected = serde_json::to_value(&catalog.final_tools[0])
                 .expect("the final fixture serializes");
@@ -4620,8 +4844,18 @@ mod tests {
                 .expect("the final catalog agrees with its bound route")
                 .build();
 
-            assert!(!server.has_tools());
+            assert!(server.has_tools());
             assert!(server.tools().is_empty());
+            let discovery = serde_json::to_value(
+                server
+                    .server_discovery()
+                    .expect("the public final proxy server is discoverable"),
+            )
+            .expect("final discovery serializes");
+            assert_eq!(
+                discovery.pointer("/capabilities/tools"),
+                Some(&serde_json::json!({}))
+            );
             let inbound = crate::InboundRequestContext::new(
                 Cx::for_testing(),
                 701,
@@ -4635,6 +4869,295 @@ mod tests {
                 .result
                 .expect("the modern tools/list response has a result payload");
             assert_eq!(catalog["tools"][0], expected);
+        }
+
+        #[test]
+        fn public_builder_proxy_final_catalog_absence_changes_only_tool_advertisement_and_registry()
+        {
+            let mut catalog = final_proxy_catalog();
+            let configured_tool_count = catalog.final_tools.len();
+            catalog.final_tools.clear();
+            assert_eq!(
+                configured_tool_count, 1,
+                "the planted negative removes only the final tool catalog entry"
+            );
+
+            let server = ServerBuilder::new("srv", "1.0")
+                .proxy(final_catalog_proxy_client(ProtocolEra::Modern2026), catalog)
+                .expect("an otherwise identical empty final catalog remains admissible")
+                .build();
+
+            assert!(!server.has_tools());
+            let discovery = serde_json::to_value(
+                server
+                    .server_discovery()
+                    .expect("the empty final proxy server remains discoverable"),
+            )
+            .expect("empty final discovery serializes");
+            assert!(discovery.pointer("/capabilities/tools").is_none());
+            let inbound = crate::InboundRequestContext::new(
+                Cx::for_testing(),
+                702,
+                crate::InboundRequestTransport::Memory,
+            );
+            let response = server
+                .dispatch_stateless(&inbound, &final_tools_list_request(702))
+                .expect("the public final tools/list path responds for an empty catalog");
+            assert_eq!(response.result, Some(serde_json::json!({"tools": []})));
+            assert!(
+                server.tools().is_empty(),
+                "removing only the final catalog entry leaves no legacy registry mutation"
+            );
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn public_builder_proxy_relays_modern_tasks_input_required_and_listener() {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let proxy = ordinary_proxy_tasks_client(Arc::clone(&calls), Arc::clone(&updates));
+            let server = Arc::new(
+                ServerBuilder::new("ordinary-proxy-tasks", "1.0")
+                    .proxy(proxy.clone(), final_proxy_catalog())
+                    .expect("the ordinary public proxy path installs the admitted modern route")
+                    .build(),
+            );
+            let discovery = serde_json::to_value(
+                server
+                    .server_discovery()
+                    .expect("the Tasks proxy is publicly discoverable"),
+            )
+            .expect("Tasks proxy discovery serializes");
+            assert_eq!(
+                discovery.pointer("/capabilities/extensions/io.modelcontextprotocol~1tasks"),
+                Some(&serde_json::json!({})),
+                "the ordinary proxy path advertises the same Tasks extension as the typed path"
+            );
+
+            let cx = Cx::for_testing();
+            let connection = crate::ModernConnection::new();
+            let emitted_notifications = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+            let notification_sender: crate::NotificationSender = {
+                let emitted_notifications = Arc::clone(&emitted_notifications);
+                Arc::new(move |notification| {
+                    emitted_notifications
+                        .lock()
+                        .expect("ordinary proxy emitted notification log is not poisoned")
+                        .push(notification);
+                })
+            };
+            let dispatch_modern = |request_id, request| {
+                let inbound = crate::InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    request_id,
+                    crate::InboundRequestTransport::Memory,
+                    &connection,
+                );
+                block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                    server.protocol_policy,
+                    &inbound,
+                    request,
+                    None,
+                    None,
+                    None,
+                    None,
+                    fastmcp_core::McpRequestCancellation::new(),
+                    None,
+                    Arc::clone(&notification_sender),
+                ))
+                .expect("public ordinary proxy request receives a JSON-RPC response")
+            };
+            let task_parameters = serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {"io.modelcontextprotocol/tasks": {}}
+                    },
+                },
+                "name": "weather",
+                "arguments": {"outcome": "task"},
+            });
+            let task = dispatch_modern(
+                703,
+                JsonRpcRequest::new("tools/call", Some(task_parameters.clone()), 703_i64),
+            );
+            assert_eq!(
+                task.result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType")),
+                Some(&serde_json::json!("task"))
+            );
+            assert_eq!(
+                task.result.as_ref().and_then(|result| result.get("taskId")),
+                Some(&serde_json::json!("ordinary-proxy-task-71"))
+            );
+            let relay_after_task = proxy
+                .final_task_registry_snapshot_for_test()
+                .expect("the retained ordinary proxy exposes its route-local Task snapshot");
+            assert_eq!(
+                relay_after_task.pointer("/tasks/ordinary-proxy-task-71/status"),
+                Some(&serde_json::json!("input_required")),
+                "the public tools/call task result is retained by the ordinary route-local relay"
+            );
+
+            let update = dispatch_modern(
+                704,
+                JsonRpcRequest::new(
+                    "tasks/update",
+                    Some(serde_json::json!({
+                        "taskId": "ordinary-proxy-task-71",
+                        "inputResponses": {},
+                        "_meta": task_parameters["_meta"].clone(),
+                    })),
+                    704_i64,
+                ),
+            );
+            assert_eq!(
+                update
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType")),
+                Some(&serde_json::json!("complete")),
+                "the public Tasks update preserves the upstream final result algebra"
+            );
+            assert_eq!(
+                updates
+                    .lock()
+                    .expect("ordinary proxy task update receipt is not poisoned")
+                    .as_slice(),
+                [serde_json::json!({})],
+                "the public Tasks update reaches the upstream backend through the local relay"
+            );
+            assert_eq!(
+                calls
+                    .lock()
+                    .expect("ordinary proxy task call log is not poisoned")
+                    .as_slice(),
+                ["tools/call:weather".to_owned(), "tasks/update".to_owned()],
+                "the public update reaches the selected upstream only after local relay admission"
+            );
+
+            let mut input_required_parameters = task_parameters.clone();
+            input_required_parameters["arguments"] = serde_json::json!({});
+            let listened = dispatch_modern(
+                705,
+                JsonRpcRequest::new(
+                    "subscriptions/listen",
+                    Some(serde_json::json!({
+                        "notifications": {"taskIds": []},
+                        "_meta": task_parameters["_meta"].clone(),
+                    })),
+                    705_i64,
+                ),
+            );
+            assert_eq!(
+                listened
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType")),
+                Some(&serde_json::json!("complete"))
+            );
+            let emitted_before_rejection = emitted_notifications
+                .lock()
+                .expect("ordinary proxy emitted notification log is not poisoned")
+                .clone();
+            assert_eq!(
+                emitted_before_rejection.len(),
+                1,
+                "the public listener emits its acknowledgement before terminal completion"
+            );
+            assert_eq!(
+                emitted_before_rejection
+                    .first()
+                    .map(|notification| notification.method.as_str()),
+                Some("notifications/subscriptions/acknowledged"),
+                "the captured local notification is the listener acknowledgement"
+            );
+            let calls_before_rejection = calls
+                .lock()
+                .expect("ordinary proxy task call log is not poisoned")
+                .clone();
+            let relay_before_rejection = proxy
+                .final_task_registry_snapshot_for_test()
+                .expect("the ordinary proxy keeps its local final Task registry");
+            let subscriptions_before_rejection = server.final_subscription_snapshot_for_test();
+            let mut missing_capability = task_parameters;
+            assert!(
+                missing_capability
+                    .pointer_mut("/_meta/io.modelcontextprotocol~1clientCapabilities/extensions")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("the admitted request has an extension map")
+                    .remove("io.modelcontextprotocol/tasks")
+                    .is_some(),
+                "the RH-5 negative changes only the client Tasks capability"
+            );
+            let rejected = dispatch_modern(
+                706,
+                JsonRpcRequest::new("tools/call", Some(missing_capability), 706_i64),
+            );
+            assert!(rejected.error.is_some());
+            assert_eq!(
+                calls
+                    .lock()
+                    .expect("ordinary proxy task call log is not poisoned")
+                    .clone(),
+                calls_before_rejection,
+                "the one-field capability rejection must not invoke or mutate the upstream route"
+            );
+            assert_eq!(
+                proxy
+                    .final_task_registry_snapshot_for_test()
+                    .expect("the ordinary proxy keeps its local final Task registry"),
+                relay_before_rejection,
+                "the one-field capability rejection must not mutate the local relay task registry"
+            );
+            assert_eq!(
+                server.final_subscription_snapshot_for_test(),
+                subscriptions_before_rejection,
+                "the one-field capability rejection must not mutate local subscription delivery state"
+            );
+            assert_eq!(
+                emitted_notifications
+                    .lock()
+                    .expect("ordinary proxy emitted notification log is not poisoned")
+                    .clone(),
+                emitted_before_rejection,
+                "the one-field capability rejection must not emit or alter local notification state"
+            );
+
+            let input_required = dispatch_modern(
+                707,
+                JsonRpcRequest::new("tools/call", Some(input_required_parameters), 707_i64),
+            );
+            assert_eq!(
+                input_required
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("resultType")),
+                Some(&serde_json::json!("input_required"))
+            );
+            assert_ne!(
+                input_required
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("requestState")),
+                Some(&serde_json::json!("upstream-forged-state")),
+                "the downstream router must mint rather than replay upstream MRTR state"
+            );
+
+            assert_eq!(
+                calls
+                    .lock()
+                    .expect("ordinary proxy task call log is not poisoned")
+                    .as_slice(),
+                [
+                    "tools/call:weather".to_owned(),
+                    "tasks/update".to_owned(),
+                    "subscriptions/listen".to_owned(),
+                    "tools/call:weather".to_owned(),
+                ],
+                "public task update, listener, and input_required requests stay on the one admitted modern upstream"
+            );
         }
 
         #[test]
