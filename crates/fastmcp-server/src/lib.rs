@@ -2119,10 +2119,10 @@ fn protocol_era_refusal(request: &JsonRpcRequest) -> Option<JsonRpcResponse> {
 }
 
 fn is_quarantined_task_rpc(method: &str) -> bool {
-    matches!(
-        method,
-        "tasks/list" | "tasks/get" | "tasks/update" | "tasks/cancel" | "tasks/submit"
-    )
+    // Legacy 2024-era names. Official MCP 2026-07-28 Tasks methods are
+    // tasks/get, tasks/update, and tasks/cancel and are served when
+    // ServerBuilder::final_tasks installed the official extension.
+    matches!(method, "tasks/list" | "tasks/submit")
 }
 
 fn is_notification_only_method(method: &str) -> bool {
@@ -10596,6 +10596,24 @@ impl Server {
         self.invoke_negotiated_extension(request_ctx, &negotiated, extension_id, request)
     }
 
+    fn maybe_dispatch_extension_fallback(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+        result: McpResult<serde_json::Value>,
+    ) -> McpResult<serde_json::Value> {
+        match result {
+            Err(error) if error.code == McpErrorCode::MethodNotFound => {
+                match self.registered_extension_handler_id(&request.method) {
+                    Ok(Some(_)) => self.dispatch_extension_fallback(request_ctx, request),
+                    Ok(None) => Err(error),
+                    Err(lookup) => Err(lookup),
+                }
+            }
+            other => other,
+        }
+    }
+
     /// Returns the test-only legacy task manager, if configured.
     #[cfg(all(test, feature = "tasks"))]
     #[must_use]
@@ -16538,6 +16556,7 @@ impl Server {
                 _ => Err(McpError::method_not_found(method)),
             }
         })();
+        let result = self.maybe_dispatch_extension_fallback(&mw_ctx, &request, result);
 
         let final_result = self.finalize_middleware_result(
             request_cancellation,
@@ -16795,6 +16814,7 @@ impl Server {
                 _ => Err(McpError::method_not_found(method)),
             }
         })();
+        let result = self.maybe_dispatch_extension_fallback(&mw_ctx, &request, result);
 
         let final_result = self.finalize_middleware_result(
             request_cancellation,
@@ -24088,6 +24108,50 @@ mod lib_unit_tests {
             Some(&serde_json::json!(task_id.as_str()))
         );
 
+        let mut session = initialized_test_session(&server);
+        let session_get = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(final_tasks_get_params(&task_id, serde_json::json!({}))),
+                    72_i64,
+                ),
+                &Arc::new(|_| {}),
+                &test_request_sender(),
+            )
+            .expect("session tasks/get must produce a JSON-RPC response");
+        assert_eq!(
+            session_get.result.as_ref().map(|result| &result["taskId"]),
+            Some(&serde_json::json!(task_id.as_str())),
+            "stdio/session dispatch must serve official tasks/get"
+        );
+        let missing = fastmcp_protocol::FinalTaskId::parse("missing-task-id-0001")
+            .expect("planted missing task id");
+        let session_missing = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    fastmcp_protocol::TASK_GET,
+                    Some(final_tasks_get_params(&missing, serde_json::json!({}))),
+                    73_i64,
+                ),
+                &Arc::new(|_| {}),
+                &test_request_sender(),
+            )
+            .expect("session tasks/get of an unknown id must respond");
+        let missing_error = session_missing
+            .error
+            .as_ref()
+            .expect("unknown task id must fail");
+        assert_ne!(
+            missing_error.code,
+            i32::from(McpErrorCode::MethodNotFound).into(),
+            "unknown task id is not MethodNotFound after official Tasks is installed"
+        );
+
         let mut requests = fastmcp_protocol::TaskInputRequests::new();
         requests.insert(
             "roots".to_owned(),
@@ -24947,9 +25011,14 @@ mod lib_unit_tests {
 
     #[test]
     fn task_rpc_quarantine_matches_exact_legacy_task_method_names() {
-        assert!(is_quarantined_task_rpc("tasks/update"));
+        assert!(is_quarantined_task_rpc("tasks/list"));
+        assert!(is_quarantined_task_rpc("tasks/submit"));
         assert!(
-            !is_quarantined_task_rpc("tasks/updates"),
+            !is_quarantined_task_rpc("tasks/get"),
+            "official final Tasks methods are not quarantined"
+        );
+        assert!(
+            !is_quarantined_task_rpc("tasks/lists"),
             "changing only the owned method name must not quarantine an unrelated extension"
         );
     }
