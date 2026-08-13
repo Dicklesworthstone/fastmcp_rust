@@ -11733,16 +11733,20 @@ impl Server {
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + 'static,
     {
         let request_cancellation = McpRequestCancellation::new();
+        let policy = server.protocol_policy;
         if request.method == SUBSCRIPTIONS_LISTEN {
-            let policy = server.protocol_policy;
+            // `inbound`/`request` move into the worker closure below;
+            // `InboundRequestContext` is deliberately non-Clone, so a failed
+            // spawn cannot fall back to inline dispatch — it answers with an
+            // internal error instead of freezing the receive pump.
             let send_cx = cx.clone();
+            let request_id = request.id.clone();
             let detached = std::thread::Builder::new()
                 .name("fastmcp-stdio-listen".to_owned())
                 .spawn({
                     let server = Arc::clone(&server);
                     let notification_sender = Arc::clone(&notification_sender);
                     let request_cancellation = request_cancellation.clone();
-                    let auth_receipt = auth_receipt.clone();
                     move || {
                         let response = block_on(server.dispatch_with_protocol_policy_owned(
                             policy,
@@ -11764,12 +11768,22 @@ impl Server {
                         }
                     }
                 });
-            if detached.is_ok() {
-                return None;
-            }
+            return match detached {
+                Ok(_) => None,
+                Err(spawn_error) => Some(JsonRpcResponse::error(
+                    request_id,
+                    JsonRpcError {
+                        code: (-32603).into(),
+                        message: format!(
+                            "failed to spawn stdio listen worker: {spawn_error}"
+                        ),
+                        data: None,
+                    },
+                )),
+            };
         }
         block_on(server.dispatch_with_protocol_policy_owned(
-            server.protocol_policy,
+            policy,
             &inbound,
             request,
             None,
