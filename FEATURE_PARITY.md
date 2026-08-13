@@ -134,7 +134,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Icons** | ✅ | 🟡 | Protocol and handler fields exist; the attribute macros do not expose an icon argument |
+| **Icons** | ✅ | ✅ | `#[tool]`, `#[resource]`, and `#[prompt]` accept `icon = "..."` (URL or data URI) |
 | **Tags** | ✅ | ✅ | Supported for filtering in router.rs |
 | **Output schema** | ✅ | ✅ | Tool output schema in macros, handler.rs |
 | **Tool annotations** | ✅ | ✅ | MCP annotations in types.rs, handler.rs |
