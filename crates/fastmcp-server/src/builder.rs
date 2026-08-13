@@ -992,6 +992,7 @@ impl ServerBuilder {
     #[must_use]
     pub fn completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
         self.router.add_completion_handler(handler);
+        self.capabilities.completions = Some(fastmcp_protocol::CompletionsCapability::default());
         self
     }
 

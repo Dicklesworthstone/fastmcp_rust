@@ -10423,6 +10423,17 @@ impl Server {
                         ..Legacy2024ListChangedCapability::default()
                     }
                 }),
+                extensions: self
+                    .capabilities
+                    .completions
+                    .as_ref()
+                    .map(|_| {
+                        BTreeMap::from([(
+                            "completions".to_owned(),
+                            serde_json::Value::Object(serde_json::Map::new()),
+                        )])
+                    })
+                    .unwrap_or_default(),
                 ..Legacy2024ServerCapabilities::default()
             },
             server_info: Legacy2024ServerInfo {
@@ -16560,6 +16571,7 @@ impl Server {
                     // Simple ping-pong for health checks
                     Ok(serde_json::json!({}))
                 }
+                "completion/complete" => self.router.dispatch_legacy_completion(&mw_ctx, &request),
                 _ => Err(McpError::method_not_found(method)),
             }
         })();
@@ -24277,6 +24289,112 @@ mod lib_unit_tests {
             i32::from(McpErrorCode::MethodNotFound).into(),
             "unknown id is not MethodNotFound once default official Tasks is installed"
         );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn default_built_server_advertises_official_tasks_in_discovery() {
+        let discovery = Server::new("default-tasks-discovery", "1.0.0")
+            .build()
+            .server_discovery()
+            .expect("default server must produce discovery");
+        let capabilities = serde_json::to_value(discovery.capabilities())
+            .expect("discovery capabilities serialize");
+        assert!(
+            capabilities
+                .pointer("/extensions/io.modelcontextprotocol~1tasks")
+                .is_some(),
+            "default build must advertise official Tasks so clients can negotiate it"
+        );
+    }
+
+    #[test]
+    fn session_dispatch_serves_legacy_completion_complete() {
+        let server = Server::new("session-completion", "1.0.0")
+            .completion_handler(LiveLegacyCompletionHandler)
+            .build();
+        let mut session = initialized_test_session(&server);
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let response = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    "completion/complete",
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "deploy"},
+                        "argument": {"name": "environment", "value": "sta"},
+                    })),
+                    90_i64,
+                ),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("session completion/complete must produce a JSON-RPC response");
+        let values = response
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/completion/values"))
+            .cloned()
+            .expect("legacy completion must return values");
+        assert_eq!(values, serde_json::json!(["legacy:sta"]));
+
+        let missing_handler = Server::new("session-completion-missing", "1.0.0").build();
+        let mut missing_session = initialized_test_session(&missing_handler);
+        let missing = missing_handler
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut missing_session,
+                JsonRpcRequest::new(
+                    "completion/complete",
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "deploy"},
+                        "argument": {"name": "environment", "value": "sta"},
+                    })),
+                    91_i64,
+                ),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("missing completion handler must still produce a JSON-RPC response");
+        let error = missing
+            .error
+            .as_ref()
+            .expect("no completion handler is MethodNotFound");
+        assert_eq!(error.code, i32::from(McpErrorCode::MethodNotFound).into());
+    }
+
+    #[test]
+    fn completion_handler_is_advertised_on_initialize() {
+        let with_handler = Server::new("advertise-completion", "1.0.0")
+            .completion_handler(LiveLegacyCompletionHandler)
+            .build();
+        assert!(with_handler.capabilities().completions.is_some());
+        let mut session = Session::new(
+            with_handler.info.clone(),
+            with_handler.capabilities().clone(),
+        );
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let response = with_handler
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                initialize_test_request(1, "client", Default::default()),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("initialize must respond");
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/capabilities/completions")),
+            Some(&serde_json::json!({})),
+            "initialize must advertise completions when a handler is installed"
+        );
+
+        let without = Server::new("no-completion", "1.0.0").build();
+        assert!(without.capabilities().completions.is_none());
     }
 
     #[cfg(feature = "tasks")]
