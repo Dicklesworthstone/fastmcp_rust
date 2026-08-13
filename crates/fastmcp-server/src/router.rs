@@ -1794,6 +1794,15 @@ fn derive_handler_context(
         handler_ctx = handler_ctx.with_progress_reporter(reporter);
     }
 
+    if let Some(sender) = notification_sender {
+        let sender = sender.clone();
+        handler_ctx = handler_ctx.with_log_sender(Arc::new(
+            crate::handler::LogNotificationSender::new(move |request| {
+                sender(request);
+            }),
+        ));
+    }
+
     if let Some(senders) = bidirectional_senders {
         if let Some(ref sampling) = senders.sampling {
             handler_ctx = handler_ctx.with_sampling(sampling.clone());

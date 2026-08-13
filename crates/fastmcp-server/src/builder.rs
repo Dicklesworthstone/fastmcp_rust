@@ -638,9 +638,7 @@ impl ServerBuilder {
         }
         self.router
             .add_mcp_apps_ui_resource_with_behavior(resource, self.on_duplicate)?;
-        self.capabilities
-            .resources
-            .get_or_insert_with(ResourcesCapability::default);
+        self.advertise_legacy_resource_subscriptions();
         Ok(self)
     }
 
@@ -660,7 +658,7 @@ impl ServerBuilder {
         }
         self.router
             .add_mcp_apps_tool_with_behavior(handler, self.on_duplicate)?;
-        self.capabilities.tools = Some(ToolsCapability::default());
+        self.advertise_legacy_tools_list_changed();
         Ok(self)
     }
 
@@ -811,7 +809,7 @@ impl ServerBuilder {
                 e.code
             );
         } else {
-            self.capabilities.tools = Some(ToolsCapability::default());
+            self.advertise_legacy_tools_list_changed();
         }
         self
     }
@@ -835,7 +833,7 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities.tools = Some(ToolsCapability::default());
+            self.advertise_legacy_tools_list_changed();
         }
         self
     }
@@ -876,10 +874,26 @@ impl ServerBuilder {
     }
 
     fn advertise_legacy_resource_subscriptions(&mut self) {
-        self.capabilities
+        let resources = self
+            .capabilities
             .resources
-            .get_or_insert_with(ResourcesCapability::default)
-            .subscribe = true;
+            .get_or_insert_with(ResourcesCapability::default);
+        resources.subscribe = true;
+        resources.list_changed = true;
+    }
+
+    fn advertise_legacy_tools_list_changed(&mut self) {
+        self.capabilities
+            .tools
+            .get_or_insert_with(ToolsCapability::default)
+            .list_changed = true;
+    }
+
+    fn advertise_legacy_prompts_list_changed(&mut self) {
+        self.capabilities
+            .prompts
+            .get_or_insert_with(PromptsCapability::default)
+            .list_changed = true;
     }
 
     /// Registers an intentionally exact MCP 2024-11-05-only resource.
@@ -957,7 +971,7 @@ impl ServerBuilder {
                 e.code
             );
         } else {
-            self.capabilities.prompts = Some(PromptsCapability::default());
+            self.advertise_legacy_prompts_list_changed();
         }
         self
     }
@@ -975,7 +989,7 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities.prompts = Some(PromptsCapability::default());
+            self.advertise_legacy_prompts_list_changed();
         }
         self
     }
@@ -1333,15 +1347,13 @@ impl ServerBuilder {
         }
 
         if has_tools {
-            self.capabilities.tools = Some(ToolsCapability::default());
+            self.advertise_legacy_tools_list_changed();
         }
         if has_resources {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
         if has_prompts {
-            self.capabilities.prompts = Some(PromptsCapability::default());
+            self.advertise_legacy_prompts_list_changed();
         }
 
         Ok(self)
@@ -1509,15 +1521,13 @@ impl ServerBuilder {
 
         // Update capabilities
         if has_tools {
-            self.capabilities.tools = Some(ToolsCapability::default());
+            self.advertise_legacy_tools_list_changed();
         }
         if has_resources {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
         if has_prompts {
-            self.capabilities.prompts = Some(PromptsCapability::default());
+            self.advertise_legacy_prompts_list_changed();
         }
 
         log::info!(
@@ -1681,15 +1691,13 @@ impl ServerBuilder {
                     }
                 }
                 if has_tools {
-                    self.capabilities.tools = Some(ToolsCapability::default());
+                    self.advertise_legacy_tools_list_changed();
                 }
                 if has_resources {
-                    self.capabilities
-                        .resources
-                        .get_or_insert_with(ResourcesCapability::default);
+                    self.advertise_legacy_resource_subscriptions();
                 }
                 if has_prompts {
-                    self.capabilities.prompts = Some(PromptsCapability::default());
+                    self.advertise_legacy_prompts_list_changed();
                 }
             }
             (
@@ -1834,15 +1842,13 @@ impl ServerBuilder {
 
         // Update capabilities based on what was mounted
         if has_tools && result.tools > 0 {
-            self.capabilities.tools = Some(ToolsCapability::default());
+            self.advertise_legacy_tools_list_changed();
         }
         if has_resources && (result.resources > 0 || result.resource_templates > 0) {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
         if has_prompts && result.prompts > 0 {
-            self.capabilities.prompts = Some(PromptsCapability::default());
+            self.advertise_legacy_prompts_list_changed();
         }
 
         self
@@ -1894,7 +1900,7 @@ impl ServerBuilder {
 
         // Update capabilities if tools were mounted
         if result.tools > 0 {
-            self.capabilities.tools = Some(ToolsCapability::default());
+            self.advertise_legacy_tools_list_changed();
         }
 
         self
@@ -1947,9 +1953,7 @@ impl ServerBuilder {
 
         // Update capabilities if resources were mounted
         if result.resources > 0 || result.resource_templates > 0 {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
 
         self
@@ -1992,7 +1996,7 @@ impl ServerBuilder {
 
         // Update capabilities if prompts were mounted
         if result.prompts > 0 {
-            self.capabilities.prompts = Some(PromptsCapability::default());
+            self.advertise_legacy_prompts_list_changed();
         }
 
         self
@@ -3489,6 +3493,14 @@ mod tests {
     fn builder_tool_enables_capability() {
         let server = ServerBuilder::new("srv", "1.0").tool(TestTool).build();
         assert!(server.capabilities().tools.is_some());
+        assert!(
+            server
+                .capabilities()
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.list_changed),
+            "registering a tool must advertise tools.listChanged so clients can watch catalog mutations"
+        );
         assert!(server.has_tools());
     }
 
@@ -3528,8 +3540,8 @@ mod tests {
                 .capabilities()
                 .resources
                 .as_ref()
-                .is_some_and(|resources| resources.subscribe),
-            "registering a resource must advertise resources.subscribe so 2024 clients can find it"
+                .is_some_and(|resources| resources.subscribe && resources.list_changed),
+            "registering a resource must advertise subscribe and listChanged"
         );
         assert!(server.has_resources());
     }
@@ -3538,6 +3550,14 @@ mod tests {
     fn builder_prompt_enables_capability() {
         let server = ServerBuilder::new("srv", "1.0").prompt(TestPrompt).build();
         assert!(server.capabilities().prompts.is_some());
+        assert!(
+            server
+                .capabilities()
+                .prompts
+                .as_ref()
+                .is_some_and(|prompts| prompts.list_changed),
+            "registering a prompt must advertise prompts.listChanged"
+        );
         assert!(server.has_prompts());
     }
 

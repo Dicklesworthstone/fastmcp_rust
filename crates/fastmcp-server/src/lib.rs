@@ -3267,6 +3267,7 @@ struct SessionView {
     supports_roots: bool,
     log_level: Option<LogLevel>,
     principal_binding: SessionPrincipalBinding,
+    resource_subscriptions: Vec<String>,
 }
 
 impl SessionView {
@@ -3280,6 +3281,10 @@ impl SessionView {
             supports_roots: session.supports_roots(),
             log_level: session.log_level(),
             principal_binding: session.principal_binding(),
+            resource_subscriptions: session
+                .subscribed_resource_uris()
+                .map(str::to_owned)
+                .collect(),
         }
     }
 }
@@ -4098,6 +4103,40 @@ static NEXT_MODERN_HTTP_STREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// wire, so listener teardown can own every active SSE dispatch.
 static NEXT_LIVE_MODERN_HTTP_RESPONSE_BODY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Bridges handler catalog mutations onto live `subscriptions/listen` streams.
+struct FinalCatalogPublisher {
+    registry: Arc<FinalSubscriptionRegistry>,
+}
+
+impl fastmcp_core::CatalogChangePublisher for FinalCatalogPublisher {
+    fn publish_catalog_changed(&self, kind: fastmcp_core::McpCatalogKind) -> bool {
+        let notification = match kind {
+            fastmcp_core::McpCatalogKind::Tools => ServerNotification::ToolsListChanged(None),
+            fastmcp_core::McpCatalogKind::Resources => {
+                ServerNotification::ResourcesListChanged(None)
+            }
+            fastmcp_core::McpCatalogKind::Prompts => ServerNotification::PromptsListChanged(None),
+        };
+        self.registry.publish(notification).unwrap_or(0) > 0
+    }
+
+    fn publish_resource_updated(&self, uri: &str) -> bool {
+        let Ok(uri) = fastmcp_protocol::common_types::AbsoluteUri::parse(uri) else {
+            return false;
+        };
+        self.registry
+            .publish(ServerNotification::ResourceUpdated(
+                fastmcp_protocol::FinalResourceUpdatedNotificationParams {
+                    uri,
+                    meta: None,
+                    additional: BTreeMap::new(),
+                },
+            ))
+            .unwrap_or(0)
+            > 0
+    }
+}
+
 /// A server-wide registry of request-owned final subscription streams.
 ///
 /// Stdio and modern HTTP both reserve the same bounded entry while sending the
@@ -4174,6 +4213,14 @@ impl FinalSubscriptionElection {
             graceful_completion: AtomicBool::new(false),
         }
     }
+}
+
+/// Caller-owned in-process `subscriptions/listen` stream.
+///
+/// Keep this handle alive for as long as events should be delivered. Drop
+/// unregisters the listener from the server.
+pub struct SubscriptionListenHandle {
+    _lease: FinalSubscriptionLease,
 }
 
 /// Removes one subscription entry when its request exits for any reason.
@@ -10356,6 +10403,43 @@ impl Server {
         self.final_subscriptions.publish(notification)
     }
 
+    /// Opens one in-process `subscriptions/listen` stream.
+    ///
+    /// The returned handle keeps the stream registered. Dropping it
+    /// unregisters the listener. Events are delivered through
+    /// `notification_sender`; this method does not block on stream lifetime.
+    /// Wire transports should keep using their owned listen dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidRequest` when `subscription_id` is not a valid JSON-RPC
+    /// id, `InvalidParams` when the filter cannot be admitted, or a capacity
+    /// error when the server already holds the maximum number of streams.
+    pub fn open_subscription_listen(
+        &self,
+        subscription_id: RequestId,
+        notifications: SubscriptionFilter,
+        notification_sender: NotificationSender,
+    ) -> McpResult<SubscriptionListenHandle> {
+        #[cfg(feature = "tasks")]
+        let accept_tasks = task_subscription_ids(&notifications)
+            .ok()
+            .flatten()
+            .is_some();
+        #[cfg(not(feature = "tasks"))]
+        let accept_tasks = false;
+        let lease = self.final_subscriptions.open(
+            subscription_id,
+            notifications,
+            accept_tasks,
+            None,
+            McpRequestCancellation::new(),
+            None,
+            notification_sender,
+        )?;
+        Ok(SubscriptionListenHandle { _lease: lease })
+    }
+
     /// Publishes one typed final Tasks status notification to matching streams.
     ///
     /// Only subscriptions whose acknowledged `taskIds` set contains the
@@ -10854,6 +10938,7 @@ impl Server {
                 .with_request_cancellation(cancellation.clone()),
             None => inbound.request_context(),
         };
+        let request_ctx = self.with_final_catalog_publisher(request_ctx);
         let budget = self.create_request_budget(request_ctx.cx());
         if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
             if let Some(stats) = &self.stats {
@@ -10941,6 +11026,10 @@ impl Server {
                 serde_json::from_value::<ServerDiscoverRequest>(params)
                     .map_err(|error| McpError::invalid_params(error.to_string()))?;
                 serde_json::to_value(self.server_discovery()?).map_err(McpError::from)
+            } else if request.method == SUBSCRIPTIONS_LISTEN {
+                Err(McpError::invalid_request(
+                    "subscriptions/listen is a long-lived stream; use Server::open_subscription_listen or an owned transport dispatch",
+                ))
             } else {
                 let continuation_cancellation =
                     inbound.mrtr_continuation_cancellation().unwrap_or_default();
@@ -11101,9 +11190,11 @@ impl Server {
                 "Inbound request identity does not match the JSON-RPC request id",
             ));
         }
-        let request_ctx = inbound
-            .request_context()
-            .with_request_cancellation(request_cancellation.clone());
+        let request_ctx = self.with_final_catalog_publisher(
+            inbound
+                .request_context()
+                .with_request_cancellation(request_cancellation.clone()),
+        );
         let budget = self.create_request_budget(request_ctx.cx());
         if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
             return response_for_error(error);
@@ -11612,6 +11703,72 @@ impl Server {
         serde_json::from_str(&wire).map_err(McpError::from)
     }
 
+    /// Runs one modern stdio request. `subscriptions/listen` is detached so the
+    /// receive pump can keep accepting tools/call and cancellation instead of
+    /// freezing on the listen wait loop.
+    fn dispatch_or_detach_stdio_modern_request<S>(
+        server: Arc<Self>,
+        cx: &Cx,
+        inbound: InboundRequestContext,
+        request: JsonRpcRequest,
+        auth_receipt: Option<AuthDispatchCustody>,
+        auth_custody_generation: Option<u64>,
+        notification_sender: NotificationSender,
+        send: Arc<Mutex<S>>,
+    ) -> Option<JsonRpcResponse>
+    where
+        S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + 'static,
+    {
+        let request_cancellation = McpRequestCancellation::new();
+        if request.method == SUBSCRIPTIONS_LISTEN {
+            let policy = server.protocol_policy;
+            let send_cx = cx.clone();
+            let detached = std::thread::Builder::new()
+                .name("fastmcp-stdio-listen".to_owned())
+                .spawn({
+                    let server = Arc::clone(&server);
+                    let notification_sender = Arc::clone(&notification_sender);
+                    let request_cancellation = request_cancellation.clone();
+                    let auth_receipt = auth_receipt.clone();
+                    move || {
+                        let response = block_on(server.dispatch_with_protocol_policy_owned(
+                            policy,
+                            &inbound,
+                            request,
+                            None,
+                            auth_receipt,
+                            auth_custody_generation,
+                            None,
+                            request_cancellation,
+                            None,
+                            notification_sender,
+                        ));
+                        if let Some(response) = response {
+                            let mut send_guard = send
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let _ = send_guard(&send_cx, &JsonRpcMessage::Response(response));
+                        }
+                    }
+                });
+            if detached.is_ok() {
+                return None;
+            }
+        }
+        block_on(server.dispatch_with_protocol_policy_owned(
+            server.protocol_policy,
+            &inbound,
+            request,
+            None,
+            auth_receipt,
+            auth_custody_generation,
+            None,
+            request_cancellation,
+            None,
+            notification_sender,
+        ))
+    }
+
     async fn dispatch_with_protocol_policy_owned(
         self: Arc<Self>,
         policy: ProtocolPolicy,
@@ -11707,6 +11864,18 @@ impl Server {
                 request_cancellation.clone(),
                 budget,
             )?;
+            request_ctx = Self::attach_session_log_floor(
+                request_ctx,
+                runtime.and_then(|runtime| runtime.log_level()),
+            );
+            if let Some(runtime) = runtime {
+                let sender = Arc::clone(&runtime.notification_sender);
+                request_ctx = request_ctx.with_log_sender(Arc::new(
+                    crate::handler::LogNotificationSender::new(move |notification| {
+                        sender(notification);
+                    }),
+                ));
+            }
             if let (Some(marker), Some(runtime)) = (Self::request_progress_marker(request), runtime)
             {
                 let sender = Arc::clone(&runtime.notification_sender);
@@ -13370,7 +13539,7 @@ impl Server {
         cx: &Cx,
         _dispatch_cx: &Cx,
         mut recv: R,
-        mut send: S,
+        send: S,
         notification_sender: NotificationSender,
         transport_label: &'static str,
         _detach_on_worker_timeout: bool,
@@ -13399,6 +13568,7 @@ impl Server {
         }
 
         let modern_connection = ModernConnection::new();
+        let send = Arc::new(Mutex::new(send));
         let mut classifier = StdioEraClassifier::new(runtime_stdio_policy(server.protocol_policy));
         let worker_failed = AtomicBool::new(false);
         let mut negotiated_era = None;
@@ -13434,7 +13604,12 @@ impl Server {
                     Ok(ProtocolEra::Modern2026) => negotiated_era = Some(ProtocolEra::Modern2026),
                     Ok(ProtocolEra::Legacy2024) | Err(_) => {
                         if let Some(response) = protocol_era_refusal(&request) {
-                            let _ = send(cx, &JsonRpcMessage::Response(response));
+                            let _ = send
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                                cx,
+                                &JsonRpcMessage::Response(response),
+                            );
                         }
                         exit_code = 1;
                         break;
@@ -13445,7 +13620,12 @@ impl Server {
                 || modern_protocol_version(&request) != Some(MODERN_PROTOCOL_VERSION)
             {
                 if let Some(response) = protocol_era_refusal(&request) {
-                    let _ = send(cx, &JsonRpcMessage::Response(response));
+                    let _ = send
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                        cx,
+                        &JsonRpcMessage::Response(response),
+                    );
                 }
                 exit_code = 1;
                 break;
@@ -13457,23 +13637,28 @@ impl Server {
                 &modern_connection,
                 transport_authorization.clone().unwrap_or_default(),
             );
-            let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
-                server.protocol_policy,
-                &inbound,
+            let response = Self::dispatch_or_detach_stdio_modern_request(
+                Arc::clone(&server),
+                cx,
+                inbound,
                 request,
-                None,
                 auth_receipt.clone(),
                 auth_custody_generation,
-                None,
-                McpRequestCancellation::new(),
-                None,
                 Arc::clone(&notification_sender),
-            ));
-            if let Some(response) = response
-                && send(cx, &JsonRpcMessage::Response(response)).is_err()
-            {
-                exit_code = 1;
-                break;
+                Arc::clone(&send),
+            );
+            if let Some(response) = response {
+                let send_err = send
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)(
+                    cx,
+                    &JsonRpcMessage::Response(response),
+                )
+                .is_err();
+                if send_err {
+                    exit_code = 1;
+                    break;
+                }
             }
         }
         if owns_server_lifecycle {
@@ -15067,19 +15252,16 @@ impl Server {
                             &modern_connection,
                             TransportAuthorization::default(),
                         );
-                        let request_cancellation = McpRequestCancellation::new();
-                        block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
-                            server.protocol_policy,
-                            &inbound,
+                        Self::dispatch_or_detach_stdio_modern_request(
+                            Arc::clone(&server),
+                            cx,
+                            inbound,
                             request,
                             None,
                             None,
-                            None,
-                            None,
-                            request_cancellation,
-                            None,
                             Arc::clone(&notification_sender),
-                        ))
+                            Arc::clone(&send),
+                        )
                         .map(HandledRequest::untracked)
                     } else {
                         let adapter = match legacy_adapter.as_mut() {
@@ -15480,19 +15662,16 @@ impl Server {
                             &modern_connection,
                             TransportAuthorization::default(),
                         );
-                        let request_cancellation = McpRequestCancellation::new();
-                        block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
-                            server.protocol_policy,
-                            &inbound,
+                        Self::dispatch_or_detach_stdio_modern_request(
+                            Arc::clone(&server),
+                            cx,
+                            inbound,
                             request,
                             None,
                             None,
-                            None,
-                            None,
-                            request_cancellation,
-                            None,
                             Arc::clone(&notification_sender),
-                        ))
+                            Arc::clone(&send),
+                        )
                         .map(HandledRequest::untracked)
                     } else {
                         let adapter = match legacy_adapter.as_mut() {
@@ -16208,13 +16387,31 @@ impl Server {
             state.clone(),
         ));
 
-        McpContext::with_state(cx.clone(), request_id, state)
+        let ctx = McpContext::with_state(cx.clone(), request_id, state)
             .with_request_cancellation(request_cancellation)
             .with_budget_ceiling(budget)
             .with_tool_caller(tool_caller)
-            .with_resource_reader(resource_reader)
+            .with_resource_reader(resource_reader);
+        self.with_final_catalog_publisher(ctx)
             .begin_request_scope()
             .ok_or_else(|| McpError::internal_error("request scope could not be established"))
+    }
+
+    fn with_final_catalog_publisher(&self, ctx: McpContext) -> McpContext {
+        ctx.with_catalog_publisher(Arc::new(FinalCatalogPublisher {
+            registry: Arc::clone(&self.final_subscriptions),
+        }))
+    }
+
+    fn attach_session_log_floor(ctx: McpContext, level: Option<LogLevel>) -> McpContext {
+        ctx.with_min_log_level(level.map(crate::handler::mcp_log_level))
+    }
+
+    fn attach_session_resource_subscriptions<'a>(
+        ctx: McpContext,
+        uris: impl IntoIterator<Item = &'a str>,
+    ) -> McpContext {
+        ctx.with_resource_subscriptions(uris)
     }
 
     /// Dispatches a request to the appropriate handler.
@@ -16239,6 +16436,9 @@ impl Server {
             request_cancellation.clone(),
             *budget,
         )?;
+        let mw_ctx = Self::attach_session_log_floor(mw_ctx, session.log_level());
+        let mw_ctx =
+            Self::attach_session_resource_subscriptions(mw_ctx, session.subscribed_resource_uris());
         if let Err(error) = Self::enforce_request_context(&mw_ctx) {
             let result =
                 Self::enforce_post_dispatch_liveness(request_cancellation, cx, *budget, Err(error));
@@ -16619,6 +16819,11 @@ impl Server {
             request_cancellation.clone(),
             *budget,
         )?;
+        let mw_ctx = Self::attach_session_log_floor(mw_ctx, session.log_level);
+        let mw_ctx = Self::attach_session_resource_subscriptions(
+            mw_ctx,
+            session.resource_subscriptions.iter().map(String::as_str),
+        );
         if let Err(error) = Self::enforce_request_context(&mw_ctx) {
             let result =
                 Self::enforce_post_dispatch_liveness(request_cancellation, cx, *budget, Err(error));
@@ -27720,6 +27925,34 @@ mod lib_unit_tests {
         }
     }
 
+    struct StdioCatalogMutatingTool;
+
+    impl ToolHandler for StdioCatalogMutatingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "stdio_catalog_mutating_tool".to_owned(),
+                description: Some(
+                    "Disables itself so listen streams observe list_changed".to_owned(),
+                ),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            if !ctx.disable_tool("stdio_catalog_mutating_tool") {
+                return Err(McpError::internal_error(
+                    "stdio catalog mutation requires session state",
+                ));
+            }
+            Ok(vec![Content::text("disabled")])
+        }
+    }
+
     struct LiveLegacyRuntimeConnectionTool;
 
     impl ToolHandler for LiveLegacyRuntimeConnectionTool {
@@ -30237,6 +30470,21 @@ mod lib_unit_tests {
         ))
     }
 
+    fn modern_catalog_mutating_tool_request(id: i64) -> JsonRpcMessage {
+        JsonRpcMessage::Request(JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "stdio_catalog_mutating_tool",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            id,
+        ))
+    }
+
     fn modern_subscriptions_listen_request(id: i64) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::new(
             SUBSCRIPTIONS_LISTEN,
@@ -30324,6 +30572,281 @@ mod lib_unit_tests {
         sent.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    fn public_stdio_listen_observes_handler_catalog_mutation() -> Vec<JsonRpcMessage> {
+        const DISCOVERY_ID: i64 = 925;
+        const SUBSCRIPTION_ID: i64 = 926;
+        const TOOL_ID: i64 = 927;
+
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let server = Arc::new(
+            Server::new("public-stdio-listen-catalog", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .tool(StdioCatalogMutatingTool)
+                .build(),
+        );
+        let weak_server = Arc::downgrade(&server);
+        let sent_for_terminator = Arc::clone(&sent);
+        let terminator = thread::spawn(move || {
+            for _ in 0..200 {
+                let saw_list_changed = sent_for_terminator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .any(|message| {
+                        matches!(
+                            message,
+                            JsonRpcMessage::Request(request)
+                                if request.method == "notifications/tools/list_changed"
+                        )
+                    });
+                if saw_list_changed {
+                    return weak_server
+                        .upgrade()
+                        .is_some_and(|server| server.terminate_subscription_streams() == 1);
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            false
+        });
+
+        struct WaitForAckThenMutate {
+            phase: u8,
+            sent: Arc<Mutex<Vec<JsonRpcMessage>>>,
+        }
+        impl Transport for WaitForAckThenMutate {
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                let phase = self.phase;
+                self.phase = self.phase.saturating_add(1);
+                match phase {
+                    0 => Ok(modern_discovery_request(DISCOVERY_ID)),
+                    1 => Ok(modern_subscriptions_listen_request(SUBSCRIPTION_ID)),
+                    2 => {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while Instant::now() < deadline {
+                            let acknowledged = self
+                                .sent
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .iter()
+                                .any(|message| {
+                                    matches!(
+                                        message,
+                                        JsonRpcMessage::Request(request)
+                                            if request.method
+                                                == "notifications/subscriptions/acknowledged"
+                                    )
+                                });
+                            if acknowledged {
+                                return Ok(modern_catalog_mutating_tool_request(TOOL_ID));
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(TransportError::Timeout)
+                    }
+                    _ => Err(TransportError::Closed),
+                }
+            }
+
+            fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.sent
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(message.clone());
+                Ok(())
+            }
+
+            fn close(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let _ = receive_calls;
+        let server = match Arc::try_unwrap(server) {
+            Ok(server) => server,
+            Err(server) => panic!(
+                "the terminator retains only a weak server reference; unexpected strong count: {}",
+                Arc::strong_count(&server)
+            ),
+        };
+        server
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                WaitForAckThenMutate {
+                    phase: 0,
+                    sent: Arc::clone(&sent),
+                },
+            )
+            .expect("public modern stdio transport must settle listen plus catalog mutation");
+        assert!(
+            terminator
+                .join()
+                .expect("catalog-mutation terminator must not panic"),
+            "the public listener must observe handler-driven tools/list_changed"
+        );
+        sent.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[test]
+    fn dispatch_stateless_listen_is_not_method_not_found() {
+        let server = Server::new("stateless-listen-error", "1.0.0").build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 926, InboundRequestTransport::Memory);
+        let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(926) else {
+            panic!("listen fixture must be a request");
+        };
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("listen with an id must produce a JSON-RPC response");
+        let error = response
+            .error
+            .expect("sync dispatch_stateless cannot own a listen stream");
+        assert_ne!(
+            error.code,
+            i32::from(McpErrorCode::MethodNotFound).into(),
+            "listen must not look unimplemented: {error:?}"
+        );
+        assert!(
+            error.message.contains("open_subscription_listen"),
+            "error must name the in-process listen API: {error:?}"
+        );
+    }
+
+    #[test]
+    fn open_subscription_listen_receives_stateless_catalog_mutation() {
+        let server = Server::new("in-process-listen", "1.0.0")
+            .tool(StdioCatalogMutatingTool)
+            .build();
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let _listen = server
+            .open_subscription_listen(
+                RequestId::String("in-process-listen".to_owned()),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                sender,
+            )
+            .expect("in-process listen must open");
+        assert!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|request| request.method == "notifications/subscriptions/acknowledged"),
+            "open_subscription_listen must acknowledge immediately"
+        );
+
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            Cx::for_testing(),
+            927,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let JsonRpcMessage::Request(request) = modern_catalog_mutating_tool_request(927) else {
+            panic!("catalog mutation fixture must be a request");
+        };
+        let response = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("stateless tools/call must respond");
+        assert!(
+            response.error.is_none(),
+            "catalog mutation tool must succeed: {response:?}"
+        );
+        assert!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|request| request.method == "notifications/tools/list_changed"),
+            "in-process listen must observe handler-driven list_changed"
+        );
+    }
+
+    #[test]
+    fn dropped_in_process_listen_does_not_receive_later_catalog_events() {
+        let server = Server::new("dropped-in-process-listen", "1.0.0")
+            .tool(StdioCatalogMutatingTool)
+            .build();
+        let sent = Arc::new(Mutex::new(Vec::<JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let listen = server
+            .open_subscription_listen(
+                RequestId::String("dropped-listen".to_owned()),
+                SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                },
+                sender,
+            )
+            .expect("in-process listen must open");
+        drop(listen);
+        sent.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let connection = ModernConnection::new();
+        let inbound = InboundRequestContext::with_modern_connection(
+            Cx::for_testing(),
+            928,
+            InboundRequestTransport::Memory,
+            &connection,
+        );
+        let JsonRpcMessage::Request(request) = modern_catalog_mutating_tool_request(928) else {
+            panic!("catalog mutation fixture must be a request");
+        };
+        let _ = server
+            .dispatch_stateless(&inbound, &request)
+            .expect("stateless tools/call must respond");
+        assert!(
+            sent.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|request| request.method != "notifications/tools/list_changed"),
+            "a dropped listen handle must not receive later catalog events"
+        );
+    }
+
+    #[test]
+    fn public_stdio_listen_receives_handler_driven_list_changed() {
+        let transcript = public_stdio_listen_observes_handler_catalog_mutation();
+        assert!(
+            transcript.iter().any(|message| {
+                matches!(
+                    message,
+                    JsonRpcMessage::Request(request)
+                        if request.method == "notifications/subscriptions/acknowledged"
+                )
+            }),
+            "listen must acknowledge before catalog events: {transcript:?}"
+        );
+        assert!(
+            transcript.iter().any(|message| {
+                matches!(
+                    message,
+                    JsonRpcMessage::Request(request)
+                        if request.method == "notifications/tools/list_changed"
+                )
+            }),
+            "detached stdio listen must receive handler-driven list_changed: {transcript:?}"
+        );
     }
 
     #[derive(Clone, Copy)]

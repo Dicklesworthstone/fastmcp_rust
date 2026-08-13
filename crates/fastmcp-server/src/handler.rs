@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use asupersync::Cx;
 use fastmcp_core::{
-    McpContext, McpError, McpOutcome, McpResult, NotificationSender, Outcome, ProgressReporter,
-    SessionState,
+    McpCatalogKind, McpContext, McpError, McpLogLevel, McpOutcome, McpResult, NotificationSender,
+    Outcome, ProgressReporter, SessionState,
 };
 use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::common_types::{
@@ -31,9 +31,10 @@ use fastmcp_protocol::{
     FinalEmbeddedElicitationParams, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest,
     FinalEmbeddedUrlElicitationParams, FinalGetPromptResult, FinalProgressNotificationParams,
     FinalPrompt, FinalPromptMessage, FinalReadResourceResult, FinalResource, FinalResourceTemplate,
-    FinalTool, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, ProgressMarker,
-    ProgressParams, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta,
-    ResultPeerEra, Tool, ToolAnnotations, decode_peer_result, encode_result, exact_json_from_serde,
+    FinalTool, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, LogLevel,
+    LogMessageParams, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
+    ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
+    decode_peer_result, encode_result, exact_json_from_serde,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -610,6 +611,103 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProgressNotificationSender")
             .finish_non_exhaustive()
+    }
+}
+
+/// Emits `notifications/message` from handler `ctx.info()` and friends.
+pub(crate) struct LogNotificationSender<F> {
+    send_fn: F,
+}
+
+impl<F> LogNotificationSender<F>
+where
+    F: Fn(JsonRpcRequest) + Send + Sync,
+{
+    pub(crate) fn new(send_fn: F) -> Self {
+        Self { send_fn }
+    }
+}
+
+impl<F> NotificationSender for LogNotificationSender<F>
+where
+    F: Fn(JsonRpcRequest) + Send + Sync,
+{
+    fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {}
+
+    fn send_log(&self, level: McpLogLevel, logger: Option<&str>, data: serde_json::Value) {
+        let params = LogMessageParams {
+            level: protocol_log_level(level),
+            logger: logger.map(str::to_owned),
+            data,
+        };
+        let Ok(payload) = serde_json::to_value(params) else {
+            return;
+        };
+        let notification = JsonRpcRequest::notification("notifications/message", Some(payload));
+        if crate::catch_extension_unwind(|| (self.send_fn)(notification)).is_err() {
+            log::error!(
+                target: "fastmcp_rust::handler",
+                "log notification callback terminated unexpectedly; detail=panic_payload_redacted"
+            );
+        }
+    }
+
+    fn send_catalog_changed(&self, kind: McpCatalogKind) {
+        let method = match kind {
+            McpCatalogKind::Tools => "notifications/tools/list_changed",
+            McpCatalogKind::Resources => "notifications/resources/list_changed",
+            McpCatalogKind::Prompts => "notifications/prompts/list_changed",
+        };
+        let notification = JsonRpcRequest::notification(method, Some(serde_json::json!({})));
+        if crate::catch_extension_unwind(|| (self.send_fn)(notification)).is_err() {
+            log::error!(
+                target: "fastmcp_rust::handler",
+                "catalog change notification callback terminated unexpectedly; detail=panic_payload_redacted"
+            );
+        }
+    }
+
+    fn send_resource_updated(&self, uri: &str) {
+        let params = fastmcp_protocol::ResourceUpdatedNotificationParams {
+            uri: uri.to_owned(),
+        };
+        let Ok(payload) = serde_json::to_value(params) else {
+            return;
+        };
+        let notification =
+            JsonRpcRequest::notification("notifications/resources/updated", Some(payload));
+        if crate::catch_extension_unwind(|| (self.send_fn)(notification)).is_err() {
+            log::error!(
+                target: "fastmcp_rust::handler",
+                "resource update notification callback terminated unexpectedly; detail=panic_payload_redacted"
+            );
+        }
+    }
+}
+
+pub(crate) fn mcp_log_level(level: LogLevel) -> McpLogLevel {
+    match level {
+        LogLevel::Debug => McpLogLevel::Debug,
+        LogLevel::Info => McpLogLevel::Info,
+        LogLevel::Notice => McpLogLevel::Notice,
+        LogLevel::Warning => McpLogLevel::Warning,
+        LogLevel::Error => McpLogLevel::Error,
+        LogLevel::Critical => McpLogLevel::Critical,
+        LogLevel::Alert => McpLogLevel::Alert,
+        LogLevel::Emergency => McpLogLevel::Emergency,
+    }
+}
+
+fn protocol_log_level(level: McpLogLevel) -> LogLevel {
+    match level {
+        McpLogLevel::Debug => LogLevel::Debug,
+        McpLogLevel::Info => LogLevel::Info,
+        McpLogLevel::Notice => LogLevel::Notice,
+        McpLogLevel::Warning => LogLevel::Warning,
+        McpLogLevel::Error => LogLevel::Error,
+        McpLogLevel::Critical => LogLevel::Critical,
+        McpLogLevel::Alert => LogLevel::Alert,
+        McpLogLevel::Emergency => LogLevel::Emergency,
     }
 }
 
