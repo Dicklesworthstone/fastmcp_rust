@@ -174,6 +174,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `resources/unsubscribe` | ✅ | ✅ | Protocol support |
 | `prompts/list` | ✅ | ✅ | With cursor pagination |
 | `prompts/get` | ✅ | ✅ | With argument support |
+| `completion/complete` | ✅ | ✅ | Session and stateless dispatch serve a registered handler; `initialize` advertises `capabilities.completions` |
 | `logging/setLevel` | ✅ | ✅ | `LogLevel` request handling exists |
 | `notifications/cancelled` | ✅ | 🟡 | Stdio can receive and route the notification while its dispatch worker runs. Custom/SSE/WebSocket loops remain sequential; end-to-end interruption, request ownership, and reliable `awaitCleanup` remain unverified |
 | `notifications/progress` | ✅ | ✅ | Progress token support |
@@ -184,6 +185,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 |------------|--------|------|-------|
 | `tasks/list` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
 | `tasks/get` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
+| `tasks/update` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
 | `tasks/submit` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
 | `tasks/cancel` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
 
