@@ -7970,6 +7970,23 @@ mod tests {
             client.call_tool_result(cx, name, arguments).await
         }
 
+        async fn read_modern_http_resource_result(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            uri: &str,
+        ) -> Result<modern::FinalCoreResult, modern::HttpClientError> {
+            client.read_resource_result(cx, uri).await
+        }
+
+        async fn get_modern_http_prompt_result(
+            client: &mut modern::HttpClient,
+            cx: &modern::Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> Result<modern::FinalCoreResult, modern::HttpClientError> {
+            client.get_prompt_result(cx, name, arguments).await
+        }
+
         async fn call_modern_http_tool_result_with_cancellation(
             client: &mut modern::HttpClient,
             cx: &modern::Cx,
