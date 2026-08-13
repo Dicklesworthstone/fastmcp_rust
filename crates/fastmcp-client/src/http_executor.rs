@@ -3085,6 +3085,16 @@ impl ClientHttpConnection {
         Ok(())
     }
 
+    /// Returns the installed modern reverse handlers when this connection is
+    /// the MCP 2026-07-28 HTTP transport.
+    pub(crate) fn modern_reverse_request_handlers(&self) -> Option<&ReverseRequestHandlers> {
+        match self {
+            Self::Modern(client) => Some(&client.reverse_request_handlers),
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::LegacySse(_) => None,
+        }
+    }
+
     /// Sends one active client request through the selected transport.
     ///
     /// Modern requests execute as one stateless final POST. Exact legacy

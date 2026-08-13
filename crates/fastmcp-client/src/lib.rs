@@ -135,6 +135,10 @@ pub use fastmcp_protocol::{
     InputRequiredResult, LegacyCoreRequest, LegacyCoreResult, ListRootsParams, ListRootsResult,
     ReadResourceResult, SubscriptionFilter,
 };
+use fastmcp_protocol::{
+    ElicitRequestFormParams, ElicitRequestUrlParams, FinalEmbeddedCreateMessageParams,
+    FinalEmbeddedElicitationParams, FinalEmbeddedInputRequest, exact_json_to_serde,
+};
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, ModernHttpClient,
     ModernHttpClientError, ModernHttpResponseStream, ModernHttpSubscriptionListenCollector,
@@ -438,6 +442,198 @@ impl ReverseRequestHandlers {
             || self.modern_elicitation_create.is_some()
     }
 
+    /// Fulfills one peer `input_required` result by invoking the matching
+    /// installed modern reverse handlers locally.
+    ///
+    /// This is the modern MRTR path: the server asked for sampling, roots, or
+    /// elicitation inside `inputRequests`, and the client supplies
+    /// `inputResponses` on the next `tools/call` without sending reverse
+    /// JSON-RPC.
+    pub(crate) fn respond_to_input_required(
+        &self,
+        cx: &Cx,
+        input_required: &InputRequiredResult,
+    ) -> McpResult<MrtrInputResponses> {
+        let Some(input_requests) = input_required.input_requests() else {
+            return Ok(MrtrInputResponses::new());
+        };
+        let mut responses = MrtrInputResponses::new();
+        for member in input_requests.members() {
+            let wire = exact_json_to_serde(&member.value).map_err(|error| {
+                McpError::invalid_params(format!(
+                    "MRTR input request {} is not valid JSON: {error}",
+                    member.name
+                ))
+            })?;
+            let request: FinalEmbeddedInputRequest =
+                serde_json::from_value(wire).map_err(|error| {
+                    McpError::invalid_params(format!(
+                        "MRTR input request {} is not a final embedded descriptor: {error}",
+                        member.name
+                    ))
+                })?;
+            let value = self.invoke_embedded_input_request(cx, &member.name, request)?;
+            responses.insert(member.name.clone(), value);
+        }
+        Ok(responses)
+    }
+
+    /// Async counterpart of [`Self::respond_to_input_required`] for callers
+    /// already on an asupersync runtime. Nested `block_on` would cancel.
+    pub(crate) async fn respond_to_input_required_async(
+        &self,
+        cx: &Cx,
+        input_required: &InputRequiredResult,
+    ) -> McpResult<MrtrInputResponses> {
+        let Some(input_requests) = input_required.input_requests() else {
+            return Ok(MrtrInputResponses::new());
+        };
+        let mut responses = MrtrInputResponses::new();
+        for member in input_requests.members() {
+            let wire = exact_json_to_serde(&member.value).map_err(|error| {
+                McpError::invalid_params(format!(
+                    "MRTR input request {} is not valid JSON: {error}",
+                    member.name
+                ))
+            })?;
+            let request: FinalEmbeddedInputRequest =
+                serde_json::from_value(wire).map_err(|error| {
+                    McpError::invalid_params(format!(
+                        "MRTR input request {} is not a final embedded descriptor: {error}",
+                        member.name
+                    ))
+                })?;
+            let value = self
+                .invoke_embedded_input_request_async(cx, &member.name, request)
+                .await?;
+            responses.insert(member.name.clone(), value);
+        }
+        Ok(responses)
+    }
+
+    fn invoke_embedded_input_request(
+        &self,
+        cx: &Cx,
+        input_key: &str,
+        request: FinalEmbeddedInputRequest,
+    ) -> McpResult<serde_json::Value> {
+        match request {
+            FinalEmbeddedInputRequest::Sampling(params) => {
+                let Some(handler) = self.modern_sampling_create_message.as_ref() else {
+                    return Err(McpError::invalid_params(format!(
+                        "MRTR input request {input_key} requires an installed sampling/createMessage reverse handler"
+                    )));
+                };
+                let result = invoke_locked_reverse_request_handler(
+                    cx,
+                    handler,
+                    ReverseRequestCancellation::new(),
+                    final_create_message_params_from_embedded(params),
+                )?;
+                serde_json::to_value(result).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "MRTR sampling input response could not serialize: {error}"
+                    ))
+                })
+            }
+            FinalEmbeddedInputRequest::Roots(params) => {
+                let Some(handler) = self.modern_roots_list.as_ref() else {
+                    return Err(McpError::invalid_params(format!(
+                        "MRTR input request {input_key} requires an installed roots/list reverse handler"
+                    )));
+                };
+                let result = invoke_locked_reverse_request_handler(
+                    cx,
+                    handler,
+                    ReverseRequestCancellation::new(),
+                    params,
+                )?;
+                serde_json::to_value(result).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "MRTR roots input response could not serialize: {error}"
+                    ))
+                })
+            }
+            FinalEmbeddedInputRequest::Elicitation(params) => {
+                let Some(handler) = self.modern_elicitation_create.as_ref() else {
+                    return Err(McpError::invalid_params(format!(
+                        "MRTR input request {input_key} requires an installed elicitation/create reverse handler"
+                    )));
+                };
+                let result = invoke_locked_reverse_request_handler(
+                    cx,
+                    handler,
+                    ReverseRequestCancellation::new(),
+                    elicit_request_params_from_embedded(input_key, params),
+                )?;
+                serde_json::to_value(result).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "MRTR elicitation input response could not serialize: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
+    async fn invoke_embedded_input_request_async(
+        &self,
+        cx: &Cx,
+        input_key: &str,
+        request: FinalEmbeddedInputRequest,
+    ) -> McpResult<serde_json::Value> {
+        match request {
+            FinalEmbeddedInputRequest::Sampling(params) => {
+                let Some(handler) = self.modern_sampling_create_message.as_ref() else {
+                    return Err(McpError::invalid_params(format!(
+                        "MRTR input request {input_key} requires an installed sampling/createMessage reverse handler"
+                    )));
+                };
+                let result = handler(
+                    cx,
+                    ReverseRequestCancellation::new(),
+                    final_create_message_params_from_embedded(params),
+                )
+                .await?;
+                serde_json::to_value(result).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "MRTR sampling input response could not serialize: {error}"
+                    ))
+                })
+            }
+            FinalEmbeddedInputRequest::Roots(params) => {
+                let Some(handler) = self.modern_roots_list.as_ref() else {
+                    return Err(McpError::invalid_params(format!(
+                        "MRTR input request {input_key} requires an installed roots/list reverse handler"
+                    )));
+                };
+                let result = handler(cx, ReverseRequestCancellation::new(), params).await?;
+                serde_json::to_value(result).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "MRTR roots input response could not serialize: {error}"
+                    ))
+                })
+            }
+            FinalEmbeddedInputRequest::Elicitation(params) => {
+                let Some(handler) = self.modern_elicitation_create.as_ref() else {
+                    return Err(McpError::invalid_params(format!(
+                        "MRTR input request {input_key} requires an installed elicitation/create reverse handler"
+                    )));
+                };
+                let result = handler(
+                    cx,
+                    ReverseRequestCancellation::new(),
+                    elicit_request_params_from_embedded(input_key, params),
+                )
+                .await?;
+                serde_json::to_value(result).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "MRTR elicitation input response could not serialize: {error}"
+                    ))
+                })
+            }
+        }
+    }
+
     /// Adds the exact 2024-11-05 client capabilities implied by these
     /// callbacks. Roots-list-change remains disabled because registering a
     /// roots handler does not authorize the client to originate change events.
@@ -601,6 +797,47 @@ pub enum FinalToolCallOutcome {
 /// `input_required` result. Values remain JSON because the peer owns the
 /// individual embedded-request schemas.
 pub type MrtrInputResponses = BTreeMap<String, serde_json::Value>;
+
+fn final_create_message_params_from_embedded(
+    params: FinalEmbeddedCreateMessageParams,
+) -> FinalCreateMessageParams {
+    FinalCreateMessageParams {
+        meta: fastmcp_protocol::common_types::OpenMetadata::default(),
+        messages: params.messages,
+        max_tokens: params.max_tokens,
+        system_prompt: params.system_prompt,
+        temperature: params.temperature,
+        stop_sequences: params.stop_sequences,
+        model_preferences: params.model_preferences,
+        include_context: params.include_context,
+        metadata: params.metadata,
+        tools: params.tools,
+        tool_choice: params.tool_choice,
+    }
+}
+
+fn elicit_request_params_from_embedded(
+    input_key: &str,
+    params: FinalEmbeddedElicitationParams,
+) -> ElicitRequestParams {
+    match params {
+        FinalEmbeddedElicitationParams::Form(form) => {
+            ElicitRequestParams::Form(ElicitRequestFormParams {
+                mode: form.mode,
+                message: form.message,
+                requested_schema: form.requested_schema.schema().clone(),
+            })
+        }
+        FinalEmbeddedElicitationParams::Url(url) => {
+            ElicitRequestParams::Url(ElicitRequestUrlParams {
+                mode: url.mode,
+                message: url.message,
+                url: url.url.as_str().to_owned(),
+                elicitation_id: input_key.to_owned(),
+            })
+        }
+    }
+}
 
 /// Maximum input responses accepted for one MRTR continuation.
 ///
@@ -5318,15 +5555,26 @@ where
     }
 
     /// Reads one resource through the negotiated WebSocket era.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`].
     pub async fn read_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<CoreResult>
     where
         IO: Send + 'static,
     {
-        self.request_core_verb(cx, "resources/read", serde_json::json!({ "uri": uri }))
-            .await
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "resources/read",
+            serde_json::json!({ "uri": uri }),
+        )
+        .await
     }
 
     /// Gets one prompt through the negotiated WebSocket era.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`].
     pub async fn get_prompt(
         &mut self,
         cx: &Cx,
@@ -5348,10 +5596,14 @@ where
                 })?,
             );
         }
-        self.request_core_verb(cx, "prompts/get", parameters).await
+        self.follow_installed_mrtr(cx, None, "prompts/get", parameters)
+            .await
     }
 
     /// Calls one tool through the negotiated WebSocket era.
+    ///
+    /// When modern reverse handlers are installed, a peer `input_required`
+    /// result is fulfilled locally and retried with `inputResponses`.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
@@ -5361,8 +5613,9 @@ where
     where
         IO: Send + 'static,
     {
-        self.request_core_verb(
+        self.follow_installed_mrtr(
             cx,
+            None,
             "tools/call",
             serde_json::json!({ "name": name, "arguments": arguments }),
         )
@@ -5441,6 +5694,9 @@ where
     }
 
     /// Calls one tool under a caller-owned cancellation domain.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`].
     pub async fn call_tool_with_cancellation(
         &mut self,
         cx: &Cx,
@@ -5451,13 +5707,60 @@ where
     where
         IO: Send + 'static,
     {
-        self.request_core_verb_with_cancellation(
+        self.follow_installed_mrtr(
             cx,
-            cancellation,
+            Some(cancellation),
             "tools/call",
             serde_json::json!({ "name": name, "arguments": arguments }),
         )
         .await
+    }
+
+    async fn follow_installed_mrtr(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        original_parameters: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        let handlers = self
+            .reverse_request_handlers
+            .has_modern_handlers()
+            .then(|| self.reverse_request_handlers.clone());
+        let mut parameters = original_parameters.clone();
+        let mut rounds = 0_usize;
+        loop {
+            let result = match cancellation {
+                Some(cancellation) => {
+                    self.request_core_verb_with_cancellation(cx, cancellation, method, parameters)
+                        .await?
+                }
+                None => self.request_core_verb(cx, method, parameters).await?,
+            };
+            let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
+                return Ok(result);
+            };
+            let Some(handlers) = handlers.as_ref() else {
+                return Ok(result);
+            };
+            if rounds >= MAX_MRTR_CONTINUATION_ROUNDS {
+                return Err(McpError::invalid_request(
+                    "MRTR continuation-round limit exceeded",
+                ));
+            }
+            rounds += 1;
+            let input_responses = handlers
+                .respond_to_input_required_async(cx, input_required)
+                .await?;
+            parameters = mrtr_retry_parameters(
+                original_parameters.clone(),
+                input_required,
+                input_responses,
+            )?;
+        }
     }
 
     /// Sends one admitted generic MCP 2026-07-28 extension request.
@@ -9869,16 +10172,27 @@ impl HttpClient {
     }
 
     /// Reads one resource through the negotiated HTTP era.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`].
     pub async fn read_resource(
         &mut self,
         cx: &Cx,
         uri: &str,
     ) -> Result<CoreResult, HttpClientError> {
-        self.request_final_core(cx, "resources/read", serde_json::json!({ "uri": uri }))
-            .await
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "resources/read",
+            serde_json::json!({ "uri": uri }),
+        )
+        .await
     }
 
     /// Gets one prompt through the negotiated HTTP era.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`].
     pub async fn get_prompt(
         &mut self,
         cx: &Cx,
@@ -9901,18 +10215,24 @@ impl HttpClient {
                 })?,
             );
         }
-        self.request_final_core(cx, "prompts/get", parameters).await
+        self.follow_installed_mrtr(cx, None, "prompts/get", parameters)
+            .await
     }
 
     /// Calls one tool through the negotiated HTTP era.
+    ///
+    /// When modern reverse handlers are installed, a peer `input_required`
+    /// result is fulfilled locally and retried with `inputResponses` instead of
+    /// being returned to the caller.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CoreResult, HttpClientError> {
-        self.request_final_core(
+        self.follow_installed_mrtr(
             cx,
+            None,
             "tools/call",
             serde_json::json!({ "name": name, "arguments": arguments }),
         )
@@ -9920,6 +10240,9 @@ impl HttpClient {
     }
 
     /// Calls one tool under a caller-owned cancellation domain.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`]. Cancellation is checked on every HTTP round.
     pub async fn call_tool_with_cancellation(
         &mut self,
         cx: &Cx,
@@ -9927,13 +10250,58 @@ impl HttpClient {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CoreResult, HttpClientError> {
-        self.request_final_core_with_cancellation(
+        self.follow_installed_mrtr(
             cx,
-            cancellation,
+            Some(cancellation),
             "tools/call",
             serde_json::json!({ "name": name, "arguments": arguments }),
         )
         .await
+    }
+
+    async fn follow_installed_mrtr(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        original_parameters: serde_json::Value,
+    ) -> Result<CoreResult, HttpClientError> {
+        let handlers = self
+            .connection
+            .modern_reverse_request_handlers()
+            .filter(|handlers| handlers.has_modern_handlers())
+            .cloned();
+        let mut parameters = original_parameters.clone();
+        let mut rounds = 0_usize;
+        loop {
+            let result = match cancellation {
+                Some(cancellation) => {
+                    self.request_final_core_with_cancellation(cx, cancellation, method, parameters)
+                        .await?
+                }
+                None => self.request_final_core(cx, method, parameters).await?,
+            };
+            let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
+                return Ok(result);
+            };
+            let Some(handlers) = handlers.as_ref() else {
+                return Ok(result);
+            };
+            if rounds >= MAX_MRTR_CONTINUATION_ROUNDS {
+                return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                    "MRTR continuation-round limit exceeded",
+                )));
+            }
+            rounds += 1;
+            let input_responses = handlers
+                .respond_to_input_required_async(cx, input_required)
+                .await?;
+            parameters = mrtr_retry_parameters(
+                original_parameters.clone(),
+                input_required,
+                input_responses,
+            )?;
+        }
     }
 
     /// Sends one raw final extension request after exact bilateral admission.
@@ -14861,6 +15229,15 @@ impl Client {
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026)
+            && self.reverse_request_handlers.has_modern_handlers()
+        {
+            let handlers = self.reverse_request_handlers.clone();
+            let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
+            return self.call_tool_with_mrtr_retry(name, arguments, |input_required| {
+                handlers.respond_to_input_required(&cx, input_required)
+            });
+        }
         let params = CallToolParams {
             name: name.to_string(),
             arguments: Some(arguments),
@@ -22150,6 +22527,267 @@ mod tests {
     fn public_http_mrtr_retry_round_bound_rejects_only_an_input_required_fifth_response_without_contact()
      {
         assert_public_http_mrtr_round_bound(false);
+    }
+
+    #[cfg(unix)]
+    fn public_http_sampling_input_required_body(request_id: i64) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "resultType": "input_required",
+                "inputRequests": {
+                    "sample": {
+                        "method": "sampling/createMessage",
+                        "params": {
+                            "messages": [{
+                                "role": "user",
+                                "content": { "type": "text", "text": "hello" }
+                            }],
+                            "maxTokens": 8
+                        }
+                    }
+                },
+                "requestState": "retry-sample"
+            }
+        }))
+        .expect("sampling input_required fixture serializes")
+    }
+
+    #[cfg(unix)]
+    fn public_http_sampling_handler() -> ReverseRequestHandlers {
+        ReverseRequestHandlers::new().with_modern_sampling_create_message(
+            |_cx, _cancellation, params| {
+                Box::pin(async move {
+                    assert_eq!(params.max_tokens.to_string(), "8");
+                    Ok(FinalCreateMessageResult {
+                        content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                            fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                                text: "sampled".to_owned(),
+                                annotations: None,
+                                meta: None,
+                                additional: BTreeMap::new(),
+                            },
+                        ),
+                        model: "public-http-mrtr-model".to_owned(),
+                        role: fastmcp_protocol::Role::Assistant,
+                        stop_reason: None,
+                        meta: None,
+                    })
+                })
+            },
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_call_tool_follows_input_required_with_installed_sampling_handler() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind public call_tool MRTR listener");
+        let address = listener
+            .local_addr()
+            .expect("read public call_tool MRTR address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept discovery");
+            let probe = read_http_cache_test_request(&mut stream);
+            assert_eq!(probe["method"], "server/discover");
+            let discovery =
+                modern_discovery_response("public-http-call-tool-mrtr", &[MODERN_PROTOCOL_VERSION]);
+            write_http_cache_test_response(&mut stream, "application/json", discovery.as_bytes());
+
+            let (mut stream, _) = listener.accept().expect("accept initial tools/call");
+            let initial = read_http_cache_test_request(&mut stream);
+            assert_eq!(initial["id"], 2);
+            assert_eq!(initial["method"], "tools/call");
+            assert!(initial["params"].get("inputResponses").is_none());
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                &public_http_sampling_input_required_body(2),
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept handler-driven retry");
+            let retry = read_http_cache_test_request(&mut stream);
+            assert_eq!(retry["id"], 3);
+            assert_eq!(retry["method"], "tools/call");
+            assert_eq!(retry["params"]["requestState"], "retry-sample");
+            assert_eq!(
+                retry["params"]["inputResponses"]["sample"]["model"],
+                "public-http-mrtr-model"
+            );
+            assert_eq!(
+                retry["params"]["inputResponses"]["sample"]["content"]["text"],
+                "sampled"
+            );
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"sampled-tool"}]}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&modern_target))
+                .client_info("public-http-call-tool-mrtr", "1.0.0")
+                .reverse_request_handlers(public_http_sampling_handler())
+                .connect_http_client_with_cx(&cx),
+        )
+        .expect("public HTTP client connects with sampling handlers");
+        let result =
+            http_test_runtime_block_on(client.call_tool(&cx, "sample-tool", serde_json::json!({})))
+                .expect("public call_tool follows sampling input_required to a terminal result");
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+        server.join().expect("public call_tool MRTR peer must join");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_call_tool_returns_input_required_when_no_reverse_handlers_are_installed() {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind public call_tool no-handler listener");
+        let address = listener
+            .local_addr()
+            .expect("read public call_tool no-handler address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept discovery");
+            let probe = read_http_cache_test_request(&mut stream);
+            assert_eq!(probe["method"], "server/discover");
+            let discovery = modern_discovery_response(
+                "public-http-call-tool-no-handler",
+                &[MODERN_PROTOCOL_VERSION],
+            );
+            write_http_cache_test_response(&mut stream, "application/json", discovery.as_bytes());
+
+            let (mut stream, _) = listener.accept().expect("accept tools/call");
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tools/call");
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                &public_http_sampling_input_required_body(2),
+            );
+
+            listener
+                .set_nonblocking(true)
+                .expect("configure no-handler no-contact assertion");
+            let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < no_contact_deadline {
+                match listener.accept() {
+                    Ok(_) => panic!(
+                        "call_tool without reverse handlers must not retry an input_required result"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("unexpected no-handler no-contact error: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "public-http-call-tool-no-handler".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP client completes discovery");
+        let result =
+            http_test_runtime_block_on(client.call_tool(&cx, "sample-tool", serde_json::json!({})))
+                .expect("call_tool without handlers returns the input_required result");
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { .. })
+        ));
+        server
+            .join()
+            .expect("public call_tool no-handler peer must join");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_call_tool_rejects_unhandled_sampling_input_before_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind public call_tool missing-handler listener");
+        let address = listener
+            .local_addr()
+            .expect("read public call_tool missing-handler address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept discovery");
+            let probe = read_http_cache_test_request(&mut stream);
+            assert_eq!(probe["method"], "server/discover");
+            let discovery = modern_discovery_response(
+                "public-http-call-tool-missing-handler",
+                &[MODERN_PROTOCOL_VERSION],
+            );
+            write_http_cache_test_response(&mut stream, "application/json", discovery.as_bytes());
+
+            let (mut stream, _) = listener.accept().expect("accept tools/call");
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tools/call");
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                &public_http_sampling_input_required_body(2),
+            );
+
+            listener
+                .set_nonblocking(true)
+                .expect("configure missing-handler no-contact assertion");
+            let no_contact_deadline = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < no_contact_deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("a missing sampling handler must reject before a retry POST"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("unexpected missing-handler no-contact error: {error}"),
+                }
+            }
+        });
+
+        let cx = Cx::for_request();
+        let handlers =
+            ReverseRequestHandlers::new().with_modern_roots_list(|_cx, _cancellation, _params| {
+                Box::pin(async move { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
+            });
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&modern_target))
+                .client_info("public-http-call-tool-missing-handler", "1.0.0")
+                .reverse_request_handlers(handlers)
+                .connect_http_client_with_cx(&cx),
+        )
+        .expect("public HTTP client connects with only roots handlers");
+        let error =
+            http_test_runtime_block_on(client.call_tool(&cx, "sample-tool", serde_json::json!({})))
+                .expect_err("missing sampling handler must reject the input_required result");
+        match error {
+            HttpClientError::CoreResult(error) => {
+                assert!(
+                    error.message.contains("sampling/createMessage"),
+                    "missing handler error must name the requested method: {}",
+                    error.message
+                );
+            }
+            other => panic!("expected a core result error, got {other}"),
+        }
+        server
+            .join()
+            .expect("public call_tool missing-handler peer must join");
     }
 
     #[cfg(unix)]
