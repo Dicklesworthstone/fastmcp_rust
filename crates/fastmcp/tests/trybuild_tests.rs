@@ -520,13 +520,13 @@ pub fn probe() {
     DownstreamFeatureSymbolProbe {
         name: "final-input-responses-legacy-era-escape",
         features: &["legacy-2024-11-05"],
-        source: r#"
+        source: r"
 use mcp::legacy_2024::FinalInputResponses;
 
 pub fn probe() {
     let _ = FinalInputResponses::try_from_entries(Vec::new());
 }
-"#,
+",
         should_compile: false,
         absent_feature_diagnostic: Some("FinalInputResponses"),
     },

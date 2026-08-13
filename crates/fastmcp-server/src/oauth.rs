@@ -2835,10 +2835,10 @@ impl OAuthServer {
     pub fn with_defaults() -> Self {
         #[cfg(test)]
         {
-            return Self::with_approval_backend(
+            Self::with_approval_backend(
                 OAuthServerConfig::default(),
                 Arc::new(TestDefaultAuthorizationApprovalBackend),
-            );
+            )
         }
         #[cfg(not(test))]
         {

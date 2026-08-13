@@ -4,9 +4,8 @@ use std::collections::HashSet;
 
 use crate::config::ConsoleConfig;
 use crate::console::{
-    DEFAULT_LOG_MESSAGE_MAX_CHARS, FastMcpConsole, REDACTED_VALUE, bounded_redacted_rich_fragment,
-    bounded_redacted_rich_text, bounded_redacted_terminal_text, is_credential_key,
-    redact_free_text_credentials,
+    DEFAULT_LOG_MESSAGE_MAX_CHARS, FastMcpConsole, REDACTED_VALUE, bounded_redacted_rich_text,
+    bounded_redacted_terminal_text, is_credential_key, redact_free_text_credentials,
 };
 use crate::theme::FastMcpTheme;
 use fastmcp_core::{McpError, McpErrorCode};
@@ -414,7 +413,8 @@ impl RichErrorRenderer {
 
             #[cfg(not(feature = "syntax"))]
             {
-                let backtrace = bounded_redacted_rich_fragment(bt, BACKTRACE_MAX_CHARS);
+                let backtrace =
+                    crate::console::bounded_redacted_rich_fragment(bt, BACKTRACE_MAX_CHARS);
                 // Fix hex call
                 let text_color = theme.text_dim.triplet.unwrap_or_default().hex();
                 console.print(&format!("  [{}]{}[/]", text_color, backtrace));
