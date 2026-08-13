@@ -22,6 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_rust::{
     AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
     ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
@@ -33,7 +34,6 @@ use fastmcp_rust::{
     SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, core, legacy_2024,
     modern, prompt, resource, tool,
 };
-use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
@@ -2511,8 +2511,8 @@ impl ToolHandler for PublicHttpSamplingTool {
     }
 }
 
-fn public_http_form_elicitation(ctx: &McpContext) -> McpResult<FinalMethodOutcome<()>> {
-    let elicitation = ctx.final_elicitation_form(
+fn public_http_form_elicitation(ctx: &McpContext) -> McpResult<fastmcp_rust::InputRequiredResult> {
+    ctx.final_elicitation_form(
         "approval",
         "Approve this operation",
         json!({
@@ -2520,10 +2520,8 @@ fn public_http_form_elicitation(ctx: &McpContext) -> McpResult<FinalMethodOutcom
             "properties": {"approved": {"type": "boolean"}},
             "required": ["approved"],
         }),
-    )?;
-    Ok(FinalMethodOutcome::InputRequired(
-        elicitation.into_input_required()?,
-    ))
+    )?
+    .into_input_required()
 }
 
 /// Live modern HTTP resource that returns framework-issued MRTR elicitation.
@@ -2543,7 +2541,12 @@ impl ResourceHandler for PublicHttpElicitationResource {
     }
 
     fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
-        Ok(vec![ResourceContent::text("exact legacy resource")])
+        Ok(vec![ResourceContent {
+            uri: PUBLIC_HTTP_ELICITATION_RESOURCE_URI.to_owned(),
+            mime_type: None,
+            text: Some("exact legacy resource".to_owned()),
+            blob: None,
+        }])
     }
 
     fn declares_final_mrtr(&self) -> bool {
@@ -2554,10 +2557,7 @@ impl ResourceHandler for PublicHttpElicitationResource {
         &self,
         ctx: &McpContext,
     ) -> McpResult<FinalMethodOutcome<fastmcp_rust::FinalReadResourceResult>> {
-        public_http_form_elicitation(ctx).map(|outcome| match outcome {
-            FinalMethodOutcome::InputRequired(result) => FinalMethodOutcome::InputRequired(result),
-            FinalMethodOutcome::Complete(()) => unreachable!("form elicitation is input_required"),
-        })
+        public_http_form_elicitation(ctx).map(FinalMethodOutcome::InputRequired)
     }
 }
 
@@ -2596,10 +2596,7 @@ impl PromptHandler for PublicHttpElicitationPrompt {
         ctx: &McpContext,
         _arguments: HashMap<String, String>,
     ) -> McpResult<FinalMethodOutcome<fastmcp_rust::FinalGetPromptResult>> {
-        public_http_form_elicitation(ctx).map(|outcome| match outcome {
-            FinalMethodOutcome::InputRequired(result) => FinalMethodOutcome::InputRequired(result),
-            FinalMethodOutcome::Complete(()) => unreachable!("form elicitation is input_required"),
-        })
+        public_http_form_elicitation(ctx).map(FinalMethodOutcome::InputRequired)
     }
 }
 
@@ -2620,6 +2617,8 @@ fn spawn_modern_sampling_http_server() -> HttpServerFixture {
             }
             let server = modern::ServerBuilder::new("facade-http-sampling", "1.0.0")
                 .tool(PublicHttpSamplingTool)
+                .resource(PublicHttpElicitationResource)
+                .prompt(PublicHttpElicitationPrompt)
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -2688,38 +2687,64 @@ fn spawn_modern_sampling_http_server() -> HttpServerFixture {
     }
 }
 
-#[test]
-fn e2e_public_http_call_tool_result_returns_live_sampling_input_required() {
-    let cx = Cx::for_request();
-    let server = spawn_modern_sampling_http_server();
-    let mut capabilities = ClientCapabilities::default();
-    capabilities.sampling = Some(Default::default());
-    let mut client = runtime_block_on_bounded(
-        &cx,
-        modern::ClientBuilder::new()
-            .client_info("e2e-public-http-sampling-client", "1.0.0")
-            .capabilities(capabilities)
-            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
-    )
-    .expect("the ModernOnly public facade connects to the live sampling route");
-
-    let result = runtime_block_on_bounded(
-        &cx,
-        client.call_tool_result(&cx, PUBLIC_HTTP_SAMPLING_TOOL_NAME, json!({})),
-    )
-    .expect("live bind_http final sampling must return a typed tools/call result");
-    let FinalCoreResult::ToolsCallInputRequired { result, .. } = result else {
-        panic!("live bind_http final sampling must keep input_required: {result:?}");
-    };
+fn assert_live_input_required(result: &fastmcp_rust::InputRequiredResult, key: &str, kind: &str) {
     assert!(
         result.request_state().is_some(),
-        "framework-issued sampling state must be returned"
+        "{kind} must return framework-issued requestState"
     );
     assert!(
         result
             .input_requests()
-            .is_some_and(|requests| requests.get("sample").is_some()),
-        "live sampling input_required must retain its sample request"
+            .is_some_and(|requests| requests.get(key).is_some()),
+        "{kind} must retain its {key} input request"
     );
+}
+
+#[test]
+fn e2e_public_http_result_verbs_return_live_input_required() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_sampling_http_server();
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.sampling = Some(Default::default());
+    capabilities.elicitation =
+        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-mrtr-client", "1.0.0")
+            .capabilities(capabilities)
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the live MRTR route");
+
+    let tool = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_result(&cx, PUBLIC_HTTP_SAMPLING_TOOL_NAME, json!({})),
+    )
+    .expect("live bind_http final sampling must return a typed tools/call result");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = tool else {
+        panic!("live bind_http final sampling must keep input_required: {tool:?}");
+    };
+    assert_live_input_required(&result, "sample", "tools/call");
+
+    let resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource_result(&cx, PUBLIC_HTTP_ELICITATION_RESOURCE_URI),
+    )
+    .expect("live bind_http final resource elicitation must return a typed resources/read result");
+    let FinalCoreResult::ResourcesReadInputRequired { result, .. } = resource else {
+        panic!("live bind_http resource elicitation must keep input_required: {resource:?}");
+    };
+    assert_live_input_required(&result, "approval", "resources/read");
+
+    let prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt_result(&cx, PUBLIC_HTTP_ELICITATION_PROMPT_NAME, HashMap::new()),
+    )
+    .expect("live bind_http final prompt elicitation must return a typed prompts/get result");
+    let FinalCoreResult::PromptsGetInputRequired { result, .. } = prompt else {
+        panic!("live bind_http prompt elicitation must keep input_required: {prompt:?}");
+    };
+    assert_live_input_required(&result, "approval", "prompts/get");
     server.shutdown();
 }
