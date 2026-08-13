@@ -736,12 +736,14 @@ impl ClientBuilder {
     {
         self.validate_feature_configuration()?;
         self.validate_websocket_configuration()?;
-        WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+        WebSocketClient::connect_with_builder_configuration_with_cx(
             cx,
             self.protocol_plan,
             self.client_info,
             self.capabilities,
             self.reverse_request_handlers,
+            self.mcp_apps_settings,
+            self.client_extension_runtime,
             transport,
         )
         .await
@@ -767,11 +769,13 @@ impl ClientBuilder {
                 "connect_websocket_auto_with_cx requires the Auto protocol policy",
             ));
         }
-        WebSocketClient::connect_auto_with_reverse_request_handlers_with_cx(
+        WebSocketClient::connect_auto_with_builder_configuration_with_cx(
             cx,
             self.client_info,
             self.capabilities,
             self.reverse_request_handlers,
+            self.mcp_apps_settings,
+            self.client_extension_runtime,
             fresh_transport,
         )
         .await
@@ -784,11 +788,6 @@ impl ClientBuilder {
         {
             return Err(McpError::invalid_params(
                 "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
-            ));
-        }
-        if self.mcp_apps_settings.is_some() || self.client_extension_runtime.is_some() {
-            return Err(McpError::invalid_params(
-                "WebSocket client extension discovery is not configured for this transport",
             ));
         }
         Ok(())
