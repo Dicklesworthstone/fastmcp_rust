@@ -327,7 +327,7 @@ The following bidirectional building blocks exist in source. This inventory does
 
 | Provider | Python | Rust | Notes |
 |----------|--------|------|-------|
-| **FilesystemProvider** | ✅ | 🟡 | Implementation is quarantined: public `build()` fails closed on every target until a guaranteed non-inline, bounded, owned-and-drained blocking-I/O capability exists and glob matching has a strict request-work bound |
+| **FilesystemProvider** | ✅ | 🟡 | Public `build()` constructs a handler on Linux/macOS and routes I/O through the caller-owned blocking pool; other targets remain fail-closed |
 | **OpenAPIProvider** | ✅ | ⊘ | Excluded per plan (intentional) |
 
 ---
@@ -403,7 +403,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 3. ✅ **Error masking** - `mask_error_details` setting (builder.rs)
 4. ✅ **Server composition** - mount(), as_proxy() (builder.rs, proxy.rs, router.rs)
 5. ✅ **CLI commands** - dev, test, and tasks command paths are present; this is not an end-to-end verification claim
-6. 🟡 **FilesystemProvider** - Quarantined implementation is present, but public construction fails closed on every target pending a safe blocking-I/O boundary
+6. 🟡 **FilesystemProvider** - Public construction works on Linux/macOS; other targets remain fail-closed
 7. ✅ **Auto-initialize** - Client auto-initialization (client/builder.rs)
 8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs)
 9. ✅ **Capabilities access** - ctx.client_capabilities(), ctx.server_capabilities() (context.rs)
