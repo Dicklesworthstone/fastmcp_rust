@@ -9611,9 +9611,12 @@ fn dispatch_modern_http_request_with_cancellation_and_transport_authorization(
 }
 
 /// Dispatches one ordinary modern JSON request while its connection owns the
-/// cancellation authority. The request has already been fully decoded, so
-/// later peer EOF (or unexpected bytes) means the peer no longer owns this
-/// response body and must cancel only this handler.
+/// cancellation authority. The request has already been fully decoded.
+///
+/// A clean write-half EOF is ordinary H1 request completion: the peer is
+/// waiting to read this response. Unexpected extra bytes (pipelining into a
+/// single-request connection) abandon the response body. Full close is
+/// observed when the later response write fails, matching modern SSE.
 async fn serve_modern_json_http_connection(
     cx: &Cx,
     stream: AsyncTcpStream,
@@ -9628,9 +9631,7 @@ async fn serve_modern_json_http_connection(
     let mut peer_watch = match cx.spawn(move |peer_cx| async move {
         let mut probe = [0_u8; 1];
         match peer_reader.read(&mut probe).await {
-            // The listener reads exactly one H1 request. EOF or any later
-            // byte abandons this request's response body, never another
-            // request on a separate connection.
+            Ok(0) => {}
             Ok(_) => {
                 peer_cancellation.cancel();
             }
@@ -11774,9 +11775,7 @@ impl Server {
                     request_id,
                     JsonRpcError {
                         code: (-32603).into(),
-                        message: format!(
-                            "failed to spawn stdio listen worker: {spawn_error}"
-                        ),
+                        message: format!("failed to spawn stdio listen worker: {spawn_error}"),
                         data: None,
                     },
                 )),
@@ -28671,6 +28670,85 @@ mod lib_unit_tests {
         Ok((initial, retry, calls.load(Ordering::Acquire)))
     }
 
+    async fn run_live_http_public_final_sampling_json(
+        cx: &Cx,
+    ) -> Result<(JsonRpcResponse, usize), String> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bound = Server::new("live-http-public-final-sampling", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
+            .tool(PublicFinalSamplingTool {
+                calls: Arc::clone(&calls),
+            })
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("live HTTP public final sampling bind failed: {error}"))?;
+        let address = bound
+            .local_addr()
+            .map_err(|error| format!("live HTTP public final sampling address failed: {error}"))?;
+        let caller_cx = cx.clone();
+        let mut client = cx
+            .spawn(move |_client_cx| async move {
+                let result = async {
+                    let request = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "public-final-sampling",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {"sampling": {}},
+                            },
+                        })),
+                        940_i64,
+                    );
+                    let body = serde_json::to_vec(&request).map_err(|error| {
+                        format!("public final sampling request did not serialize: {error}")
+                    })?;
+                    let response = live_http_exchange(
+                        address,
+                        live_http_post(
+                            "/mcp",
+                            &body,
+                            &[
+                                ("Accept", "application/json"),
+                                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                ("Mcp-Method", "tools/call"),
+                                ("Mcp-Name", "public-final-sampling"),
+                            ],
+                        ),
+                    )
+                    .await?;
+                    let response = serde_json::from_slice(live_http_response_body(&response)?)
+                        .map_err(|error| {
+                            format!(
+                                "public final sampling response was not valid JSON-RPC: {error}"
+                            )
+                        })?;
+                    Ok::<_, String>(response)
+                }
+                .await;
+                caller_cx.cancel_with(
+                    CancelKind::User,
+                    Some("live HTTP public final sampling complete"),
+                );
+                result
+            })
+            .map_err(|error| {
+                format!("live HTTP public final sampling client admission failed: {error}")
+            })?;
+
+        let serve = bound.serve(cx).await;
+        let response = client.join(cx).await.map_err(|error| {
+            format!("live HTTP public final sampling client failed: {error:?}")
+        })??;
+        let shutdown = serve
+            .map_err(|error| format!("live HTTP public final sampling server failed: {error}"))?;
+        require_quiescent_http_shutdown(shutdown, "live HTTP public final sampling").await?;
+        Ok((response, calls.load(Ordering::Acquire)))
+    }
+
     struct LiveLegacyCompletionHandler;
 
     impl CompletionHandler for LiveLegacyCompletionHandler {
@@ -34599,6 +34677,49 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn live_http_public_final_sampling_json_returns_input_required() {
+        run_live_http_test(|cx| async move {
+            let (response, calls) = run_live_http_public_final_sampling_json(&cx).await?;
+            if response.id != Some(940_i64.into()) {
+                return Err(format!(
+                    "public final sampling JSON response id was unexpected: {response:?}"
+                ));
+            }
+            if let Some(error) = response.error.as_ref() {
+                return Err(format!(
+                    "public final sampling JSON POST was cancelled or rejected: {error:?}"
+                ));
+            }
+            if response
+                .result
+                .as_ref()
+                .and_then(|result| result.get("resultType"))
+                != Some(&serde_json::json!("input_required"))
+            {
+                return Err(format!(
+                    "public final sampling JSON POST did not yield input_required: {response:?}"
+                ));
+            }
+            if response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/inputRequests/sample/method"))
+                != Some(&serde_json::json!("sampling/createMessage"))
+            {
+                return Err(format!(
+                    "public final sampling JSON POST omitted sampling/createMessage: {response:?}"
+                ));
+            }
+            if calls != 1 {
+                return Err(format!(
+                    "public final sampling handler ran {calls} times instead of once"
+                ));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
     fn live_http_mrtr_rejects_server_issued_state_across_separate_stateless_posts() {
         run_live_http_test(|cx| async move {
             let (initial, retry, calls) = run_live_http_mrtr_retry(&cx, "").await?;
@@ -36860,13 +36981,27 @@ mod lib_unit_tests {
                 .await?;
 
                 if close_originating_peer {
-                    drop(stream);
-                    wait_for_live_http_flag(
-                        &client_cx,
-                        &observed_by_client,
-                        "modern JSON originating peer close cancellation",
+                    stream
+                        .shutdown(std::net::Shutdown::Write)
+                        .map_err(|error| format!("modern JSON write-half close failed: {error}"))?;
+                    release_by_client.store(true, Ordering::Release);
+                    let mut response = Vec::new();
+                    read_live_http_to_end(
+                        &mut stream,
+                        &mut response,
+                        "modern JSON write-half-close positive response EOF",
                     )
                     .await?;
+                    if !response.starts_with(b"HTTP/1.1 200") {
+                        return Err(format!(
+                            "modern JSON write-half-close response was unexpected: {response:?}"
+                        ));
+                    }
+                    if observed_by_client.load(Ordering::Acquire) {
+                        return Err(
+                            "a write-half-closed modern JSON peer cancelled its handler".to_owned()
+                        );
+                    }
                 } else {
                     release_by_client.store(true, Ordering::Release);
                     let mut response = Vec::new();
@@ -36902,14 +37037,12 @@ mod lib_unit_tests {
         let shutdown =
             serve.map_err(|error| format!("modern JSON peer-close server failed: {error}"))?;
         require_quiescent_http_shutdown(shutdown, "modern JSON peer-close").await?;
-        if close_originating_peer {
-            if !observed_cancellation.load(Ordering::Acquire) {
-                return Err(
-                    "originating modern JSON peer close did not cancel its handler".to_owned(),
-                );
-            }
-        } else if observed_cancellation.load(Ordering::Acquire) {
-            return Err("connected modern JSON peer unexpectedly cancelled its handler".to_owned());
+        if observed_cancellation.load(Ordering::Acquire) {
+            return Err(if close_originating_peer {
+                "a write-half-closed modern JSON peer cancelled its handler".to_owned()
+            } else {
+                "connected modern JSON peer unexpectedly cancelled its handler".to_owned()
+            });
         }
         Ok(())
     }
@@ -36922,9 +37055,9 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn live_http_modern_json_originating_peer_close_cancels_handler() {
-        // This differs from the positive probe only by closing the originating
-        // socket after the handler starts.
+    fn live_http_modern_json_write_half_close_preserves_handler() {
+        // A clean write-half EOF is ordinary H1 request completion. It must
+        // not cancel the still-owned JSON response body.
         run_live_http_test(
             |cx| async move { live_http_modern_json_peer_close_probe(&cx, true).await },
         );
