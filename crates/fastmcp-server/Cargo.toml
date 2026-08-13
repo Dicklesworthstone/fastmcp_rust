@@ -75,6 +75,9 @@ redis = { version = "=1.4.1", default-features = false, features = ["acl", "scri
 
 [dev-dependencies]
 fastmcp-derive.workspace = true
+# The OIDC external-custody adapter is exercised with a real RS256 operation
+# only in the cfg(test) module; this never enters the shipped server graph.
+ring = { workspace = true }
 # Unit tests exercise the dated adapter explicitly, without making it part of
 # the production dependency graph selected by a no-legacy facade profile.
 fastmcp-protocol = { workspace = true, features = ["legacy-2024-11-05"] }

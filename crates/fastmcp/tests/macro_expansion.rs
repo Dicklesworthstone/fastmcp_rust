@@ -1359,7 +1359,7 @@ fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
     let emitted_notifications = std::sync::Arc::clone(&notifications);
     let task_store = std::sync::Arc::new(InMemoryFinalTaskStore::default());
     let runtime = FinalTaskRuntime::new(
-        std::sync::Arc::clone(&task_store),
+        task_store.clone(),
         FinalTaskRuntimeConfig::new(60_000, None).expect("valid final task policy"),
         std::sync::Arc::new(move |_| {
             emitted_notifications.fetch_add(1, Ordering::SeqCst);

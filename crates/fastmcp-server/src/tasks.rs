@@ -1400,21 +1400,15 @@ fn can_transition_official_task(from: OfficialTaskStatus, to: OfficialTaskStatus
         (
             OfficialTaskStatus::Working,
             OfficialTaskStatus::InputRequired
-        ) | (OfficialTaskStatus::Working, OfficialTaskStatus::Completed)
-            | (OfficialTaskStatus::Working, OfficialTaskStatus::Failed)
-            | (OfficialTaskStatus::Working, OfficialTaskStatus::Cancelled)
-            | (
-                OfficialTaskStatus::InputRequired,
-                OfficialTaskStatus::Working
-            )
-            | (
-                OfficialTaskStatus::InputRequired,
-                OfficialTaskStatus::Failed
-            )
-            | (
-                OfficialTaskStatus::InputRequired,
-                OfficialTaskStatus::Cancelled
-            )
+                | OfficialTaskStatus::Completed
+                | OfficialTaskStatus::Failed
+                | OfficialTaskStatus::Cancelled
+        ) | (
+            OfficialTaskStatus::InputRequired,
+            OfficialTaskStatus::Working
+                | OfficialTaskStatus::Failed
+                | OfficialTaskStatus::Cancelled
+        )
     )
 }
 
@@ -3324,9 +3318,9 @@ fn next_in_memory_final_task_recovery_id<'a>(
             task_ids
                 .iter()
                 .copied()
-                .find(|task_id| *task_id > after_task_id && eligible(*task_id))
+                .find(|task_id| *task_id > after_task_id && eligible(task_id))
         })
-        .or_else(|| task_ids.into_iter().find(|task_id| eligible(*task_id)))
+        .or_else(|| task_ids.into_iter().find(|task_id| eligible(task_id)))
         .cloned()
 }
 
@@ -3426,12 +3420,12 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
     let expired_handoff_task_ids = state
         .handoff_leases
         .iter()
-        .filter_map(|(task_id, lease)| {
+        .filter(|(_, lease)| {
             lease
                 .recovery_expires_at
                 .is_some_and(|expires_at| expires_at <= now)
-                .then(|| task_id.clone())
         })
+        .map(|(task_id, _)| task_id.clone())
         .collect::<Vec<_>>();
     for task_id in expired_handoff_task_ids {
         let Some(lease_generation) = state
@@ -3464,15 +3458,9 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
             // Fence the abandoned claimant before a new worker can recover
             // the retained payload. Without this generation advance, a late
             // drop from the old worker could release a newer worker's lease.
-            match next_in_memory_final_task_generation(state) {
-                Ok(generation) => {
-                    state.handoff_leases.remove(&task_id);
-                    state.generations.insert(task_id, generation);
-                }
-                // Generation exhaustion cannot safely release an abandoned
-                // claim: doing so would let an old claimant and a new
-                // claimant share the same CAS fence. Leave it retained.
-                Err(_) => {}
+            if let Ok(generation) = next_in_memory_final_task_generation(state) {
+                state.handoff_leases.remove(&task_id);
+                state.generations.insert(task_id, generation);
             }
         } else {
             state.handoff_leases.remove(&task_id);
@@ -3481,7 +3469,8 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
     let expired_task_ids = state
         .expires_at
         .iter()
-        .filter_map(|(task_id, expires_at)| (*expires_at <= now).then(|| task_id.clone()))
+        .filter(|(_, expires_at)| **expires_at <= now)
+        .map(|(task_id, _)| task_id.clone())
         .collect::<Vec<_>>();
     for task_id in expired_task_ids {
         state.expires_at.remove(&task_id);
@@ -7378,14 +7367,14 @@ mod tests {
                 None,
             )?);
             if current.generation() != generation
-                || !self
+                || self
                     .inner
                     .request_cancellation_and_clear_input_if_current(
                         &current,
                         cancelled_task.clone(),
                         final_task_notification(&cancelled_task),
                     )?
-                    .is_some()
+                    .is_none()
             {
                 return Ok(None);
             }

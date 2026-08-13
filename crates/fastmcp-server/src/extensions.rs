@@ -708,9 +708,9 @@ mod tests {
     #[cfg(feature = "apps")]
     use fastmcp_protocol::extensions::official_mcp_apps_empty_server_settings;
     use fastmcp_protocol::extensions::{
-        ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionRegistryError,
-        ExtensionSettings, ServerExtensionDiscovery, official_tasks_descriptor,
-        official_tasks_empty_settings, register_official_tasks_extension,
+        ClientExtensionDiscovery, ExtensionLocalEnablement, ExtensionSettings,
+        ServerExtensionDiscovery, official_tasks_descriptor, official_tasks_empty_settings,
+        register_official_tasks_extension,
     };
     use fastmcp_protocol::protocol_policy::ProtocolEra;
     use fastmcp_protocol::{
@@ -771,6 +771,10 @@ mod tests {
         updated_title: String,
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the ExtensionHandler callback contract requires McpResult"
+    )]
     fn get_task(context: &McpContext, request: GetTaskRequest) -> McpResult<GetTaskResponse> {
         assert_eq!(context.request_id(), 71);
         Ok(GetTaskResponse {
@@ -778,6 +782,10 @@ mod tests {
         })
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the ExtensionHandler callback contract requires McpResult"
+    )]
     fn alternate_get_task(
         context: &McpContext,
         request: GetTaskRequest,
@@ -788,6 +796,10 @@ mod tests {
         })
     }
 
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the ExtensionHandler callback contract requires McpResult"
+    )]
     fn update_task(
         context: &McpContext,
         request: UpdateTaskRequest,

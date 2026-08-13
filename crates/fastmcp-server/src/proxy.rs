@@ -1621,8 +1621,8 @@ impl ProxyBackend for Client {
 
     fn complete_result(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
         match Client::complete(self, params)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::Completion(_))
-            | result @ CoreResult::Final(FinalCoreResult::Completion { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::Completion(_))
+            | CoreResult::Final(FinalCoreResult::Completion { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("completion/complete")),
         }
     }
@@ -1666,16 +1666,16 @@ impl ProxyBackend for Client {
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
         match Client::call_tool_typed(self, name, arguments)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::ToolsCall(_))
-            | result @ CoreResult::Final(FinalCoreResult::ToolsCall { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::ToolsCall(_))
+            | CoreResult::Final(FinalCoreResult::ToolsCall { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("tools/call")),
         }
     }
 
     fn read_resource_result(&mut self, uri: &str) -> McpResult<CoreResult> {
         match Client::read_resource_typed(self, uri)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::ResourcesRead(_))
-            | result @ CoreResult::Final(FinalCoreResult::ResourcesRead { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::ResourcesRead(_))
+            | CoreResult::Final(FinalCoreResult::ResourcesRead { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("resources/read")),
         }
     }
@@ -1686,8 +1686,8 @@ impl ProxyBackend for Client {
         arguments: HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         match Client::get_prompt_typed(self, name, arguments)? {
-            result @ CoreResult::Legacy(LegacyCoreResult::PromptsGet(_))
-            | result @ CoreResult::Final(FinalCoreResult::PromptsGet { .. }) => Ok(result),
+            result @ (CoreResult::Legacy(LegacyCoreResult::PromptsGet(_))
+            | CoreResult::Final(FinalCoreResult::PromptsGet { .. })) => Ok(result),
             _ => Err(unexpected_proxy_result("prompts/get")),
         }
     }
@@ -5084,6 +5084,33 @@ impl ProxyClient {
             self.clone(),
             binding,
         ))))
+    }
+
+    /// Returns the route-local relayed Tasks state for a unit-test
+    /// unchanged-state assertion. This deliberately exposes only a stable
+    /// serialized snapshot, never the mutable registry or its retention
+    /// clocks.
+    #[cfg(all(test, feature = "tasks"))]
+    pub(crate) fn final_task_registry_snapshot_for_test(&self) -> McpResult<serde_json::Value> {
+        let registry = self
+            .final_task_registry
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
+        let mut tasks = BTreeMap::new();
+        for (task_id, retained) in &registry.tasks {
+            tasks.insert(
+                task_id.to_string(),
+                serde_json::to_value(&retained.task).map_err(|_| {
+                    McpError::internal_error(
+                        "Proxy relayed final Task snapshot serialization failed",
+                    )
+                })?,
+            );
+        }
+        Ok(serde_json::json!({
+            "pendingCreations": registry.pending_creations,
+            "tasks": tasks,
+        }))
     }
 
     /// Fetches a catalog by querying the backend.

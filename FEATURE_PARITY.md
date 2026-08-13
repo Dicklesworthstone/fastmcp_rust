@@ -36,8 +36,9 @@ Release publication remains quarantined. This document supplies neither publicat
   separately through pre-dispatch admission, but public turnkey HTTP remains
   fail-closed and no complete transport-boundary admission/challenge path is
   qualified.
-- Task RPC is not advertised; all four `tasks/*` methods return
-  `MethodNotFound`.
+- Legacy `tasks/list` and `tasks/submit` return `MethodNotFound`. Official
+  `tasks/get`, `tasks/update`, and `tasks/cancel` are served when
+  `ServerBuilder::final_tasks` is installed.
 - OAuth/OIDC public source APIs exist for development, but production security
   and profile conformance remain unverified and quarantined from support claims.
 - Explicit client close now returns process/transport cleanup failures. The
@@ -180,10 +181,10 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
-| `tasks/list` | ✅ | 🚧 | Server capability is not advertised; the RPC returns `MethodNotFound` |
-| `tasks/get` | ✅ | 🚧 | Server capability is not advertised; the RPC returns `MethodNotFound` |
-| `tasks/submit` | ✅ | 🚧 | Server capability is not advertised; the RPC returns `MethodNotFound` |
-| `tasks/cancel` | ✅ | 🚧 | Server capability is not advertised; the RPC returns `MethodNotFound` |
+| `tasks/list` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
+| `tasks/get` | ✅ | 🟡 | Served when `ServerBuilder::final_tasks` is installed |
+| `tasks/submit` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
+| `tasks/cancel` | ✅ | 🟡 | Served when `ServerBuilder::final_tasks` is installed |
 
 The historical `TaskManager` source remains test-only for implementation
 archaeology. Production builds expose neither a manager constructor/builder

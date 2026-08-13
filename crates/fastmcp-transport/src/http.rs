@@ -558,14 +558,25 @@ impl HttpRequest {
 
 /// Concrete HTTP POST sink for the exact MCP 2024-11-05 SSE endpoint event.
 ///
-/// This narrow adapter opens one plain-HTTP connection to the URI advertised
-/// by the legacy SSE stream and writes one JSON-RPC message POST. It never
-/// derives a `/sse` or `/messages` route and never adds modern session headers.
+/// This narrow adapter opens one plain-HTTP connection to a numeric socket
+/// authority advertised by the legacy SSE stream and writes one JSON-RPC
+/// message POST. It never derives a `/sse` or `/messages` route and never adds
+/// modern session headers. DNS is deliberately outside this synchronous,
+/// caller-deadline-aware sink; hostname authorities fail closed before contact.
 /// TLS, credential, redirect, and origin policy are intentionally owned by the
 /// corresponding security and adapter layers rather than this transport slice.
 #[cfg(feature = "legacy-2024-11-05")]
 #[derive(Debug, Default)]
 pub struct LegacySseHttpPostSink;
+
+#[cfg(feature = "legacy-2024-11-05")]
+const LEGACY_SSE_HTTP_POST_RESPONSE_HEAD_BYTES: usize = 8 * 1024;
+#[cfg(feature = "legacy-2024-11-05")]
+const LEGACY_SSE_HTTP_POST_OPERATION_BOUND: Duration = Duration::from_secs(5);
+#[cfg(feature = "legacy-2024-11-05")]
+const LEGACY_SSE_HTTP_POST_IO_POLL_BOUND: Duration = Duration::from_millis(10);
+#[cfg(feature = "legacy-2024-11-05")]
+const LEGACY_SSE_HTTP_POST_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 
 #[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseHttpPostSink {
@@ -583,26 +594,259 @@ impl crate::sse::LegacySsePostSink for LegacySseHttpPostSink {
         cx: &Cx,
         post: crate::sse::LegacySseMessagePost,
     ) -> Result<(), TransportError> {
-        if cx.is_cancel_requested() {
-            return Err(TransportError::Cancelled);
-        }
-        let (authority, target) = legacy_sse_http_post_target(post.endpoint())?;
-        let mut stream = StdTcpStream::connect(authority).map_err(TransportError::Io)?;
+        let deadline = legacy_sse_http_post_deadline(cx);
+        legacy_sse_http_post_checkpoint(cx, deadline)?;
+        let (authority, address, target) = legacy_sse_http_post_target(post.endpoint())?;
+        let mut stream = legacy_sse_http_post_connect(cx, deadline, address)?;
         let request = format!(
             "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             post.body().len(),
         );
+        legacy_sse_http_post_write_all(cx, deadline, &mut stream, request.as_bytes())?;
+        legacy_sse_http_post_write_all(cx, deadline, &mut stream, post.body())?;
+        legacy_sse_http_post_flush(cx, deadline, &mut stream)?;
+        legacy_sse_http_post_checkpoint(cx, deadline)?;
         stream
-            .write_all(request.as_bytes())
+            .shutdown(Shutdown::Write)
             .map_err(TransportError::Io)?;
-        stream.write_all(post.body()).map_err(TransportError::Io)?;
-        stream.flush().map_err(TransportError::Io)?;
-        stream.shutdown(Shutdown::Write).map_err(TransportError::Io)
+        legacy_sse_http_post_requires_accepted(cx, deadline, &mut stream)
     }
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
-fn legacy_sse_http_post_target(endpoint: &str) -> Result<(&str, &str), TransportError> {
+fn legacy_sse_http_post_deadline(cx: &Cx) -> asupersync::Time {
+    let bounded = cx.now() + LEGACY_SSE_HTTP_POST_OPERATION_BOUND;
+    cx.budget()
+        .deadline
+        .map_or(bounded, |deadline| deadline.min(bounded))
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_checkpoint(
+    cx: &Cx,
+    deadline: asupersync::Time,
+) -> Result<(), TransportError> {
+    http_checkpoint(cx)?;
+    if cx.now() >= deadline {
+        return Err(TransportError::Timeout);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_poll_timeout(
+    cx: &Cx,
+    deadline: asupersync::Time,
+) -> Result<Duration, TransportError> {
+    legacy_sse_http_post_checkpoint(cx, deadline)?;
+    let wait = Duration::from_nanos(deadline.duration_since(cx.now()))
+        .min(LEGACY_SSE_HTTP_POST_IO_POLL_BOUND);
+    if wait.is_zero() {
+        return Err(TransportError::Timeout);
+    }
+    Ok(wait)
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_retry_backoff(
+    cx: &Cx,
+    deadline: asupersync::Time,
+) -> Result<(), TransportError> {
+    let backoff =
+        legacy_sse_http_post_poll_timeout(cx, deadline)?.min(LEGACY_SSE_HTTP_POST_RETRY_BACKOFF);
+    std::thread::sleep(backoff);
+    legacy_sse_http_post_checkpoint(cx, deadline)
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_connect(
+    cx: &Cx,
+    deadline: asupersync::Time,
+    address: SocketAddr,
+) -> Result<StdTcpStream, TransportError> {
+    legacy_sse_http_post_checkpoint(cx, deadline)?;
+    loop {
+        let timeout = legacy_sse_http_post_poll_timeout(cx, deadline)?;
+        match StdTcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => {
+                legacy_sse_http_post_checkpoint(cx, deadline)?;
+                return Ok(stream);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                legacy_sse_http_post_retry_backoff(cx, deadline)?;
+            }
+            Err(error) => return Err(TransportError::Io(error)),
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_write_all(
+    cx: &Cx,
+    deadline: asupersync::Time,
+    stream: &mut StdTcpStream,
+    bytes: &[u8],
+) -> Result<(), TransportError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let timeout = legacy_sse_http_post_poll_timeout(cx, deadline)?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(TransportError::Io)?;
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "legacy SSE message POST stopped before its request body was written",
+                )));
+            }
+            Ok(written) => {
+                offset = offset.saturating_add(written);
+                legacy_sse_http_post_checkpoint(cx, deadline)?;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                legacy_sse_http_post_retry_backoff(cx, deadline)?;
+            }
+            Err(error) => {
+                legacy_sse_http_post_checkpoint(cx, deadline)?;
+                return Err(TransportError::Io(error));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_flush(
+    cx: &Cx,
+    deadline: asupersync::Time,
+    stream: &mut StdTcpStream,
+) -> Result<(), TransportError> {
+    loop {
+        let timeout = legacy_sse_http_post_poll_timeout(cx, deadline)?;
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(TransportError::Io)?;
+        match stream.flush() {
+            Ok(()) => return legacy_sse_http_post_checkpoint(cx, deadline),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                legacy_sse_http_post_retry_backoff(cx, deadline)?;
+            }
+            Err(error) => {
+                legacy_sse_http_post_checkpoint(cx, deadline)?;
+                return Err(TransportError::Io(error));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_requires_accepted(
+    cx: &Cx,
+    deadline: asupersync::Time,
+    stream: &mut StdTcpStream,
+) -> Result<(), TransportError> {
+    let mut head = Vec::with_capacity(512);
+    let mut chunk = [0_u8; 512];
+
+    while head.len() < LEGACY_SSE_HTTP_POST_RESPONSE_HEAD_BYTES {
+        let remaining = LEGACY_SSE_HTTP_POST_RESPONSE_HEAD_BYTES - head.len();
+        let chunk_len = remaining.min(chunk.len());
+        let read = loop {
+            let timeout = legacy_sse_http_post_poll_timeout(cx, deadline)?;
+            stream
+                .set_read_timeout(Some(timeout))
+                .map_err(TransportError::Io)?;
+            match stream.read(&mut chunk[..chunk_len]) {
+                Ok(read) => break read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    legacy_sse_http_post_retry_backoff(cx, deadline)?;
+                }
+                Err(error) => {
+                    legacy_sse_http_post_checkpoint(cx, deadline)?;
+                    return Err(TransportError::Io(error));
+                }
+            }
+        };
+        legacy_sse_http_post_checkpoint(cx, deadline)?;
+        if read == 0 {
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "legacy SSE message POST closed before a complete HTTP response head",
+            )));
+        }
+        head.extend_from_slice(&chunk[..read]);
+
+        if let Some(head_end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = std::str::from_utf8(&head[..head_end]).map_err(|_| {
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "legacy SSE message POST response head is not UTF-8",
+                ))
+            })?;
+            let mut lines = head.split("\r\n");
+            let status_line = lines.next().expect("a completed head has a status line");
+            let mut status_fields = status_line.splitn(3, ' ');
+            let version = status_fields.next();
+            let status = status_fields.next();
+            let reason = status_fields.next();
+            let headers_are_well_formed = lines.all(|line| {
+                let Some((name, value)) = line.split_once(':') else {
+                    return false;
+                };
+                let value = value.trim_matches([' ', '\t']);
+                is_http_token(name) && (value.is_empty() || is_valid_http_header_value(value))
+            });
+            if version == Some("HTTP/1.1")
+                && status == Some("202")
+                && reason.is_some_and(is_valid_http_header_value)
+                && headers_are_well_formed
+            {
+                return Ok(());
+            }
+            return Err(TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy SSE message POST requires an HTTP/1.1 202 Accepted response",
+            )));
+        }
+    }
+
+    Err(TransportError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "legacy SSE message POST response head exceeds its byte limit",
+    )))
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn legacy_sse_http_post_target(endpoint: &str) -> Result<(&str, SocketAddr, &str), TransportError> {
     let authority_and_target = endpoint.strip_prefix("http://").ok_or_else(|| {
         TransportError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -629,7 +873,13 @@ fn legacy_sse_http_post_target(endpoint: &str) -> Result<(&str, &str), Transport
             "legacy SSE advertised endpoint omits its authority",
         )));
     }
-    Ok((authority, target))
+    let address = authority.parse::<SocketAddr>().map_err(|_| {
+        TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy SSE advertised endpoint authority must be a numeric SocketAddr",
+        ))
+    })?;
+    Ok((authority, address, target))
 }
 
 /// Outgoing HTTP response.
@@ -1678,20 +1928,15 @@ fn is_public_guarded_ipv4(address: Ipv4Addr) -> bool {
     let [a, b, c, _] = address.octets();
     !matches!(
         (a, b, c),
-        (0, _, _)
-            | (10, _, _)
+        (0 | 10 | 127 | 224..=255, _, _)
             | (100, 64..=127, _)
-            | (127, _, _)
             | (169, 254, _)
             | (172, 16..=31, _)
-            | (192, 0, _)
-            | (192, 2, _)
+            | (192, 0 | 2 | 168, _)
             | (192, 88, 99)
-            | (192, 168, _)
             | (198, 18..=19, _)
             | (198, 51, 100)
             | (203, 0, 113)
-            | (224..=255, _, _)
     )
 }
 
@@ -1702,15 +1947,11 @@ fn is_public_guarded_ipv6(address: Ipv6Addr) -> bool {
     let segments = address.segments();
     !matches!(
         segments,
-        [0x0000, ..]
+        [0x0000 | 0x2002 | 0xFC00..=0xFDFF | 0xFE80..=0xFEBF, ..]
             | [0x0064, 0xFF9B, 0, 0, 0, 0, ..]
             | [0x0064, 0xFF9B, 0x0001, ..]
             | [0x0100, 0, 0, 0, ..]
-            | [0x2001, 0, ..]
-            | [0x2001, 0x0DB8, ..]
-            | [0x2002, ..]
-            | [0xFC00..=0xFDFF, ..]
-            | [0xFE80..=0xFEBF, ..]
+            | [0x2001, 0 | 0x0DB8, ..]
     )
 }
 
@@ -6309,8 +6550,10 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
                         Ok(Err(error)) => {
                             panic!("loopback TLS server cancellation settled: {error}")
                         }
-                        Err(_) => {
-                            panic!("loopback TLS server failed bounded cancellation settlement")
+                        Err(error) => {
+                            panic!(
+                                "loopback TLS server failed bounded cancellation settlement: {error:?}"
+                            )
                         }
                     }
                 }
@@ -7190,7 +7433,7 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
                 ));
             }
             self.interrupt_next = true;
-            self.inner.read(buffer)
+            std::io::Read::read(&mut self.inner, buffer)
         }
     }
 
@@ -7202,7 +7445,7 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
 
     impl Read for CancelAfterSuccessfulRead {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let read = self.inner.read(buffer)?;
+            let read = std::io::Read::read(&mut self.inner, buffer)?;
             if read > 0 && self.reads.fetch_add(1, Ordering::AcqRel) == 0 {
                 self.cx.set_cancel_requested(true);
             }

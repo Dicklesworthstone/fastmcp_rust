@@ -13,19 +13,21 @@
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-#[cfg(unix)]
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use fastmcp_protocol::{LegacyContent, LegacyResourceContent};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    AuthContext, McpContext, McpErrorCode, McpResult, PromptMessage, Role, StaticTokenVerifier,
-    TokenAuthProvider,
+    AuthContext, CacheScope, CacheTtl, ContentBlock, EmbeddedResourceContents, McpContext,
+    McpErrorCode, McpResult, PromptMessage, Role, StaticTokenVerifier, TokenAuthProvider,
 };
 #[cfg(unix)]
-use fastmcp_rust::{Client, Cx, ProtocolEra, ProtocolPolicy, auto, legacy_2024, modern};
+use fastmcp_rust::{
+    Client, Cx, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto, legacy_2024, modern,
+};
 use serde_json::json;
 
 // ============================================================================
@@ -1219,30 +1221,13 @@ fn e2e_custom_client_info() {
 // ============================================================================
 
 #[cfg(unix)]
-fn shipped_echo_server_executable() -> PathBuf {
-    let test_binary = std::env::current_exe().expect("the integration-test executable is known");
-    let profile_directory = test_binary
-        .parent()
-        .and_then(|deps_directory| deps_directory.parent())
-        .expect("the integration-test executable lives below Cargo's profile directory");
-    let executable = profile_directory
-        .join("examples")
-        .join(format!("echo_server{}", std::env::consts::EXE_SUFFIX));
-
-    assert!(
-        executable.is_file(),
-        "the existing shipped `echo_server` example must be built beside this integration test: {}",
-        executable.display()
-    );
-    executable
+fn shipped_echo_server_executable() -> &'static str {
+    env!("CARGO_BIN_EXE_echo_server")
 }
 
 #[cfg(unix)]
 fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
-    let executable = shipped_echo_server_executable();
-    let command = executable
-        .to_str()
-        .expect("the shipped example path is valid UTF-8");
+    let command = shipped_echo_server_executable();
     let builder = auto::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
     assert_eq!(
         builder.selected_protocol_plan().policy(),
@@ -1257,17 +1242,40 @@ fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
 
 #[cfg(unix)]
 fn connect_modern_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<modern::Client> {
-    let executable = shipped_echo_server_executable();
-    let command = executable
-        .to_str()
-        .expect("the shipped example path is valid UTF-8");
+    let command = shipped_echo_server_executable();
     let builder = modern::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
 
     builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
 }
 
 #[cfg(unix)]
-fn connect_legacy_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<Client> {
+const STDIO_COMPLETION_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const STDIO_COMPLETION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(unix)]
+const STDIO_COMPLETION_CLEANUP_BOUND: Duration = Duration::from_secs(4);
+
+#[cfg(unix)]
+fn connect_bounded_modern_stdio_to_shipped_echo_server(
+    server_policy: &str,
+) -> McpResult<modern::Client> {
+    let command = shipped_echo_server_executable();
+    modern::client_builder()
+        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+        .request_timeout_policy(
+            RequestTimeoutPolicy::new(
+                STDIO_COMPLETION_IDLE_TIMEOUT,
+                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+            )
+            .expect("the public completion timeout policy is valid"),
+        )
+        .connect_stdio_with_cx(command, &[], &Cx::for_request())
+}
+
+#[cfg(unix)]
+fn connect_legacy_stdio_to_shipped_echo_server(
+    server_policy: &str,
+) -> McpResult<legacy_2024::Client> {
     connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
         server_policy,
         legacy_2024::LegacyReverseRequestHandlers::new(),
@@ -1278,20 +1286,59 @@ fn connect_legacy_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult
 fn connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
     server_policy: &str,
     handlers: legacy_2024::LegacyReverseRequestHandlers,
-) -> McpResult<Client> {
-    let executable = shipped_echo_server_executable();
-    let command = executable
-        .to_str()
-        .expect("the shipped example path is valid UTF-8");
+) -> McpResult<legacy_2024::Client> {
+    let command = shipped_echo_server_executable();
     let builder = legacy_2024::client_builder()
         .env("FASTMCP_PROTOCOL_POLICY", server_policy)
         .reverse_request_handlers(handlers);
     assert_eq!(
-        builder.selected_protocol_plan().policy(),
-        ProtocolPolicy::LegacyOnly
+        builder.protocol_policy(),
+        legacy_2024::ProtocolPolicy::LegacyOnly
     );
 
     builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+}
+
+#[cfg(unix)]
+fn selected_modern_stdio_raw_result(
+    client: &mut Client,
+    method: &str,
+    parameters: serde_json::Value,
+) -> serde_json::Value {
+    let cx = Cx::for_request();
+    let mut request = client
+        .start_multiplexed_request(&cx, method, Some(parameters))
+        .expect("the selected modern public facade commits the raw MRTR request");
+    let response = client
+        .wait_multiplexed_request(&cx, &mut request)
+        .expect("the selected modern public facade receives the raw MRTR response");
+    assert!(response.error.is_none(), "the raw MRTR request succeeds");
+    response
+        .result
+        .expect("a successful raw MRTR response carries its exact result")
+}
+
+#[cfg(unix)]
+fn selected_modern_stdio_raw_error(
+    client: &mut Client,
+    method: &str,
+    parameters: serde_json::Value,
+) -> String {
+    let cx = Cx::for_request();
+    let mut request = client
+        .start_multiplexed_request(&cx, method, Some(parameters))
+        .expect("the selected modern public facade commits the negative MRTR request");
+    let response = client
+        .wait_multiplexed_request(&cx, &mut request)
+        .expect("the selected modern public facade receives the negative MRTR response");
+    assert!(
+        response.result.is_none(),
+        "the rejected MRTR retry has no result"
+    );
+    response
+        .error
+        .expect("the rejected MRTR retry carries a JSON-RPC error")
+        .message
 }
 
 #[cfg(unix)]
@@ -1430,6 +1477,402 @@ fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclared_argument() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+    let params = modern::CompletionParams {
+        reference: modern::CompletionReference::PromptWithTitle {
+            name: "greeting".to_owned(),
+            title: "Greeting".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "name".to_owned(),
+            value: "co".to_owned(),
+        },
+        context: Some(modern::FinalCompletionContext {
+            arguments: Some(std::collections::BTreeMap::from([(
+                "locale".to_owned(),
+                "en-US".to_owned(),
+            )])),
+        }),
+    };
+
+    let completion_started = Instant::now();
+    let result = client
+        .complete(params.clone())
+        .expect("the typed ModernOnly client reaches the shipped completion provider");
+    assert!(
+        completion_started.elapsed() <= STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+        "the positive completion finishes within its explicit public-client absolute bound"
+    );
+    assert_eq!(
+        result.completion.values,
+        vec!["stdio-completion-1".to_owned()],
+        "the exact FinalCompletionResult retains the provider value and count"
+    );
+    assert_eq!(
+        result.completion.total,
+        Some(modern::JsonInteger::from(1_i64)),
+        "the exact FinalCompletionResult retains its JSON-integer count"
+    );
+    assert_eq!(
+        result.completion.has_more,
+        Some(false),
+        "the exact FinalCompletionResult retains the terminal pagination flag"
+    );
+
+    // RH-5 near-negative: retain the target, title, prefix, and context,
+    // changing only the completion argument name. Router validation must
+    // reject before the shipped provider can increment its process-local count.
+    let mut undeclared_argument = params.clone();
+    undeclared_argument.argument.name = "undeclared".to_owned();
+    let error = client
+        .complete(undeclared_argument)
+        .expect_err("only an undeclared completion argument is rejected");
+    assert_eq!(error.code, McpErrorCode::InvalidParams);
+
+    let resumed = client
+        .complete(params)
+        .expect("the rejected request leaves the live modern client and provider usable");
+    assert_eq!(
+        resumed.completion.values,
+        vec!["stdio-completion-2".to_owned()],
+        "the next accepted completion proves the rejected argument did not invoke the provider"
+    );
+    assert_eq!(
+        resumed.completion.total,
+        Some(modern::JsonInteger::from(2_i64)),
+        "the provider count advances only for the two accepted completions"
+    );
+    assert_eq!(resumed.completion.has_more, Some(false));
+    let cleanup_started = Instant::now();
+    client
+        .close()
+        .expect("modern completion stdio client cleanup and child reap");
+    assert!(
+        cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
+        "the public close confirms bounded stdio child cleanup and reap"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_resource_and_prompt_mrtr_are_typed_and_bounded() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let operation_started = Instant::now();
+    let resource = client
+        .read_resource_with_mrtr_retry("info://mrtr-resource", |_| {
+            Ok(std::collections::BTreeMap::from([(
+                "roots".to_owned(),
+                json!({"roots": []}),
+            )]))
+        })
+        .expect("the public modern facade resumes the shipped resource with typed roots");
+    let modern::FinalCoreResult::ResourcesRead { result, .. } = resource else {
+        panic!("the resumed resource returns the exact FinalReadResourceResult branch");
+    };
+    assert_eq!(result.payload.ttl_ms, CacheTtl::milliseconds(7));
+    assert_eq!(result.payload.cache_scope, CacheScope::Private);
+    let [
+        EmbeddedResourceContents::Text {
+            uri,
+            text,
+            mime_type,
+            meta,
+            additional,
+        },
+    ] = result.payload.contents.as_slice()
+    else {
+        panic!("the final resource result contains one exact text resource");
+    };
+    assert_eq!(uri.as_str(), "info://mrtr-resource/result");
+    assert_eq!(text, "typed resource roots=0");
+    assert_eq!(mime_type.as_deref(), Some("text/plain"));
+    assert!(meta.is_none());
+    assert!(additional.is_empty());
+
+    let prompt = client
+        .get_prompt_with_mrtr_retry(
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "terminal".to_owned())]),
+            |_| {
+                Ok(std::collections::BTreeMap::from([(
+                    "roots".to_owned(),
+                    json!({"roots": []}),
+                )]))
+            },
+        )
+        .expect("the public modern facade resumes the shipped prompt with typed roots");
+    let modern::FinalCoreResult::PromptsGet { result, .. } = prompt else {
+        panic!("the resumed prompt returns the exact FinalGetPromptResult branch");
+    };
+    assert_eq!(
+        result.payload.description.as_deref(),
+        Some("typed MRTR prompt result")
+    );
+    let [message] = result.payload.messages.as_slice() else {
+        panic!("the final prompt result contains one exact final message");
+    };
+    assert_eq!(message.role, Role::Assistant);
+    assert!(matches!(
+        &message.content,
+        ContentBlock::Text {
+            text,
+            annotations: None,
+            meta: None,
+            additional,
+        } if text == "typed prompt roots=0" && additional.is_empty()
+    ));
+    assert!(
+        operation_started.elapsed() <= STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+        "both typed public MRTR completions finish within the explicit absolute bound"
+    );
+
+    // RH-5: keep the method, URI, issued state, and typed roots response;
+    // changing only requestState must reject without consuming the registry
+    // entry, so the originally issued state still completes below.
+    let mut raw = connect_auto_stdio_to_shipped_echo_server("modern-only");
+    assert_eq!(raw.selected_protocol_era(), Some(ProtocolEra::Modern2026));
+    let initial = selected_modern_stdio_raw_result(
+        &mut raw,
+        "resources/read",
+        json!({"uri": "info://mrtr-resource"}),
+    );
+    assert_eq!(initial["resultType"], "input_required");
+    assert_eq!(
+        initial["inputRequests"],
+        json!({"roots": {"method": "roots/list"}})
+    );
+    let request_state = initial["requestState"]
+        .as_str()
+        .expect("the router mints an opaque resource MRTR state")
+        .to_owned();
+    let bad_request_state = selected_modern_stdio_raw_error(
+        &mut raw,
+        "resources/read",
+        json!({
+            "uri": "info://mrtr-resource",
+            "inputResponses": {"roots": {"roots": []}},
+            "requestState": format!("{request_state}-mutated"),
+        }),
+    );
+    assert_eq!(bad_request_state, "Invalid or expired MRTR request state");
+
+    // RH-5: retain every accepted field and change only the typed response
+    // discriminator from roots to elicitation.
+    // A subsequent accepted retry with the original state proves neither
+    // rejection consumed the server-owned registry entry or reached the handler.
+    let bad_input_responses = selected_modern_stdio_raw_error(
+        &mut raw,
+        "resources/read",
+        json!({
+            "uri": "info://mrtr-resource",
+            "inputResponses": {
+                "roots": {"action": "accept", "content": {}},
+            },
+            "requestState": request_state,
+        }),
+    );
+    assert_eq!(
+        bad_input_responses,
+        "MRTR input response does not match its request"
+    );
+    let completed = selected_modern_stdio_raw_result(
+        &mut raw,
+        "resources/read",
+        json!({
+            "uri": "info://mrtr-resource",
+            "inputResponses": {"roots": {"roots": []}},
+            "requestState": initial["requestState"],
+        }),
+    );
+    assert_eq!(completed["resultType"], "complete");
+    assert_eq!(completed["ttlMs"], 7);
+    assert_eq!(completed["cacheScope"], "private");
+    assert_eq!(completed["contents"][0]["text"], "typed resource roots=0");
+    let raw_cleanup_started = Instant::now();
+    raw.close()
+        .expect("the selected-modern raw MRTR public facade cleans up");
+    assert!(
+        raw_cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
+        "the selected-modern raw MRTR facade also bounds child cleanup"
+    );
+
+    let cancellation = client
+        .get_prompt_with_mrtr_retry(
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "terminal".to_owned())]),
+            |_| Err(fastmcp_rust::McpError::request_cancelled()),
+        )
+        .expect_err("a caller cancellation rejects before the MRTR retry is sent");
+    assert_eq!(cancellation.code, McpErrorCode::RequestCancelled);
+
+    let mut round_callbacks = 0;
+    let round_error = client
+        .get_prompt_with_mrtr_retry(
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "round-bound".to_owned())]),
+            |_| {
+                round_callbacks += 1;
+                Ok(std::collections::BTreeMap::from([(
+                    "roots".to_owned(),
+                    json!({"roots": [{"uri": "file:///mrtr/retry"}]}),
+                )]))
+            },
+        )
+        .expect_err("one continuation beyond the public round bound is rejected locally");
+    assert_eq!(round_error.code, McpErrorCode::InvalidParams);
+    assert_eq!(
+        round_error.message,
+        "MRTR continuation-round limit exceeded"
+    );
+    assert_eq!(round_callbacks, 4);
+
+    let input_error = client
+        .get_prompt_with_mrtr_retry(
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "terminal".to_owned())]),
+            |_| {
+                Ok((0..=128)
+                    .map(|index| (format!("oversized-{index}"), json!({"roots": []})))
+                    .collect())
+            },
+        )
+        .expect_err("a 129th response differs only by crossing the public input bound");
+    assert_eq!(input_error.code, McpErrorCode::InvalidParams);
+    assert_eq!(
+        input_error.message,
+        "MRTR inputResponses must not exceed 128 entries"
+    );
+    assert!(
+        client.list_tools(None).is_ok(),
+        "cancellation and local bounds leave the public modern connection usable"
+    );
+
+    let cleanup_started = Instant::now();
+    client
+        .close()
+        .expect("modern MRTR stdio client cleanup reaps the shipped server");
+    assert!(
+        cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
+        "the public client bounds the shipped server lifecycle by closing stdio"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_tasks_create_resume_cancel_and_reject_missing_capability() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client starts the shipped caller-owned Task service");
+
+    // RH-5 near-negative: preserve the modern session, method, tool, and
+    // arguments. `call_tool` differs from `call_tool_outcome` only by omitting
+    // the official Tasks client capability. The bounded one-task store makes
+    // the following successful creation a public proof that this refusal did
+    // not persist a Task.
+    let missing_capability = client
+        .call_tool("durable_task", json!({}))
+        .expect_err("a task-capable tool requires the declared Tasks capability");
+    assert_eq!(i32::from(missing_capability.code), -32_021);
+
+    let created = client
+        .call_tool_outcome("durable_task", json!({}))
+        .expect("the typed ModernOnly facade client creates one durable Task");
+    let modern::FinalToolCallOutcome::Task(created) = created else {
+        panic!("the task-capable tool returns the exact final Task result branch");
+    };
+    assert!(matches!(created.task, modern::FinalTask::Working(_)));
+    assert_eq!(
+        created.task.base().status_message.as_deref(),
+        Some("durable stdio task call 1"),
+        "the created Task proves the missing-capability call reached no durable Task state"
+    );
+    let task_id = created.task.base().task_id.clone();
+
+    let input_required_deadline = Instant::now() + STDIO_COMPLETION_ABSOLUTE_TIMEOUT;
+    let input_required = loop {
+        let observed = client
+            .get_task(task_id.clone())
+            .expect("typed tasks/get observes the live shipped Task");
+        if matches!(&observed.task, modern::FinalTask::InputRequired { .. }) {
+            break observed;
+        }
+        assert!(
+            Instant::now() < input_required_deadline,
+            "the caller-owned supervisor reaches input_required within the public bound"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        input_required.task.base().status_message.as_deref(),
+        Some("awaiting roots from the caller-owned stdio service")
+    );
+
+    let responses: modern::FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"roots": []}}))
+            .expect("the exact public Tasks input response is typed");
+    let updated = client
+        .update_task(&input_required.task, responses)
+        .expect("typed tasks/update accepts the declared input request");
+    assert!(
+        updated.additional.is_empty(),
+        "tasks/update returns the exact empty final acknowledgement"
+    );
+    let cancelled = client
+        .cancel_task(task_id.clone())
+        .expect("typed tasks/cancel acknowledges the durable cancellation request");
+    assert!(
+        cancelled.additional.is_empty(),
+        "tasks/cancel returns the exact empty final acknowledgement"
+    );
+
+    let cancellation_deadline = Instant::now() + STDIO_COMPLETION_ABSOLUTE_TIMEOUT;
+    loop {
+        let observed = client
+            .get_task(task_id.clone())
+            .expect("typed tasks/get remains usable after cancellation");
+        if matches!(&observed.task, modern::FinalTask::Cancelled(_)) {
+            break;
+        }
+        assert!(
+            Instant::now() < cancellation_deadline,
+            "the live caller-owned supervisor honors cancellation within the public bound"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let cleanup_started = Instant::now();
+    client
+        .close()
+        .expect("modern Tasks stdio client cleanup reaps the live subprocess");
+    assert!(
+        cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
+        "the caller-owned stdio Task service settles when the client closes"
+    );
+
+    let mut legacy = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("the exact-2024 facade retains its separate shipped stdio lifecycle");
+    let legacy_result = legacy
+        .call_tool("durable_task", json!({}))
+        .expect("exact-2024 treats the task-capable tool as an ordinary legacy tool");
+    assert!(matches!(
+        legacy_result.first(),
+        Some(LegacyContent::Text { text, .. }) if text == "exact-2024 Tasks are unavailable"
+    ));
+    let legacy_cleanup_started = Instant::now();
+    legacy
+        .close()
+        .expect("exact-2024 stdio client cleanup reaps its separate subprocess");
+    assert!(
+        legacy_cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
+        "the exact-2024 subprocess also performs bounded cleanup without a Task service"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_modern_only_rejects_the_exact_legacy_shipped_server() {
     // This differs from the matched ModernOnly positive only in the child
     // server's policy. The public client must not silently downgrade.
@@ -1447,11 +1890,6 @@ fn e2e_public_stdio_legacy_only_round_trips_with_the_shipped_facade_server() {
     let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
         .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
 
-    assert_eq!(client.protocol_policy(), ProtocolPolicy::LegacyOnly);
-    assert_eq!(
-        client.selected_protocol_era(),
-        Some(ProtocolEra::Legacy2024)
-    );
     assert_eq!(
         client.protocol_version(),
         fastmcp_rust::legacy_2024::PROTOCOL_VERSION
@@ -1459,6 +1897,25 @@ fn e2e_public_stdio_legacy_only_round_trips_with_the_shipped_facade_server() {
     client
         .ping()
         .expect("the explicit LegacyOnly core connection remains usable");
+    let legacy_resource = client
+        .read_resource("info://mrtr-resource")
+        .expect_err("exact-2024 cannot activate the final MRTR resource handler");
+    assert_eq!(legacy_resource.code, McpErrorCode::InternalError);
+    assert_eq!(
+        legacy_resource.message,
+        "final #[resource] handlers must be invoked through ResourceHandler::read_final"
+    );
+    let legacy_prompt = client
+        .get_prompt(
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "terminal".to_owned())]),
+        )
+        .expect_err("exact-2024 cannot activate the final MRTR prompt handler");
+    assert_eq!(legacy_prompt.code, McpErrorCode::InternalError);
+    assert_eq!(
+        legacy_prompt.message,
+        "final #[prompt] handlers must be invoked through PromptHandler::get_final"
+    );
     client.close().expect("legacy-only stdio client cleanup");
 }
 
@@ -1475,39 +1932,32 @@ fn e2e_public_legacy_stdio_roots_callback_reaches_context() {
             ]))
         }
     });
-    let mut client =
-        connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers("legacy-only", handlers)
-            .expect("the roots callback is configured before exact legacy initialization");
-
-    let cx = Cx::for_request();
-    let mut execution = client
-        .start_multiplexed_request(
-            &cx,
-            "tools/call",
-            Some(json!({"name": "client_root_uri", "arguments": {}})),
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("legacy callback runtime builds");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("legacy callback runtime installs its Cx");
+        let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+            "legacy-only",
+            handlers,
         )
-        .expect("the public multiplexed stdio tool call commits");
-    let response = client
-        .wait_multiplexed_request(&cx, &mut execution)
-        .expect("the shared receive arbiter routes roots/list before the tool response");
-    assert_eq!(response.id.as_ref(), Some(execution.request_id()));
-    let result: legacy_2024::CallToolResult = serde_json::from_value(
-        response
-            .result
-            .expect("the successful multiplexed tools/call response has a result"),
-    )
-    .expect("the exact legacy multiplexed tools/call result remains decodable");
-    assert!(!result.is_error);
-    assert!(matches!(
-        result.content.first(),
-        Some(LegacyContent::Text { text, .. }) if text == "file:///workspace"
-    ));
-    assert_eq!(
-        callback_calls.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "the tool's context authority issues exactly one roots/list callback"
-    );
-    client.close().expect("legacy roots client cleanup");
+        .expect("the roots callback is configured before exact legacy initialization");
+        let result = client
+            .call_tool_with_cx(&cx, "client_root_uri", json!({}))
+            .await
+            .expect("the sealed legacy facade services roots/list before its typed tool result");
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.content.first(),
+            Some(LegacyContent::Text { text, .. }) if text == "file:///workspace"
+        ));
+        assert_eq!(
+            callback_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the tool's context authority issues exactly one roots/list callback"
+        );
+        client.close().expect("legacy roots client cleanup");
+    });
 }
 
 #[cfg(unix)]
@@ -1515,37 +1965,28 @@ fn e2e_public_legacy_stdio_roots_callback_reaches_context() {
 fn e2e_public_legacy_stdio_roots_without_capability_has_no_callback_authority() {
     // This differs from the positive path only by omitting its roots callback.
     // The builder consequently omits the roots capability before initialization.
-    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
-        "legacy-only",
-        legacy_2024::LegacyReverseRequestHandlers::new(),
-    )
-    .expect("the exact legacy connection without roots capability initializes");
-
-    let cx = Cx::for_request();
-    let mut execution = client
-        .start_multiplexed_request(
-            &cx,
-            "tools/call",
-            Some(json!({"name": "client_root_uri", "arguments": {}})),
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("legacy missing-roots runtime builds");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("legacy missing-roots runtime installs its Cx");
+        let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+            "legacy-only",
+            legacy_2024::LegacyReverseRequestHandlers::new(),
         )
-        .expect("the paired multiplexed stdio tool call commits");
-    let response = client
-        .wait_multiplexed_request(&cx, &mut execution)
-        .expect("missing roots authority remains a multiplexed MCP tool result");
-    assert_eq!(response.id.as_ref(), Some(execution.request_id()));
-    let result: legacy_2024::CallToolResult = serde_json::from_value(
-        response
-            .result
-            .expect("the refused multiplexed tools/call response has a result"),
-    )
-    .expect("the exact legacy refusal remains decodable");
-    assert!(result.is_error);
-    assert!(matches!(
-        result.content.first(),
-        Some(LegacyContent::Text { text, .. })
-            if text == "Roots not available: client does not support roots capability"
-    ));
-    client.close().expect("legacy roots client cleanup");
+        .expect("the exact legacy connection without roots capability initializes");
+        let result = client
+            .call_tool_with_cx(&cx, "client_root_uri", json!({}))
+            .await
+            .expect("missing roots authority remains a typed legacy tool result");
+        assert!(result.is_error);
+        assert!(matches!(
+            result.content.first(),
+            Some(LegacyContent::Text { text, .. })
+                if text == "Roots not available: client does not support roots capability"
+        ));
+        client.close().expect("legacy roots client cleanup");
+    });
 }
 
 #[cfg(unix)]

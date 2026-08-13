@@ -222,6 +222,10 @@ impl AdmittedRsaJwks {
 /// rotation, ring publication change, or deployment configuration change must
 /// never be mistaken for another kind of continuity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the repeated suffix distinguishes four independent security generations at the API boundary"
+)]
 pub struct Rs256SigningBinding {
     provider_generation: u64,
     key_generation: u64,
@@ -369,24 +373,25 @@ impl AttestedRs256PublicKey {
     /// owning issuer to publish and later compare byte-for-byte with its
     /// independently read-back JWKS response; they do not prove publication
     /// or activate signing by themselves.
-    #[must_use]
     pub fn canonical_public_jwks(&self) -> Result<CanonicalRs256PublicJwks, JoseError> {
-        let value = serde_json::json!({
-            "keys": [{
-                "alg": "RS256",
-                "e": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .encode(ADMITTED_RSA_PUBLIC_EXPONENT),
-                "kid": &self.kid,
-                "kty": "RSA",
-                "n": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.modulus),
-                "use": "sig"
-            }]
-        });
+        let value = serde_json::json!({"keys": [self.canonical_jwk_value()]});
         let bytes =
             serde_json::to_vec(&value).map_err(|_| JoseError::InvalidJson("canonical JWKS"))?;
         Ok(CanonicalRs256PublicJwks {
             bytes,
             binding: self.binding,
+        })
+    }
+
+    fn canonical_jwk_value(&self) -> Value {
+        serde_json::json!({
+            "alg": "RS256",
+            "e": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(ADMITTED_RSA_PUBLIC_EXPONENT),
+            "kid": &self.kid,
+            "kty": "RSA",
+            "n": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.modulus),
+            "use": "sig"
         })
     }
 
@@ -423,6 +428,460 @@ impl CanonicalRs256PublicJwks {
     #[must_use]
     pub const fn binding(&self) -> Rs256SigningBinding {
         self.binding
+    }
+}
+
+/// A canonical public JWKS containing the active RS256 key and any retained
+/// verification keys for one issuer key-ring generation.
+///
+/// This is deliberately minted only from admitted external signer keys.  A
+/// server cannot concatenate caller-provided JSON to manufacture overlap: the
+/// exact public components, `kid` uniqueness, and deterministic key ordering
+/// remain owned by the JOSE boundary.
+#[derive(Clone)]
+pub struct CanonicalRs256PublicJwksSet {
+    bytes: Vec<u8>,
+    generation: u64,
+}
+
+impl CanonicalRs256PublicJwksSet {
+    /// Borrows the exact bytes every advertised endpoint must return.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the monotonically selected issuer key-ring generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl fmt::Debug for CanonicalRs256PublicJwksSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CanonicalRs256PublicJwksSet")
+            .field("bytes", &self.bytes.len())
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// A selected external signing key plus public verification overlap retained
+/// until the issuer's last artifact can expire.
+///
+/// The ring owns no private material.  It is a profile-neutral public-key
+/// construction primitive; issuer persistence and endpoint publication remain
+/// server responsibilities.
+#[derive(Clone)]
+pub struct Rs256PublicKeyRing {
+    active: Arc<ExternalRs256Signer>,
+    retained: Vec<Arc<ExternalRs256Signer>>,
+    generation: u64,
+}
+
+impl Rs256PublicKeyRing {
+    /// Creates one nonempty, generation-fenced ring.
+    ///
+    /// Every `kid` must be unique.  Supplying the active key again as a
+    /// retained key is rejected rather than silently normalised.
+    pub fn new(
+        active: Arc<ExternalRs256Signer>,
+        retained: Vec<Arc<ExternalRs256Signer>>,
+        generation: u64,
+    ) -> Result<Self, JwsSignerConfigurationError> {
+        if generation == 0 {
+            return Err(JwsSignerConfigurationError::ZeroGeneration);
+        }
+        if retained.len().saturating_add(1) > MAX_JWKS_KEYS {
+            return Err(JwsSignerConfigurationError::InvalidPublicKey);
+        }
+        let mut kids = BTreeSet::new();
+        if !kids.insert(active.public_key.kid.clone()) {
+            return Err(JwsSignerConfigurationError::InvalidKeyId);
+        }
+        for signer in &retained {
+            if !kids.insert(signer.public_key.kid.clone()) {
+                return Err(JwsSignerConfigurationError::InvalidKeyId);
+            }
+        }
+        Ok(Self {
+            active,
+            retained,
+            generation,
+        })
+    }
+
+    /// Returns the signer permitted to create new artifacts in this generation.
+    #[must_use]
+    pub fn active_signer(&self) -> &Arc<ExternalRs256Signer> {
+        &self.active
+    }
+
+    /// Reports whether this verification ring contains the exact public key
+    /// bound to `signer`. This permits an issuer to prove that a successor
+    /// ring retains its still-live active key during rotation.
+    #[must_use]
+    pub fn contains_signer(&self, signer: &ExternalRs256Signer) -> bool {
+        let Some(expected) = signer.canonical_public_jwks().ok() else {
+            return false;
+        };
+        self.active
+            .canonical_public_jwks()
+            .is_ok_and(|active| active.as_bytes() == expected.as_bytes())
+            || self.retained.iter().any(|retained| {
+                retained
+                    .canonical_public_jwks()
+                    .is_ok_and(|candidate| candidate.as_bytes() == expected.as_bytes())
+            })
+    }
+
+    /// Returns the canonical public key identifiers carried by this ring.
+    /// Callers must still use [`Self::retains_key_from`] when a key's exact
+    /// public bytes, rather than its identifier alone, form a security fence.
+    #[must_use]
+    pub fn key_ids(&self) -> Vec<String> {
+        let mut key_ids = Vec::with_capacity(self.len());
+        key_ids.push(self.active.public_key.kid.clone());
+        key_ids.extend(
+            self.retained
+                .iter()
+                .map(|signer| signer.public_key.kid.clone()),
+        );
+        key_ids
+    }
+
+    /// Returns the exact canonical single-key JWKS identity bound to `key_id`.
+    ///
+    /// Durable consumers use these bytes to fence a restart against replacing
+    /// a retained key with different RSA material under the same `kid`.
+    #[must_use]
+    pub fn canonical_public_key_identity(&self, key_id: &str) -> Option<CanonicalRs256PublicJwks> {
+        let signer = if self.active.public_key.kid == key_id {
+            Some(&self.active)
+        } else {
+            self.retained
+                .iter()
+                .find(|signer| signer.public_key.kid == key_id)
+        }?;
+        signer.canonical_public_jwks().ok()
+    }
+
+    /// Confirms that `self` retains the exact public key named by `key_id`
+    /// from `previous`, rather than merely reusing that key identifier.
+    #[must_use]
+    pub fn retains_key_from(&self, previous: &Self, key_id: &str) -> bool {
+        let previous_signer = if previous.active.public_key.kid == key_id {
+            Some(&previous.active)
+        } else {
+            previous
+                .retained
+                .iter()
+                .find(|signer| signer.public_key.kid == key_id)
+        };
+        previous_signer.is_some_and(|signer| self.contains_signer(signer))
+    }
+
+    /// Returns the immutable key-ring generation.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the number of public verification keys, including the active key.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.retained.len() + 1
+    }
+
+    /// Reports whether this ring has no verification keys.
+    ///
+    /// A valid ring always owns one active key, so this is always false.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Creates the exact canonical JWKS for the active plus retained keys.
+    pub fn canonical_public_jwks(&self) -> Result<CanonicalRs256PublicJwksSet, JoseError> {
+        let mut keys = BTreeMap::new();
+        keys.insert(
+            self.active.public_key.kid.clone(),
+            self.active.public_key.canonical_jwk_value(),
+        );
+        for signer in &self.retained {
+            if keys
+                .insert(
+                    signer.public_key.kid.clone(),
+                    signer.public_key.canonical_jwk_value(),
+                )
+                .is_some()
+            {
+                return Err(JoseError::DuplicateKeyId);
+            }
+        }
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "keys": keys.into_values().collect::<Vec<_>>()
+        }))
+        .map_err(|_| JoseError::InvalidJson("canonical JWKS"))?;
+        if bytes.len() > MAX_JWKS_BYTES {
+            return Err(JoseError::TooLarge("JWKS"));
+        }
+        Ok(CanonicalRs256PublicJwksSet {
+            bytes,
+            generation: self.generation,
+        })
+    }
+
+    /// Refuses retirement before the maximum lifetime of artifacts signed by
+    /// the retiring key has elapsed.  The caller supplies an issuer-owned
+    /// monotonic time value; this protocol module does not consult wall clock.
+    pub fn retire(
+        &self,
+        retiring_kid: &str,
+        now_unix_seconds: i64,
+        last_artifact_expires_at: i64,
+        successor: Arc<ExternalRs256Signer>,
+        successor_generation: u64,
+    ) -> Result<Self, JwsSignerConfigurationError> {
+        if last_artifact_expires_at > now_unix_seconds || successor_generation <= self.generation {
+            return Err(JwsSignerConfigurationError::RetirementNotPermitted);
+        }
+        if self.active.public_key.kid != retiring_kid
+            && !self
+                .retained
+                .iter()
+                .any(|signer| signer.public_key.kid == retiring_kid)
+        {
+            return Err(JwsSignerConfigurationError::InvalidKeyId);
+        }
+        let mut retained = Vec::with_capacity(self.retained.len() + 1);
+        if self.active.public_key.kid != retiring_kid {
+            retained.push(Arc::clone(&self.active));
+        }
+        retained.extend(
+            self.retained
+                .iter()
+                .filter(|signer| signer.public_key.kid != retiring_kid)
+                .cloned(),
+        );
+        Self::new(successor, retained, successor_generation)
+    }
+
+    /// Selects a successor signing key while retaining every current
+    /// verification key in the next canonical JWKS generation.
+    pub fn rotate(
+        &self,
+        successor: Arc<ExternalRs256Signer>,
+        successor_generation: u64,
+    ) -> Result<Self, JwsSignerConfigurationError> {
+        if successor_generation <= self.generation {
+            return Err(JwsSignerConfigurationError::RetirementNotPermitted);
+        }
+        let mut retained = Vec::with_capacity(self.retained.len() + 1);
+        retained.push(Arc::clone(&self.active));
+        retained.extend(self.retained.iter().cloned());
+        Self::new(successor, retained, successor_generation)
+    }
+}
+
+impl fmt::Debug for Rs256PublicKeyRing {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Rs256PublicKeyRing")
+            .field("generation", &self.generation)
+            .field("key_count", &self.len())
+            .finish()
+    }
+}
+
+/// Closed consumer profile for a publication/read-back activation receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningActivationProfile {
+    /// OpenID Connect ID-token issuance.
+    OidcIdToken,
+}
+
+/// One externally fetched JWKS response, retained as bounded evidence for an
+/// activation receipt.  This type is evidence, not a fetch API: the owning
+/// server must acquire it through its configured endpoint verifier.
+#[derive(Clone)]
+pub struct JwksEndpointReadBack {
+    uri: String,
+    origin: String,
+    bytes: Vec<u8>,
+    generation: u64,
+}
+
+impl JwksEndpointReadBack {
+    /// Constructs bounded endpoint evidence after the owner fetched a response.
+    pub fn new(
+        uri: impl Into<String>,
+        origin: impl Into<String>,
+        bytes: Vec<u8>,
+        generation: u64,
+    ) -> Result<Self, JwsSignerConfigurationError> {
+        let uri = uri.into();
+        let origin = origin.into();
+        if generation == 0 || uri.is_empty() || origin.is_empty() || bytes.is_empty() {
+            return Err(JwsSignerConfigurationError::InvalidActivationEvidence);
+        }
+        if uri.len() > MAX_JWKS_BYTES
+            || origin.len() > MAX_JWKS_BYTES
+            || bytes.len() > MAX_JWKS_BYTES
+        {
+            return Err(JwsSignerConfigurationError::InvalidActivationEvidence);
+        }
+        Ok(Self {
+            uri,
+            origin,
+            bytes,
+            generation,
+        })
+    }
+
+    /// Exact configured endpoint URI fetched by the verifier.
+    #[must_use]
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// Exact origin asserted by the verifier for this endpoint.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// Monotonic publication generation observed by the verifier.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Sealed evidence that every advertised JWKS endpoint returned one exact
+/// key-ring generation and verified a signer-produced canary.
+#[derive(Clone)]
+pub struct SigningActivationReceipt {
+    profile: SigningActivationProfile,
+    issuer: String,
+    key_ring_generation: u64,
+    endpoints: Vec<JwksEndpointReadBack>,
+    canary: String,
+}
+
+impl SigningActivationReceipt {
+    /// Verifies endpoint evidence and the compact canary before minting a
+    /// receipt.  The caller must provide every advertised endpoint; copied
+    /// bytes fail unless they are the exact fetched response recorded here.
+    pub fn verify(
+        profile: SigningActivationProfile,
+        issuer: impl Into<String>,
+        expected: &CanonicalRs256PublicJwksSet,
+        configured_endpoints: &[String],
+        configured_origins: &[String],
+        endpoints: Vec<JwksEndpointReadBack>,
+        canary: String,
+    ) -> Result<Self, JoseError> {
+        let issuer = issuer.into();
+        if issuer.is_empty()
+            || endpoints.is_empty()
+            || endpoints.len() != configured_endpoints.len()
+            || endpoints.len() != configured_origins.len()
+            || canary.is_empty()
+        {
+            return Err(JoseError::InvalidJwk("activation receipt evidence"));
+        }
+        let mut seen = BTreeSet::new();
+        for endpoint in &endpoints {
+            if endpoint.generation != expected.generation
+                || endpoint.bytes != expected.bytes
+                || !seen.insert(endpoint.uri.as_str())
+                || !configured_endpoints
+                    .iter()
+                    .zip(configured_origins)
+                    .any(|(uri, origin)| uri == endpoint.uri() && origin == endpoint.origin())
+            {
+                return Err(JoseError::InvalidJwk(
+                    "activation receipt endpoint mismatch",
+                ));
+            }
+            let keys = AdmittedRsaJwks::from_json(&endpoint.bytes)?;
+            verify_compact_jws_rs256(&canary, &keys)?;
+        }
+        Ok(Self {
+            profile,
+            issuer,
+            key_ring_generation: expected.generation,
+            endpoints,
+            canary,
+        })
+    }
+
+    /// The profile whose signing admission this receipt authorizes.
+    #[must_use]
+    pub const fn profile(&self) -> SigningActivationProfile {
+        self.profile
+    }
+
+    /// Exact issuer identity bound to the receipt.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Exact key-ring generation admitted by the endpoint observations.
+    #[must_use]
+    pub const fn key_ring_generation(&self) -> u64 {
+        self.key_ring_generation
+    }
+
+    /// Returns the observed endpoint count without exposing mutable evidence.
+    #[must_use]
+    pub fn endpoint_count(&self) -> usize {
+        self.endpoints.len()
+    }
+
+    /// Confirms this receipt remains exactly applicable to a selected profile,
+    /// issuer, canonical key-ring, and configured endpoint list.
+    pub fn applies_to(
+        &self,
+        profile: SigningActivationProfile,
+        issuer: &str,
+        expected: &CanonicalRs256PublicJwksSet,
+        endpoints: &[String],
+        origins: &[String],
+    ) -> bool {
+        if self.profile != profile
+            || self.issuer != issuer
+            || self.key_ring_generation != expected.generation
+            || self.endpoints.len() != endpoints.len()
+            || self.endpoints.len() != origins.len()
+        {
+            return false;
+        }
+        self.endpoints.iter().all(|observed| {
+            endpoints
+                .iter()
+                .zip(origins)
+                .any(|(endpoint, origin)| endpoint == &observed.uri && origin == &observed.origin)
+                && observed.bytes == expected.bytes
+                && observed.generation == expected.generation
+        })
+    }
+}
+
+impl fmt::Debug for SigningActivationReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SigningActivationReceipt")
+            .field("profile", &self.profile)
+            .field("issuer_bytes", &self.issuer.len())
+            .field("key_ring_generation", &self.key_ring_generation)
+            .field("endpoint_count", &self.endpoints.len())
+            .field("canary_bytes", &self.canary.len())
+            .finish()
     }
 }
 
@@ -726,6 +1185,10 @@ pub enum JwsSignerConfigurationError {
     InvalidSignature,
     /// The provider supplied no operation identifier.
     ZeroOperation,
+    /// Endpoint evidence was absent, oversized, or not generation-bound.
+    InvalidActivationEvidence,
+    /// A key remains needed by a live artifact or the requested generation regressed.
+    RetirementNotPermitted,
 }
 
 impl fmt::Display for JwsSignerConfigurationError {
@@ -739,6 +1202,12 @@ impl fmt::Display for JwsSignerConfigurationError {
             Self::InvalidClaims => "RS256 signer claims are invalid",
             Self::InvalidSignature => "RS256 signer signature is invalid",
             Self::ZeroOperation => "RS256 signer operation identifier must be nonzero",
+            Self::InvalidActivationEvidence => {
+                "RS256 signing activation evidence is invalid or unbounded"
+            }
+            Self::RetirementNotPermitted => {
+                "RS256 verification key retirement is fenced by live artifacts or generation"
+            }
         })
     }
 }
@@ -896,8 +1365,13 @@ impl ExternalRs256Signer {
         self.public_key.binding()
     }
 
-    /// Returns the sole canonical public JWKS that can activate this signer.
+    /// Returns the exact public key identifier selected for this signer.
     #[must_use]
+    pub fn key_id(&self) -> &str {
+        self.public_key.kid()
+    }
+
+    /// Returns the sole canonical public JWKS that can activate this signer.
     pub fn canonical_public_jwks(&self) -> Result<CanonicalRs256PublicJwks, JoseError> {
         self.public_key.canonical_public_jwks()
     }
@@ -1897,6 +2371,117 @@ mod tests {
             calls,
             binding,
         )
+    }
+
+    fn ring_signer(kid: &str, binding: Rs256SigningBinding) -> Arc<ExternalRs256Signer> {
+        let key = attested_key_from_jwk(FIXED_JWK, kid, binding);
+        Arc::new(ExternalRs256Signer::new(
+            Arc::new(FixedVectorExternalBackend {
+                mode: FixedBackendMode::Valid,
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            key,
+        ))
+    }
+
+    #[test]
+    fn key_ring_canonical_overlap_and_retirement_fence_are_generation_bound() {
+        let binding = fixed_binding();
+        let active = ring_signer("active", binding);
+        let retained = ring_signer("retained", binding);
+        let ring = Rs256PublicKeyRing::new(Arc::clone(&active), vec![retained], 31)
+            .expect("two public signer keys form one ring");
+        let overlap = ring
+            .canonical_public_jwks()
+            .expect("canonical overlap JWKS");
+        let admitted = AdmittedRsaJwks::from_json(overlap.as_bytes()).expect("admit overlap");
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(overlap.generation(), 31);
+
+        let successor = ring_signer("successor", binding);
+        let rotated = ring
+            .rotate(Arc::clone(&successor), 32)
+            .expect("successor retains active verification overlap");
+        assert_eq!(
+            AdmittedRsaJwks::from_json(
+                rotated
+                    .canonical_public_jwks()
+                    .expect("canonical rotated JWKS")
+                    .as_bytes(),
+            )
+            .expect("admit rotated JWKS")
+            .len(),
+            3,
+        );
+        assert!(matches!(
+            ring.retire("active", 100, 101, Arc::clone(&successor), 32),
+            Err(JwsSignerConfigurationError::RetirementNotPermitted)
+        ));
+        let retired = ring
+            .retire("active", 101, 101, successor, 32)
+            .expect("retirement after final token expiry");
+        let retired = retired
+            .canonical_public_jwks()
+            .expect("canonical retired JWKS");
+        assert_eq!(retired.generation(), 32);
+        assert_eq!(
+            AdmittedRsaJwks::from_json(retired.as_bytes())
+                .expect("admit retired JWKS")
+                .len(),
+            2,
+        );
+    }
+
+    #[test]
+    fn signing_activation_receipt_requires_exact_endpoint_bytes_and_generation() {
+        let binding = fixed_binding();
+        let active = ring_signer("fixed-rs256", binding);
+        let ring = Rs256PublicKeyRing::new(active, Vec::new(), 41).expect("one-key ring");
+        let jwks = ring.canonical_public_jwks().expect("canonical JWKS");
+        let endpoint = JwksEndpointReadBack::new(
+            "https://issuer.example.test/oidc/jwks",
+            "https://issuer.example.test",
+            jwks.as_bytes().to_vec(),
+            41,
+        )
+        .expect("bounded endpoint evidence");
+        let receipt = SigningActivationReceipt::verify(
+            SigningActivationProfile::OidcIdToken,
+            "https://issuer.example.test/",
+            &jwks,
+            &["https://issuer.example.test/oidc/jwks".to_string()],
+            &["https://issuer.example.test".to_string()],
+            vec![endpoint],
+            FIXED_COMPACT_JWS.to_string(),
+        )
+        .expect("fixed RS256 canary verifies against endpoint bytes");
+        assert!(receipt.applies_to(
+            SigningActivationProfile::OidcIdToken,
+            "https://issuer.example.test/",
+            &jwks,
+            &["https://issuer.example.test/oidc/jwks".to_string()],
+            &["https://issuer.example.test".to_string()],
+        ));
+
+        let stale = JwksEndpointReadBack::new(
+            "https://issuer.example.test/oidc/jwks",
+            "https://issuer.example.test",
+            jwks.as_bytes().to_vec(),
+            40,
+        )
+        .expect("bounded stale evidence");
+        assert!(
+            SigningActivationReceipt::verify(
+                SigningActivationProfile::OidcIdToken,
+                "https://issuer.example.test/",
+                &jwks,
+                &["https://issuer.example.test/oidc/jwks".to_string()],
+                &["https://issuer.example.test".to_string()],
+                vec![stale],
+                FIXED_COMPACT_JWS.to_string(),
+            )
+            .is_err()
+        );
     }
 
     fn builtin_access_token_signer(
