@@ -4081,7 +4081,7 @@ where
 {
     Frame {
         receiver: AsyncWsClientRecvHalf<IO>,
-        result: Result<ReceivedTransportFrame, TransportError>,
+        result: Box<Result<ReceivedTransportFrame, TransportError>>,
     },
     CallbackTerminal,
 }
@@ -6042,9 +6042,7 @@ where
         if let Some(error) = self.reverse_callback_pool.terminal_error() {
             return Err(error);
         }
-        if let Err(error) = self.reverse_callback_pool.reap_finished_tasks() {
-            return Err(error);
-        }
+        self.reverse_callback_pool.reap_finished_tasks()?;
         self.reverse_callback_pool
             .terminal_error()
             .map_or(Ok(()), Err)
@@ -6074,7 +6072,10 @@ where
             .race(vec![
                 Box::pin(async move {
                     let result = receiver.recv_with_source(&receive_cx).await;
-                    WebSocketReceiveRace::Frame { receiver, result }
+                    WebSocketReceiveRace::Frame {
+                        receiver,
+                        result: Box::new(result),
+                    }
                 }),
                 Box::pin(async move {
                     let _ = terminal.recv(&terminal_cx).await;
@@ -6085,7 +6086,7 @@ where
         match raced {
             Ok(WebSocketReceiveRace::Frame { receiver, result }) => {
                 self.receiver = Some(receiver);
-                result
+                *result
             }
             Ok(WebSocketReceiveRace::CallbackTerminal) => {
                 if cx.checkpoint().is_err() {
@@ -6212,9 +6213,7 @@ where
             Some(receiver) => receiver.close(cx).await.map_err(transport_error_to_mcp),
             None => Ok(()),
         };
-        if let Err(error) = callbacks_result {
-            return Err(error);
-        }
+        callbacks_result?;
         match (sender_result, receiver_result) {
             (Ok(()), Ok(())) => {
                 self.close_settled = true;
@@ -6244,13 +6243,16 @@ async fn async_websocket_discover<IO>(
     cx: &Cx,
     client_info: &ClientInfo,
     client_capabilities: &ClientCapabilities,
-    _mcp_apps_settings: Option<&McpAppsClientSettings>,
+    mcp_apps_settings: Option<&McpAppsClientSettings>,
     client_extension_runtime: Option<&ClientExtensionRuntime>,
     id: i64,
 ) -> Result<WebSocketInitialization, WebSocketHandshakeError>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    #[cfg(not(feature = "apps"))]
+    let _ = mcp_apps_settings;
+
     let mut params = serde_json::to_value(ServerDiscoverRequest::default()).map_err(|_| {
         WebSocketHandshakeError::Mcp(McpError::internal_error(
             "Modern WebSocket discovery parameters could not be serialized",
@@ -6304,7 +6306,7 @@ where
     }
     #[cfg(feature = "apps")]
     if client_extension_runtime.is_none_or(|runtime| !runtime.configures_mcp_apps())
-        && let Some(settings) = _mcp_apps_settings
+        && let Some(settings) = mcp_apps_settings
     {
         let capabilities = metadata
             .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
@@ -17887,7 +17889,7 @@ mod tests {
                 let callback_cx = Arc::clone(&callback_cx);
                 let parked_receiver = Arc::clone(&parked_receiver);
                 move |handler_cx, _cancellation, _params| {
-                    let receiver = parked_receiver
+                    let mut receiver = parked_receiver
                         .lock()
                         .expect("callback receiver lock")
                         .take()
@@ -18003,7 +18005,7 @@ mod tests {
                 let callback_started = Arc::clone(&callback_started);
                 let parked_receiver = Arc::clone(&parked_receiver);
                 move |handler_cx, cancellation, _params| {
-                    let receiver = parked_receiver
+                    let mut receiver = parked_receiver
                         .lock()
                         .expect("callback receiver lock")
                         .take()
@@ -18020,7 +18022,7 @@ mod tests {
                     })
                 }
             });
-            let release = cx
+            let mut release = cx
                 .spawn({
                     let callback_started = Arc::clone(&callback_started);
                     let foreign_cancellation_sent = Arc::clone(&foreign_cancellation_sent);
@@ -18190,7 +18192,7 @@ mod tests {
                 let callback_started = Arc::clone(&callback_started);
                 let receiver = Arc::clone(&receiver);
                 move |handler_cx, cancellation, _params| {
-                    let receiver = receiver
+                    let mut receiver = receiver
                         .lock()
                         .expect("callback receiver lock")
                         .take()
