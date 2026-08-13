@@ -170,7 +170,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `resources/list` | ✅ | ✅ | With cursor pagination |
 | `resources/read` | ✅ | ✅ | With progress token support |
 | `resources/templates/list` | ✅ | 🟡 | Listing plus RFC 6570 reversible matching exist; lossy prefix/explode templates are refused rather than guessed |
-| `resources/subscribe` | ✅ | ✅ | Protocol support |
+| `resources/subscribe` | ✅ | ✅ | Session dispatch serves subscribe for registered URIs; registering a resource or template advertises `resources.subscribe` on initialize |
 | `resources/unsubscribe` | ✅ | ✅ | Protocol support |
 | `prompts/list` | ✅ | ✅ | With cursor pagination |
 | `prompts/get` | ✅ | ✅ | With argument support |

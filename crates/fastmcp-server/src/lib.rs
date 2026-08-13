@@ -24459,6 +24459,81 @@ mod lib_unit_tests {
         assert_eq!(values, serde_json::json!(["legacy:sta"]));
     }
 
+    #[test]
+    fn registered_resource_advertises_subscribe_on_initialize() {
+        struct SubscribeResource;
+        impl ResourceHandler for SubscribeResource {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: "file:///subscribe.txt".to_string(),
+                    name: "subscribe".to_string(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                }
+            }
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                Ok(vec![fastmcp_protocol::ResourceContent {
+                    uri: "file:///subscribe.txt".to_string(),
+                    mime_type: None,
+                    text: Some("ok".to_string()),
+                    blob: None,
+                }])
+            }
+        }
+
+        let server = Server::new("advertise-subscribe", "1.0.0")
+            .resource(SubscribeResource)
+            .build();
+        assert!(
+            server
+                .capabilities()
+                .resources
+                .as_ref()
+                .is_some_and(|resources| resources.subscribe)
+        );
+        let mut session = Session::new(server.info.clone(), server.capabilities().clone());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let response = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                initialize_test_request(1, "client", Default::default()),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("initialize must respond");
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/capabilities/resources/subscribe")),
+            Some(&serde_json::json!(true)),
+            "initialize must advertise resources.subscribe once a resource is registered"
+        );
+
+        let mut session = initialized_test_session(&server);
+        let subscribed = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    "resources/subscribe",
+                    Some(serde_json::json!({ "uri": "file:///subscribe.txt" })),
+                    93_i64,
+                ),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("session resources/subscribe must produce a JSON-RPC response");
+        assert!(
+            subscribed.error.is_none(),
+            "registered resource must be subscribable without resource_subscriptions(): {subscribed:?}"
+        );
+    }
+
     #[cfg(feature = "tasks")]
     #[test]
     fn public_tasks_update_requires_an_id_before_the_extension_handler_can_mutate_state() {
