@@ -110,9 +110,9 @@ pub use fastmcp_transport::websocket::AsyncWsServerTransport;
 pub use handler::{
     BidirectionalSenders, BoxFuture, CompletionHandler, FinalElicitation,
     FinalElicitationContextExt, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
-    FinalToolOutcome, FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler,
-    ResourceHandler, ToolErrorKind, ToolHandler, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    FinalSampling, FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
+    ProgressNotificationSender, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
+    create_context_with_progress, create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 use oauth::{
@@ -469,8 +469,11 @@ use crate::http_admission::{
     ResponseRepresentation, admit_modern_post,
 };
 
-use asupersync::codec::Framed;
-use asupersync::http::h1::{Http1Codec, Method as Http1Method, Response as Http1Response};
+use asupersync::bytes::BytesMut;
+use asupersync::codec::{Decoder, Encoder, Framed};
+use asupersync::http::h1::{
+    Http1Codec, HttpError as Http1DecodeError, Method as Http1Method, Response as Http1Response,
+};
 #[cfg(feature = "websocket")]
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
@@ -520,8 +523,8 @@ use fastmcp_protocol::tasks_extension::{
 };
 use fastmcp_protocol::{
     CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
-    ClientCapabilities, ClientExtensionDiscovery, CoreRequest, CoreResult, CorrelationKey,
-    DiscoveryCacheHints, ExtensionDescriptor, ExtensionId, ExtensionRegistryError,
+    ClientCapabilities, ClientExtensionDiscovery, ClientNotification, CoreRequest, CoreResult,
+    CorrelationKey, DiscoveryCacheHints, ExtensionDescriptor, ExtensionId, ExtensionRegistryError,
     ExtensionRegistryReceipt, ExtensionSettings, FINAL_CLIENT_CAPABILITIES_META_KEY,
     FINAL_SERVER_INFO_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams,
     FinalCoreRequest, FinalCoreResult, FinalLogMessageParams, FinalResultMetadataSeal,
@@ -1702,6 +1705,32 @@ fn decode_final_core_request_for_middleware(
     .map_err(|error| McpError::invalid_params(error.to_string()))
 }
 
+/// Admits the sole client-originated final notification before an ID-less
+/// registered final frame can enter authentication or application dispatch.
+///
+/// Final registry membership is intentionally checked first: extension
+/// notifications remain eligible for their registered extension path, while a
+/// final request missing its id and every server-originated final notification
+/// is rejected by the typed client union.
+fn admit_final_client_notification_ingress(request: &JsonRpcRequest) -> McpResult<()> {
+    if request.id.is_some() || final_2026_07_28_method(&request.method).is_none() {
+        return Ok(());
+    }
+
+    ClientNotification::decode(request)
+        .map(|_| ())
+        .map_err(|error| McpError::invalid_request(error.to_string()))
+}
+
+/// Rejects a final client-forbidden notification from raw native-HTTP input
+/// before strict POST admission rejects its missing request id.  That keeps
+/// HTTP on the same typed direction authority as stateful transports without
+/// treating an untyped malformed document as a notification.
+fn rejects_final_client_notification_http_ingress(body: &[u8], document_byte_limit: usize) -> bool {
+    JsonRpcRequest::decode_strict_with_raw_params(body, document_byte_limit)
+        .is_ok_and(|(request, _)| admit_final_client_notification_ingress(&request).is_err())
+}
+
 /// Projects admitted final client capabilities into the handler context.
 ///
 /// Final handlers use the context capability view to decide whether an
@@ -1741,9 +1770,14 @@ fn admitted_final_client_capability_info(
         .map_or((false, false), |elicitation| {
             (elicitation.supports_form(), elicitation.supports_url())
         });
-    Ok(Some(
-        ClientCapabilityInfo::new().with_elicitation(elicitation_form, elicitation_url),
-    ))
+    let capability_info =
+        ClientCapabilityInfo::new().with_elicitation(elicitation_form, elicitation_url);
+    let capability_info = if capabilities.sampling.is_some() {
+        capability_info.with_sampling()
+    } else {
+        capability_info
+    };
+    Ok(Some(capability_info))
 }
 
 /// A raw parameter sidecar is usable only while authentication and admission
@@ -4183,6 +4217,30 @@ impl Drop for FinalSubscriptionLease {
 }
 
 impl FinalSubscriptionRegistry {
+    #[cfg(test)]
+    fn snapshot_for_test(&self) -> serde_json::Value {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut entries = state
+            .entries
+            .values()
+            .map(|entry| {
+                serde_json::json!({
+                    "subscriptionId": entry.subscription_id.clone(),
+                    "filter": entry.accepted_filter.clone(),
+                    "modernHttpOwner": entry.modern_http_owner,
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.to_string());
+        serde_json::json!({
+            "terminating": self.terminating.load(Ordering::Acquire),
+            "entries": entries,
+        })
+    }
+
     fn open(
         self: &Arc<Self>,
         subscription_id: RequestId,
@@ -7116,8 +7174,17 @@ impl ServerHttpSession {
         &self,
         mut request: HttpRequest,
     ) -> Result<(HttpRequest, JsonRpcRequest, Option<Arc<str>>), HttpResponse> {
+        if rejects_final_client_notification_http_ingress(
+            &request.body,
+            self.server.http_config.handler_config.max_body_size,
+        ) {
+            return Err(HttpResponse::bad_request());
+        }
         let admitted = self.admit_modern_http_request(&request)?;
         let raw_params = admitted.raw_params().map(Arc::<str>::from);
+        if admit_final_client_notification_ingress(admitted.request()).is_err() {
+            return Err(HttpResponse::bad_request());
+        }
         if let Some(response) = self
             .server
             .preflight_modern_http_required_capability(admitted.request())
@@ -8053,6 +8120,18 @@ fn oauth_http_error(error: OAuthError) -> HttpResponse {
     )
 }
 
+/// Maps OAuth errors emitted while authenticating a token or revocation
+/// request's form client credentials.  These endpoints challenge client-auth
+/// failures without changing authorization-endpoint redirect behavior.
+fn oauth_http_client_authentication_error(error: OAuthError) -> HttpResponse {
+    match &error {
+        OAuthError::InvalidClient(_) | OAuthError::UnauthorizedClient(_) => {
+            oauth_http_client_authentication_rejection(error.error_code())
+        }
+        _ => oauth_http_error(error),
+    }
+}
+
 fn oauth_http_invalid_request() -> HttpResponse {
     oauth_http_no_store(
         HttpResponse::bad_request().with_json(&serde_json::json!({ "error": "invalid_request" })),
@@ -8063,6 +8142,32 @@ fn oauth_http_method_not_allowed(allow: &'static str) -> HttpResponse {
     oauth_http_no_store(
         HttpResponse::new(HttpStatus::METHOD_NOT_ALLOWED).with_header("allow", allow),
     )
+}
+
+fn oauth_http_client_authentication_rejection(error_code: &'static str) -> HttpResponse {
+    oauth_http_no_store(
+        HttpResponse::new(HttpStatus::UNAUTHORIZED)
+            .with_header("www-authenticate", "Basic realm=\"oauth\"")
+            .with_json(&serde_json::json!({ "error": error_code })),
+    )
+}
+
+/// Rejects an HTTP Authorization header on form-authenticated OAuth routes.
+///
+/// Only an attempted Basic client-authentication exchange is challenged. Other
+/// schemes remain malformed OAuth requests: treating a Bearer credential as a
+/// Basic challenge would both change the established route semantics and
+/// invite a client to resend an unrelated bearer token as client credentials.
+fn oauth_http_client_authorization_header_rejection(authorization: &str) -> HttpResponse {
+    if authorization
+        .split_ascii_whitespace()
+        .next()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+    {
+        oauth_http_client_authentication_rejection("invalid_client")
+    } else {
+        oauth_http_invalid_request()
+    }
 }
 
 fn h1_oauth_singleton_header<'a>(
@@ -8089,15 +8194,6 @@ fn oauth_form_content_type(request: &asupersync::http::h1::Request) -> Result<()
         .eq_ignore_ascii_case("application/x-www-form-urlencoded")
     {
         return Err(HttpResponse::new(HttpStatus(415)));
-    }
-    Ok(())
-}
-
-fn oauth_reject_http_authorization(
-    request: &asupersync::http::h1::Request,
-) -> Result<(), HttpResponse> {
-    if h1_oauth_singleton_header(request, "authorization")?.is_some() {
-        return Err(oauth_http_invalid_request());
     }
     Ok(())
 }
@@ -8192,10 +8288,45 @@ fn dispatch_oauth_h1_request(
     raw_path: &str,
     raw_query: &str,
 ) -> HttpResponse {
-    if let Err(response) = oauth_reject_http_authorization(request) {
-        return response;
+    let authorization_header = match h1_oauth_singleton_header(request, "authorization") {
+        Ok(header) => header,
+        Err(response) => return response,
+    };
+    #[cfg(feature = "builtin-auth-server")]
+    if let Some(oidc) = routes.oidc_routes() {
+        if raw_path == oidc.discovery_path() || raw_path == oidc.jwks_path() {
+            if authorization_header.is_some() || !raw_query.is_empty() || !request.body.is_empty() {
+                return oauth_http_invalid_request();
+            }
+            if !matches!(request.method, Http1Method::Get) {
+                return oauth_http_method_not_allowed("GET");
+            }
+            if raw_path == oidc.discovery_path() {
+                return oauth_http_no_store(
+                    HttpResponse::ok().with_json(
+                        &oidc
+                            .provider()
+                            .discovery_document(routes.public_endpoint_base()),
+                    ),
+                );
+            }
+            return oidc
+                .provider()
+                .published_jwks_document(oidc.jwks_uri())
+                .map(|body| {
+                    oauth_http_no_store(
+                        HttpResponse::ok()
+                            .with_header("content-type", "application/jwk-set+json")
+                            .with_body(body),
+                    )
+                })
+                .unwrap_or_else(|_| HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE));
+        }
     }
     if raw_path == routes.authorization_path() {
+        if authorization_header.is_some() {
+            return oauth_http_invalid_request();
+        }
         if !matches!(request.method, Http1Method::Get) {
             return oauth_http_method_not_allowed("GET");
         }
@@ -8217,7 +8348,15 @@ fn dispatch_oauth_h1_request(
             Ok((_code, redirect)) => oauth_http_no_store(
                 HttpResponse::new(HttpStatus(303)).with_header("location", redirect),
             ),
-            Err(error) => oauth_http_error(error),
+            Err(error) => routes
+                .server()
+                .authorization_error_redirect(&authorization, &error)
+                .map(|redirect| {
+                    oauth_http_no_store(
+                        HttpResponse::new(HttpStatus(303)).with_header("location", redirect),
+                    )
+                })
+                .unwrap_or_else(|| oauth_http_error(error)),
         };
     }
 
@@ -8225,6 +8364,9 @@ fn dispatch_oauth_h1_request(
         return oauth_http_invalid_request();
     }
     if raw_path == routes.token_path() {
+        if let Some(authorization_header) = authorization_header {
+            return oauth_http_client_authorization_header_rejection(authorization_header);
+        }
         if !matches!(request.method, Http1Method::Post) {
             return oauth_http_method_not_allowed("POST");
         }
@@ -8244,10 +8386,13 @@ fn dispatch_oauth_h1_request(
         };
         return match routes.server().token(&token) {
             Ok(response) => oauth_http_no_store(HttpResponse::ok().with_json(&response)),
-            Err(error) => oauth_http_error(error),
+            Err(error) => oauth_http_client_authentication_error(error),
         };
     }
 
+    if let Some(authorization_header) = authorization_header {
+        return oauth_http_client_authorization_header_rejection(authorization_header);
+    }
     if !matches!(request.method, Http1Method::Post) {
         return oauth_http_method_not_allowed("POST");
     }
@@ -8276,8 +8421,181 @@ fn dispatch_oauth_h1_request(
         .revoke(&token, &client_id, client_secret.as_deref())
     {
         Ok(()) => oauth_http_no_store(HttpResponse::ok()),
-        Err(error) => oauth_http_error(error),
+        Err(error) => oauth_http_client_authentication_error(error),
     }
+}
+
+/// Immutable route facts needed before the generic HTTP/1 decoder accepts a
+/// request body. Keeping this separate from the OAuth server prevents the
+/// listener's MCP-sized body allowance from becoming an OAuth body allowance.
+#[derive(Clone)]
+struct OAuthNativeH1RouteLimits {
+    authorization: String,
+    token: String,
+    revocation: String,
+    #[cfg(feature = "builtin-auth-server")]
+    oidc_discovery: Option<String>,
+    #[cfg(feature = "builtin-auth-server")]
+    oidc_jwks: Option<String>,
+}
+
+impl OAuthNativeH1RouteLimits {
+    fn from_routes(routes: &OAuthHttpRoutes) -> Self {
+        Self {
+            authorization: routes.authorization_path().to_owned(),
+            token: routes.token_path().to_owned(),
+            revocation: routes.revocation_path().to_owned(),
+            #[cfg(feature = "builtin-auth-server")]
+            oidc_discovery: routes
+                .oidc_routes()
+                .map(|oidc| oidc.discovery_path().to_owned()),
+            #[cfg(feature = "builtin-auth-server")]
+            oidc_jwks: routes.oidc_routes().map(|oidc| oidc.jwks_path().to_owned()),
+        }
+    }
+
+    fn body_limit_for_path(&self, path: &str) -> Option<usize> {
+        if path == self.authorization || {
+            #[cfg(feature = "builtin-auth-server")]
+            {
+                self.oidc_discovery.as_deref() == Some(path)
+                    || self.oidc_jwks.as_deref() == Some(path)
+            }
+            #[cfg(not(feature = "builtin-auth-server"))]
+            {
+                false
+            }
+        } {
+            Some(0)
+        } else if path == self.token || path == self.revocation {
+            Some(oauth::MAX_OAUTH_FORM_BODY_BYTES)
+        } else {
+            None
+        }
+    }
+}
+
+/// Pre-body routing state for [`NativeHttp1Codec`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeHttp1PreBodyAdmission {
+    AwaitingHead,
+    Complete,
+}
+
+/// Native HTTP/1 codec with a route-aware OAuth pre-body limit.
+///
+/// The generic codec still owns all HTTP parsing and MCP's configured body
+/// limit. This wrapper only examines a complete unconsumed request head before
+/// delegating, so OAuth `Content-Length` and transfer-encoding admission can
+/// fail before the generic decoder allocates a body at the larger MCP limit.
+struct NativeHttp1Codec {
+    inner: Http1Codec,
+    oauth_limits: Option<OAuthNativeH1RouteLimits>,
+    pre_body_admission: NativeHttp1PreBodyAdmission,
+}
+
+impl NativeHttp1Codec {
+    fn new(max_body_size: usize, routes: Option<&OAuthHttpRoutes>) -> Self {
+        Self {
+            inner: Http1Codec::new().max_body_size(max_body_size),
+            oauth_limits: routes.map(OAuthNativeH1RouteLimits::from_routes),
+            pre_body_admission: NativeHttp1PreBodyAdmission::AwaitingHead,
+        }
+    }
+
+    fn pre_admit_oauth_body(&mut self, source: &BytesMut) -> Result<(), Http1DecodeError> {
+        if self.pre_body_admission == NativeHttp1PreBodyAdmission::Complete {
+            return Ok(());
+        }
+        let Some(head_end) = source.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return Ok(());
+        };
+        // The underlying codec remains the sole authority for malformed HTTP.
+        // A non-UTF-8 or malformed head is left for it to reject.
+        let Ok(head) = std::str::from_utf8(&source[..head_end]) else {
+            return Ok(());
+        };
+        let Some(request_line) = head.split("\r\n").next() else {
+            return Ok(());
+        };
+        let mut request_line_parts = request_line.split(' ');
+        let Some(_method) = request_line_parts.next() else {
+            return Ok(());
+        };
+        let Some(target) = request_line_parts.next() else {
+            return Ok(());
+        };
+        let raw_path = target.split_once('?').map_or(target, |(path, _)| path);
+        let Some(limits) = self.oauth_limits.as_ref() else {
+            self.pre_body_admission = NativeHttp1PreBodyAdmission::Complete;
+            return Ok(());
+        };
+        let Some(body_limit) = limits.body_limit_for_path(raw_path) else {
+            self.pre_body_admission = NativeHttp1PreBodyAdmission::Complete;
+            return Ok(());
+        };
+        if raw_path == limits.authorization_path {
+            let query = target.split_once('?').map_or("", |(_, query)| query);
+            if query.len() > oauth::MAX_OAUTH_AUTHORIZATION_QUERY_BYTES {
+                return Err(Http1DecodeError::BodyTooLarge);
+            }
+        }
+
+        for line in head.split("\r\n").skip(1) {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                // An OAuth route has a small, fixed body budget. Rejecting a
+                // streaming transfer before the generic decoder starts
+                // buffering preserves that budget without constraining MCP.
+                return Err(Http1DecodeError::BodyTooLarge);
+            }
+            if name.eq_ignore_ascii_case("content-length")
+                && value
+                    .trim()
+                    .parse::<usize>()
+                    .is_ok_and(|length| length > body_limit)
+            {
+                return Err(Http1DecodeError::BodyTooLarge);
+            }
+        }
+        self.pre_body_admission = NativeHttp1PreBodyAdmission::Complete;
+        Ok(())
+    }
+}
+
+impl Decoder for NativeHttp1Codec {
+    type Item = asupersync::http::h1::Request;
+    type Error = Http1DecodeError;
+
+    fn decode(&mut self, source: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        self.pre_admit_oauth_body(source)?;
+        let request = self.inner.decode(source)?;
+        if request.is_some() {
+            self.pre_body_admission = NativeHttp1PreBodyAdmission::AwaitingHead;
+        }
+        Ok(request)
+    }
+}
+
+impl Encoder<Http1Response> for NativeHttp1Codec {
+    type Error = Http1DecodeError;
+
+    fn encode(
+        &mut self,
+        response: Http1Response,
+        destination: &mut BytesMut,
+    ) -> Result<(), Self::Error> {
+        self.inner.encode(response, destination)
+    }
+}
+
+fn native_http1_codec(endpoint: &ServerHttpEndpoint) -> NativeHttp1Codec {
+    NativeHttp1Codec::new(
+        endpoint.server.http_config.handler_config.max_body_size,
+        endpoint.server.oauth_http_routes.as_ref(),
+    )
 }
 
 /// Handles an OAuth-only route before MCP's transport conversion can merge
@@ -8285,7 +8603,7 @@ fn dispatch_oauth_h1_request(
 /// request path was one of the installed immutable OAuth routes.
 async fn serve_oauth_h1_request<T>(
     cx: &Cx,
-    framed: &mut Framed<T, Http1Codec>,
+    framed: &mut Framed<T, NativeHttp1Codec>,
     endpoint: &ServerHttpEndpoint,
     request: &asupersync::http::h1::Request,
 ) -> bool
@@ -8346,7 +8664,7 @@ fn h1_response(mut response: HttpResponse) -> Http1Response {
 
 async fn send_h1_response<T>(
     cx: &Cx,
-    framed: &mut Framed<T, Http1Codec>,
+    framed: &mut Framed<T, NativeHttp1Codec>,
     response: HttpResponse,
 ) -> Result<(), ()>
 where
@@ -9292,10 +9610,7 @@ async fn serve_modern_json_http_connection(
     peer_watch.abort();
     let _ = peer_watch.join(cx).await;
 
-    let mut response_framed = Framed::new(
-        writer,
-        Http1Codec::new().max_body_size(endpoint.server.http_config.handler_config.max_body_size),
-    );
+    let mut response_framed = Framed::new(writer, native_http1_codec(&endpoint));
     let _ = send_h1_response(cx, &mut response_framed, response).await;
 }
 
@@ -9434,10 +9749,7 @@ async fn serve_http_connection(
     modern_sessions: LiveModernHttpSessionRegistry,
 ) {
     let http_config = &endpoint.server.http_config.handler_config;
-    let mut framed = Framed::new(
-        stream,
-        Http1Codec::new().max_body_size(http_config.max_body_size),
-    );
+    let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
     #[cfg(test)]
     lib_unit_tests::record_live_http_connection_read_wait();
     let Some(request) = framed.next().await else {
@@ -9715,10 +10027,7 @@ async fn serve_modern_http_connection(
     modern_sessions: LiveModernHttpSessionRegistry,
 ) {
     let http_config = &endpoint.server.http_config.handler_config;
-    let mut framed = Framed::new(
-        stream,
-        Http1Codec::new().max_body_size(http_config.max_body_size),
-    );
+    let mut framed = Framed::new(stream, native_http1_codec(&endpoint));
     let Some(request) = framed.next().await else {
         return;
     };
@@ -9960,6 +10269,13 @@ pub struct Server {
 }
 
 impl Server {
+    /// Returns the local subscription/notification delivery state for unit
+    /// tests that prove a rejected request produced no local side effect.
+    #[cfg(test)]
+    pub(crate) fn final_subscription_snapshot_for_test(&self) -> serde_json::Value {
+        self.final_subscriptions.snapshot_for_test()
+    }
+
     /// Creates a new server builder.
     #[must_use]
     #[allow(clippy::new_ret_no_self)]
@@ -10483,6 +10799,9 @@ impl Server {
                 "MCP notification method must not carry a request id",
             ));
         }
+        if admit_final_client_notification_ingress(request).is_err() {
+            return None;
+        }
         if is_notification && is_request_only_method(&method) {
             if let Some(stats) = &self.stats {
                 stats.record_request(&method, started_at.elapsed(), false);
@@ -10740,6 +11059,9 @@ impl Server {
                 "MCP notification method must not carry a request id",
             ));
         }
+        if admit_final_client_notification_ingress(&request).is_err() {
+            return None;
+        }
         if is_notification && is_request_only_method(&method) {
             return None;
         }
@@ -10779,7 +11101,7 @@ impl Server {
         };
         match admitted_final_client_capability_info(final_core_request.as_ref()) {
             Ok(Some(capabilities)) => {
-                request_ctx = request_ctx.with_client_capabilities(capabilities)
+                request_ctx = request_ctx.with_client_capabilities(capabilities);
             }
             Ok(None) => {}
             Err(error) => return response_for_error(error),
@@ -13711,6 +14033,15 @@ impl Server {
                         );
                         continue;
                     }
+                    if matches!(era, ProtocolEra::Modern2026)
+                        && admit_final_client_notification_ingress(&request).is_err()
+                    {
+                        debug!(
+                            target: targets::SESSION,
+                            "Ignoring final cancellation notification not admitted from the client"
+                        );
+                        continue;
+                    }
                     match server.authenticate_cancelled_control_notification(
                         cx,
                         &session_principal,
@@ -13856,6 +14187,16 @@ impl Server {
                             },
                         }
                     };
+                    if matches!(era, ProtocolEra::Modern2026)
+                        && admit_final_client_notification_ingress(&request).is_err()
+                    {
+                        debug!(
+                            target: targets::SESSION,
+                            "Ignoring final notification not admitted from the client before dispatch; method={}",
+                            request.method
+                        );
+                        continue;
+                    }
                     let request_id = request.id.clone();
                     if let Some(id) = request_id.as_ref()
                         && (server.request_id_is_active(session_id, id)
@@ -18122,6 +18463,8 @@ mod lib_unit_tests {
         CoreResultDiscriminatorPolicy, DecodedResult, ResultPeerEra, decode_peer_result,
     };
     use std::future::Future;
+    #[cfg(feature = "builtin-auth-server")]
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
     use std::sync::{Condvar, OnceLock};
@@ -18140,6 +18483,221 @@ mod lib_unit_tests {
     static LIVE_HTTP_LISTENER_WAITS: AtomicUsize = AtomicUsize::new(0);
     static LIVE_HTTP_CONNECTION_READ_WAITS: AtomicUsize = AtomicUsize::new(0);
     const LIVE_HTTP_TEST_TIMEOUT_NANOS: u64 = 2_000_000_000;
+
+    #[cfg(feature = "builtin-auth-server")]
+    const OIDC_TEST_PUBLIC_MODULUS: &str = "jlHZ9nzuIuM4aiAQSAgEJMBaYS7qm7Z_3mtGYDdzReIkzxPHHr21oeXQyUJI89eQG13fsUdyoodcuh5kmndPCrODJekfr_zgor6sNspcB88iQEqEc9yf9YAf5v-cNH1Evh82KABuWb26LMaNAzZFR3BMhMEQ1FD6fLFGAbX76Drd5_UZ-1xcU07IXEc_9zvQvOwXckhO7P5Yil1fVzLTrHye_6zTbGWvdqi45095bKPnSqjrLBCTVrUW8o02Gi6mt7Ls9pZeWx2DXV8SqV06DdlqiovtKWRooQ1zV-v7BGsLsVk6T6d-8mNMGNrh0fpNb_5kdaHphAt_Ji6eE1wQPw";
+    #[cfg(feature = "builtin-auth-server")]
+    const OIDC_TEST_CANARY_COMPACT_JWS: &str = concat!(
+        "eyJhbGciOiJSUzI1NiIsImtpZCI6ImZpeGVkLXJzMjU2In0.",
+        "eyJzdWIiOiJmaXhlZC12ZWN0b3IiLCJhdWQiOiJzZXJ2ZXItcG9saWN5LWxhdGVyIn0.",
+        "Oak9UDEtrL-pNcPIFw31uzuCoCTyXywF5i3jxDixd0gHonZYPFfSlyPwhNSTrqmlzPsL-wNFcDn1zFlug6Ae1vK_QaL-bZBSxq-lOrMDUI_5_3P_HUrngtZaNk8ru88-wdGByGm1jRZa-LfeoSkESHVKPIcQ_WT7wqhq1RX3ZrPiq9QkHFE8nWIgiIesu8DFOXsdN05rmOxHheCbDGRpf8cQAG0ZENpJvYugD-SX9Sg9Kds5HOlOt6csIQBexCeKM2rIrN0r7qCp6jx_0aevqU6rNr6oxCxCGoH3UZGJa5xRh2KeJ6NVBE9BpPW3Kdi3dEfKlKldjzlUW-zEREdeEw"
+    );
+
+    #[cfg(feature = "builtin-auth-server")]
+    struct OidcPublicCanaryBackend;
+
+    #[cfg(feature = "builtin-auth-server")]
+    impl fastmcp_protocol::jose::ExternalRs256SignerBackend for OidcPublicCanaryBackend {
+        fn sign<'a>(
+            &'a self,
+            _: &'a Cx,
+            request: fastmcp_protocol::jose::ExternalRs256SigningRequest,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = fastmcp_protocol::jose::ExternalRs256SignDisposition>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                use base64::Engine as _;
+                use fastmcp_protocol::jose::{
+                    ExternalRs256OperationReceipt, ExternalRs256SignDisposition, RawRs256Signature,
+                    RedactedSignerProvenance,
+                };
+
+                let (input, signature) = OIDC_TEST_CANARY_COMPACT_JWS
+                    .rsplit_once('.')
+                    .expect("retained public test canary has a signature");
+                assert!(
+                    request
+                        .input()
+                        .with_bytes(|bytes| bytes == input.as_bytes())
+                );
+                let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(signature)
+                    .expect("retained public canary signature decodes");
+                let receipt = ExternalRs256OperationReceipt::new(
+                    request.binding(),
+                    1,
+                    RedactedSignerProvenance::new("oidc-live-public-canary")
+                        .expect("bounded redacted provenance"),
+                )
+                .expect("valid dispatched operation receipt");
+                ExternalRs256SignDisposition::Dispatched(
+                    RawRs256Signature::from_bytes(signature)
+                        .expect("retained RS256 signature has exact length"),
+                    receipt,
+                )
+            })
+        }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn oidc_public_canary_signer() -> Arc<fastmcp_protocol::jose::ExternalRs256Signer> {
+        use base64::Engine as _;
+        use fastmcp_protocol::jose::{
+            AttestedRs256PublicKey, ExternalRs256Signer, RedactedSignerProvenance,
+            Rs256SigningBinding,
+        };
+
+        let modulus = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(OIDC_TEST_PUBLIC_MODULUS)
+            .expect("retained public verification modulus");
+        let binding = Rs256SigningBinding::new(71, 72, 73, 74)
+            .expect("well-formed external signer generations");
+        let key = AttestedRs256PublicKey::admit(
+            "fixed-rs256",
+            modulus,
+            binding,
+            RedactedSignerProvenance::new("oidc-live-public-test")
+                .expect("bounded redacted provenance"),
+        )
+        .expect("retained public key admits");
+        Arc::new(ExternalRs256Signer::new(
+            Arc::new(OidcPublicCanaryBackend),
+            key,
+        ))
+    }
+
+    /// Test-only embedding verifier: it performs a fresh loopback HTTP fetch
+    /// of the shipped JWKS route and returns evidence bound to the configured
+    /// public HTTPS URI/origin. It never reads the provider's route buffer.
+    #[cfg(feature = "builtin-auth-server")]
+    struct LiveLoopbackOidcReadBackVerifier {
+        address: Mutex<Option<SocketAddr>>,
+        generation: u64,
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    impl LiveLoopbackOidcReadBackVerifier {
+        fn set_address(&self, address: SocketAddr) {
+            *self.address.lock().expect("loopback verifier address lock") = Some(address);
+        }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    impl oidc::OidcJwksReadBackVerifier for LiveLoopbackOidcReadBackVerifier {
+        fn read_back<'a>(
+            &'a self,
+            _: &'a Cx,
+            endpoints: &'a [String],
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Vec<fastmcp_protocol::jose::JwksEndpointReadBack>,
+                            oidc::OidcError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let address = *self.address.lock().expect("loopback verifier address lock");
+            let generation = self.generation;
+            Box::pin(async move {
+                let address = address.ok_or_else(|| {
+                    oidc::OidcError::SigningError(
+                        "loopback read-back endpoint is not bound".to_string(),
+                    )
+                })?;
+                let mut evidence = Vec::with_capacity(endpoints.len());
+                for endpoint in endpoints {
+                    if endpoint != "https://fastmcp.invalid/oidc/jwks" {
+                        return Err(oidc::OidcError::SigningError(
+                            "loopback verifier was asked for an unconfigured public JWKS URI"
+                                .to_string(),
+                        ));
+                    }
+                    let response = live_http_exchange(
+                        address,
+                        b"GET /oidc/jwks HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    )
+                    .await
+                    .map_err(oidc::OidcError::SigningError)?;
+                    if !response.starts_with(b"HTTP/1.1 200") {
+                        return Err(oidc::OidcError::SigningError(
+                            "loopback JWKS read-back did not return HTTP 200".to_string(),
+                        ));
+                    }
+                    let body = live_http_response_body(&response)
+                        .map_err(oidc::OidcError::SigningError)?
+                        .to_vec();
+                    evidence.push(
+                        fastmcp_protocol::jose::JwksEndpointReadBack::new(
+                            endpoint.clone(),
+                            "https://fastmcp.invalid",
+                            body,
+                            generation,
+                        )
+                        .map_err(|_| {
+                            oidc::OidcError::SigningError(
+                                "loopback JWKS evidence is outside admission bounds".to_string(),
+                            )
+                        })?,
+                    );
+                }
+                Ok(evidence)
+            })
+        }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[derive(Default)]
+    struct LiveOidcActivationStore {
+        record: Mutex<Option<oidc::OidcSigningActivationStoreRecord>>,
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    impl oidc::OidcSigningActivationStore for LiveOidcActivationStore {
+        fn load(
+            &self,
+            _: &Cx,
+            issuer: &str,
+        ) -> Result<Option<oidc::OidcSigningActivationStoreRecord>, oidc::OidcError> {
+            Ok(self
+                .record
+                .lock()
+                .map_err(|_| {
+                    oidc::OidcError::SigningError("live OIDC store unavailable".to_string())
+                })?
+                .clone()
+                .filter(|record| record.issuer() == issuer))
+        }
+
+        fn compare_and_set(
+            &self,
+            _: &Cx,
+            expected_generation: Option<u64>,
+            next: oidc::OidcSigningActivationStoreRecord,
+        ) -> Result<oidc::OidcSigningActivationStoreRecord, oidc::OidcError> {
+            let mut record = self.record.lock().map_err(|_| {
+                oidc::OidcError::SigningError("live OIDC store unavailable".to_string())
+            })?;
+            if record
+                .as_ref()
+                .map(oidc::OidcSigningActivationStoreRecord::activation_generation)
+                != expected_generation
+            {
+                return Err(oidc::OidcError::SigningError(
+                    "live OIDC activation CAS lost".to_string(),
+                ));
+            }
+            *record = Some(next.clone());
+            Ok(next)
+        }
+    }
 
     #[test]
     fn websocket_profile_exposes_turnkey_server_endpoint_behind_its_feature() {
@@ -18270,6 +18828,140 @@ mod lib_unit_tests {
                 return Err(
                     "successful WebSocket child did not settle before quiescent cleanup".to_owned(),
                 );
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn rh5_websocket_rejects_server_notification_without_dispatch_or_connection_loss() {
+        run_live_http_test(|cx| async move {
+            use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+            let handler_calls = Arc::new(AtomicUsize::new(0));
+            let middleware_calls = Arc::new(AtomicUsize::new(0));
+            let saw_credential = Arc::new(AtomicBool::new(false));
+            let listener = Server::new("websocket-wrong-direction-notification", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("modern-only policy is available")
+                .middleware(ModernHttpAuthMiddleware {
+                    calls: Arc::clone(&middleware_calls),
+                    saw_credential: Arc::clone(&saw_credential),
+                })
+                .tool(ModernHttpAuthCounterTool {
+                    calls: Arc::clone(&handler_calls),
+                })
+                .build()
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("wrong-direction WebSocket bind failed: {error}"))?;
+            let address = listener
+                .local_addr()
+                .map_err(|error| format!("wrong-direction WebSocket address failed: {error}"))?;
+            let scope = cx.scope();
+            let mut listener_task = cx
+                .spawn_in(&scope, move |listener_cx| async move {
+                    listener.serve(&listener_cx).await
+                })
+                .map_err(|error| {
+                    format!("wrong-direction WebSocket listener admission failed: {error}")
+                })?;
+            let opening = concat!(
+                "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n",
+                "Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n",
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            );
+            let (mut client, accepted) =
+                websocket_upgrade(&cx, address, opening.as_bytes()).await?;
+            if !accepted.starts_with(b"HTTP/1.1 101") {
+                return Err("wrong-direction WebSocket was not upgraded".to_owned());
+            }
+            let server_notification = JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": "server-only", "progress": 1})),
+            ));
+            let resumed_client_request = JsonRpcMessage::Request(JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": "modern_http_auth_counter",
+                    "arguments": {},
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                })),
+                7_402_i64,
+            ));
+            let mut frames = masked_websocket_message(modern_discovery_request(7_401));
+            frames.extend(masked_websocket_message(server_notification));
+            frames.extend(masked_websocket_message(resumed_client_request));
+            client
+                .write_all(&frames)
+                .await
+                .map_err(|error| format!("wrong-direction WebSocket write failed: {error}"))?;
+            client
+                .flush()
+                .await
+                .map_err(|error| format!("wrong-direction WebSocket flush failed: {error}"))?;
+
+            let deadline = cx.now().saturating_add_nanos(LIVE_HTTP_TEST_TIMEOUT_NANOS);
+            let mut responses = Vec::new();
+            while !(responses
+                .windows(b"serverInfo".len())
+                .any(|window| window == b"serverInfo")
+                && responses
+                    .windows(b"authenticated modern HTTP dispatch".len())
+                    .any(|window| window == b"authenticated modern HTTP dispatch"))
+            {
+                let mut chunk = [0_u8; 1024];
+                let read = asupersync::time::timeout_at(deadline, client.read(&mut chunk))
+                    .await
+                    .map_err(|_| "wrong-direction WebSocket response timed out".to_owned())?
+                    .map_err(|error| {
+                        format!("wrong-direction WebSocket response failed: {error}")
+                    })?;
+                if read == 0 {
+                    return Err(
+                        "wrong-direction notification closed the WebSocket connection".to_owned(),
+                    );
+                }
+                responses.extend_from_slice(&chunk[..read]);
+            }
+            if handler_calls.load(Ordering::Acquire) != 1
+                || middleware_calls.load(Ordering::Acquire) != 2
+                || saw_credential.load(Ordering::Acquire)
+            {
+                return Err(
+                    "wrong-direction notification reached middleware or handler before the resumed request"
+                        .to_owned(),
+                );
+            }
+
+            client
+                .write_all(&masked_websocket_frame(0x08, &[]))
+                .await
+                .map_err(|error| {
+                    format!("wrong-direction WebSocket close write failed: {error}")
+                })?;
+            client.flush().await.map_err(|error| {
+                format!("wrong-direction WebSocket close flush failed: {error}")
+            })?;
+            drop(client);
+            cx.cancel_with(
+                CancelKind::User,
+                Some("wrong-direction WebSocket ingress proof complete"),
+            );
+            let join_cx = Cx::for_testing();
+            let shutdown = listener_task
+                .join(&join_cx)
+                .await
+                .map_err(|error| {
+                    format!("wrong-direction WebSocket listener join failed: {error:?}")
+                })?
+                .map_err(|error| format!("wrong-direction WebSocket listener failed: {error}"))?;
+            if !matches!(shutdown, WebSocketServerShutdown::Quiescent) {
+                return Err("wrong-direction WebSocket listener did not quiesce".to_owned());
             }
             Ok(())
         });
@@ -20121,6 +20813,22 @@ mod lib_unit_tests {
                     .then(|| value.trim().to_owned())
             })
             .ok_or_else(|| format!("live HTTP response omitted {name} header"))
+    }
+
+    fn live_http_response_has_header(response: &[u8], name: &str) -> Result<bool, String> {
+        let headers = std::str::from_utf8(
+            response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| &response[..offset])
+                .ok_or_else(|| "live HTTP response omitted its header terminator".to_string())?,
+        )
+        .map_err(|error| format!("live HTTP response headers were not UTF-8: {error}"))?;
+        Ok(headers.split("\r\n").skip(1).any(|header| {
+            header
+                .split_once(':')
+                .is_some_and(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        }))
     }
 
     async fn read_live_http_until(
@@ -26869,6 +27577,110 @@ mod lib_unit_tests {
         }
     }
 
+    struct PublicFinalSamplingTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for PublicFinalSamplingTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "public-final-sampling".to_owned(),
+                description: Some("Proves public final sampling capability propagation".to_owned()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("exact legacy result")])
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
+        fn call_final_outcome(
+            &self,
+            ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            let sampling = ctx.final_sampling(
+                "sample",
+                serde_json::from_value(serde_json::json!({
+                    "messages": [{
+                        "role": "assistant",
+                        "content": {
+                            "type": "tool_use",
+                            "id": "weather-request",
+                            "name": "weather",
+                            "input": {"city": "Boston"},
+                        },
+                    }],
+                    "maxTokens": 16,
+                    "tools": [{
+                        "name": "weather",
+                        "inputSchema": {"type": "object"},
+                    }],
+                    "toolChoice": {"mode": "required"},
+                }))
+                .map_err(|error| McpError::internal_error(error.to_string()))?,
+            )?;
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Ok(FinalToolOutcome::InputRequired(
+                sampling.into_input_required()?,
+            ))
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            resume_inputs: Option<&'a bidirectional::MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                let Some(inputs) = resume_inputs else {
+                    return self
+                        .call_final_outcome(ctx, arguments)
+                        .map_or_else(fastmcp_core::Outcome::Err, fastmcp_core::Outcome::Ok);
+                };
+                match inputs.sampling("sample") {
+                    Ok(Some(fastmcp_protocol::FinalCreateMessageResult {
+                        content:
+                            fastmcp_protocol::FinalSamplingMessageContent::Block(
+                                fastmcp_protocol::FinalSamplingMessageContentBlock::ToolUse {
+                                    ..
+                                },
+                            ),
+                        ..
+                    })) => {
+                        self.calls.fetch_add(1, Ordering::AcqRel);
+                        crate::handler::promote_legacy_tool_content(vec![Content::text(
+                            "final sampling resumed with tool use",
+                        )])
+                        .map(FinalToolOutcome::Complete)
+                        .map_or_else(fastmcp_core::Outcome::Err, fastmcp_core::Outcome::Ok)
+                    }
+                    Ok(Some(_)) => fastmcp_core::Outcome::Err(McpError::invalid_params(
+                        "public final sampling test requires a tool-use result",
+                    )),
+                    Ok(None) => fastmcp_core::Outcome::Err(McpError::invalid_params(
+                        "public final sampling retry lost its admitted input",
+                    )),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
+        }
+    }
+
     impl ToolHandler for LiveHttpMrtrTool {
         fn definition(&self) -> Tool {
             Tool {
@@ -30068,6 +30880,72 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn rh5_stdio_rejects_server_notification_without_dispatch_or_connection_loss() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let receive_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let saw_credential = Arc::new(AtomicBool::new(false));
+        let server_notification = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({"progressToken": "server-only", "progress": 1})),
+        ));
+        let valid_call = JsonRpcMessage::Request(JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "modern_http_auth_counter",
+                "arguments": {},
+                "_meta": {
+                    MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                },
+            })),
+            73_i64,
+        ));
+
+        Server::new("stdio-wrong-direction-notification", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
+            .middleware(ModernHttpAuthMiddleware {
+                calls: Arc::clone(&middleware_calls),
+                saw_credential: Arc::clone(&saw_credential),
+            })
+            .tool(ModernHttpAuthCounterTool {
+                calls: Arc::clone(&handler_calls),
+            })
+            .build()
+            .run_transport_returning_with_cx(
+                &Cx::for_testing(),
+                ProtocolPolicyScriptTransport {
+                    inbound: std::collections::VecDeque::from([
+                        modern_discovery_request(72),
+                        server_notification,
+                        valid_call,
+                    ]),
+                    sent: Arc::clone(&sent),
+                    receive_calls: Arc::clone(&receive_calls),
+                },
+            )
+            .expect("wrong-direction stdio notification must not close the connection");
+
+        assert_eq!(receive_calls.load(Ordering::Acquire), 4);
+        assert_eq!(middleware_calls.load(Ordering::Acquire), 2);
+        assert_eq!(handler_calls.load(Ordering::Acquire), 1);
+        assert!(!saw_credential.load(Ordering::Acquire));
+        let sent = sent
+            .lock()
+            .expect("stdio sent-message mutex must not be poisoned");
+        assert!(matches!(
+            sent.as_slice(),
+            [JsonRpcMessage::Response(discovery), JsonRpcMessage::Response(call)]
+                if discovery.id == Some(72_i64.into())
+                    && discovery.error.is_none()
+                    && call.id == Some(73_i64.into())
+                    && call.error.is_none()
+        ));
+    }
+
+    #[test]
     fn public_split_transport_legacy_runtime_retains_state_notifications_and_sampling() {
         let sent = live_legacy_runtime_connection_transcript(true);
 
@@ -31385,6 +32263,124 @@ mod lib_unit_tests {
         });
     }
 
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn live_http_oidc_jwks_read_back_then_discovery_activate_exact_public_bytes() {
+        run_live_http_test(|cx| async move {
+            use fastmcp_protocol::jose::ExternalRs256SigningDeadline;
+
+            let oauth = Arc::new(oauth::OAuthServer::with_defaults());
+            let signer = oidc_public_canary_signer();
+            let expected_jwks = signer
+                .canonical_public_jwks()
+                .map_err(|error| format!("OIDC canonical JWKS failed: {error}"))?
+                .as_bytes()
+                .to_vec();
+            let provider = Arc::new(
+                oidc::OidcProvider::with_defaults(Arc::clone(&oauth))
+                    .map_err(|error| format!("OIDC provider construction failed: {error}"))?,
+            );
+            let verifier = Arc::new(LiveLoopbackOidcReadBackVerifier {
+                address: Mutex::new(None),
+                generation: signer.binding().ring_generation(),
+            });
+            let store = Arc::new(LiveOidcActivationStore::default());
+            provider
+                .set_id_token_signing_activation_dependencies(
+                    Arc::clone(&verifier) as Arc<dyn oidc::OidcJwksReadBackVerifier>,
+                    Arc::clone(&store) as Arc<dyn oidc::OidcSigningActivationStore>,
+                )
+                .map_err(|error| format!("OIDC external dependencies failed: {error}"))?;
+            provider
+                .begin_id_token_signing_activation(
+                    Arc::clone(&signer),
+                    "https://fastmcp.invalid/oidc/jwks",
+                )
+                .map_err(|error| format!("OIDC Pending admission failed: {error}"))?;
+            provider
+                .publish_id_token_signing_jwks(
+                    signer.canonical_public_jwks().map_err(|error| {
+                        format!("OIDC JWKS publication generation failed: {error}")
+                    })?,
+                )
+                .map_err(|error| format!("OIDC canonical JWKS publication failed: {error}"))?;
+            let routes = OAuthHttpRoutes::new(Arc::clone(&oauth), "https://fastmcp.invalid/oauth")
+                .map_err(|error| format!("OIDC OAuth route base failed: {error}"))?
+                .with_oidc(Arc::clone(&provider))
+                .map_err(|error| format!("OIDC public route configuration failed: {error}"))?;
+            let bound = Server::new("live-oidc-jwks", "1.0.0")
+                .oauth_http_routes(routes)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("OIDC public HTTP bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("OIDC public HTTP address failed: {error}"))?;
+            verifier.set_address(address);
+            let provider_for_client = Arc::clone(&provider);
+            let caller_cx = cx.clone();
+            let expected_for_client = expected_jwks.clone();
+            let mut client = cx
+                .spawn(move |client_cx| async move {
+                    let jwks = live_http_exchange(
+                        address,
+                        b"GET /oidc/jwks HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    )
+                    .await?;
+                    if !jwks.starts_with(b"HTTP/1.1 200")
+                        || live_http_response_body(&jwks)? != expected_for_client.as_slice()
+                    {
+                        return Err(format!(
+                            "OIDC public JWKS did not return exact canonical bytes: {}",
+                            String::from_utf8_lossy(&jwks)
+                        ));
+                    }
+                    let deadline = ExternalRs256SigningDeadline::new(Duration::from_secs(1))
+                        .map_err(|error| format!("OIDC canary deadline invalid: {error}"))?;
+                    provider_for_client
+                        .activate_id_token_signing(&client_cx, deadline)
+                        .await
+                        .map_err(|error| format!("OIDC active admission failed: {error}"))?;
+                    let discovery = live_http_exchange(
+                        address,
+                        b"GET /.well-known/openid-configuration HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    )
+                    .await?;
+                    caller_cx.cancel_with(CancelKind::User, Some("live OIDC publication complete"));
+                    Ok::<_, String>(discovery)
+                })
+                .map_err(|error| format!("OIDC public client admission failed: {error}"))?;
+
+            let serve = bound.serve(&cx).await;
+            let discovery = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("OIDC public client failed: {error:?}"))??;
+            let shutdown = serve.map_err(|error| format!("OIDC public server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "live OIDC public JWKS").await?;
+            if !discovery.starts_with(b"HTTP/1.1 200") {
+                return Err(format!(
+                    "OIDC discovery did not become publicly reachable: {}",
+                    String::from_utf8_lossy(&discovery)
+                ));
+            }
+            let discovery: serde_json::Value =
+                serde_json::from_slice(live_http_response_body(&discovery)?)
+                    .map_err(|error| format!("OIDC discovery was not JSON: {error}"))?;
+            if discovery["issuer"] != "https://fastmcp.invalid/"
+                || discovery["jwks_uri"] != "https://fastmcp.invalid/oidc/jwks"
+            {
+                return Err(format!(
+                    "OIDC discovery mismatched active publication: {discovery}"
+                ));
+            }
+            Ok(())
+        });
+    }
+
     #[test]
     fn live_http_oauth_pkce_authorize_then_token_is_publicly_reachable() {
         run_live_http_test(|cx| async move {
@@ -31414,6 +32410,13 @@ mod lib_unit_tests {
             let caller_cx = cx.clone();
             let mut client = cx
                 .spawn(move |_client_cx| async move {
+                    let denied = format!(
+                        "GET /oauth/authorize?response_type=code&client_id=live-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=denied&state=opaque-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                    );
+                    // RH-5: this differs from the successful request only in
+                    // its requested scope. A valid redirect must carry the
+                    // OAuth error and the original opaque state.
+                    let denied = live_http_exchange(address, denied.into_bytes()).await?;
                     let authorize = format!(
                         "GET /oauth/authorize?response_type=code&client_id=live-pkce-client&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&scope=mcp&state=opaque-state&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256 HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
                     );
@@ -31443,12 +32446,12 @@ mod lib_unit_tests {
                     );
                     let token = live_http_exchange(address, token.into_bytes()).await?;
                     caller_cx.cancel_with(CancelKind::User, Some("live OAuth PKCE complete"));
-                    Ok::<_, String>((authorize, token))
+                    Ok::<_, String>((denied, authorize, token))
                 })
                 .map_err(|error| format!("live OAuth client admission failed: {error}"))?;
 
             let serve = bound.serve(&cx).await;
-            let (authorize, token) = client
+            let (denied, authorize, token) = client
                 .join(&cx)
                 .await
                 .map_err(|error| format!("live OAuth client failed: {error:?}"))??;
@@ -31458,6 +32461,38 @@ mod lib_unit_tests {
                 return Err(format!(
                     "OAuth authorization did not redirect: {}",
                     String::from_utf8_lossy(&authorize)
+                ));
+            }
+            if !denied.starts_with(b"HTTP/1.1 303") {
+                return Err(format!(
+                    "valid OAuth error did not redirect: {}",
+                    String::from_utf8_lossy(&denied)
+                ));
+            }
+            let denied_location = live_http_response_header(&denied, "location")?;
+            let denied_redirect = url::Url::parse(&denied_location)
+                .map_err(|error| format!("OAuth error Location was invalid: {error}"))?;
+            if denied_redirect
+                .query_pairs()
+                .find_map(|(name, value)| (name == "error").then(|| value.into_owned()))
+                .as_deref()
+                != Some("invalid_scope")
+                || denied_redirect
+                    .query_pairs()
+                    .find_map(|(name, value)| (name == "state").then(|| value.into_owned()))
+                    .as_deref()
+                    != Some("opaque-state")
+                || denied_redirect
+                    .query_pairs()
+                    .find_map(|(name, value)| (name == "iss").then(|| value.into_owned()))
+                    .as_deref()
+                    != Some("https://fastmcp.invalid/")
+                || denied_redirect
+                    .query_pairs()
+                    .any(|(name, _)| name == "code")
+            {
+                return Err(format!(
+                    "OAuth error redirect did not preserve the safe client response: {denied_location}"
                 ));
             }
             if !token.starts_with(b"HTTP/1.1 200")
@@ -31486,6 +32521,7 @@ mod lib_unit_tests {
             oauth
                 .register_client(
                     oauth::OAuthClient::builder("live-redirect-client")
+                        .secret("correct-secret")
                         .redirect_uri("https://client.example.test/callback")
                         .scope("mcp")
                         .build()
@@ -31522,29 +32558,124 @@ mod lib_unit_tests {
                     let encoded_code = url::form_urlencoded::byte_serialize(code.as_bytes())
                         .collect::<String>();
                     let original = format!(
-                        "grant_type=authorization_code&code={encoded_code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id=live-redirect-client&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+                        "grant_type=authorization_code&code={encoded_code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&client_id=live-redirect-client&client_secret=correct-secret&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
                     );
                     // RH-5: this form differs from `original` only at redirect_uri.
                     let mismatch = original.replace(
                         "redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback",
                         "redirect_uri=https%3A%2F%2Fclient.example.test%2Fother",
                     );
-                    let request = |form: &str| {
+                    // RH-5: this form differs from `original` only at the
+                    // confidential client credential. Its rejection must not
+                    // consume the authorization code.
+                    let wrong_secret = original.replace(
+                        "client_secret=correct-secret",
+                        "client_secret=wrong-secret",
+                    );
+                    let request = |path: &str, form: &str, authorization: Option<&str>| {
                         format!(
-                            "POST /oauth/token HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            form.len(), form,
+                            "POST {path} HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/x-www-form-urlencoded\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n")),
+                            form.len(),
+                            form,
                         )
                         .into_bytes()
                     };
-                    let rejected = live_http_exchange(address, request(&mismatch)).await?;
-                    let retried = live_http_exchange(address, request(&original)).await?;
+                    let rejected =
+                        live_http_exchange(address, request("/oauth/token", &mismatch, None)).await?;
+                    let wrong_secret_rejected = live_http_exchange(
+                        address,
+                        request("/oauth/token", &wrong_secret, None),
+                    )
+                    .await?;
+                    // RH-5: compared with the eventual successful redemption,
+                    // this request adds only the forbidden Authorization header.
+                    let header_rejected = live_http_exchange(
+                        address,
+                        request("/oauth/token", &original, Some("Basic ZmFzdG1jcDppbnZhbGlk")),
+                    )
+                    .await?;
+                    // RH-5: this differs from `original` only in its
+                    // unsupported Bearer Authorization header. It must not
+                    // be converted into a Basic challenge or consume `code`.
+                    let bearer_rejected = live_http_exchange(
+                        address,
+                        request("/oauth/token", &original, Some("Bearer unsupported-token")),
+                    )
+                    .await?;
+                    let revocation =
+                        "token=not-a-token&client_id=live-redirect-client&client_secret=wrong-secret";
+                    let revoke_wrong_secret = live_http_exchange(
+                        address,
+                        request("/oauth/revoke", revocation, None),
+                    )
+                    .await?;
+                    // A declared over-limit OAuth form must be rejected from
+                    // its head alone; no body bytes follow this request.
+                    let over_limit = format!(
+                        "POST /oauth/token HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        oauth::MAX_OAUTH_FORM_BODY_BYTES + 1,
+                    )
+                    .into_bytes();
+                    let over_limit = live_http_exchange(address, over_limit).await?;
+                    let retried =
+                        live_http_exchange(address, request("/oauth/token", &original, None)).await?;
+                    let access_token = serde_json::from_slice::<serde_json::Value>(
+                        live_http_response_body(&retried)?,
+                    )
+                    .map_err(|error| {
+                        format!("successful retry token response was not JSON: {error}")
+                    })?["access_token"]
+                        .as_str()
+                        .filter(|token| !token.is_empty())
+                        .ok_or_else(|| {
+                            "successful retry token response omitted access_token".to_owned()
+                        })?
+                        .to_owned();
+                    let bearer_revocation_form = format!(
+                        "token={}&client_id=live-redirect-client&client_secret=correct-secret",
+                        url::form_urlencoded::byte_serialize(access_token.as_bytes())
+                            .collect::<String>(),
+                    );
+                    // RH-5: this differs only by an unsupported Bearer
+                    // Authorization header from the form that would revoke
+                    // the freshly issued access token.
+                    let bearer_revoke_rejected = live_http_exchange(
+                        address,
+                        request(
+                            "/oauth/revoke",
+                            &bearer_revocation_form,
+                            Some("Bearer unsupported-token"),
+                        ),
+                    )
+                    .await?;
                     caller_cx.cancel_with(CancelKind::User, Some("live OAuth redirect retry complete"));
-                    Ok::<_, String>((rejected, retried))
+                    Ok::<_, String>((
+                        rejected,
+                        wrong_secret_rejected,
+                        header_rejected,
+                        bearer_rejected,
+                        revoke_wrong_secret,
+                        over_limit,
+                        retried,
+                        bearer_revoke_rejected,
+                        access_token,
+                    ))
                 })
                 .map_err(|error| format!("live redirect OAuth client admission failed: {error}"))?;
 
             let serve = bound.serve(&cx).await;
-            let (rejected, retried) = client
+            let (
+                rejected,
+                wrong_secret_rejected,
+                header_rejected,
+                bearer_rejected,
+                revoke_wrong_secret,
+                over_limit,
+                retried,
+                bearer_revoke_rejected,
+                access_token,
+            ) = client
                 .join(&cx)
                 .await
                 .map_err(|error| format!("live redirect OAuth client failed: {error:?}"))??;
@@ -31565,8 +32696,70 @@ mod lib_unit_tests {
             }
             if !retried.starts_with(b"HTTP/1.1 200") {
                 return Err(format!(
-                    "redirect-only mismatch consumed the authorization code: {}",
+                    "a rejected token request consumed the authorization code: {}",
                     String::from_utf8_lossy(&retried)
+                ));
+            }
+            for (endpoint, response) in [
+                ("token form", &wrong_secret_rejected),
+                ("revocation form", &revoke_wrong_secret),
+            ] {
+                if !response.starts_with(b"HTTP/1.1 401")
+                    || live_http_response_header(response, "www-authenticate")?
+                        != "Basic realm=\"oauth\""
+                    || serde_json::from_slice::<serde_json::Value>(live_http_response_body(
+                        response,
+                    )?)
+                    .ok()
+                    .and_then(|body| body["error"].as_str().map(str::to_owned))
+                    .as_deref()
+                        != Some("invalid_client")
+                {
+                    return Err(format!(
+                        "{endpoint} wrong-secret rejection was not an invalid_client Basic 401: {}",
+                        String::from_utf8_lossy(response)
+                    ));
+                }
+            }
+            if !header_rejected.starts_with(b"HTTP/1.1 401")
+                || live_http_response_header(&header_rejected, "www-authenticate")?
+                    != "Basic realm=\"oauth\""
+            {
+                return Err(format!(
+                    "token Authorization rejection was not a Basic 401: {}",
+                    String::from_utf8_lossy(&header_rejected)
+                ));
+            }
+            for (endpoint, response) in [
+                ("token Bearer", &bearer_rejected),
+                ("revocation Bearer", &bearer_revoke_rejected),
+            ] {
+                if !response.starts_with(b"HTTP/1.1 400")
+                    || live_http_response_has_header(response, "www-authenticate")?
+                    || serde_json::from_slice::<serde_json::Value>(live_http_response_body(
+                        response,
+                    )?)
+                    .ok()
+                    .and_then(|body| body["error"].as_str().map(str::to_owned))
+                    .as_deref()
+                        != Some("invalid_request")
+                {
+                    return Err(format!(
+                        "{endpoint} rejection was not an unchallenged invalid_request: {}",
+                        String::from_utf8_lossy(response)
+                    ));
+                }
+            }
+            if oauth.validate_access_token(&access_token).is_none() {
+                return Err(
+                    "Bearer rejection on /oauth/revoke changed the issued access-token state"
+                        .to_owned(),
+                );
+            }
+            if !over_limit.starts_with(b"HTTP/1.1 400") {
+                return Err(format!(
+                    "over-limit OAuth form was not rejected from its head: {}",
+                    String::from_utf8_lossy(&over_limit)
                 ));
             }
             Ok(())
@@ -32576,10 +33769,19 @@ mod lib_unit_tests {
                             .to_owned();
                         let wrong_kind = serde_json::to_value(
                             bidirectional::MrtrInputResponse::sampling(
-                                fastmcp_protocol::CreateMessageResult::text(
-                                    "not a roots result",
-                                    "test-model",
-                                ),
+                                serde_json::from_value(serde_json::json!({
+                                    "content": {
+                                        "type": "text",
+                                        "text": "not a roots result",
+                                    },
+                                    "role": "assistant",
+                                    "model": "test-model",
+                                }))
+                                .map_err(|error| {
+                                    format!(
+                                        "MRTR wrong-kind final sampling response failed to decode: {error}"
+                                    )
+                                })?,
                             )
                             .map_err(|error| {
                                 format!("MRTR wrong-kind sampling response failed: {error}")
@@ -40064,7 +41266,7 @@ mod lib_unit_tests {
         );
     }
 
-    #[cfg(feature = "tasks")]
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
     fn subscription_filter_admission_matches_reordered_active_sets() {
         let task_a =
@@ -40108,7 +41310,7 @@ mod lib_unit_tests {
         );
     }
 
-    #[cfg(feature = "tasks")]
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
     fn subscription_filter_admission_rejects_one_missing_task_id() {
         let task_a =
@@ -40694,6 +41896,90 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn rh5_native_http_rejects_server_notification_before_auth_and_session_admission() {
+        let cx = Cx::for_testing();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let middleware_calls = Arc::new(AtomicUsize::new(0));
+        let saw_credential = Arc::new(AtomicBool::new(false));
+        let endpoint = Server::new("native-http-wrong-direction-notification", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly must be available to this test build")
+            .auth_provider(OneShotNativeAuthProvider {
+                calls: Arc::clone(&provider_calls),
+            })
+            .middleware(ModernHttpAuthMiddleware {
+                calls: Arc::clone(&middleware_calls),
+                saw_credential: Arc::clone(&saw_credential),
+            })
+            .tool(ModernHttpAuthCounterTool {
+                calls: Arc::clone(&handler_calls),
+            })
+            .build_http_endpoint("http://final.test")
+            .expect("modern endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("modern endpoint session must open");
+        let server_notification = JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({"progressToken": "server-only", "progress": 1})),
+        );
+        let rejected = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Post, "/mcp")
+                    .with_header("content-type", "application/json")
+                    .with_header("accept", "application/json")
+                    .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                    .with_header("mcp-method", "notifications/progress")
+                    .with_body(
+                        serde_json::to_vec(&server_notification)
+                            .expect("wrong-direction notification must encode"),
+                    ),
+            )
+            .expect("native HTTP must reject the wrong-direction notification");
+        assert!(matches!(
+            rejected,
+            ServerHttpEndpointResponse::Immediate(HttpResponse {
+                status: HttpStatus::BAD_REQUEST,
+                ..
+            })
+        ));
+        assert_eq!(provider_calls.load(Ordering::Acquire), 0);
+        assert_eq!(middleware_calls.load(Ordering::Acquire), 0);
+        assert_eq!(handler_calls.load(Ordering::Acquire), 0);
+        assert!(!saw_credential.load(Ordering::Acquire));
+        assert_eq!(session.selected_era, None);
+        assert!(
+            endpoint
+                .server
+                .active_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "rejected native HTTP notification must not allocate a request session"
+        );
+
+        let accepted = session
+            .handle(
+                &cx,
+                modern_http_json_tool_request("modern_http_auth_counter", 947)
+                    .with_header("authorization", "Bearer alpha"),
+            )
+            .expect("the same HTTP session must remain usable after rejection");
+        assert!(matches!(
+            accepted,
+            ServerHttpEndpointResponse::Immediate(response)
+                if serde_json::from_slice::<JsonRpcResponse>(&response.body).is_ok_and(|response| {
+                    response.id == Some(947_i64.into()) && response.error.is_none()
+                })
+        ));
+        assert_eq!(provider_calls.load(Ordering::Acquire), 1);
+        assert_eq!(middleware_calls.load(Ordering::Acquire), 1);
+        assert_eq!(handler_calls.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
     fn public_http_modern_authorization_authenticates_before_middleware_and_fences_principals() {
         let cx = Cx::for_testing();
         let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -40892,7 +42178,7 @@ mod lib_unit_tests {
                 .and_then(|result| result.pointer("/inputRequests/approval/params/mode")),
             Some(&serde_json::json!("form"))
         );
-        let active_before_rejection = server.router.mrtr_exchanges.active_len();
+        let active_before_rejection = server.router.test_active_mrtr_exchange_count();
         assert_eq!(active_before_rejection, 1);
 
         let mut capability_removed = admitted_params.clone();
@@ -40922,7 +42208,7 @@ mod lib_unit_tests {
             Some(i32::from(McpErrorCode::InvalidRequest).into())
         );
         assert_eq!(
-            server.router.mrtr_exchanges.active_len(),
+            server.router.test_active_mrtr_exchange_count(),
             active_before_rejection,
             "removing only client elicitation capability cannot mint or consume MRTR state"
         );
@@ -40945,9 +42231,168 @@ mod lib_unit_tests {
             Some(i32::from(McpErrorCode::InvalidRequest).into())
         );
         assert_eq!(
-            server.router.mrtr_exchanges.active_len(),
+            server.router.test_active_mrtr_exchange_count(),
             active_before_rejection,
             "a form-only client cannot mint URL elicitation state"
+        );
+    }
+
+    #[test]
+    fn public_final_sampling_projects_capability_and_preserves_tool_use_retry() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let server = Server::new("public-final-sampling", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("modern-only policy is available")
+            .tool(PublicFinalSamplingTool {
+                calls: Arc::clone(&handler_calls),
+            })
+            .build();
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let admitted_params = serde_json::json!({
+            "name": "public-final-sampling",
+            "arguments": {},
+            "_meta": {
+                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {"sampling": {}},
+            },
+        });
+        let initial = server
+            .dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    960,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                ),
+                &JsonRpcRequest::new("tools/call", Some(admitted_params.clone()), 960_i64),
+            )
+            .expect("public final sampling request must respond");
+        assert!(initial.error.is_none());
+        assert_eq!(
+            initial
+                .result
+                .as_ref()
+                .and_then(|result| result.get("resultType")),
+            Some(&serde_json::json!("input_required"))
+        );
+        assert_eq!(
+            initial
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/inputRequests/sample/method")),
+            Some(&serde_json::json!("sampling/createMessage"))
+        );
+        assert_eq!(
+            initial
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/inputRequests/sample/params/toolChoice/mode")),
+            Some(&serde_json::json!("required"))
+        );
+        assert_eq!(
+            initial
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/inputRequests/sample/params/tools/0/name")),
+            Some(&serde_json::json!("weather"))
+        );
+        assert_eq!(
+            initial.result.as_ref().and_then(|result| {
+                result.pointer("/inputRequests/sample/params/messages/0/content/type")
+            }),
+            Some(&serde_json::json!("tool_use"))
+        );
+        let request_state = initial
+            .result
+            .as_ref()
+            .and_then(|result| result.get("requestState"))
+            .and_then(serde_json::Value::as_str)
+            .expect("framework-issued final sampling state must be returned")
+            .to_owned();
+        let active_before_rejection = server.router.test_active_mrtr_exchange_count();
+        assert_eq!(active_before_rejection, 1);
+        assert_eq!(handler_calls.load(Ordering::Acquire), 1);
+
+        let mut capability_removed = admitted_params.clone();
+        let capabilities = capability_removed
+            .pointer_mut("/_meta/io.modelcontextprotocol~1clientCapabilities")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("admitted fixture has a client capability object");
+        let admitted_capability_count = capabilities.len();
+        assert!(
+            capabilities.remove("sampling").is_some(),
+            "the planted RH-5 negative removes only sampling capability"
+        );
+        assert_eq!(capabilities.len() + 1, admitted_capability_count);
+        let rejected = server
+            .dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    961,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                ),
+                &JsonRpcRequest::new("tools/call", Some(capability_removed), 961_i64),
+            )
+            .expect("the capability-negative final sampling request must respond");
+        assert_eq!(
+            rejected.error.map(|error| error.code),
+            Some(i32::from(McpErrorCode::InvalidRequest).into())
+        );
+        assert_eq!(
+            server.router.test_active_mrtr_exchange_count(),
+            active_before_rejection,
+            "removing only sampling capability cannot mint or consume MRTR state"
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::Acquire),
+            1,
+            "the removed capability must reject before this handler's post-admission mutation"
+        );
+
+        let mut retry_params = admitted_params;
+        retry_params["inputResponses"] = serde_json::json!({
+            "sample": {
+                "content": {
+                    "type": "tool_use",
+                    "id": "weather-response",
+                    "name": "weather",
+                    "input": {"city": "Cambridge"},
+                },
+                "role": "assistant",
+                "model": "test-model",
+            },
+        });
+        retry_params["requestState"] = serde_json::json!(request_state);
+        let resumed = server
+            .dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx,
+                    962,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                ),
+                &JsonRpcRequest::new("tools/call", Some(retry_params), 962_i64),
+            )
+            .expect("an admitted final sampling retry must respond");
+        assert!(resumed.error.is_none());
+        assert_eq!(
+            resumed
+                .result
+                .as_ref()
+                .and_then(|result| result.get("resultType")),
+            Some(&serde_json::json!("complete"))
+        );
+        assert_eq!(
+            handler_calls.load(Ordering::Acquire),
+            2,
+            "the valid final tool-use response reaches exactly one resumed handler invocation"
+        );
+        assert_eq!(
+            server.router.test_active_mrtr_exchange_count(),
+            0,
+            "only the admitted retry consumes the framework-owned request state"
         );
     }
 
