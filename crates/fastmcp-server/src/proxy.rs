@@ -12,17 +12,16 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+#[cfg(feature = "tasks")]
+use fastmcp_client::FinalToolCallOutcome;
 use fastmcp_client::http_executor::{LegacyHttpRequest, ModernHttpClient, ModernHttpResponseKind};
 #[cfg(feature = "tasks")]
 use fastmcp_client::http_executor::{ModernHttpFinalCoreEvent, ModernHttpSubscriptionListenError};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
     Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
-    ClientProtocolPlan, CompletionParams, CompletionReference, ReverseRequestHandlers,
-};
-#[cfg(feature = "tasks")]
-use fastmcp_client::{
-    FinalToolCallOutcome, ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+    ClientProtocolPlan, CompletionParams, CompletionReference, ModernHttpSubscriptionListenEvent,
+    ModernHttpSubscriptionListener, ReverseRequestHandlers, StdioSubscriptionEvent,
 };
 use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
 use fastmcp_protocol::common_types::RawIcon;
@@ -46,16 +45,16 @@ use fastmcp_protocol::{
     LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
     LegacyResourceContent, ListRootsResult, ProgressParams, Prompt, PromptMessage,
     ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
-    ServerDiscoverResult, ServerNotification, Tool, ToolAnnotations, decode_strict_jsonrpc_message,
-    decode_strict_jsonrpc_response,
+    ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool, ToolAnnotations,
+    decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{
     ClientExtensionDiscovery, CreateTaskResult, ExtensionDescriptorRegistry, ExtensionDirection,
     ExtensionSettings, FinalCancelTaskParams, FinalCancelTaskResult, FinalGetTaskParams,
-    FinalGetTaskResult, FinalTaskId, ServerExtensionDiscovery, SubscriptionFilter,
-    Task as FinalTask, TaskInputResponses as FinalTaskInputResponses, UpdateTaskParams,
-    UpdateTaskResult, task_subscription_ids,
+    FinalGetTaskResult, FinalTaskId, ServerExtensionDiscovery, Task as FinalTask,
+    TaskInputResponses as FinalTaskInputResponses, UpdateTaskParams, UpdateTaskResult,
+    task_subscription_ids,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -1020,6 +1019,30 @@ pub trait ProxyBackend: Send {
         Ok(false)
     }
 
+    /// Starts an incrementally driven catalog `subscriptions/listen` when the
+    /// backend itself owns a sequential ingress loop (currently stdio).
+    ///
+    /// Returning `Ok(true)` transfers listener polling to
+    /// [`Self::next_incremental_catalog_listener`].
+    fn start_incremental_catalog_listener(
+        &mut self,
+        _notifications: SubscriptionFilter,
+    ) -> McpResult<bool> {
+        Ok(false)
+    }
+
+    /// Takes one event from a listener started through
+    /// [`Self::start_incremental_catalog_listener`].
+    fn next_incremental_catalog_listener(
+        &mut self,
+        _cx: &Cx,
+        _request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<fastmcp_client::StdioSubscriptionEvent> {
+        Err(McpError::invalid_request(
+            "Proxy upstream does not own an incremental catalog listener",
+        ))
+    }
+
     /// Takes one event from a listener started through
     /// [`Self::start_incremental_final_task_listener`].
     #[cfg(feature = "tasks")]
@@ -1931,6 +1954,22 @@ impl ProxyBackend for Client {
         }
         Client::open_final_task_subscription_listener(self, notifications)?;
         Ok(true)
+    }
+
+    fn start_incremental_catalog_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<bool> {
+        Client::open_subscriptions_listener(self, notifications)?;
+        Ok(true)
+    }
+
+    fn next_incremental_catalog_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<fastmcp_client::StdioSubscriptionEvent> {
+        Client::next_subscription_event(self, cx, request_cancellation)
     }
 
     #[cfg(feature = "tasks")]
@@ -2871,6 +2910,7 @@ pub struct ProxyHttpClient {
     client_capabilities: ClientCapabilities,
     next_request_id: i64,
     legacy_initialized: bool,
+    live_catalog_listener: Option<ModernHttpSubscriptionListener>,
 }
 
 impl std::fmt::Debug for ProxyHttpClient {
@@ -2909,6 +2949,7 @@ impl ProxyHttpClient {
             client_capabilities,
             next_request_id,
             legacy_initialized: false,
+            live_catalog_listener: None,
         }
     }
 
@@ -3937,6 +3978,85 @@ impl ProxyBackend for ProxyHttpClient {
             ))
         })?;
         Ok(Box::new(ProxyHttpFinalTaskListener { listener }))
+    }
+
+    fn start_incremental_catalog_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<bool> {
+        if self.live_catalog_listener.is_some() {
+            return Err(McpError::invalid_request(
+                "A final HTTP catalog subscription is already active on this proxy route",
+            ));
+        }
+        if self.connection.selected_protocol_era() != ProtocolEra::Modern2026 {
+            return Ok(false);
+        }
+        let request_id = self.next_request_id()?;
+        let listener = block_on(self.connection.open_subscriptions_listener(
+            &self.cx,
+            request_id,
+            notifications,
+            Self::sse_limits(),
+        ))
+        .map_err(|error| {
+            McpError::invalid_request(format!(
+                "Proxy HTTP incremental subscriptions/listen failed: {error}"
+            ))
+        })?;
+        self.live_catalog_listener = Some(listener);
+        Ok(true)
+    }
+
+    fn next_incremental_catalog_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<StdioSubscriptionEvent> {
+        if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.live_catalog_listener = None;
+            return Err(McpError::request_cancelled());
+        }
+        let event = {
+            let listener = self.live_catalog_listener.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live HTTP catalog subscription is active")
+            })?;
+            block_on(listener.next_event(cx))
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                self.live_catalog_listener = None;
+                return Err(McpError::invalid_request(format!(
+                    "Proxy HTTP incremental catalog listener failed: {error}"
+                )));
+            }
+        };
+        match event {
+            Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
+                Ok(StdioSubscriptionEvent::Acknowledged(accepted_filter))
+            }
+            Some(ModernHttpSubscriptionListenEvent::Notification(notification)) => {
+                Ok(StdioSubscriptionEvent::Notification(notification))
+            }
+            #[cfg(feature = "tasks")]
+            Some(ModernHttpSubscriptionListenEvent::TaskNotification(_)) => {
+                self.live_catalog_listener = None;
+                Err(McpError::invalid_request(
+                    "Proxy incremental catalog listener received a Tasks event",
+                ))
+            }
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
+                self.live_catalog_listener = None;
+                Ok(StdioSubscriptionEvent::Terminal)
+            }
+            None => {
+                self.live_catalog_listener = None;
+                Err(McpError::invalid_request(
+                    "Proxy HTTP incremental catalog listener ended after its terminal result",
+                ))
+            }
+        }
     }
 }
 
@@ -5602,6 +5722,28 @@ impl ProxyClient {
         }
     }
 
+    /// Starts an incremental catalog listener on a stdio or HTTP upstream.
+    ///
+    /// Returns `true` when this route now owns a live listener that
+    /// [`Self::next_catalog_listener_event`] can poll. A custom backend that
+    /// does not own sequential ingress returns `false` instead of collecting
+    /// the stream to terminal. Modern HTTP routes store the listener on this
+    /// proxy client so the same route can keep issuing ordinary requests.
+    pub fn start_catalog_listener(&self, notifications: SubscriptionFilter) -> McpResult<bool> {
+        self.with_backend(|backend| backend.start_incremental_catalog_listener(notifications))
+    }
+
+    /// Drives one incremental catalog listener event on this proxy route.
+    pub fn next_catalog_listener_event(
+        &self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<fastmcp_client::StdioSubscriptionEvent> {
+        self.with_backend(|backend| {
+            backend.next_incremental_catalog_listener(cx, request_cancellation)
+        })
+    }
+
     /// Reads a resource without erasing exact legacy fields or final result state.
     pub fn read_resource_typed(&self, ctx: &McpContext, uri: &str) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
@@ -6314,12 +6456,11 @@ mod tests {
         Content, CoreResult, FinalCallToolResult, FinalCoreResult, FinalProgressNotificationParams,
         FinalRequestMeta, JsonRpcMessage, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
         LegacyResourceContent, Prompt, PromptMessage, Resource, ResourceContent,
-        ServerNotification, Tool, decode_strict_jsonrpc_message,
+        ServerNotification, SubscriptionFilter, Tool, decode_strict_jsonrpc_message,
     };
     #[cfg(feature = "tasks")]
     use fastmcp_protocol::{
-        CreateTaskResult, EmptyTaskResult, FinalGetTaskResult, SubscriptionFilter,
-        set_task_subscription_ids,
+        CreateTaskResult, EmptyTaskResult, FinalGetTaskResult, set_task_subscription_ids,
     };
 
     use super::{
@@ -6340,6 +6481,25 @@ mod tests {
     use crate::handler::FinalToolOutcome;
     use crate::handler::{FinalToolSchemaAuthority, PromptHandler, ToolHandler};
     use std::task::Poll;
+
+    #[test]
+    fn custom_backend_does_not_pretend_to_own_an_incremental_catalog_listener() {
+        let proxy = ProxyClient::from_backend(TestBackend::default());
+        assert!(
+            !proxy
+                .start_catalog_listener(SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                })
+                .expect("a custom backend must answer the incremental catalog reservation"),
+            "only a sequential stdio backend can own the live catalog listener"
+        );
+        let error = proxy
+            .next_catalog_listener_event(&Cx::for_testing(), &McpRequestCancellation::new())
+            .expect_err("polling without a reserved incremental listener must fail closed");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(error.message.contains("incremental catalog listener"));
+    }
 
     #[test]
     fn proxy_modern_sse_progress_callback_preserves_raw_progress_lexemes() {
