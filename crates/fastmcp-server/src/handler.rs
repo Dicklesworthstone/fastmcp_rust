@@ -2383,6 +2383,19 @@ pub trait CompletionHandler: Send + Sync {
         })
     }
 
+    /// Completes one exact-legacy request from its request-owned child.
+    ///
+    /// Existing handlers keep their behavior through the default delegation to
+    /// [`Self::complete_legacy_async`].
+    fn complete_legacy_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+        self.complete_legacy_async(ctx, params)
+    }
+
     /// Asynchronously completes one final request.
     ///
     /// The default delegates to [`Self::complete_final`].

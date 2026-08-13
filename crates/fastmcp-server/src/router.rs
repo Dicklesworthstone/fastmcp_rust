@@ -1653,6 +1653,10 @@ fn read_handler_timeout(
         .map_err(|_payload| sanitized_handler_panic(cx, handler_class))
 }
 
+#[allow(
+    dead_code,
+    reason = "retained as the blocking dispatcher if a remaining session entry cannot yet take a request-owned child Cx"
+)]
 fn run_handler<'a, T>(
     ctx: &McpContext,
     budget: Budget,
@@ -3489,9 +3493,13 @@ impl Router {
             dispatch_started_at,
         );
         let handler_ctx = handler_ctx.with_operation_deadline(effective_budget.deadline);
-        let outcome = run_handler(&handler_ctx, effective_budget, "completion", || {
-            handler.complete_legacy_async(&handler_ctx, params)
-        })?;
+        let outcome = block_on(run_handler_in_request(
+            &handler_ctx,
+            request_ctx.cx(),
+            effective_budget,
+            "completion",
+            |child_cx| handler.complete_legacy_async_in_request(&handler_ctx, child_cx, params),
+        ))?;
 
         let completion = match outcome {
             Outcome::Ok(completion) => completion,
@@ -4699,9 +4707,13 @@ impl Router {
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
 
         // Call the handler asynchronously - returns McpOutcome (4-valued)
-        let outcome = run_handler(&ctx, effective_budget, "tool", || {
-            handler.call_async(&ctx, arguments)
-        })?;
+        let outcome = block_on(run_handler_in_request(
+            &ctx,
+            request_ctx.cx(),
+            effective_budget,
+            "tool",
+            |child_cx| handler.call_async_in_request(&ctx, child_cx, arguments),
+        ))?;
         match outcome {
             Outcome::Ok(content) => Ok(CallToolResult {
                 content: legacy_contents_from_handler(content)?,
@@ -5190,11 +5202,20 @@ impl Router {
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
 
         // Read the resource asynchronously - returns McpOutcome (4-valued)
-        let outcome = run_handler(&ctx, effective_budget, "resource", || {
-            resolved
-                .handler
-                .read_async_with_uri(&ctx, &params.uri, &resolved.params)
-        })?;
+        let outcome = block_on(run_handler_in_request(
+            &ctx,
+            request_ctx.cx(),
+            effective_budget,
+            "resource",
+            |child_cx| {
+                resolved.handler.read_async_with_uri_in_request(
+                    &ctx,
+                    child_cx,
+                    &params.uri,
+                    &resolved.params,
+                )
+            },
+        ))?;
 
         // Convert 4-valued Outcome to McpResult for JSON-RPC response
         let contents = match outcome {
@@ -5558,9 +5579,13 @@ impl Router {
 
         // Get the prompt asynchronously - returns McpOutcome (4-valued)
         let arguments = params.arguments.unwrap_or_default();
-        let outcome = run_handler(&ctx, effective_budget, "prompt", || {
-            handler.get_async(&ctx, arguments)
-        })?;
+        let outcome = block_on(run_handler_in_request(
+            &ctx,
+            request_ctx.cx(),
+            effective_budget,
+            "prompt",
+            |child_cx| handler.get_async_in_request(&ctx, child_cx, arguments),
+        ))?;
 
         // Convert 4-valued Outcome to McpResult for JSON-RPC response
         let messages = match outcome {
@@ -7411,11 +7436,20 @@ impl ResourceReader for RouterResourceReader {
                 )));
 
             // Read the resource
-            let outcome = run_handler(&child_ctx, effective_budget, "resource", || {
-                resolved
-                    .handler
-                    .read_async_with_uri(&child_ctx, &uri, &resolved.params)
-            })?;
+            let outcome = block_on(run_handler_in_request(
+                &child_ctx,
+                parent_ctx.cx(),
+                effective_budget,
+                "resource",
+                |request_cx| {
+                    resolved.handler.read_async_with_uri_in_request(
+                        &child_ctx,
+                        request_cx,
+                        &uri,
+                        &resolved.params,
+                    )
+                },
+            ))?;
 
             // Convert outcome to result
             let contents = match outcome {
@@ -7589,9 +7623,13 @@ impl ToolCaller for RouterToolCaller {
                 )));
 
             // Call the tool
-            let outcome = run_handler(&child_ctx, effective_budget, "tool", || {
-                handler.call_async(&child_ctx, args)
-            })?;
+            let outcome = block_on(run_handler_in_request(
+                &child_ctx,
+                parent_ctx.cx(),
+                effective_budget,
+                "tool",
+                |request_cx| handler.call_async_in_request(&child_ctx, request_cx, args),
+            ))?;
 
             // Convert outcome to result
             match outcome {
