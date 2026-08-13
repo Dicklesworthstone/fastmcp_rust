@@ -17,7 +17,10 @@ use asupersync::{Budget, CancelKind, Cx, time::wall_now};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{info, targets};
-use fastmcp_core::{AuthContext, McpContext, McpError, McpErrorCode, McpResult, SessionState};
+use fastmcp_core::{
+    AuthContext, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
+    SessionState,
+};
 use fastmcp_derive::tool;
 use fastmcp_protocol::{
     CallToolParams, CancelledParams, ClientCapabilities, ClientInfo, Content, CreateMessageResult,
@@ -76,6 +79,31 @@ fn greet(ctx: &McpContext, name: String) -> McpResult<String> {
 fn greet_default(ctx: &McpContext, name: String) -> McpResult<String> {
     ctx.checkpoint()?;
     Ok(format!("Hello, {name}!"))
+}
+
+#[tool(name = "announce", description = "Emits handler log notifications")]
+fn announce(ctx: &McpContext, name: String) -> McpResult<String> {
+    ctx.debug("handler-debug");
+    ctx.info(format!("handler-info:{name}"));
+    Ok(format!("announced {name}"))
+}
+
+#[tool(
+    name = "hide_greet",
+    description = "Disables the greet tool for this session"
+)]
+fn hide_greet(ctx: &McpContext) -> McpResult<String> {
+    ctx.disable_tool("greet");
+    Ok("hidden".to_string())
+}
+
+#[tool(
+    name = "touch_file",
+    description = "Notifies subscribers that a file changed"
+)]
+fn touch_file(ctx: &McpContext, uri: String) -> McpResult<String> {
+    let notified = ctx.notify_resource_updated(&uri);
+    Ok(if notified { "notified" } else { "silent" }.to_string())
 }
 
 #[tool(name = "formal_greet", description = "Formally greets a user")]
@@ -2434,6 +2462,480 @@ mod router_tests {
             "e2e log notification {}",
             text
         );
+    }
+
+    #[test]
+    fn handler_info_emits_after_set_level_and_debug_stays_filtered() {
+        let server = Server::new("handler-log-server", "1.0.0")
+            .tool(Announce)
+            .build();
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        session.initialize(
+            ClientInfo {
+                name: "handler-log-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let notifications_for_sender = Arc::clone(&notifications);
+        let sender: NotificationSender = Arc::new(move |req| {
+            notifications_for_sender
+                .lock()
+                .expect("notifications lock poisoned")
+                .push(req);
+        });
+
+        let call = |id: i64| {
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "announce".to_string(),
+                        arguments: Some(serde_json::json!({"name": "Ada"})),
+                        meta: None,
+                    })
+                    .expect("tool params"),
+                ),
+                id,
+            )
+        };
+
+        let _ = server
+            .handle_request(
+                &cx,
+                &mut session,
+                call(1),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("handler log without setLevel still responds");
+        let handler_logs = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/message")
+            .filter_map(|req| req.params.as_ref())
+            .filter(|params| {
+                params
+                    .get("data")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|data| data.contains("handler-"))
+            })
+            .count();
+        assert_eq!(
+            handler_logs, 0,
+            "MCP forbids notifications/message before logging/setLevel"
+        );
+
+        let _ = server
+            .handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "logging/setLevel",
+                    Some(
+                        serde_json::to_value(SetLogLevelParams {
+                            level: LogLevel::Info,
+                        })
+                        .expect("set level params"),
+                    ),
+                    2_i64,
+                ),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("setLevel must respond");
+        notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .clear();
+        let _ = server
+            .handle_request(
+                &cx,
+                &mut session,
+                call(3),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("handler log after setLevel must respond");
+        let emitted: Vec<String> = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/message")
+            .filter_map(|req| {
+                req.params
+                    .as_ref()
+                    .and_then(|params| params.get("data"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert!(
+            emitted.iter().any(|data| data.contains("handler-info:Ada")),
+            "ctx.info must emit after setLevel info: {emitted:?}"
+        );
+        assert!(
+            emitted.iter().all(|data| !data.contains("handler-debug")),
+            "ctx.debug must stay below an info floor: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn disable_tool_emits_list_changed_only_when_the_catalog_mutates() {
+        let server = Server::new("catalog-change", "1.0.0")
+            .tool(Greet)
+            .tool(HideGreet)
+            .build();
+        assert!(
+            server
+                .capabilities()
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.list_changed)
+        );
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "catalog-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notifications_for_sender = Arc::clone(&notifications);
+        let sender: NotificationSender = Arc::new(move |req| {
+            notifications_for_sender
+                .lock()
+                .expect("notifications lock poisoned")
+                .push(req);
+        });
+        let call = |id: i64| {
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "hide_greet".to_string(),
+                        arguments: Some(serde_json::json!({})),
+                        meta: None,
+                    })
+                    .expect("tool params"),
+                ),
+                id,
+            )
+        };
+        let _ = server
+            .handle_request(
+                &cx,
+                &mut session,
+                call(1),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("first hide must respond");
+        let first = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(first, 1, "first disable must emit one tools/list_changed");
+
+        notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .clear();
+        let _ = server
+            .handle_request(
+                &cx,
+                &mut session,
+                call(2),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("repeat hide must respond");
+        let repeat = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(
+            repeat, 0,
+            "disabling an already-disabled tool must not emit list_changed"
+        );
+    }
+
+    #[test]
+    fn disable_tool_publishes_to_modern_subscription_listeners() {
+        let server = Server::new("modern-catalog-listen", "1.0.0")
+            .tool(Greet)
+            .tool(HideGreet)
+            .build();
+        let sent = Arc::new(Mutex::new(Vec::<fastmcp_protocol::JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let listen_sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let _lease = server
+            .final_subscriptions
+            .open(
+                RequestId::String("listen-hide".to_owned()),
+                fastmcp_protocol::SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..fastmcp_protocol::SubscriptionFilter::default()
+                },
+                false,
+                None,
+                fastmcp_core::McpRequestCancellation::new(),
+                None,
+                listen_sender,
+            )
+            .expect("listen stream must open");
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "listen-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let session_sender: NotificationSender = Arc::new(|_| {});
+        let _ = server
+            .handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::to_value(CallToolParams {
+                            name: "hide_greet".to_string(),
+                            arguments: Some(serde_json::json!({})),
+                            meta: None,
+                        })
+                        .expect("tool params"),
+                    ),
+                    1_i64,
+                ),
+                &session_sender,
+                &create_test_request_sender(),
+            )
+            .expect("hide_greet must respond");
+        let delivered = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|request| request.method == "notifications/tools/list_changed")
+            .count();
+        assert_eq!(
+            delivered, 1,
+            "handler-driven disable must publish to subscriptions/listen"
+        );
+    }
+
+    #[test]
+    fn notify_resource_updated_publishes_to_matching_listen_filters() {
+        const URI: &str = "file:///watched.txt";
+        let server = Server::new("modern-resource-listen", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "watched".to_string(),
+            })
+            .tool(TouchFile)
+            .build();
+        let sent = Arc::new(Mutex::new(Vec::<fastmcp_protocol::JsonRpcRequest>::new()));
+        let sent_for_sender = Arc::clone(&sent);
+        let listen_sender: NotificationSender = Arc::new(move |notification| {
+            sent_for_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(notification);
+        });
+        let _lease = server
+            .final_subscriptions
+            .open(
+                RequestId::String("listen-touch".to_owned()),
+                fastmcp_protocol::SubscriptionFilter {
+                    resource_subscriptions: Some(vec![URI.to_owned()]),
+                    ..fastmcp_protocol::SubscriptionFilter::default()
+                },
+                false,
+                None,
+                McpRequestCancellation::new(),
+                None,
+                listen_sender,
+            )
+            .expect("listen stream must open");
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "listen-touch-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let session_sender: NotificationSender = Arc::new(|_| {});
+        let response = server
+            .handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "tools/call",
+                    Some(
+                        serde_json::to_value(CallToolParams {
+                            name: "touch_file".to_string(),
+                            arguments: Some(serde_json::json!({ "uri": URI })),
+                            meta: None,
+                        })
+                        .expect("tool params"),
+                    ),
+                    1_i64,
+                ),
+                &session_sender,
+                &create_test_request_sender(),
+            )
+            .expect("touch_file must respond");
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("notified"),
+            "a matching modern listener must count as delivery"
+        );
+        let delivered = sent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|request| request.method == "notifications/resources/updated")
+            .count();
+        assert_eq!(
+            delivered, 1,
+            "handler-driven resource update must publish to subscriptions/listen"
+        );
+    }
+
+    #[test]
+    fn notify_resource_updated_emits_only_for_subscribed_uris() {
+        const URI: &str = "file:///watched.txt";
+        let server = Server::new("resource-update", "1.0.0")
+            .resource(StaticResource {
+                uri: URI.to_string(),
+                content: "watched".to_string(),
+            })
+            .tool(TouchFile)
+            .build();
+        let cx = Cx::for_testing();
+        let mut session = create_test_session();
+        session.initialize(
+            ClientInfo {
+                name: "resource-update-client".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            ClientCapabilities::default(),
+            "2024-11-05".to_string(),
+        );
+        let notifications = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notifications_for_sender = Arc::clone(&notifications);
+        let sender: NotificationSender = Arc::new(move |req| {
+            notifications_for_sender
+                .lock()
+                .expect("notifications lock poisoned")
+                .push(req);
+        });
+        let call = |id: i64| {
+            fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(
+                    serde_json::to_value(CallToolParams {
+                        name: "touch_file".to_string(),
+                        arguments: Some(serde_json::json!({ "uri": URI })),
+                        meta: None,
+                    })
+                    .expect("tool params"),
+                ),
+                id,
+            )
+        };
+        let silent = server
+            .handle_request(
+                &cx,
+                &mut session,
+                call(1),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("unsubscribed touch must respond");
+        assert_eq!(
+            silent
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("silent")
+        );
+        assert!(
+            notifications
+                .lock()
+                .expect("notifications lock poisoned")
+                .iter()
+                .all(|req| req.method != "notifications/resources/updated")
+        );
+
+        let _ = server
+            .handle_request(
+                &cx,
+                &mut session,
+                fastmcp_protocol::JsonRpcRequest::new(
+                    "resources/subscribe",
+                    Some(serde_json::json!({ "uri": URI })),
+                    2_i64,
+                ),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("subscribe must respond");
+        notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .clear();
+        let notified = server
+            .handle_request(
+                &cx,
+                &mut session,
+                call(3),
+                &sender,
+                &create_test_request_sender(),
+            )
+            .expect("subscribed touch must respond");
+        assert_eq!(
+            notified
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/content/0/text"))
+                .and_then(serde_json::Value::as_str),
+            Some("notified")
+        );
+        let updates = notifications
+            .lock()
+            .expect("notifications lock poisoned")
+            .iter()
+            .filter(|req| req.method == "notifications/resources/updated")
+            .count();
+        assert_eq!(updates, 1, "subscribed URI must emit one resources/updated");
     }
 
     #[test]
