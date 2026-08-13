@@ -1208,10 +1208,13 @@ impl FilesystemResourceHandler {
 async fn run_filesystem_blocking<T, F>(ctx: &McpContext, work: F) -> McpOutcome<T>
 where
     T: Send + 'static,
-    F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
+    F: FnOnce(&McpContext) -> McpResult<T> + Clone + Send + 'static,
 {
     let request_id = ctx.request_id();
     let runtime_cx = ctx.cx();
+    // Retain a clone for the no-blocking-pool fallback: spawn_blocking consumes
+    // the closure whether or not it succeeds in scheduling it.
+    let fallback = work.clone();
     match runtime_cx.spawn_blocking(move |child| {
         let child_ctx = McpContext::new(child, request_id);
         work(&child_ctx)
@@ -1224,7 +1227,7 @@ where
             }
             Err(error) => Outcome::Err(McpError::internal_error(error.to_string())),
         },
-        Err(_) => match work(ctx) {
+        Err(_) => match fallback(ctx) {
             Ok(value) => Outcome::Ok(value),
             Err(error) => Outcome::Err(error),
         },
@@ -1381,19 +1384,6 @@ impl ResourceHandler for FilesystemResourceHandler {
         Ok(vec![resource_content])
     }
 
-    fn read_async_with_uri<'a>(
-        &'a self,
-        ctx: &'a McpContext,
-        uri: &'a str,
-        params: &'a UriParams,
-    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
-        Box::pin(async move {
-            match self.read_with_uri(ctx, uri, params) {
-                Ok(v) => Outcome::Ok(v),
-                Err(e) => Outcome::Err(e),
-            }
-        })
-    }
 }
 
 impl std::fmt::Debug for FilesystemResourceHandler {
