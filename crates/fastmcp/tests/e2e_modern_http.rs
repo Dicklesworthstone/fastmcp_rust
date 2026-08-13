@@ -25,13 +25,15 @@ use std::time::{Duration, Instant};
 use fastmcp_rust::{
     AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
     ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
-    CoreResult, Cx, FinalCoreResult, FinalSamplingContextExt, FinalToolOutcome,
-    HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
-    JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware, MiddlewareDecision,
-    ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler, PromptMessage, ProtocolEra,
-    ProtocolPolicy, ResourceHandler, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool,
-    ToolHandler, auto, core, legacy_2024, modern, prompt, resource, tool,
+    CoreResult, Cx, FinalCoreResult, FinalElicitationContextExt, FinalSamplingContextExt,
+    FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
+    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware,
+    MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, Prompt, PromptHandler,
+    PromptMessage, ProtocolEra, ProtocolPolicy, Resource, ResourceContent, ResourceHandler, Role,
+    SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, core, legacy_2024,
+    modern, prompt, resource, tool,
 };
+use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
@@ -2449,6 +2451,8 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
 }
 
 const PUBLIC_HTTP_SAMPLING_TOOL_NAME: &str = "public-http-e2e-sampling";
+const PUBLIC_HTTP_ELICITATION_RESOURCE_URI: &str = "test://public-http-e2e/elicitation";
+const PUBLIC_HTTP_ELICITATION_PROMPT_NAME: &str = "public-http-e2e-elicitation-prompt";
 
 /// Live modern HTTP tool that returns framework-issued MRTR sampling input.
 struct PublicHttpSamplingTool;
@@ -2504,6 +2508,98 @@ impl ToolHandler for PublicHttpSamplingTool {
         Ok(FinalToolOutcome::InputRequired(
             sampling.into_input_required()?,
         ))
+    }
+}
+
+fn public_http_form_elicitation(ctx: &McpContext) -> McpResult<FinalMethodOutcome<()>> {
+    let elicitation = ctx.final_elicitation_form(
+        "approval",
+        "Approve this operation",
+        json!({
+            "type": "object",
+            "properties": {"approved": {"type": "boolean"}},
+            "required": ["approved"],
+        }),
+    )?;
+    Ok(FinalMethodOutcome::InputRequired(
+        elicitation.into_input_required()?,
+    ))
+}
+
+/// Live modern HTTP resource that returns framework-issued MRTR elicitation.
+struct PublicHttpElicitationResource;
+
+impl ResourceHandler for PublicHttpElicitationResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PUBLIC_HTTP_ELICITATION_RESOURCE_URI.to_owned(),
+            name: "public-http-e2e-elicitation".to_owned(),
+            description: Some("Proves live facade HTTP resource input_required".to_owned()),
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Ok(vec![ResourceContent::text("exact legacy resource")])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn read_final_outcome(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<fastmcp_rust::FinalReadResourceResult>> {
+        public_http_form_elicitation(ctx).map(|outcome| match outcome {
+            FinalMethodOutcome::InputRequired(result) => FinalMethodOutcome::InputRequired(result),
+            FinalMethodOutcome::Complete(()) => unreachable!("form elicitation is input_required"),
+        })
+    }
+}
+
+/// Live modern HTTP prompt that returns framework-issued MRTR elicitation.
+struct PublicHttpElicitationPrompt;
+
+impl PromptHandler for PublicHttpElicitationPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: PUBLIC_HTTP_ELICITATION_PROMPT_NAME.to_owned(),
+            description: Some("Proves live facade HTTP prompt input_required".to_owned()),
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::text("exact legacy prompt"),
+        }])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn get_final_outcome(
+        &self,
+        ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<fastmcp_rust::FinalGetPromptResult>> {
+        public_http_form_elicitation(ctx).map(|outcome| match outcome {
+            FinalMethodOutcome::InputRequired(result) => FinalMethodOutcome::InputRequired(result),
+            FinalMethodOutcome::Complete(()) => unreachable!("form elicitation is input_required"),
+        })
     }
 }
 
