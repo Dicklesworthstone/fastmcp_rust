@@ -562,40 +562,48 @@ impl ClientBuilder {
             .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(|_| Self::http_policy_admission_error())?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
+        let mut client_capabilities = builder.capabilities.clone();
+        if reverse_request_handlers.has_modern_handlers() {
+            reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
+        }
         let legacy_capabilities =
-            legacy_capabilities_for_handlers(&builder.capabilities, &reverse_request_handlers);
-        let connection = ClientHttpConnection::connect_with_extensions(
+            legacy_capabilities_for_handlers(&client_capabilities, &reverse_request_handlers);
+        let mut connection = ClientHttpConnection::connect_with_extensions(
             cx,
             builder.protocol_plan,
             builder.client_info,
-            builder.capabilities,
+            client_capabilities,
             builder.mcp_apps_settings,
             builder.client_extension_runtime,
         )
         .await?;
-        #[cfg(feature = "legacy-2024-11-05")]
-        let mut connection = connection;
-
-        #[cfg(feature = "legacy-2024-11-05")]
-        if connection.selected_protocol_era()
-            == fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
-        {
-            // This must run even for an empty handler set. A caller may not
-            // advertise exact-2024 sampling or roots authority without the
-            // matching callable handler merely because Auto selected legacy
-            // after its disposable modern probe.
-            reverse_request_handlers
-                .validate_legacy_capabilities(&legacy_capabilities)
-                .map_err(|_| Self::http_policy_admission_error())?;
-            connection.set_legacy_client_capabilities(legacy_capabilities);
-            connection
-                .set_legacy_reverse_request_handlers(reverse_request_handlers)
-                .map_err(|_| Self::http_policy_admission_error())?;
+        match connection.selected_protocol_era() {
+            fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
+                if reverse_request_handlers.has_modern_handlers() =>
+            {
+                connection
+                    .set_modern_reverse_request_handlers(reverse_request_handlers)
+                    .map_err(|_| Self::http_policy_admission_error())?;
+                let _ = legacy_capabilities;
+            }
+            #[cfg(feature = "legacy-2024-11-05")]
+            fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024 => {
+                // This must run even for an empty handler set. A caller may not
+                // advertise exact-2024 sampling or roots authority without the
+                // matching callable handler merely because Auto selected legacy
+                // after its disposable modern probe.
+                reverse_request_handlers
+                    .validate_legacy_capabilities(&legacy_capabilities)
+                    .map_err(|_| Self::http_policy_admission_error())?;
+                connection.set_legacy_client_capabilities(legacy_capabilities);
+                connection
+                    .set_legacy_reverse_request_handlers(reverse_request_handlers)
+                    .map_err(|_| Self::http_policy_admission_error())?;
+            }
+            _ => {
+                let _ = (reverse_request_handlers, legacy_capabilities);
+            }
         }
-        // Without the exact-2024 lane, no connection can select the legacy era,
-        // so the reverse-handler and capability material is inert here.
-        #[cfg(not(feature = "legacy-2024-11-05"))]
-        let _ = (reverse_request_handlers, legacy_capabilities);
 
         Ok(connection)
     }
@@ -625,11 +633,15 @@ impl ClientBuilder {
             .validate_reverse_callback_configuration(&builder.protocol_plan)
             .map_err(HttpClientError::CoreResult)?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
+        let mut client_capabilities = builder.capabilities.clone();
+        if reverse_request_handlers.has_modern_handlers() {
+            reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
+        }
         HttpClient::connect_with_extensions(
             cx,
             builder.protocol_plan,
             builder.client_info,
-            builder.capabilities,
+            client_capabilities,
             builder.mcp_apps_settings,
             builder.client_extension_runtime,
             reverse_request_handlers,
@@ -1481,6 +1493,23 @@ mod tests {
             .expect_err("final negotiation cannot expose exact-2024 callbacks");
         assert_eq!(modern_error.code, fastmcp_core::McpErrorCode::InvalidParams);
 
+        let modern_http_handlers = ReverseRequestHandlers::new()
+            .with_modern_sampling_create_message(|_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Err(fastmcp_core::McpError::internal_error(
+                        "modern HTTP reverse handlers must be rejected before contact",
+                    ))
+                })
+            });
+        assert!(
+            modern_http_handlers.has_modern_handlers(),
+            "modern sampling is a modern reverse handler"
+        );
+        assert!(
+            modern_http_handlers.is_empty(),
+            "modern handlers must not count as exact-2024 handlers"
+        );
+
         let mut capabilities = ClientCapabilities::default();
         capabilities.roots = Some(fastmcp_protocol::RootsCapability { list_changed: true });
         let legacy = ClientBuilder::new()
@@ -1508,6 +1537,55 @@ mod tests {
             ))
             .expect_err("an advertised roots capability requires a roots/list handler");
         assert_eq!(legacy_error.code, fastmcp_core::McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn http_connect_does_not_refuse_modern_reverse_handlers_before_contact() {
+        let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
+            |_cx, _cancellation, _params| {
+                Box::pin(async {
+                    Err(McpError::internal_error(
+                        "modern HTTP reverse handler is unused when the peer is unreachable",
+                    ))
+                })
+            },
+        );
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(
+                fastmcp_core::CanonicalHttpUrl::parse("http://127.0.0.1:1/mcp")
+                    .expect("loopback HTTP URL is canonical"),
+            ),
+            None,
+            None,
+            "fastmcp-test-http".to_owned(),
+            "fastmcp-test-http".to_owned(),
+            "modern-http-reverse-contact".to_owned(),
+            0,
+            0,
+            0,
+        )
+        .expect("modern-only HTTP plan admits a POST target");
+        let builder = ClientBuilder::new()
+            .protocol_plan(plan)
+            .reverse_request_handlers(handlers);
+        let error = block_on(builder.connect_http_with_cx(&Cx::for_testing()))
+            .err()
+            .expect("an unreachable modern POST target still fails at contact");
+        assert!(
+            !matches!(
+                error,
+                ClientHttpConnectionError::Modern(
+                    ModernHttpClientError::ReverseRequestDispatch(_)
+                        | ModernHttpClientError::ReverseResponsePostRejected { .. }
+                )
+            ),
+            "modern reverse handlers must reach the HTTP probe instead of failing closed: {error}"
+        );
+        assert!(
+            matches!(error, ClientHttpConnectionError::Modern(_)),
+            "unreachable modern POST remains a modern transport error: {error}"
+        );
     }
 
     #[cfg(unix)]

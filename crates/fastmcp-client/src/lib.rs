@@ -74,6 +74,12 @@ use fastmcp_client::HttpClient;
 
 let _ = HttpClient::take_legacy_notification;
 ```
+
+```compile_fail
+use fastmcp_client::Client;
+
+let _ = Client::sse;
+```
 "#
 )]
 pub mod http_executor;
@@ -123,10 +129,11 @@ pub use fastmcp_protocol::{
     CallToolResult, CompleteResult, CoreResult, CreateMessageParams, CreateMessageResult,
     ElicitRequestParams, ElicitResult, FinalCallToolResult,
     FinalCompletionArgument as CompletionArgument, FinalCompletionContext as CompletionContext,
-    FinalCompletionReference as CompletionReference, FinalCoreResult, FinalGetPromptResult,
-    FinalReadResourceResult, FinalSubscriptionsListenResult, GetPromptResult, InputRequiredResult,
-    LegacyCoreRequest, LegacyCoreResult, ListRootsParams, ListRootsResult, ReadResourceResult,
-    SubscriptionFilter,
+    FinalCompletionReference as CompletionReference, FinalCoreResult, FinalCreateMessageParams,
+    FinalCreateMessageResult, FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult,
+    FinalGetPromptResult, FinalReadResourceResult, FinalSubscriptionsListenResult, GetPromptResult,
+    InputRequiredResult, LegacyCoreRequest, LegacyCoreResult, ListRootsParams, ListRootsResult,
+    ReadResourceResult, SubscriptionFilter,
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, ModernHttpClient,
@@ -225,7 +232,7 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
     ClientCapabilities, ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
+    ElicitationCapability, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
     FinalCancelledNotificationParams, FinalCoreRequest, FinalLogMessageParams,
     FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, InitializeParams,
@@ -280,11 +287,47 @@ pub type RootsRequestHandler = Arc<
         + Sync,
 >;
 
+/// Async handler for a modern `sampling/createMessage` reverse request.
+pub type ModernSamplingRequestHandler = Arc<
+    dyn for<'cx> Fn(
+            &'cx Cx,
+            ReverseRequestCancellation,
+            FinalCreateMessageParams,
+        ) -> ReverseRequestFuture<'cx, FinalCreateMessageResult>
+        + Send
+        + Sync,
+>;
+
+/// Async handler for a modern `roots/list` reverse request.
+pub type ModernRootsRequestHandler = Arc<
+    dyn for<'cx> Fn(
+            &'cx Cx,
+            ReverseRequestCancellation,
+            FinalEmbeddedRootsListParams,
+        ) -> ReverseRequestFuture<'cx, FinalEmbeddedRootsListResult>
+        + Send
+        + Sync,
+>;
+
+/// Async handler for a modern `elicitation/create` reverse request.
+pub type ModernElicitationRequestHandler = Arc<
+    dyn for<'cx> Fn(
+            &'cx Cx,
+            ReverseRequestCancellation,
+            ElicitRequestParams,
+        ) -> ReverseRequestFuture<'cx, ElicitResult>
+        + Send
+        + Sync,
+>;
+
 /// Configurable handlers for reverse requests received from a live MCP server.
 #[derive(Clone, Default)]
 pub struct ReverseRequestHandlers {
     sampling_create_message: Option<SamplingRequestHandler>,
     roots_list: Option<RootsRequestHandler>,
+    modern_sampling_create_message: Option<ModernSamplingRequestHandler>,
+    modern_roots_list: Option<ModernRootsRequestHandler>,
+    modern_elicitation_create: Option<ModernElicitationRequestHandler>,
 }
 
 impl ReverseRequestHandlers {
@@ -294,6 +337,9 @@ impl ReverseRequestHandlers {
         Self {
             sampling_create_message: None,
             roots_list: None,
+            modern_sampling_create_message: None,
+            modern_roots_list: None,
+            modern_elicitation_create: None,
         }
     }
 
@@ -331,13 +377,86 @@ impl ReverseRequestHandlers {
         self
     }
 
+    /// Configures handling for modern `sampling/createMessage`.
+    #[must_use]
+    pub fn with_modern_sampling_create_message<F>(mut self, handler: F) -> Self
+    where
+        F: for<'cx> Fn(
+                &'cx Cx,
+                ReverseRequestCancellation,
+                FinalCreateMessageParams,
+            ) -> ReverseRequestFuture<'cx, FinalCreateMessageResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.modern_sampling_create_message = Some(Arc::new(handler));
+        self
+    }
+
+    /// Configures handling for modern `roots/list`.
+    #[must_use]
+    pub fn with_modern_roots_list<F>(mut self, handler: F) -> Self
+    where
+        F: for<'cx> Fn(
+                &'cx Cx,
+                ReverseRequestCancellation,
+                FinalEmbeddedRootsListParams,
+            ) -> ReverseRequestFuture<'cx, FinalEmbeddedRootsListResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.modern_roots_list = Some(Arc::new(handler));
+        self
+    }
+
+    /// Configures handling for modern `elicitation/create`.
+    #[must_use]
+    pub fn with_modern_elicitation_create<F>(mut self, handler: F) -> Self
+    where
+        F: for<'cx> Fn(
+                &'cx Cx,
+                ReverseRequestCancellation,
+                ElicitRequestParams,
+            ) -> ReverseRequestFuture<'cx, ElicitResult>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.modern_elicitation_create = Some(Arc::new(handler));
+        self
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.sampling_create_message.is_none() && self.roots_list.is_none()
+    }
+
+    pub(crate) fn has_modern_handlers(&self) -> bool {
+        self.modern_sampling_create_message.is_some()
+            || self.modern_roots_list.is_some()
+            || self.modern_elicitation_create.is_some()
     }
 
     /// Adds the exact 2024-11-05 client capabilities implied by these
     /// callbacks. Roots-list-change remains disabled because registering a
     /// roots handler does not authorize the client to originate change events.
+    pub(crate) fn derive_modern_capabilities(&self, capabilities: &mut ClientCapabilities) {
+        if self.modern_sampling_create_message.is_some() {
+            capabilities.sampling.get_or_insert(SamplingCapability {});
+        }
+        if self.modern_roots_list.is_some() {
+            capabilities.roots.get_or_insert(RootsCapability {
+                list_changed: false,
+            });
+        }
+        if self.modern_elicitation_create.is_some() {
+            capabilities
+                .elicitation
+                .get_or_insert(ElicitationCapability::both());
+        }
+    }
+
     pub(crate) fn derive_legacy_capabilities(&self, capabilities: &mut ClientCapabilities) {
         if self.sampling_create_message.is_some() {
             capabilities.sampling.get_or_insert(SamplingCapability {});
@@ -746,6 +865,16 @@ fn validate_subscription_acknowledgement(
         ));
     }
     validate_subscription_acknowledgement_filter(requested, &acknowledgement.notifications)
+}
+
+fn catalog_subscription_requested(filter: &SubscriptionFilter) -> bool {
+    filter.tools_list_changed == Some(true)
+        || filter.resources_list_changed == Some(true)
+        || filter.prompts_list_changed == Some(true)
+        || filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| !uris.is_empty())
 }
 
 fn validate_subscription_notification_filter(
@@ -4344,6 +4473,23 @@ where
     sender.send(cx, message).await
 }
 
+/// One incrementally driven final catalog subscription on a WebSocket client.
+///
+/// The receive half stays owned by [`WebSocketClient`], so ordinary requests
+/// such as `tools/list` can still run while catalog events are drained one at
+/// a time. Collect-to-terminal [`WebSocketClient::listen_subscriptions_typed`]
+/// occupies ingress until the stream ends.
+#[cfg(feature = "websocket-experimental")]
+struct LiveWebSocketCatalogSubscription {
+    request_id: RequestId,
+    core_request: CoreRequest,
+    requested_filter: SubscriptionFilter,
+    accepted_filter: Option<SubscriptionFilter>,
+    acknowledgement_delivered: bool,
+    pending_notifications: VecDeque<ServerNotification>,
+    terminal_response: Option<(JsonRpcResponse, Option<String>)>,
+}
+
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
 ///
 /// The client owns one source-preserving receive half and one independently
@@ -4366,6 +4512,7 @@ where
     final_server_notifications: VecDeque<ServerNotification>,
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
     retired_response_keys: VecDeque<CorrelationKey>,
+    live_catalog_subscription: Option<LiveWebSocketCatalogSubscription>,
     next_id: u64,
     closed: bool,
     close_settled: bool,
@@ -4457,7 +4604,9 @@ where
                     "MCP 2026-07-28 does not support exact-2024 reverse request handlers",
                 ));
             }
-            ProtocolPolicy::ModernOnly => {}
+            ProtocolPolicy::ModernOnly => {
+                reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
+            }
             ProtocolPolicy::Auto => {}
         }
         if matches!(protocol_plan.policy(), ProtocolPolicy::Auto) {
@@ -4589,6 +4738,7 @@ where
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             retired_response_keys: VecDeque::new(),
+            live_catalog_subscription: None,
             next_id: 2,
             closed: false,
             close_settled: false,
@@ -4748,18 +4898,22 @@ where
         self.admit_raw_client_request(&method, params.as_ref())?;
         let id = self.allocate_request_id()?;
         let request = JsonRpcRequest::new(method, params, id.clone());
-        self.request_admitted_with_raw_result(cx, request).await
+        self.request_admitted_with_raw_result(cx, request, None)
+            .await
     }
 
     async fn request_admitted_with_raw_result(
         &mut self,
         cx: &Cx,
         request: JsonRpcRequest,
+        cancellation: Option<&McpRequestCancellation>,
     ) -> McpResult<WebSocketResponse>
     where
         IO: Send + 'static,
     {
-        if cx.checkpoint().is_err() {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(McpError::request_cancelled());
         }
         if self.closed {
@@ -4776,6 +4930,9 @@ where
         }
 
         loop {
+            if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+                return Err(self.retire_committed_request_after_cancellation(id).await);
+            }
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
@@ -4791,7 +4948,11 @@ where
                         )
                         .await);
                 }
-                Err(TransportError::Cancelled) if cx.is_cancel_requested() => {
+                Err(TransportError::Cancelled)
+                    if cx.is_cancel_requested()
+                        || cancellation
+                            .is_some_and(McpRequestCancellation::is_cancel_requested) =>
+                {
                     return Err(self.retire_committed_request_after_cancellation(id).await);
                 }
                 Err(error) => return Err(self.terminal_transport_error(cx, error).await),
@@ -4803,6 +4964,31 @@ where
                 continue;
             };
             if self.discard_retired_websocket_response(response) {
+                continue;
+            }
+            if self
+                .live_catalog_subscription
+                .as_ref()
+                .is_some_and(|subscription| {
+                    response.id.as_ref().is_some_and(|response_id| {
+                        response_id.correlates_with(&subscription.request_id)
+                    })
+                })
+            {
+                let response = response.clone();
+                let raw_result = raw_result_from_admitted_response(&response, frame, "WebSocket")?;
+                let Some(subscription) = self.live_catalog_subscription.as_mut() else {
+                    continue;
+                };
+                if subscription.terminal_response.is_some() {
+                    return Err(self
+                        .close_after_protocol_error(
+                            cx,
+                            "WebSocket catalog listener received a duplicate terminal response",
+                        )
+                        .await);
+                }
+                subscription.terminal_response = Some((response, raw_result));
                 continue;
             }
             if !response
@@ -4905,6 +5091,14 @@ where
         };
         if self.selected_protocol_era() == ProtocolEra::Modern2026 {
             if self.retain_modern_websocket_notification(frame)? {
+                return Ok(());
+            }
+            if let Some(dispatch) = self.try_dispatch_modern_reverse_request(request)? {
+                if let LiveServerRequestDispatch::Immediate(reverse_response) = dispatch {
+                    self.send_message(cx, &reverse_response)
+                        .await
+                        .map_err(transport_error_to_mcp)?;
+                }
                 return Ok(());
             }
             return Err(McpError::invalid_request(
@@ -5020,6 +5214,7 @@ where
             return Ok(());
         }
         self.closed = true;
+        self.live_catalog_subscription = None;
         self.settle_close(cx).await
     }
 
@@ -5052,6 +5247,219 @@ where
         }
     }
 
+    async fn request_core_verb(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => self.request_final_core(cx, method, parameters).await,
+            ProtocolEra::Legacy2024 => self.request_selected_core(cx, method, parameters).await,
+        }
+    }
+
+    fn websocket_list_parameters(cursor: Option<&str>) -> serde_json::Value {
+        cursor.map_or_else(
+            || serde_json::json!({}),
+            |cursor| serde_json::json!({ "cursor": cursor }),
+        )
+    }
+
+    /// Lists one page of tools through the negotiated WebSocket era.
+    pub async fn list_tools(&mut self, cx: &Cx, cursor: Option<&str>) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(cx, "tools/list", Self::websocket_list_parameters(cursor))
+            .await
+    }
+
+    /// Lists one page of resources through the negotiated WebSocket era.
+    pub async fn list_resources(&mut self, cx: &Cx, cursor: Option<&str>) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(
+            cx,
+            "resources/list",
+            Self::websocket_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of resource templates through the negotiated WebSocket era.
+    pub async fn list_resource_templates(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(
+            cx,
+            "resources/templates/list",
+            Self::websocket_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of prompts through the negotiated WebSocket era.
+    pub async fn list_prompts(&mut self, cx: &Cx, cursor: Option<&str>) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(cx, "prompts/list", Self::websocket_list_parameters(cursor))
+            .await
+    }
+
+    /// Reads one resource through the negotiated WebSocket era.
+    pub async fn read_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(cx, "resources/read", serde_json::json!({ "uri": uri }))
+            .await
+    }
+
+    /// Gets one prompt through the negotiated WebSocket era.
+    pub async fn get_prompt(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        let mut parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            let object = parameters.as_object_mut().ok_or_else(|| {
+                McpError::internal_error("WebSocket prompt parameters must remain an object")
+            })?;
+            object.insert(
+                "arguments".to_owned(),
+                serde_json::to_value(arguments).map_err(|_| {
+                    McpError::internal_error("WebSocket prompt arguments could not serialize")
+                })?,
+            );
+        }
+        self.request_core_verb(cx, "prompts/get", parameters).await
+    }
+
+    /// Calls one tool through the negotiated WebSocket era.
+    pub async fn call_tool(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(
+            cx,
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )
+        .await
+    }
+
+    async fn request_core_verb_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let era = self.selected_protocol_era();
+        let parameters = if era == ProtocolEra::Modern2026 {
+            self.with_modern_request_metadata(parameters)?
+        } else {
+            parameters
+        };
+        let request = CoreRequest::decode(era, method, Some(&parameters)).map_err(|_| {
+            McpError::invalid_params(
+                "WebSocket request parameters do not match the negotiated method contract",
+            )
+        })?;
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        let request_id = self.allocate_request_id()?;
+        let received = self
+            .request_admitted_with_raw_result(
+                cx,
+                JsonRpcRequest::new(method, Some(parameters), request_id),
+                Some(cancellation),
+            )
+            .await?;
+        if let Some(error) = received.response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        let result = received.response.result.as_ref().ok_or_else(|| {
+            McpError::invalid_request("WebSocket successful response has no result")
+        })?;
+        let source = received.raw_result.as_deref().ok_or_else(|| {
+            McpError::invalid_request("WebSocket response has no admitted result source")
+        })?;
+        decode_core_result_from_source(&request, result, Some(source))
+    }
+
+    /// Lists one page of tools under a caller-owned cancellation domain.
+    ///
+    /// A domain that is already cancelled rejects before allocating an ID or
+    /// writing a frame. After send, cancellation retires the correlated
+    /// response and emits `notifications/cancelled`. A blocked ingress wait
+    /// still belongs to the connection `Cx` until the next frame arrives.
+    pub async fn list_tools_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb_with_cancellation(
+            cx,
+            cancellation,
+            "tools/list",
+            Self::websocket_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Calls one tool under a caller-owned cancellation domain.
+    pub async fn call_tool_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb_with_cancellation(
+            cx,
+            cancellation,
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )
+        .await
+    }
+
     /// Sends one admitted generic MCP 2026-07-28 extension request.
     ///
     /// The extension registry and retained discovery must agree that `method`
@@ -5079,6 +5487,7 @@ where
             .request_admitted_with_raw_result(
                 cx,
                 JsonRpcRequest::new(method, Some(parameters), request_id),
+                None,
             )
             .await?;
         if let Some(error) = received.response.error {
@@ -5249,6 +5658,10 @@ where
     /// The receive half remains the only ingress owner for the complete
     /// operation, so acknowledgement, live notifications, and termination
     /// cannot be consumed by an unrelated request waiter.
+    ///
+    /// Prefer [`Self::open_subscriptions_listener`] plus
+    /// [`Self::next_subscription_event`] when this client must keep issuing
+    /// ordinary requests while the stream is live.
     pub async fn listen_subscriptions_typed(
         &mut self,
         cx: &Cx,
@@ -5262,6 +5675,11 @@ where
         }
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        if self.live_catalog_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final WebSocket catalog subscription is already active on this client",
+            ));
         }
         self.require_modern("subscriptions/listen")?;
         #[cfg(feature = "tasks")]
@@ -5495,6 +5913,393 @@ where
                 }
             }
         }
+    }
+
+    /// Starts a real, incrementally driven final catalog subscription on this
+    /// WebSocket connection.
+    ///
+    /// Unlike [`Self::listen_subscriptions_typed`], this does not collect the
+    /// stream to terminal completion. Call [`Self::next_subscription_event`]
+    /// to let this client keep sole ownership of ingress while exposing each
+    /// acknowledged catalog or resource-update event in arrival order. The
+    /// same client can still issue ordinary requests such as `tools/list`.
+    pub async fn open_subscriptions_listener(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        if cx.checkpoint().is_err() {
+            return Err(self.terminal_cancellation(cx).await);
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        if self.live_catalog_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final WebSocket catalog subscription is already active on this client",
+            ));
+        }
+        self.require_modern("subscriptions/listen")?;
+        #[cfg(feature = "tasks")]
+        if task_subscription_ids(&notifications)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .is_some()
+        {
+            return Err(McpError::invalid_params(
+                "A live catalog subscription cannot include taskIds",
+            ));
+        }
+        if !catalog_subscription_requested(&notifications) {
+            return Err(McpError::invalid_params(
+                "A live catalog subscription requires tools, resources, or prompts list_changed or resourceSubscriptions",
+            ));
+        }
+        let parameters = self.with_modern_request_metadata(serde_json::json!({
+            "notifications": notifications.clone(),
+        }))?;
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "subscriptions/listen",
+            Some(&parameters),
+        )
+        .map_err(|_| {
+            McpError::invalid_params("Modern WebSocket subscription parameters are invalid")
+        })?;
+        let request_id = self.allocate_request_id()?;
+        let request =
+            JsonRpcRequest::new("subscriptions/listen", Some(parameters), request_id.clone());
+        if let Err(error) = self
+            .send_message(cx, &JsonRpcMessage::Request(request))
+            .await
+        {
+            return Err(self.terminal_transport_error(cx, error).await);
+        }
+        self.live_catalog_subscription = Some(LiveWebSocketCatalogSubscription {
+            request_id,
+            core_request,
+            requested_filter: notifications,
+            accepted_filter: None,
+            acknowledgement_delivered: false,
+            pending_notifications: VecDeque::new(),
+            terminal_response: None,
+        });
+        Ok(())
+    }
+
+    /// Drives the sole WebSocket ingress reader until one live catalog
+    /// listener event is available.
+    ///
+    /// Catalog and resource-update events admitted while another sequential
+    /// request (for example `tools/list`) is in flight are harvested from the
+    /// connection-level queue, so the same client can observe `list_changed`
+    /// without collecting this stream to terminal.
+    pub async fn next_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<StdioSubscriptionEvent>
+    where
+        IO: Send + 'static,
+    {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.cancel_live_catalog_subscription(cx).await?;
+            return Err(McpError::request_cancelled());
+        }
+        loop {
+            if let Err(error) = self.harvest_live_catalog_subscription_notifications() {
+                return Err(self.close_after_protocol_error(cx, &error.message).await);
+            }
+            if let Some(event) = self.take_ready_catalog_subscription_event()? {
+                return Ok(event);
+            }
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_catalog_subscription(cx).await?;
+                return Err(McpError::request_cancelled());
+            }
+            if let Err(error) = self.drain_completed_reverse_callbacks() {
+                return Err(self.terminal_callback_error(cx, error).await);
+            }
+            let frame = match self.recv_with_callback_terminal(cx).await {
+                Ok(frame) => frame,
+                Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
+                    return Err(self
+                        .terminal_callback_error(
+                            cx,
+                            self.reverse_callback_pool
+                                .terminal_error()
+                                .expect("terminal callback error was observed"),
+                        )
+                        .await);
+                }
+                Err(error) => return Err(self.terminal_transport_error(cx, error).await),
+            };
+            match frame.message() {
+                JsonRpcMessage::Response(response) => {
+                    if self.discard_retired_websocket_response(response) {
+                        continue;
+                    }
+                    let listen_id = self
+                        .live_catalog_subscription
+                        .as_ref()
+                        .map(|subscription| subscription.request_id.clone());
+                    if !response.id.as_ref().is_some_and(|response_id| {
+                        listen_id
+                            .as_ref()
+                            .is_some_and(|listen_id| response_id.correlates_with(listen_id))
+                    }) {
+                        return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket catalog listener received a response for another request",
+                            )
+                            .await);
+                    }
+                    let response = response.clone();
+                    let raw_result =
+                        raw_result_from_admitted_response(&response, frame, "WebSocket")?;
+                    let Some(subscription) = self.live_catalog_subscription.as_mut() else {
+                        return Err(McpError::invalid_request(
+                            "No live final catalog WebSocket subscription is active",
+                        ));
+                    };
+                    if subscription.terminal_response.is_some() {
+                        return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket catalog listener received a duplicate terminal response",
+                            )
+                            .await);
+                    }
+                    subscription.terminal_response = Some((response, raw_result));
+                }
+                JsonRpcMessage::Request(_) => {
+                    if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame).await
+                    {
+                        return Err(self.terminal_callback_error(cx, error).await);
+                    }
+                }
+            }
+        }
+    }
+
+    fn harvest_live_catalog_subscription_notifications(&mut self) -> McpResult<()> {
+        if self.live_catalog_subscription.is_none() {
+            return Ok(());
+        }
+        let queued: Vec<ServerNotification> = self.final_server_notifications.drain(..).collect();
+        let mut remainder = VecDeque::new();
+        let mut harvest_error = None;
+        for notification in queued {
+            if harvest_error.is_some() {
+                remainder.push_back(notification);
+                continue;
+            }
+            let Some(subscription) = self.live_catalog_subscription.as_mut() else {
+                remainder.push_back(notification);
+                continue;
+            };
+            match notification {
+                ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                    if subscription.accepted_filter.is_some() {
+                        harvest_error = Some(subscription_listener_protocol_error(
+                            "Subscription listener received a duplicate acknowledgement",
+                        ));
+                        continue;
+                    }
+                    if let Err(error) = validate_subscription_acknowledgement(
+                        &subscription.request_id,
+                        &subscription.requested_filter,
+                        &acknowledgement,
+                    ) {
+                        harvest_error = Some(error);
+                        continue;
+                    }
+                    subscription.accepted_filter = Some(acknowledgement.notifications);
+                }
+                notification @ (ServerNotification::ResourcesListChanged(_)
+                | ServerNotification::ToolsListChanged(_)
+                | ServerNotification::PromptsListChanged(_)
+                | ServerNotification::ResourceUpdated(_)) => {
+                    let Some(accepted_filter) = subscription.accepted_filter.as_ref() else {
+                        harvest_error = Some(subscription_listener_protocol_error(
+                            "Subscription listener received an event before acknowledgement",
+                        ));
+                        continue;
+                    };
+                    if let Err(error) =
+                        validate_subscription_notification_filter(&notification, accepted_filter)
+                    {
+                        harvest_error = Some(error);
+                        continue;
+                    }
+                    if subscription.pending_notifications.len()
+                        >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS
+                    {
+                        harvest_error = Some(McpError::invalid_request(
+                            FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                        ));
+                        continue;
+                    }
+                    subscription.pending_notifications.push_back(notification);
+                }
+                other => remainder.push_back(other),
+            }
+        }
+        self.final_server_notifications = remainder;
+        if let Some(error) = harvest_error {
+            self.live_catalog_subscription = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn take_ready_catalog_subscription_event(
+        &mut self,
+    ) -> McpResult<Option<StdioSubscriptionEvent>> {
+        enum ReadyCatalog {
+            Event(StdioSubscriptionEvent),
+            Terminal {
+                response: JsonRpcResponse,
+                raw_result: Option<String>,
+                request_id: RequestId,
+                core_request: CoreRequest,
+                accepted_filter: Option<SubscriptionFilter>,
+            },
+            Waiting,
+        }
+
+        let ready = {
+            let subscription = self.live_catalog_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final catalog WebSocket subscription is active")
+            })?;
+            if !subscription.acknowledgement_delivered
+                && let Some(acknowledged) = subscription.accepted_filter.clone()
+            {
+                subscription.acknowledgement_delivered = true;
+                ReadyCatalog::Event(StdioSubscriptionEvent::Acknowledged(acknowledged))
+            } else if let Some(notification) = subscription.pending_notifications.pop_front() {
+                ReadyCatalog::Event(StdioSubscriptionEvent::Notification(notification))
+            } else if let Some((response, raw_result)) = subscription.terminal_response.take() {
+                ReadyCatalog::Terminal {
+                    response,
+                    raw_result,
+                    request_id: subscription.request_id.clone(),
+                    core_request: subscription.core_request.clone(),
+                    accepted_filter: subscription.accepted_filter.clone(),
+                }
+            } else {
+                ReadyCatalog::Waiting
+            }
+        };
+        match ready {
+            ReadyCatalog::Event(event) => Ok(Some(event)),
+            ReadyCatalog::Waiting => Ok(None),
+            ReadyCatalog::Terminal {
+                response,
+                raw_result,
+                request_id,
+                core_request,
+                accepted_filter,
+            } => {
+                let Some(raw_result) = raw_result.as_deref() else {
+                    self.live_catalog_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscriptions/listen response lost its admitted result source",
+                    ));
+                };
+                if let Some(error) = response.error.clone() {
+                    self.live_catalog_subscription = None;
+                    return Err(json_rpc_error_to_mcp(error));
+                }
+                let result = match decode_core_result_from_source(
+                    &core_request,
+                    response.result.as_ref().ok_or_else(|| {
+                        McpError::invalid_request(
+                            "WebSocket subscription terminal response has no result",
+                        )
+                    })?,
+                    Some(raw_result),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.live_catalog_subscription = None;
+                        return Err(error);
+                    }
+                };
+                let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+                    subscription_id, ..
+                }) = result
+                else {
+                    self.live_catalog_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscription terminal result is not subscriptions/listen",
+                    ));
+                };
+                if !subscription_id.correlates_with(&request_id) {
+                    self.live_catalog_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscription terminal ID does not match its request",
+                    ));
+                }
+                if accepted_filter.is_none() {
+                    self.live_catalog_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscription terminated before acknowledgement",
+                    ));
+                }
+                self.live_catalog_subscription = None;
+                Ok(Some(StdioSubscriptionEvent::Terminal))
+            }
+        }
+    }
+
+    async fn cancel_live_catalog_subscription(&mut self, cx: &Cx) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        let request_id = self
+            .live_catalog_subscription
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::invalid_request("No live final catalog WebSocket subscription is active")
+            })?
+            .request_id
+            .clone();
+        let request_key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("WebSocket catalog listener request ID is not correlatable")
+        })?;
+        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
+            self.live_catalog_subscription = None;
+            return Err(self
+                .close_after_protocol_error(
+                    cx,
+                    "WebSocket cancelled-response tombstone capacity exceeded",
+                )
+                .await);
+        }
+        let control = CancellationWireMessage::Modern2026 {
+            sender: CancellationSender::Client,
+            params: FinalCancelledNotificationParams {
+                request_id,
+                reason: None,
+                meta: None,
+                additional: BTreeMap::default(),
+            },
+        }
+        .encode()
+        .map(JsonRpcMessage::Request)
+        .map_err(|error| {
+            McpError::invalid_params(format!("invalid WebSocket cancellation: {error}"))
+        })?;
+        self.retired_response_keys.push_back(request_key);
+        if let Err(error) = self.send_message(cx, &control).await {
+            return Err(self.terminal_transport_error(cx, error).await);
+        }
+        self.live_catalog_subscription = None;
+        Ok(())
     }
 
     /// Calls a Tasks-capable modern tool without projecting its result algebra.
@@ -5893,6 +6698,7 @@ where
             .request_admitted_with_raw_result(
                 cx,
                 JsonRpcRequest::new(method, Some(params), request_id),
+                None,
             )
             .await?;
         if let Some(error) = received.response.error {
@@ -5904,6 +6710,115 @@ where
         serde_json::from_str(&source).map_err(|_| {
             McpError::invalid_request("Modern Tasks response has an invalid result shape")
         })
+    }
+
+    fn try_dispatch_modern_reverse_request(
+        &self,
+        request: &JsonRpcRequest,
+    ) -> McpResult<Option<LiveServerRequestDispatch>>
+    where
+        IO: Send + 'static,
+    {
+        if !self.reverse_request_handlers.has_modern_handlers() {
+            return Ok(None);
+        }
+        let Some(id) = request.id.clone() else {
+            return Ok(None);
+        };
+        match request.method.as_str() {
+            "sampling/createMessage" => {
+                let Some(handler) = self
+                    .reverse_request_handlers
+                    .modern_sampling_create_message
+                    .as_ref()
+                else {
+                    return Ok(None);
+                };
+                let params =
+                    match decode_reverse_request_params::<FinalCreateMessageParams>(request) {
+                        Ok(params) => params,
+                        Err(error) => {
+                            return Ok(Some(LiveServerRequestDispatch::Immediate(
+                                reverse_request_response::<FinalCreateMessageResult>(
+                                    id,
+                                    Err(error),
+                                ),
+                            )));
+                        }
+                    };
+                match self
+                    .reverse_callback_pool
+                    .dispatch(id.clone(), params, Arc::clone(handler))
+                {
+                    Ok(()) => Ok(Some(LiveServerRequestDispatch::CallbackAdmitted)),
+                    Err(error) if self.reverse_callback_pool.terminal_error().is_some() => {
+                        Err(error)
+                    }
+                    Err(error) => Ok(Some(LiveServerRequestDispatch::Immediate(
+                        reverse_request_response::<FinalCreateMessageResult>(id, Err(error)),
+                    ))),
+                }
+            }
+            "elicitation/create" => {
+                let Some(handler) = self
+                    .reverse_request_handlers
+                    .modern_elicitation_create
+                    .as_ref()
+                else {
+                    return Ok(None);
+                };
+                let params = match decode_reverse_request_params::<ElicitRequestParams>(request) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return Ok(Some(LiveServerRequestDispatch::Immediate(
+                            reverse_request_response::<ElicitResult>(id, Err(error)),
+                        )));
+                    }
+                };
+                match self
+                    .reverse_callback_pool
+                    .dispatch(id.clone(), params, Arc::clone(handler))
+                {
+                    Ok(()) => Ok(Some(LiveServerRequestDispatch::CallbackAdmitted)),
+                    Err(error) if self.reverse_callback_pool.terminal_error().is_some() => {
+                        Err(error)
+                    }
+                    Err(error) => Ok(Some(LiveServerRequestDispatch::Immediate(
+                        reverse_request_response::<ElicitResult>(id, Err(error)),
+                    ))),
+                }
+            }
+            "roots/list" => {
+                let Some(handler) = self.reverse_request_handlers.modern_roots_list.as_ref() else {
+                    return Ok(None);
+                };
+                let params =
+                    match decode_reverse_request_params::<FinalEmbeddedRootsListParams>(request) {
+                        Ok(params) => params,
+                        Err(error) => {
+                            return Ok(Some(LiveServerRequestDispatch::Immediate(
+                                reverse_request_response::<FinalEmbeddedRootsListResult>(
+                                    id,
+                                    Err(error),
+                                ),
+                            )));
+                        }
+                    };
+                match self
+                    .reverse_callback_pool
+                    .dispatch(id.clone(), params, Arc::clone(handler))
+                {
+                    Ok(()) => Ok(Some(LiveServerRequestDispatch::CallbackAdmitted)),
+                    Err(error) if self.reverse_callback_pool.terminal_error().is_some() => {
+                        Err(error)
+                    }
+                    Err(error) => Ok(Some(LiveServerRequestDispatch::Immediate(
+                        reverse_request_response::<FinalEmbeddedRootsListResult>(id, Err(error)),
+                    ))),
+                }
+            }
+            _ => Ok(None),
+        }
     }
 
     fn dispatch_legacy_reverse_request(
@@ -7426,7 +8341,11 @@ enum RequestCancellationTerminalElection {
 }
 
 impl RequestCancellationTerminalElection {
-    fn response_wins(self, response: &ReceivedJsonRpcResponse) -> bool {
+    fn response_wins(
+        self,
+        #[cfg_attr(not(feature = "tasks"), allow(unused_variables))]
+        response: &ReceivedJsonRpcResponse,
+    ) -> bool {
         match self {
             Self::CancelFirst => false,
             #[cfg(feature = "tasks")]
@@ -7894,6 +8813,10 @@ pub struct HttpClient {
     final_result_cache: FinalResultCache,
     final_cache_ttl_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
     mcp_apps_settings: Option<McpAppsClientSettings>,
+    /// At most one incremental HTTP catalog listener. Stored on the client so
+    /// ordinary requests can keep using this connection while events are
+    /// drained one at a time.
+    live_subscription: Option<ModernHttpSubscriptionListener>,
 }
 
 /// Errors raised while composing a ready public HTTP client.
@@ -8307,7 +9230,7 @@ impl HttpClient {
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
         reverse_request_handlers: ReverseRequestHandlers,
     ) -> Result<Self, HttpClientError> {
-        let connection = ClientHttpConnection::connect_with_extensions(
+        let mut connection = ClientHttpConnection::connect_with_extensions(
             cx,
             protocol_plan,
             client_info.clone(),
@@ -8318,11 +9241,14 @@ impl HttpClient {
         .await
         .map_err(HttpClientError::Connection)?;
         #[cfg(feature = "legacy-2024-11-05")]
-        let mut connection = connection;
-        #[cfg(feature = "legacy-2024-11-05")]
         let mut client_capabilities = client_capabilities;
-        #[cfg(not(feature = "legacy-2024-11-05"))]
-        let _ = &reverse_request_handlers;
+        if connection.selected_protocol_era() == ProtocolEra::Modern2026
+            && reverse_request_handlers.has_modern_handlers()
+        {
+            connection
+                .set_modern_reverse_request_handlers(reverse_request_handlers.clone())
+                .map_err(HttpClientError::CoreResult)?;
+        }
 
         // Legacy callbacks are part of the capability set advertised by
         // `initialize`, so they must be installed before the lifecycle sends
@@ -8417,6 +9343,7 @@ impl HttpClient {
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
             mcp_apps_settings,
+            live_subscription: None,
         })
     }
 
@@ -8717,18 +9644,25 @@ impl HttpClient {
             .await
     }
 
-    #[cfg(feature = "apps")]
-    async fn request_final_core_with_cancellation(
+    /// Sends one supported core request under a caller-owned cancellation
+    /// domain.
+    ///
+    /// Unlike [`Self::request_final_core`], this path honors
+    /// [`McpRequestCancellation`] for the HTTP exchange itself, including the
+    /// wait for response headers and the disposable JSON body. Ordinary
+    /// `tools/call` and `tools/list` callers no longer need the Apps feature
+    /// to cancel a live HTTP request.
+    pub async fn request_final_core_with_cancellation(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
-        method: &str,
+        method: impl AsRef<str>,
         parameters: serde_json::Value,
     ) -> Result<CoreResult, HttpClientError> {
         self.request_final_core_with_optional_cancellation(
             cx,
             Some(cancellation),
-            method,
+            method.as_ref(),
             parameters,
         )
         .await
@@ -8865,6 +9799,141 @@ impl HttpClient {
         };
         self.request_final_core(cx, "completion/complete", parameters)
             .await
+    }
+
+    fn http_list_parameters(cursor: Option<&str>) -> serde_json::Value {
+        cursor.map_or_else(
+            || serde_json::json!({}),
+            |cursor| serde_json::json!({ "cursor": cursor }),
+        )
+    }
+
+    /// Lists one page of tools through the negotiated HTTP era.
+    pub async fn list_tools(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(cx, "tools/list", Self::http_list_parameters(cursor))
+            .await
+    }
+
+    /// Lists one page of tools under a caller-owned cancellation domain.
+    pub async fn list_tools_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core_with_cancellation(
+            cx,
+            cancellation,
+            "tools/list",
+            Self::http_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of resources through the negotiated HTTP era.
+    pub async fn list_resources(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(cx, "resources/list", Self::http_list_parameters(cursor))
+            .await
+    }
+
+    /// Lists one page of resource templates through the negotiated HTTP era.
+    pub async fn list_resource_templates(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(
+            cx,
+            "resources/templates/list",
+            Self::http_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of prompts through the negotiated HTTP era.
+    pub async fn list_prompts(
+        &mut self,
+        cx: &Cx,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(cx, "prompts/list", Self::http_list_parameters(cursor))
+            .await
+    }
+
+    /// Reads one resource through the negotiated HTTP era.
+    pub async fn read_resource(
+        &mut self,
+        cx: &Cx,
+        uri: &str,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(cx, "resources/read", serde_json::json!({ "uri": uri }))
+            .await
+    }
+
+    /// Gets one prompt through the negotiated HTTP era.
+    pub async fn get_prompt(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> Result<CoreResult, HttpClientError> {
+        let mut parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            let object = parameters.as_object_mut().ok_or_else(|| {
+                HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP prompt parameters must remain an object",
+                ))
+            })?;
+            object.insert(
+                "arguments".to_owned(),
+                serde_json::to_value(arguments).map_err(|_| {
+                    HttpClientError::CoreResult(McpError::internal_error(
+                        "HTTP prompt arguments could not serialize",
+                    ))
+                })?,
+            );
+        }
+        self.request_final_core(cx, "prompts/get", parameters).await
+    }
+
+    /// Calls one tool through the negotiated HTTP era.
+    pub async fn call_tool(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(
+            cx,
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )
+        .await
+    }
+
+    /// Calls one tool under a caller-owned cancellation domain.
+    pub async fn call_tool_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core_with_cancellation(
+            cx,
+            cancellation,
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )
+        .await
     }
 
     /// Sends one raw final extension request after exact bilateral admission.
@@ -9054,6 +10123,76 @@ impl HttpClient {
             listener,
             final_result_cache: &mut self.final_result_cache,
         })
+    }
+
+    /// Starts an incremental HTTP catalog listener on this client.
+    ///
+    /// Unlike [`Self::open_subscriptions_listener`], this does not borrow the
+    /// final-result cache for the listener lifetime. Call
+    /// [`Self::next_http_subscription_event`] so the same client can keep
+    /// issuing ordinary requests such as `tools/list` while the stream is live.
+    pub async fn start_subscriptions_listener(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+        limits: sse::SseLimits,
+    ) -> Result<(), HttpClientError> {
+        if self.live_subscription.is_some() {
+            return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                "A final HTTP subscription is already active on this client",
+            )));
+        }
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let request_id = self.next_request_id()?;
+        let listener = self
+            .connection
+            .open_subscriptions_listener(cx, request_id, notifications, limits)
+            .await
+            .map_err(HttpClientError::Connection)?;
+        self.live_subscription = Some(listener);
+        Ok(())
+    }
+
+    /// Drives one incremental HTTP catalog listener event.
+    ///
+    /// Accepted catalog and resource notifications invalidate cached result
+    /// sets before this method returns them. Terminal completion or a stream
+    /// error retires the live listener.
+    pub async fn next_http_subscription_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpSubscriptionListenEvent>, HttpClientError> {
+        let event = {
+            let listener = self.live_subscription.as_mut().ok_or_else(|| {
+                HttpClientError::CoreResult(McpError::invalid_request(
+                    "No live final HTTP subscription is active",
+                ))
+            })?;
+            listener.next_event(cx).await
+        };
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                self.live_subscription = None;
+                return Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::SubscriptionsListen(error),
+                ));
+            }
+        };
+        if let Some(ModernHttpSubscriptionListenEvent::Notification(notification)) = event.as_ref()
+        {
+            self.final_result_cache
+                .invalidate_notification(notification);
+        }
+        if matches!(
+            event,
+            None | Some(ModernHttpSubscriptionListenEvent::Terminal { .. })
+        ) {
+            self.live_subscription = None;
+        }
+        Ok(event)
     }
 
     /// Collects one typed final HTTP subscription stream.
@@ -9357,6 +10496,40 @@ struct LiveStdioTaskSubscription {
     /// Retain the exact failure so a later poll cannot pretend cancellation
     /// committed after the upstream writer had already failed.
     cancellation_failure: Option<McpError>,
+}
+
+/// One incrementally driven final catalog subscription on a stdio client.
+///
+/// Like the Tasks listener, this stays inside [`Client`] so the same connection
+/// can keep issuing ordinary requests while catalog events are drained one at
+/// a time. A borrowing listener would occupy ingress and freeze `tools/call`.
+struct LiveStdioCatalogSubscription {
+    executor: StdioRequestExecutor,
+    execution: StdioRequestExecution,
+    core_request: CoreRequest,
+    requested_filter: SubscriptionFilter,
+    accepted_filter: Option<SubscriptionFilter>,
+    acknowledgement_delivered: bool,
+    pending_notifications: VecDeque<ServerNotification>,
+    /// A failed cancellation control leaves this listener owned by the client.
+    /// Retain the exact failure so a later poll cannot pretend cancellation
+    /// committed after the upstream writer had already failed.
+    cancellation_failure: Option<McpError>,
+}
+
+/// One incrementally observed stdio catalog subscription event.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public event deliberately exposes an owned typed catalog notification so callers can inspect it without an extra allocation or a changed match surface"
+)]
+#[derive(Debug, Clone)]
+pub enum StdioSubscriptionEvent {
+    /// The upstream accepted the exact filter for this request.
+    Acknowledged(SubscriptionFilter),
+    /// One typed catalog or resource-update event, in upstream arrival order.
+    Notification(ServerNotification),
+    /// The correlated listener reached its validated final completion result.
+    Terminal,
 }
 
 /// One incrementally observed stdio Tasks subscription event.
@@ -9691,6 +10864,10 @@ pub struct Client {
     /// listener surface.  It is driven by this client's sole ingress method.
     #[cfg(feature = "tasks")]
     live_task_subscription: Option<LiveStdioTaskSubscription>,
+    /// At most one live final catalog subscription owns the incremental stdio
+    /// listener surface. It is driven by this client's sole ingress method so
+    /// ordinary requests can still complete while events are drained.
+    live_catalog_subscription: Option<LiveStdioCatalogSubscription>,
     /// Capability context for cancellation.
     cx: Cx,
     /// Session state after initialization.
@@ -10026,6 +11203,7 @@ impl Client {
             multiplexed_executor: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
+            live_catalog_subscription: None,
             cx,
             session: ClientSession::new_placeholder(
                 client_info.clone(),
@@ -10122,6 +11300,55 @@ impl Client {
             .await
     }
 
+    /// Connects one exact MCP 2024-11-05 HTTP+SSE client.
+    ///
+    /// This is the standalone SSE constructor for callers who already know the
+    /// GET event stream and POST message endpoints. Auto still uses SSE only
+    /// as a fallback after a modern HTTP probe; this method never probes
+    /// MCP 2026-07-28.
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub fn sse(
+        sse_endpoint: CanonicalHttpUrl,
+        message_post_endpoint: CanonicalHttpUrl,
+    ) -> Result<HttpClient, HttpClientError> {
+        Self::http(Self::legacy_sse_plan(sse_endpoint, message_post_endpoint)?)
+    }
+
+    /// Connects one exact MCP 2024-11-05 HTTP+SSE client with an explicit
+    /// cancellation context.
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub async fn sse_with_cx(
+        sse_endpoint: CanonicalHttpUrl,
+        message_post_endpoint: CanonicalHttpUrl,
+        cx: &Cx,
+    ) -> Result<HttpClient, HttpClientError> {
+        Self::http_with_cx(
+            Self::legacy_sse_plan(sse_endpoint, message_post_endpoint)?,
+            cx,
+        )
+        .await
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_sse_plan(
+        sse_endpoint: CanonicalHttpUrl,
+        message_post_endpoint: CanonicalHttpUrl,
+    ) -> Result<ClientProtocolPlan, HttpClientError> {
+        ClientProtocolPlan::http(
+            ProtocolPolicy::LegacyOnly,
+            None,
+            Some(sse_endpoint),
+            Some(message_post_endpoint),
+            "fastmcp-rust-client-sse".to_owned(),
+            "fastmcp-rust-client-sse".to_owned(),
+            "legacy-2024-http-sse".to_owned(),
+            0,
+            0,
+            0,
+        )
+        .map_err(|error| HttpClientError::CoreResult(McpError::invalid_params(error.to_string())))
+    }
+
     /// Creates a client from its component parts.
     ///
     /// This is an internal constructor used by the builder.
@@ -10176,6 +11403,7 @@ impl Client {
             multiplexed_executor: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
+            live_catalog_subscription: None,
             cx,
             session,
             next_id: Arc::new(AtomicU64::new(2)), // Start at 2 since initialize used 1
@@ -10246,6 +11474,7 @@ impl Client {
             multiplexed_executor: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
+            live_catalog_subscription: None,
             cx,
             session,
             next_id: Arc::new(AtomicU64::new(1)), // Start at 1 since initialize hasn't happened
@@ -14891,6 +16120,11 @@ impl Client {
     /// exact terminal [`CompleteResult`]. Exact 2024-11-05 has no equivalent
     /// listener contract and is rejected before a request ID is allocated or
     /// bytes are written.
+    ///
+    /// This occupies ingress until the stream ends. To keep issuing requests
+    /// on the same `Client` while catalog events arrive, use
+    /// [`Self::open_subscriptions_listener`] and
+    /// [`Self::next_subscription_event`].
     pub fn listen_subscriptions_typed(
         &mut self,
         notifications: SubscriptionFilter,
@@ -14967,6 +16201,339 @@ impl Client {
         self.recv_subscription_listener(waiter, &core_request, &requested, deadlines)
     }
 
+    /// Starts a real, incrementally driven final catalog subscription on this
+    /// stdio connection.
+    ///
+    /// Unlike [`Self::listen_subscriptions_typed`], this does not collect the
+    /// stream to terminal completion. Call [`Self::next_subscription_event`]
+    /// to let this `Client` keep sole ownership of ingress while exposing each
+    /// acknowledged catalog or resource-update event in arrival order. The
+    /// same `Client` can still issue ordinary requests such as `tools/call`.
+    pub fn open_subscriptions_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<()> {
+        self.ensure_initialized()?;
+        if self.live_catalog_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final catalog stdio subscription is already active on this client",
+            ));
+        }
+        #[cfg(feature = "tasks")]
+        if self.live_task_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final Tasks stdio subscription is already active on this client",
+            ));
+        }
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return Err(McpError::invalid_params(
+                "subscriptions/listen is available only for MCP 2026-07-28",
+            ));
+        }
+        #[cfg(feature = "tasks")]
+        {
+            let tasks_requested = task_subscription_ids(&notifications)
+                .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+                .is_some();
+            if tasks_requested {
+                return Err(McpError::invalid_params(
+                    "A live catalog subscription cannot include taskIds; use open_final_task_subscription_listener",
+                ));
+            }
+        }
+        if !catalog_subscription_requested(&notifications) {
+            return Err(McpError::invalid_params(
+                "A live catalog subscription requires tools, resources, or prompts list_changed or resourceSubscriptions",
+            ));
+        }
+        let params_value = serde_json::to_value(serde_json::json!({
+            "notifications": notifications.clone(),
+        }))
+        .map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to serialize subscriptions/listen parameters: {error}"
+            ))
+        })?;
+        let params_value = self.prepare_request_parameters(params_value)?;
+        let core_request = self
+            .prepared_core_request("subscriptions/listen", &params_value)?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "subscriptions/listen is not a supported core request in the negotiated era",
+                )
+            })?;
+        let params_value = core_request
+            .encode_params()
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "subscriptions/listen could not be encoded in the negotiated protocol era",
+                )
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "subscriptions/listen requires a parameter object in the negotiated protocol era",
+                )
+            })?;
+        let executor = self.multiplexed_stdio_executor()?;
+        executor.service(&self.cx)?;
+        let execution = executor.execute(&self.cx, "subscriptions/listen", Some(params_value))?;
+        self.live_catalog_subscription = Some(LiveStdioCatalogSubscription {
+            executor,
+            execution,
+            core_request,
+            requested_filter: notifications,
+            accepted_filter: None,
+            acknowledgement_delivered: false,
+            pending_notifications: VecDeque::new(),
+            cancellation_failure: None,
+        });
+        Ok(())
+    }
+
+    /// Commits upstream cancellation before retiring the live catalog listener.
+    ///
+    /// The listener remains installed when the cancellation control cannot be
+    /// committed. This preserves its request ownership and retains the
+    /// original transport failure instead of silently converting it into a
+    /// successful local cancellation.
+    fn cancel_live_catalog_subscription(&mut self, cx: &Cx) -> McpResult<()> {
+        let cancellation = {
+            let subscription = self.live_catalog_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final catalog stdio subscription is active")
+            })?;
+            if let Some(error) = &subscription.cancellation_failure {
+                return Err(error.clone());
+            }
+            subscription
+                .executor
+                .cancel(cx, &mut subscription.execution)
+        };
+        match cancellation {
+            Ok(()) => {
+                self.live_catalog_subscription = None;
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(subscription) = self.live_catalog_subscription.as_mut() {
+                    subscription.cancellation_failure = Some(error.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn harvest_live_catalog_subscription_notifications(&mut self) -> McpResult<()> {
+        if self.live_catalog_subscription.is_none() {
+            return Ok(());
+        }
+        let queued: Vec<ServerNotification> = self.final_server_notifications.drain(..).collect();
+        let mut remainder = VecDeque::new();
+        let mut harvest_error = None;
+        for notification in queued {
+            if harvest_error.is_some() {
+                remainder.push_back(notification);
+                continue;
+            }
+            let Some(subscription) = self.live_catalog_subscription.as_mut() else {
+                remainder.push_back(notification);
+                continue;
+            };
+            match notification {
+                ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                    if subscription.accepted_filter.is_some() {
+                        harvest_error = Some(subscription_listener_protocol_error(
+                            "Subscription listener received a duplicate acknowledgement",
+                        ));
+                        continue;
+                    }
+                    if let Err(error) = validate_subscription_acknowledgement(
+                        subscription.execution.request_id(),
+                        &subscription.requested_filter,
+                        &acknowledgement,
+                    ) {
+                        harvest_error = Some(error);
+                        continue;
+                    }
+                    subscription.accepted_filter = Some(acknowledgement.notifications);
+                }
+                notification @ (ServerNotification::ResourcesListChanged(_)
+                | ServerNotification::ToolsListChanged(_)
+                | ServerNotification::PromptsListChanged(_)
+                | ServerNotification::ResourceUpdated(_)) => {
+                    let Some(accepted_filter) = subscription.accepted_filter.as_ref() else {
+                        harvest_error = Some(subscription_listener_protocol_error(
+                            "Subscription listener received an event before acknowledgement",
+                        ));
+                        continue;
+                    };
+                    if let Err(error) =
+                        validate_subscription_notification_filter(&notification, accepted_filter)
+                    {
+                        harvest_error = Some(error);
+                        continue;
+                    }
+                    if subscription.pending_notifications.len()
+                        >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS
+                    {
+                        harvest_error = Some(McpError::invalid_request(
+                            FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+                        ));
+                        continue;
+                    }
+                    subscription.pending_notifications.push_back(notification);
+                }
+                other => remainder.push_back(other),
+            }
+        }
+        self.final_server_notifications = remainder;
+        if let Some(error) = harvest_error {
+            return Err(self.terminate_connection(error));
+        }
+        Ok(())
+    }
+
+    /// Drives the sole stdio ingress reader until one live catalog listener
+    /// event is available.
+    ///
+    /// Catalog and resource-update events admitted while another sequential
+    /// request (for example `tools/call`) is in flight are harvested from the
+    /// connection-level queue, so the same `Client` can mutate the catalog and
+    /// observe `list_changed` without collecting this stream to terminal.
+    pub fn next_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<StdioSubscriptionEvent> {
+        if let Some(error) = self
+            .live_catalog_subscription
+            .as_ref()
+            .and_then(|subscription| subscription.cancellation_failure.clone())
+        {
+            return Err(error);
+        }
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.cancel_live_catalog_subscription(cx)?;
+            return Err(McpError::request_cancelled());
+        }
+        loop {
+            self.harvest_live_catalog_subscription_notifications()?;
+            if let Some(event) = self.take_ready_catalog_subscription_event()? {
+                return Ok(event);
+            }
+            self.drive_multiplexed_stdio(cx)?;
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_catalog_subscription(cx)?;
+                return Err(McpError::request_cancelled());
+            }
+        }
+    }
+
+    fn take_ready_catalog_subscription_event(
+        &mut self,
+    ) -> McpResult<Option<StdioSubscriptionEvent>> {
+        enum ReadyCatalog {
+            Event(StdioSubscriptionEvent),
+            Terminal {
+                response: JsonRpcResponse,
+                raw_result: Option<String>,
+                request_id: RequestId,
+                core_request: CoreRequest,
+                accepted_filter: Option<SubscriptionFilter>,
+            },
+            Waiting,
+            Failed(McpError),
+        }
+
+        let ready = {
+            let subscription = self.live_catalog_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final catalog stdio subscription is active")
+            })?;
+            if !subscription.acknowledgement_delivered
+                && let Some(acknowledged) = subscription.accepted_filter.clone()
+            {
+                subscription.acknowledgement_delivered = true;
+                ReadyCatalog::Event(StdioSubscriptionEvent::Acknowledged(acknowledged))
+            } else if let Some(notification) = subscription.pending_notifications.pop_front() {
+                ReadyCatalog::Event(StdioSubscriptionEvent::Notification(notification))
+            } else {
+                match subscription
+                    .executor
+                    .try_take_response_with_raw_result(&mut subscription.execution)
+                {
+                    Ok(Some((response, raw_result))) => ReadyCatalog::Terminal {
+                        response,
+                        raw_result,
+                        request_id: subscription.execution.request_id().clone(),
+                        core_request: subscription.core_request.clone(),
+                        accepted_filter: subscription.accepted_filter.clone(),
+                    },
+                    Ok(None) => ReadyCatalog::Waiting,
+                    Err(error) => ReadyCatalog::Failed(error),
+                }
+            }
+        };
+        match ready {
+            ReadyCatalog::Event(event) => Ok(Some(event)),
+            ReadyCatalog::Waiting => Ok(None),
+            ReadyCatalog::Failed(error) => {
+                self.live_catalog_subscription = None;
+                Err(error)
+            }
+            ReadyCatalog::Terminal {
+                response,
+                raw_result,
+                request_id,
+                core_request,
+                accepted_filter,
+            } => {
+                let Some(raw_result) = raw_result.as_deref() else {
+                    self.live_catalog_subscription = None;
+                    return Err(self.terminate_connection(McpError::invalid_request(
+                        "Final subscriptions/listen response lost its admitted result source",
+                    )));
+                };
+                let result = match core_request.decode_response_result(&response, raw_result) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.live_catalog_subscription = None;
+                        return Err(self.terminate_connection(McpError::invalid_request(format!(
+                            "Invalid final subscriptions/listen termination: {error}"
+                        ))));
+                    }
+                };
+                let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+                    subscription_id, ..
+                }) = result
+                else {
+                    self.live_catalog_subscription = None;
+                    return Err(
+                        self.terminate_connection(subscription_listener_protocol_error(
+                            "Subscription listener received a non-listen terminal result",
+                        )),
+                    );
+                };
+                if !subscription_id.correlates_with(&request_id) {
+                    self.live_catalog_subscription = None;
+                    return Err(
+                        self.terminate_connection(subscription_listener_protocol_error(
+                            "Subscription listener terminal ID does not match its request",
+                        )),
+                    );
+                }
+                if accepted_filter.is_none() {
+                    self.live_catalog_subscription = None;
+                    return Err(
+                        self.terminate_connection(subscription_listener_protocol_error(
+                            "Subscription listener terminated before acknowledgement",
+                        )),
+                    );
+                }
+                self.live_catalog_subscription = None;
+                Ok(Some(StdioSubscriptionEvent::Terminal))
+            }
+        }
+    }
+
     /// Starts a real, incrementally driven final Tasks subscription on this
     /// stdio connection.
     ///
@@ -14984,6 +16551,11 @@ impl Client {
         if self.live_task_subscription.is_some() {
             return Err(McpError::invalid_request(
                 "A final Tasks stdio subscription is already active on this client",
+            ));
+        }
+        if self.live_catalog_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final catalog stdio subscription is already active on this client",
             ));
         }
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
@@ -15656,6 +17228,16 @@ mod tests {
                     "version": "1.0"
                 }
             },
+            "ttlMs": 0,
+            "cacheScope": "private"
+        })
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn async_modern_tools_list_result() -> serde_json::Value {
+        serde_json::json!({
+            "resultType": "complete",
+            "tools": [],
             "ttlMs": 0,
             "cacheScope": "private"
         })
@@ -16427,6 +18009,318 @@ mod tests {
                 assert_eq!(collector.notifications.len(), 1);
                 client.close(&cx).await.expect("close subscription client");
             }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_incremental_catalog_listener_routes_ack_list_changed_and_terminal() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1e0")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before incremental listen");
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .expect("incremental WebSocket listen commits one catalog subscription");
+            let cancellation = McpRequestCancellation::new();
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &cancellation)
+                    .await
+                    .expect("incremental WebSocket ingress routes the acknowledgement"),
+                StdioSubscriptionEvent::Acknowledged(ref filter)
+                    if filter.tools_list_changed == Some(true)
+            ));
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &cancellation)
+                    .await
+                    .expect("incremental WebSocket ingress routes the catalog event"),
+                StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(None))
+            ));
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &cancellation)
+                    .await
+                    .expect("incremental WebSocket ingress routes the terminal response"),
+                StdioSubscriptionEvent::Terminal
+            ));
+            assert!(
+                client.live_catalog_subscription.is_none(),
+                "terminal completion releases only the completed live listener"
+            );
+            client
+                .close(&cx)
+                .await
+                .expect("close incremental subscription client");
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_incremental_catalog_listener_keeps_issuing_tools_list() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1e0")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            )
+            .await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before interleaved listen");
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .expect("listen stays live while this client issues another request");
+            let cancellation = McpRequestCancellation::new();
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &cancellation)
+                    .await
+                    .expect("acknowledgement arrives before the interleaved tools/list"),
+                StdioSubscriptionEvent::Acknowledged(_)
+            ));
+            let listed = client
+                .list_tools_with_cancellation(&cx, &cancellation, None)
+                .await
+                .expect("the same client must complete tools/list while listen is live");
+            assert!(matches!(
+                listed,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &cancellation)
+                    .await
+                    .expect("catalog events queued during tools/list stay request-owned"),
+                StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(None))
+            ));
+            assert!(matches!(
+                client
+                    .next_subscription_event(&cx, &cancellation)
+                    .await
+                    .expect("a listen terminal parked during tools/list remains available"),
+                StdioSubscriptionEvent::Terminal
+            ));
+            client
+                .close(&cx)
+                .await
+                .expect("close interleaved subscription client");
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_typed_list_tools_with_cancellation_rejects_before_contact() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let listed = Arc::new(AtomicBool::new(false));
+            let peer_listed = Arc::clone(&listed);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives discovery")
+                    else {
+                        panic!("client must discover before a cancelled tools/list");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery has an ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends discovery result");
+                    if let Ok(JsonRpcMessage::Request(request)) = server.recv(&peer_cx).await
+                        && request.method == "tools/list"
+                    {
+                        peer_listed.store(true, Ordering::SeqCst);
+                    }
+                })
+                .expect("spawn cancelled-tools/list WebSocket peer");
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before a cancelled tools/list");
+            let cancellation = McpRequestCancellation::new();
+            cancellation.cancel();
+            let error = client
+                .list_tools_with_cancellation(&cx, &cancellation, None)
+                .await
+                .expect_err("an already-cancelled domain must reject before tools/list");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            client
+                .close(&cx)
+                .await
+                .expect("close cancelled-tools/list client");
+            peer.abort();
+            let _ = peer.join(&cx).await;
+            assert!(
+                !listed.load(Ordering::SeqCst),
+                "cancelled tools/list must not write a tools/list frame"
+            );
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_incremental_catalog_listener_rejects_second_open_and_empty_filter() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1e0")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before reservation checks");
+            let error = client
+                .open_subscriptions_listener(&cx, SubscriptionFilter::default())
+                .await
+                .expect_err("an empty filter is not a catalog subscription");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            let filter = SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            };
+            client
+                .open_subscriptions_listener(&cx, filter.clone())
+                .await
+                .expect("the first incremental listen reserves ingress");
+            let error = client
+                .open_subscriptions_listener(&cx, filter.clone())
+                .await
+                .expect_err("a second incremental listen must fail closed");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            let error = client
+                .listen_subscriptions_typed(&cx, filter)
+                .await
+                .expect_err("collect-to-terminal listen cannot steal a live incremental listener");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            client
+                .close(&cx)
+                .await
+                .expect("close reservation-check client");
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_incremental_catalog_listener_rejects_event_before_acknowledgement() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1e0")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{}}"#,
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects before the unacknowledged event");
+            client
+                .open_subscriptions_listener(
+                    &cx,
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                )
+                .await
+                .expect("the live listener commits before the unacknowledged event is consumed");
+            let error = client
+                .next_subscription_event(&cx, &McpRequestCancellation::new())
+                .await
+                .expect_err("an event before acknowledgement must fail closed");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert!(error.message.contains("before acknowledgement"));
+            client
+                .close(&cx)
+                .await
+                .expect("close before-ack subscription client");
         });
     }
 
@@ -18424,6 +20318,364 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_modern_sampling_reverse_request_is_answered_by_the_typed_handler() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives discovery")
+                    else {
+                        panic!("expected discovery request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends discovery result");
+                    let _ = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives modern tools/list");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "sampling/createMessage",
+                                Some(serde_json::json!({
+                                    "_meta": {
+                                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                                        "io.modelcontextprotocol/clientCapabilities": {}
+                                    },
+                                    "messages": [{
+                                        "role": "user",
+                                        "content": {"type": "text", "text": "hello"}
+                                    }],
+                                    "maxTokens": 8
+                                })),
+                                RequestId::Number(99),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends modern sampling reverse request");
+                    let JsonRpcMessage::Response(sampling) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives modern sampling response")
+                    else {
+                        panic!("expected sampling response");
+                    };
+                    assert!(
+                        sampling
+                            .id
+                            .as_ref()
+                            .is_some_and(|id| id.correlates_with(&RequestId::Number(99)))
+                    );
+                    assert!(sampling.error.is_none());
+                    assert_eq!(
+                        sampling.result.as_ref().and_then(|value| value.get("model")),
+                        Some(&serde_json::json!("modern-ws-model"))
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                RequestId::Number(2),
+                                async_modern_tools_list_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer completes tools/list after sampling");
+                    let _ = server.recv(&peer_cx).await;
+                })
+                .expect("spawn modern sampling reverse peer");
+            let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
+                |_cx, _cancellation, params| {
+                    Box::pin(async move {
+                        assert_eq!(params.max_tokens.to_string(), "8");
+                        Ok(FinalCreateMessageResult {
+                            content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                                fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                                    text: "sampled".to_owned(),
+                                    annotations: None,
+                                    meta: None,
+                                    additional: BTreeMap::new(),
+                                },
+                            ),
+                            model: "modern-ws-model".to_owned(),
+                            role: fastmcp_protocol::Role::Assistant,
+                            stop_reason: None,
+                            meta: None,
+                        })
+                    })
+                },
+            );
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects with sampling handler");
+            let listed = client
+                .list_tools(&cx, None)
+                .await
+                .expect("tools/list completes after modern sampling is answered");
+            assert!(matches!(
+                listed,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            client
+                .close(&cx)
+                .await
+                .expect("close modern sampling reverse client");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_modern_elicitation_reverse_request_is_answered_by_the_typed_handler() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives discovery")
+                    else {
+                        panic!("expected discovery request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends discovery result");
+                    let _ = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives modern tools/list");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "elicitation/create",
+                                Some(serde_json::json!({
+                                    "mode": "form",
+                                    "message": "Choose a name",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": {"name": {"type": "string"}},
+                                        "required": ["name"]
+                                    }
+                                })),
+                                RequestId::Number(77),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends modern elicitation reverse request");
+                    let JsonRpcMessage::Response(elicited) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives modern elicitation response")
+                    else {
+                        panic!("expected elicitation response");
+                    };
+                    assert!(
+                        elicited
+                            .id
+                            .as_ref()
+                            .is_some_and(|id| id.correlates_with(&RequestId::Number(77)))
+                    );
+                    assert!(elicited.error.is_none());
+                    assert_eq!(
+                        elicited
+                            .result
+                            .as_ref()
+                            .and_then(|value| value.get("action")),
+                        Some(&serde_json::json!("accept"))
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                RequestId::Number(2),
+                                async_modern_tools_list_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer completes tools/list after elicitation");
+                    let _ = server.recv(&peer_cx).await;
+                })
+                .expect("spawn modern elicitation reverse peer");
+            let handlers = ReverseRequestHandlers::new().with_modern_elicitation_create(
+                |_cx, _cancellation, params| {
+                    Box::pin(async move {
+                        assert_eq!(params.message(), "Choose a name");
+                        let mut content = std::collections::HashMap::new();
+                        content.insert(
+                            "name".to_owned(),
+                            fastmcp_protocol::ElicitContentValue::String("Ada".to_owned()),
+                        );
+                        Ok(ElicitResult::accept(content))
+                    })
+                },
+            );
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects with elicitation handler");
+            let listed = client
+                .list_tools(&cx, None)
+                .await
+                .expect("tools/list completes after modern elicitation is answered");
+            assert!(matches!(
+                listed,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            client
+                .close(&cx)
+                .await
+                .expect("close modern elicitation reverse client");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_modern_roots_reverse_request_is_answered_by_the_typed_handler() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives discovery")
+                    else {
+                        panic!("expected discovery request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends discovery result");
+                    let _ = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives modern tools/list");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "roots/list",
+                                Some(serde_json::json!({})),
+                                RequestId::Number(55),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends modern roots reverse request");
+                    let JsonRpcMessage::Response(roots) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives modern roots response")
+                    else {
+                        panic!("expected roots response");
+                    };
+                    assert!(
+                        roots
+                            .id
+                            .as_ref()
+                            .is_some_and(|id| id.correlates_with(&RequestId::Number(55)))
+                    );
+                    assert!(roots.error.is_none());
+                    assert_eq!(
+                        roots.result.as_ref().and_then(|value| value.get("roots")),
+                        Some(&serde_json::json!([{"uri":"file:///workspace"}]))
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                RequestId::Number(2),
+                                async_modern_tools_list_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer completes tools/list after roots/list");
+                    let _ = server.recv(&peer_cx).await;
+                })
+                .expect("spawn modern roots reverse peer");
+            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async move {
+                        Ok(FinalEmbeddedRootsListResult {
+                            roots: vec![fastmcp_protocol::Root::new("file:///workspace")],
+                        })
+                    })
+                },
+            );
+            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                handlers,
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("modern client connects with roots handler");
+            let listed = client
+                .list_tools(&cx, None)
+                .await
+                .expect("tools/list completes after modern roots/list is answered");
+            assert!(matches!(
+                listed,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            client
+                .close(&cx)
+                .await
+                .expect("close modern roots reverse client");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
     #[test]
     fn websocket_modern_connection_multiplexes_progress_cancellation_and_exact_result_source() {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -20093,6 +22345,99 @@ mod tests {
     #[test]
     fn cache_03_public_http_subscription_rejects_one_unacknowledged_change_field() {
         assert_http_subscription_cache_invalidation(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_public_http_incremental_listen_keeps_issuing_tools_list() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind incremental HTTP listener");
+        let address = listener
+            .local_addr()
+            .expect("read incremental HTTP listener address");
+        let modern_target = format!("http://{address}/mcp");
+        let discovery = modern_discovery_response(
+            "http-incremental-listen-modern-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let initial = http_tools_list_response(2, "cached", 1_000);
+        let refreshed = http_tools_list_response(4, "refreshed", 1_000);
+        let server = std::thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept HTTP discovery");
+            let _ = read_http_cache_test_request(&mut probe);
+            write_http_cache_test_response(&mut probe, "application/json", discovery.as_bytes());
+
+            let (mut first_list, _) = listener.accept().expect("accept initial tools/list");
+            let _ = read_http_cache_test_request(&mut first_list);
+            write_http_cache_test_response(&mut first_list, "application/json", &initial);
+
+            let (mut listen, _) = listener.accept().expect("accept subscriptions/listen");
+            let _ = read_http_cache_test_request(&mut listen);
+            let terminal = r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#;
+            let sse = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{{\"toolsListChanged\":true}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {terminal}\n\n"
+            );
+            write_http_cache_test_response(&mut listen, "text/event-stream", sse.as_bytes());
+
+            let (mut second_list, _) = listener
+                .accept()
+                .expect("incremental listen must not block a later tools/list");
+            let _ = read_http_cache_test_request(&mut second_list);
+            write_http_cache_test_response(&mut second_list, "application/json", &refreshed);
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(HttpClient::connect(
+            &cx,
+            http_cache_test_plan(&modern_target),
+            ClientInfo {
+                name: "http-incremental-listen-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("public HTTP client completes discovery");
+        let _ = http_test_runtime_block_on(client.request_final_core(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+        ))
+        .expect("initial public HTTP tools/list fills the cache");
+
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        let limits =
+            sse::SseLimits::new(1_024, 8_192, 16).expect("explicit SSE bounds are nonzero");
+        http_test_runtime_block_on(client.start_subscriptions_listener(&cx, filter, limits))
+            .expect("incremental HTTP listener commits without borrowing the cache");
+        assert!(matches!(
+            http_test_runtime_block_on(client.next_http_subscription_event(&cx))
+                .expect("incremental acknowledgement is accepted"),
+            Some(ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+        ));
+        assert!(matches!(
+            http_test_runtime_block_on(client.next_http_subscription_event(&cx))
+                .expect("incremental catalog event is accepted"),
+            Some(ModernHttpSubscriptionListenEvent::Notification(
+                ServerNotification::ToolsListChanged(None)
+            ))
+        ));
+        let refreshed_result = http_test_runtime_block_on(client.request_final_core(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+        ))
+        .expect("the same HTTP client must list tools while the listener is still installed");
+        assert!(
+            refreshed_result
+                .encode()
+                .expect("refreshed typed result re-encodes")
+                .contains("refreshed")
+        );
+        server
+            .join()
+            .expect("incremental HTTP subscription server must join");
     }
 
     #[cfg(unix)]
@@ -25532,6 +27877,14 @@ mod tests {
 
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
+    fn client_sse_is_the_standalone_exact_legacy_http_constructor() {
+        let _: fn(CanonicalHttpUrl, CanonicalHttpUrl) -> Result<HttpClient, HttpClientError> =
+            Client::sse;
+        let _ = Client::sse_with_cx;
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
     fn client_stdio_fails_for_nonexistent_command() {
         let result = Client::stdio("definitely-not-a-real-command-xyz", &[]);
         assert!(result.is_err());
@@ -26107,6 +28460,32 @@ mod tests {
              case \"$request\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
              case \"$request\" in *'\"toolsListChanged\":true'*) \
              printf '%s\\n' '{acknowledgement}'{stream_frames} ;; *) exit 1 ;; esac"
+        )
+    }
+
+    #[cfg(unix)]
+    fn modern_incremental_catalog_listener_with_tool_call_script() -> String {
+        let discovery_response = modern_discovery_response(
+            "incremental-catalog-listener-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*) ;; *) exit 1 ;; esac; \
+             case \"$first\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r listen || exit 1; \
+             case \"$listen\" in *subscriptions/listen*) ;; *) exit 1 ;; esac; \
+             case \"$listen\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) ;; *) exit 1 ;; esac; \
+             case \"$listen\" in *'\"toolsListChanged\":true'*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}},\"notifications\":{{\"toolsListChanged\":true}}}}}}' ;; *) exit 1 ;; esac; \
+             IFS= read -r call || exit 1; \
+             case \"$call\" in *tools/call*) ;; *) exit 1 ;; esac; \
+             case \"$call\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"hidden\"}}],\"isError\":false}}}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' ;; *) exit 1 ;; esac; \
+             exec sleep 2"
         )
     }
 
@@ -28346,6 +30725,240 @@ mod tests {
             FinalSubscriptionsListenResult {}
         ));
         client.close().expect("modern client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_catalog_listener_routes_acknowledgement_list_changed_and_terminal() {
+        let script = modern_subscriptions_listen_client_script(
+            2,
+            &[
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            ],
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the incremental catalog listener");
+        client
+            .open_subscriptions_listener(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect("the public incremental listener commits one selected-stdio subscription");
+
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(
+            client
+                .next_subscription_event(&cx, &cancellation)
+                .expect("public selected-stdio ingress routes the acknowledgement"),
+            StdioSubscriptionEvent::Acknowledged(ref filter)
+                if filter.tools_list_changed == Some(true)
+        ));
+        assert!(matches!(
+            client
+                .next_subscription_event(&cx, &cancellation)
+                .expect("public selected-stdio ingress routes the catalog event"),
+            StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(None))
+        ));
+        assert!(matches!(
+            client
+                .next_subscription_event(&cx, &cancellation)
+                .expect("public selected-stdio ingress routes the terminal response"),
+            StdioSubscriptionEvent::Terminal
+        ));
+        assert!(
+            client.live_catalog_subscription.is_none(),
+            "terminal completion releases only the completed live listener"
+        );
+        client
+            .close()
+            .expect("incremental catalog listener cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_catalog_listener_keeps_issuing_tools_call_on_the_same_client() {
+        let script = modern_incremental_catalog_listener_with_tool_call_script();
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the interleaved catalog listener");
+        client
+            .open_subscriptions_listener(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect("listen stays live while this client issues another request");
+
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(
+            client
+                .next_subscription_event(&cx, &cancellation)
+                .expect("acknowledgement arrives before the interleaved tools/call"),
+            StdioSubscriptionEvent::Acknowledged(_)
+        ));
+
+        let result = client
+            .call_tool_typed("hide_greet", serde_json::json!({}))
+            .expect("the same client must complete tools/call while listen is live");
+        assert!(matches!(
+            result,
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+        ));
+        assert!(matches!(
+            client
+                .next_subscription_event(&cx, &cancellation)
+                .expect("catalog events queued during tools/call stay request-owned"),
+            StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(None))
+        ));
+        assert!(matches!(
+            client
+                .next_subscription_event(&cx, &cancellation)
+                .expect("the listen terminal remains available after tools/call"),
+            StdioSubscriptionEvent::Terminal
+        ));
+        client
+            .close()
+            .expect("interleaved catalog listener cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_catalog_listener_rejects_event_before_acknowledgement() {
+        let discovery_response = modern_discovery_response(
+            "catalog-listener-before-ack-server",
+            &[MODERN_PROTOCOL_VERSION],
+        );
+        let script = format!(
+            "IFS= read -r first || exit 1; \
+             case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
+             printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
+             IFS= read -r request || exit 1; \
+             case \"$request\" in *subscriptions/listen*) \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}' \
+             ;; *) exit 1 ;; esac; \
+             exec sleep 2"
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the before-ack catalog listener");
+        client
+            .open_subscriptions_listener(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect("the live listener commits before the unacknowledged event arrives");
+
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let error = client
+            .next_subscription_event(&cx, &cancellation)
+            .err()
+            .expect("a catalog event before acknowledgement must fail closed");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Subscription listener received an event before acknowledgement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_catalog_listener_rejects_an_empty_filter() {
+        let script = modern_subscriptions_listen_client_script(2, &[]);
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the empty-filter catalog listener");
+        let error = client
+            .open_subscriptions_listener(SubscriptionFilter::default())
+            .expect_err("an empty filter must not commit a catalog listener");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(
+            error
+                .message
+                .contains("requires tools, resources, or prompts")
+        );
+        client
+            .close()
+            .expect("empty-filter catalog listener cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_catalog_listener_rejects_a_second_open_on_the_same_client() {
+        let script = modern_subscriptions_listen_client_script(
+            2,
+            &[
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+            ],
+        );
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", script.as_str()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            Cx::for_request(),
+        )
+        .expect("modern discovery initializes the exclusive catalog listener");
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        client
+            .open_subscriptions_listener(filter.clone())
+            .expect("the first live catalog listener commits");
+        let error = client
+            .open_subscriptions_listener(filter)
+            .expect_err("a second live catalog listener must not replace the first");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "A final catalog stdio subscription is already active on this client"
+        );
+        client.close().expect("exclusive catalog listener cleanup");
+    }
+
+    #[cfg(unix)]
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn live_catalog_listener_is_rejected_on_exact_legacy() {
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            "sh",
+            &["-c", legacy_public_client_script()],
+            ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly),
+            Cx::for_request(),
+        )
+        .expect("legacy-only initializes the exact client");
+
+        let error = client
+            .open_subscriptions_listener(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .expect_err("legacy has no final subscription listener contract");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        client.ping().expect(
+            "the rejected incremental listener leaves exact legacy request state unchanged",
+        );
+        client.close().expect("legacy client cleanup");
     }
 
     #[cfg(unix)]
