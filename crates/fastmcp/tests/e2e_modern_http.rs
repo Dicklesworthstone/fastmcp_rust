@@ -23,14 +23,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_rust::{
-    AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientHttpConnectionError,
-    ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content, CoreResult, Cx,
-    FinalCoreResult, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
-    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware,
-    MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler,
-    PromptMessage, ProtocolEra, ProtocolPolicy, ResourceHandler, Role, SseLimits,
-    StaticTokenVerifier, TokenAuthProvider, ToolHandler, auto, core, legacy_2024, modern, prompt,
-    resource, tool,
+    AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
+    ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
+    CoreResult, Cx, FinalCoreResult, FinalSamplingContextExt, FinalToolOutcome,
+    HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
+    JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware, MiddlewareDecision,
+    ModernHttpResponseKind, ModernHttpResponseStream, PromptHandler, PromptMessage, ProtocolEra,
+    ProtocolPolicy, ResourceHandler, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool,
+    ToolHandler, auto, core, legacy_2024, modern, prompt, resource, tool,
 };
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
@@ -2446,4 +2446,184 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
         json!({}),
         "the isolated legacy response must remain the ping acknowledgement: {legacy_document}"
     );
+}
+
+const PUBLIC_HTTP_SAMPLING_TOOL_NAME: &str = "public-http-e2e-sampling";
+
+/// Live modern HTTP tool that returns framework-issued MRTR sampling input.
+struct PublicHttpSamplingTool;
+
+impl ToolHandler for PublicHttpSamplingTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_SAMPLING_TOOL_NAME.to_owned(),
+            description: Some("Proves live facade HTTP final sampling input_required".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("exact legacy result")])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        let sampling = ctx.final_sampling(
+            "sample",
+            serde_json::from_value(json!({
+                "messages": [{
+                    "role": "assistant",
+                    "content": {
+                        "type": "tool_use",
+                        "id": "weather-request",
+                        "name": "weather",
+                        "input": {"city": "Boston"},
+                    },
+                }],
+                "maxTokens": 16,
+                "tools": [{
+                    "name": "weather",
+                    "inputSchema": {"type": "object"},
+                }],
+                "toolChoice": {"mode": "required"},
+            }))
+            .map_err(|error| McpError::internal_error(error.to_string()))?,
+        )?;
+        Ok(FinalToolOutcome::InputRequired(
+            sampling.into_input_required()?,
+        ))
+    }
+}
+
+/// Starts one ModernOnly facade whose only tool is live final sampling.
+fn spawn_modern_sampling_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("sampling HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-sampling", "1.0.0")
+                .tool(PublicHttpSamplingTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("sampling facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("sampling facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("sampling HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("sampling facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("sampling facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("sampling facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("sampling facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_call_tool_result_returns_live_sampling_input_required() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_sampling_http_server();
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.sampling = Some(Default::default());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-sampling-client", "1.0.0")
+            .capabilities(capabilities)
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the live sampling route");
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_result(&cx, PUBLIC_HTTP_SAMPLING_TOOL_NAME, json!({})),
+    )
+    .expect("live bind_http final sampling must return a typed tools/call result");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = result else {
+        panic!("live bind_http final sampling must keep input_required: {result:?}");
+    };
+    assert!(
+        result.request_state().is_some(),
+        "framework-issued sampling state must be returned"
+    );
+    assert!(
+        result
+            .input_requests()
+            .is_some_and(|requests| requests.get("sample").is_some()),
+        "live sampling input_required must retain its sample request"
+    );
+    server.shutdown();
 }
