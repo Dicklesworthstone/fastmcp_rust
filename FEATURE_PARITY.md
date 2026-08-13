@@ -208,7 +208,7 @@ edge nor a network capability while TASK-01/TASK-02 remain open.
 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
-| **Elicitation** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` plus stdio response routing exist. Modern WebSocket and modern HTTP answer typed `elicitation/create` reverse requests when a modern handler is installed. Modern server elicitation is MRTR `input_required` (`ctx.final_elicitation_form` / `final_elicitation_url`); public `call_tool` fulfills an installed elicitation handler locally. Custom-loop qualification remains open |
+| **Elicitation** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` plus stdio response routing exist. Modern WebSocket and modern HTTP answer typed `elicitation/create` reverse requests when a modern handler is installed. Modern server elicitation is MRTR `input_required` (`ctx.final_elicitation_form` / `final_elicitation_url`); live `bind_http` `read_resource_result` / `get_prompt_result` return that branch for form elicitation. Public `call_tool` fulfills an installed elicitation handler locally. Custom-loop qualification remains open |
 | **Roots** | ✅ | 🟡 | `TransportRootsProvider` exists. Modern WebSocket and modern HTTP answer typed `roots/list` reverse requests when a modern handler is installed. Modern server roots are MRTR `input_required`, not reverse JSON-RPC; public `call_tool` fulfills an installed roots handler locally |
 
 ### Bidirectional Communication Infrastructure
