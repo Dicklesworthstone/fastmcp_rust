@@ -857,9 +857,7 @@ impl ServerBuilder {
                 e.code
             );
         } else {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
         self
     }
@@ -867,16 +865,21 @@ impl ServerBuilder {
     /// Advertises the `resources.subscribe` capability so clients may
     /// subscribe to registered resource URIs.
     ///
-    /// Subscription admission still requires each subscribed URI to resolve
-    /// to a registered resource; this only turns on the capability that the
-    /// subscribe methods are gated behind.
+    /// Registering a resource or template already advertises subscribe because
+    /// session and exact-2024 dispatch serve `resources/subscribe` for those
+    /// URIs. This remains for servers that want the capability visible before
+    /// any catalog entry is installed.
     #[must_use]
     pub fn resource_subscriptions(mut self) -> Self {
+        self.advertise_legacy_resource_subscriptions();
+        self
+    }
+
+    fn advertise_legacy_resource_subscriptions(&mut self) {
         self.capabilities
             .resources
             .get_or_insert_with(ResourcesCapability::default)
             .subscribe = true;
-        self
     }
 
     /// Registers an intentionally exact MCP 2024-11-05-only resource.
@@ -892,9 +895,7 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
         self
     }
@@ -916,9 +917,7 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
         self
     }
@@ -936,9 +935,7 @@ impl ServerBuilder {
                 error.code
             );
         } else {
-            self.capabilities
-                .resources
-                .get_or_insert_with(ResourcesCapability::default);
+            self.advertise_legacy_resource_subscriptions();
         }
         self
     }
@@ -998,11 +995,13 @@ impl ServerBuilder {
 
     /// Registers a completion handler for exact MCP 2024-11-05 dispatch only.
     ///
-    /// The handler remains available to legacy `completion/complete`, but is
-    /// neither advertised nor reachable through a final connection.
+    /// Initialize advertises `capabilities.completions` so a 2024-11-05 client
+    /// can discover `completion/complete`. Final `server/discover` still omits
+    /// completions unless a modern handler is also installed.
     #[must_use]
     pub fn legacy_completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
         self.router.add_legacy_completion_handler(handler);
+        self.capabilities.completions = Some(fastmcp_protocol::CompletionsCapability::default());
         self
     }
 
@@ -3524,6 +3523,14 @@ mod tests {
             .resource(TestResource)
             .build();
         assert!(server.capabilities().resources.is_some());
+        assert!(
+            server
+                .capabilities()
+                .resources
+                .as_ref()
+                .is_some_and(|resources| resources.subscribe),
+            "registering a resource must advertise resources.subscribe so 2024 clients can find it"
+        );
         assert!(server.has_resources());
     }
 

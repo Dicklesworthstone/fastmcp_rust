@@ -24397,6 +24397,68 @@ mod lib_unit_tests {
         assert!(without.capabilities().completions.is_none());
     }
 
+    #[test]
+    fn legacy_completion_handler_is_advertised_on_initialize_only() {
+        let server = Server::new("legacy-advertise-completion", "1.0.0")
+            .legacy_completion_handler(LiveLegacyCompletionHandler)
+            .build();
+        assert!(server.capabilities().completions.is_some());
+        let mut session = Session::new(server.info.clone(), server.capabilities().clone());
+        let notification_sender: NotificationSender = Arc::new(|_| {});
+        let response = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                initialize_test_request(1, "client", Default::default()),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("initialize must respond");
+        assert_eq!(
+            response
+                .result
+                .as_ref()
+                .and_then(|result| result.pointer("/capabilities/completions")),
+            Some(&serde_json::json!({})),
+            "initialize must advertise completions when only the 2024 handler is installed"
+        );
+
+        let discovery = server
+            .server_discovery()
+            .expect("legacy-only completion server must still produce discovery");
+        let capabilities = serde_json::to_value(discovery.capabilities())
+            .expect("discovery capabilities serialize");
+        assert!(
+            capabilities.pointer("/completions").is_none(),
+            "legacy-only completion must not appear on final server/discover"
+        );
+
+        let mut session = initialized_test_session(&server);
+        let served = server
+            .dispatch_request(
+                &Cx::for_testing(),
+                &mut session,
+                JsonRpcRequest::new(
+                    "completion/complete",
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "deploy"},
+                        "argument": {"name": "environment", "value": "sta"},
+                    })),
+                    92_i64,
+                ),
+                &notification_sender,
+                &test_request_sender(),
+            )
+            .expect("session completion/complete must produce a JSON-RPC response");
+        let values = served
+            .result
+            .as_ref()
+            .and_then(|result| result.pointer("/completion/values"))
+            .cloned()
+            .expect("legacy-only completion must return values");
+        assert_eq!(values, serde_json::json!(["legacy:sta"]));
+    }
+
     #[cfg(feature = "tasks")]
     #[test]
     fn public_tasks_update_requires_an_id_before_the_extension_handler_can_mutate_state() {
