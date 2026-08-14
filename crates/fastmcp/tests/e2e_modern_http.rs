@@ -29,11 +29,11 @@ use fastmcp_rust::{
     ContentBlock, CoreResult, Cx, FinalCoreResult, FinalElicitationContextExt,
     FinalEmbeddedRootsListParams, FinalRootsContextExt, FinalSamplingContextExt, FinalToolOutcome,
     HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
-    JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware, MiddlewareDecision,
-    ModernHttpResponseKind, ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage,
-    ProtocolEra, ProtocolPolicy, Resource, ResourceContent, ResourceHandler, Role, SseLimits,
-    StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, core, legacy_2024, modern,
-    prompt, resource, tool,
+    JsonRpcRequest, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
+    Middleware, MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, Prompt,
+    PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy, Resource, ResourceContent,
+    ResourceHandler, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler,
+    auto, core, legacy_2024, modern, prompt, resource, tool,
 };
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
@@ -2922,5 +2922,177 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
         panic!("live bind_http prompt elicitation must keep input_required: {prompt:?}");
     };
     assert_live_input_required(&result, "approval", "prompts/get");
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_typed_verbs_honor_pre_send_cancellation() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_facade_http_server(false, None);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-pre-send-cancel", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects before pre-send cancellation");
+    runtime_block_on_bounded(&cx, client.ping(&cx))
+        .expect("live bind_http modern ping completes before local cancellation");
+    let cancellation = McpRequestCancellation::new();
+    cancellation.cancel();
+    let ping = runtime_block_on_bounded(&cx, client.ping_with_cancellation(&cx, &cancellation))
+        .expect_err("pre-send HTTP ping cancellation must reject locally");
+    assert!(matches!(
+        ping,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+
+    let list = runtime_block_on_bounded(
+        &cx,
+        client.list_tools_with_cancellation(&cx, &cancellation, None),
+    )
+    .expect_err("pre-send HTTP list_tools cancellation must reject locally");
+    assert!(matches!(
+        list,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+    let resources = runtime_block_on_bounded(
+        &cx,
+        client.list_resources_with_cancellation(&cx, &cancellation, None),
+    )
+    .expect_err("pre-send HTTP list_resources cancellation must reject locally");
+    assert!(matches!(
+        resources,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+    let templates = runtime_block_on_bounded(
+        &cx,
+        client.list_resource_templates_with_cancellation(&cx, &cancellation, None),
+    )
+    .expect_err("pre-send HTTP list_resource_templates cancellation must reject locally");
+    assert!(matches!(
+        templates,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+    let prompts = runtime_block_on_bounded(
+        &cx,
+        client.list_prompts_with_cancellation(&cx, &cancellation, None),
+    )
+    .expect_err("pre-send HTTP list_prompts cancellation must reject locally");
+    assert!(matches!(
+        prompts,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+
+    let call = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_cancellation(
+            &cx,
+            &cancellation,
+            PUBLIC_HTTP_TOOL_NAME,
+            json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+        ),
+    )
+    .expect_err("pre-send HTTP call_tool cancellation must reject locally");
+    assert!(matches!(
+        call,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+
+    let resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource_with_cancellation(&cx, &cancellation, PUBLIC_HTTP_RESOURCE_URI),
+    )
+    .expect_err("pre-send HTTP read_resource cancellation must reject locally");
+    assert!(matches!(
+        resource,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+
+    let prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt_with_cancellation(
+            &cx,
+            &cancellation,
+            PUBLIC_HTTP_PROMPT_NAME,
+            HashMap::from([("subject".to_owned(), PUBLIC_HTTP_TOOL_ARGUMENT.to_owned())]),
+        ),
+    )
+    .expect_err("pre-send HTTP get_prompt cancellation must reject locally");
+    assert!(matches!(
+        prompt,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+    let completion = runtime_block_on_bounded(
+        &cx,
+        client.complete_with_cancellation(
+            &cx,
+            &cancellation,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+                    title: "Public HTTP E2E Prompt".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                context: None,
+            },
+        ),
+    )
+    .expect_err("pre-send HTTP complete cancellation must reject locally");
+    assert!(matches!(
+        completion,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+
+    runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the same HTTP session remains usable after local cancellation");
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_set_log_level_stamps_request_metadata() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_facade_http_server(false, None);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-log-level", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects before logLevel configuration");
+    runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("JSON tools/list succeeds before request logLevel is configured");
+
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("modern HTTP set_log_level stores request metadata locally");
+    let info = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect_err("info logLevel requires owned SSE, so JSON tools/list must fail closed");
+    let info = info.to_string();
+    assert!(
+        info.contains("406") || info.to_ascii_lowercase().contains("not acceptable"),
+        "info logLevel must surface the SSE requirement: {info}"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Emergency)
+        .expect("emergency logLevel still stores request metadata locally");
+    runtime_block_on_bounded(&cx, client.list_tools(&cx, None)).expect(
+        "changing only the logLevel rank to emergency keeps JSON tools/list off the SSE path",
+    );
+    drop(client);
     server.shutdown();
 }

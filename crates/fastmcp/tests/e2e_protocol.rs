@@ -1649,16 +1649,112 @@ fn e2e_public_stdio_typed_verbs_honor_pre_send_cancellation() {
         .list_tools_with_cancellation(&cx, &cancellation, None)
         .expect_err("pre-send list_tools cancellation must reject locally");
     assert_eq!(list.code, McpErrorCode::RequestCancelled);
+    let resources = client
+        .list_resources_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_resources cancellation must reject locally");
+    assert_eq!(resources.code, McpErrorCode::RequestCancelled);
+    let templates = client
+        .list_resource_templates_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_resource_templates cancellation must reject locally");
+    assert_eq!(templates.code, McpErrorCode::RequestCancelled);
+    let prompts = client
+        .list_prompts_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_prompts cancellation must reject locally");
+    assert_eq!(prompts.code, McpErrorCode::RequestCancelled);
     let call = client
         .call_tool_with_cancellation(&cx, &cancellation, "echo", json!({"message": "hi"}))
         .expect_err("pre-send call_tool cancellation must reject locally");
     assert_eq!(call.code, McpErrorCode::RequestCancelled);
+    let resource = client
+        .read_resource_with_cancellation(&cx, &cancellation, "info://mrtr-resource")
+        .expect_err("pre-send read_resource cancellation must reject locally");
+    assert_eq!(resource.code, McpErrorCode::RequestCancelled);
+    let prompt = client
+        .get_prompt_with_cancellation(
+            &cx,
+            &cancellation,
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "terminal".to_owned())]),
+        )
+        .expect_err("pre-send get_prompt cancellation must reject locally");
+    assert_eq!(prompt.code, McpErrorCode::RequestCancelled);
+    let completion = client
+        .complete_with_cancellation(
+            &cx,
+            &cancellation,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: "greeting".to_owned(),
+                    title: "Greeting".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "co".to_owned(),
+                },
+                context: None,
+            },
+        )
+        .expect_err("pre-send complete cancellation must reject locally");
+    assert_eq!(completion.code, McpErrorCode::RequestCancelled);
+    let ping = client
+        .ping_with_cancellation(&cx, &cancellation)
+        .expect_err("pre-send ping cancellation must reject locally");
+    assert_eq!(ping.code, McpErrorCode::RequestCancelled);
+    client
+        .ping()
+        .expect("modern stdio ping remains usable after local cancellation");
     client
         .list_tools(None)
         .expect("the same stdio session remains usable after local cancellation");
     client
         .close()
         .expect("stdio pre-send cancellation client cleanup reaps the live subprocess");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_executor_execute_stamps_modern_meta() {
+    let mut client = connect_auto_stdio_to_shipped_echo_server("modern-only");
+    assert_eq!(
+        client.selected_protocol_era(),
+        Some(ProtocolEra::Modern2026)
+    );
+    let cx = Cx::for_request();
+    let executor = client
+        .multiplexed_stdio_executor()
+        .expect("a negotiated modern stdio session exposes the shared executor");
+    let mut listed = executor
+        .execute(&cx, "tools/list", Some(json!({})))
+        .expect("a cloned executor stamps modern _meta before tools/list");
+    let listed = client
+        .wait_multiplexed_request(&cx, &mut listed)
+        .expect("undecorated tools/list params are admitted after executor stamping");
+    assert!(
+        listed.error.is_none(),
+        "executor-stamped tools/list must not be an era refusal: {listed:?}"
+    );
+    assert_eq!(
+        listed
+            .result
+            .as_ref()
+            .and_then(|result| result.get("resultType")),
+        Some(&json!("complete"))
+    );
+
+    let refused = executor
+        .execute(&cx, "tools/list", Some(json!("not-an-object")))
+        .expect_err("modern execute rejects a non-object body before send");
+    assert_eq!(refused.code, McpErrorCode::InvalidParams);
+    assert!(
+        refused.message.contains("object parameters"),
+        "only the parameter shape is refused: {refused:?}"
+    );
+    client
+        .list_tools_typed(None)
+        .expect("the same stdio session remains usable after the local parameter refusal");
+    client
+        .close()
+        .expect("stdio executor-stamp client cleanup reaps the live subprocess");
 }
 
 #[cfg(unix)]
