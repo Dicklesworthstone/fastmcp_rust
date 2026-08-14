@@ -26,13 +26,14 @@ use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_rust::{
     AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
     ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
-    CoreResult, Cx, FinalCoreResult, FinalElicitationContextExt, FinalSamplingContextExt,
-    FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
-    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware,
-    MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, Prompt, PromptHandler,
-    PromptMessage, ProtocolEra, ProtocolPolicy, Resource, ResourceContent, ResourceHandler, Role,
-    SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, core, legacy_2024,
-    modern, prompt, resource, tool,
+    ContentBlock, CoreResult, Cx, FinalCoreResult, FinalElicitationContextExt,
+    FinalEmbeddedRootsListParams, FinalRootsContextExt, FinalSamplingContextExt, FinalToolOutcome,
+    HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
+    JsonRpcRequest, McpContext, McpError, McpErrorCode, McpResult, Middleware, MiddlewareDecision,
+    ModernHttpResponseKind, ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage,
+    ProtocolEra, ProtocolPolicy, Resource, ResourceContent, ResourceHandler, Role, SseLimits,
+    StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, core, legacy_2024, modern,
+    prompt, resource, tool,
 };
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
@@ -2451,6 +2452,8 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
 }
 
 const PUBLIC_HTTP_SAMPLING_TOOL_NAME: &str = "public-http-e2e-sampling";
+const PUBLIC_HTTP_ROOTS_TOOL_NAME: &str = "public-http-e2e-roots";
+const PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME: &str = "public-http-e2e-url-elicitation";
 const PUBLIC_HTTP_ELICITATION_RESOURCE_URI: &str = "test://public-http-e2e/elicitation";
 const PUBLIC_HTTP_ELICITATION_PROMPT_NAME: &str = "public-http-e2e-elicitation-prompt";
 
@@ -2507,6 +2510,86 @@ impl ToolHandler for PublicHttpSamplingTool {
         )?;
         Ok(FinalToolOutcome::InputRequired(
             sampling.into_input_required()?,
+        ))
+    }
+}
+
+/// Live modern HTTP tool that returns framework-issued MRTR roots input.
+struct PublicHttpRootsTool;
+
+impl ToolHandler for PublicHttpRootsTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_ROOTS_TOOL_NAME.to_owned(),
+            description: Some("Proves live facade HTTP final roots input_required".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("exact legacy result")])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        let roots = ctx.final_roots("roots", FinalEmbeddedRootsListParams::default())?;
+        Ok(FinalToolOutcome::InputRequired(
+            roots.into_input_required()?,
+        ))
+    }
+}
+
+/// Live modern HTTP tool that returns framework-issued MRTR URL elicitation.
+struct PublicHttpUrlElicitationTool;
+
+impl ToolHandler for PublicHttpUrlElicitationTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME.to_owned(),
+            description: Some(
+                "Proves live facade HTTP final URL elicitation input_required".to_owned(),
+            ),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("exact legacy result")])
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        let elicitation = ctx.final_elicitation_url(
+            "approval",
+            "Approve this operation",
+            "https://example.com/approve",
+        )?;
+        Ok(FinalToolOutcome::InputRequired(
+            elicitation.into_input_required()?,
         ))
     }
 }
@@ -2617,6 +2700,8 @@ fn spawn_modern_sampling_http_server() -> HttpServerFixture {
             }
             let server = modern::ServerBuilder::new("facade-http-sampling", "1.0.0")
                 .tool(PublicHttpSamplingTool)
+                .tool(PublicHttpRootsTool)
+                .tool(PublicHttpUrlElicitationTool)
                 .resource(PublicHttpElicitationResource)
                 .prompt(PublicHttpElicitationPrompt)
                 .build();
@@ -2706,8 +2791,9 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
     let server = spawn_modern_sampling_http_server();
     let mut capabilities = ClientCapabilities::default();
     capabilities.sampling = Some(Default::default());
-    capabilities.elicitation =
-        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+    capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+        .expect("form and url elicitation capabilities are valid");
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -2726,6 +2812,96 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
         panic!("live bind_http final sampling must keep input_required: {tool:?}");
     };
     assert_live_input_required(&result, "sample", "tools/call");
+
+    let roots = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_result(&cx, PUBLIC_HTTP_ROOTS_TOOL_NAME, json!({})),
+    )
+    .expect("live bind_http final roots must return a typed tools/call result");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = roots else {
+        panic!("live bind_http final roots must keep input_required: {roots:?}");
+    };
+    assert_live_input_required(&result, "roots", "tools/call");
+
+    let mut no_roots_capabilities = ClientCapabilities::default();
+    no_roots_capabilities.sampling = Some(Default::default());
+    no_roots_capabilities.elicitation =
+        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    let mut no_roots_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-mrtr-no-roots", "1.0.0")
+            .capabilities(no_roots_capabilities)
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects without advertising roots");
+    let missing_roots = runtime_block_on_bounded(
+        &cx,
+        no_roots_client.call_tool_result(&cx, PUBLIC_HTTP_ROOTS_TOOL_NAME, json!({})),
+    )
+    .expect("live bind_http ctx.final_roots must return a typed tools/call result");
+    let FinalCoreResult::ToolsCall { result, .. } = missing_roots else {
+        panic!("missing roots capability must fail closed as a tool error: {missing_roots:?}");
+    };
+    assert!(
+        result.payload.is_error,
+        "missing roots capability must fail closed: {result:?}"
+    );
+    assert!(
+        result.payload.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("not advertised by the client"),
+            _ => false,
+        }),
+        "missing roots capability must name the capability gate: {result:?}"
+    );
+
+    let url_elicitation = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_result(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
+    )
+    .expect("live bind_http final URL elicitation must return a typed tools/call result");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = url_elicitation else {
+        panic!(
+            "live bind_http final URL elicitation must keep input_required: {url_elicitation:?}"
+        );
+    };
+    assert_live_input_required(&result, "approval", "tools/call");
+
+    let mut no_url_capabilities = ClientCapabilities::default();
+    no_url_capabilities.sampling = Some(Default::default());
+    no_url_capabilities.roots =
+        serde_json::from_value(json!({})).expect("roots capability is valid");
+    no_url_capabilities.elicitation =
+        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    let mut no_url_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-mrtr-no-url", "1.0.0")
+            .capabilities(no_url_capabilities)
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects without advertising URL elicitation");
+    let missing_url = runtime_block_on_bounded(
+        &cx,
+        no_url_client.call_tool_result(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
+    )
+    .expect("live bind_http ctx.final_elicitation_url must return a typed tools/call result");
+    let FinalCoreResult::ToolsCall { result, .. } = missing_url else {
+        panic!(
+            "missing URL elicitation capability must fail closed as a tool error: {missing_url:?}"
+        );
+    };
+    assert!(
+        result.payload.is_error,
+        "missing URL elicitation capability must fail closed: {result:?}"
+    );
+    assert!(
+        result.payload.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("not advertised by the client"),
+            _ => false,
+        }),
+        "missing URL elicitation capability must name the capability gate: {result:?}"
+    );
 
     let resource = runtime_block_on_bounded(
         &cx,

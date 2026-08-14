@@ -1328,16 +1328,9 @@ fn selected_modern_stdio_raw_error(
     let mut request = client
         .start_multiplexed_request(&cx, method, Some(parameters))
         .expect("the selected modern public facade commits the negative MRTR request");
-    let response = client
+    client
         .wait_multiplexed_request(&cx, &mut request)
-        .expect("the selected modern public facade receives the negative MRTR response");
-    assert!(
-        response.result.is_none(),
-        "the rejected MRTR retry has no result"
-    );
-    response
-        .error
-        .expect("the rejected MRTR retry carries a JSON-RPC error")
+        .expect_err("the rejected MRTR retry surfaces as the public wait error")
         .message
 }
 
@@ -1553,6 +1546,142 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
         cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
         "the public close confirms bounded stdio child cleanup and reap"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_result_verbs_keep_live_input_required() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client observes live stdio input_required");
+    let pending_resource = client
+        .read_resource_result("info://mrtr-resource")
+        .expect("live stdio resources/read must keep a typed result");
+    let modern::FinalCoreResult::ResourcesReadInputRequired { result, .. } = pending_resource
+    else {
+        panic!("live stdio resources/read must keep input_required: {pending_resource:?}");
+    };
+    assert!(
+        result.request_state().is_some(),
+        "stdio resource MRTR must return framework-issued requestState"
+    );
+    assert!(
+        result
+            .input_requests()
+            .is_some_and(|requests| requests.get("roots").is_some()),
+        "stdio resource MRTR must retain its roots input request"
+    );
+    let pending_prompt = client
+        .get_prompt_result(
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "terminal".to_owned())]),
+        )
+        .expect("live stdio prompts/get must keep a typed result");
+    let modern::FinalCoreResult::PromptsGetInputRequired { result, .. } = pending_prompt else {
+        panic!("live stdio prompts/get must keep input_required: {pending_prompt:?}");
+    };
+    assert!(
+        result.request_state().is_some(),
+        "stdio prompt MRTR must return framework-issued requestState"
+    );
+    assert!(
+        result
+            .input_requests()
+            .is_some_and(|requests| requests.get("roots").is_some()),
+        "stdio prompt MRTR must retain its roots input request"
+    );
+    client
+        .close()
+        .expect("stdio result-verb client cleanup reaps the live subprocess");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_read_resource_and_get_prompt_follow_installed_roots_handler() {
+    let mut client = modern::client_builder()
+        .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+        .request_timeout_policy(
+            RequestTimeoutPolicy::new(
+                STDIO_COMPLETION_IDLE_TIMEOUT,
+                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+            )
+            .expect("the public follow timeout policy is valid"),
+        )
+        .modern_reverse_request_handlers(
+            modern::ReverseRequestHandlers::new().with_modern_roots_list(
+                |_cx, _cancellation, _params| {
+                    Box::pin(async { Ok(modern::FinalEmbeddedRootsListResult { roots: vec![] }) })
+                },
+            ),
+        )
+        .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request())
+        .expect("a ModernOnly facade client installs a roots handler before discovery");
+
+    let resource = client
+        .read_resource("info://mrtr-resource")
+        .expect("public stdio read_resource follows the installed roots handler");
+    assert_eq!(resource.ttl_ms, CacheTtl::milliseconds(7));
+    assert_eq!(resource.cache_scope, CacheScope::Private);
+
+    let prompt = client
+        .get_prompt(
+            "mrtr_prompt",
+            HashMap::from([("mode".to_owned(), "terminal".to_owned())]),
+        )
+        .expect("public stdio get_prompt follows the installed roots handler");
+    assert_eq!(
+        prompt.description.as_deref(),
+        Some("typed MRTR prompt result")
+    );
+    client
+        .close()
+        .expect("stdio follow-handler client cleanup reaps the live subprocess");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_typed_verbs_honor_pre_send_cancellation() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects before pre-send cancellation");
+    let cx = Cx::for_request();
+    let cancellation = fastmcp_rust::McpRequestCancellation::new();
+    cancellation.cancel();
+    let list = client
+        .list_tools_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_tools cancellation must reject locally");
+    assert_eq!(list.code, McpErrorCode::RequestCancelled);
+    let call = client
+        .call_tool_with_cancellation(&cx, &cancellation, "echo", json!({"message": "hi"}))
+        .expect_err("pre-send call_tool cancellation must reject locally");
+    assert_eq!(call.code, McpErrorCode::RequestCancelled);
+    client
+        .list_tools(None)
+        .expect("the same stdio session remains usable after local cancellation");
+    client
+        .close()
+        .expect("stdio pre-send cancellation client cleanup reaps the live subprocess");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_final_resource_keeps_authored_cache_ttl() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+    let resource = client
+        .read_resource_with_mrtr_retry("info://mrtr-resource", |_| {
+            Ok(std::collections::BTreeMap::from([(
+                "roots".to_owned(),
+                json!({"roots": []}),
+            )]))
+        })
+        .expect("the public modern facade resumes the shipped resource with typed roots");
+    let modern::FinalCoreResult::ResourcesRead { result, .. } = resource else {
+        panic!("the resumed resource returns the exact FinalReadResourceResult branch");
+    };
+    assert_eq!(result.payload.ttl_ms, CacheTtl::milliseconds(7));
+    assert_eq!(result.payload.cache_scope, CacheScope::Private);
+    client
+        .close()
+        .expect("stdio cache-ttl client cleanup reaps the live subprocess");
 }
 
 #[cfg(unix)]
@@ -1858,7 +1987,7 @@ fn e2e_public_stdio_modern_tasks_create_resume_cancel_and_reject_missing_capabil
         .call_tool("durable_task", json!({}))
         .expect("exact-2024 treats the task-capable tool as an ordinary legacy tool");
     assert!(matches!(
-        legacy_result.first(),
+        legacy_result.content.first(),
         Some(LegacyContent::Text { text, .. }) if text == "exact-2024 Tasks are unavailable"
     ));
     let legacy_cleanup_started = Instant::now();
@@ -1925,11 +2054,13 @@ fn e2e_public_legacy_stdio_roots_callback_reaches_context() {
     let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handlers = legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list({
         let callback_calls = Arc::clone(&callback_calls);
-        move |_cancellation, _params| {
+        move |_cx, _cancellation, _params| {
             callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(legacy_2024::ListRootsResult::new(vec![
-                legacy_2024::Root::with_name("file:///workspace", "workspace"),
-            ]))
+            Box::pin(async {
+                Ok(legacy_2024::ListRootsResult::new(vec![
+                    legacy_2024::Root::with_name("file:///workspace", "workspace"),
+                ]))
+            })
         }
     });
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
