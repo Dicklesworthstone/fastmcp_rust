@@ -41,6 +41,8 @@ fn echo(ctx: &McpContext, message: String) -> String {
     if ctx.is_cancelled() {
         return "Cancelled".to_string();
     }
+    ctx.report_progress(1.0, Some("echoed"));
+    ctx.info("echo-handler-info");
     message
 }
 

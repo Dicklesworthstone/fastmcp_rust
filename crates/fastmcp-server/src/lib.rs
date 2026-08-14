@@ -504,7 +504,8 @@ use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_core::logging::{debug, error, info, targets};
 use fastmcp_core::{
     AuthContext, ClientCapabilityInfo, McpContext, McpContextLeaseGuard, McpError, McpErrorCode,
-    McpRequestCancellation, McpResult, SessionState, Sha256Digest, block_on, sha256_bounded,
+    McpLogLevel, McpRequestCancellation, McpResult, SessionState, Sha256Digest, block_on,
+    sha256_bounded,
 };
 #[cfg(any(feature = "apps", feature = "tasks"))]
 use fastmcp_protocol::ExtensionDescriptorRegistry;
@@ -11247,6 +11248,18 @@ impl Server {
             Ok(None) => {}
             Err(error) => return response_for_error(error),
         }
+        if let Some(level) = self.final_request_log_level(&request) {
+            request_ctx =
+                request_ctx.with_min_log_level(Some(Self::mcp_log_level_from_final(level)));
+        }
+        {
+            let sender = notification_sender.clone();
+            request_ctx = request_ctx.with_log_sender(Arc::new(
+                crate::handler::LogNotificationSender::new(move |notification| {
+                    sender(notification);
+                }),
+            ));
+        }
         // The outer request owner retains the sole final-progress runtime.
         // Router/handler derivation sees this reporter and reuses it instead
         // of constructing a second sender, so the coalescing slot and
@@ -17764,6 +17777,19 @@ impl Server {
             LevelFilter::Info => Some(LoggingLevel::Info),
             LevelFilter::Warn => Some(LoggingLevel::Warning),
             LevelFilter::Error => Some(LoggingLevel::Error),
+        }
+    }
+
+    fn mcp_log_level_from_final(level: LoggingLevel) -> McpLogLevel {
+        match level {
+            LoggingLevel::Debug => McpLogLevel::Debug,
+            LoggingLevel::Info => McpLogLevel::Info,
+            LoggingLevel::Notice => McpLogLevel::Notice,
+            LoggingLevel::Warning => McpLogLevel::Warning,
+            LoggingLevel::Error => McpLogLevel::Error,
+            LoggingLevel::Critical => McpLogLevel::Critical,
+            LoggingLevel::Alert => McpLogLevel::Alert,
+            LoggingLevel::Emergency => McpLogLevel::Emergency,
         }
     }
 
