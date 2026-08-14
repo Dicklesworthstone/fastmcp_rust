@@ -815,8 +815,9 @@ pub mod auto {
     pub use fastmcp_client::{
         Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
-        ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession, HttpClient,
-        HttpClientError, HttpSubscriptionListener, Request, RequestExecution, RequestExecutor,
+        ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
+        CompletionContext, CompletionParams, CompletionReference, HttpClient, HttpClientError,
+        HttpSubscriptionListener, MrtrInputResponses, Request, RequestExecution, RequestExecutor,
         ReverseRequest, ReverseRequestCancellation, ReverseRequestHandlers, StdioRequestExecution,
         StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
         SubscriptionListenCollector,
@@ -927,7 +928,7 @@ pub mod auto {
         pub async fn complete(
             &mut self,
             cx: &Cx,
-            params: crate::FinalCompletionParams,
+            params: crate::CompletionParams,
         ) -> McpResult<CoreResult>
         where
             IO: Send + 'static,
@@ -966,7 +967,7 @@ pub mod auto {
             respond: F,
         ) -> McpResult<crate::FinalReadResourceResult>
         where
-            F: FnMut(&crate::InputRequiredResult) -> McpResult<crate::MrtrInputResponses>,
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<fastmcp_client::MrtrInputResponses>,
             IO: Send + 'static,
         {
             match self
@@ -994,7 +995,7 @@ pub mod auto {
             respond: F,
         ) -> McpResult<crate::FinalGetPromptResult>
         where
-            F: FnMut(&crate::InputRequiredResult) -> McpResult<crate::MrtrInputResponses>,
+            F: FnMut(&crate::InputRequiredResult) -> McpResult<fastmcp_client::MrtrInputResponses>,
             IO: Send + 'static,
         {
             match self
@@ -1528,6 +1529,45 @@ pub mod auto {
         pub fn prompt<H: crate::PromptHandler + 'static>(self, handler: H) -> Self {
             Self {
                 inner: self.inner.prompt(handler),
+            }
+        }
+
+        /// Mounts another Auto server's catalog into this builder.
+        ///
+        /// A nonempty prefix rewrites tool and prompt names as `{prefix}/{name}`.
+        /// Prefixed resource URIs are not absolute final URIs, so those entries
+        /// stay off the modern catalog. Pass `None` to keep resource URIs exact.
+        #[must_use]
+        pub fn mount(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only tools from another Auto server.
+        #[must_use]
+        pub fn mount_tools(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_tools(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only resources and templates from another Auto server.
+        ///
+        /// A nonempty prefix is not an absolute final URI, so those entries
+        /// stay off the modern catalog. Pass `None` to keep resource URIs exact.
+        #[must_use]
+        pub fn mount_resources(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_resources(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only prompts from another Auto server.
+        #[must_use]
+        pub fn mount_prompts(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_prompts(server.inner, prefix),
             }
         }
 
@@ -2478,6 +2518,31 @@ pub mod modern {
             }
         }
 
+        /// Completes a prompt or resource-template argument and admits
+        /// request-scoped `notifications/progress` for the supplied marker.
+        pub async fn complete_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            params: CompletionParams,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalCompletionResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .complete_with_progress_marker(cx, params, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final completion/complete result",
+                )),
+            }
+        }
+
         /// Sends `ping` on this modern WebSocket session.
         pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
         where
@@ -2769,6 +2834,57 @@ pub mod modern {
                 ) => Ok(result.payload),
                 _ => Err(McpError::internal_error(
                     "Modern WebSocket client received a non-final tools/call result",
+                )),
+            }
+        }
+
+        /// Reads one resource and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        pub async fn read_resource_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalReadResourceResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .read_resource_with_progress_marker(cx, uri, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/read result",
+                )),
+            }
+        }
+
+        /// Gets one prompt and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        pub async fn get_prompt_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalGetPromptResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .get_prompt_with_progress_marker(cx, name, arguments, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final prompts/get result",
                 )),
             }
         }
@@ -3262,6 +3378,47 @@ pub mod modern {
             }
         }
 
+        /// Reads one resource and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        pub fn read_resource_with_progress_marker(
+            &mut self,
+            uri: &str,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalReadResourceResult> {
+            match self
+                .inner
+                .read_resource_with_progress_marker(uri, progress_marker)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final resources/read result",
+                )),
+            }
+        }
+
+        /// Gets one prompt and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        pub fn get_prompt_with_progress_marker(
+            &mut self,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalGetPromptResult> {
+            match self
+                .inner
+                .get_prompt_with_progress_marker(name, arguments, progress_marker)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final prompts/get result",
+                )),
+            }
+        }
+
         /// Calls one tool under a request-local cancellation domain.
         ///
         /// A cancellation observed before send makes no transport contact.
@@ -3508,6 +3665,26 @@ pub mod modern {
         /// Completes a prompt or resource-template argument using final context.
         pub fn complete(&mut self, params: CompletionParams) -> McpResult<FinalCompletionResult> {
             match self.inner.complete(params)? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final completion/complete result",
+                )),
+            }
+        }
+
+        /// Completes a prompt or resource-template argument and admits
+        /// request-scoped `notifications/progress` for the supplied marker.
+        pub fn complete_with_progress_marker(
+            &mut self,
+            params: CompletionParams,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalCompletionResult> {
+            match self
+                .inner
+                .complete_with_progress_marker(params, progress_marker)?
+            {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::Completion { result, .. },
                 ) => Ok(result.payload),
@@ -3903,6 +4080,47 @@ pub mod modern {
                     fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
                 ) => Ok(result.payload),
                 _ => Err(unexpected_modern_http_result("tools/call")),
+            }
+        }
+
+        /// Reads one resource and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        pub async fn read_resource_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+            progress_marker: ProgressMarker,
+        ) -> Result<FinalReadResourceResult, HttpClientError> {
+            match self
+                .inner
+                .read_resource_with_progress_marker(cx, uri, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("resources/read")),
+            }
+        }
+
+        /// Gets one prompt and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        pub async fn get_prompt_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            progress_marker: ProgressMarker,
+        ) -> Result<FinalGetPromptResult, HttpClientError> {
+            match self
+                .inner
+                .get_prompt_with_progress_marker(cx, name, arguments, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("prompts/get")),
             }
         }
 
@@ -4350,6 +4568,26 @@ pub mod modern {
             match self
                 .inner
                 .request_final_core(cx, "completion/complete", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("completion/complete")),
+            }
+        }
+
+        /// Completes a prompt or resource-template argument and admits
+        /// request-scoped `notifications/progress` for the supplied marker.
+        pub async fn complete_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            params: CompletionParams,
+            progress_marker: ProgressMarker,
+        ) -> Result<FinalCompletionResult, HttpClientError> {
+            match self
+                .inner
+                .complete_with_progress_marker(cx, params, progress_marker)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4960,6 +5198,45 @@ pub mod modern {
         pub fn prompt<H: PromptHandler + 'static>(self, handler: H) -> Self {
             Self {
                 inner: self.inner.prompt(handler),
+            }
+        }
+
+        /// Mounts another modern-only server's catalog into this builder.
+        ///
+        /// A nonempty prefix rewrites tool and prompt names as `{prefix}/{name}`.
+        /// Prefixed resource URIs are not absolute final URIs, so those entries
+        /// stay off the modern catalog. Pass `None` to keep resource URIs exact.
+        #[must_use]
+        pub fn mount(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only tools from another modern-only server.
+        #[must_use]
+        pub fn mount_tools(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_tools(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only resources and templates from another modern-only server.
+        ///
+        /// A nonempty prefix is not an absolute final URI, so those entries
+        /// stay off the modern catalog. Pass `None` to keep resource URIs exact.
+        #[must_use]
+        pub fn mount_resources(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_resources(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only prompts from another modern-only server.
+        #[must_use]
+        pub fn mount_prompts(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_prompts(server.inner, prefix),
             }
         }
 
@@ -5725,6 +6002,41 @@ pub mod legacy_2024 {
         pub fn prompt<H: PromptHandler + 'static>(self, handler: H) -> Self {
             Self {
                 inner: self.inner.legacy_prompt(handler),
+            }
+        }
+
+        /// Mounts another exact-2024 server's catalog into this builder.
+        ///
+        /// A nonempty prefix rewrites tool, resource, and prompt names as
+        /// `{prefix}/{name}`. Pass `None` to keep the child's names exact.
+        #[must_use]
+        pub fn mount(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only tools from another exact-2024 server.
+        #[must_use]
+        pub fn mount_tools(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_tools(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only resources and templates from another exact-2024 server.
+        #[must_use]
+        pub fn mount_resources(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_resources(server.inner, prefix),
+            }
+        }
+
+        /// Mounts only prompts from another exact-2024 server.
+        #[must_use]
+        pub fn mount_prompts(self, server: Server, prefix: Option<&str>) -> Self {
+            Self {
+                inner: self.inner.mount_prompts(server.inner, prefix),
             }
         }
 
@@ -7376,7 +7688,7 @@ mod tests {
             let response = client
                 .complete(
                     &cx,
-                    super::FinalCompletionParams {
+                    super::CompletionParams {
                         reference: super::CompletionReference::Prompt {
                             name: "deploy".to_owned(),
                         },
@@ -8610,6 +8922,37 @@ mod tests {
                         modern::ProgressMarker::from("ws-progress"),
                     )
                     .await?;
+                let _ = client
+                    .read_resource_with_progress_marker(
+                        cx,
+                        "resource://example",
+                        modern::ProgressMarker::from("ws-resource-progress"),
+                    )
+                    .await?;
+                let _ = client
+                    .get_prompt_with_progress_marker(
+                        cx,
+                        "example",
+                        std::collections::HashMap::new(),
+                        modern::ProgressMarker::from("ws-prompt-progress"),
+                    )
+                    .await?;
+                let _ = client
+                    .complete_with_progress_marker(
+                        cx,
+                        modern::CompletionParams {
+                            reference: modern::CompletionReference::Prompt {
+                                name: "example".to_owned(),
+                            },
+                            argument: modern::FinalCompletionArgument {
+                                name: "arg".to_owned(),
+                                value: String::new(),
+                            },
+                            context: None,
+                        },
+                        modern::ProgressMarker::from("ws-complete-progress"),
+                    )
+                    .await?;
                 client
                     .call_tool_with_cancellation(cx, cancellation, "example", serde_json::json!({}))
                     .await
@@ -8629,6 +8972,25 @@ mod tests {
             modern::ProgressMarker,
         ) -> modern::McpResult<modern::FinalCallToolResult> =
             modern::Client::call_tool_with_progress_marker;
+        let _: fn(
+            &mut modern::Client,
+            &str,
+            modern::ProgressMarker,
+        ) -> modern::McpResult<modern::FinalReadResourceResult> =
+            modern::Client::read_resource_with_progress_marker;
+        let _: fn(
+            &mut modern::Client,
+            &str,
+            std::collections::HashMap<String, String>,
+            modern::ProgressMarker,
+        ) -> modern::McpResult<modern::FinalGetPromptResult> =
+            modern::Client::get_prompt_with_progress_marker;
+        let _: fn(
+            &mut modern::Client,
+            modern::CompletionParams,
+            modern::ProgressMarker,
+        ) -> modern::McpResult<modern::FinalCompletionResult> =
+            modern::Client::complete_with_progress_marker;
         let _: fn(&mut modern::Client) -> Vec<modern::FinalProgressNotificationParams> =
             modern::Client::take_progress_notifications;
         let _: fn(&mut modern::Client) -> Vec<modern::ServerNotification> =
@@ -8856,6 +9218,10 @@ mod tests {
             modern::HttpClient::take_server_notifications;
         let _: fn(&mut modern::HttpClient) -> Vec<modern::FinalProgressNotificationParams> =
             modern::HttpClient::take_progress_notifications;
+        let _ = modern::HttpClient::call_tool_with_progress_marker;
+        let _ = modern::HttpClient::read_resource_with_progress_marker;
+        let _ = modern::HttpClient::get_prompt_with_progress_marker;
+        let _ = modern::HttpClient::complete_with_progress_marker;
         let _ = modern::HttpClient::connect;
         let _ = bind_modern_http;
         let _ = serve_modern_http;

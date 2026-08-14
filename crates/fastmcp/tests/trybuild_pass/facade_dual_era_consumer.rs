@@ -223,6 +223,42 @@ fn assert_modern_server_builder_forwarders() {
         modern::ServerBuilder::final_tasks;
     let _: fn(modern::ServerBuilder, DownstreamCompletionHandler) -> modern::ServerBuilder =
         modern::ServerBuilder::completion_handler::<DownstreamCompletionHandler>;
+    let _: fn(modern::ServerBuilder, modern::Server, Option<&str>) -> modern::ServerBuilder =
+        modern::ServerBuilder::mount;
+    let _: fn(modern::ServerBuilder, modern::Server, Option<&str>) -> modern::ServerBuilder =
+        modern::ServerBuilder::mount_tools;
+    let _: fn(modern::ServerBuilder, modern::Server, Option<&str>) -> modern::ServerBuilder =
+        modern::ServerBuilder::mount_resources;
+    let _: fn(modern::ServerBuilder, modern::Server, Option<&str>) -> modern::ServerBuilder =
+        modern::ServerBuilder::mount_prompts;
+    let _: fn(auto::ServerBuilder, auto::Server, Option<&str>) -> auto::ServerBuilder =
+        auto::ServerBuilder::mount;
+    let _: fn(auto::ServerBuilder, auto::Server, Option<&str>) -> auto::ServerBuilder =
+        auto::ServerBuilder::mount_tools;
+    let _: fn(auto::ServerBuilder, auto::Server, Option<&str>) -> auto::ServerBuilder =
+        auto::ServerBuilder::mount_resources;
+    let _: fn(auto::ServerBuilder, auto::Server, Option<&str>) -> auto::ServerBuilder =
+        auto::ServerBuilder::mount_prompts;
+    let _: fn(
+        legacy_2024::ServerBuilder,
+        legacy_2024::Server,
+        Option<&str>,
+    ) -> legacy_2024::ServerBuilder = legacy_2024::ServerBuilder::mount;
+    let _: fn(
+        legacy_2024::ServerBuilder,
+        legacy_2024::Server,
+        Option<&str>,
+    ) -> legacy_2024::ServerBuilder = legacy_2024::ServerBuilder::mount_tools;
+    let _: fn(
+        legacy_2024::ServerBuilder,
+        legacy_2024::Server,
+        Option<&str>,
+    ) -> legacy_2024::ServerBuilder = legacy_2024::ServerBuilder::mount_resources;
+    let _: fn(
+        legacy_2024::ServerBuilder,
+        legacy_2024::Server,
+        Option<&str>,
+    ) -> legacy_2024::ServerBuilder = legacy_2024::ServerBuilder::mount_prompts;
 }
 
 fn assert_modern_server_final_task_forwarders(
@@ -714,6 +750,9 @@ fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::take_server_notifications;
     let _ = modern::HttpClient::take_progress_notifications;
     let _ = modern::HttpClient::call_tool_with_progress_marker;
+    let _ = modern::HttpClient::read_resource_with_progress_marker;
+    let _ = modern::HttpClient::get_prompt_with_progress_marker;
+    let _ = modern::HttpClient::complete_with_progress_marker;
     let _ = modern::HttpClient::list_tools_with_cancellation;
     let _ = modern::HttpClient::list_resources_with_cancellation;
     let _ = modern::HttpClient::list_resource_templates_with_cancellation;
@@ -800,6 +839,9 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
         modern::Client::read_resource;
     let _ = modern::Client::call_tool_result;
     let _ = modern::Client::call_tool_with_progress_marker;
+    let _ = modern::Client::read_resource_with_progress_marker;
+    let _ = modern::Client::get_prompt_with_progress_marker;
+    let _ = modern::Client::complete_with_progress_marker;
     let _ = modern::Client::read_resource_result;
     let _ = modern::Client::get_prompt_result;
     let _ = modern::Client::ping;
