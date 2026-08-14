@@ -111,7 +111,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | **Tags for filtering** | ✅ | ✅ | `include_tags`/`exclude_tags` in router.rs |
 | **Icons support** | ✅ | ✅ | Icon metadata in types.rs, handler.rs |
 | **Error masking** | ✅ | ✅ | `mask_error_details` in builder.rs. Live `bind_http` `mask_error_details(true)` replaces a resource `ToolExecutionError` secret with `Internal server error`; changing only that flag to `false` keeps the secret |
-| **Strict input validation** | ✅ | ✅ | `strict_input_validation` in router.rs |
+| **Strict input validation** | ✅ | ✅ | `strict_input_validation` in router.rs. Live `bind_http` with the flag on refuses a `tools/call` that adds only an unknown property and still admits the declared arguments; changing only that flag to `false` admits the same extra property. Modern final dispatch now honors the flag the same way legacy dispatch already did |
 | **Duplicate handling** | ✅ | ✅ | `on_duplicate` in builder.rs |
 | **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete`. Live `bind_http` `as_proxy_typed("ext", …)` prefixes tools/prompts as `ext/...`, keeps exact-final resource URIs and RFC 6570 templates unprefixed, and forwards `tools/call`, `prompts/get`, `resources/read` (including a matched template URI and a live FilesystemProvider file URI), and `completion/complete`. A near-identical unmatched template path stays `InvalidParams` before the upstream handler. Prefixed `as_proxy_typed` installs the same route-bound official Tasks relay as `proxy_typed` (complete-only tools stay unwrapped; `tasks/*` forwards) instead of the disconnected default in-memory store. Live official Tasks through that relay: `tasks/get` of an upstream-created Task, `tasks/update` of its `input_required` snapshot (a near-identical wrong-kind roots payload is refused and leaves the Task in place), and `tasks/cancel` of the resumed Task. A near-identical missing id stays an error for `tasks/get` and `tasks/cancel`. Live `as_proxy("ext", stdio Client)` against the shipped echo server binds HTTP, prefixes tools/prompts as `ext/echo` and `ext/greeting`, forwards `tools/call`, `prompts/get`, `completion/complete` of `ext/greeting` (rewritten to upstream `greeting`), and `resources/read` of unprefixed `info://server`, and refuses the unprefixed tool/prompt/completion names. Live `ext/hide_echo` forwards the session-local disable: the gateway snapshot still lists `ext/echo`, a later `ext/echo` is a `Method not found` tool error, and `ext/add` still returns `5`. Live `ext/show_echo` restores that same prefixed echo tool. Live `ext/hide_catalog` keeps the gateway snapshot, leaves a warmed HTTP client's cached `info://server` read in place, refuses a later uncached `info://server` read and `ext/greeting` get, and live `ext/show_catalog` restores a later uncached read and the prefixed greeting get. Live official Tasks on that same stdio client: `tasks/get` of its `input_required` snapshot, `tasks/update` with matching roots, and `tasks/cancel` of the resumed Task; a near-identical missing id stays an error. Live `ProxyClient::start_catalog_listener` against a modern `bind_http` upstream retains `notifications/tools/list_changed` after a forwarded hide tool. `as_proxy_typed` keeps the live ModernHttp binding |
 | **mount() composition** | ✅ | ✅ | Implemented in builder.rs, router.rs. Public Auto/modern facades `mount()` prefix tools/prompts and keep exact resource URIs so they stay on the modern catalog. Live `bind_http` `mount(child, Some("child"))` lists `child/...` tools/prompts and reads the original resource URI. Live `mount()` of a FilesystemProvider child keeps `file:///{prefix}/{+path}` exact, expands a matching file URI, and refuses an unmatched prefix before the child handler. Legacy `mount()` still prefixes every key. `mount_tools` / `mount_resources` / `mount_prompts` remain available |
@@ -327,9 +327,9 @@ The following bidirectional building blocks exist in source. This inventory does
 | **ProxyToolManager** | ✅ | ✅ | Tool proxying |
 | **ProxyResourceManager** | ✅ | ✅ | Resource proxying |
 | **ProxyPromptManager** | ✅ | ✅ | Prompt proxying |
-| **Tool Transformations** | ✅ | ✅ | `transform.rs` - Dynamic schema modification |
-| **TransformedTool** | ✅ | ✅ | Dynamic tool modification |
-| **ArgTransform** | ✅ | ✅ | Argument transformation rules |
+| **Tool Transformations** | ✅ | ✅ | `transform.rs` - Dynamic schema modification. Live `bind_http` `TransformedTool::from_tool` renames the catalog name and argument, rewrites `query` back to the parent handler, hides `value` and injects the configured default, and keeps the parent tool name unknown |
+| **TransformedTool** | ✅ | ✅ | Dynamic tool modification. Live `bind_http` rename and hide-arg proofs above |
+| **ArgTransform** | ✅ | ✅ | Argument transformation rules. Live `bind_http` `rename_arg` and `hide_arg` reach the parent handler |
 
 ### Historical provider gap-closure inventory
 
@@ -418,7 +418,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 10. ✅ **Per-handler timeout** - Handler-level configuration exists and both modern and exact-2024 session dispatch now enforce it through `run_handler_in_request`. Live `bind_http` refuses a late tool and still admits a fast peer; panic-boundary hardening remains unit-proven
 11. ✅ **Output schema** - Tool output schema support (macros, handler.rs)
 12. ✅ **Tool annotations** - MCP tool annotations (types.rs, handler.rs)
-13. ✅ **Strict validation** - strict_input_validation setting (router.rs, builder.rs)
+13. ✅ **Strict validation** - `strict_input_validation` setting. Live `bind_http` refuses an unknown property when the flag is on and admits the same extra property when it is off; modern final `tools/call` now consults the flag
 14. ✅ **Duplicate handling** - on_duplicate behavior (builder.rs)
 
 ---
