@@ -2703,6 +2703,14 @@ impl McpContext {
         self.request_scope_is_active() && self.state.is_some()
     }
 
+    /// Returns whether attached session state is request-local, not durable.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn session_is_ephemeral(&self) -> bool {
+        self.request_scope_is_active()
+            && self.state.as_ref().is_some_and(SessionState::is_ephemeral)
+    }
+
     /// Returns the session state attached to this context, if any.
     ///
     /// Final dispatch uses this shared bag so a later inbound on the same
@@ -2802,6 +2810,18 @@ impl McpContext {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(&cache_id)
+    }
+
+    /// Returns whether any response-cache middleware served this request.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn response_was_served_from_cache(&self) -> bool {
+        self.request_scope_is_active()
+            && !self
+                .response_cache_hits
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
     }
 
     // ========================================================================

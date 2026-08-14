@@ -34,6 +34,10 @@ pub struct SessionState {
     local: Option<Arc<Mutex<HashMap<String, serde_json::Value>>>>,
     cache_partition: Option<[u8; CACHE_PARTITION_BYTES]>,
     revision: Arc<AtomicU64>,
+    /// Request-local modern HTTP state is not a durable client session.
+    /// Response caching must treat it as the stateless partition; otherwise
+    /// every POST mints a unique identity and the cache never hits.
+    ephemeral: bool,
 }
 
 impl Default for SessionState {
@@ -60,6 +64,7 @@ impl fmt::Debug for SessionState {
             .field("shared_entry_count", &shared_entries)
             .field("has_local_overrides", &self.local.is_some())
             .field("local_entry_count", &local_entries)
+            .field("ephemeral", &self.ephemeral)
             .finish()
     }
 }
@@ -84,6 +89,7 @@ impl SessionState {
             local: None,
             cache_partition,
             revision: Arc::new(AtomicU64::new(0)),
+            ephemeral: false,
         }
     }
 
@@ -99,6 +105,25 @@ impl SessionState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates request-local session state that is not a durable client session.
+    ///
+    /// Modern Streamable HTTP opens a fresh bag on every POST so
+    /// `disable_*` / `enable_*` can publish `list_changed` without inventing
+    /// `Mcp-Session-Id`. Response caching must not treat that bag as a
+    /// partition identity.
+    #[must_use]
+    pub fn ephemeral() -> Self {
+        let mut state = Self::default();
+        state.ephemeral = true;
+        state
+    }
+
+    /// Returns whether this bag is request-local rather than a durable session.
+    #[must_use]
+    pub const fn is_ephemeral(&self) -> bool {
+        self.ephemeral
     }
 
     /// Returns a view with request-local overrides layered on top of the
@@ -117,6 +142,7 @@ impl SessionState {
             ),
             cache_partition: self.cache_partition,
             revision: Arc::clone(&self.revision),
+            ephemeral: self.ephemeral,
         }
     }
 
@@ -140,7 +166,9 @@ impl SessionState {
                     .clone(),
             );
         }
-        Self::from_map(snapshot)
+        let mut snapshot = Self::from_map(snapshot);
+        snapshot.ephemeral = self.ephemeral;
+        snapshot
     }
 
     /// Gets a value from session state by key.
@@ -564,6 +592,16 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_session_state_stays_request_local_across_clone_and_snapshot() {
+        let state = SessionState::ephemeral();
+        assert!(state.is_ephemeral());
+        assert!(state.clone().is_ephemeral());
+        assert!(state.with_local_overrides().is_ephemeral());
+        assert!(state.snapshot().is_ephemeral());
+        assert!(!SessionState::new().is_ephemeral());
+    }
+
+    #[test]
     fn cache_partition_is_clone_stable_and_mutation_versioned() {
         let state = SessionState::new();
         let initial = state
@@ -709,6 +747,7 @@ mod tests {
         assert!(debug.contains("shared_entry_count: 1"));
         assert!(debug.contains("has_local_overrides: true"));
         assert!(debug.contains("local_entry_count: 1"));
+        assert!(debug.contains("ephemeral: false"));
         for canary in [
             SECRET_KEY,
             SECRET_VALUE,
