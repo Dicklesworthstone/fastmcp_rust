@@ -504,8 +504,8 @@ use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_core::logging::{debug, error, info, targets};
 use fastmcp_core::{
     AuthContext, ClientCapabilityInfo, McpContext, McpContextLeaseGuard, McpError, McpErrorCode,
-    McpLogLevel, McpRequestCancellation, McpResult, SessionState, Sha256Digest, block_on,
-    sha256_bounded,
+    McpLogLevel, McpRequestCancellation, McpResult, ServerCapabilityInfo, SessionState,
+    Sha256Digest, block_on, sha256_bounded,
 };
 #[cfg(any(feature = "apps", feature = "tasks"))]
 use fastmcp_protocol::ExtensionDescriptorRegistry;
@@ -10968,7 +10968,8 @@ impl Server {
                 .with_request_cancellation(cancellation.clone()),
             None => inbound.request_context(),
         };
-        let request_ctx = self.with_final_catalog_publisher(request_ctx);
+        let request_ctx = self
+            .attach_request_scoped_component_access(self.with_final_catalog_publisher(request_ctx));
         let budget = self.create_request_budget(request_ctx.cx());
         if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
             if let Some(stats) = &self.stats {
@@ -11222,10 +11223,12 @@ impl Server {
                 "Inbound request identity does not match the JSON-RPC request id",
             ));
         }
-        let request_ctx = self.with_final_catalog_publisher(
-            inbound
-                .request_context()
-                .with_request_cancellation(request_cancellation.clone()),
+        let request_ctx = self.attach_request_scoped_component_access(
+            self.with_final_catalog_publisher(
+                inbound
+                    .request_context()
+                    .with_request_cancellation(request_cancellation.clone()),
+            ),
         );
         let budget = self.create_request_budget(request_ctx.cx());
         if let Some(error) = Self::request_budget_error(request_ctx.cx(), budget) {
@@ -16438,23 +16441,56 @@ impl Server {
         request_cancellation: McpRequestCancellation,
         budget: Budget,
     ) -> McpResult<(McpContext, McpContextLeaseGuard)> {
-        let tool_caller = Arc::new(RouterToolCaller::request_scoped(
-            Arc::downgrade(&self.router),
-            state.clone(),
-        ));
-        let resource_reader = Arc::new(RouterResourceReader::request_scoped(
-            Arc::downgrade(&self.router),
-            state.clone(),
-        ));
-
         let ctx = McpContext::with_state(cx.clone(), request_id, state)
             .with_request_cancellation(request_cancellation)
-            .with_budget_ceiling(budget)
-            .with_tool_caller(tool_caller)
-            .with_resource_reader(resource_reader);
-        self.with_final_catalog_publisher(ctx)
+            .with_budget_ceiling(budget);
+        self.attach_request_scoped_component_access(self.with_final_catalog_publisher(ctx))
             .begin_request_scope()
             .ok_or_else(|| McpError::internal_error("request scope could not be established"))
+    }
+
+    /// Attaches request-scoped nested tool/resource access to one context.
+    ///
+    /// Modern HTTP dispatch used to build the inbound context without these
+    /// callers, so `ctx.call_tool` / `ctx.read_resource` failed as a masked
+    /// internal error even after the nested router path awaited instead of
+    /// `block_on`.
+    fn attach_request_scoped_component_access(&self, ctx: McpContext) -> McpContext {
+        let state = ctx
+            .session_state()
+            .cloned()
+            .unwrap_or_else(SessionState::ephemeral);
+        // Hold a strong router for the request. Weak upgrade failing mid-call
+        // would look like cancellation; a shared clone cannot miss the router
+        // while this Server (and therefore this request) is still live.
+        ctx.with_tool_caller(Arc::new(RouterToolCaller::new(
+            Arc::clone(&self.router),
+            state.clone(),
+        )))
+        .with_resource_reader(Arc::new(RouterResourceReader::new(
+            Arc::clone(&self.router),
+            state,
+        )))
+        .with_server_capabilities(self.handler_visible_server_capabilities())
+    }
+
+    /// Handler-visible slice of the advertised server capability document.
+    fn handler_visible_server_capabilities(&self) -> ServerCapabilityInfo {
+        let advertised = &self.capabilities;
+        let mut info = ServerCapabilityInfo::new();
+        if advertised.tools.is_some() {
+            info = info.with_tools();
+        }
+        if let Some(resources) = advertised.resources.as_ref() {
+            info = info.with_resources(resources.subscribe);
+        }
+        if advertised.prompts.is_some() {
+            info = info.with_prompts();
+        }
+        if advertised.logging.is_some() {
+            info = info.with_logging();
+        }
+        info
     }
 
     fn with_final_catalog_publisher(&self, ctx: McpContext) -> McpContext {
