@@ -4753,6 +4753,8 @@ where
     next_id: u64,
     closed: bool,
     close_settled: bool,
+    /// Modern request-only `io.modelcontextprotocol/logLevel`.
+    final_log_level: Option<LoggingLevel>,
 }
 
 #[cfg(feature = "websocket-experimental")]
@@ -4979,6 +4981,7 @@ where
             next_id: 2,
             closed: false,
             close_settled: false,
+            final_log_level: None,
         })
     }
 
@@ -5484,6 +5487,40 @@ where
         }
     }
 
+    /// Completes one prompt or resource-template argument under a caller-owned
+    /// cancellation domain.
+    pub async fn complete_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: CompletionParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        let parameters = match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => serde_json::to_value(params).map_err(|_| {
+                McpError::invalid_params(
+                    "Modern WebSocket completion parameters could not serialize",
+                )
+            })?,
+            ProtocolEra::Legacy2024 => {
+                serde_json::to_value(params.into_legacy()?).map_err(|_| {
+                    McpError::invalid_params(
+                        "Exact legacy WebSocket completion parameters could not serialize",
+                    )
+                })?
+            }
+        };
+        self.request_core_verb_with_cancellation(
+            cx,
+            cancellation,
+            "completion/complete",
+            parameters,
+        )
+        .await
+    }
+
     async fn request_core_verb(
         &mut self,
         cx: &Cx,
@@ -5513,6 +5550,90 @@ where
     {
         self.request_core_verb(cx, "tools/list", Self::websocket_list_parameters(cursor))
             .await
+    }
+
+    /// Sends `ping` through the negotiated WebSocket era.
+    pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        self.ping_with_optional_cancellation(cx, None).await
+    }
+
+    /// Sends `ping` under a caller-owned cancellation domain.
+    pub async fn ping_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        self.ping_with_optional_cancellation(cx, Some(cancellation))
+            .await
+    }
+
+    async fn ping_with_optional_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
+            return Err(McpError::request_cancelled());
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        let parameters = if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            self.with_modern_request_metadata(serde_json::json!({}))?
+        } else {
+            serde_json::json!({})
+        };
+        let request_id = self.allocate_request_id()?;
+        let received = self
+            .request_admitted_with_raw_result(
+                cx,
+                JsonRpcRequest::new("ping", Some(parameters), request_id),
+                cancellation,
+            )
+            .await?;
+        if let Some(error) = received.response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        Ok(())
+    }
+
+    /// Configures the selected protocol era's log level behavior.
+    ///
+    /// A modern session stores the complete RFC 5424 level and adds it as
+    /// `io.modelcontextprotocol/logLevel` metadata to every later request. It
+    /// never sends `logging/setLevel`.
+    pub fn set_log_level_typed(&mut self, level: LoggingLevel) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => {
+                self.final_log_level = Some(level);
+                Ok(())
+            }
+            ProtocolEra::Legacy2024 => Err(McpError::invalid_params(
+                "modern request logLevel metadata is only for MCP 2026-07-28",
+            )),
+        }
+    }
+
+    /// Configures one of the RFC 5424 severities supported by both protocol eras.
+    pub fn set_log_level(&mut self, level: LogLevel) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        self.set_log_level_typed(final_log_level(level))
     }
 
     /// Lists one page of resources through the negotiated WebSocket era.
@@ -5554,6 +5675,25 @@ where
             .await
     }
 
+    fn websocket_prompt_parameters(
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<serde_json::Value> {
+        let mut parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            let object = parameters.as_object_mut().ok_or_else(|| {
+                McpError::internal_error("WebSocket prompt parameters must remain an object")
+            })?;
+            object.insert(
+                "arguments".to_owned(),
+                serde_json::to_value(arguments).map_err(|_| {
+                    McpError::internal_error("WebSocket prompt arguments could not serialize")
+                })?,
+            );
+        }
+        Ok(parameters)
+    }
+
     /// Reads one resource through the negotiated WebSocket era.
     ///
     /// Installed modern reverse handlers fulfill `input_required` the same way
@@ -5565,6 +5705,29 @@ where
         self.follow_installed_mrtr(
             cx,
             None,
+            "resources/read",
+            serde_json::json!({ "uri": uri }),
+        )
+        .await
+    }
+
+    /// Reads one resource under a caller-owned cancellation domain.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`]. Cancellation is checked on every WebSocket
+    /// round.
+    pub async fn read_resource_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        uri: &str,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.follow_installed_mrtr(
+            cx,
+            Some(cancellation),
             "resources/read",
             serde_json::json!({ "uri": uri }),
         )
@@ -5584,20 +5747,37 @@ where
     where
         IO: Send + 'static,
     {
-        let mut parameters = serde_json::json!({ "name": name });
-        if !arguments.is_empty() {
-            let object = parameters.as_object_mut().ok_or_else(|| {
-                McpError::internal_error("WebSocket prompt parameters must remain an object")
-            })?;
-            object.insert(
-                "arguments".to_owned(),
-                serde_json::to_value(arguments).map_err(|_| {
-                    McpError::internal_error("WebSocket prompt arguments could not serialize")
-                })?,
-            );
-        }
-        self.follow_installed_mrtr(cx, None, "prompts/get", parameters)
-            .await
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "prompts/get",
+            Self::websocket_prompt_parameters(name, arguments)?,
+        )
+        .await
+    }
+
+    /// Gets one prompt under a caller-owned cancellation domain.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`]. Cancellation is checked on every WebSocket
+    /// round.
+    pub async fn get_prompt_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.follow_installed_mrtr(
+            cx,
+            Some(cancellation),
+            "prompts/get",
+            Self::websocket_prompt_parameters(name, arguments)?,
+        )
+        .await
     }
 
     /// Calls one tool through the negotiated WebSocket era.
@@ -5688,6 +5868,64 @@ where
             cx,
             cancellation,
             "tools/list",
+            Self::websocket_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of resources under a caller-owned cancellation domain.
+    pub async fn list_resources_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb_with_cancellation(
+            cx,
+            cancellation,
+            "resources/list",
+            Self::websocket_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of resource templates under a caller-owned cancellation
+    /// domain.
+    pub async fn list_resource_templates_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb_with_cancellation(
+            cx,
+            cancellation,
+            "resources/templates/list",
+            Self::websocket_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of prompts under a caller-owned cancellation domain.
+    pub async fn list_prompts_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb_with_cancellation(
+            cx,
+            cancellation,
+            "prompts/list",
             Self::websocket_list_parameters(cursor),
         )
         .await
@@ -6822,6 +7060,16 @@ where
                     .entry(key.clone())
                     .or_insert_with(|| value.clone());
             }
+        }
+        if let Some(level) = self.final_log_level {
+            generated.insert(
+                "io.modelcontextprotocol/logLevel".to_owned(),
+                serde_json::to_value(level).map_err(|error| {
+                    McpError::internal_error(format!(
+                        "Failed to serialize modern logging configuration: {error}"
+                    ))
+                })?,
+            );
         }
         object.insert("_meta".to_owned(), metadata);
         Ok(params)
@@ -9120,6 +9368,10 @@ pub struct HttpClient {
     /// ordinary requests can keep using this connection while events are
     /// drained one at a time.
     live_subscription: Option<ModernHttpSubscriptionListener>,
+    /// Modern request-only `io.modelcontextprotocol/logLevel`. Absent until
+    /// [`Self::set_log_level_typed`] stores a severity; never sent as the
+    /// removed final `logging/setLevel` RPC.
+    final_log_level: Option<LoggingLevel>,
 }
 
 /// Errors raised while composing a ready public HTTP client.
@@ -9647,6 +9899,7 @@ impl HttpClient {
             final_cache_ttl_diagnostics: VecDeque::new(),
             mcp_apps_settings,
             live_subscription: None,
+            final_log_level: None,
         })
     }
 
@@ -10104,6 +10357,37 @@ impl HttpClient {
             .await
     }
 
+    /// Completes one prompt or resource-template argument under a caller-owned
+    /// cancellation domain.
+    pub async fn complete_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: CompletionParams,
+    ) -> Result<CoreResult, HttpClientError> {
+        let parameters = match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => serde_json::to_value(params).map_err(|_| {
+                HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP modern completion parameters could not serialize",
+                ))
+            })?,
+            ProtocolEra::Legacy2024 => {
+                serde_json::to_value(params.into_legacy()?).map_err(|_| {
+                    HttpClientError::CoreResult(McpError::internal_error(
+                        "HTTP legacy completion parameters could not serialize",
+                    ))
+                })?
+            }
+        };
+        self.request_final_core_with_cancellation(
+            cx,
+            cancellation,
+            "completion/complete",
+            parameters,
+        )
+        .await
+    }
+
     fn http_list_parameters(cursor: Option<&str>) -> serde_json::Value {
         cursor.map_or_else(
             || serde_json::json!({}),
@@ -10121,6 +10405,89 @@ impl HttpClient {
             .await
     }
 
+    /// Sends `ping` through the negotiated HTTP era.
+    pub async fn ping(&mut self, cx: &Cx) -> Result<(), HttpClientError> {
+        self.ping_with_optional_cancellation(cx, None).await
+    }
+
+    /// Sends `ping` under a caller-owned cancellation domain.
+    pub async fn ping_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> Result<(), HttpClientError> {
+        self.ping_with_optional_cancellation(cx, Some(cancellation))
+            .await
+    }
+
+    async fn ping_with_optional_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+    ) -> Result<(), HttpClientError> {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let parameters = self.core_request_parameters(&serde_json::json!({}))?;
+        let request_id = self.next_request_id()?;
+        let response = match cancellation {
+            Some(cancellation) => {
+                self.connection
+                    .request_json_with_result_source_at_with_cancellation(
+                        cx,
+                        cancellation,
+                        "ping",
+                        parameters,
+                        request_id,
+                        DEFAULT_FINAL_CACHE_MAX_BYTES,
+                    )
+                    .await
+            }
+            None => {
+                self.connection
+                    .request_json_with_result_source_at(
+                        cx,
+                        "ping",
+                        parameters,
+                        request_id,
+                        DEFAULT_FINAL_CACHE_MAX_BYTES,
+                    )
+                    .await
+            }
+        }
+        .map_err(HttpClientError::Connection)?;
+        let (mut response, _, _) = response;
+        if let Some(error) = response.error.take() {
+            return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
+        }
+        Ok(())
+    }
+
+    /// Configures the selected protocol era's log level behavior.
+    ///
+    /// A modern session stores the complete RFC 5424 level and adds it as
+    /// `io.modelcontextprotocol/logLevel` metadata to every later request. It
+    /// never sends `logging/setLevel`. An exact 2024-11-05 session must use
+    /// the legacy `logging/setLevel` verb instead.
+    pub fn set_log_level_typed(&mut self, level: LoggingLevel) -> Result<(), HttpClientError> {
+        match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => {
+                self.final_log_level = Some(level);
+                Ok(())
+            }
+            ProtocolEra::Legacy2024 => Err(HttpClientError::CoreResult(McpError::invalid_params(
+                "modern request logLevel metadata is only for MCP 2026-07-28",
+            ))),
+        }
+    }
+
+    /// Configures one of the RFC 5424 severities supported by both protocol eras.
+    pub fn set_log_level(&mut self, level: LogLevel) -> Result<(), HttpClientError> {
+        self.set_log_level_typed(final_log_level(level))
+    }
+
     /// Lists one page of tools under a caller-owned cancellation domain.
     pub async fn list_tools_with_cancellation(
         &mut self,
@@ -10132,6 +10499,55 @@ impl HttpClient {
             cx,
             cancellation,
             "tools/list",
+            Self::http_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of resources under a caller-owned cancellation domain.
+    pub async fn list_resources_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core_with_cancellation(
+            cx,
+            cancellation,
+            "resources/list",
+            Self::http_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of resource templates under a caller-owned cancellation
+    /// domain.
+    pub async fn list_resource_templates_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core_with_cancellation(
+            cx,
+            cancellation,
+            "resources/templates/list",
+            Self::http_list_parameters(cursor),
+        )
+        .await
+    }
+
+    /// Lists one page of prompts under a caller-owned cancellation domain.
+    pub async fn list_prompts_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core_with_cancellation(
+            cx,
+            cancellation,
+            "prompts/list",
             Self::http_list_parameters(cursor),
         )
         .await
@@ -10171,6 +10587,29 @@ impl HttpClient {
             .await
     }
 
+    fn http_prompt_parameters(
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> Result<serde_json::Value, HttpClientError> {
+        let mut parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            let object = parameters.as_object_mut().ok_or_else(|| {
+                HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP prompt parameters must remain an object",
+                ))
+            })?;
+            object.insert(
+                "arguments".to_owned(),
+                serde_json::to_value(arguments).map_err(|_| {
+                    HttpClientError::CoreResult(McpError::internal_error(
+                        "HTTP prompt arguments could not serialize",
+                    ))
+                })?,
+            );
+        }
+        Ok(parameters)
+    }
+
     /// Reads one resource through the negotiated HTTP era.
     ///
     /// Installed modern reverse handlers fulfill `input_required` the same way
@@ -10189,6 +10628,25 @@ impl HttpClient {
         .await
     }
 
+    /// Reads one resource under a caller-owned cancellation domain.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`]. Cancellation is checked on every HTTP round.
+    pub async fn read_resource_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        uri: &str,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.follow_installed_mrtr(
+            cx,
+            Some(cancellation),
+            "resources/read",
+            serde_json::json!({ "uri": uri }),
+        )
+        .await
+    }
+
     /// Gets one prompt through the negotiated HTTP era.
     ///
     /// Installed modern reverse handlers fulfill `input_required` the same way
@@ -10199,24 +10657,33 @@ impl HttpClient {
         name: &str,
         arguments: std::collections::HashMap<String, String>,
     ) -> Result<CoreResult, HttpClientError> {
-        let mut parameters = serde_json::json!({ "name": name });
-        if !arguments.is_empty() {
-            let object = parameters.as_object_mut().ok_or_else(|| {
-                HttpClientError::CoreResult(McpError::internal_error(
-                    "HTTP prompt parameters must remain an object",
-                ))
-            })?;
-            object.insert(
-                "arguments".to_owned(),
-                serde_json::to_value(arguments).map_err(|_| {
-                    HttpClientError::CoreResult(McpError::internal_error(
-                        "HTTP prompt arguments could not serialize",
-                    ))
-                })?,
-            );
-        }
-        self.follow_installed_mrtr(cx, None, "prompts/get", parameters)
-            .await
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "prompts/get",
+            Self::http_prompt_parameters(name, arguments)?,
+        )
+        .await
+    }
+
+    /// Gets one prompt under a caller-owned cancellation domain.
+    ///
+    /// Installed modern reverse handlers fulfill `input_required` the same way
+    /// as [`Self::call_tool`]. Cancellation is checked on every HTTP round.
+    pub async fn get_prompt_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.follow_installed_mrtr(
+            cx,
+            Some(cancellation),
+            "prompts/get",
+            Self::http_prompt_parameters(name, arguments)?,
+        )
+        .await
     }
 
     /// Calls one tool through the negotiated HTTP era.
@@ -10682,16 +11149,30 @@ impl HttpClient {
                 "HTTP modern core request parameters must be an object",
             ))
         })?;
-        parameters.insert(
-            "_meta".to_owned(),
-            serde_json::to_value(FinalRequestMeta::new(self.client_capabilities.clone())).map_err(
-                |_| {
-                    HttpClientError::CoreResult(McpError::internal_error(
-                        "HTTP client metadata could not form a core request",
-                    ))
-                },
-            )?,
-        );
+        let mut metadata = serde_json::to_value(FinalRequestMeta::new(
+            self.client_capabilities.clone(),
+        ))
+        .map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP client metadata could not form a core request",
+            ))
+        })?;
+        if let Some(level) = self.final_log_level {
+            let object = metadata.as_object_mut().ok_or_else(|| {
+                HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP client metadata is not an object",
+                ))
+            })?;
+            object.insert(
+                "io.modelcontextprotocol/logLevel".to_owned(),
+                serde_json::to_value(level).map_err(|error| {
+                    HttpClientError::CoreResult(McpError::internal_error(format!(
+                        "Failed to serialize modern logging configuration: {error}"
+                    )))
+                })?,
+            );
+        }
+        parameters.insert("_meta".to_owned(), metadata);
         Ok(serde_json::Value::Object(parameters))
     }
 
@@ -10832,6 +11313,7 @@ pub struct StdioRequestExecutor {
     next_id: Arc<AtomicU64>,
     timeout_policy: Arc<Mutex<RequestTimeoutPolicy>>,
     peer_era: ProtocolEra,
+    modern_request_meta: Option<Arc<FinalRequestMeta>>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
 }
 
@@ -10945,6 +11427,7 @@ impl StdioRequestExecutor {
         next_id: Arc<AtomicU64>,
         peer_era: ProtocolEra,
         timeout_policy: RequestTimeoutPolicy,
+        modern_request_meta: Option<FinalRequestMeta>,
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     ) -> Self {
         Self {
@@ -10952,6 +11435,7 @@ impl StdioRequestExecutor {
             next_id,
             timeout_policy: Arc::new(Mutex::new(timeout_policy)),
             peer_era,
+            modern_request_meta: modern_request_meta.map(Arc::new),
             client_extension_runtime,
         }
     }
@@ -10968,6 +11452,10 @@ impl StdioRequestExecutor {
     /// the Client's sequential APIs stay in one monotonic correlation space.
     /// A completed handle is observed with [`Self::try_take_response`] after
     /// the owning [`Client`] drives ingress.
+    ///
+    /// A Modern2026 executor stamps the negotiated protocol version and
+    /// advertised client capabilities when the caller omitted them. Already
+    /// present `_meta` keys are left unchanged.
     pub fn execute(
         &self,
         cx: &Cx,
@@ -10984,6 +11472,7 @@ impl StdioRequestExecutor {
                 "Registered final extension methods require Client::request_final_extension",
             ));
         }
+        let params = self.decorate_modern_request_parameters(params)?;
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
         self.execute_request(cx, JsonRpcRequest::new(method, params, id))
@@ -11001,6 +11490,37 @@ impl StdioRequestExecutor {
             .executor
             .execute_with_timeout_policy(cx, request, timeout_policy)?;
         Ok(StdioRequestExecution { execution })
+    }
+
+    fn decorate_modern_request_parameters(
+        &self,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<Option<serde_json::Value>> {
+        let Some(final_metadata) = self.modern_request_meta.as_ref() else {
+            return Ok(params);
+        };
+        let mut params = params.unwrap_or_else(|| serde_json::json!({}));
+        let object = params.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Modern MCP requests require object parameters")
+        })?;
+        let metadata = object
+            .entry("_meta")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let metadata = metadata.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Modern MCP request metadata must be an object")
+        })?;
+        let stamped = serde_json::to_value(final_metadata.as_ref()).map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to serialize modern request metadata: {error}"
+            ))
+        })?;
+        let stamped = stamped.as_object().ok_or_else(|| {
+            McpError::internal_error("Modern request metadata did not serialize as an object")
+        })?;
+        for (key, value) in stamped {
+            metadata.entry(key.clone()).or_insert(value.clone());
+        }
+        Ok(Some(params))
     }
 
     /// Commits one already-prepared final Tasks subscription request.
@@ -12401,11 +12921,18 @@ impl Client {
         let Some(transport) = self.selected_io.clone() else {
             return;
         };
+        let modern_request_meta = (peer_era == ProtocolEra::Modern2026).then(|| FinalRequestMeta {
+            protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
+            client_capabilities: self.session.client_capabilities().clone(),
+            client_info: Some(self.session.client_info().clone()),
+            additional_metadata: BTreeMap::default(),
+        });
         self.multiplexed_executor = Some(StdioRequestExecutor::new(
             transport,
             Arc::clone(&self.next_id),
             peer_era,
             self.timeout_policy,
+            modern_request_meta,
             self.session.client_extension_runtime().cloned(),
         ));
     }
@@ -12680,13 +13207,43 @@ impl Client {
 
     /// Verifies that the initialized server can answer an MCP ping request.
     ///
+    /// A modern session stamps the same `_meta` protocol version the typed
+    /// verbs send. Exact-2024 keeps the empty-object ping body.
+    ///
     /// # Errors
     ///
     /// Returns an error when initialization, transport, envelope validation,
     /// or the server's ping response fails.
     pub fn ping(&mut self) -> McpResult<()> {
-        self.require_legacy_exact_result_session("ping")?;
-        let _: serde_json::Value = self.send_request("ping", serde_json::json!({}))?;
+        self.ensure_initialized()?;
+        let params = self.prepare_request_parameters(serde_json::json!({}))?;
+        let _: serde_json::Value = self.send_prepared_request("ping", params)?.result;
+        Ok(())
+    }
+
+    /// Sends `ping` under a request-local cancellation domain.
+    ///
+    /// A cancellation observed before send makes no transport contact.
+    pub fn ping_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<()> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.ensure_initialized()?;
+        let params = self.prepare_request_parameters(serde_json::json!({}))?;
+        let _: serde_json::Value = self
+            .send_prepared_request_with_request_cancellation(
+                cx,
+                cancellation,
+                "ping",
+                params,
+                RequestCancellationTerminalElection::CancelFirst,
+                |_| {},
+            )?
+            .result;
         Ok(())
     }
 
@@ -15125,6 +15682,73 @@ impl Client {
         self.request_core_with_cancellation(cx, cancellation, "tools/list", parameters, |_| {})
     }
 
+    /// Lists one page of resources under a request-local cancellation domain.
+    ///
+    /// A cancellation observed before send makes no transport contact. One
+    /// observed after commit sends the selected-era cancellation control.
+    pub fn list_resources_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult> {
+        let params = ListResourcesParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListResourcesParams::default()
+        };
+        let parameters = serde_json::to_value(params).map_err(|error| {
+            McpError::internal_error(format!(
+                "Client resources/list parameters could not serialize: {error}"
+            ))
+        })?;
+        self.request_core_with_cancellation(cx, cancellation, "resources/list", parameters, |_| {})
+    }
+
+    /// Lists one page of resource templates under a request-local cancellation
+    /// domain.
+    pub fn list_resource_templates_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult> {
+        let params = ListResourceTemplatesParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListResourceTemplatesParams::default()
+        };
+        let parameters = serde_json::to_value(params).map_err(|error| {
+            McpError::internal_error(format!(
+                "Client resources/templates/list parameters could not serialize: {error}"
+            ))
+        })?;
+        self.request_core_with_cancellation(
+            cx,
+            cancellation,
+            "resources/templates/list",
+            parameters,
+            |_| {},
+        )
+    }
+
+    /// Lists one page of prompts under a request-local cancellation domain.
+    pub fn list_prompts_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult> {
+        let params = ListPromptsParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListPromptsParams::default()
+        };
+        let parameters = serde_json::to_value(params).map_err(|error| {
+            McpError::internal_error(format!(
+                "Client prompts/list parameters could not serialize: {error}"
+            ))
+        })?;
+        self.request_core_with_cancellation(cx, cancellation, "prompts/list", parameters, |_| {})
+    }
+
     /// Lists available tools.
     ///
     /// This convenience API follows peer cursors and returns the flattened
@@ -16183,6 +16807,17 @@ impl Client {
         )
     }
 
+    /// Reads one resource under a request-local cancellation domain.
+    pub fn read_resource_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        uri: &str,
+    ) -> McpResult<CoreResult> {
+        let parameters = serde_json::json!({ "uri": uri });
+        self.request_core_with_cancellation(cx, cancellation, "resources/read", parameters, |_| {})
+    }
+
     /// Reads a resource and follows bounded final MRTR continuations with
     /// caller-supplied responses.
     ///
@@ -16394,6 +17029,25 @@ impl Client {
             meta: None,
         };
         self.send_typed_core_request("prompts/get", params)
+    }
+
+    /// Gets one prompt under a request-local cancellation domain.
+    pub fn get_prompt_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> McpResult<CoreResult> {
+        let mut parameters = serde_json::json!({ "name": name });
+        if !arguments.is_empty() {
+            parameters["arguments"] = serde_json::to_value(&arguments).map_err(|error| {
+                McpError::internal_error(format!(
+                    "Client prompts/get arguments could not serialize: {error}"
+                ))
+            })?;
+        }
+        self.request_core_with_cancellation(cx, cancellation, "prompts/get", parameters, |_| {})
     }
 
     /// Gets a prompt and follows bounded final MRTR continuations with
@@ -18676,6 +19330,26 @@ mod tests {
                 .await
                 .expect_err("an already-cancelled domain must reject before tools/list");
             assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            let resource = client
+                .read_resource_with_cancellation(&cx, &cancellation, "info://pre-send")
+                .await
+                .expect_err("an already-cancelled domain must reject before resources/read");
+            assert_eq!(resource.code, McpErrorCode::RequestCancelled);
+            let prompt = client
+                .get_prompt_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    "pre-send",
+                    std::collections::HashMap::new(),
+                )
+                .await
+                .expect_err("an already-cancelled domain must reject before prompts/get");
+            assert_eq!(prompt.code, McpErrorCode::RequestCancelled);
+            let ping = client
+                .ping_with_cancellation(&cx, &cancellation)
+                .await
+                .expect_err("an already-cancelled domain must reject before ping");
+            assert_eq!(ping.code, McpErrorCode::RequestCancelled);
             client
                 .close(&cx)
                 .await
@@ -18684,7 +19358,7 @@ mod tests {
             let _ = peer.join(&cx).await;
             assert!(
                 !listed.load(Ordering::SeqCst),
-                "cancelled tools/list must not write a tools/list frame"
+                "cancelled typed verbs must not write a tools/list frame"
             );
         });
     }
