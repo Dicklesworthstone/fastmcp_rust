@@ -6363,6 +6363,83 @@ impl Router {
         result
     }
 
+    /// Mounts tools and prompts with an optional name prefix, and keeps
+    /// resource and template keys exact.
+    ///
+    /// A nonempty `{prefix}/{uri}` key is not an absolute final URI. Callers
+    /// that need a modern resource catalog after namespacing tools/prompts
+    /// must preserve the child's resource URIs instead of prefixing them.
+    pub fn mount_namespaced_with_behavior(
+        &mut self,
+        other: Router,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+    ) -> MountResult {
+        let mut preflight = self.mount_preflight(&other, prefix, behavior, MountSelection::Tools);
+        preflight.merge(self.mount_preflight(&other, prefix, behavior, MountSelection::Prompts));
+        preflight.merge(self.mount_preflight(&other, None, behavior, MountSelection::Resources));
+        if !preflight.is_success() {
+            return preflight;
+        }
+
+        let mut result = preflight;
+        let Router {
+            tools,
+            tool_order,
+            resources,
+            final_only_resources,
+            final_resources,
+            resource_order,
+            prompts,
+            final_only_prompts,
+            final_prompts,
+            prompt_order,
+            resource_templates,
+            resource_template_order,
+            ..
+        } = other;
+
+        result.merge(self.mount_tools_from(tools, tool_order, prefix, behavior));
+        result.merge(self.mount_resources_from(
+            resources,
+            final_only_resources,
+            final_resources,
+            resource_order,
+            None,
+            behavior,
+        ));
+        result.merge(self.mount_resource_templates_from(
+            resource_templates,
+            resource_template_order,
+            None,
+            behavior,
+        ));
+        result.merge(self.mount_prompts_from(
+            prompts,
+            final_only_prompts,
+            final_prompts,
+            prompt_order,
+            prefix,
+            behavior,
+        ));
+
+        if result.has_components() {
+            debug!(
+                target: targets::HANDLER,
+                "mounted namespaced {} tools, {} resources, {} templates, {} prompts; prefix_present={}; prefix_key={}",
+                result.tools,
+                result.resources,
+                result.resource_templates,
+                result.prompts,
+                prefix.is_some(),
+                safe_log_label(prefix.unwrap_or_default())
+            );
+            self.advance_final_catalog_revision();
+        }
+
+        result
+    }
+
     /// Mounts only tools from a router.
     pub fn mount_tools(&mut self, other: Router, prefix: Option<&str>) -> MountResult {
         self.mount_tools_with_behavior(other, prefix, crate::DuplicateBehavior::Replace)
@@ -12387,6 +12464,24 @@ mod router_tests {
         assert_eq!(uri, "ns/file:///a");
         assert_eq!(text, "content");
         assert!(additional.is_empty());
+    }
+
+    #[test]
+    fn mount_namespaced_prefixes_tools_and_keeps_resource_uris() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("query"));
+        sub.add_resource(NamedResource::new("file:///a"));
+        let result =
+            main.mount_namespaced_with_behavior(sub, Some("ns"), crate::DuplicateBehavior::Replace);
+        assert!(result.is_success());
+        assert_eq!(result.tools, 1);
+        assert_eq!(result.resources, 1);
+        assert!(main.get_tool("ns/query").is_some());
+        assert!(main.get_tool("query").is_none());
+        assert!(main.get_resource("file:///a").is_some());
+        assert!(main.get_resource("ns/file:///a").is_none());
+        assert!(main.final_resources.contains_key("file:///a"));
     }
 
     #[test]

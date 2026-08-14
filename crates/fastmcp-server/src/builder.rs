@@ -1390,13 +1390,58 @@ impl ServerBuilder {
     /// policy rejects a proxied component.
     #[cfg(feature = "proxy")]
     pub fn as_proxy(
-        mut self,
+        self,
         prefix: &str,
         client: fastmcp_client::Client,
     ) -> Result<Self, fastmcp_core::McpError> {
         let proxy_client = ProxyClient::from_client(client)?;
         let catalog = proxy_client.catalog_typed()?;
+        self.register_prefixed_typed_proxy_catalog(prefix, proxy_client, catalog)
+    }
+
+    /// Registers one already-negotiated typed upstream catalog under a caller
+    /// prefix. Tools and prompts take `{prefix}/{name}`; exact-final resource
+    /// URIs stay unprefixed so they remain absolute.
+    ///
+    /// This is the HTTP-capable counterpart to [`as_proxy`](Self::as_proxy):
+    /// a live `ProxyClient` from `connect_http_with_protocol_plan` already
+    /// carries a ModernHttp/LegacyHttpSse binding, so it must not be rebuilt
+    /// through `from_client` (which labels the adapter as stdio).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the typed catalog is mixed-era, contradicts the
+    /// selected route, or the configured duplicate policy rejects a proxied
+    /// component.
+    #[cfg(feature = "proxy")]
+    pub fn as_proxy_typed(
+        self,
+        prefix: &str,
+        proxy_client: ProxyClient,
+        catalog: ProxyTypedCatalog,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        self.register_prefixed_typed_proxy_catalog(prefix, proxy_client, catalog)
+    }
+
+    #[cfg(feature = "proxy")]
+    fn register_prefixed_typed_proxy_catalog(
+        mut self,
+        prefix: &str,
+        proxy_client: ProxyClient,
+        catalog: ProxyTypedCatalog,
+    ) -> Result<Self, fastmcp_core::McpError> {
+        proxy_client.admit_typed_catalog(&catalog)?;
         let completion_supported = proxy_client.supports_completion()?;
+        #[cfg(feature = "tasks")]
+        let catalog_era = catalog.era()?;
+        #[cfg(feature = "tasks")]
+        let task_relay = if catalog_era == ProtocolEra::Modern2026 {
+            proxy_client.final_tasks_relay()?
+        } else {
+            None
+        };
+        #[cfg(feature = "tasks")]
+        self.install_proxy_final_tasks_relay(task_relay.clone())?;
         let (tool_count, resource_count, template_count, prompt_count) = match catalog {
             ProxyTypedCatalog {
                 tools: ProxyToolCatalog::Legacy(tools),
@@ -1474,17 +1519,45 @@ impl ServerBuilder {
                 resource_templates: ProxyResourceTemplateCatalog::Final(resource_templates),
                 prompts: ProxyPromptCatalog::Final(prompts),
             } => {
-                if !resources.is_empty() || !resource_templates.is_empty() {
-                    return Err(fastmcp_core::McpError::invalid_request(
-                        "a prefixed proxy cannot preserve exact-final resource URIs; use as_proxy_raw",
-                    ));
-                }
-                let counts = (tools.len(), 0, 0, prompts.len());
+                // Tools and prompts take the caller prefix. Exact-final resource
+                // URIs stay unprefixed so they remain absolute; prefixing them
+                // as `{prefix}/{uri}` would drop them from the modern catalog.
+                let counts = (
+                    tools.len(),
+                    resources.len(),
+                    resource_templates.len(),
+                    prompts.len(),
+                );
                 for tool in tools {
                     self.router.add_final_tool_with_behavior(
                         ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?,
                         self.on_duplicate,
                     )?;
+                }
+                for resource in resources {
+                    self.router.add_final_resource_with_behavior(
+                        FinalProxyResourceHandler::new(resource, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                }
+                for template in resource_templates {
+                    let downstream_uri = template.uri_template.clone();
+                    let completion_target_admitted =
+                        self.proxy_resource_template_wins_admission(&downstream_uri);
+                    self.router.add_final_resource_with_behavior(
+                        FinalProxyResourceTemplateHandler::new(template, proxy_client.clone()),
+                        self.on_duplicate,
+                    )?;
+                    if completion_target_admitted && completion_supported {
+                        self.router.add_resource_template_completion_handler(
+                            downstream_uri.clone(),
+                            ProxyCompletionHandler::for_resource_template(
+                                proxy_client.clone(),
+                                downstream_uri.clone(),
+                                downstream_uri,
+                            ),
+                        );
+                    }
                 }
                 for prompt in prompts {
                     let upstream_name = prompt.name.clone();
@@ -1847,6 +1920,55 @@ impl ServerBuilder {
         }
 
         // Update capabilities based on what was mounted
+        if has_tools && result.tools > 0 {
+            self.advertise_legacy_tools_list_changed();
+        }
+        if has_resources && (result.resources > 0 || result.resource_templates > 0) {
+            self.advertise_legacy_resource_subscriptions();
+        }
+        if has_prompts && result.prompts > 0 {
+            self.advertise_legacy_prompts_list_changed();
+        }
+
+        self
+    }
+
+    /// Mounts tools and prompts with an optional name prefix, and keeps
+    /// resource and template URIs exact.
+    ///
+    /// Use this when the destination must remain a modern catalog: a nonempty
+    /// `{prefix}/{uri}` key is not an absolute final URI.
+    #[must_use]
+    pub fn mount_preserving_resource_uris(
+        mut self,
+        server: crate::Server,
+        prefix: Option<&str>,
+    ) -> Self {
+        #[cfg(feature = "apps")]
+        if server.router.has_mcp_apps_bound_components() && !self.has_active_official_mcp_apps() {
+            log::error!(
+                target: "fastmcp_rust::mount",
+                "Mount rejected because the child contains MCP Apps components but the destination has no active compatible MCP Apps extension"
+            );
+            return self;
+        }
+
+        let has_tools = server.has_tools();
+        let has_resources = server.has_resources();
+        let has_prompts = server.has_prompts();
+
+        let source_router = server.into_router();
+        let result =
+            self.router
+                .mount_namespaced_with_behavior(source_router, prefix, self.on_duplicate);
+
+        for warning in &result.warnings {
+            log::warn!(target: "fastmcp_rust::mount", "{}", warning);
+        }
+        for error in &result.errors {
+            log::error!(target: "fastmcp_rust::mount", "{}", error);
+        }
+
         if has_tools && result.tools > 0 {
             self.advertise_legacy_tools_list_changed();
         }
@@ -6537,6 +6659,36 @@ mod tests {
         }
 
         #[test]
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn as_proxy_typed_installs_route_bound_final_tasks_relay() {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let updates = Arc::new(Mutex::new(Vec::new()));
+            let server = ServerBuilder::new("prefixed-proxy-tasks", "1.0")
+                .as_proxy_typed(
+                    "ext",
+                    ordinary_proxy_tasks_client(calls, updates),
+                    final_completion_proxy_catalog(),
+                )
+                .expect("as_proxy_typed admits a modern catalog with a Tasks-capable route")
+                .build();
+            assert!(
+                server.final_task_runtime().is_none(),
+                "as_proxy_typed must install the route-bound Tasks relay instead of the default in-memory store"
+            );
+            let discovery = serde_json::to_value(
+                server
+                    .server_discovery()
+                    .expect("the prefixed Tasks proxy remains discoverable"),
+            )
+            .expect("prefixed Tasks proxy discovery serializes");
+            assert_eq!(
+                discovery.pointer("/capabilities/extensions/io.modelcontextprotocol~1tasks"),
+                Some(&serde_json::json!({})),
+                "as_proxy_typed must advertise the same Tasks extension as proxy_typed"
+            );
+        }
+
         fn as_proxy_raw_propagates_duplicate_registration_errors() {
             let result = ServerBuilder::new("srv", "1.0")
                 .on_duplicate(DuplicateBehavior::Error)
