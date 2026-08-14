@@ -705,8 +705,21 @@ fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::get_prompt;
     let _ = modern::HttpClient::get_prompt_result;
     let _ = modern::HttpClient::complete;
+    let _ = modern::HttpClient::complete_with_cancellation;
     let _ = modern::HttpClient::call_tool_result;
     let _ = modern::HttpClient::call_tool_result_with_cancellation;
+    let _ = modern::HttpClient::ping;
+    let _ = modern::HttpClient::ping_with_cancellation;
+    let _ = modern::HttpClient::set_log_level;
+    let _ = modern::HttpClient::list_tools_with_cancellation;
+    let _ = modern::HttpClient::list_resources_with_cancellation;
+    let _ = modern::HttpClient::list_resource_templates_with_cancellation;
+    let _ = modern::HttpClient::list_prompts_with_cancellation;
+    let _ = modern::HttpClient::call_tool_with_cancellation;
+    let _ = modern::HttpClient::read_resource_with_cancellation;
+    let _ = modern::HttpClient::read_resource_result_with_cancellation;
+    let _ = modern::HttpClient::get_prompt_with_cancellation;
+    let _ = modern::HttpClient::get_prompt_result_with_cancellation;
     let _ = modern::HttpClient::call_tool_with_mrtr_retry;
     let _ = modern::HttpClient::read_resource_with_mrtr_retry;
     let _ = modern::HttpClient::get_prompt_with_mrtr_retry;
@@ -785,8 +798,17 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     let _ = modern::Client::call_tool_result;
     let _ = modern::Client::read_resource_result;
     let _ = modern::Client::get_prompt_result;
+    let _ = modern::Client::ping;
+    let _ = modern::Client::ping_with_cancellation;
+    let _ = modern::Client::set_log_level;
     let _ = modern::Client::list_tools_with_cancellation;
+    let _ = modern::Client::list_resources_with_cancellation;
+    let _ = modern::Client::list_resource_templates_with_cancellation;
+    let _ = modern::Client::list_prompts_with_cancellation;
     let _ = modern::Client::call_tool_with_cancellation;
+    let _ = modern::Client::read_resource_with_cancellation;
+    let _ = modern::Client::get_prompt_with_cancellation;
+    let _ = modern::Client::complete_with_cancellation;
     let _: fn(&mut modern::Client, modern::SubscriptionFilter) -> modern::McpResult<()> =
         modern::Client::open_subscriptions_listener;
     let _: fn(

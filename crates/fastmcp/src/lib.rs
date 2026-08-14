@@ -2453,6 +2453,59 @@ pub mod modern {
             }
         }
 
+        /// Completes a prompt or resource-template argument under a
+        /// caller-owned cancellation domain.
+        pub async fn complete_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: CompletionParams,
+        ) -> McpResult<FinalCompletionResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .complete_with_cancellation(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final completion/complete result",
+                )),
+            }
+        }
+
+        /// Sends `ping` on this modern WebSocket session.
+        pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.ping(cx).await
+        }
+
+        /// Sends `ping` under a caller-owned cancellation domain.
+        pub async fn ping_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.ping_with_cancellation(cx, cancellation).await
+        }
+
+        /// Stores modern request `logLevel` metadata; never sends `logging/setLevel`.
+        pub fn set_log_level(&mut self, level: LoggingLevel) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.set_log_level_typed(level)
+        }
+
         /// Lists one exact final page of tools through the pinned WebSocket session.
         pub async fn list_tools(
             &mut self,
@@ -2620,6 +2673,55 @@ pub mod modern {
             }
         }
 
+        /// Reads one resource under a caller-owned cancellation domain.
+        pub async fn read_resource_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<FinalReadResourceResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .read_resource_with_cancellation(cx, cancellation, uri)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/read result",
+                )),
+            }
+        }
+
+        /// Gets one prompt under a caller-owned cancellation domain.
+        pub async fn get_prompt_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<FinalGetPromptResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .get_prompt_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final prompts/get result",
+                )),
+            }
+        }
+
         /// Calls one tool through the pinned modern WebSocket session.
         ///
         /// When modern reverse handlers are installed, a peer `input_required`
@@ -2685,6 +2787,81 @@ pub mod modern {
                 ) => Ok(result.payload),
                 _ => Err(McpError::internal_error(
                     "Modern WebSocket client received a non-final tools/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of resources under a caller-owned
+        /// cancellation domain.
+        pub async fn list_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListResourcesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_resources_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of resource templates under a caller-owned
+        /// cancellation domain.
+        pub async fn list_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListResourceTemplatesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_resource_templates_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final resources/templates/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of prompts under a caller-owned
+        /// cancellation domain.
+        pub async fn list_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListPromptsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_prompts_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final prompts/list result",
                 )),
             }
         }
@@ -2911,6 +3088,25 @@ pub mod modern {
         }
 
         /// Lists one exact final page of tools without a legacy projection.
+        /// Sends `ping` on this modern stdio session.
+        pub fn ping(&mut self) -> McpResult<()> {
+            self.inner.ping()
+        }
+
+        /// Sends `ping` under a request-local cancellation domain.
+        pub fn ping_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<()> {
+            self.inner.ping_with_cancellation(cx, cancellation)
+        }
+
+        /// Stores modern request `logLevel` metadata; never sends `logging/setLevel`.
+        pub fn set_log_level(&mut self, level: LoggingLevel) -> McpResult<()> {
+            self.inner.set_log_level_typed(level)
+        }
+
         pub fn list_tools(&mut self, cursor: Option<&str>) -> McpResult<FinalListToolsResult> {
             match self.inner.list_tools_typed(cursor)? {
                 fastmcp_protocol::CoreResult::Final(
@@ -2939,6 +3135,69 @@ pub mod modern {
                 ) => Ok(result.payload),
                 _ => Err(McpError::internal_error(
                     "Modern client received a non-final tools/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of resources under a request-local
+        /// cancellation domain.
+        pub fn list_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListResourcesResult> {
+            match self
+                .inner
+                .list_resources_with_cancellation(cx, cancellation, cursor)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final resources/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of resource templates under a
+        /// request-local cancellation domain.
+        pub fn list_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListResourceTemplatesResult> {
+            match self
+                .inner
+                .list_resource_templates_with_cancellation(cx, cancellation, cursor)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final resources/templates/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact final page of prompts under a request-local
+        /// cancellation domain.
+        pub fn list_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListPromptsResult> {
+            match self
+                .inner
+                .list_prompts_with_cancellation(cx, cancellation, cursor)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final prompts/list result",
                 )),
             }
         }
@@ -3077,6 +3336,26 @@ pub mod modern {
             }
         }
 
+        /// Reads one resource under a request-local cancellation domain.
+        pub fn read_resource_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<FinalReadResourceResult> {
+            match self
+                .inner
+                .read_resource_with_cancellation(cx, cancellation, uri)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final resources/read result",
+                )),
+            }
+        }
+
         /// Gets one prompt and keeps a live `input_required` branch.
         pub fn get_prompt_result(
             &mut self,
@@ -3088,6 +3367,27 @@ pub mod modern {
                     result @ (fastmcp_protocol::FinalCoreResult::PromptsGet { .. }
                     | fastmcp_protocol::FinalCoreResult::PromptsGetInputRequired { .. }),
                 ) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final prompts/get result",
+                )),
+            }
+        }
+
+        /// Gets one prompt under a request-local cancellation domain.
+        pub fn get_prompt_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<FinalGetPromptResult> {
+            match self
+                .inner
+                .get_prompt_with_cancellation(cx, cancellation, name, arguments)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. },
+                ) => Ok(result.payload),
                 _ => Err(McpError::internal_error(
                     "Modern client received a non-final prompts/get result",
                 )),
@@ -3157,6 +3457,27 @@ pub mod modern {
         /// Completes a prompt or resource-template argument using final context.
         pub fn complete(&mut self, params: CompletionParams) -> McpResult<FinalCompletionResult> {
             match self.inner.complete(params)? {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final completion/complete result",
+                )),
+            }
+        }
+
+        /// Completes a prompt or resource-template argument under a
+        /// request-local cancellation domain.
+        pub fn complete_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: CompletionParams,
+        ) -> McpResult<FinalCompletionResult> {
+            match self
+                .inner
+                .complete_with_cancellation(cx, cancellation, params, |_| {})?
+            {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::Completion { result, .. },
                 ) => Ok(result.payload),
@@ -3530,6 +3851,64 @@ pub mod modern {
             }
         }
 
+        /// Lists one page of resources under a caller-owned cancellation domain.
+        pub async fn list_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> Result<FinalListResourcesResult, HttpClientError> {
+            match self
+                .inner
+                .list_resources_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("resources/list")),
+            }
+        }
+
+        /// Lists one page of resource templates under a caller-owned
+        /// cancellation domain.
+        pub async fn list_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> Result<FinalListResourceTemplatesResult, HttpClientError> {
+            match self
+                .inner
+                .list_resource_templates_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("resources/templates/list")),
+            }
+        }
+
+        /// Lists one page of prompts under a caller-owned cancellation domain.
+        pub async fn list_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> Result<FinalListPromptsResult, HttpClientError> {
+            match self
+                .inner
+                .list_prompts_with_cancellation(cx, cancellation, cursor)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::PromptsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("prompts/list")),
+            }
+        }
+
         /// Calls one tool under a caller-owned cancellation domain.
         pub async fn call_tool_with_cancellation(
             &mut self,
@@ -3567,6 +3946,25 @@ pub mod modern {
                 ) => Ok(result),
                 _ => Err(unexpected_modern_http_result("tools/call")),
             }
+        }
+
+        /// Sends `ping` through the policy-bound HTTP client.
+        pub async fn ping(&mut self, cx: &Cx) -> Result<(), HttpClientError> {
+            self.inner.ping(cx).await
+        }
+
+        /// Sends `ping` under a caller-owned cancellation domain.
+        pub async fn ping_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> Result<(), HttpClientError> {
+            self.inner.ping_with_cancellation(cx, cancellation).await
+        }
+
+        /// Stores modern request `logLevel` metadata; never sends `logging/setLevel`.
+        pub fn set_log_level(&mut self, level: LoggingLevel) -> Result<(), HttpClientError> {
+            self.inner.set_log_level_typed(level)
         }
 
         /// Lists one exact final page of tools through the policy-bound HTTP client.
@@ -3753,6 +4151,86 @@ pub mod modern {
             }
         }
 
+        /// Reads one resource under a caller-owned cancellation domain.
+        pub async fn read_resource_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> Result<FinalReadResourceResult, HttpClientError> {
+            match self
+                .read_resource_result_with_cancellation(cx, cancellation, uri)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::ResourcesRead { result, .. } => {
+                    Ok(result.payload)
+                }
+                _ => Err(unexpected_modern_http_result("resources/read")),
+            }
+        }
+
+        /// Reads one resource under a caller-owned cancellation domain and
+        /// retains either a complete result or a live `input_required` branch.
+        pub async fn read_resource_result_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> Result<fastmcp_protocol::FinalCoreResult, HttpClientError> {
+            match self
+                .inner
+                .read_resource_with_cancellation(cx, cancellation, uri)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    result @ (fastmcp_protocol::FinalCoreResult::ResourcesRead { .. }
+                    | fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired {
+                        ..
+                    }),
+                ) => Ok(result),
+                _ => Err(unexpected_modern_http_result("resources/read")),
+            }
+        }
+
+        /// Gets one prompt under a caller-owned cancellation domain.
+        pub async fn get_prompt_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> Result<FinalGetPromptResult, HttpClientError> {
+            match self
+                .get_prompt_result_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
+                fastmcp_protocol::FinalCoreResult::PromptsGet { result, .. } => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("prompts/get")),
+            }
+        }
+
+        /// Gets one prompt under a caller-owned cancellation domain and retains
+        /// either a complete result or a live `input_required` branch.
+        pub async fn get_prompt_result_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> Result<fastmcp_protocol::FinalCoreResult, HttpClientError> {
+            match self
+                .inner
+                .get_prompt_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    result @ (fastmcp_protocol::FinalCoreResult::PromptsGet { .. }
+                    | fastmcp_protocol::FinalCoreResult::PromptsGetInputRequired { .. }),
+                ) => Ok(result),
+                _ => Err(unexpected_modern_http_result("prompts/get")),
+            }
+        }
+
         /// Completes a prompt or resource-template argument using final context.
         pub async fn complete(
             &mut self,
@@ -3767,6 +4245,26 @@ pub mod modern {
             match self
                 .inner
                 .request_final_core(cx, "completion/complete", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::Completion { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("completion/complete")),
+            }
+        }
+
+        /// Completes a prompt or resource-template argument under a
+        /// caller-owned cancellation domain.
+        pub async fn complete_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: CompletionParams,
+        ) -> Result<FinalCompletionResult, HttpClientError> {
+            match self
+                .inner
+                .complete_with_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
