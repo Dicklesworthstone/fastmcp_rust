@@ -433,14 +433,20 @@ fn context_cache_partition(ctx: &McpContext, phase: CachePartitionPhase) -> Opti
 
     let mut canonical = BoundedCacheBytes::new(MAX_CACHE_KEY_INPUT_BYTES);
     canonical.write_all(CACHE_PARTITION_KEY_DOMAIN).ok()?;
-    match session_partition {
-        Some((opaque_session, state_revision)) => {
-            canonical.write_all(&[1]).ok()?;
-            canonical.write_all(&opaque_session).ok()?;
-            canonical.write_all(&state_revision.to_be_bytes()).ok()?;
+    if ctx.session_is_ephemeral() {
+        // Per-POST modern HTTP state exists so disable_*/enable_* can
+        // publish list_changed. It is not a durable cache identity.
+        canonical.write_all(CACHE_STATELESS_PARTITION_DOMAIN).ok()?;
+    } else {
+        match session_partition {
+            Some((opaque_session, state_revision)) => {
+                canonical.write_all(&[1]).ok()?;
+                canonical.write_all(&opaque_session).ok()?;
+                canonical.write_all(&state_revision.to_be_bytes()).ok()?;
+            }
+            None if ctx.has_session_state() => return None,
+            None => canonical.write_all(CACHE_STATELESS_PARTITION_DOMAIN).ok()?,
         }
-        None if ctx.has_session_state() => return None,
-        None => canonical.write_all(CACHE_STATELESS_PARTITION_DOMAIN).ok()?,
     }
     match auth_partition {
         None => canonical.write_all(&[0]).ok()?,
@@ -2312,6 +2318,53 @@ mod tests {
             panic!("same session/auth partition did not produce a cache hit");
         };
         assert_eq!(cached, response);
+    }
+
+    #[test]
+    fn request_local_sessions_share_the_stateless_cache_partition() {
+        let middleware =
+            ResponseCachingMiddleware::new().include_tools(vec!["pure_tool".to_string()]);
+        let first = anonymous_partitioned_context(&SessionState::ephemeral(), 30);
+        let second = anonymous_partitioned_context(&SessionState::ephemeral(), 31);
+        let request = test_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "pure_tool", "arguments": {"n": 1}})),
+        );
+        let response = serde_json::json!({"resultType": "complete", "content": [{"type": "text", "text": "1"}]});
+
+        assert!(first.session_is_ephemeral());
+        assert!(second.session_is_ephemeral());
+        assert!(matches!(
+            middleware.on_request(&first, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        middleware
+            .on_response(&first, &request, response.clone())
+            .unwrap();
+
+        let MiddlewareDecision::Respond(cached) = middleware.on_request(&second, &request).unwrap()
+        else {
+            panic!("a second request-local modern HTTP session must hit the first complete result");
+        };
+        assert_eq!(cached, response);
+        assert!(second.response_was_served_from_cache());
+    }
+
+    #[test]
+    fn durable_sessions_do_not_share_request_local_cache_entries() {
+        let middleware = ResponseCachingMiddleware::new();
+        let ephemeral = anonymous_partitioned_context(&SessionState::ephemeral(), 40);
+        let durable = anonymous_partitioned_context(&SessionState::new(), 41);
+        let request = test_request("tools/list", None);
+        let response = serde_json::json!({"tools": ["request-local"]});
+
+        middleware
+            .on_response(&ephemeral, &request, response)
+            .unwrap();
+        assert!(matches!(
+            middleware.on_request(&durable, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
     }
 
     #[test]
