@@ -3475,10 +3475,48 @@ impl Router {
             .map_err(McpError::from)
     }
 
+    pub(crate) async fn dispatch_legacy_completion_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
+        if request.method != COMPLETION_COMPLETE {
+            return Err(McpError::method_not_found(&request.method));
+        }
+
+        let request = CoreRequest::decode(
+            ProtocolEra::Legacy2024,
+            COMPLETION_COMPLETE,
+            request.params.as_ref(),
+        )
+        .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        let CoreRequest::Legacy(LegacyCoreRequest::Completion(params)) = request else {
+            return Err(McpError::internal_error(
+                "legacy completion dispatch selected another core request",
+            ));
+        };
+
+        serde_json::to_value(
+            self.handle_completion_legacy_in_request(request_ctx, request_cx, params)
+                .await?,
+        )
+        .map_err(McpError::from)
+    }
+
     /// Handles one exact MCP 2024-11-05 completion request.
     pub fn handle_completion_legacy(
         &self,
         request_ctx: &McpContext,
+        params: LegacyCompletionParams,
+    ) -> McpResult<LegacyCompletionResult> {
+        block_on(self.handle_completion_legacy_in_request(request_ctx, request_ctx.cx(), params))
+    }
+
+    pub(crate) async fn handle_completion_legacy_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
         params: LegacyCompletionParams,
     ) -> McpResult<LegacyCompletionResult> {
         let dispatch_started_at = request_ctx.cx().now();
@@ -3508,13 +3546,14 @@ impl Router {
             dispatch_started_at,
         );
         let handler_ctx = handler_ctx.with_operation_deadline(effective_budget.deadline);
-        let outcome = block_on(run_handler_in_request(
+        let outcome = run_handler_in_request(
             &handler_ctx,
-            request_ctx.cx(),
+            request_cx,
             effective_budget,
             "completion",
             |child_cx| handler.complete_legacy_async_in_request(&handler_ctx, child_cx, params),
-        ))?;
+        )
+        .await?;
 
         let completion = match outcome {
             Outcome::Ok(completion) => completion,
@@ -4651,142 +4690,17 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<CallToolResult> {
-        debug!(
-            target: targets::HANDLER,
-            "calling tool; tool_key={}; arguments_present={}",
-            safe_log_label(&params.name),
-            params.arguments.is_some()
-        );
-
-        // Anchor every relative ceiling once at dispatch entry. Definition/schema
-        // work and timeout metadata lookup are part of this operation and must
-        // not reset a handler-declared window by taking a later clock sample.
-        let dispatch_started_at = request_ctx.cx().now();
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        // Check if tool is disabled for this session
-        if !session_state.is_tool_enabled(&params.name) {
-            return Err(McpError::new(
-                McpErrorCode::MethodNotFound,
-                format!("Tool '{}' is disabled for this session", params.name),
-            ));
-        }
-
-        // Find the tool handler
-        let entry = self
-            .tools
-            .get(&params.name)
-            .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", params.name)))?;
-        if !entry.legacy_enabled {
-            return Err(McpError::method_not_found(&format!(
-                "tool: {}",
-                params.name
-            )));
-        }
-        let handler = &entry.handler;
-
-        // Validate arguments against the tool's input schema
-        // Default to empty object since MCP tool arguments are always objects
-        let arguments = params.arguments.unwrap_or_else(|| serde_json::json!({}));
-        // Use strict or lenient validation based on configuration
-        let validation_result = if self.strict_input_validation {
-            validate_strict(&entry.definition.input_schema, &arguments)
-        } else {
-            validate(&entry.definition.input_schema, &arguments)
-        };
-
-        if let Err(validation_errors) = validation_result {
-            let error_messages: Vec<String> = validation_errors
-                .iter()
-                .map(|e| format!("{}: {}", e.path, e.message))
-                .collect();
-            return Err(McpError::invalid_params(format!(
-                "Input validation failed: {}",
-                error_messages.join("; ")
-            )));
-        }
-
-        // Extract progress marker from request metadata
-        let progress_marker: Option<ProgressMarker> =
-            params.meta.as_ref().and_then(|m| m.progress_marker.clone());
-
-        // Clone the request authority so auth, budget accounting, cancellation,
-        // and mask state remain shared with middleware and nested operations.
-        let ctx = derive_handler_context(
+        block_on(self.handle_tools_call_in_request(
             request_ctx,
-            progress_marker,
+            request_ctx.cx(),
+            params,
+            session_state,
             notification_sender,
             bidirectional_senders,
-            ProtocolEra::Legacy2024,
-        );
-
-        let handler_timeout =
-            read_handler_timeout(request_ctx.cx(), "tool_timeout", || handler.timeout())?;
-        let effective_budget = compose_handler_budget(
-            request_ctx.cx().budget(),
-            request_ctx.budget(),
-            handler_timeout,
-            dispatch_started_at,
-        );
-        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-
-        // Call the handler asynchronously - returns McpOutcome (4-valued)
-        let outcome = block_on(run_handler_in_request(
-            &ctx,
-            request_ctx.cx(),
-            effective_budget,
-            "tool",
-            |child_cx| handler.call_async_in_request(&ctx, child_cx, arguments),
-        ))?;
-        match outcome {
-            Outcome::Ok(content) => Ok(CallToolResult {
-                content: legacy_contents_from_handler(content)?,
-                is_error: false,
-                meta: None,
-                additional: BTreeMap::new(),
-            }),
-            Outcome::Err(e) => {
-                let e = sanitize_handler_error(request_ctx.cx(), "tool", e);
-                if is_framework_terminal_tool_error(e.code) {
-                    return Err(e);
-                }
-
-                // Tool errors are returned as content with is_error=true
-                Ok(CallToolResult {
-                    content: vec![LegacyContent::Text {
-                        text: e.message,
-                        annotations: None,
-                        additional: BTreeMap::new(),
-                    }],
-                    is_error: true,
-                    meta: None,
-                    additional: BTreeMap::new(),
-                })
-            }
-            Outcome::Cancelled(reason) => {
-                // Cancelled requests are reported as JSON-RPC errors; a
-                // deadline-driven cancellation keeps its distinguishable
-                // timeout message rather than collapsing into the generic
-                // cancel report.
-                if matches!(
-                    reason.kind,
-                    asupersync::CancelKind::Timeout | asupersync::CancelKind::Deadline
-                ) {
-                    Err(McpError::new(
-                        McpErrorCode::RequestCancelled,
-                        "Request timeout exceeded",
-                    ))
-                } else {
-                    Err(McpError::request_cancelled())
-                }
-            }
-            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
-        }
+        ))
     }
 
-    async fn handle_tools_call_in_request(
+    pub(crate) async fn handle_tools_call_in_request(
         &self,
         request_ctx: &McpContext,
         request_cx: &Cx,
@@ -5183,93 +5097,17 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<ReadResourceResult> {
-        debug!(
-            target: targets::HANDLER,
-            "reading resource; resource_key={}",
-            safe_log_label(&params.uri)
-        );
-
-        let dispatch_started_at = request_ctx.cx().now();
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        // Check if resource is disabled for this session
-        if !session_state.is_resource_enabled(&params.uri) {
-            return Err(McpError::new(
-                McpErrorCode::ResourceNotFound,
-                format!("Resource '{}' is disabled for this session", params.uri),
-            ));
-        }
-
-        let resolved = self
-            .resolve_resource_for_era(&params.uri, Some(ProtocolEra::Legacy2024))
-            .ok_or_else(|| McpError::resource_not_found(&params.uri))?;
-        if !resolved.legacy_enabled {
-            return Err(McpError::resource_not_found(&params.uri));
-        }
-
-        // Extract progress marker from request metadata
-        let progress_marker: Option<ProgressMarker> =
-            params.meta.as_ref().and_then(|m| m.progress_marker.clone());
-
-        // Clone the request authority so auth, budget accounting, cancellation,
-        // and mask state remain shared with middleware and nested operations.
-        let ctx = derive_handler_context(
+        block_on(self.handle_resources_read_in_request(
             request_ctx,
-            progress_marker,
+            request_ctx.cx(),
+            params,
+            session_state,
             notification_sender,
             bidirectional_senders,
-            ProtocolEra::Legacy2024,
-        );
-
-        let handler_timeout = read_handler_timeout(request_ctx.cx(), "resource_timeout", || {
-            resolved.handler.timeout()
-        })?;
-        let effective_budget = compose_handler_budget(
-            request_ctx.cx().budget(),
-            request_ctx.budget(),
-            handler_timeout,
-            dispatch_started_at,
-        );
-        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-
-        // Read the resource asynchronously - returns McpOutcome (4-valued)
-        let outcome = block_on(run_handler_in_request(
-            &ctx,
-            request_ctx.cx(),
-            effective_budget,
-            "resource",
-            |child_cx| {
-                resolved.handler.read_async_with_uri_in_request(
-                    &ctx,
-                    child_cx,
-                    &params.uri,
-                    &resolved.params,
-                )
-            },
-        ))?;
-
-        // Convert 4-valued Outcome to McpResult for JSON-RPC response
-        let contents = match outcome {
-            Outcome::Ok(contents) => contents,
-            Outcome::Err(error) => {
-                return Err(sanitize_handler_error(request_ctx.cx(), "resource", error));
-            }
-            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-            Outcome::Panicked(_payload) => {
-                return Err(sanitized_handler_panic(request_ctx.cx(), "resource"));
-            }
-        };
-
-        Ok(ReadResourceResult {
-            contents: legacy_resource_contents_from_handler(contents)?,
-            meta: None,
-            additional: BTreeMap::new(),
-        })
+        ))
     }
 
-    async fn handle_resources_read_in_request(
+    pub(crate) async fn handle_resources_read_in_request(
         &self,
         request_ctx: &McpContext,
         request_cx: &Cx,
@@ -5550,97 +5388,17 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<GetPromptResult> {
-        debug!(
-            target: targets::HANDLER,
-            "getting prompt; prompt_key={}; arguments_present={}",
-            safe_log_label(&params.name),
-            params.arguments.is_some()
-        );
-
-        let dispatch_started_at = request_ctx.cx().now();
-        if let Some(error) = budget_error(request_ctx) {
-            return Err(error);
-        }
-
-        // Check if prompt is disabled for this session
-        if !session_state.is_prompt_enabled(&params.name) {
-            return Err(McpError::new(
-                McpErrorCode::PromptNotFound,
-                format!("Prompt '{}' is disabled for this session", params.name),
-            ));
-        }
-
-        // Find the prompt handler
-        let handler = self.prompts.get(&params.name).ok_or_else(|| {
-            McpError::new(
-                fastmcp_core::McpErrorCode::PromptNotFound,
-                format!("Prompt not found: {}", params.name),
-            )
-        })?;
-        if self.final_only_prompts.contains(&params.name) {
-            return Err(McpError::new(
-                fastmcp_core::McpErrorCode::PromptNotFound,
-                format!("Prompt not found: {}", params.name),
-            ));
-        }
-        let description = crate::catch_extension_unwind(|| handler.definition().description)
-            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
-
-        // Extract progress marker from request metadata
-        let progress_marker: Option<ProgressMarker> =
-            params.meta.as_ref().and_then(|m| m.progress_marker.clone());
-
-        // Clone the request authority so auth, budget accounting, cancellation,
-        // and mask state remain shared with middleware and nested operations.
-        let ctx = derive_handler_context(
+        block_on(self.handle_prompts_get_in_request(
             request_ctx,
-            progress_marker,
+            request_ctx.cx(),
+            params,
+            session_state,
             notification_sender,
             bidirectional_senders,
-            ProtocolEra::Legacy2024,
-        );
-
-        let handler_timeout =
-            read_handler_timeout(request_ctx.cx(), "prompt_timeout", || handler.timeout())?;
-        let effective_budget = compose_handler_budget(
-            request_ctx.cx().budget(),
-            request_ctx.budget(),
-            handler_timeout,
-            dispatch_started_at,
-        );
-        let ctx = ctx.with_operation_deadline(effective_budget.deadline);
-
-        // Get the prompt asynchronously - returns McpOutcome (4-valued)
-        let arguments = params.arguments.unwrap_or_default();
-        let outcome = block_on(run_handler_in_request(
-            &ctx,
-            request_ctx.cx(),
-            effective_budget,
-            "prompt",
-            |child_cx| handler.get_async_in_request(&ctx, child_cx, arguments),
-        ))?;
-
-        // Convert 4-valued Outcome to McpResult for JSON-RPC response
-        let messages = match outcome {
-            Outcome::Ok(messages) => messages,
-            Outcome::Err(error) => {
-                return Err(sanitize_handler_error(request_ctx.cx(), "prompt", error));
-            }
-            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-            Outcome::Panicked(_payload) => {
-                return Err(sanitized_handler_panic(request_ctx.cx(), "prompt"));
-            }
-        };
-
-        Ok(GetPromptResult {
-            description,
-            messages: legacy_prompt_messages_from_handler(messages)?,
-            meta: None,
-            additional: BTreeMap::new(),
-        })
+        ))
     }
 
-    async fn handle_prompts_get_in_request(
+    pub(crate) async fn handle_prompts_get_in_request(
         &self,
         request_ctx: &McpContext,
         request_cx: &Cx,
