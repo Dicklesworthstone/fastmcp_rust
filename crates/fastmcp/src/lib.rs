@@ -1360,6 +1360,27 @@ pub mod auto {
         }
 
         #[must_use]
+        pub fn on_startup<F, E>(self, hook: F) -> Self
+        where
+            F: FnOnce() -> Result<(), E> + Send + 'static,
+            E: std::error::Error + Send + Sync + 'static,
+        {
+            Self {
+                inner: self.inner.on_startup(hook),
+            }
+        }
+
+        #[must_use]
+        pub fn on_shutdown<F>(self, hook: F) -> Self
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_shutdown(hook),
+            }
+        }
+
+        #[must_use]
         pub fn mask_error_details(self, enabled: bool) -> Self {
             Self {
                 inner: self.inner.mask_error_details(enabled),
@@ -5070,6 +5091,29 @@ pub mod modern {
         pub fn middleware<M: Middleware + 'static>(self, middleware: M) -> Self {
             Self {
                 inner: self.inner.middleware(middleware),
+            }
+        }
+
+        /// Runs once when the bound HTTP listener begins serving.
+        #[must_use]
+        pub fn on_startup<F, E>(self, hook: F) -> Self
+        where
+            F: FnOnce() -> Result<(), E> + Send + 'static,
+            E: std::error::Error + Send + Sync + 'static,
+        {
+            Self {
+                inner: self.inner.on_startup(hook),
+            }
+        }
+
+        /// Runs once when the bound HTTP listener shuts down cooperatively.
+        #[must_use]
+        pub fn on_shutdown<F>(self, hook: F) -> Self
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_shutdown(hook),
             }
         }
 
