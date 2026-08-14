@@ -32,15 +32,16 @@ use fastmcp_rust::{
 use fastmcp_rust::{
     AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
     ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
-    ContentBlock, CoreResult, Cx, EmbeddedResourceContents, FinalCoreResult,
+    ContentBlock, CoreResult, Cx, DuplicateBehavior, EmbeddedResourceContents, FinalCoreResult,
     FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalResourceTemplate,
     FinalRootsContextExt, FinalSamplingContextExt, FinalToolOutcome, HttpNonquiescentShutdown,
     HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext,
     McpError, McpErrorCode, McpRequestCancellation, McpResult, Middleware, MiddlewareDecision,
     ModernHttpResponseKind, ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage,
-    ProtocolEra, ProtocolPolicy, Resource, ResourceContent, ResourceHandler, ResourceTemplate,
-    Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, caching,
-    core, legacy_2024, modern, prompt, providers, rate_limiting, resource, tool, transform,
+    ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
+    ResourceTemplate, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool,
+    ToolAnnotations, ToolHandler, auto, caching, core, legacy_2024, modern, prompt, providers,
+    rate_limiting, resource, tool, transform,
 };
 #[cfg(feature = "proxy")]
 use fastmcp_rust::{ClientInfo, ProxyClient, StdioSubscriptionEvent};
@@ -59,6 +60,11 @@ const PUBLIC_HTTP_TOOL_TEXT: &str = "tool:cross-era";
 const PUBLIC_HTTP_RESOURCE_TEXT: &str = "resource:deterministic";
 const PUBLIC_HTTP_PROMPT_TEXT: &str = "prompt:cross-era";
 const PUBLIC_HTTP_COMPLETION_VALUE: &str = "cross-era-completion";
+const PUBLIC_HTTP_AUTH_TOOL_NAME: &str = "public-http-e2e-auth";
+const PUBLIC_HTTP_AUTH_SUBJECT: &str = "e2e-native-http-principal";
+const PUBLIC_HTTP_ICON_TOOL_NAME: &str = "public-http-e2e-icon";
+const PUBLIC_HTTP_PLAIN_TOOL_NAME: &str = "public-http-e2e-plain";
+const PUBLIC_HTTP_ICON_SRC: &str = "https://example.test/e2e-icon.png";
 
 /// The deterministic user handler exercised through both public HTTP facades.
 #[tool(name = "public-http-e2e-tool", tags = ["cursor"])]
@@ -223,6 +229,114 @@ impl ToolHandler for CountingPublicHttpValue {
     fn call(&self, context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         self.counters.tool.fetch_add(1, Ordering::SeqCst);
         PublicHttpValue.call(context, arguments)
+    }
+}
+
+/// Second registration of the same catalog name, used to prove on_duplicate.
+struct ReplacedPublicHttpValue;
+
+impl ToolHandler for ReplacedPublicHttpValue {
+    fn definition(&self) -> Tool {
+        PublicHttpValue.definition()
+    }
+
+    fn call(&self, _context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let value = arguments
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        Ok(vec![Content::text(format!("replaced:{value}"))])
+    }
+}
+
+/// Returns the committed native-HTTP `AuthContext` subject.
+struct PublicHttpAuthSubject {
+    counters: Arc<PublicHttpHandlerCallCounters>,
+}
+
+impl ToolHandler for PublicHttpAuthSubject {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_AUTH_TOOL_NAME.to_owned(),
+            description: Some("Returns the committed native HTTP auth subject".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, context: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        self.counters.tool.fetch_add(1, Ordering::SeqCst);
+        let subject = context
+            .auth()
+            .and_then(|auth| auth.subject)
+            .unwrap_or_else(|| "anonymous".to_owned());
+        Ok(vec![Content::text(format!("subject:{subject}"))])
+    }
+}
+
+/// Advertises exact-final catalog icons, title, and annotations.
+struct PublicHttpIconTool {
+    icons: Vec<RawIcon>,
+}
+
+impl ToolHandler for PublicHttpIconTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_ICON_TOOL_NAME.to_owned(),
+            description: Some("Catalog metadata tool with final icons".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: Some("1.2.3".to_owned()),
+            tags: vec!["catalog".to_owned()],
+            annotations: Some(ToolAnnotations::new().read_only(true).idempotent(true)),
+        }
+    }
+
+    fn final_title(&self) -> Option<&str> {
+        Some("Icon Tool")
+    }
+
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        Some(&self.icons)
+    }
+
+    fn call(
+        &self,
+        _context: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("icon")])
+    }
+}
+
+/// Near-identical peer that advertises no final icons, title, or annotations.
+struct PublicHttpPlainTool;
+
+impl ToolHandler for PublicHttpPlainTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_PLAIN_TOOL_NAME.to_owned(),
+            description: Some("Catalog metadata peer without final icons".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(
+        &self,
+        _context: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("plain")])
     }
 }
 
@@ -8178,6 +8292,71 @@ fn e2e_public_http_official_tasks_create_get_and_cancel_on_bind_http() {
     let _ = missing_cancel;
     next_id += 1;
 
+    let wrong_update: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"action": "accept"}}))
+            .expect("the planted-wrong Tasks update payload is typed");
+    let rejected_update = runtime_block_on_bounded(
+        &cx,
+        client.update_task(
+            &cx,
+            RequestId::Number(next_id),
+            &observed.task,
+            wrong_update,
+            1 << 20,
+        ),
+    )
+    .expect_err("changing only the input response kind must not resume the created Task");
+    let _ = rejected_update;
+    next_id += 1;
+
+    let still_waiting = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(next_id), task_id.clone(), 1 << 20),
+    )
+    .expect("a rejected tasks/update must leave the created Task in place");
+    next_id += 1;
+    assert!(
+        matches!(still_waiting.task, FinalTask::InputRequired { .. }),
+        "a rejected tasks/update must not leave the input_required Task: {still_waiting:?}"
+    );
+
+    let responses: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"roots": []}}))
+            .expect("the public final roots response is typed");
+    runtime_block_on_bounded(
+        &cx,
+        client.update_task(
+            &cx,
+            RequestId::Number(next_id),
+            &observed.task,
+            responses,
+            1 << 20,
+        ),
+    )
+    .expect("live bind_http must serve tasks/update of the created Task");
+    next_id += 1;
+
+    let working_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(&cx, RequestId::Number(next_id), task_id.clone(), 1 << 20),
+        )
+        .expect("live bind_http must keep serving tasks/get after update");
+        next_id = next_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::Working(_)) {
+            break;
+        }
+        if Instant::now() >= working_deadline {
+            panic!(
+                "live bind_http must observe the working Task after a matching update: {observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
     runtime_block_on_bounded(
         &cx,
         client.cancel_task(&cx, RequestId::Number(next_id), task_id.clone(), 1 << 20),
@@ -8206,6 +8385,143 @@ fn e2e_public_http_official_tasks_create_get_and_cancel_on_bind_http() {
 
     drop(client);
     server.shutdown();
+}
+
+fn spawn_modern_duplicate_http_server(behavior: DuplicateBehavior) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("duplicate HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-duplicate", "1.0.0")
+                .on_duplicate(behavior)
+                .tool(PublicHttpValue)
+                .tool(ReplacedPublicHttpValue)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("duplicate facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("duplicate facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("duplicate HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("duplicate facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("duplicate facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("duplicate facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("duplicate facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_on_duplicate_error_keeps_first_and_replace_installs_second() {
+    let cx = Cx::for_request();
+
+    let keep_server = spawn_modern_duplicate_http_server(DuplicateBehavior::Error);
+    let mut keep_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-duplicate-error", "1.0.0")
+            .connect_http_with_cx(public_http_target(keep_server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the Error-on-duplicate HTTP server");
+    let kept = runtime_block_on_bounded(
+        &cx,
+        keep_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("Error must keep the first registration callable");
+    assert!(
+        kept.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "on_duplicate Error must keep the first handler: {kept:?}"
+    );
+    drop(keep_client);
+    keep_server.shutdown();
+
+    let replace_server = spawn_modern_duplicate_http_server(DuplicateBehavior::Replace);
+    let mut replace_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-duplicate-replace", "1.0.0")
+            .connect_http_with_cx(public_http_target(replace_server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the Replace-on-duplicate HTTP server");
+    let replaced = runtime_block_on_bounded(
+        &cx,
+        replace_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("Replace must install the second registration");
+    assert!(
+        replaced.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "replaced:alpha",
+            _ => false,
+        }),
+        "changing only on_duplicate to Replace must reach the second handler: {replaced:?}"
+    );
+    drop(replace_client);
+    replace_server.shutdown();
 }
 
 fn spawn_modern_cache_http_server() -> HttpServerFixture {
@@ -8622,6 +8938,530 @@ fn e2e_public_http_resource_and_prompt_list_changed_are_retained_on_incremental_
         )),
         "live bind_http must retain notifications/prompts/list_changed: {kinds:?}"
     );
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_modern_auth_admission_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("auth admission HTTP server control receiver went away".to_owned());
+            }
+            let verifier = StaticTokenVerifier::new([(
+                "alpha",
+                AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+            )])
+            .expect("the deterministic native bearer verifier is valid")
+            .with_allowed_schemes(["Bearer"])
+            .expect("the bearer scheme allowlist is valid");
+            let server = modern::ServerBuilder::new("facade-http-auth-admission", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(verifier))
+                .tool(PublicHttpAuthSubject {
+                    counters: tool_calls,
+                })
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("auth admission facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("auth admission facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("auth admission HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("auth admission facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("auth admission facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("auth admission facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("auth admission facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_static_token_refuses_missing_and_wrong_and_commits_subject() {
+    const MAX_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+
+    fn exchange(address: SocketAddr, authorization: Option<&str>, body: &[u8]) -> Vec<u8> {
+        let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+            .expect("native HTTP client connects to the auth admission listener");
+        stream
+            .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client read deadline is configured");
+        stream
+            .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client write deadline is configured");
+        let authorization_header =
+            authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\n{authorization_header}Accept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {PUBLIC_HTTP_AUTH_TOOL_NAME}\r\nContent-Length: {}\r\n\r\n",
+            modern::PROTOCOL_VERSION,
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(body))
+            .expect("native HTTP request commits to the auth admission listener");
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("native HTTP response reads within its configured deadline");
+            if read == 0 {
+                break;
+            }
+            assert!(
+                response
+                    .len()
+                    .checked_add(read)
+                    .is_some_and(|size| size <= MAX_NATIVE_HTTP_RESPONSE_BYTES),
+                "native HTTP response exceeds the test's bounded response budget"
+            );
+            response.extend_from_slice(&buffer[..read]);
+        }
+        response
+    }
+
+    fn response_headers(response: &[u8]) -> &str {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("native HTTP response contains a complete header terminator");
+        std::str::from_utf8(&response[..header_end])
+            .expect("native HTTP response headers are ASCII")
+    }
+
+    fn response_json_body(response: &[u8]) -> serde_json::Value {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("native HTTP response contains a complete header terminator");
+        let headers = std::str::from_utf8(&response[..header_end])
+            .expect("native HTTP response headers are ASCII");
+        let mut content_length = None;
+        let mut chunked = false;
+        for header in headers.lines().skip(1) {
+            let (name, value) = header
+                .split_once(':')
+                .expect("native HTTP response header has a field delimiter");
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("native HTTP Content-Length is a valid byte count"),
+                );
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked = true;
+            }
+        }
+        let body = &response[header_end + 4..];
+        let decoded = if chunked {
+            let mut cursor = 0;
+            let mut decoded = Vec::new();
+            loop {
+                let size_end = body[cursor..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                    .map(|offset| cursor + offset)
+                    .expect("chunked response contains a complete chunk-size line");
+                let size_line = std::str::from_utf8(&body[cursor..size_end])
+                    .expect("chunked response chunk size is ASCII");
+                let size =
+                    usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+                        .expect("chunked response chunk size is hexadecimal");
+                cursor = size_end + 2;
+                if size == 0 {
+                    return serde_json::from_slice(&decoded)
+                        .expect("authenticated tool response is JSON-RPC");
+                }
+                let chunk_end = cursor
+                    .checked_add(size)
+                    .expect("chunked response chunk length does not overflow");
+                decoded.extend_from_slice(&body[cursor..chunk_end]);
+                cursor = chunk_end + 2;
+            }
+        } else {
+            let content_length = content_length
+                .expect("native HTTP response uses Content-Length or chunked framing");
+            body[..content_length].to_vec()
+        };
+        serde_json::from_slice(&decoded).expect("authenticated tool response is JSON-RPC")
+    }
+
+    let server = spawn_modern_auth_admission_http_server();
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("exact-modern tool request serializes");
+
+    let missing = exchange(server.address(), None, &tool_body);
+    assert!(
+        missing.starts_with(b"HTTP/1.1 401"),
+        "missing Authorization must be refused before dispatch: {}",
+        String::from_utf8_lossy(&missing)
+    );
+    assert!(
+        response_headers(&missing).lines().any(|header| header
+            .to_ascii_lowercase()
+            .starts_with("www-authenticate:")
+            && header.to_ascii_lowercase().contains("bearer")),
+        "the missing-token challenge must advertise Bearer: {}",
+        String::from_utf8_lossy(&missing)
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "missing Authorization must not invoke the authenticated handler"
+    );
+
+    let wrong = exchange(server.address(), Some("Bearer beta"), &tool_body);
+    assert!(
+        wrong.starts_with(b"HTTP/1.1 401"),
+        "changing only the bearer token must be refused before dispatch: {}",
+        String::from_utf8_lossy(&wrong)
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "a wrong bearer token must not invoke the authenticated handler"
+    );
+
+    let admitted = exchange(server.address(), Some("Bearer alpha"), &tool_body);
+    assert!(
+        admitted.starts_with(b"HTTP/1.1 200"),
+        "the matching bearer token must admit tools/call: {}",
+        String::from_utf8_lossy(&admitted)
+    );
+    let admitted = response_json_body(&admitted);
+    assert!(
+        admitted.get("error").is_none(),
+        "the matching bearer token must reach the handler: {admitted}"
+    );
+    let content = admitted["result"]["content"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        content.iter().any(|block| {
+            block["text"].as_str() == Some(&format!("subject:{PUBLIC_HTTP_AUTH_SUBJECT}"))
+        }),
+        "admitted native HTTP must commit the verifier subject into ctx.auth(): {admitted}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "only the matching bearer token may invoke the authenticated handler"
+    );
+    server.shutdown();
+}
+
+fn spawn_modern_catalog_metadata_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("catalog metadata HTTP server control receiver went away".to_owned());
+            }
+            let icons = vec![
+                RawIcon::try_new(PUBLIC_HTTP_ICON_SRC).expect("the catalog icon source is valid"),
+            ];
+            let server = modern::ServerBuilder::new("facade-http-catalog-metadata", "1.0.0")
+                .tool(PublicHttpIconTool { icons })
+                .tool(PublicHttpPlainTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("catalog metadata facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("catalog metadata facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("catalog metadata HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("catalog metadata facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("catalog metadata facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("catalog metadata facade HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("catalog metadata facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_list_tools_retains_final_icons_title_and_annotations() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_catalog_metadata_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-catalog-metadata", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the catalog metadata HTTP server");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("live bind_http must list the catalog metadata tools");
+    let icon_tool = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_ICON_TOOL_NAME)
+        .expect("the icon tool must remain on the live catalog");
+    let plain_tool = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_PLAIN_TOOL_NAME)
+        .expect("the plain peer tool must remain on the live catalog");
+
+    assert_eq!(icon_tool.title.as_deref(), Some("Icon Tool"));
+    let icons = icon_tool
+        .icons
+        .as_ref()
+        .expect("the icon tool must advertise its exact-final icons");
+    assert_eq!(icons.len(), 1);
+    assert_eq!(icons[0].src.as_str(), PUBLIC_HTTP_ICON_SRC);
+    let annotations = icon_tool
+        .annotations
+        .as_ref()
+        .expect("the icon tool must retain its projected annotations");
+    assert_eq!(annotations.read_only, Some(true));
+    assert_eq!(annotations.idempotent, Some(true));
+    assert_eq!(annotations.destructive, None);
+
+    assert_eq!(plain_tool.title, None);
+    assert_eq!(plain_tool.icons, None);
+    assert_eq!(plain_tool.annotations, None);
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_two_clients_call_the_same_tool_independently() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_facade_http_server(false, None, false);
+    let mut first = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-multi-client-a", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the first ModernOnly public facade connects to the shared HTTP server");
+    let mut second = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-multi-client-b", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the second ModernOnly public facade connects to the same HTTP server");
+
+    let first_result = runtime_block_on_bounded(
+        &cx,
+        first.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("the first live client must reach the shared tool");
+    let second_result = runtime_block_on_bounded(
+        &cx,
+        second.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "beta"})),
+    )
+    .expect("the second live client must reach the shared tool independently");
+    assert!(
+        first_result.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the first client must keep its own tools/call result: {first_result:?}"
+    );
+    assert!(
+        second_result.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:beta",
+            _ => false,
+        }),
+        "changing only the second client's arguments must not reuse the first result: {second_result:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        2,
+        "two independent HTTP clients must each invoke the shared handler"
+    );
+
+    drop(first);
+    drop(second);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_ping_then_tools_call_on_bind_http() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_facade_http_server(false, None, false);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-ping", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects before ping");
+
+    runtime_block_on_bounded(&cx, client.ping(&cx)).expect("live bind_http must answer ping");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "ping must not invoke a tools/call handler"
+    );
+
+    let called = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("tools/call must still be admitted after ping");
+    assert!(
+        called.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "a later tools/call must keep its handler result after ping: {called:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "only the later tools/call may invoke the handler"
+    );
+
     drop(client);
     server.shutdown();
 }
