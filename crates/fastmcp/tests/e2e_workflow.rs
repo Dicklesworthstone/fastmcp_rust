@@ -777,14 +777,17 @@ fn public_facade_proxy_builders_preserve_pinned_eras() {
     let _ = auto::ServerBuilder::as_proxy;
     let _ = auto::ServerBuilder::as_proxy_raw;
     let _ = auto::ServerBuilder::proxy_typed;
+    let _ = auto::ServerBuilder::as_proxy_typed;
     let _ = modern::ServerBuilder::proxy;
     let _ = modern::ServerBuilder::as_proxy;
     let _ = modern::ServerBuilder::as_proxy_raw;
     let _ = modern::ServerBuilder::proxy_typed;
+    let _ = modern::ServerBuilder::as_proxy_typed;
     let _ = legacy_2024::ServerBuilder::proxy;
     let _ = legacy_2024::ServerBuilder::as_proxy;
     let _ = legacy_2024::ServerBuilder::as_proxy_raw;
     let _ = legacy_2024::ServerBuilder::proxy_typed;
+    let _ = legacy_2024::ServerBuilder::as_proxy_typed;
 
     let legacy_catalog = fastmcp_rust::ProxyCatalog {
         tool_catalog_era: Some(fastmcp_rust::ProtocolEra::Legacy2024),
