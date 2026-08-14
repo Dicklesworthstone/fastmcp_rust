@@ -38,10 +38,13 @@ use fastmcp_rust::{
 };
 #[cfg(feature = "proxy")]
 use fastmcp_rust::{ClientInfo, ProxyClient};
+#[cfg(feature = "tasks")]
+use fastmcp_rust::{FinalTaskId, FinalTaskWorkDescriptor, FinalToolCallOutcome, RequestId};
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
 const PUBLIC_HTTP_TOOL_NAME: &str = "public-http-e2e-tool";
+const PUBLIC_HTTP_TASK_TOOL_NAME: &str = "public-http-e2e-task";
 const PUBLIC_HTTP_LOG_TOOL_NAME: &str = "public-http-e2e-log";
 const PUBLIC_HTTP_HANDLER_LOG_TEXT: &str = "public-http-handler-info";
 const PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME: &str = "public-http-e2e-cursor-secondary";
@@ -87,6 +90,47 @@ fn public_http_instruction(_ctx: &McpContext, subject: String) -> Vec<PromptMess
             text: format!("prompt:{subject}"),
         },
     }]
+}
+
+/// Live modern HTTP tool whose official Tasks create is visible through a prefixed gateway.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct PublicHttpTaskTool;
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl ToolHandler for PublicHttpTaskTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_TASK_TOOL_NAME.to_owned(),
+            description: Some("Creates one official final Tasks operation".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("exact-2024 Tasks are unavailable")])
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        Ok(FinalToolOutcome::CreateTask {
+            work_descriptor: FinalTaskWorkDescriptor::new(json!({
+                "operation": "public-http-e2e-task",
+            }))?,
+            status_message: Some("working through the public HTTP as_proxy Tasks relay".to_owned()),
+        })
+    }
 }
 
 #[derive(Default)]
@@ -2067,6 +2111,304 @@ fn e2e_public_http_prefixed_as_proxy_forwards_prefixed_tool_and_unprefixed_resou
     );
 
     drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_task_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-task", "1.0.0")
+                .tool(PublicHttpTaskTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("task facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("task facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task HTTP server startup receiver went away".to_owned());
+            }
+            bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("task facade HTTP server stopped unexpectedly: {error}"))
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("task facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("task facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("task facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("task proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("task proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task proxy gateway HTTP server control receiver went away".to_owned());
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream, "/mcp")),
+                None,
+                None,
+                "e2e-http-task-proxy-gateway".to_owned(),
+                "e2e-http-task-proxy-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .map_err(|error| format!("task proxy gateway HTTP plan failed: {error}"))?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-live-task-upstream",
+                    "native-h1:e2e-live-task-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-http-task-proxy".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .map_err(|error| format!("live HTTP task proxy upstream connect failed: {error}"))?;
+            let catalog = proxy
+                .catalog_typed()
+                .map_err(|error| format!("live HTTP task proxy catalog failed: {error}"))?;
+            let tool_names = catalog
+                .final_tools()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !tool_names.contains(&PUBLIC_HTTP_TASK_TOOL_NAME) {
+                return Err(format!(
+                    "live HTTP task proxy catalog omitted {PUBLIC_HTTP_TASK_TOOL_NAME}: {tool_names:?}"
+                ));
+            }
+            let server = modern::ServerBuilder::new("e2e-http-task-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .map_err(|error| format!("as_proxy_typed task install failed: {error}"))?
+                .build();
+            if server.final_task_runtime().is_some() {
+                return Err(
+                    "as_proxy_typed must install the route-bound Tasks relay instead of the default in-memory store"
+                        .to_owned(),
+                );
+            }
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("task proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("task proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task proxy gateway HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("task proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("task proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("task proxy gateway HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("task proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_gets_upstream_created_task() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+
+    let mut upstream_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-task-upstream-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live task upstream HTTP server");
+    let created = runtime_block_on_bounded(
+        &cx,
+        upstream_client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("the live upstream must create one official Task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the task-capable live tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+    drop(upstream_client);
+
+    let mut gateway_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-task-gateway-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live prefixed as_proxy Tasks gateway");
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        gateway_client.get_task(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("the live prefixed gateway must forward tasks/get to the upstream store");
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "as_proxy_typed must return the upstream-created Task rather than a disconnected local store: {observed:?}"
+    );
+
+    let missing = FinalTaskId::parse("missing-upstream-task")
+        .expect("the planted-missing task id is a valid official TaskId");
+    let missing = runtime_block_on_bounded(
+        &cx,
+        gateway_client.get_task(&cx, RequestId::Number(5), missing, 1 << 20),
+    )
+    .expect_err("changing only the task id must not invent a Task on the gateway");
+    let _ = missing;
+
+    drop(gateway_client);
     gateway.shutdown();
     upstream.shutdown();
 }
