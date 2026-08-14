@@ -12425,6 +12425,10 @@ impl Client {
 
     /// Commits one raw JSON-RPC request through the negotiated shared stdio
     /// executor without waiting for its response.
+    ///
+    /// A Modern2026 session stamps the same `_meta` protocol version and
+    /// client capabilities the typed verbs already send. Callers still supply
+    /// the method body; they do not have to reconstruct era admission.
     pub fn start_multiplexed_request(
         &mut self,
         cx: &Cx,
@@ -12433,6 +12437,13 @@ impl Client {
     ) -> McpResult<StdioRequestExecution> {
         let executor = self.multiplexed_stdio_executor()?;
         executor.service(cx)?;
+        let params = match params {
+            Some(params) => Some(self.prepare_request_parameters(params)?),
+            None if self.session.selected_era() == Some(ProtocolEra::Modern2026) => {
+                Some(self.prepare_request_parameters(serde_json::json!({}))?)
+            }
+            None => None,
+        };
         executor.execute(cx, method, params)
     }
 
@@ -15092,6 +15103,28 @@ impl Client {
         )
     }
 
+    /// Lists one page of tools under a request-local cancellation domain.
+    ///
+    /// A cancellation observed before send makes no transport contact. One
+    /// observed after commit sends the selected-era cancellation control.
+    pub fn list_tools_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult> {
+        let params = ListToolsParams {
+            cursor: cursor.map(ToOwned::to_owned),
+            ..ListToolsParams::default()
+        };
+        let parameters = serde_json::to_value(params).map_err(|error| {
+            McpError::internal_error(format!(
+                "Client tools/list parameters could not serialize: {error}"
+            ))
+        })?;
+        self.request_core_with_cancellation(cx, cancellation, "tools/list", parameters, |_| {})
+    }
+
     /// Lists available tools.
     ///
     /// This convenience API follows peer cursors and returns the flattened
@@ -15244,6 +15277,33 @@ impl Client {
             meta: None,
         };
         self.send_typed_core_request("tools/call", params)
+    }
+
+    /// Calls one tool under a request-local cancellation domain.
+    ///
+    /// A cancellation observed before send makes no transport contact. One
+    /// observed after commit sends the selected-era cancellation control.
+    /// Installed modern reverse handlers are not followed on this path; use
+    /// [`Self::call_tool_typed`] or [`Self::call_tool_with_mrtr_retry`] when
+    /// the caller must resume `input_required`.
+    pub fn call_tool_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let params = CallToolParams {
+            name: name.to_string(),
+            arguments: Some(arguments),
+            meta: None,
+        };
+        let parameters = serde_json::to_value(params).map_err(|error| {
+            McpError::internal_error(format!(
+                "Client tools/call parameters could not serialize: {error}"
+            ))
+        })?;
+        self.request_core_with_cancellation(cx, cancellation, "tools/call", parameters, |_| {})
     }
 
     /// Calls a tool and follows bounded final MRTR continuations with
@@ -16100,6 +16160,15 @@ impl Client {
     /// connection.
     pub fn read_resource_typed(&mut self, uri: &str) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026)
+            && self.reverse_request_handlers.has_modern_handlers()
+        {
+            let handlers = self.reverse_request_handlers.clone();
+            let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
+            return self.read_resource_with_mrtr_retry(uri, |input_required| {
+                handlers.respond_to_input_required(&cx, input_required)
+            });
+        }
         let uri = uri.to_owned();
         let params = ReadResourceParams {
             uri: uri.clone(),
@@ -16310,6 +16379,15 @@ impl Client {
         arguments: std::collections::HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026)
+            && self.reverse_request_handlers.has_modern_handlers()
+        {
+            let handlers = self.reverse_request_handlers.clone();
+            let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
+            return self.get_prompt_with_mrtr_retry(name, arguments, |input_required| {
+                handlers.respond_to_input_required(&cx, input_required)
+            });
+        }
         let params = GetPromptParams {
             name: name.to_owned(),
             arguments: (!arguments.is_empty()).then_some(arguments),
