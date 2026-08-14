@@ -494,6 +494,11 @@ impl FinalResultCache {
             ServerNotification::ResourcesListChanged(_) => {
                 self.invalidate_result_set(&FinalCacheResultSet::Resources);
                 self.invalidate_result_set(&FinalCacheResultSet::ResourceTemplates);
+                // Catalog visibility changed. Individual resources/read
+                // entries can no longer be trusted, including session-local
+                // disable_resource mutations that publish list_changed rather
+                // than resources/updated.
+                self.invalidate_result_set(&FinalCacheResultSet::Resource(String::new()));
             }
             ServerNotification::PromptsListChanged(_) => {
                 self.invalidate_result_set(&FinalCacheResultSet::Prompts);
@@ -931,6 +936,54 @@ mod tests {
             "notifications/resources/updated",
             Some(serde_json::json!({"uri": "file:///changed.txt"})),
         ));
+        assert!(matches!(
+            cache.lookup(&resource_key),
+            FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+        ));
+    }
+
+    #[test]
+    fn resources_list_changed_invalidates_cached_resource_reads() {
+        let mut cache = FinalResultCache::default();
+        let resource_key = FinalCacheKey::new(
+            "stdio",
+            "2026-07-28",
+            "{}",
+            "{}",
+            "resources/read",
+            "{\"uri\":\"info://server\"}",
+            None,
+            1,
+            1,
+            0,
+            0,
+            CachePartitionKey::new("credential-a"),
+            FinalCacheResultSet::Resource("info://server".to_owned()),
+        );
+        let request = CoreRequest::Final(FinalCoreRequest::ResourcesRead(
+            fastmcp_protocol::FinalReadResourceParams {
+                meta: OpenMetadata::default(),
+                uri: serde_json::from_str("\"info://server\"").expect("absolute URI fixture"),
+                input_responses: None,
+                request_state: None,
+            },
+        ));
+        let result = request
+            .decode_result(
+                r#"{"resultType":"complete","contents":[],"ttlMs":100,"cacheScope":"private"}"#,
+            )
+            .expect("complete resource result is admitted");
+        let generation = cache.begin_fetch(resource_key.result_set());
+        assert_eq!(
+            cache.insert_if_current(resource_key.clone(), generation, result),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            cache.lookup(&resource_key),
+            FinalCacheLookup::Fresh(_)
+        ));
+
+        cache.invalidate_notification(&notification("notifications/resources/list_changed", None));
         assert!(matches!(
             cache.lookup(&resource_key),
             FinalCacheLookup::Miss(FinalCacheMiss::Absent)

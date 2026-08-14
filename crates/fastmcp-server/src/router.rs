@@ -4232,12 +4232,16 @@ impl Router {
     ) -> McpResult<serde_json::Value> {
         #[cfg(feature = "tasks")]
         let request_metadata = params.meta.clone();
+        let session_state = request_ctx
+            .session_state()
+            .cloned()
+            .unwrap_or_else(SessionState::new);
         let outcome = self
             .handle_tools_call_final_in_request(
                 request_ctx,
                 request_cx,
                 params,
-                SessionState::new(),
+                session_state,
                 None,
                 None,
                 resume_inputs.as_ref(),
@@ -4298,12 +4302,16 @@ impl Router {
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
+        let session_state = request_ctx
+            .session_state()
+            .cloned()
+            .unwrap_or_else(SessionState::new);
         match self
             .handle_resources_read_final_in_request(
                 request_ctx,
                 request_cx,
                 params,
-                SessionState::new(),
+                session_state,
                 None,
                 None,
                 resume_inputs.as_ref(),
@@ -4336,12 +4344,16 @@ impl Router {
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
+        let session_state = request_ctx
+            .session_state()
+            .cloned()
+            .unwrap_or_else(SessionState::new);
         match self
             .handle_prompts_get_final_in_request(
                 request_ctx,
                 request_cx,
                 params,
-                SessionState::new(),
+                session_state,
                 None,
                 None,
                 resume_inputs.as_ref(),
@@ -6350,6 +6362,83 @@ impl Router {
             debug!(
                 target: targets::HANDLER,
                 "mounted {} tools, {} resources, {} templates, {} prompts; prefix_present={}; prefix_key={}",
+                result.tools,
+                result.resources,
+                result.resource_templates,
+                result.prompts,
+                prefix.is_some(),
+                safe_log_label(prefix.unwrap_or_default())
+            );
+            self.advance_final_catalog_revision();
+        }
+
+        result
+    }
+
+    /// Mounts tools and prompts with an optional name prefix, and keeps
+    /// resource and template keys exact.
+    ///
+    /// A nonempty `{prefix}/{uri}` key is not an absolute final URI. Callers
+    /// that need a modern resource catalog after namespacing tools/prompts
+    /// must preserve the child's resource URIs instead of prefixing them.
+    pub fn mount_namespaced_with_behavior(
+        &mut self,
+        other: Router,
+        prefix: Option<&str>,
+        behavior: crate::DuplicateBehavior,
+    ) -> MountResult {
+        let mut preflight = self.mount_preflight(&other, prefix, behavior, MountSelection::Tools);
+        preflight.merge(self.mount_preflight(&other, prefix, behavior, MountSelection::Prompts));
+        preflight.merge(self.mount_preflight(&other, None, behavior, MountSelection::Resources));
+        if !preflight.is_success() {
+            return preflight;
+        }
+
+        let mut result = preflight;
+        let Router {
+            tools,
+            tool_order,
+            resources,
+            final_only_resources,
+            final_resources,
+            resource_order,
+            prompts,
+            final_only_prompts,
+            final_prompts,
+            prompt_order,
+            resource_templates,
+            resource_template_order,
+            ..
+        } = other;
+
+        result.merge(self.mount_tools_from(tools, tool_order, prefix, behavior));
+        result.merge(self.mount_resources_from(
+            resources,
+            final_only_resources,
+            final_resources,
+            resource_order,
+            None,
+            behavior,
+        ));
+        result.merge(self.mount_resource_templates_from(
+            resource_templates,
+            resource_template_order,
+            None,
+            behavior,
+        ));
+        result.merge(self.mount_prompts_from(
+            prompts,
+            final_only_prompts,
+            final_prompts,
+            prompt_order,
+            prefix,
+            behavior,
+        ));
+
+        if result.has_components() {
+            debug!(
+                target: targets::HANDLER,
+                "mounted namespaced {} tools, {} resources, {} templates, {} prompts; prefix_present={}; prefix_key={}",
                 result.tools,
                 result.resources,
                 result.resource_templates,
@@ -12387,6 +12476,24 @@ mod router_tests {
         assert_eq!(uri, "ns/file:///a");
         assert_eq!(text, "content");
         assert!(additional.is_empty());
+    }
+
+    #[test]
+    fn mount_namespaced_prefixes_tools_and_keeps_resource_uris() {
+        let mut main = Router::new();
+        let mut sub = Router::new();
+        sub.add_tool(NamedTool::new("query"));
+        sub.add_resource(NamedResource::new("file:///a"));
+        let result =
+            main.mount_namespaced_with_behavior(sub, Some("ns"), crate::DuplicateBehavior::Replace);
+        assert!(result.is_success());
+        assert_eq!(result.tools, 1);
+        assert_eq!(result.resources, 1);
+        assert!(main.get_tool("ns/query").is_some());
+        assert!(main.get_tool("query").is_none());
+        assert!(main.get_resource("file:///a").is_some());
+        assert!(main.get_resource("ns/file:///a").is_none());
+        assert!(main.final_resources.contains_key("file:///a"));
     }
 
     #[test]
@@ -19998,6 +20105,75 @@ mod router_tests {
         assert!(legacy_resources.resources.is_empty());
         assert!(legacy_templates.resource_templates.is_empty());
         assert!(legacy_prompts.prompts.is_empty());
+
+        let later_inbound = InboundRequestContext::with_modern_connection(
+            request_ctx.cx().clone(),
+            630,
+            InboundRequestTransport::Stdio,
+            &connection,
+        );
+        let later_ctx = later_inbound.request_context();
+        let read_error = router
+            .dispatch_stateless(
+                &later_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "uri": "file:///connection-scoped-resource",
+                    })),
+                    631_i64,
+                ),
+            )
+            .expect_err(
+                "a later inbound on the same modern connection must refuse the disabled resource",
+            );
+        assert_eq!(read_error.code, McpErrorCode::ResourceNotFound);
+        assert!(
+            read_error.message.contains("disabled"),
+            "the refused resource read must keep the session-disabled message: {read_error:?}"
+        );
+        let prompt_error = router
+            .dispatch_stateless(
+                &later_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/get",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "name": "connection-scoped-prompt",
+                    })),
+                    632_i64,
+                ),
+            )
+            .expect_err(
+                "a later inbound on the same modern connection must refuse the disabled prompt",
+            );
+        assert_eq!(prompt_error.code, McpErrorCode::PromptNotFound);
+        assert!(
+            prompt_error.message.contains("disabled"),
+            "the refused prompt get must keep the session-disabled message: {prompt_error:?}"
+        );
+        let tool_error = router
+            .dispatch_stateless(
+                &later_ctx,
+                &JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "name": "connection-scoped-tool",
+                        "arguments": {},
+                    })),
+                    633_i64,
+                ),
+            )
+            .expect_err(
+                "a later inbound on the same modern connection must refuse the disabled tool",
+            );
+        assert_eq!(tool_error.code, McpErrorCode::MethodNotFound);
+        assert!(
+            tool_error.message.contains("disabled"),
+            "the refused tool call must keep the session-disabled message: {tool_error:?}"
+        );
     }
 
     #[test]

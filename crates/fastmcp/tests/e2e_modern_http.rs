@@ -23,6 +23,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_rust::server::FinalMethodOutcome;
+#[cfg(feature = "tasks")]
+use fastmcp_rust::{
+    ApplicationTaskSupervisor, FinalTask, FinalTaskId, FinalTaskInputRequests,
+    FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolCallOutcome, RequestId,
+};
 use fastmcp_rust::{
     AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
     ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
@@ -37,11 +43,12 @@ use fastmcp_rust::{
     legacy_2024, modern, prompt, providers, resource, tool,
 };
 #[cfg(feature = "proxy")]
-use fastmcp_rust::{ClientInfo, ProxyClient};
+use fastmcp_rust::{ClientInfo, ProxyClient, StdioSubscriptionEvent};
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
 const PUBLIC_HTTP_TOOL_NAME: &str = "public-http-e2e-tool";
+const PUBLIC_HTTP_TASK_TOOL_NAME: &str = "public-http-e2e-task";
 const PUBLIC_HTTP_LOG_TOOL_NAME: &str = "public-http-e2e-log";
 const PUBLIC_HTTP_HANDLER_LOG_TEXT: &str = "public-http-handler-info";
 const PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME: &str = "public-http-e2e-cursor-secondary";
@@ -87,6 +94,94 @@ fn public_http_instruction(_ctx: &McpContext, subject: String) -> Vec<PromptMess
             text: format!("prompt:{subject}"),
         },
     }]
+}
+
+/// Live modern HTTP tool whose official Tasks create is visible through a prefixed gateway.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct PublicHttpTaskTool;
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl ToolHandler for PublicHttpTaskTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_TASK_TOOL_NAME.to_owned(),
+            description: Some("Creates one official final Tasks operation".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("exact-2024 Tasks are unavailable")])
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        true
+    }
+
+    fn call_final_outcome(
+        &self,
+        _ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        Ok(FinalToolOutcome::CreateTask {
+            work_descriptor: FinalTaskWorkDescriptor::new(json!({
+                "operation": "public-http-e2e-task",
+            }))?,
+            status_message: Some("working through the public HTTP as_proxy Tasks relay".to_owned()),
+        })
+    }
+}
+
+/// Keeps one created official Task live until `tasks/cancel` is honored.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+struct PublicHttpHoldingTaskSupervisor;
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+impl ApplicationTaskSupervisor for PublicHttpHoldingTaskSupervisor {
+    fn resume<'a>(
+        &'a self,
+        cx: &'a Cx,
+        handoff: FinalTaskSupervisorHandoff,
+    ) -> FinalTaskSupervisorFuture<'a> {
+        Box::pin(async move {
+            match handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => {
+                    let requests: FinalTaskInputRequests = serde_json::from_value(json!({
+                        "roots": {"method": "roots/list"}
+                    }))
+                    .map_err(|error| {
+                        McpError::internal_error(format!(
+                            "public HTTP as_proxy Tasks input descriptor is invalid: {error}"
+                        ))
+                    })?;
+                    initial.require_input(
+                        requests,
+                        Some(
+                            "awaiting roots through the public HTTP as_proxy Tasks relay"
+                                .to_owned(),
+                        ),
+                    )?;
+                }
+                FinalTaskSupervisorHandoff::Resumed(accepted) => loop {
+                    if accepted.is_cancellation_requested()? {
+                        accepted.honor_cancellation(Some(
+                            "cancelled through the public HTTP as_proxy Tasks relay".to_owned(),
+                        ))?;
+                        break;
+                    }
+                    cx.checkpoint()
+                        .map_err(|error| McpError::internal_error(error.to_string()))?;
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                },
+            }
+            Ok(())
+        })
+    }
 }
 
 #[derive(Default)]
@@ -670,19 +765,13 @@ fn spawn_modern_mounted_http_server() -> HttpServerFixture {
                 cx.set_cancel_requested(true);
                 return Err("mounted HTTP server control receiver went away".to_owned());
             }
-            let tool_child = modern::ServerBuilder::new("facade-mounted-tools", "1.0.0")
+            let child = modern::ServerBuilder::new("facade-mounted-child", "1.0.0")
                 .tool(PublicHttpValue)
-                .build();
-            let prompt_child = modern::ServerBuilder::new("facade-mounted-prompts", "1.0.0")
                 .prompt(PublicHttpInstructionPrompt)
-                .build();
-            let resource_child = modern::ServerBuilder::new("facade-mounted-resource", "1.0.0")
                 .resource(PublicHttpSnapshotResource)
                 .build();
             let server = modern::ServerBuilder::new("facade-mounted-parent", "1.0.0")
-                .mount_tools(tool_child, Some("child"))
-                .mount_prompts(prompt_child, Some("child"))
-                .mount_resources(resource_child, None)
+                .mount(child, Some("child"))
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -1617,6 +1706,14 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
 
 #[cfg(feature = "proxy")]
 fn spawn_modern_http_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    spawn_modern_http_proxy_gateway_with_prefix(upstream, None)
+}
+
+#[cfg(feature = "proxy")]
+fn spawn_modern_http_proxy_gateway_with_prefix(
+    upstream: SocketAddr,
+    prefix: Option<&'static str>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -1711,10 +1808,25 @@ fn spawn_modern_http_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
                     "live HTTP proxy catalog omitted {PUBLIC_HTTP_RESOURCE_URI}: {resource_uris:?}"
                 ));
             }
-            let server = modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
-                .proxy_typed(proxy, catalog)
-                .map_err(|error| format!("proxy_typed install failed: {error}"))?
-                .build();
+            let server = match prefix {
+                Some(prefix) => {
+                    let server = modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
+                        .as_proxy_typed(prefix, proxy, catalog)
+                        .map_err(|error| format!("as_proxy_typed install failed: {error}"))?
+                        .build();
+                    if server.final_task_runtime().is_some() {
+                        return Err(
+                            "as_proxy_typed must install the route-bound Tasks relay instead of the default in-memory store"
+                                .to_owned(),
+                        );
+                    }
+                    server
+                }
+                None => modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
+                    .proxy_typed(proxy, catalog)
+                    .map_err(|error| format!("proxy_typed install failed: {error}"))?
+                    .build(),
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -1908,6 +2020,1609 @@ fn e2e_public_http_proxy_gateway_forwards_live_bind_http_tool() {
     upstream.shutdown();
 }
 
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_forwards_prefixed_tool_and_unprefixed_resource() {
+    const PREFIXED_TOOL_NAME: &str = "ext/public-http-e2e-tool";
+    const PREFIXED_PROMPT_NAME: &str = "ext/public-http-e2e-prompt";
+
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_facade_http_server(false, None, true);
+    let gateway = spawn_modern_http_proxy_gateway_with_prefix(upstream.address(), Some("ext"));
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-as-proxy-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live prefixed as_proxy HTTP gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live prefixed gateway must advertise the upstream tools/list catalog");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PREFIXED_TOOL_NAME),
+        "as_proxy_typed must prefix the live upstream tool name: {listed:?}"
+    );
+    assert!(
+        !listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+        "a nonempty as_proxy prefix must not keep the unprefixed upstream tool: {listed:?}"
+    );
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PREFIXED_TOOL_NAME,
+            json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+        ),
+    )
+    .expect("the live prefixed gateway must forward tools/call to the upstream bind_http server");
+    assert!(
+        result.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == PUBLIC_HTTP_TOOL_TEXT,
+            _ => false,
+        }),
+        "the prefixed live tool must retain the upstream handler value: {result:?}"
+    );
+
+    let listed_prompts = runtime_block_on_bounded(&cx, client.list_prompts(&cx, None))
+        .expect("the live prefixed gateway must advertise the upstream prompts/list catalog");
+    assert!(
+        listed_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == PREFIXED_PROMPT_NAME),
+        "as_proxy_typed must prefix the live upstream prompt name: {listed_prompts:?}"
+    );
+    let prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PREFIXED_PROMPT_NAME,
+            HashMap::from([("subject".to_owned(), PUBLIC_HTTP_TOOL_ARGUMENT.to_owned())]),
+        ),
+    )
+    .expect("the live prefixed gateway must forward prompts/get to the upstream bind_http server");
+    let prompt = serde_json::to_value(prompt)
+        .expect("the prefixed prompt result serializes for its observable assertion");
+    assert_eq!(
+        prompt["messages"][0]["content"]["text"],
+        json!(PUBLIC_HTTP_PROMPT_TEXT),
+        "the prefixed live prompt must retain the upstream handler value: {prompt:?}"
+    );
+
+    let listed_resources = runtime_block_on_bounded(&cx, client.list_resources(&cx, None)).expect(
+        "the live prefixed gateway must advertise the exact upstream resources/list catalog",
+    );
+    assert!(
+        listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_RESOURCE_URI),
+        "as_proxy_typed must keep the exact final resource URI: {listed_resources:?}"
+    );
+    assert!(
+        listed_resources
+            .resources
+            .iter()
+            .all(|resource| { !resource.uri.as_str().starts_with("ext/") }),
+        "a nonempty as_proxy prefix must not invent a non-absolute modern resource URI: {listed_resources:?}"
+    );
+    let resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_RESOURCE_URI),
+    )
+    .expect(
+        "the live prefixed gateway must forward resources/read to the upstream bind_http server",
+    );
+    assert!(
+        matches!(
+            resource.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_RESOURCE_TEXT
+        ),
+        "the prefixed live resource must retain the upstream handler value: {:?}",
+        resource.contents
+    );
+
+    let completion = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: PREFIXED_PROMPT_NAME.to_owned(),
+                    title: "Public HTTP E2E Prompt".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                context: Some(modern::FinalCompletionContext {
+                    arguments: Some(std::collections::BTreeMap::from([(
+                        "region".to_owned(),
+                        "us-east-1".to_owned(),
+                    )])),
+                }),
+            },
+        ),
+    )
+    .expect(
+        "the live prefixed gateway must forward completion/complete to the upstream bind_http server",
+    );
+    assert_eq!(
+        completion.completion.values,
+        vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+        "the prefixed live completion must retain the upstream provider values: {completion:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_task_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task HTTP server control receiver went away".to_owned());
+            }
+            let task_runtime = FinalTaskRuntime::in_memory(
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                    .expect("task HTTP server timing policy is valid"),
+                Arc::new(|_| {}),
+            );
+            let task_runner = task_runtime
+                .install_task_service(1, Arc::new(PublicHttpHoldingTaskSupervisor))
+                .map_err(|error| format!("task HTTP server service install failed: {error}"))?;
+            let server = modern::ServerBuilder::new("facade-http-task", "1.0.0")
+                .tool(PublicHttpTaskTool)
+                .final_tasks(task_runtime)
+                .map_err(|error| format!("task HTTP server final_tasks install failed: {error}"))?
+                .build();
+            let mut service = std::pin::pin!(task_runner.run(&cx));
+            std::future::poll_fn(|task_context| match service.as_mut().poll(task_context) {
+                std::task::Poll::Pending => std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Ready(Ok(())) => {
+                    std::task::Poll::Ready(Err("task HTTP service stopped before bind".to_owned()))
+                }
+                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
+                    "task HTTP service failed before bind: {error}"
+                ))),
+            })
+            .await?;
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("task facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("task facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task HTTP server startup receiver went away".to_owned());
+            }
+            let mut serving = std::pin::pin!(bound.serve(&cx));
+            let mut service_stopped = false;
+            std::future::poll_fn(|task_context| {
+                if !service_stopped {
+                    match service.as_mut().poll(task_context) {
+                        std::task::Poll::Ready(Ok(())) if cx.checkpoint().is_ok() => {
+                            return std::task::Poll::Ready(Err(
+                                "task HTTP service stopped while the server remained live"
+                                    .to_owned(),
+                            ));
+                        }
+                        std::task::Poll::Ready(Err(error)) if cx.checkpoint().is_ok() => {
+                            return std::task::Poll::Ready(Err(format!(
+                                "task HTTP service failed while the server remained live: {error}"
+                            )));
+                        }
+                        std::task::Poll::Ready(_) => service_stopped = true,
+                        std::task::Poll::Pending => {}
+                    }
+                }
+                match serving.as_mut().poll(task_context) {
+                    std::task::Poll::Ready(Ok(shutdown)) => std::task::Poll::Ready(Ok(shutdown)),
+                    std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
+                        "task facade HTTP server stopped unexpectedly: {error}"
+                    ))),
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })
+            .await
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("task facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("task facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("task facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("task proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("task proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task proxy gateway HTTP server control receiver went away".to_owned());
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream, "/mcp")),
+                None,
+                None,
+                "e2e-http-task-proxy-gateway".to_owned(),
+                "e2e-http-task-proxy-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .map_err(|error| format!("task proxy gateway HTTP plan failed: {error}"))?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-live-task-upstream",
+                    "native-h1:e2e-live-task-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-http-task-proxy".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .map_err(|error| format!("live HTTP task proxy upstream connect failed: {error}"))?;
+            let catalog = proxy
+                .catalog_typed()
+                .map_err(|error| format!("live HTTP task proxy catalog failed: {error}"))?;
+            let tool_names = catalog
+                .final_tools()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !tool_names.contains(&PUBLIC_HTTP_TASK_TOOL_NAME) {
+                return Err(format!(
+                    "live HTTP task proxy catalog omitted {PUBLIC_HTTP_TASK_TOOL_NAME}: {tool_names:?}"
+                ));
+            }
+            let server = modern::ServerBuilder::new("e2e-http-task-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .map_err(|error| format!("as_proxy_typed task install failed: {error}"))?
+                .build();
+            if server.final_task_runtime().is_some() {
+                return Err(
+                    "as_proxy_typed must install the route-bound Tasks relay instead of the default in-memory store"
+                        .to_owned(),
+                );
+            }
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("task proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("task proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("task proxy gateway HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("task proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("task proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("task proxy gateway HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("task proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_gets_upstream_created_task() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+
+    let mut upstream_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-task-upstream-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live task upstream HTTP server");
+    let created = runtime_block_on_bounded(
+        &cx,
+        upstream_client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("the live upstream must create one official Task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the task-capable live tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+    drop(upstream_client);
+
+    let mut gateway_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-task-gateway-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live prefixed as_proxy Tasks gateway");
+
+    let input_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let mut next_get_id = 4_i64;
+    let observed = loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            gateway_client.get_task(
+                &cx,
+                RequestId::Number(next_get_id),
+                task_id.clone(),
+                1 << 20,
+            ),
+        )
+        .expect("the live prefixed gateway must forward tasks/get to the upstream store");
+        next_get_id = next_get_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::InputRequired { .. }) {
+            break observed;
+        }
+        if Instant::now() >= input_deadline {
+            panic!(
+                "as_proxy_typed must observe the upstream input_required Task rather than a disconnected local store: {observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "as_proxy_typed must return the upstream-created Task rather than a disconnected local store: {observed:?}"
+    );
+
+    let missing = FinalTaskId::parse("missing-upstream-task")
+        .expect("the planted-missing task id is a valid official TaskId");
+    let missing_get = runtime_block_on_bounded(
+        &cx,
+        gateway_client.get_task(
+            &cx,
+            RequestId::Number(next_get_id),
+            missing.clone(),
+            1 << 20,
+        ),
+    )
+    .expect_err("changing only the task id must not invent a Task on the gateway");
+    let _ = missing_get;
+    next_get_id += 1;
+
+    let wrong_update: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"action": "accept"}}))
+            .expect("the planted-wrong Tasks update payload is typed");
+    let rejected_update = runtime_block_on_bounded(
+        &cx,
+        gateway_client.update_task(
+            &cx,
+            RequestId::Number(next_get_id),
+            &observed.task,
+            wrong_update,
+            1 << 20,
+        ),
+    )
+    .expect_err("changing only the input response kind must not resume the upstream Task");
+    let _ = rejected_update;
+    next_get_id += 1;
+
+    let still_waiting = runtime_block_on_bounded(
+        &cx,
+        gateway_client.get_task(
+            &cx,
+            RequestId::Number(next_get_id),
+            task_id.clone(),
+            1 << 20,
+        ),
+    )
+    .expect("a rejected tasks/update must leave the upstream Task in place");
+    next_get_id += 1;
+    assert!(
+        matches!(still_waiting.task, FinalTask::InputRequired { .. }),
+        "a rejected tasks/update must not leave the input_required Task: {still_waiting:?}"
+    );
+
+    let responses: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"roots": []}}))
+            .expect("the public final roots response is typed");
+    runtime_block_on_bounded(
+        &cx,
+        gateway_client.update_task(
+            &cx,
+            RequestId::Number(next_get_id),
+            &observed.task,
+            responses,
+            1 << 20,
+        ),
+    )
+    .expect("the live prefixed gateway must forward tasks/update to the upstream store");
+    next_get_id += 1;
+
+    let working_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let working = loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            gateway_client.get_task(
+                &cx,
+                RequestId::Number(next_get_id),
+                task_id.clone(),
+                1 << 20,
+            ),
+        )
+        .expect("the live prefixed gateway must keep forwarding tasks/get after update");
+        next_get_id = next_get_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::Working(_)) {
+            break observed;
+        }
+        if Instant::now() >= working_deadline {
+            panic!(
+                "as_proxy_typed must observe the upstream working Task after a matching update: {observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        working.task.base().task_id,
+        task_id,
+        "as_proxy_typed must resume the same upstream-created Task: {working:?}"
+    );
+
+    let missing_cancel = runtime_block_on_bounded(
+        &cx,
+        gateway_client.cancel_task(&cx, RequestId::Number(next_get_id), missing, 1 << 20),
+    )
+    .expect_err("changing only the task id must not invent a cancellation on the gateway");
+    let _ = missing_cancel;
+    next_get_id += 1;
+
+    runtime_block_on_bounded(
+        &cx,
+        gateway_client.cancel_task(
+            &cx,
+            RequestId::Number(next_get_id),
+            task_id.clone(),
+            1 << 20,
+        ),
+    )
+    .expect("the live prefixed gateway must forward tasks/cancel to the upstream store");
+    next_get_id += 1;
+
+    let cancel_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let cancelled = loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            gateway_client.get_task(
+                &cx,
+                RequestId::Number(next_get_id),
+                task_id.clone(),
+                1 << 20,
+            ),
+        )
+        .expect("the live prefixed gateway must keep forwarding tasks/get after cancel");
+        next_get_id = next_get_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::Cancelled(_)) {
+            break observed;
+        }
+        if Instant::now() >= cancel_deadline {
+            panic!(
+                "as_proxy_typed must observe the upstream cancelled Task rather than a disconnected local store: {observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        cancelled.task.base().task_id,
+        task_id,
+        "as_proxy_typed must cancel the same upstream-created Task: {cancelled:?}"
+    );
+
+    drop(gateway_client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_stdio_as_proxy_gateway() -> (HttpServerFixture, FinalTaskId) {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(SocketAddr, FinalTaskId), String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("stdio as_proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("stdio as_proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("stdio as_proxy gateway HTTP server control receiver went away".to_owned());
+            }
+            let mut last_connect_error = None;
+            let mut stdio = None;
+            for attempt in 1_u32..=4 {
+                match modern::ClientBuilder::new()
+                    .client_info("e2e-http-stdio-as-proxy-upstream", "1.0.0")
+                    .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+                    .max_retries(2)
+                    .retry_delay_ms(150)
+                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                {
+                    Ok(client) => {
+                        stdio = Some(client);
+                        break;
+                    }
+                    Err(error) => {
+                        last_connect_error = Some(error);
+                        if attempt < 4 {
+                            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                        }
+                    }
+                }
+            }
+            let mut stdio = stdio.ok_or_else(|| {
+                format!(
+                    "live stdio as_proxy upstream connect failed: {}",
+                    last_connect_error
+                        .expect("a failed stdio connect records its last transport error")
+                )
+            })?;
+            let created = stdio
+                .call_tool_outcome("durable_task", json!({}))
+                .map_err(|error| {
+                    format!("live stdio as_proxy upstream must create one official Task: {error}")
+                })?;
+            let FinalToolCallOutcome::Task(created) = created else {
+                return Err(format!(
+                    "the shipped durable_task tool must return the official Task result branch: {created:?}"
+                ));
+            };
+            let task_id = created.task.base().task_id.clone();
+            let server = modern::ServerBuilder::new("e2e-http-stdio-as-proxy", "1.0.0")
+                .as_proxy("ext", stdio)
+                .map_err(|error| format!("as_proxy stdio install failed: {error}"))?
+                .build();
+            if server.final_task_runtime().is_some() {
+                return Err(
+                    "as_proxy must install the route-bound Tasks relay instead of the default in-memory store"
+                        .to_owned(),
+                );
+            }
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("stdio as_proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("stdio as_proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok((address, task_id))).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("stdio as_proxy gateway HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("stdio as_proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let (address, task_id) = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("stdio as_proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(ready)) => break ready,
+            Ok(Err(error)) => panic!("stdio as_proxy gateway HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("stdio as_proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    (
+        HttpServerFixture {
+            address,
+            server_cx,
+            finished,
+            shutdown_completion: None,
+            join,
+            nonquiescent: None,
+            handler_calls,
+        },
+        task_id,
+    )
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo() {
+    let cx = Cx::for_request();
+    let (gateway, task_id) = spawn_modern_http_stdio_as_proxy_gateway();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-stdio-as-proxy-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy HTTP gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the prefixed echo catalog");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == "ext/echo"),
+        "as_proxy must prefix the live stdio echo tool: {listed:?}"
+    );
+    assert!(
+        !listed.tools.iter().any(|tool| tool.name == "echo"),
+        "a nonempty as_proxy prefix must not keep the unprefixed stdio echo tool: {listed:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "echo", json!({"message": "nope"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed stdio handler");
+    let _ = missing;
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({ "message": "stdio-as-proxy" })),
+    )
+    .expect("the live stdio as_proxy gateway must forward tools/call to the shipped echo server");
+    assert!(
+        result.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "stdio-as-proxy",
+            _ => false,
+        }),
+        "the prefixed live stdio tool must retain the echo handler value: {result:?}"
+    );
+
+    let hidden = runtime_block_on_bounded(&cx, client.call_tool(&cx, "ext/hide_echo", json!({})))
+        .expect(
+            "the live stdio as_proxy gateway must forward hide_echo to the shipped echo session",
+        );
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "as_proxy must retain the echo disable_tool mutation: {hidden:?}"
+    );
+    let still_listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None)).expect(
+        "the live stdio as_proxy gateway must keep its install-time catalog after hide_echo",
+    );
+    assert!(
+        still_listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ext/echo"),
+        "as_proxy must not drop the prefixed echo tool from the gateway snapshot: {still_listed:?}"
+    );
+    let disabled = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({ "message": "after-hide" })),
+    )
+    .expect("hide_echo on the live stdio session must keep the public tools/call result");
+    assert!(
+        disabled.is_error,
+        "hide_echo on the live stdio session must mark a later ext/echo call as a tool error: {disabled:?}"
+    );
+    assert!(
+        disabled.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("Method not found"),
+            _ => false,
+        }),
+        "the refused ext/echo call must keep the session-disabled MethodNotFound tool error: {disabled:?}"
+    );
+    let added = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/add", json!({ "a": 2, "b": 3 })),
+    )
+    .expect("changing only the tool name must still reach an undisabled stdio handler");
+    assert!(
+        added.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "5",
+            _ => false,
+        }),
+        "as_proxy must keep undisabled stdio tools callable after hide_echo: {added:?}"
+    );
+    let shown = runtime_block_on_bounded(&cx, client.call_tool(&cx, "ext/show_echo", json!({})))
+        .expect(
+            "the live stdio as_proxy gateway must forward show_echo to the shipped echo session",
+        );
+    assert!(
+        shown.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "shown",
+            _ => false,
+        }),
+        "as_proxy must retain the echo enable_tool mutation: {shown:?}"
+    );
+    let restored = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({ "message": "after-show" })),
+    )
+    .expect("show_echo on the live stdio session must restore the prefixed echo tool");
+    assert!(
+        restored.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "after-show",
+            _ => false,
+        }),
+        "as_proxy must keep the restored stdio echo tool callable: {restored:?}"
+    );
+
+    let listed_resources = runtime_block_on_bounded(&cx, client.list_resources(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the exact upstream resource URIs");
+    assert!(
+        listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://server"),
+        "as_proxy must keep the live stdio resource URI unprefixed: {listed_resources:?}"
+    );
+    assert!(
+        !listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str().contains("ext/")),
+        "as_proxy must not prefix exact-final resource URIs: {listed_resources:?}"
+    );
+    let resource = runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://server"))
+        .expect("the live stdio as_proxy gateway must forward the unprefixed resource URI");
+    assert!(
+        resource.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => text.contains("echo-server"),
+            _ => false,
+        }),
+        "the unprefixed live stdio resource must retain the echo handler value: {resource:?}"
+    );
+
+    let listed_prompts = runtime_block_on_bounded(&cx, client.list_prompts(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the prefixed prompt catalog");
+    assert!(
+        listed_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == "ext/greeting"),
+        "as_proxy must prefix the live stdio greeting prompt: {listed_prompts:?}"
+    );
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "greeting",
+            HashMap::from([("name".to_owned(), "Ada".to_owned())]),
+        ),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed stdio handler");
+    let _ = missing_prompt;
+    let prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/greeting",
+            HashMap::from([("name".to_owned(), "Ada".to_owned())]),
+        ),
+    )
+    .expect("the live stdio as_proxy gateway must forward prompts/get to the shipped echo server");
+    let prompt = serde_json::to_value(prompt)
+        .expect("the prefixed stdio prompt result serializes for its observable assertion");
+    assert_eq!(
+        prompt["messages"][0]["content"]["text"],
+        json!("Please greet Ada in a friendly way."),
+        "the prefixed live stdio prompt must retain the echo handler value: {prompt:?}"
+    );
+
+    let completion_params = modern::CompletionParams {
+        reference: modern::CompletionReference::PromptWithTitle {
+            name: "ext/greeting".to_owned(),
+            title: "Greeting".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "name".to_owned(),
+            value: "co".to_owned(),
+        },
+        context: Some(modern::FinalCompletionContext {
+            arguments: Some(std::collections::BTreeMap::from([(
+                "locale".to_owned(),
+                "en-US".to_owned(),
+            )])),
+        }),
+    };
+    let mut unprefixed_completion = completion_params.clone();
+    unprefixed_completion.reference = modern::CompletionReference::PromptWithTitle {
+        name: "greeting".to_owned(),
+        title: "Greeting".to_owned(),
+    };
+    let missing_completion =
+        runtime_block_on_bounded(&cx, client.complete(&cx, unprefixed_completion)).expect_err(
+            "changing only the completion prompt name must not reach the stdio provider",
+        );
+    let _ = missing_completion;
+
+    let completion = runtime_block_on_bounded(&cx, client.complete(&cx, completion_params)).expect(
+        "the live stdio as_proxy gateway must rewrite ext/greeting and forward completion/complete",
+    );
+    assert_eq!(
+        completion.completion.values,
+        vec!["stdio-completion-1".to_owned()],
+        "the prefixed live stdio completion must retain the echo provider value: {completion:?}"
+    );
+
+    let hidden_catalog =
+        runtime_block_on_bounded(&cx, client.call_tool(&cx, "ext/hide_catalog", json!({}))).expect(
+            "the live stdio as_proxy gateway must forward hide_catalog to the shipped echo session",
+        );
+    assert!(
+        hidden_catalog.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "as_proxy must retain the echo disable_resource and disable_prompt mutations: {hidden_catalog:?}"
+    );
+    let still_listed_resources =
+        runtime_block_on_bounded(&cx, client.list_resources(&cx, None)).expect(
+            "the live stdio as_proxy gateway must keep its install-time resource catalog after hide_catalog",
+        );
+    assert!(
+        still_listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://server"),
+        "as_proxy must not drop the unprefixed resource URI from the gateway snapshot: {still_listed_resources:?}"
+    );
+    let still_listed_prompts = runtime_block_on_bounded(&cx, client.list_prompts(&cx, None)).expect(
+        "the live stdio as_proxy gateway must keep its install-time prompt catalog after hide_catalog",
+    );
+    assert!(
+        still_listed_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == "ext/greeting"),
+        "as_proxy must not drop the prefixed greeting prompt from the gateway snapshot: {still_listed_prompts:?}"
+    );
+    let cached_resource = runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://server"))
+        .expect(
+            "the warmed HTTP client must keep its cached info://server read after hide_catalog",
+        );
+    assert!(
+        cached_resource
+            .contents
+            .iter()
+            .any(|content| match content {
+                EmbeddedResourceContents::Text { text, .. } => text.contains("echo-server"),
+                _ => false,
+            }),
+        "as_proxy must not invent a resources/list_changed that would drop the client cache: {cached_resource:?}"
+    );
+    let mut fresh_after_hide = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-stdio-as-proxy-hide-catalog", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("a second HTTP client connects after hide_catalog");
+    let disabled_resource = runtime_block_on_bounded(
+        &cx,
+        fresh_after_hide.read_resource(&cx, "info://server"),
+    )
+    .expect_err(
+        "hide_catalog on the live stdio session must refuse a later uncached info://server read",
+    );
+    let disabled_resource = format!("{disabled_resource:?}");
+    assert!(
+        disabled_resource.contains("disabled") && disabled_resource.contains("info://server"),
+        "the refused resource read must be the session-disabled upstream URI: {disabled_resource}"
+    );
+    drop(fresh_after_hide);
+    let disabled_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/greeting",
+            HashMap::from([("name".to_owned(), "Bea".to_owned())]),
+        ),
+    )
+    .expect_err("hide_catalog on the live stdio session must refuse a later ext/greeting get");
+    let disabled_prompt = format!("{disabled_prompt:?}");
+    assert!(
+        disabled_prompt.contains("disabled") && disabled_prompt.contains("greeting"),
+        "the refused prompt get must be the session-disabled upstream prompt: {disabled_prompt}"
+    );
+    let shown_catalog =
+        runtime_block_on_bounded(&cx, client.call_tool(&cx, "ext/show_catalog", json!({}))).expect(
+            "the live stdio as_proxy gateway must forward show_catalog to the shipped echo session",
+        );
+    assert!(
+        shown_catalog.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "shown",
+            _ => false,
+        }),
+        "as_proxy must retain the echo enable_resource and enable_prompt mutations: {shown_catalog:?}"
+    );
+    let mut fresh_after_show = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-stdio-as-proxy-show-catalog", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("a third HTTP client connects after show_catalog");
+    let restored_resource =
+        runtime_block_on_bounded(&cx, fresh_after_show.read_resource(&cx, "info://server")).expect(
+            "show_catalog on the live stdio session must restore an uncached info://server read",
+        );
+    assert!(
+        restored_resource
+            .contents
+            .iter()
+            .any(|content| match content {
+                EmbeddedResourceContents::Text { text, .. } => text.contains("echo-server"),
+                _ => false,
+            }),
+        "as_proxy must keep the restored stdio resource readable: {restored_resource:?}"
+    );
+    drop(fresh_after_show);
+    let restored_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/greeting",
+            HashMap::from([("name".to_owned(), "Cyd".to_owned())]),
+        ),
+    )
+    .expect("show_catalog on the live stdio session must restore the prefixed greeting prompt");
+    let restored_prompt = serde_json::to_value(restored_prompt)
+        .expect("the restored stdio prompt result serializes for its observable assertion");
+    assert_eq!(
+        restored_prompt["messages"][0]["content"]["text"],
+        json!("Please greet Cyd in a friendly way."),
+        "as_proxy must keep the restored stdio prompt callable: {restored_prompt:?}"
+    );
+
+    let input_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let mut next_input_id = 40_i64;
+    let observed = loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(
+                &cx,
+                RequestId::Number(next_input_id),
+                task_id.clone(),
+                1 << 20,
+            ),
+        )
+        .expect("the live stdio as_proxy gateway must forward tasks/get to the echo store");
+        next_input_id = next_input_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::InputRequired { .. }) {
+            break observed;
+        }
+        if Instant::now() >= input_deadline {
+            panic!(
+                "as_proxy must observe the stdio-created input_required Task rather than a disconnected local store: {observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "as_proxy must return the stdio-created Task rather than a disconnected local store: {observed:?}"
+    );
+    let missing_id = FinalTaskId::parse("missing-stdio-upstream-task")
+        .expect("the planted-missing task id is a valid official TaskId");
+    let missing_get = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(41), missing_id.clone(), 1 << 20),
+    )
+    .expect_err("changing only the task id must not invent a Task on the stdio as_proxy gateway");
+    let _ = missing_get;
+
+    let responses: FinalTaskInputResponses =
+        serde_json::from_value(json!({"roots": {"roots": []}}))
+            .expect("the public final roots response is typed");
+    runtime_block_on_bounded(
+        &cx,
+        client.update_task(
+            &cx,
+            RequestId::Number(42),
+            &observed.task,
+            responses,
+            1 << 20,
+        ),
+    )
+    .expect("the live stdio as_proxy gateway must forward tasks/update to the echo store");
+
+    let working_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let mut next_get_id = 43_i64;
+    let working = loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(
+                &cx,
+                RequestId::Number(next_get_id),
+                task_id.clone(),
+                1 << 20,
+            ),
+        )
+        .expect("the live stdio as_proxy gateway must keep forwarding tasks/get after update");
+        next_get_id = next_get_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::Working(_)) {
+            break observed;
+        }
+        if Instant::now() >= working_deadline {
+            panic!(
+                "as_proxy must observe the stdio-created working Task after a matching update: {observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        working.task.base().task_id,
+        task_id,
+        "as_proxy must resume the same stdio-created Task: {working:?}"
+    );
+
+    let missing_cancel = runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(next_get_id), missing_id, 1 << 20),
+    )
+    .expect_err(
+        "changing only the task id must not invent a cancellation on the stdio as_proxy gateway",
+    );
+    let _ = missing_cancel;
+    next_get_id += 1;
+
+    runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(
+            &cx,
+            RequestId::Number(next_get_id),
+            task_id.clone(),
+            1 << 20,
+        ),
+    )
+    .expect("the live stdio as_proxy gateway must forward tasks/cancel to the echo store");
+    next_get_id += 1;
+    let cancel_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let cancelled = loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(
+                &cx,
+                RequestId::Number(next_get_id),
+                task_id.clone(),
+                1 << 20,
+            ),
+        )
+        .expect("the live stdio as_proxy gateway must keep forwarding tasks/get after cancel");
+        next_get_id = next_get_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::Cancelled(_)) {
+            break observed;
+        }
+        if Instant::now() >= cancel_deadline {
+            panic!(
+                "as_proxy must observe the stdio-created cancelled Task rather than a disconnected local store: {observed:?}"
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        cancelled.task.base().task_id,
+        task_id,
+        "as_proxy must cancel the same stdio-created Task: {cancelled:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "tasks"))]
+#[test]
+fn e2e_public_stdio_hide_catalog_refuses_later_read_and_prompt() {
+    let cx = Cx::for_request();
+    let mut client = modern::ClientBuilder::new()
+        .client_info("e2e-stdio-hide-catalog", "1.0.0")
+        .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+        .max_retries(2)
+        .retry_delay_ms(150)
+        .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+        .expect("a ModernOnly facade client connects to the shipped echo server");
+
+    let before = client
+        .read_resource("info://server")
+        .expect("the shipped echo resource must be readable before hide_catalog");
+    assert!(
+        before.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => text.contains("echo-server"),
+            _ => false,
+        }),
+        "the live stdio resource must retain the echo handler value: {before:?}"
+    );
+
+    let hidden = client
+        .call_tool("hide_catalog", json!({}))
+        .expect("disabling a shipped resource and prompt must complete");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "stdio session state must retain disable_resource and disable_prompt: {hidden:?}"
+    );
+
+    let disabled_resource = client.read_resource("info://server").expect_err(
+        "hide_catalog must refuse a later info://server read on the same stdio session",
+    );
+    let disabled_resource = format!("{disabled_resource:?}");
+    assert!(
+        disabled_resource.contains("disabled") && disabled_resource.contains("info://server"),
+        "the refused resource read must be the session-disabled URI: {disabled_resource}"
+    );
+    let disabled_prompt = client
+        .get_prompt(
+            "greeting",
+            HashMap::from([("name".to_owned(), "Bea".to_owned())]),
+        )
+        .expect_err("hide_catalog must refuse a later greeting get on the same stdio session");
+    let disabled_prompt = format!("{disabled_prompt:?}");
+    assert!(
+        disabled_prompt.contains("disabled") && disabled_prompt.contains("greeting"),
+        "the refused prompt get must be the session-disabled prompt: {disabled_prompt}"
+    );
+
+    let shown = client
+        .call_tool("show_catalog", json!({}))
+        .expect("re-enabling a shipped resource and prompt must complete");
+    assert!(
+        shown.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "shown",
+            _ => false,
+        }),
+        "stdio session state must retain enable_resource and enable_prompt: {shown:?}"
+    );
+    let restored = client
+        .read_resource("info://server")
+        .expect("show_catalog must restore a later info://server read on the same stdio session");
+    assert!(
+        restored.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => text.contains("echo-server"),
+            _ => false,
+        }),
+        "the restored stdio resource must retain the echo handler value: {restored:?}"
+    );
+    let restored_prompt = client
+        .get_prompt(
+            "greeting",
+            HashMap::from([("name".to_owned(), "Cyd".to_owned())]),
+        )
+        .expect("show_catalog must restore a later greeting get on the same stdio session");
+    let restored_prompt = serde_json::to_value(restored_prompt)
+        .expect("the restored stdio prompt result serializes for its observable assertion");
+    assert_eq!(
+        restored_prompt["messages"][0]["content"]["text"],
+        json!("Please greet Cyd in a friendly way."),
+        "the restored stdio prompt must retain the echo handler value: {restored_prompt:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio hide_catalog client cleanup");
+}
+
+#[cfg(feature = "proxy")]
+fn spawn_modern_http_template_proxy_gateway(
+    upstream: SocketAddr,
+    expected_template: &'static str,
+) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("template proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("template proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "template proxy gateway HTTP server control receiver went away".to_owned(),
+                );
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream, "/mcp")),
+                None,
+                None,
+                "e2e-http-template-proxy-gateway".to_owned(),
+                "e2e-http-template-proxy-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .map_err(|error| format!("template proxy gateway HTTP plan failed: {error}"))?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-live-template-upstream",
+                    "native-h1:e2e-live-template-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-http-template-proxy".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .map_err(|error| {
+                    format!("live HTTP template proxy upstream connect failed: {error}")
+                })?;
+            let catalog = proxy
+                .catalog_typed()
+                .map_err(|error| format!("live HTTP template proxy catalog failed: {error}"))?;
+            let templates = catalog
+                .final_resource_templates()
+                .map(|templates| {
+                    templates
+                        .iter()
+                        .map(|template| template.uri_template.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !templates.contains(&expected_template) {
+                return Err(format!(
+                    "live HTTP template proxy catalog omitted {expected_template}: {templates:?}"
+                ));
+            }
+            let server = modern::ServerBuilder::new("e2e-http-template-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .map_err(|error| format!("as_proxy_typed template install failed: {error}"))?
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("template proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("template proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "template proxy gateway HTTP server startup receiver went away".to_owned(),
+                );
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("template proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("template proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("template proxy gateway HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("template proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_forwards_unprefixed_resource_template() {
+    let cx = Cx::for_request();
+    let (upstream, reads) = spawn_modern_template_http_server();
+    let gateway =
+        spawn_modern_http_template_proxy_gateway(upstream.address(), PUBLIC_HTTP_TEMPLATE);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-as-proxy-template-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live template as_proxy HTTP gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_resource_templates(&cx, None))
+        .expect("the live prefixed gateway must advertise the exact upstream resource template");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_TEMPLATE
+                && template.name == PUBLIC_HTTP_TEMPLATE_NAME),
+        "as_proxy_typed must keep the exact final resource template: {:?}",
+        listed.resource_templates
+    );
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .all(|template| !template.uri_template.starts_with("ext/")),
+        "a nonempty as_proxy prefix must not invent a non-absolute template URI: {:?}",
+        listed.resource_templates
+    );
+
+    let matched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_TEMPLATE_MATCHED_URI),
+    )
+    .expect("the live prefixed gateway must expand a URI that matches the upstream template");
+    assert!(
+        matches!(
+            matched.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == "item:alpha"
+        ),
+        "the proxied matched template read must retain the extracted id: {:?}",
+        matched.contents
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a matching proxied resources/read must invoke the upstream templated handler once"
+    );
+
+    let unmatched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_TEMPLATE_UNMATCHED_URI),
+    )
+    .expect_err(
+        "changing only the path that the template cannot bind must refuse before upstream dispatch",
+    );
+    assert!(
+        matches!(
+            unmatched,
+            modern::HttpClientError::CoreResult(ref error)
+                if error.code == McpErrorCode::InvalidParams
+        ),
+        "an unmatched proxied template URI must stay InvalidParams: {unmatched:?}"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the unmatched URI must leave the upstream templated handler uninvoked"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
 #[test]
 fn e2e_public_http_mount_forwards_prefixed_tool_and_unprefixed_resource() {
     const MOUNTED_TOOL_NAME: &str = "child/public-http-e2e-tool";
@@ -2024,9 +3739,15 @@ const PUBLIC_HTTP_FS_FILE_TEXT: &str = "filesystem:deterministic";
 /// Starts a public ModernOnly facade whose catalog is one live FilesystemProvider.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_modern_filesystem_http_server() -> HttpServerFixture {
+    spawn_modern_filesystem_http_server_named("direct")
+}
+
+fn spawn_modern_filesystem_http_server_named(label: &'static str) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
-    let root =
-        std::env::temp_dir().join(format!("fastmcp-public-http-fs-e2e-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "fastmcp-public-http-fs-e2e-{}-{label}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&root).expect("the filesystem e2e root is created");
     std::fs::write(
         root.join(PUBLIC_HTTP_FS_FILE_NAME),
@@ -2050,9 +3771,18 @@ fn spawn_modern_filesystem_http_server() -> HttpServerFixture {
                 .with_exclude(&[])
                 .build()
                 .map_err(|error| format!("FilesystemProvider::build failed: {error}"))?;
-            let server = modern::ServerBuilder::new("facade-filesystem-http", "1.0.0")
-                .resource(handler)
-                .build();
+            let server = if label == "mounted" {
+                let child = modern::ServerBuilder::new("facade-filesystem-child", "1.0.0")
+                    .resource(handler)
+                    .build();
+                modern::ServerBuilder::new("facade-filesystem-parent", "1.0.0")
+                    .mount(child, Some("child"))
+                    .build()
+            } else {
+                modern::ServerBuilder::new("facade-filesystem-http", "1.0.0")
+                    .resource(handler)
+                    .build()
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -2167,6 +3897,139 @@ fn e2e_public_http_filesystem_provider_lists_and_reads_live_file() {
             [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_FS_FILE_TEXT
         ),
         "the live filesystem read must retain the file bytes: {:?}",
+        file.contents
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(all(feature = "proxy", any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_forwards_filesystem_template() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_filesystem_http_server_named("as-proxy");
+    let gateway =
+        spawn_modern_http_template_proxy_gateway(upstream.address(), PUBLIC_HTTP_FS_TEMPLATE);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-as-proxy-fs-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live filesystem as_proxy HTTP gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_resource_templates(&cx, None))
+        .expect("the live prefixed gateway must advertise the exact filesystem template");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_FS_TEMPLATE
+                && template.name == PUBLIC_HTTP_FS_PREFIX),
+        "as_proxy_typed must keep the exact filesystem template: {:?}",
+        listed.resource_templates
+    );
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .all(|template| !template.uri_template.starts_with("ext/")),
+        "a nonempty as_proxy prefix must not invent a non-absolute filesystem template URI: {:?}",
+        listed.resource_templates
+    );
+
+    let unmatched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "file:///other/note.txt"),
+    )
+    .expect_err(
+        "changing only the prefix the template cannot bind must refuse before upstream dispatch",
+    );
+    assert!(
+        matches!(
+            unmatched,
+            modern::HttpClientError::CoreResult(ref error)
+                if error.code == McpErrorCode::InvalidParams
+        ),
+        "an unmatched proxied filesystem URI must stay InvalidParams: {unmatched:?}"
+    );
+
+    let file = runtime_block_on_bounded(&cx, client.read_resource(&cx, PUBLIC_HTTP_FS_FILE_URI))
+        .expect("the live prefixed gateway must expand the live file URI through the upstream filesystem handler");
+    assert!(
+        matches!(
+            file.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_FS_FILE_TEXT
+        ),
+        "the proxied live filesystem read must retain the file bytes: {:?}",
+        file.contents
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn e2e_public_http_mount_forwards_unprefixed_filesystem_template() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_filesystem_http_server_named("mounted");
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-mount-fs-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live mounted filesystem HTTP server");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_resource_templates(&cx, None))
+        .expect("the mounted parent must advertise the exact filesystem template");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_FS_TEMPLATE
+                && template.name == PUBLIC_HTTP_FS_PREFIX),
+        "mount() must keep the exact filesystem template: {:?}",
+        listed.resource_templates
+    );
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .all(|template| !template.uri_template.starts_with("child/")),
+        "a nonempty mount prefix must not invent a non-absolute filesystem template URI: {:?}",
+        listed.resource_templates
+    );
+
+    let unmatched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "file:///other/note.txt"),
+    )
+    .expect_err(
+        "changing only the prefix the template cannot bind must refuse before the child handler",
+    );
+    assert!(
+        matches!(
+            unmatched,
+            modern::HttpClientError::CoreResult(ref error)
+                if error.code == McpErrorCode::InvalidParams
+        ),
+        "an unmatched mounted filesystem URI must stay InvalidParams: {unmatched:?}"
+    );
+
+    let file = runtime_block_on_bounded(&cx, client.read_resource(&cx, PUBLIC_HTTP_FS_FILE_URI))
+        .expect(
+            "the mounted parent must expand the live file URI through the child filesystem handler",
+        );
+    assert!(
+        matches!(
+            file.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_FS_FILE_TEXT
+        ),
+        "the mounted live filesystem read must retain the file bytes: {:?}",
         file.contents
     );
 
@@ -5197,6 +7060,293 @@ fn e2e_public_http_tools_list_changed_is_retained_on_incremental_listen() {
     );
     drop(other_client);
     server.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_proxy_client_catalog_listen_retains_list_changed() {
+    let server = spawn_modern_subscription_http_server();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .with_reactor(
+            asupersync::runtime::reactor::create_reactor()
+                .expect("proxy catalog listen client reactor initializes"),
+        )
+        .build()
+        .expect("proxy catalog listen client installs an owned runtime");
+    let outcome = runtime.block_on(async {
+        let cx = Cx::current().expect("owned proxy client runtime installs an ambient context");
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(public_http_target(server.address(), "/mcp")),
+            None,
+            None,
+            "e2e-http-proxy-listen".to_owned(),
+            "e2e-http-proxy-listen".to_owned(),
+            "modern-http".to_owned(),
+            0,
+            0,
+            0,
+        )
+        .map_err(|error| format!("proxy catalog listen HTTP plan failed: {error}"))?;
+        let mut registry = ProxyClient::upstream_binding_registry();
+        let proxy = registry
+            .connect_http_with_protocol_plan(
+                "e2e-listen-upstream",
+                "native-h1:e2e-listen-upstream",
+                1,
+                plan,
+                ClientInfo {
+                    name: "e2e-http-proxy-listen".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+                ClientCapabilities::default(),
+                cx.clone(),
+            )
+            .map_err(|error| format!("live HTTP ProxyClient connect failed: {error}"))?;
+        let started = proxy
+            .start_catalog_listener(modern::SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..modern::SubscriptionFilter::default()
+            })
+            .map_err(|error| format!("ProxyClient catalog listen start failed: {error}"))?;
+        if !started {
+            return Err(
+                "a live ModernHttp ProxyClient must own the incremental catalog listener"
+                    .to_owned(),
+            );
+        }
+        let acknowledgement = proxy
+            .next_catalog_listener_event(&cx, &McpRequestCancellation::new())
+            .map_err(|error| format!("ProxyClient catalog listen ack failed: {error}"))?;
+        if !matches!(
+            acknowledgement,
+            StdioSubscriptionEvent::Acknowledged(ref filter)
+                if filter.tools_list_changed == Some(true)
+        ) {
+            return Err(format!(
+                "the first ProxyClient listen record must be the accepted filter: {acknowledgement:?}"
+            ));
+        }
+
+        let touched = proxy
+            .call_tool_typed(
+                &McpContext::new(cx.clone(), 1),
+                PUBLIC_HTTP_TOUCH_TOOL_NAME,
+                json!({}),
+            )
+            .map_err(|error| format!("ProxyClient touch tool failed: {error}"))?;
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result: touched, .. }) = touched else {
+            return Err(format!(
+                "the live HTTP ProxyClient must keep a final tools/call result: {touched:?}"
+            ));
+        };
+        if !touched.payload.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "notified" || text == "silent",
+            _ => false,
+        }) {
+            return Err(format!(
+                "the live HTTP ProxyClient must forward the non-mutating touch tool: {touched:?}"
+            ));
+        }
+
+        let hidden = proxy
+            .call_tool_typed(
+                &McpContext::new(cx.clone(), 2),
+                PUBLIC_HTTP_HIDE_TOOL_NAME,
+                json!({}),
+            )
+            .map_err(|error| format!("ProxyClient hide tool failed: {error}"))?;
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result: hidden, .. }) = hidden else {
+            return Err(format!(
+                "the live HTTP ProxyClient must keep a final hide tools/call result: {hidden:?}"
+            ));
+        };
+        if !hidden.payload.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }) {
+            return Err(format!(
+                "the live HTTP ProxyClient must forward disable_tool: {hidden:?}"
+            ));
+        }
+
+        let changed = proxy
+            .next_catalog_listener_event(&cx, &McpRequestCancellation::new())
+            .map_err(|error| {
+                format!("ProxyClient catalog listen must retain tools/list_changed: {error}")
+            })?;
+        if !matches!(
+            changed,
+            StdioSubscriptionEvent::Notification(modern::ServerNotification::ToolsListChanged(_))
+        ) {
+            return Err(format!(
+                "live ProxyClient must retain notifications/tools/list_changed: {changed:?}"
+            ));
+        }
+        Ok(())
+    });
+    server.shutdown();
+    outcome.expect("the live HTTP ProxyClient catalog listener must retain tools/list_changed");
+}
+
+const PUBLIC_HTTP_LEAK_RESOURCE_URI: &str = "test://public-http-e2e/leak";
+const PUBLIC_HTTP_LEAK_SECRET: &str = "secret-db-dsn";
+
+/// Live modern HTTP resource whose execution error carries an internal secret.
+struct PublicHttpLeakResource;
+
+impl ResourceHandler for PublicHttpLeakResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PUBLIC_HTTP_LEAK_RESOURCE_URI.to_owned(),
+            name: "public-http-e2e-leak".to_owned(),
+            description: Some("Proves live facade HTTP mask_error_details".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Err(McpError::tool_error(PUBLIC_HTTP_LEAK_SECRET))
+    }
+}
+
+fn spawn_modern_mask_http_server(mask_error_details: bool) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("mask HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-mask", "1.0.0")
+                .mask_error_details(mask_error_details)
+                .resource(PublicHttpLeakResource)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("mask facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("mask facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("mask HTTP server startup receiver went away".to_owned());
+            }
+            bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("mask facade HTTP server stopped unexpectedly: {error}"))
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("mask facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("mask facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("mask facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_mask_error_details_hides_resource_execution_secret() {
+    let cx = Cx::for_request();
+    let masked_server = spawn_modern_mask_http_server(true);
+    let mut masked_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-mask", "1.0.0")
+            .connect_http_with_cx(public_http_target(masked_server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the masked HTTP server");
+    let masked = runtime_block_on_bounded(
+        &cx,
+        masked_client.read_resource(&cx, PUBLIC_HTTP_LEAK_RESOURCE_URI),
+    )
+    .expect_err("a leaking resource must stay a resources/read error");
+    let masked = format!("{masked:?}");
+    assert!(
+        masked.contains("Internal server error"),
+        "mask_error_details must replace the execution secret: {masked}"
+    );
+    assert!(
+        !masked.contains(PUBLIC_HTTP_LEAK_SECRET),
+        "mask_error_details must not leak the execution secret: {masked}"
+    );
+    drop(masked_client);
+    masked_server.shutdown();
+
+    let unmasked_server = spawn_modern_mask_http_server(false);
+    let mut unmasked_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-unmask", "1.0.0")
+            .connect_http_with_cx(public_http_target(unmasked_server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the unmasked HTTP server");
+    let unmasked = runtime_block_on_bounded(
+        &cx,
+        unmasked_client.read_resource(&cx, PUBLIC_HTTP_LEAK_RESOURCE_URI),
+    )
+    .expect_err("changing only mask_error_details must still refuse the leaking resource");
+    let unmasked = format!("{unmasked:?}");
+    assert!(
+        unmasked.contains(PUBLIC_HTTP_LEAK_SECRET),
+        "disabling mask_error_details must keep the execution secret: {unmasked}"
+    );
+    drop(unmasked_client);
+    unmasked_server.shutdown();
 }
 
 #[test]

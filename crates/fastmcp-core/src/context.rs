@@ -2703,6 +2703,16 @@ impl McpContext {
         self.request_scope_is_active() && self.state.is_some()
     }
 
+    /// Returns the session state attached to this context, if any.
+    ///
+    /// Final dispatch uses this shared bag so a later inbound on the same
+    /// modern connection still sees `disable_*` mutations from earlier
+    /// requests. Cloning the returned value shares the underlying store.
+    #[must_use]
+    pub fn session_state(&self) -> Option<&SessionState> {
+        self.state.as_ref()
+    }
+
     /// Returns the opaque cache partition and mutation revision for this
     /// request's session state.
     ///

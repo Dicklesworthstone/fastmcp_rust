@@ -78,6 +78,28 @@ fn hide_catalog(ctx: &McpContext) -> String {
     }
 }
 
+/// Re-enables the shipped echo tool and publishes `notifications/tools/list_changed`.
+#[tool]
+fn show_echo(ctx: &McpContext) -> String {
+    if ctx.enable_tool("echo") {
+        "shown".to_owned()
+    } else {
+        "silent".to_owned()
+    }
+}
+
+/// Re-enables a shipped resource and prompt and publishes both list_changed events.
+#[tool]
+fn show_catalog(ctx: &McpContext) -> String {
+    let resource = ctx.enable_resource("info://server");
+    let prompt = ctx.enable_prompt("greeting");
+    if resource && prompt {
+        "shown".to_owned()
+    } else {
+        "silent".to_owned()
+    }
+}
+
 /// Add two numbers together.
 #[tool(description = "Calculate the sum of two numbers")]
 fn add(_ctx: &McpContext, a: i64, b: i64) -> String {
@@ -543,6 +565,8 @@ fn main() {
         .tool(TouchServerInfo)
         .tool(HideEcho)
         .tool(HideCatalog)
+        .tool(ShowEcho)
+        .tool(ShowCatalog)
         .tool(Add)
         .tool(Reverse)
         .tool(CountWords)

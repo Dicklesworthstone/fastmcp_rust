@@ -113,8 +113,8 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | **Error masking** | ✅ | ✅ | `mask_error_details` in builder.rs |
 | **Strict input validation** | ✅ | ✅ | `strict_input_validation` in router.rs |
 | **Duplicate handling** | ✅ | ✅ | `on_duplicate` in builder.rs |
-| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete` through `ProxyClient::connect_http_with_protocol_plan`; complete-only proxied tools do not require the official Tasks client extension |
-| **mount() composition** | ✅ | ✅ | Implemented in builder.rs, router.rs. Public Auto/modern/legacy facades expose `mount()`, `mount_tools()`, `mount_resources()`, and `mount_prompts()`. Live `bind_http` parent lists prefixed child tools/prompts and dispatches `tools/call` and `prompts/get`; an unprefixed `mount_resources` child keeps the exact final resource URI for `resources/read`. A nonempty prefix does not invent a non-absolute modern resource URI |
+| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete`. Live `bind_http` `as_proxy_typed("ext", …)` prefixes tools/prompts as `ext/...`, keeps exact-final resource URIs and RFC 6570 templates unprefixed, and forwards `tools/call`, `prompts/get`, `resources/read` (including a matched template URI and a live FilesystemProvider file URI), and `completion/complete`. A near-identical unmatched template path stays `InvalidParams` before the upstream handler. Prefixed `as_proxy_typed` installs the same route-bound official Tasks relay as `proxy_typed` (complete-only tools stay unwrapped; `tasks/*` forwards) instead of the disconnected default in-memory store. Live official Tasks through that relay: `tasks/get` of an upstream-created Task, `tasks/update` of its `input_required` snapshot (a near-identical wrong-kind roots payload is refused and leaves the Task in place), and `tasks/cancel` of the resumed Task. A near-identical missing id stays an error for `tasks/get` and `tasks/cancel`. Live `as_proxy("ext", stdio Client)` against the shipped echo server binds HTTP, prefixes tools/prompts as `ext/echo` and `ext/greeting`, forwards `tools/call`, `prompts/get`, `completion/complete` of `ext/greeting` (rewritten to upstream `greeting`), and `resources/read` of unprefixed `info://server`, and refuses the unprefixed tool/prompt/completion names. Live `ext/hide_echo` forwards the session-local disable: the gateway snapshot still lists `ext/echo`, a later `ext/echo` is a `Method not found` tool error, and `ext/add` still returns `5`. Live official Tasks on that same stdio client: `tasks/get` of its `input_required` snapshot, `tasks/update` with matching roots, and `tasks/cancel` of the resumed Task; a near-identical missing id stays an error. `as_proxy_typed` keeps the live ModernHttp binding |
+| **mount() composition** | ✅ | ✅ | Implemented in builder.rs, router.rs. Public Auto/modern facades `mount()` prefix tools/prompts and keep exact resource URIs so they stay on the modern catalog. Live `bind_http` `mount(child, Some("child"))` lists `child/...` tools/prompts and reads the original resource URI. Live `mount()` of a FilesystemProvider child keeps `file:///{prefix}/{+path}` exact, expands a matching file URI, and refuses an unmatched prefix before the child handler. Legacy `mount()` still prefixes every key. `mount_tools` / `mount_resources` / `mount_prompts` remain available |
 
 ---
 
@@ -169,7 +169,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `tools/call` | ✅ | ✅ | With progress token support |
 | `resources/list` | ✅ | ✅ | With cursor pagination |
 | `resources/read` | ✅ | ✅ | With progress token support. Final `#[resource]` handlers that author a complete result keep their `ttlMs` / `cacheScope`; the router default (one hour, private) applies only to the legacy-bridge projection |
-| `resources/templates/list` | ✅ | 🟡 | Listing plus RFC 6570 reversible matching exist; lossy prefix/explode templates are refused rather than guessed. Live `bind_http` `list_resource_templates` retains a registered reversible template; `resources/read` expands a matching URI through `read_with_uri` and refuses a near-identical unmatched path before the handler runs |
+| `resources/templates/list` | ✅ | 🟡 | Listing plus RFC 6570 reversible matching exist; lossy prefix/explode templates are refused rather than guessed. Live `bind_http` `list_resource_templates` retains a registered reversible template; `resources/read` expands a matching URI through `read_with_uri` and refuses a near-identical unmatched path before the handler runs. Live `as_proxy_typed("ext", …)` keeps the exact template URI unprefixed and forwards a matched `resources/read` while refusing the unmatched path before the upstream handler |
 | `resources/subscribe` | ✅ | ✅ | Session dispatch serves subscribe for registered URIs; registering a resource or template advertises `resources.subscribe` on initialize |
 | `resources/unsubscribe` | ✅ | ✅ | Protocol support |
 | `prompts/list` | ✅ | ✅ | With cursor pagination |
@@ -189,10 +189,10 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
 | `tasks/list` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
-| `tasks/get` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
-| `tasks/update` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
+| `tasks/get` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store. Live `as_proxy_typed("ext", …)` and live `as_proxy("ext", stdio Client)` forward `tasks/get` of an upstream-created Task and refuse a near-identical missing id |
+| `tasks/update` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store. Live `as_proxy_typed("ext", …)` and live `as_proxy("ext", stdio Client)` forward a matching `tasks/update` of an upstream `input_required` Task. The HTTP path also refuses a near-identical wrong-kind roots payload without leaving that Task |
 | `tasks/submit` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
-| `tasks/cancel` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
+| `tasks/cancel` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store. Live `as_proxy_typed("ext", …)` and live `as_proxy("ext", stdio Client)` forward `tasks/cancel` of an upstream-created Task and refuse a near-identical missing id |
 
 The historical `TaskManager` source remains test-only for implementation
 archaeology. Production builds expose neither a manager constructor/builder
@@ -249,7 +249,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Auto-initialize** | ✅ | ✅ | Implemented in client builder.rs |
-| **Task client methods** | ✅ | 🟡 | Client methods exist; the default server serves official `tasks/get`, `tasks/update`, and `tasks/cancel` |
+| **Task client methods** | ✅ | 🟡 | Client methods exist; the default server serves official `tasks/get`, `tasks/update`, and `tasks/cancel`. Live `as_proxy_typed` HTTP forwards those three verbs to an upstream-created Task |
 
 ---
 
@@ -335,7 +335,7 @@ The following bidirectional building blocks exist in source. This inventory does
 
 | Provider | Python | Rust | Notes |
 |----------|--------|------|-------|
-| **FilesystemProvider** | ✅ | 🟡 | Public `build()` constructs a handler on Linux/macOS and routes I/O through the caller-owned blocking pool. Live `bind_http` lists `file:///{prefix}/{+path}` and `resources/read` expands a matching file URI through `read_with_uri`; a near-identical unmatched prefix is refused before the handler runs. Other targets remain fail-closed |
+| **FilesystemProvider** | ✅ | 🟡 | Public `build()` constructs a handler on Linux/macOS and routes I/O through the caller-owned blocking pool. Live `bind_http` lists `file:///{prefix}/{+path}` and `resources/read` expands a matching file URI through `read_with_uri`; a near-identical unmatched prefix is refused before the handler runs. Live `as_proxy_typed("ext", …)` and live `mount(child, Some("child"))` keep that same exact template unprefixed and forward a matching file read. Other targets remain fail-closed |
 | **OpenAPIProvider** | ✅ | ⊘ | Excluded per plan (intentional) |
 
 ---
@@ -411,7 +411,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 3. ✅ **Error masking** - `mask_error_details` setting (builder.rs)
 4. ✅ **Server composition** - mount(), as_proxy() (builder.rs, proxy.rs, router.rs)
 5. ✅ **CLI commands** - dev, test, and tasks command paths are present; this is not an end-to-end verification claim
-6. 🟡 **FilesystemProvider** - Public construction and live `bind_http` list+read work on Linux/macOS; other targets remain fail-closed
+6. 🟡 **FilesystemProvider** - Public construction and live `bind_http` list+read work on Linux/macOS, including through a prefixed `as_proxy_typed` gateway that keeps the exact `file:///` template; other targets remain fail-closed
 7. ✅ **Auto-initialize** - Client auto-initialization (client/builder.rs)
 8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs)
 9. ✅ **Capabilities access** - ctx.client_capabilities(), ctx.server_capabilities() (context.rs)

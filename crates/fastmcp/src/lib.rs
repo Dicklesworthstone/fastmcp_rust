@@ -1445,6 +1445,19 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
+        /// Registers a prefixed typed proxy catalog while retaining Auto's selected-era routing.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy_typed(
+            self,
+            prefix: &str,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyTypedCatalog,
+        ) -> McpResult<Self> {
+            self.inner
+                .as_proxy_typed(prefix, client, catalog)
+                .map(|inner| Self { inner })
+        }
+
         #[cfg(feature = "apps")]
         pub fn mcp_apps(self) -> Result<Self, crate::ServerExtensionConfigurationError> {
             self.inner.mcp_apps().map(|inner| Self { inner })
@@ -1535,12 +1548,14 @@ pub mod auto {
         /// Mounts another Auto server's catalog into this builder.
         ///
         /// A nonempty prefix rewrites tool and prompt names as `{prefix}/{name}`.
-        /// Prefixed resource URIs are not absolute final URIs, so those entries
-        /// stay off the modern catalog. Pass `None` to keep resource URIs exact.
+        /// Resource and template URIs stay exact so they remain absolute final
+        /// URIs. Pass `None` to keep every child name exact.
         #[must_use]
         pub fn mount(self, server: Server, prefix: Option<&str>) -> Self {
             Self {
-                inner: self.inner.mount(server.inner, prefix),
+                inner: self
+                    .inner
+                    .mount_preserving_resource_uris(server.inner, prefix),
             }
         }
 
@@ -5108,6 +5123,24 @@ pub mod modern {
                 .map(|inner| Self { inner })
         }
 
+        /// Registers a prefixed exact-final typed proxy catalog without a legacy projection.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy_typed(
+            self,
+            prefix: &str,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyTypedCatalog,
+        ) -> McpResult<Self> {
+            if catalog.era()? != fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026 {
+                return Err(McpError::invalid_request(
+                    "ModernOnly facade rejects an exact-2024 typed proxy catalog",
+                ));
+            }
+            self.inner
+                .as_proxy_typed(prefix, client, catalog)
+                .map(|inner| Self { inner })
+        }
+
         /// Installs the official MCP Apps discovery marker.
         #[cfg(feature = "apps")]
         pub fn mcp_apps(self) -> Result<Self, ServerExtensionConfigurationError> {
@@ -5204,12 +5237,14 @@ pub mod modern {
         /// Mounts another modern-only server's catalog into this builder.
         ///
         /// A nonempty prefix rewrites tool and prompt names as `{prefix}/{name}`.
-        /// Prefixed resource URIs are not absolute final URIs, so those entries
-        /// stay off the modern catalog. Pass `None` to keep resource URIs exact.
+        /// Resource and template URIs stay exact so they remain absolute final
+        /// URIs. Pass `None` to keep every child name exact.
         #[must_use]
         pub fn mount(self, server: Server, prefix: Option<&str>) -> Self {
             Self {
-                inner: self.inner.mount(server.inner, prefix),
+                inner: self
+                    .inner
+                    .mount_preserving_resource_uris(server.inner, prefix),
             }
         }
 
@@ -5962,6 +5997,24 @@ pub mod legacy_2024 {
             }
             self.inner
                 .proxy_typed(client, catalog)
+                .map(|inner| Self { inner })
+        }
+
+        /// Registers a prefixed exact-2024 typed proxy catalog without a final projection.
+        #[cfg(feature = "proxy")]
+        pub fn as_proxy_typed(
+            self,
+            prefix: &str,
+            client: crate::ProxyClient,
+            catalog: crate::ProxyTypedCatalog,
+        ) -> McpResult<Self> {
+            if catalog.era()? != fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024 {
+                return Err(McpError::invalid_request(
+                    "LegacyOnly facade rejects an exact-final typed proxy catalog",
+                ));
+            }
+            self.inner
+                .as_proxy_typed(prefix, client, catalog)
                 .map(|inner| Self { inner })
         }
 
