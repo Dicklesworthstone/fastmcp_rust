@@ -26,8 +26,8 @@ use fastmcp_protocol::extensions::ExtensionDirection;
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
 use fastmcp_protocol::methods::{
-    Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PROMPTS_GET, RESOURCES_READ,
-    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
+    Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PING, PROMPTS_GET,
+    RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
@@ -7797,6 +7797,17 @@ fn request_name_header_value(
 }
 
 fn validate_final_method(method: &str, has_request_id: bool) -> Result<(), ModernHttpClientError> {
+    // Connection health-check. Not a member of the official 2026 client-request
+    // union; the server still answers `{}` on the stateless HTTP surface.
+    if method == PING {
+        return if has_request_id {
+            Ok(())
+        } else {
+            Err(ModernHttpClientError::MissingRequestId {
+                method: method.to_owned(),
+            })
+        };
+    }
     let final_method = final_2026_07_28_method(method).ok_or_else(|| {
         ModernHttpClientError::UnsupportedFinalMethod {
             method: method.to_owned(),
