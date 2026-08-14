@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use fastmcp_rust::server::FinalMethodOutcome;
+use fastmcp_rust::server::{BoxFuture, FinalMethodOutcome};
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
     ApplicationTaskSupervisor, FinalTask, FinalTaskId, FinalTaskInputRequests,
@@ -37,12 +37,12 @@ use fastmcp_rust::{
     FinalEmbeddedRootsListParams, FinalResourceTemplate, FinalRootsContextExt,
     FinalSamplingContextExt, FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown,
     HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode,
-    McpRequestCancellation, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
-    ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy,
-    RawIcon, Resource, ResourceContent, ResourceHandler, ResourceTemplate, ResultMeta, Role,
-    SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolAnnotations, ToolErrorKind,
-    ToolHandler, auto, caching, core, legacy_2024, modern, prompt, providers, rate_limiting,
-    resource, tool, transform,
+    McpOutcome, McpRequestCancellation, McpResult, Middleware, MiddlewareDecision,
+    ModernHttpResponseKind, ModernHttpResponseStream, Outcome, Prompt, PromptHandler,
+    PromptMessage, ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent,
+    ResourceHandler, ResourceTemplate, ResultMeta, Role, SseLimits, StaticTokenVerifier,
+    TokenAuthProvider, Tool, ToolAnnotations, ToolErrorKind, ToolHandler, auto, caching, core,
+    legacy_2024, modern, prompt, providers, rate_limiting, resource, tool, transform,
 };
 #[cfg(feature = "proxy")]
 use fastmcp_rust::{ClientInfo, ProxyClient, StdioSubscriptionEvent};
@@ -67,6 +67,9 @@ const PUBLIC_HTTP_ICON_TOOL_NAME: &str = "public-http-e2e-icon";
 const PUBLIC_HTTP_PLAIN_TOOL_NAME: &str = "public-http-e2e-plain";
 const PUBLIC_HTTP_ICON_SRC: &str = "https://example.test/e2e-icon.png";
 const PUBLIC_HTTP_OUTPUT_TOOL_NAME: &str = "public-http-e2e-output";
+const PUBLIC_HTTP_COMPOSE_TOOL_NAME: &str = "public-http-e2e-compose";
+const PUBLIC_HTTP_STATE_TOOL_NAME: &str = "public-http-e2e-state";
+const PUBLIC_HTTP_STATE_KEY: &str = "e2e-request-local-state";
 
 /// The deterministic user handler exercised through both public HTTP facades.
 #[tool(name = "public-http-e2e-tool", tags = ["cursor"])]
@@ -407,6 +410,160 @@ impl ToolHandler for PublicHttpOutputTool {
             },
             ResultMeta::empty(),
         ))
+    }
+}
+
+/// Nested `ctx.call_tool` + `ctx.read_resource` through the request-owned router.
+struct PublicHttpComposeTool;
+
+impl ToolHandler for PublicHttpComposeTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_COMPOSE_TOOL_NAME.to_owned(),
+            description: Some(
+                "Composes a nested tools/call and resources/read on the same request".to_owned(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string"},
+                    "tool": {"type": "string"},
+                    "resource": {"type": "string"}
+                },
+                "required": ["value"]
+            }),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(
+        &self,
+        _context: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        Err(McpError::internal_error(
+            "compose must run through the request-owned final async hook",
+        ))
+    }
+
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            if !ctx.can_call_tools() || !ctx.can_read_resources() {
+                return Outcome::Err(McpError::internal_error(
+                    "compose requires a request-owned router on the handler context",
+                ));
+            }
+            let value = arguments
+                .get("value")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing");
+            let tool_name = arguments
+                .get("tool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(PUBLIC_HTTP_TOOL_NAME);
+            let resource_uri = arguments
+                .get("resource")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(PUBLIC_HTTP_RESOURCE_URI);
+            let tool_text = match ctx
+                .call_tool_text(tool_name, json!({ "value": value }))
+                .await
+            {
+                Ok(text) => text,
+                Err(error) => return Outcome::Err(error),
+            };
+            let resource_text = match ctx.read_resource_text(resource_uri).await {
+                Ok(text) => text,
+                Err(error) => return Outcome::Err(error),
+            };
+            Outcome::Ok(FinalToolOutcome::Complete(CompleteResult::new(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text(format!(
+                        "compose:{tool_text}|{resource_text}"
+                    ))],
+                    is_error: false,
+                    structured_content: None,
+                },
+                ResultMeta::empty(),
+            )))
+        })
+    }
+}
+
+/// Session-state write/read/remove on the request-local modern HTTP bag.
+struct PublicHttpStateTool;
+
+impl ToolHandler for PublicHttpStateTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_STATE_TOOL_NAME.to_owned(),
+            description: Some("Reads and writes request-local session state".to_owned()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "value": {"type": "string"}
+                },
+                "required": ["action"]
+            }),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        if !context.has_session_state() {
+            return Err(McpError::internal_error(
+                "modern HTTP request context must carry session state",
+            ));
+        }
+        let action = arguments
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("read");
+        let rendered = match action {
+            "write" => {
+                let value = arguments
+                    .get("value")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("missing");
+                if !context.set_state(PUBLIC_HTTP_STATE_KEY, value) {
+                    return Err(McpError::internal_error(
+                        "set_state must succeed on the request-local bag",
+                    ));
+                }
+                let got = context
+                    .get_state::<String>(PUBLIC_HTTP_STATE_KEY)
+                    .unwrap_or_else(|| "missing".to_owned());
+                format!("state:{got}")
+            }
+            "remove" => {
+                let _ = context.remove_state(PUBLIC_HTTP_STATE_KEY);
+                let got = context
+                    .get_state::<String>(PUBLIC_HTTP_STATE_KEY)
+                    .unwrap_or_else(|| "missing".to_owned());
+                format!("state:{got}")
+            }
+            _ => {
+                let got = context
+                    .get_state::<String>(PUBLIC_HTTP_STATE_KEY)
+                    .unwrap_or_else(|| "missing".to_owned());
+                format!("state:{got}")
+            }
+        };
+        Ok(vec![Content::text(rendered)])
     }
 }
 
@@ -9685,6 +9842,265 @@ fn e2e_public_http_output_schema_retains_structured_content_and_peer_stays_bare(
     assert_eq!(
         peer.structured_content, None,
         "changing only the missing output schema must not invent structuredContent: {peer:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_modern_compose_and_state_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let resource_calls = Arc::clone(&handler_calls);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("compose HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-compose", "1.0.0")
+                .tool(CountingPublicHttpValue {
+                    counters: Arc::clone(&tool_calls),
+                })
+                .tool(PublicHttpComposeTool)
+                .tool(PublicHttpStateTool)
+                .resource(CountingPublicHttpSnapshot {
+                    counters: resource_calls,
+                })
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("compose facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("compose facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("compose HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("compose facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("compose facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("compose facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("compose facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_handler_ctx_call_tool_and_read_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_and_state_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the compose HTTP server");
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            json!({"value": "alpha"}),
+        ),
+    )
+    .expect("live bind_http must compose a nested tool call and resource read");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "compose:tool:alpha|resource:deterministic"
+            }
+            _ => false,
+        }),
+        "ctx.call_tool and ctx.read_resource must reach the live peer handlers: {composed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+        ),
+    )
+    .expect_err("changing only the nested tool name must refuse before the peer handlers run");
+    let missing_tool = format!("{missing_tool:?}");
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("Unknown tool")
+            || missing_tool.contains("not found")
+            || missing_tool.contains("MethodNotFound"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "an unknown nested tool name must not reach the peer resource"
+    );
+
+    let missing_resource = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            json!({
+                "value": "beta",
+                "resource": "test://public-http-e2e/missing"
+            }),
+        ),
+    )
+    .expect_err("changing only the nested resource URI must refuse after the peer tool runs");
+    let missing_resource = format!("{missing_resource:?}");
+    assert!(
+        missing_resource.contains("test://public-http-e2e/missing")
+            || missing_resource.contains("not found")
+            || missing_resource.contains("ResourceNotFound"),
+        "the nested unknown resource must stay a handler-visible refusal: {missing_resource}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        2,
+        "the peer tool must still run when only the nested resource URI changes"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "an unknown nested resource URI must not invoke the peer resource"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_session_state_is_request_local_across_posts() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_and_state_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-state", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the session-state HTTP server");
+
+    let written = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_STATE_TOOL_NAME,
+            json!({"action": "write", "value": "alpha"}),
+        ),
+    )
+    .expect("live bind_http must write request-local session state");
+    assert!(
+        written.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "state:alpha",
+            _ => false,
+        }),
+        "set_state then get_state on the same POST must retain the value: {written:?}"
+    );
+
+    let later_read = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_STATE_TOOL_NAME, json!({"action": "read"})),
+    )
+    .expect("a later POST must still be admitted");
+    assert!(
+        later_read.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "state:missing",
+            _ => false,
+        }),
+        "changing only the POST must not reuse the previous request-local bag: {later_read:?}"
+    );
+
+    let removed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_STATE_TOOL_NAME,
+            json!({"action": "write", "value": "beta"}),
+        ),
+    )
+    .expect("a later write must still succeed on a fresh request-local bag");
+    assert!(
+        removed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "state:beta",
+            _ => false,
+        }),
+        "a later POST write must see only its own bag: {removed:?}"
     );
 
     drop(client);
