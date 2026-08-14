@@ -214,6 +214,7 @@ pub trait Legacy2024Handler {
     ) -> crate::BoxFuture<'a, Result<Value, Legacy2024HandlerError>> {
         // Evaluate the sync contract immediately so the returned future does
         // not capture `&mut Self`. Many adapter tests use `!Send` handlers.
+        // BoxFuture requires Send; `&mut Self` is not Send when Self is not.
         let result = self.handle_legacy_2024_with_request_id(request_id, method, params);
         Box::pin(async move { result })
     }
