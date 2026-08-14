@@ -5539,6 +5539,45 @@ where
         .await
     }
 
+    /// Completes one prompt or resource-template argument and admits
+    /// request-scoped `notifications/progress` for the supplied marker.
+    pub async fn complete_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        params: CompletionParams,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            McpError::internal_error("WebSocket progress token could not be encoded")
+        })?;
+        let mut parameters = match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => serde_json::to_value(params).map_err(|_| {
+                McpError::invalid_params(
+                    "Modern WebSocket completion parameters could not serialize",
+                )
+            })?,
+            ProtocolEra::Legacy2024 => {
+                serde_json::to_value(params.into_legacy()?).map_err(|_| {
+                    McpError::invalid_params(
+                        "Exact legacy WebSocket completion parameters could not serialize",
+                    )
+                })?
+            }
+        };
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::internal_error("WebSocket completion parameters must remain an object")
+        })?;
+        object.insert(
+            "_meta".to_owned(),
+            serde_json::json!({ "progressToken": token }),
+        );
+        self.request_final_core(cx, "completion/complete", parameters)
+            .await
+    }
+
     async fn request_core_verb(
         &mut self,
         cx: &Cx,
@@ -5752,6 +5791,34 @@ where
         .await
     }
 
+    /// Reads one resource and admits request-scoped `notifications/progress`
+    /// for the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub async fn read_resource_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        uri: &str,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            McpError::internal_error("WebSocket progress token could not be encoded")
+        })?;
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "resources/read",
+            serde_json::json!({
+                "uri": uri,
+                "_meta": { "progressToken": token },
+            }),
+        )
+        .await
+    }
+
     /// Gets one prompt through the negotiated WebSocket era.
     ///
     /// Installed modern reverse handlers fulfill `input_required` the same way
@@ -5796,6 +5863,35 @@ where
             Self::websocket_prompt_parameters(name, arguments)?,
         )
         .await
+    }
+
+    /// Gets one prompt and admits request-scoped `notifications/progress` for
+    /// the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub async fn get_prompt_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            McpError::internal_error("WebSocket progress token could not be encoded")
+        })?;
+        let mut parameters = Self::websocket_prompt_parameters(name, arguments)?;
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::internal_error("WebSocket prompt parameters must remain an object")
+        })?;
+        object.insert(
+            "_meta".to_owned(),
+            serde_json::json!({ "progressToken": token }),
+        );
+        self.follow_installed_mrtr(cx, None, "prompts/get", parameters)
+            .await
     }
 
     /// Calls one tool through the negotiated WebSocket era.
@@ -10462,6 +10558,46 @@ impl HttpClient {
         .await
     }
 
+    /// Completes one prompt or resource-template argument and admits
+    /// request-scoped `notifications/progress` for the supplied marker.
+    pub async fn complete_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        params: CompletionParams,
+        progress_marker: ProgressMarker,
+    ) -> Result<CoreResult, HttpClientError> {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP progress token could not be encoded",
+            ))
+        })?;
+        let mut parameters = match self.selected_protocol_era() {
+            ProtocolEra::Modern2026 => serde_json::to_value(params).map_err(|_| {
+                HttpClientError::CoreResult(McpError::internal_error(
+                    "HTTP modern completion parameters could not serialize",
+                ))
+            })?,
+            ProtocolEra::Legacy2024 => {
+                serde_json::to_value(params.into_legacy()?).map_err(|_| {
+                    HttpClientError::CoreResult(McpError::internal_error(
+                        "HTTP legacy completion parameters could not serialize",
+                    ))
+                })?
+            }
+        };
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP completion parameters must remain an object",
+            ))
+        })?;
+        object.insert(
+            "_meta".to_owned(),
+            serde_json::json!({ "progressToken": token }),
+        );
+        self.request_final_core(cx, "completion/complete", parameters)
+            .await
+    }
+
     fn http_list_parameters(cursor: Option<&str>) -> serde_json::Value {
         cursor.map_or_else(
             || serde_json::json!({}),
@@ -10728,6 +10864,33 @@ impl HttpClient {
         .await
     }
 
+    /// Reads one resource and admits request-scoped `notifications/progress`
+    /// for the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub async fn read_resource_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        uri: &str,
+        progress_marker: ProgressMarker,
+    ) -> Result<CoreResult, HttpClientError> {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP progress token could not be encoded",
+            ))
+        })?;
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "resources/read",
+            serde_json::json!({
+                "uri": uri,
+                "_meta": { "progressToken": token },
+            }),
+        )
+        .await
+    }
+
     /// Gets one prompt through the negotiated HTTP era.
     ///
     /// Installed modern reverse handlers fulfill `input_required` the same way
@@ -10765,6 +10928,36 @@ impl HttpClient {
             Self::http_prompt_parameters(name, arguments)?,
         )
         .await
+    }
+
+    /// Gets one prompt and admits request-scoped `notifications/progress` for
+    /// the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub async fn get_prompt_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        progress_marker: ProgressMarker,
+    ) -> Result<CoreResult, HttpClientError> {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP progress token could not be encoded",
+            ))
+        })?;
+        let mut parameters = Self::http_prompt_parameters(name, arguments)?;
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP prompt parameters must remain an object",
+            ))
+        })?;
+        object.insert(
+            "_meta".to_owned(),
+            serde_json::json!({ "progressToken": token }),
+        );
+        self.follow_installed_mrtr(cx, None, "prompts/get", parameters)
+            .await
     }
 
     /// Calls one tool through the negotiated HTTP era.
@@ -16206,6 +16399,46 @@ impl Client {
         self.send_typed_core_request("tools/call", params)
     }
 
+    /// Reads one resource and admits request-scoped `notifications/progress`
+    /// for the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub fn read_resource_with_progress_marker(
+        &mut self,
+        uri: &str,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = ReadResourceParams {
+            uri: uri.to_owned(),
+            meta: Some(RequestMeta {
+                progress_marker: Some(progress_marker),
+            }),
+        };
+        self.send_typed_core_request("resources/read", params)
+    }
+
+    /// Gets one prompt and admits request-scoped `notifications/progress` for
+    /// the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub fn get_prompt_with_progress_marker(
+        &mut self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = GetPromptParams {
+            name: name.to_owned(),
+            arguments: (!arguments.is_empty()).then_some(arguments),
+            meta: Some(RequestMeta {
+                progress_marker: Some(progress_marker),
+            }),
+        };
+        self.send_typed_core_request("prompts/get", params)
+    }
+
     /// Calls a tool and returns its exact MCP 2024-11-05 result payload.
     ///
     /// This retains legacy result metadata and all schema-legal open members
@@ -17290,6 +17523,44 @@ impl Client {
                 "Client has no negotiated protocol era for completion",
             )),
         }
+    }
+
+    /// Completes one prompt or resource-template argument and admits
+    /// request-scoped `notifications/progress` for the supplied marker.
+    pub fn complete_with_progress_marker(
+        &mut self,
+        params: CompletionParams,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            McpError::internal_error("stdio progress token could not be encoded")
+        })?;
+        let mut parameters = match self.session.selected_era() {
+            Some(ProtocolEra::Modern2026) => serde_json::to_value(params).map_err(|_| {
+                McpError::internal_error("stdio modern completion parameters could not serialize")
+            })?,
+            Some(ProtocolEra::Legacy2024) => {
+                serde_json::to_value(params.into_legacy()?).map_err(|_| {
+                    McpError::internal_error(
+                        "stdio legacy completion parameters could not serialize",
+                    )
+                })?
+            }
+            None => {
+                return Err(McpError::internal_error(
+                    "Client has no negotiated protocol era for completion",
+                ));
+            }
+        };
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::internal_error("stdio completion parameters must remain an object")
+        })?;
+        object.insert(
+            "_meta".to_owned(),
+            serde_json::json!({ "progressToken": token }),
+        );
+        self.send_typed_core_request("completion/complete", parameters)
     }
 
     /// Completes one prompt or resource-template argument under a
