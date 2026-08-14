@@ -31,17 +31,18 @@ use fastmcp_rust::{
 };
 use fastmcp_rust::{
     AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
-    ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
-    ContentBlock, CoreResult, Cx, DuplicateBehavior, EmbeddedResourceContents, FinalCoreResult,
-    FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalResourceTemplate,
-    FinalRootsContextExt, FinalSamplingContextExt, FinalToolOutcome, HttpNonquiescentShutdown,
-    HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext,
-    McpError, McpErrorCode, McpRequestCancellation, McpResult, Middleware, MiddlewareDecision,
-    ModernHttpResponseKind, ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage,
-    ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
-    ResourceTemplate, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool,
-    ToolAnnotations, ToolHandler, auto, caching, core, legacy_2024, modern, prompt, providers,
-    rate_limiting, resource, tool, transform,
+    ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompleteResult,
+    CompletionHandler, Content, ContentBlock, CoreResult, Cx, DuplicateBehavior,
+    EmbeddedResourceContents, FinalCallToolResult, FinalCoreResult, FinalElicitationContextExt,
+    FinalEmbeddedRootsListParams, FinalResourceTemplate, FinalRootsContextExt,
+    FinalSamplingContextExt, FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown,
+    HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode,
+    McpRequestCancellation, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
+    ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy,
+    RawIcon, Resource, ResourceContent, ResourceHandler, ResourceTemplate, ResultMeta, Role,
+    SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolAnnotations, ToolErrorKind,
+    ToolHandler, auto, caching, core, legacy_2024, modern, prompt, providers, rate_limiting,
+    resource, tool, transform,
 };
 #[cfg(feature = "proxy")]
 use fastmcp_rust::{ClientInfo, ProxyClient, StdioSubscriptionEvent};
@@ -65,6 +66,7 @@ const PUBLIC_HTTP_AUTH_SUBJECT: &str = "e2e-native-http-principal";
 const PUBLIC_HTTP_ICON_TOOL_NAME: &str = "public-http-e2e-icon";
 const PUBLIC_HTTP_PLAIN_TOOL_NAME: &str = "public-http-e2e-plain";
 const PUBLIC_HTTP_ICON_SRC: &str = "https://example.test/e2e-icon.png";
+const PUBLIC_HTTP_OUTPUT_TOOL_NAME: &str = "public-http-e2e-output";
 
 /// The deterministic user handler exercised through both public HTTP facades.
 #[tool(name = "public-http-e2e-tool", tags = ["cursor"])]
@@ -337,6 +339,74 @@ impl ToolHandler for PublicHttpPlainTool {
         _arguments: serde_json::Value,
     ) -> McpResult<Vec<Content>> {
         Ok(vec![Content::text("plain")])
+    }
+}
+
+/// Advertises an output schema and authors matching structured content.
+struct PublicHttpOutputTool;
+
+impl ToolHandler for PublicHttpOutputTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_OUTPUT_TOOL_NAME.to_owned(),
+            description: Some(
+                "Returns structured output matching the advertised schema".to_owned(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }),
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            })),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn final_tool_error_structured_content(
+        &self,
+        kind: ToolErrorKind,
+    ) -> Option<serde_json::Value> {
+        Some(json!({
+            "value": match kind {
+                ToolErrorKind::InputValidation => "input-error",
+                ToolErrorKind::Handler => "handler-error",
+            }
+        }))
+    }
+
+    fn call(&self, _context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let value = arguments
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        Ok(vec![Content::text(format!("tool:{value}"))])
+    }
+
+    fn call_final(
+        &self,
+        _context: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        let value = arguments
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        Ok(CompleteResult::new(
+            FinalCallToolResult {
+                content: vec![ContentBlock::text(format!("tool:{value}"))],
+                is_error: false,
+                structured_content: Some(json!({"value": value})),
+            },
+            ResultMeta::empty(),
+        ))
     }
 }
 
@@ -9460,6 +9530,161 @@ fn e2e_public_http_ping_then_tools_call_on_bind_http() {
         server.handler_call_snapshot().tool,
         1,
         "only the later tools/call may invoke the handler"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_modern_output_schema_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("output schema HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-output-schema", "1.0.0")
+                .tool(PublicHttpOutputTool)
+                .tool(PublicHttpPlainTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("output schema facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("output schema facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("output schema HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("output schema facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("output schema facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("output schema facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("output schema facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_output_schema_retains_structured_content_and_peer_stays_bare() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_output_schema_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-output-schema", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the output-schema HTTP server");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("live bind_http must list the output-schema tools");
+    let output_tool = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_OUTPUT_TOOL_NAME)
+        .expect("the output-schema tool must remain on the live catalog");
+    let plain_tool = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_PLAIN_TOOL_NAME)
+        .expect("the bare peer tool must remain on the live catalog");
+    assert_eq!(
+        output_tool
+            .output_schema
+            .as_ref()
+            .and_then(|schema| schema.get("required")),
+        Some(&json!(["value"])),
+        "tools/list must retain the advertised output schema: {output_tool:?}"
+    );
+    assert_eq!(
+        plain_tool.output_schema, None,
+        "changing only the missing output schema must keep the peer bare: {plain_tool:?}"
+    );
+
+    let called = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_OUTPUT_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("live bind_http must admit the structured output tool");
+    assert!(
+        called.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the structured tool must still author text content: {called:?}"
+    );
+    assert_eq!(
+        called.structured_content,
+        Some(json!({"value": "alpha"})),
+        "tools/call must retain structuredContent matching the advertised schema: {called:?}"
+    );
+
+    let peer = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_PLAIN_TOOL_NAME, json!({})),
+    )
+    .expect("the bare peer tool must still be callable");
+    assert_eq!(
+        peer.structured_content, None,
+        "changing only the missing output schema must not invent structuredContent: {peer:?}"
     );
 
     drop(client);
