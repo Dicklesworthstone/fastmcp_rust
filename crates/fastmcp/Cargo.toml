@@ -125,8 +125,7 @@ required-features = ["testing-lab", "legacy-2024-11-05", "tasks"]
 name = "e2e_modern_http"
 path = "tests/e2e_modern_http.rs"
 # This dual-era HTTP harness directly names the sealed exact-2024 facade.
-# The live bind_websocket proofs also require the experimental WS listener.
-required-features = ["legacy-2024-11-05", "websocket-experimental"]
+required-features = ["legacy-2024-11-05"]
 
 [[test]]
 name = "e2e_stress"

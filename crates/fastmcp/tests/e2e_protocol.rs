@@ -1471,7 +1471,7 @@ fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
 #[cfg(unix)]
 #[test]
 fn e2e_public_stdio_progress_marker_is_retained_from_live_echo() {
-    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
 
     client
@@ -1498,9 +1498,239 @@ fn e2e_public_stdio_progress_marker_is_retained_from_live_echo() {
         client.take_progress_notifications().is_empty(),
         "take_progress_notifications must drain the retained queue"
     );
+
+    client
+        .read_resource("info://server")
+        .expect("a resources/read without a progress token still completes");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "without a progressToken the shipped server_info resource must not emit request-scoped progress"
+    );
+
+    let resource_marker = modern::ProgressMarker::from("stdio-resource-progress");
+    client
+        .read_resource_with_progress_marker("info://server", resource_marker.clone())
+        .expect("a progressToken must not prevent the shipped server_info resource from completing");
+    let resource_progress = client.take_progress_notifications();
+    assert!(
+        resource_progress.iter().any(|notification| {
+            notification.progress_token == resource_marker
+                && notification.message.as_deref() == Some("info")
+        }),
+        "live stdio must retain resource notifications/progress after a progressToken: {resource_progress:?}"
+    );
+
+    let mut greeting_arguments = std::collections::HashMap::new();
+    greeting_arguments.insert("name".to_owned(), "no-token".to_owned());
+    client
+        .get_prompt("greeting", greeting_arguments)
+        .expect("a prompts/get without a progress token still completes");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "without a progressToken the shipped greeting prompt must not emit request-scoped progress"
+    );
+
+    let prompt_marker = modern::ProgressMarker::from("stdio-prompt-progress");
+    let mut greeting_with_token = std::collections::HashMap::new();
+    greeting_with_token.insert("name".to_owned(), "token".to_owned());
+    client
+        .get_prompt_with_progress_marker("greeting", greeting_with_token, prompt_marker.clone())
+        .expect("a progressToken must not prevent the shipped greeting prompt from completing");
+    let prompt_progress = client.take_progress_notifications();
+    assert!(
+        prompt_progress.iter().any(|notification| {
+            notification.progress_token == prompt_marker
+                && notification.message.as_deref() == Some("greeted")
+        }),
+        "live stdio must retain prompt notifications/progress after a progressToken: {prompt_progress:?}"
+    );
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "take_progress_notifications must drain the retained resource and prompt queues"
+    );
     client
         .close()
         .expect("modern-only stdio progress client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_resource_updated_is_retained_on_incremental_listen() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    client
+        .open_subscriptions_listener(modern::SubscriptionFilter {
+            resource_subscriptions: Some(vec!["info://server".to_owned()]),
+            ..modern::SubscriptionFilter::default()
+        })
+        .expect("live stdio must admit an incremental subscriptions/listen");
+
+    let cx = Cx::for_request();
+    let cancellation = modern::McpRequestCancellation::new();
+    let acknowledgement = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("subscriptions/listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            acknowledgement,
+            modern::StdioSubscriptionEvent::Acknowledged(ref filter)
+                if filter.resource_subscriptions.as_deref() == Some(&["info://server".to_owned()][..])
+        ),
+        "the first incremental listen record must be the accepted filter: {acknowledgement:?}"
+    );
+
+    let touched = client
+        .call_tool("touch_server_info", json!({}))
+        .expect("touching the watched resource must complete");
+    assert!(
+        touched.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "notified",
+            _ => false,
+        }),
+        "a matching incremental listener must count as notify_resource_updated delivery: {touched:?}"
+    );
+
+    let updated = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("subscriptions/listen must retain resources/updated after the handler publish");
+    assert!(
+        matches!(
+            updated,
+            modern::StdioSubscriptionEvent::Notification(
+                modern::ServerNotification::ResourceUpdated(ref params)
+            ) if params.uri.as_str() == "info://server"
+        ),
+        "live stdio must retain notifications/resources/updated on the incremental listener: {updated:?}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio subscription client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_tools_list_changed_is_retained_on_incremental_listen() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    client
+        .open_subscriptions_listener(modern::SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..modern::SubscriptionFilter::default()
+        })
+        .expect("live stdio must admit an incremental subscriptions/listen");
+
+    let cx = Cx::for_request();
+    let cancellation = modern::McpRequestCancellation::new();
+    let acknowledgement = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("subscriptions/listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            acknowledgement,
+            modern::StdioSubscriptionEvent::Acknowledged(ref filter)
+                if filter.tools_list_changed == Some(true)
+        ),
+        "the first incremental listen record must be the accepted filter: {acknowledgement:?}"
+    );
+
+    let hidden = client
+        .call_tool("hide_echo", json!({}))
+        .expect("disabling the shipped echo tool must complete");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "stdio session state must let disable_tool publish list_changed: {hidden:?}"
+    );
+
+    let changed = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("subscriptions/listen must retain tools/list_changed after the handler mutation");
+    assert!(
+        matches!(
+            changed,
+            modern::StdioSubscriptionEvent::Notification(
+                modern::ServerNotification::ToolsListChanged(_)
+            )
+        ),
+        "live stdio must retain notifications/tools/list_changed on the incremental listener: {changed:?}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio list_changed client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_resource_and_prompt_list_changed_are_retained_on_incremental_listen() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    client
+        .open_subscriptions_listener(modern::SubscriptionFilter {
+            resources_list_changed: Some(true),
+            prompts_list_changed: Some(true),
+            ..modern::SubscriptionFilter::default()
+        })
+        .expect("live stdio must admit an incremental subscriptions/listen");
+
+    let cx = Cx::for_request();
+    let cancellation = modern::McpRequestCancellation::new();
+    let acknowledgement = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("subscriptions/listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            acknowledgement,
+            modern::StdioSubscriptionEvent::Acknowledged(ref filter)
+                if filter.resources_list_changed == Some(true)
+                    && filter.prompts_list_changed == Some(true)
+        ),
+        "the first incremental listen record must be the accepted filter: {acknowledgement:?}"
+    );
+
+    let hidden = client
+        .call_tool("hide_catalog", json!({}))
+        .expect("disabling a shipped resource and prompt must complete");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "stdio session state must let disable_resource and disable_prompt publish: {hidden:?}"
+    );
+
+    let first = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("subscriptions/listen must retain the first catalog mutation");
+    let second = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("subscriptions/listen must retain the second catalog mutation");
+    let kinds = [first, second];
+    assert!(
+        kinds.iter().any(|event| matches!(
+            event,
+            modern::StdioSubscriptionEvent::Notification(
+                modern::ServerNotification::ResourcesListChanged(_)
+            )
+        )),
+        "live stdio must retain notifications/resources/list_changed: {kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|event| matches!(
+            event,
+            modern::StdioSubscriptionEvent::Notification(
+                modern::ServerNotification::PromptsListChanged(_)
+            )
+        )),
+        "live stdio must retain notifications/prompts/list_changed: {kinds:?}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio catalog list_changed client cleanup");
 }
 
 #[cfg(unix)]
@@ -1569,8 +1799,16 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
     };
 
     let completion_started = Instant::now();
-    let result = client
+    client
         .complete(params.clone())
+        .expect("a completion/complete without a progress token still completes");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "without a progressToken the shipped completion handler must not emit request-scoped progress"
+    );
+    let marker = modern::ProgressMarker::from("stdio-completion-progress");
+    let result = client
+        .complete_with_progress_marker(params.clone(), marker.clone())
         .expect("the typed ModernOnly client reaches the shipped completion provider");
     assert!(
         completion_started.elapsed() <= STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
@@ -1578,12 +1816,20 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
     );
     assert_eq!(
         result.completion.values,
-        vec!["stdio-completion-1".to_owned()],
+        vec!["stdio-completion-2".to_owned()],
         "the exact FinalCompletionResult retains the provider value and count"
+    );
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("stdio-completion-halfway")
+        }),
+        "live shipped-echo stdio must retain completion notifications/progress: {progress:?}"
     );
     assert_eq!(
         result.completion.total,
-        Some(modern::JsonInteger::from(1_i64)),
+        Some(modern::JsonInteger::from(2_i64)),
         "the exact FinalCompletionResult retains its JSON-integer count"
     );
     assert_eq!(
@@ -1607,13 +1853,13 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
         .expect("the rejected request leaves the live modern client and provider usable");
     assert_eq!(
         resumed.completion.values,
-        vec!["stdio-completion-2".to_owned()],
+        vec!["stdio-completion-3".to_owned()],
         "the next accepted completion proves the rejected argument did not invoke the provider"
     );
     assert_eq!(
         resumed.completion.total,
-        Some(modern::JsonInteger::from(2_i64)),
-        "the provider count advances only for the two accepted completions"
+        Some(modern::JsonInteger::from(3_i64)),
+        "the provider count advances only for the three accepted completions"
     );
     assert_eq!(resumed.completion.has_more, Some(false));
     let cleanup_started = Instant::now();
