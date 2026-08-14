@@ -782,6 +782,11 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     ) -> auto::McpResult<auto::FinalCallToolResult> = auto::Client::call_tool_final;
     let _: fn(&mut modern::Client, &str) -> modern::McpResult<modern::FinalReadResourceResult> =
         modern::Client::read_resource;
+    let _ = modern::Client::call_tool_result;
+    let _ = modern::Client::read_resource_result;
+    let _ = modern::Client::get_prompt_result;
+    let _ = modern::Client::list_tools_with_cancellation;
+    let _ = modern::Client::call_tool_with_cancellation;
     let _: fn(&mut modern::Client, modern::SubscriptionFilter) -> modern::McpResult<()> =
         modern::Client::open_subscriptions_listener;
     let _: fn(

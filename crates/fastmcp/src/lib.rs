@@ -120,8 +120,8 @@ pub mod __private {
     pub mod server {
         pub use fastmcp_server::bidirectional;
         pub use fastmcp_server::{
-            BoxFuture, FinalMethodOutcome, FinalToolOutcome, PromptHandler, ResourceHandler,
-            ToolHandler,
+            BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
+            PromptHandler, ResourceHandler, ToolHandler,
         };
     }
 
@@ -278,19 +278,19 @@ pub mod server {
         ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
         FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
-        FinalResourceReadCacheHintProvenance, FinalSampling, FinalSamplingContextExt,
-        FinalToolOutcome, FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig,
-        HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport,
-        LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision, MountResult,
-        NotificationSender, PendingRequests, ProgressNotificationSender, PromptHandler,
-        RequestSender, ResourceHandler, Router, ServerExtensionConfigurationError,
-        ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
-        ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse,
-        ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
-        TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity,
-        TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, caching,
-        create_context_with_progress, create_context_with_progress_and_senders, oauth, oidc,
-        providers, rate_limiting, transform,
+        FinalResourceReadCacheHintProvenance, FinalRoots, FinalRootsContextExt, FinalSampling,
+        FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
+        HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement,
+        InboundRequestContext, InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware,
+        MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+        ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
+        ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
+        ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
+        ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier,
+        StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolHandler,
+        TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
+        TransportSamplingSender, caching, create_context_with_progress,
+        create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
@@ -659,12 +659,13 @@ pub use fastmcp_transport::{event_store, http, memory};
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
     BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
-    FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalSampling,
-    FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority, HttpNonquiescentShutdown,
-    HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext,
-    InboundRequestTransport, Middleware, MiddlewareDecision, MountResult, NotificationSender,
-    PendingRequests, ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
-    Router, ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
+    FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalRoots,
+    FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
+    FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
+    HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, Middleware,
+    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+    ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
+    ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
     ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
     StaticTokenVerifier, StatsSnapshot, SubscriptionListenHandle, TagFilters, TokenAuthProvider,
     TokenVerifier, ToolErrorKind, ToolHandler, TrafficVerbosity, TransportElicitationSender,
@@ -2024,12 +2025,13 @@ pub mod modern {
         DuplicateBehavior, ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
         FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
-        FinalResourceReadCacheHintProvenance, FinalSampling, FinalSamplingContextExt,
-        FinalToolOutcome, FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerShutdown,
-        HttpShutdownSettlement, LifespanHooks, LoggingConfig, Middleware, MiddlewareDecision,
-        MountResult, ProgressNotificationSender, PromptHandler, ResourceHandler,
-        ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
-        ToolHandler, TrafficVerbosity, create_context_with_progress,
+        FinalResourceReadCacheHintProvenance, FinalRoots, FinalRootsContextExt, FinalSampling,
+        FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
+        HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, LifespanHooks,
+        LoggingConfig, Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender,
+        PromptHandler, ResourceHandler, ServerExtensionConfigurationError, ShutdownHook,
+        StartupHook, TagFilters, ToolErrorKind, ToolHandler, TrafficVerbosity,
+        create_context_with_progress,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
@@ -2920,6 +2922,27 @@ pub mod modern {
             }
         }
 
+        /// Lists one exact final page of tools under a request-local
+        /// cancellation domain.
+        pub fn list_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<FinalListToolsResult> {
+            match self
+                .inner
+                .list_tools_with_cancellation(cx, cancellation, cursor)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final tools/list result",
+                )),
+            }
+        }
+
         /// Calls one tool and retains the exact final content vocabulary.
         pub fn call_tool(
             &mut self,
@@ -2927,6 +2950,30 @@ pub mod modern {
             arguments: JsonValue,
         ) -> McpResult<FinalCallToolResult> {
             self.inner.call_tool_final(name, arguments)
+        }
+
+        /// Calls one tool under a request-local cancellation domain.
+        ///
+        /// A cancellation observed before send makes no transport contact.
+        /// Installed reverse handlers are not followed on this path.
+        pub fn call_tool_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalCallToolResult> {
+            match self
+                .inner
+                .call_tool_with_cancellation(cx, cancellation, name, arguments)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final tools/call result",
+                )),
+            }
         }
 
         /// Calls one tool with the official Tasks result discriminator enabled.
@@ -2993,6 +3040,58 @@ pub mod modern {
             arguments: std::collections::HashMap<String, String>,
         ) -> McpResult<FinalGetPromptResult> {
             self.inner.get_prompt_final(name, arguments)
+        }
+
+        /// Calls one tool and keeps a live `input_required` branch.
+        ///
+        /// [`Self::call_tool`] projects only the complete payload. Use this
+        /// when the caller must observe framework-issued MRTR input.
+        pub fn call_tool_result(
+            &mut self,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalCoreResult> {
+            match self.inner.call_tool_typed(name, arguments)? {
+                fastmcp_protocol::CoreResult::Final(
+                    result @ (fastmcp_protocol::FinalCoreResult::ToolsCall { .. }
+                    | fastmcp_protocol::FinalCoreResult::ToolsCallInputRequired { .. }),
+                ) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final tools/call result",
+                )),
+            }
+        }
+
+        /// Reads one resource and keeps a live `input_required` branch.
+        pub fn read_resource_result(&mut self, uri: &str) -> McpResult<FinalCoreResult> {
+            match self.inner.read_resource_typed(uri)? {
+                fastmcp_protocol::CoreResult::Final(
+                    result @ (fastmcp_protocol::FinalCoreResult::ResourcesRead { .. }
+                    | fastmcp_protocol::FinalCoreResult::ResourcesReadInputRequired {
+                        ..
+                    }),
+                ) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final resources/read result",
+                )),
+            }
+        }
+
+        /// Gets one prompt and keeps a live `input_required` branch.
+        pub fn get_prompt_result(
+            &mut self,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<FinalCoreResult> {
+            match self.inner.get_prompt_typed(name, arguments)? {
+                fastmcp_protocol::CoreResult::Final(
+                    result @ (fastmcp_protocol::FinalCoreResult::PromptsGet { .. }
+                    | fastmcp_protocol::FinalCoreResult::PromptsGetInputRequired { .. }),
+                ) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final prompts/get result",
+                )),
+            }
         }
 
         /// Calls one tool through final-only stdio until a terminal final result arrives.
@@ -7760,6 +7859,9 @@ mod tests {
         let _: Option<super::FinalSampling> = None;
         fn assert_final_sampling_context_ext<T: super::FinalSamplingContextExt>() {}
         assert_final_sampling_context_ext::<super::McpContext>();
+        let _: Option<super::FinalRoots> = None;
+        fn assert_final_roots_context_ext<T: super::FinalRootsContextExt>() {}
+        assert_final_roots_context_ext::<super::McpContext>();
         let _: fn(
             super::modern::ServerBuilder,
             super::oauth::OAuthHttpRoutes,
