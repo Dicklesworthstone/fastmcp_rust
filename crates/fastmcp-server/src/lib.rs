@@ -110,9 +110,10 @@ pub use fastmcp_transport::websocket::AsyncWsServerTransport;
 pub use handler::{
     BidirectionalSenders, BoxFuture, CompletionHandler, FinalElicitation,
     FinalElicitationContextExt, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
-    FinalSampling, FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
-    ProgressNotificationSender, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    FinalRoots, FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
+    FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler, ResourceHandler,
+    ToolErrorKind, ToolHandler, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 use oauth::{
@@ -1789,6 +1790,10 @@ fn admitted_final_client_capability_info(
         capability_info.with_sampling()
     } else {
         capability_info
+    };
+    let capability_info = match capabilities.roots.as_ref() {
+        Some(roots) => capability_info.with_roots(roots.list_changed),
+        None => capability_info,
     };
     Ok(Some(capability_info))
 }

@@ -29,12 +29,12 @@ use fastmcp_protocol::{
     CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue, FinalCallToolResult,
     FinalCompletionParams, FinalCompletionValues, FinalEmbeddedCreateMessageParams,
     FinalEmbeddedElicitationParams, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest,
-    FinalEmbeddedUrlElicitationParams, FinalGetPromptResult, FinalProgressNotificationParams,
-    FinalPrompt, FinalPromptMessage, FinalReadResourceResult, FinalResource, FinalResourceTemplate,
-    FinalTool, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams, LogLevel,
-    LogMessageParams, ProgressMarker, ProgressParams, Prompt, PromptMessage, Resource,
-    ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations,
-    decode_peer_result, encode_result, exact_json_from_serde,
+    FinalEmbeddedRootsListParams, FinalEmbeddedUrlElicitationParams, FinalGetPromptResult,
+    FinalProgressNotificationParams, FinalPrompt, FinalPromptMessage, FinalReadResourceResult,
+    FinalResource, FinalResourceTemplate, FinalTool, Icon, InputRequiredResult, JsonRpcRequest,
+    LegacyCompletionParams, LogLevel, LogMessageParams, ProgressMarker, ProgressParams, Prompt,
+    PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool,
+    ToolAnnotations, decode_peer_result, encode_result, exact_json_from_serde,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -1100,6 +1100,86 @@ impl FinalSamplingContextExt for McpContext {
         parameters: FinalEmbeddedCreateMessageParams,
     ) -> McpResult<FinalSampling> {
         FinalSampling::new(self, input_key, parameters)
+    }
+}
+
+/// One final-era roots request that a handler returns as MRTR input.
+///
+/// Modern server roots are not reverse JSON-RPC. The handler returns this
+/// descriptor through [`FinalToolOutcome::InputRequired`], then reads the
+/// accepted roots with [`MrtrCompletedInputs::roots`] after the client retries.
+#[derive(Debug, Clone)]
+pub struct FinalRoots {
+    input_key: String,
+    parameters: FinalEmbeddedRootsListParams,
+}
+
+impl FinalRoots {
+    fn new(
+        context: &McpContext,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedRootsListParams,
+    ) -> McpResult<Self> {
+        if !context.client_supports_roots() {
+            return Err(McpError::invalid_request(
+                "Final roots listing is not advertised by the client",
+            ));
+        }
+        let input_key = input_key.into();
+        if input_key.is_empty() {
+            return Err(McpError::invalid_params(
+                "Final roots input key must not be empty",
+            ));
+        }
+        Ok(Self {
+            input_key,
+            parameters,
+        })
+    }
+
+    /// Returns the opaque map key that correlates this roots request on retry.
+    #[must_use]
+    pub fn input_key(&self) -> &str {
+        &self.input_key
+    }
+
+    /// Converts this roots request into framework-admitted final MRTR input.
+    pub fn into_input_required(self) -> McpResult<InputRequiredResult> {
+        let descriptor = FinalEmbeddedInputRequest::Roots(self.parameters);
+        let wire = serde_json::json!({self.input_key: descriptor});
+        let ExactJsonValue::Object(input_requests) = exact_json_from_serde(&wire)
+            .map_err(|error| McpError::invalid_params(error.to_string()))?
+        else {
+            return Err(McpError::internal_error(
+                "Final roots input requests must encode as an object",
+            ));
+        };
+        InputRequiredResult::new(Some(input_requests), None, ResultMeta::empty())
+            .map_err(|error| McpError::invalid_params(error.to_string()))
+    }
+}
+
+/// Final-only roots construction for [`McpContext`].
+///
+/// Import this trait to build a final embedded `roots/list` request inside a
+/// final handler. Return it through [`FinalToolOutcome::InputRequired`], then
+/// read the typed response with [`MrtrCompletedInputs::roots`] after retry.
+pub trait FinalRootsContextExt {
+    /// Builds one capability-gated final MRTR roots descriptor.
+    fn final_roots(
+        &self,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedRootsListParams,
+    ) -> McpResult<FinalRoots>;
+}
+
+impl FinalRootsContextExt for McpContext {
+    fn final_roots(
+        &self,
+        input_key: impl Into<String>,
+        parameters: FinalEmbeddedRootsListParams,
+    ) -> McpResult<FinalRoots> {
+        FinalRoots::new(self, input_key, parameters)
     }
 }
 
@@ -5863,5 +5943,55 @@ mod tests {
             .final_sampling("sample", parameters)
             .expect_err("removing only sampling capability rejects final sampling");
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn final_roots_context_emits_roots_list_method() {
+        let context = McpContext::new(Cx::for_testing(), 73)
+            .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_roots(false));
+        let input_required = context
+            .final_roots("roots", FinalEmbeddedRootsListParams::default())
+            .expect("advertised roots builds final MRTR input")
+            .into_input_required()
+            .expect("final roots input serializes");
+        let wire: serde_json::Value = serde_json::from_str(&encode_result(
+            &DecodedResult::InputRequired(input_required),
+        ))
+        .expect("input-required result encodes through its exact wire path");
+        assert_eq!(
+            wire["inputRequests"]["roots"]["method"],
+            serde_json::json!("roots/list")
+        );
+        assert!(
+            wire["inputRequests"]["roots"].get("params").is_none(),
+            "empty roots params must omit the params member"
+        );
+    }
+
+    #[test]
+    fn final_roots_context_rejects_only_removed_roots_capability() {
+        let admitted = McpContext::new(Cx::for_testing(), 74)
+            .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_roots(false));
+        assert!(
+            admitted
+                .final_roots("roots", FinalEmbeddedRootsListParams::default())
+                .is_ok()
+        );
+
+        let rejected = McpContext::new(Cx::for_testing(), 74);
+        let error = rejected
+            .final_roots("roots", FinalEmbeddedRootsListParams::default())
+            .expect_err("removing only roots capability rejects final roots");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn final_roots_context_rejects_empty_input_key() {
+        let context = McpContext::new(Cx::for_testing(), 75)
+            .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_roots(false));
+        let error = context
+            .final_roots("", FinalEmbeddedRootsListParams::default())
+            .expect_err("empty roots input key is invalid");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
     }
 }
