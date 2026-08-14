@@ -106,15 +106,15 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Dynamic enable/disable** | ✅ | ✅ | Per-session visibility via state.rs, context.rs; `disable_*`/`enable_*` emit 2024 `list_changed` and publish the same events to modern `subscriptions/listen` |
+| **Dynamic enable/disable** | ✅ | ✅ | Per-session visibility via state.rs, context.rs; `disable_*`/`enable_*` emit 2024 `list_changed` and publish the same events to modern `subscriptions/listen`. Live `bind_http` incremental listen retains handler `disable_tool` / `disable_resource` / `disable_prompt` publication and same-request `enable_tool` after `disable_tool`; anonymous HTTP POSTs get a request-local `SessionState` so that mutation can fire without inventing `Mcp-Session-Id` |
 | **Component versioning** | ✅ | ✅ | Version fields on Tool, Resource, Prompt types |
 | **Tags for filtering** | ✅ | ✅ | `include_tags`/`exclude_tags` in router.rs |
 | **Icons support** | ✅ | ✅ | Icon metadata in types.rs, handler.rs |
 | **Error masking** | ✅ | ✅ | `mask_error_details` in builder.rs |
 | **Strict input validation** | ✅ | ✅ | `strict_input_validation` in router.rs |
 | **Duplicate handling** | ✅ | ✅ | `on_duplicate` in builder.rs |
-| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs |
-| **mount() composition** | ✅ | ✅ | Implemented in builder.rs, router.rs |
+| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete` through `ProxyClient::connect_http_with_protocol_plan`; complete-only proxied tools do not require the official Tasks client extension |
+| **mount() composition** | ✅ | ✅ | Implemented in builder.rs, router.rs. Public Auto/modern/legacy facades expose `mount()`, `mount_tools()`, `mount_resources()`, and `mount_prompts()`. Live `bind_http` parent lists prefixed child tools/prompts and dispatches `tools/call` and `prompts/get`; an unprefixed `mount_resources` child keeps the exact final resource URI for `resources/read`. A nonempty prefix does not invent a non-absolute modern resource URI |
 
 ---
 
@@ -147,8 +147,8 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Stdio transport** | ✅ | ✅ | NDJSON implementation present |
-| **SSE transport** | ✅ | 🟡 | Low-level `SseServerTransport`/`SseClientTransport` types exist; public `Client::sse` / `Client::sse_with_cx` connect an exact-2024 HTTP+SSE client without probing modern HTTP. Auto still uses SSE only as a fallback |
-| **WebSocket transport** | ✅ | 🟡 | `WsTransport` framing plus `ClientBuilder::connect_websocket_with_cx` exist behind `websocket-experimental`. Live public `bind_websocket` plus `modern::WebSocketClient` prove `ping`, `set_log_level` + `ctx.info`, and `call_tool_with_progress_marker` over a real localhost socket. Aggregate lifecycle qualification remains open |
+| **SSE transport** | ✅ | 🟡 | Low-level `SseServerTransport`/`SseClientTransport` types exist; public `Client::sse` / `Client::sse_with_cx` connect an exact-2024 HTTP+SSE client without probing modern HTTP. Live `bind_http` LegacyOnly `Client::sse_with_cx` invokes a real tool handler. Auto still uses SSE only as a fallback |
+| **WebSocket transport** | ✅ | 🟡 | `WsTransport` framing plus `ClientBuilder::connect_websocket_with_cx` exist behind `websocket-experimental`; aggregate lifecycle qualification remains open |
 | **HTTP transport** | ✅ | 🟡 | Public `Server::run_http*` binds a dual-era listener; `Client::http` is the high-level client. Aggregate admission/challenge and bidirectional qualification remain open |
 | **Streamable HTTP** | ✅ | 🟡 | `StreamableHttpTransport` and public modern/legacy HTTP paths exist; aggregate protocol qualification remains unverified |
 | **MemoryTransport (in-process)** | ✅ | ✅ | `memory.rs` for testing |
@@ -169,7 +169,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `tools/call` | ✅ | ✅ | With progress token support |
 | `resources/list` | ✅ | ✅ | With cursor pagination |
 | `resources/read` | ✅ | ✅ | With progress token support. Final `#[resource]` handlers that author a complete result keep their `ttlMs` / `cacheScope`; the router default (one hour, private) applies only to the legacy-bridge projection |
-| `resources/templates/list` | ✅ | 🟡 | Listing plus RFC 6570 reversible matching exist; lossy prefix/explode templates are refused rather than guessed |
+| `resources/templates/list` | ✅ | 🟡 | Listing plus RFC 6570 reversible matching exist; lossy prefix/explode templates are refused rather than guessed. Live `bind_http` `list_resource_templates` retains a registered reversible template; `resources/read` expands a matching URI through `read_with_uri` and refuses a near-identical unmatched path before the handler runs |
 | `resources/subscribe` | ✅ | ✅ | Session dispatch serves subscribe for registered URIs; registering a resource or template advertises `resources.subscribe` on initialize |
 | `resources/unsubscribe` | ✅ | ✅ | Protocol support |
 | `prompts/list` | ✅ | ✅ | With cursor pagination |
@@ -182,7 +182,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `notifications/resources/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
 | `notifications/prompts/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
 | `notifications/resources/updated` | ✅ | ✅ | `ctx.notify_resource_updated` plus matching listen filters |
-| `subscriptions/listen` | ✅ | 🟡 | Owned HTTP incremental listener (`start_subscriptions_listener` keeps the same `HttpClient` free to issue requests), stdio incremental catalog/Tasks listeners on the same `Client`, `ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams, WebSocket incremental catalog listen (`WebSocketClient::open_subscriptions_listener`), detached sequential pumps, and `Server::open_subscription_listen` for in-process callers. `dispatch_stateless` rejects listen instead of returning `MethodNotFound`. Collect-to-terminal stdio/WebSocket and the borrowing HTTP listener remain available |
+| `subscriptions/listen` | ✅ | 🟡 | Owned HTTP incremental listener (`start_subscriptions_listener` keeps the same `HttpClient` free to issue requests), stdio incremental catalog/Tasks listeners on the same `Client`, `ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams, WebSocket incremental catalog listen (`WebSocketClient::open_subscriptions_listener`), detached sequential pumps, and `Server::open_subscription_listen` for in-process callers. Live `bind_http` incremental listen retains handler `notifications/resources/updated` and tool/resource/prompt `list_changed`. Live shipped-echo stdio uses split stdin/stdout so listen acknowledgements, `resources/updated`, and tool/resource/prompt `list_changed` publish while the receive pump is blocked. `dispatch_stateless` rejects listen instead of returning `MethodNotFound`. Collect-to-terminal stdio/WebSocket and the borrowing HTTP listener remain available |
 
 ### Background Tasks (Docket/SEP-1686; network surface quarantined)
 
@@ -237,7 +237,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Progress callbacks | ✅ | ✅ | `call_tool_with_progress()` |
 | List operations | ✅ | ✅ | Tool/resource/prompt list methods exist |
 | Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the Unix stdio receive pump can route it during dispatch. Public HTTP `request_final_core_with_cancellation` plus typed `list_*`/`call_tool`/`read_resource`/`get_prompt`/`complete` `*_with_cancellation` verbs honor a caller-owned cancellation domain for ordinary core requests. Public stdio `modern::Client` exposes the same typed verbs and rejects before send when the domain is already cancelled. WebSocket typed verbs reject before send and retire after send; a blocked ingress wait still belongs to the connection `Cx` until the next frame. Non-Unix stdio and custom/SSE loops retain sequential/blocking boundaries; reliable interruption, cleanup waiting, and request-owned isolation remain open |
-| Log level setting | ✅ | ✅ | Exact-2024 `set_log_level()` sends `logging/setLevel`. Modern stdio, HTTP, and WebSocket `set_log_level` stamp `io.modelcontextprotocol/logLevel` on later requests. Modern HTTP and live `bind_websocket` `take_server_notifications` then retain the request-scoped `notifications/message` frames that floor admits |
+| Log level setting | ✅ | ✅ | Exact-2024 `set_log_level()` sends `logging/setLevel`. Modern stdio, HTTP, and WebSocket `set_log_level` stamp `io.modelcontextprotocol/logLevel` on later requests. Modern HTTP `take_server_notifications` then retains the request-scoped `notifications/message` frames that floor admits |
 | Response ID validation | ✅ | ✅ | Validates response IDs |
 | Client request idle/absolute deadlines | ✅ | 🟡 | Ordinary requests use monotonic `Instant` deadlines that begin after send commit (30-second idle and 120-second non-resettable absolute defaults). Unix subprocess stdout receives, including silent and partial frames, are bounded; generic blocking `recv`, non-Unix child pipes, synchronous writes, and best-effort Drop prevent a portable end-to-end wall-clock guarantee (FND-04) |
 | **MCPConfig client creation** | ✅ | ✅ | `mcp_config.rs` with JSON/TOML parsing |
@@ -258,9 +258,9 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | Context object | ✅ | ✅ | `McpContext` |
-| Progress reporting | ✅ | ✅ | `report_progress()`, `report_progress_with_total()`. Modern HTTP, WebSocket, and stdio `call_tool_with_progress_marker` stamp `progressToken`; `take_progress_notifications` retains the request-scoped frames. Live `bind_websocket` proves the same progress path over a real socket |
-| Handler log notifications | ✅ | ✅ | `ctx.debug()`/`info()`/`notice()`/`warning()`/`error()` emit `notifications/message` after `logging/setLevel`. Exact-2024 uses the session `setLevel` floor. Modern HTTP, stdio, and live `bind_websocket` apply the request `io.modelcontextprotocol/logLevel` floor to `ctx.info` and friends; public `take_server_notifications` drains the frames |
-| Resource update notifications | ✅ | ✅ | `ctx.notify_resource_updated(uri)` emits 2024 `resources/updated` to session subscribers and publishes the same event to matching `subscriptions/listen` streams |
+| Progress reporting | ✅ | ✅ | `report_progress()`, `report_progress_with_total()`. Modern HTTP, WebSocket, and stdio `call_tool_with_progress_marker` / `read_resource_with_progress_marker` / `get_prompt_with_progress_marker` stamp `progressToken`; modern HTTP, WebSocket, and stdio also expose `complete_with_progress_marker`. `take_progress_notifications` retains the request-scoped frames |
+| Handler log notifications | ✅ | ✅ | `ctx.debug()`/`info()`/`notice()`/`warning()`/`error()` emit `notifications/message` after `logging/setLevel`. Exact-2024 uses the session `setLevel` floor. Modern HTTP and stdio apply the request `io.modelcontextprotocol/logLevel` floor to `ctx.info` and friends on tools, resources, and prompts; public `take_server_notifications` drains the frames |
+| Resource update notifications | ✅ | ✅ | `ctx.notify_resource_updated(uri)` emits 2024 `resources/updated` to session subscribers and publishes the same event to matching `subscriptions/listen` streams. Live `bind_http` and live shipped-echo stdio incremental listen retain the handler publish |
 | Checkpoint for cancellation | ✅ | ✅ | `checkpoint()` |
 | Budget access | ✅ | ✅ | `budget()` |
 | Request ID access | ✅ | ✅ | `request_id()` |
@@ -335,7 +335,7 @@ The following bidirectional building blocks exist in source. This inventory does
 
 | Provider | Python | Rust | Notes |
 |----------|--------|------|-------|
-| **FilesystemProvider** | ✅ | 🟡 | Public `build()` constructs a handler on Linux/macOS and routes I/O through the caller-owned blocking pool; other targets remain fail-closed |
+| **FilesystemProvider** | ✅ | 🟡 | Public `build()` constructs a handler on Linux/macOS and routes I/O through the caller-owned blocking pool. Live `bind_http` lists `file:///{prefix}/{+path}` and `resources/read` expands a matching file URI through `read_with_uri`; a near-identical unmatched prefix is refused before the handler runs. Other targets remain fail-closed |
 | **OpenAPIProvider** | ✅ | ⊘ | Excluded per plan (intentional) |
 
 ---
@@ -411,7 +411,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 3. ✅ **Error masking** - `mask_error_details` setting (builder.rs)
 4. ✅ **Server composition** - mount(), as_proxy() (builder.rs, proxy.rs, router.rs)
 5. ✅ **CLI commands** - dev, test, and tasks command paths are present; this is not an end-to-end verification claim
-6. 🟡 **FilesystemProvider** - Public construction works on Linux/macOS; other targets remain fail-closed
+6. 🟡 **FilesystemProvider** - Public construction and live `bind_http` list+read work on Linux/macOS; other targets remain fail-closed
 7. ✅ **Auto-initialize** - Client auto-initialization (client/builder.rs)
 8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs)
 9. ✅ **Capabilities access** - ctx.client_capabilities(), ctx.server_capabilities() (context.rs)
@@ -507,9 +507,7 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
 - The public client supports subprocess stdio and HTTP (`Client::http` with
   typed list/call/read/get verbs). WebSocket is behind
   `websocket-experimental` and now has incremental catalog listen plus the
-  same typed verbs; live `bind_websocket` plus `modern::WebSocketClient`
-  prove ping, request-scoped `ctx.info`, and progress over a real socket.
-  SSE is used as the exact-2024 HTTP fallback and remains a
+  same typed verbs; SSE is used as the exact-2024 HTTP fallback and remains a
   lower-level transport type
 
 **Not production-certified for MCP 2026-07-28** until final attestation and GATE packages pass.
