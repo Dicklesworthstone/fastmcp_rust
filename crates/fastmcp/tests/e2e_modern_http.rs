@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_rust::{
-    AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
+    AsyncWsClientTransport, AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
     ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
     ContentBlock, CoreResult, Cx, FinalCoreResult, FinalElicitationContextExt,
     FinalEmbeddedRootsListParams, FinalRootsContextExt, FinalSamplingContextExt, FinalToolOutcome,
@@ -33,12 +33,15 @@ use fastmcp_rust::{
     Middleware, MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, Prompt,
     PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy, Resource, ResourceContent,
     ResourceHandler, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler,
-    auto, core, legacy_2024, modern, prompt, resource, tool,
+    WebSocketNonquiescentShutdown, WebSocketServerShutdown, auto, core, legacy_2024, modern, prompt,
+    resource, tool,
 };
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
 const PUBLIC_HTTP_TOOL_NAME: &str = "public-http-e2e-tool";
+const PUBLIC_HTTP_LOG_TOOL_NAME: &str = "public-http-e2e-log";
+const PUBLIC_HTTP_HANDLER_LOG_TEXT: &str = "public-http-handler-info";
 const PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME: &str = "public-http-e2e-cursor-secondary";
 const PUBLIC_HTTP_RESOURCE_URI: &str = "test://public-http-e2e/resource";
 const PUBLIC_HTTP_PROMPT_NAME: &str = "public-http-e2e-prompt";
@@ -3075,24 +3078,705 @@ fn e2e_public_http_set_log_level_stamps_request_metadata() {
     .expect("the ModernOnly public facade connects before logLevel configuration");
     runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
         .expect("JSON tools/list succeeds before request logLevel is configured");
+    assert_eq!(client.log_level(), None);
 
     client
         .set_log_level(modern::LoggingLevel::Info)
         .expect("modern HTTP set_log_level stores request metadata locally");
-    let info = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
-        .expect_err("info logLevel requires owned SSE, so JSON tools/list must fail closed");
-    let info = info.to_string();
-    assert!(
-        info.contains("406") || info.to_ascii_lowercase().contains("not acceptable"),
-        "info logLevel must surface the SSE requirement: {info}"
+    assert_eq!(client.log_level(), Some(modern::LoggingLevel::Info));
+    runtime_block_on_bounded(&cx, client.list_tools(&cx, None)).expect(
+        "info logLevel is request metadata; the public JSON+SSE Accept still completes tools/list",
     );
 
     client
         .set_log_level(modern::LoggingLevel::Emergency)
         .expect("emergency logLevel still stores request metadata locally");
-    runtime_block_on_bounded(&cx, client.list_tools(&cx, None)).expect(
-        "changing only the logLevel rank to emergency keeps JSON tools/list off the SSE path",
+    runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("changing only the logLevel rank cannot break the same public tools/list verb");
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_set_log_level_retains_request_scoped_message_notifications() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_facade_http_server(false, None);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-log-notify", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects before log notification retention");
+
+    assert!(
+        client.take_server_notifications().is_empty(),
+        "no request has produced a request-scoped log yet"
     );
+
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("info logLevel is stored as request metadata");
+    runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("info logLevel forces the request-owned SSE body that can carry logs");
+    let info_notifications = client.take_server_notifications();
+    assert!(
+        info_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+        )),
+        "live bind_http must retain notifications/message after set_log_level(Info): {info_notifications:?}"
+    );
+    assert!(
+        client.take_server_notifications().is_empty(),
+        "take_server_notifications must drain the retained queue"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Emergency)
+        .expect("emergency logLevel still stores request metadata locally");
+    runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("raising the floor cannot break the same public tools/list verb");
+    let emergency_notifications = client.take_server_notifications();
+    assert!(
+        !emergency_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+        )),
+        "raising only the logLevel floor must suppress the info notification: {emergency_notifications:?}"
+    );
+    drop(client);
+    server.shutdown();
+}
+
+/// Live modern HTTP tool that emits `ctx.info` so request-scoped logs are observable.
+struct PublicHttpLogTool;
+
+impl ToolHandler for PublicHttpLogTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_LOG_TOOL_NAME.to_owned(),
+            description: Some("Proves live facade HTTP handler log notifications".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        ctx.info(PUBLIC_HTTP_HANDLER_LOG_TEXT);
+        Ok(vec![Content::text("logged")])
+    }
+}
+
+fn spawn_modern_log_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("log HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-log", "1.0.0")
+                .tool(PublicHttpLogTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("log facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("log facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("log HTTP server startup receiver went away".to_owned());
+            }
+            bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("log facade HTTP server stopped unexpectedly: {error}"))
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("log facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("log facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("log facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_ctx_info_is_retained_after_set_log_level() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_log_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-ctx-info", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects before handler log emission");
+
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("info logLevel is stored as request metadata");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_LOG_TOOL_NAME, json!({})),
+    )
+    .expect("ctx.info must not prevent the same tools/call from completing");
+    let info_notifications = client.take_server_notifications();
+    assert!(
+        info_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+                    && message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+        )),
+        "live bind_http must retain ctx.info after set_log_level(Info): {info_notifications:?}"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Emergency)
+        .expect("emergency logLevel still stores request metadata locally");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_LOG_TOOL_NAME, json!({})),
+    )
+    .expect("raising only the logLevel floor cannot break the same public tools/call");
+    let emergency_notifications = client.take_server_notifications();
+    assert!(
+        !emergency_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+        )),
+        "raising only the logLevel floor must suppress ctx.info: {emergency_notifications:?}"
+    );
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_PROGRESS_TOOL_NAME: &str = "public-http-e2e-progress";
+
+/// Live modern HTTP tool that reports progress when the request carries a token.
+struct PublicHttpProgressTool;
+
+impl ToolHandler for PublicHttpProgressTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_PROGRESS_TOOL_NAME.to_owned(),
+            description: Some("Proves live facade HTTP progress notifications".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        ctx.report_progress(0.5, Some("halfway"));
+        Ok(vec![Content::text("progressed")])
+    }
+}
+
+fn spawn_modern_progress_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("progress HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-progress", "1.0.0")
+                .tool(PublicHttpProgressTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("progress facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("progress facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("progress HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("progress facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("progress facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("progress facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("progress facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_progress_marker_is_retained_from_request_sse() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_progress_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-progress", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects before progress emission");
+
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_PROGRESS_TOOL_NAME, json!({})),
+    )
+    .expect("a tools/call without a progress token still completes");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "without a progressToken the handler must not emit request-scoped progress"
+    );
+
+    let marker = modern::ProgressMarker::from("http-progress");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_progress_marker(
+            &cx,
+            PUBLIC_HTTP_PROGRESS_TOOL_NAME,
+            json!({}),
+            marker.clone(),
+        ),
+    )
+    .expect("a progressToken must not prevent the same tools/call from completing");
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("halfway")
+        }),
+        "live bind_http must retain notifications/progress after a progressToken: {progress:?}"
+    );
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "take_progress_notifications must drain the retained queue"
+    );
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_WS_LOG_TOOL_NAME: &str = "public-ws-e2e-log";
+const PUBLIC_WS_HANDLER_LOG_TEXT: &str = "public-ws-handler-info";
+const WS_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(6);
+
+/// Live modern WebSocket tool that emits `ctx.info` and optional progress.
+struct PublicWebSocketLogTool;
+
+impl ToolHandler for PublicWebSocketLogTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_WS_LOG_TOOL_NAME.to_owned(),
+            description: Some("Proves live facade WebSocket handler log and progress".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        ctx.info(PUBLIC_WS_HANDLER_LOG_TEXT);
+        ctx.report_progress(0.5, Some("halfway"));
+        Ok(vec![Content::text("logged")])
+    }
+}
+
+/// Owns one real public `bind_websocket` listener and proves its teardown.
+struct WebSocketServerFixture {
+    address: SocketAddr,
+    server_cx: Cx,
+    finished: mpsc::Receiver<Result<WebSocketServerShutdown, String>>,
+    shutdown_completion: Option<Result<WebSocketServerShutdown, String>>,
+    join: Option<JoinHandle<()>>,
+    nonquiescent: Option<WebSocketNonquiescentShutdown>,
+}
+
+impl Drop for WebSocketServerFixture {
+    fn drop(&mut self) {
+        if self.join.is_none() && self.nonquiescent.is_none() {
+            return;
+        }
+        if let Err(error) = self.settle() {
+            eprintln!("public WebSocket server fixture drop failed: {error}");
+            std::process::abort();
+        }
+    }
+}
+
+impl WebSocketServerFixture {
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn settle(&mut self) -> Result<(), String> {
+        if let Some(shutdown) = self.nonquiescent.as_mut() {
+            return match runtime_block_on(shutdown.settle_for(WS_SERVER_TEARDOWN_BOUND)) {
+                Ok(true) => {
+                    self.nonquiescent = None;
+                    Err(
+                        "facade WebSocket server stopped nonquiescently but settled during fixture cleanup"
+                            .to_owned(),
+                    )
+                }
+                Ok(false) => Err(format!(
+                    "facade WebSocket server remains nonquiescent after bounded fixture cleanup ({} retained connections)",
+                    shutdown.remaining_connections()
+                )),
+                Err(error) => Err(format!(
+                    "facade WebSocket server child settlement failed: {error}"
+                )),
+            };
+        }
+        self.server_cx.set_cancel_requested(true);
+        match await_websocket_server_shutdown(
+            &self.finished,
+            &mut self.shutdown_completion,
+            &mut self.join,
+        )? {
+            WebSocketServerShutdown::Quiescent => Ok(()),
+            WebSocketServerShutdown::Nonquiescent(shutdown) => {
+                self.nonquiescent = Some(shutdown);
+                self.settle()
+            }
+        }
+    }
+
+    fn shutdown(mut self) {
+        self.settle()
+            .unwrap_or_else(|error| panic!("public WebSocket server teardown failed: {error}"));
+    }
+}
+
+fn await_websocket_server_shutdown(
+    finished: &mpsc::Receiver<Result<WebSocketServerShutdown, String>>,
+    completion: &mut Option<Result<WebSocketServerShutdown, String>>,
+    join: &mut Option<JoinHandle<()>>,
+) -> Result<WebSocketServerShutdown, String> {
+    let completion_result = if completion.is_some() {
+        Ok(())
+    } else {
+        finished
+            .recv_timeout(WS_SERVER_TEARDOWN_BOUND)
+            .map(|shutdown| *completion = Some(shutdown))
+            .map_err(|error| {
+                format!("public WebSocket server teardown exceeded its bound: {error}")
+            })
+    };
+    let join_result = join_finished_thread(join, WS_SERVER_TEARDOWN_BOUND, "WebSocket server");
+    match (completion_result, join_result) {
+        (Ok(()), Ok(())) => match completion
+            .take()
+            .expect("a completed WebSocket shutdown retains its completion report")
+        {
+            Ok(shutdown) => Ok(shutdown),
+            Err(completion) => Err(format!(
+                "public WebSocket server teardown failed: {completion}"
+            )),
+        },
+        (Ok(()), Err(join)) => Err(join),
+        (Err(completion), Ok(())) => Err(completion),
+        (Err(completion), Err(join)) => Err(format!(
+            "{completion}; owned thread settlement failed: {join}"
+        )),
+    }
+}
+
+fn spawn_modern_log_websocket_server() -> WebSocketServerFixture {
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) =
+        mpsc::sync_channel::<Result<WebSocketServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("log WebSocket server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-ws-log", "1.0.0")
+                .tool(PublicWebSocketLogTool)
+                .build();
+            let bound = match server.bind_websocket(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("log facade WebSocket server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("log facade WebSocket server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("log WebSocket server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("log facade WebSocket server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut server_cx = None;
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        if server_cx.is_none() {
+            if let Ok(cx) = server_cx_rx.try_recv() {
+                server_cx = Some(cx);
+            }
+        }
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if let Some(cx) = server_cx.as_ref() {
+                cx.set_cancel_requested(true);
+            }
+            panic!("log facade WebSocket server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("log facade WebSocket server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("log facade WebSocket server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    if server_cx.is_none() {
+        if let Ok(cx) = server_cx_rx.try_recv() {
+            server_cx = Some(cx);
+        }
+    }
+
+    WebSocketServerFixture {
+        address,
+        server_cx: server_cx.expect("startup retains the runtime-installed server context"),
+        finished: finished_rx,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+    }
+}
+
+fn connect_public_websocket(
+    cx: &Cx,
+    address: SocketAddr,
+    client_name: &str,
+) -> modern::WebSocketClient<asupersync::net::TcpStream> {
+    runtime_block_on_bounded(cx, async {
+        let transport = AsyncWsClientTransport::connect(cx, &format!("ws://{address}/mcp"))
+            .await
+            .expect("public bind_websocket must complete RFC 6455 upgrade");
+        modern::ClientBuilder::new()
+            .client_info(client_name, "1.0.0")
+            .connect_websocket_with_cx(cx, transport)
+            .await
+            .expect("the ModernOnly public facade negotiates over bind_websocket")
+    })
+}
+
+#[test]
+fn e2e_public_websocket_bind_retains_ping_log_and_progress() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_log_websocket_server();
+    let mut client = connect_public_websocket(&cx, server.address(), "e2e-public-ws-bind");
+
+    runtime_block_on_bounded(&cx, client.ping(&cx))
+        .expect("live bind_websocket must answer modern ping with {{}}");
+
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("info logLevel is stored as request metadata");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+    )
+    .expect("ctx.info must not prevent the same tools/call from completing");
+    let info_notifications = client.take_server_notifications();
+    assert!(
+        info_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+                    && message.data == json!(PUBLIC_WS_HANDLER_LOG_TEXT)
+        )),
+        "live bind_websocket must retain ctx.info after set_log_level(Info): {info_notifications:?}"
+    );
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "without a progressToken the handler must not emit request-scoped progress"
+    );
+
+    let marker = modern::ProgressMarker::from("ws-progress");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_progress_marker(
+            &cx,
+            PUBLIC_WS_LOG_TOOL_NAME,
+            json!({}),
+            marker.clone(),
+        ),
+    )
+    .expect("a progressToken must not prevent the same tools/call from completing");
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("halfway")
+        }),
+        "live bind_websocket must retain notifications/progress after a progressToken: {progress:?}"
+    );
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "take_progress_notifications must drain the retained queue"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Emergency)
+        .expect("emergency logLevel still stores request metadata locally");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+    )
+    .expect("raising only the logLevel floor cannot break the same public tools/call");
+    let emergency_notifications = client.take_server_notifications();
+    assert!(
+        !emergency_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.data == json!(PUBLIC_WS_HANDLER_LOG_TEXT)
+        )),
+        "raising only the logLevel floor must suppress ctx.info: {emergency_notifications:?}"
+    );
+
+    runtime_block_on_bounded(&cx, client.close(&cx))
+        .expect("the public WebSocket client closes after the live bind proof");
     drop(client);
     server.shutdown();
 }

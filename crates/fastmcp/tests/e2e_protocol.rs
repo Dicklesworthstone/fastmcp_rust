@@ -1470,6 +1470,84 @@ fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_progress_marker_is_retained_from_live_echo() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    client
+        .call_tool("echo", json!({"message": "no-token"}))
+        .expect("echo still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "without a progressToken the shipped echo tool must not emit request-scoped progress"
+    );
+
+    let marker = modern::ProgressMarker::from("stdio-progress");
+    client
+        .call_tool_with_progress_marker("echo", json!({"message": "token"}), marker.clone())
+        .expect("a progressToken must not prevent the shipped echo tool from completing");
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("echoed")
+        }),
+        "live stdio must retain notifications/progress after a progressToken: {progress:?}"
+    );
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "take_progress_notifications must drain the retained queue"
+    );
+    client
+        .close()
+        .expect("modern-only stdio progress client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_ctx_info_is_retained_after_set_log_level() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("info logLevel is stored as request metadata");
+    client
+        .call_tool("echo", json!({"message": "log"}))
+        .expect("ctx.info must not prevent the shipped echo tool from completing");
+    let info_notifications = client.take_server_notifications();
+    assert!(
+        info_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+                    && message.data == json!("echo-handler-info")
+        )),
+        "live stdio must retain ctx.info after set_log_level(Info): {info_notifications:?}"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Emergency)
+        .expect("emergency logLevel still stores request metadata locally");
+    client
+        .call_tool("echo", json!({"message": "quiet"}))
+        .expect("raising only the logLevel floor cannot break the shipped echo tool");
+    let emergency_notifications = client.take_server_notifications();
+    assert!(
+        !emergency_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.data == json!("echo-handler-info")
+        )),
+        "raising only the logLevel floor must suppress ctx.info: {emergency_notifications:?}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio log client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclared_argument() {
     let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
