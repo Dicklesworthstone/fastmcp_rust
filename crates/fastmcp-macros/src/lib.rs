@@ -1221,7 +1221,7 @@ fn generate_tool_execution_methods(
         quote! { #fn_name(#(#param_names),*).await }
     };
 
-    let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
+    let final_method = if let Some(conversion) = final_result_conversion {
         quote! {
             fn call_final_async<'a>(
                 &'a self,
@@ -1254,7 +1254,40 @@ fn generate_tool_execution_methods(
                 })
             }
         }
-    });
+    } else if final_outcome_conversion.is_none() {
+        quote! {
+            fn call_final_async<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                arguments: serde_json::Value,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<
+                    fastmcp_protocol::CompleteResult<fastmcp_protocol::FinalCallToolResult>,
+                >,
+            > {
+                Box::pin(async move {
+                    match self.call_async(ctx, arguments).await {
+                        fastmcp_core::Outcome::Ok(content) => {
+                            match ::fastmcp_server::promote_legacy_tool_content(content) {
+                                Ok(complete) => fastmcp_core::Outcome::Ok(complete),
+                                Err(error) => fastmcp_core::Outcome::Err(error),
+                            }
+                        }
+                        fastmcp_core::Outcome::Err(error) => fastmcp_core::Outcome::Err(error),
+                        fastmcp_core::Outcome::Cancelled(cancelled) => {
+                            fastmcp_core::Outcome::Cancelled(cancelled)
+                        }
+                        fastmcp_core::Outcome::Panicked(panic) => {
+                            fastmcp_core::Outcome::Panicked(panic)
+                        }
+                    }
+                })
+            }
+        }
+    } else {
+        TokenStream2::new()
+    };
 
     let final_outcome_method =
         final_outcome_conversion.map_or_else(TokenStream2::new, |conversion| {
@@ -1865,6 +1898,7 @@ fn generate_prompt_execution_methods(
     param_extractions: &[TokenStream2],
     result_conversion: &TokenStream2,
     final_result_conversion: Option<&TokenStream2>,
+    emit_async_final_outcome: bool,
 ) -> TokenStream2 {
     let modern_request_methods = quote! {
         fn get_async_in_request<'a>(
@@ -2029,10 +2063,82 @@ fn generate_prompt_execution_methods(
         }
     };
 
+    let async_outcome_hook = if emit_async_final_outcome {
+        if final_result_conversion.is_some() {
+            quote! {
+                fn get_final_outcome_async_in_request<'a>(
+                    &'a self,
+                    ctx: &'a fastmcp_core::McpContext,
+                    request_cx: &'a fastmcp_core::Cx,
+                    arguments: std::collections::HashMap<String, String>,
+                ) -> fastmcp_server::BoxFuture<
+                    'a,
+                    fastmcp_core::McpOutcome<
+                        fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>,
+                    >,
+                > {
+                    Box::pin(async move {
+                        match self.get_final_async_in_request(ctx, request_cx, arguments).await {
+                            fastmcp_core::Outcome::Ok(complete) => {
+                                fastmcp_core::Outcome::Ok(
+                                    fastmcp_server::FinalMethodOutcome::Complete(complete),
+                                )
+                            }
+                            fastmcp_core::Outcome::Err(error) => fastmcp_core::Outcome::Err(error),
+                            fastmcp_core::Outcome::Cancelled(cancelled) => {
+                                fastmcp_core::Outcome::Cancelled(cancelled)
+                            }
+                            fastmcp_core::Outcome::Panicked(panic) => {
+                                fastmcp_core::Outcome::Panicked(panic)
+                            }
+                        }
+                    })
+                }
+            }
+        } else {
+            quote! {
+                fn get_final_outcome_async_in_request<'a>(
+                    &'a self,
+                    ctx: &'a fastmcp_core::McpContext,
+                    request_cx: &'a fastmcp_core::Cx,
+                    arguments: std::collections::HashMap<String, String>,
+                ) -> fastmcp_server::BoxFuture<
+                    'a,
+                    fastmcp_core::McpOutcome<
+                        fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalGetPromptResult>,
+                    >,
+                > {
+                    Box::pin(async move {
+                        match self.get_async_in_request(ctx, request_cx, arguments).await {
+                            fastmcp_core::Outcome::Ok(messages) => {
+                                match ::fastmcp_server::promote_legacy_prompt_messages(messages) {
+                                    Ok(complete) => fastmcp_core::Outcome::Ok(
+                                        fastmcp_server::FinalMethodOutcome::Complete(complete),
+                                    ),
+                                    Err(error) => fastmcp_core::Outcome::Err(error),
+                                }
+                            }
+                            fastmcp_core::Outcome::Err(error) => fastmcp_core::Outcome::Err(error),
+                            fastmcp_core::Outcome::Cancelled(cancelled) => {
+                                fastmcp_core::Outcome::Cancelled(cancelled)
+                            }
+                            fastmcp_core::Outcome::Panicked(panic) => {
+                                fastmcp_core::Outcome::Panicked(panic)
+                            }
+                        }
+                    })
+                }
+            }
+        }
+    } else {
+        TokenStream2::new()
+    };
+
     quote! {
         #legacy_methods
         #final_method
         #modern_request_methods
+        #async_outcome_hook
     }
 }
 
@@ -2419,7 +2525,49 @@ fn generate_resource_execution_methods(
     result_conversion: &TokenStream2,
     final_result_conversion: Option<&TokenStream2>,
     final_outcome_conversion: Option<&TokenStream2>,
+    emit_async_final_outcome: bool,
 ) -> TokenStream2 {
+    let default_async_outcome_hook = if emit_async_final_outcome {
+        quote! {
+            fn read_final_outcome_async_with_uri_in_request<'a>(
+                &'a self,
+                ctx: &'a fastmcp_core::McpContext,
+                request_cx: &'a fastmcp_core::Cx,
+                uri: &'a str,
+                uri_params: &'a std::collections::HashMap<String, String>,
+            ) -> fastmcp_server::BoxFuture<
+                'a,
+                fastmcp_core::McpOutcome<
+                    fastmcp_server::FinalMethodOutcome<fastmcp_protocol::FinalReadResourceResult>,
+                >,
+            > {
+                Box::pin(async move {
+                    match self
+                        .read_async_with_uri_in_request(ctx, request_cx, uri, uri_params)
+                        .await
+                    {
+                        fastmcp_core::Outcome::Ok(contents) => {
+                            match ::fastmcp_server::promote_legacy_resource_contents(contents) {
+                                Ok(complete) => fastmcp_core::Outcome::Ok(
+                                    fastmcp_server::FinalMethodOutcome::Complete(complete),
+                                ),
+                                Err(error) => fastmcp_core::Outcome::Err(error),
+                            }
+                        }
+                        fastmcp_core::Outcome::Err(error) => fastmcp_core::Outcome::Err(error),
+                        fastmcp_core::Outcome::Cancelled(cancelled) => {
+                            fastmcp_core::Outcome::Cancelled(cancelled)
+                        }
+                        fastmcp_core::Outcome::Panicked(panic) => {
+                            fastmcp_core::Outcome::Panicked(panic)
+                        }
+                    }
+                })
+            }
+        }
+    } else {
+        TokenStream2::new()
+    };
     let modern_request_methods = quote! {
         fn read_async_with_uri_in_request<'a>(
             &'a self,
@@ -2448,6 +2596,8 @@ fn generate_resource_execution_methods(
         > {
             self.read_final_async_with_uri(ctx, uri, uri_params)
         }
+
+        #default_async_outcome_hook
     };
     let final_outcome_method =
         final_outcome_conversion.map_or_else(TokenStream2::new, |conversion| {
@@ -2707,7 +2857,8 @@ mod async_handler_expansion_tests {
             None,
         );
 
-        assert_direct_async_expansion(tokens, "fn call_async");
+        assert_direct_async_expansion(tokens.clone(), "fn call_async");
+        assert_direct_async_expansion(tokens, "fn call_final_async");
     }
 
     #[test]
@@ -2722,9 +2873,11 @@ mod async_handler_expansion_tests {
             &quote! { Ok(vec![]) },
             None,
             None,
+            true,
         );
 
-        assert_direct_async_expansion(generated, "fn read_async_with_uri");
+        assert_direct_async_expansion(generated.clone(), "fn read_async_with_uri");
+        assert_direct_async_expansion(generated, "fn read_final_outcome_async_with_uri_in_request");
     }
 
     #[test]
@@ -2739,6 +2892,7 @@ mod async_handler_expansion_tests {
             &[quote! { let value: String = String::new(); }],
             &quote! { Ok(vec![]) },
             None,
+            true,
         );
 
         assert_direct_async_expansion(tokens, "fn get_async");
@@ -2812,6 +2966,7 @@ mod async_handler_expansion_tests {
             &quote! { Ok(vec![]) },
             Some(&resource_conversion),
             None,
+            false,
         )
         .to_string();
         assert!(
@@ -2841,10 +2996,15 @@ mod async_handler_expansion_tests {
             &[],
             &quote! { Ok(vec![]) },
             Some(&prompt_conversion),
+            true,
         )
         .to_string();
         assert!(prompt.contains("fn get_async_in_request"), "{prompt}");
         assert!(prompt.contains("fn get_final_async_in_request"), "{prompt}");
+        assert!(
+            prompt.contains("fn get_final_outcome_async_in_request"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -2867,6 +3027,7 @@ mod async_handler_expansion_tests {
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             None,
             Some(&outcome_conversion),
+            false,
         );
 
         assert_direct_async_expansion(
@@ -3172,6 +3333,7 @@ mod async_handler_expansion_tests {
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&resource_conversion),
             None,
+            false,
         )
         .to_string();
         let (resource_legacy_hook, resource_final_hook) = resource_tokens
@@ -3207,6 +3369,7 @@ mod async_handler_expansion_tests {
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&resource_conversion),
             None,
+            false,
         );
         assert_direct_async_expansion(
             resource_async_tokens.clone(),
@@ -3247,6 +3410,7 @@ mod async_handler_expansion_tests {
             &prompt_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&prompt_conversion),
+            false,
         )
         .to_string();
         let (prompt_legacy_hook, prompt_final_hook) = prompt_tokens
@@ -3277,6 +3441,7 @@ mod async_handler_expansion_tests {
             &prompt_param_extractions,
             &quote! { Err(fastmcp_core::McpError::internal_error("legacy")) },
             Some(&prompt_conversion),
+            true,
         );
         assert_direct_async_expansion(prompt_async_tokens.clone(), "fn get_final_async");
         let prompt_async_expansion = prompt_async_tokens.to_string();
@@ -5210,6 +5375,10 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
             .is_none()
             .then_some(final_outcome_conversion.as_ref())
             .flatten(),
+        is_async
+            && mrtr_resume_param.is_none()
+            && final_result_conversion.is_none()
+            && final_outcome_conversion.is_none(),
     );
     let mrtr_outcome_methods = match (mrtr_resume_param, final_outcome_conversion.as_ref()) {
         (Some((name, ty)), Some(conversion)) => generate_resource_mrtr_outcome_methods(
@@ -5634,6 +5803,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         &param_extractions,
         &prompt_result_conversion,
         final_result_conversion.as_ref(),
+        is_async && mrtr_resume_param.is_none(),
     );
     let mrtr_outcome_methods = match (mrtr_resume_param, final_outcome_conversion.as_ref()) {
         (Some((name, ty)), Some(conversion)) => generate_prompt_mrtr_outcome_methods(

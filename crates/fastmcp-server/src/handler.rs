@@ -1281,7 +1281,12 @@ pub(crate) fn empty_final_result_meta() -> McpResult<ResultMeta> {
 /// a final request reaches the router. Every legacy content variant is mapped
 /// without discarding information; malformed legacy embedded resources are
 /// refused rather than authored as a different final resource.
-pub(crate) fn promote_legacy_tool_content(
+/// Promotes legacy tool content into a complete final `tools/call` result.
+///
+/// Async `#[tool]` handlers that only implement [`ToolHandler::call_async`]
+/// use this from the generated final hook so modern dispatch does not fall
+/// through to the sync `call` rejection.
+pub fn promote_legacy_tool_content(
     content: Vec<Content>,
 ) -> McpResult<CompleteResult<FinalCallToolResult>> {
     let content = content
@@ -1361,7 +1366,12 @@ pub(crate) const DEFAULT_FINAL_RESOURCE_TTL_MS: u64 = 60 * 60 * 1_000;
 /// The trait default uses the same private one-hour cache policy as the
 /// router's default legacy projection. Direct final handlers can override it
 /// and author their selected cache policy without this conversion.
-fn promote_legacy_resource_contents(
+/// Promotes legacy resource contents into a complete final `resources/read` result.
+///
+/// Async `#[resource]` handlers that only implement
+/// [`ResourceHandler::read_async`] use this from the generated final-outcome
+/// hook so modern dispatch does not fall through to the sync `read` rejection.
+pub fn promote_legacy_resource_contents(
     contents: Vec<ResourceContent>,
 ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
     let contents = contents
@@ -1393,7 +1403,12 @@ fn promote_legacy_resource_contents(
 ///
 /// Direct final prompt handlers bypass this conversion and keep their final
 /// common content, including open fields, intact.
-fn promote_legacy_prompt_messages(
+/// Promotes legacy prompt messages into a complete final `prompts/get` result.
+///
+/// Async `#[prompt]` handlers that only implement [`PromptHandler::get_async`]
+/// use this from the generated final-outcome hook so modern dispatch does not
+/// fall through to the sync `get` rejection.
+pub fn promote_legacy_prompt_messages(
     messages: Vec<PromptMessage>,
 ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
     let messages = messages
