@@ -24,17 +24,17 @@ use std::time::{Duration, Instant};
 
 use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_rust::{
-    AsyncWsClientTransport, AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl, ClientCapabilities,
-    ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan, CompletionHandler, Content,
-    ContentBlock, CoreResult, Cx, FinalCoreResult, FinalElicitationContextExt,
-    FinalEmbeddedRootsListParams, FinalRootsContextExt, FinalSamplingContextExt, FinalToolOutcome,
-    HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, JsonRpcMessage,
-    JsonRpcRequest, McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult,
-    Middleware, MiddlewareDecision, ModernHttpResponseKind, ModernHttpResponseStream, Prompt,
-    PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy, Resource, ResourceContent,
-    ResourceHandler, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler,
-    WebSocketNonquiescentShutdown, WebSocketServerShutdown, auto, core, legacy_2024, modern, prompt,
-    resource, tool,
+    AsyncWsClientTransport, AuthContext, CacheScope, CacheTtl, CanonicalHttpUrl,
+    ClientCapabilities, ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan,
+    CompletionHandler, Content, ContentBlock, CoreResult, Cx, FinalCoreResult,
+    FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalRootsContextExt,
+    FinalSamplingContextExt, FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown,
+    HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode,
+    McpRequestCancellation, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
+    ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage, ProtocolEra, ProtocolPolicy,
+    Resource, ResourceContent, ResourceHandler, Role, SseLimits, StaticTokenVerifier,
+    TokenAuthProvider, Tool, ToolHandler, WebSocketNonquiescentShutdown, WebSocketServerShutdown,
+    auto, core, legacy_2024, modern, prompt, resource, tool,
 };
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
@@ -3708,7 +3708,7 @@ fn e2e_public_websocket_bind_retains_ping_log_and_progress() {
     let mut client = connect_public_websocket(&cx, server.address(), "e2e-public-ws-bind");
 
     runtime_block_on_bounded(&cx, client.ping(&cx))
-        .expect("live bind_websocket must answer modern ping with {{}}");
+        .expect("live bind_websocket must answer modern ping");
 
     client
         .set_log_level(modern::LoggingLevel::Info)

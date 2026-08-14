@@ -148,7 +148,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 |---------|--------|------|-------|
 | **Stdio transport** | ✅ | ✅ | NDJSON implementation present |
 | **SSE transport** | ✅ | 🟡 | Low-level `SseServerTransport`/`SseClientTransport` types exist; public `Client::sse` / `Client::sse_with_cx` connect an exact-2024 HTTP+SSE client without probing modern HTTP. Auto still uses SSE only as a fallback |
-| **WebSocket transport** | ✅ | 🟡 | `WsTransport` framing plus `ClientBuilder::connect_websocket_with_cx` exist behind `websocket-experimental`; aggregate lifecycle qualification remains open |
+| **WebSocket transport** | ✅ | 🟡 | `WsTransport` framing plus `ClientBuilder::connect_websocket_with_cx` exist behind `websocket-experimental`. Live public `bind_websocket` plus `modern::WebSocketClient` prove `ping`, `set_log_level` + `ctx.info`, and `call_tool_with_progress_marker` over a real localhost socket. Aggregate lifecycle qualification remains open |
 | **HTTP transport** | ✅ | 🟡 | Public `Server::run_http*` binds a dual-era listener; `Client::http` is the high-level client. Aggregate admission/challenge and bidirectional qualification remain open |
 | **Streamable HTTP** | ✅ | 🟡 | `StreamableHttpTransport` and public modern/legacy HTTP paths exist; aggregate protocol qualification remains unverified |
 | **MemoryTransport (in-process)** | ✅ | ✅ | `memory.rs` for testing |
@@ -237,7 +237,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Progress callbacks | ✅ | ✅ | `call_tool_with_progress()` |
 | List operations | ✅ | ✅ | Tool/resource/prompt list methods exist |
 | Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the Unix stdio receive pump can route it during dispatch. Public HTTP `request_final_core_with_cancellation` plus typed `list_*`/`call_tool`/`read_resource`/`get_prompt`/`complete` `*_with_cancellation` verbs honor a caller-owned cancellation domain for ordinary core requests. Public stdio `modern::Client` exposes the same typed verbs and rejects before send when the domain is already cancelled. WebSocket typed verbs reject before send and retire after send; a blocked ingress wait still belongs to the connection `Cx` until the next frame. Non-Unix stdio and custom/SSE loops retain sequential/blocking boundaries; reliable interruption, cleanup waiting, and request-owned isolation remain open |
-| Log level setting | ✅ | ✅ | Exact-2024 `set_log_level()` sends `logging/setLevel`. Modern stdio, HTTP, and WebSocket `set_log_level` stamp `io.modelcontextprotocol/logLevel` on later requests. Modern HTTP `take_server_notifications` then retains the request-scoped `notifications/message` frames that floor admits |
+| Log level setting | ✅ | ✅ | Exact-2024 `set_log_level()` sends `logging/setLevel`. Modern stdio, HTTP, and WebSocket `set_log_level` stamp `io.modelcontextprotocol/logLevel` on later requests. Modern HTTP and live `bind_websocket` `take_server_notifications` then retain the request-scoped `notifications/message` frames that floor admits |
 | Response ID validation | ✅ | ✅ | Validates response IDs |
 | Client request idle/absolute deadlines | ✅ | 🟡 | Ordinary requests use monotonic `Instant` deadlines that begin after send commit (30-second idle and 120-second non-resettable absolute defaults). Unix subprocess stdout receives, including silent and partial frames, are bounded; generic blocking `recv`, non-Unix child pipes, synchronous writes, and best-effort Drop prevent a portable end-to-end wall-clock guarantee (FND-04) |
 | **MCPConfig client creation** | ✅ | ✅ | `mcp_config.rs` with JSON/TOML parsing |
@@ -258,8 +258,8 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | Context object | ✅ | ✅ | `McpContext` |
-| Progress reporting | ✅ | ✅ | `report_progress()`, `report_progress_with_total()`. Modern HTTP, WebSocket, and stdio `call_tool_with_progress_marker` stamp `progressToken`; `take_progress_notifications` retains the request-scoped frames |
-| Handler log notifications | ✅ | ✅ | `ctx.debug()`/`info()`/`notice()`/`warning()`/`error()` emit `notifications/message` after `logging/setLevel`. Exact-2024 uses the session `setLevel` floor. Modern HTTP and stdio apply the request `io.modelcontextprotocol/logLevel` floor to `ctx.info` and friends; public `take_server_notifications` drains the frames |
+| Progress reporting | ✅ | ✅ | `report_progress()`, `report_progress_with_total()`. Modern HTTP, WebSocket, and stdio `call_tool_with_progress_marker` stamp `progressToken`; `take_progress_notifications` retains the request-scoped frames. Live `bind_websocket` proves the same progress path over a real socket |
+| Handler log notifications | ✅ | ✅ | `ctx.debug()`/`info()`/`notice()`/`warning()`/`error()` emit `notifications/message` after `logging/setLevel`. Exact-2024 uses the session `setLevel` floor. Modern HTTP, stdio, and live `bind_websocket` apply the request `io.modelcontextprotocol/logLevel` floor to `ctx.info` and friends; public `take_server_notifications` drains the frames |
 | Resource update notifications | ✅ | ✅ | `ctx.notify_resource_updated(uri)` emits 2024 `resources/updated` to session subscribers and publishes the same event to matching `subscriptions/listen` streams |
 | Checkpoint for cancellation | ✅ | ✅ | `checkpoint()` |
 | Budget access | ✅ | ✅ | `budget()` |
@@ -507,7 +507,9 @@ Historical Phase-5 snapshots claimed near-complete parity with Python FastMCP v2
 - The public client supports subprocess stdio and HTTP (`Client::http` with
   typed list/call/read/get verbs). WebSocket is behind
   `websocket-experimental` and now has incremental catalog listen plus the
-  same typed verbs; SSE is used as the exact-2024 HTTP fallback and remains a
+  same typed verbs; live `bind_websocket` plus `modern::WebSocketClient`
+  prove ping, request-scoped `ctx.info`, and progress over a real socket.
+  SSE is used as the exact-2024 HTTP fallback and remains a
   lower-level transport type
 
 **Not production-certified for MCP 2026-07-28** until final attestation and GATE packages pass.
