@@ -212,7 +212,10 @@ pub trait Legacy2024Handler {
         method: &'static str,
         params: Option<&'a Value>,
     ) -> crate::BoxFuture<'a, Result<Value, Legacy2024HandlerError>> {
-        Box::pin(async move { self.handle_legacy_2024_with_request_id(request_id, method, params) })
+        // Evaluate the sync contract immediately so the returned future does
+        // not capture `&mut Self`. Many adapter tests use `!Send` handlers.
+        let result = self.handle_legacy_2024_with_request_id(request_id, method, params);
+        Box::pin(async move { result })
     }
 }
 
@@ -525,6 +528,17 @@ where
         wire: Value,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
         self.adapter_mut(binding)?.receive(binding, wire)
+    }
+
+    /// Applies one complete client-to-server JSON value without `block_on`.
+    pub async fn receive_async(
+        &mut self,
+        binding: LegacyPeerBinding,
+        wire: Value,
+    ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
+        self.adapter_mut(binding)?
+            .receive_async(binding, wire)
+            .await
     }
 
     /// Builds one capability-gated server-to-client request for a live peer.
