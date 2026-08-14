@@ -3868,11 +3868,10 @@ impl Router {
 
         let params = request.params.as_ref();
         let result = match request.method.as_str() {
-            // `ping` remains an exact 2024-11-05 connection method.  The
-            // stateless endpoint is exclusively the final 2026 surface, so
-            // accepting it here would make a legacy-only method appear in
-            // final dispatch.
-            "ping" => return Err(McpError::method_not_found("ping")),
+            // Connection health-check. Session dispatch already answers `{}`.
+            // Stateless HTTP needs the same check without adding ping to
+            // FINAL_2026_07_28_METHODS / FinalCoreRequest.
+            "ping" => serde_json::json!({}),
             COMPLETION_COMPLETE => {
                 let request =
                     CoreRequest::decode(ProtocolEra::Modern2026, COMPLETION_COMPLETE, params)

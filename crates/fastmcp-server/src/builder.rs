@@ -6153,7 +6153,8 @@ mod tests {
         }
 
         #[test]
-        fn public_legacy_ping_is_retained_while_the_one_metadata_change_rejects_final_ping() {
+        fn public_legacy_and_stateless_ping_answer_empty_object_without_entering_the_final_request_union()
+         {
             let server = ServerBuilder::new("srv", "1.0").build();
             let mut legacy_session =
                 crate::Session::new(server.info().clone(), server.capabilities().clone());
@@ -6217,19 +6218,36 @@ mod tests {
                 714,
                 crate::InboundRequestTransport::Memory,
             );
-            let rejected = server
+            let answered = server
                 .dispatch_stateless(&inbound, &final_ping)
-                .expect("the final public dispatch path returns a JSON-RPC error");
-            assert_eq!(
-                rejected.error.and_then(|error| error.code.as_i32()),
-                Some(-32601)
-            );
-            assert!(rejected.result.is_none());
+                .expect("stateless modern ping is a connection health-check");
+            assert_eq!(answered.result, Some(serde_json::json!({})));
+            assert!(answered.error.is_none());
             assert_eq!(
                 legacy_session.state().len(),
                 state_before,
-                "changing only the protocol-era metadata cannot mutate the legacy session state"
+                "ping cannot mutate session state"
             );
+
+            assert!(
+                !fastmcp_protocol::methods::FINAL_2026_07_28_METHODS
+                    .iter()
+                    .any(|method| method.name == "ping"),
+                "ping must remain outside the official 2026 client-request union"
+            );
+            let decode = fastmcp_protocol::CoreRequest::decode(
+                ProtocolEra::Modern2026,
+                "ping",
+                Some(&serde_json::json!({})),
+            )
+            .expect_err("FinalCoreRequest must not grow a Ping variant");
+            assert!(matches!(
+                decode,
+                fastmcp_protocol::CoreDispatchError::UnsupportedMethod {
+                    era: ProtocolEra::Modern2026,
+                    method,
+                } if method == "ping"
+            ));
         }
 
         #[test]
