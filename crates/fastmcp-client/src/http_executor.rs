@@ -14662,4 +14662,23 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
     fn public_http_mrtr_partial_input_map_has_no_next_post_or_id_mutation() {
         assert_public_http_mrtr_requires_every_input_key(false);
     }
+
+    #[test]
+    fn public_http_ping_is_admitted_without_entering_the_final_request_union() {
+        super::validate_final_method(fastmcp_protocol::methods::PING, true)
+            .expect("ping is a connection health-check");
+        super::validate_final_method(fastmcp_protocol::methods::PING, false)
+            .expect_err("ping still requires a request id");
+        let refused = super::validate_final_method("logging/setLevel", true)
+            .expect_err("the removed final setLevel RPC stays refused");
+        assert!(matches!(
+            refused,
+            super::ModernHttpClientError::UnsupportedFinalMethod { method }
+                if method == "logging/setLevel"
+        ));
+        assert!(
+            fastmcp_protocol::methods::final_2026_07_28_method("ping").is_none(),
+            "ping must remain outside the official 2026 client-request union"
+        );
+    }
 }
