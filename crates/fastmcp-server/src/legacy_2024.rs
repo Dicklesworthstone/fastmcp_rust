@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 
+use fastmcp_core::block_on;
 use fastmcp_protocol::JsonInteger;
 use fastmcp_protocol::methods::Legacy2024EnvelopeError;
 use fastmcp_protocol::methods::{
@@ -198,6 +199,20 @@ pub trait Legacy2024Handler {
         params: Option<&Value>,
     ) -> Result<Value, Legacy2024HandlerError> {
         self.handle_legacy_2024(method, params)
+    }
+
+    /// Request-owned async dispatch for one admitted exact-2024 request.
+    ///
+    /// The default preserves the transport-neutral sync handler contract.
+    /// Live HTTP/stdio runtimes override this so handler futures are polled
+    /// on the request `Cx` instead of `block_on`.
+    fn handle_legacy_2024_with_request_id_async<'a>(
+        &'a mut self,
+        request_id: &'a Value,
+        method: &'static str,
+        params: Option<&'a Value>,
+    ) -> crate::BoxFuture<'a, Result<Value, Legacy2024HandlerError>> {
+        Box::pin(async move { self.handle_legacy_2024_with_request_id(request_id, method, params) })
     }
 }
 
@@ -662,6 +677,15 @@ where
         binding: LegacyPeerBinding,
         wire: Value,
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
+        block_on(self.receive_async(binding, wire))
+    }
+
+    /// Applies one inbound client-to-server JSON value without `block_on`.
+    pub async fn receive_async(
+        &mut self,
+        binding: LegacyPeerBinding,
+        wire: Value,
+    ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
         self.require_binding(binding)?;
         let response_shaped = wire.as_object().is_some_and(|object| {
             // A frame without a method is attempting to be a response, even
@@ -705,7 +729,10 @@ where
         };
         match envelope {
             Legacy2024Envelope::Request { method, id, params } => {
-                match self.receive_request(&id, method.name, params.as_ref()) {
+                match self
+                    .receive_request_async(&id, method.name, params.as_ref())
+                    .await
+                {
                     Ok(result) => Ok(Legacy2024Outbound::Response(success_response(id, result))),
                     Err(error) => Ok(Legacy2024Outbound::Response(error_response(id, error))),
                 }
@@ -862,7 +889,7 @@ where
         }
     }
 
-    fn receive_request(
+    async fn receive_request_async(
         &mut self,
         request_id: &Value,
         method: &'static str,
@@ -881,7 +908,8 @@ where
                 "notifications/initialized is required before operating requests",
             )),
             Legacy2024Lifecycle::Operating => {
-                self.handle_operating_request(request_id, method, params)
+                self.handle_operating_request_async(request_id, method, params)
+                    .await
             }
             Legacy2024Lifecycle::Closed => Err(Legacy2024AdapterError::invalid_request(
                 "legacy adapter lifecycle is closed",
@@ -993,7 +1021,7 @@ where
         Ok(result)
     }
 
-    fn handle_operating_request(
+    async fn handle_operating_request_async(
         &mut self,
         request_id: &Value,
         method: &'static str,
@@ -1015,7 +1043,8 @@ where
                 self.require_server_capability(method)?;
                 let result = self
                     .handler
-                    .handle_legacy_2024_with_request_id(request_id, method, params)
+                    .handle_legacy_2024_with_request_id_async(request_id, method, params)
+                    .await
                     .map_err(|error| Legacy2024AdapterError {
                         code: error.code().clone(),
                         message: error.message().to_owned(),
