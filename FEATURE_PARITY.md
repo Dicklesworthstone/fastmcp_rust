@@ -92,7 +92,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | Stdio transport | ✅ | ✅ | NDJSON implementation present |
 | SSE transport | ✅ | ✅ | `run_sse()` with `SseServerTransport` |
 | WebSocket transport | ✅ | ✅ | `run_websocket()` with `WsTransport` and caller-provided reader/writer integration |
-| **HTTP transport** | ✅ | 🟡 | Public native HTTP admission and listener paths implement modern MCP 2026-07-28 and isolated exact MCP 2024-11-05 routing; aggregate qualification remains unverified |
+| **HTTP transport** | ✅ | 🟡 | Public native HTTP admission and listener paths implement modern MCP 2026-07-28 and isolated exact MCP 2024-11-05 routing. Live `bind_http` JSON-only `Accept: application/json` composes `ctx.call_tool` + `ctx.read_resource` the same way the SSE client does. Aggregate qualification remains unverified |
 | **Streamable HTTP transport** | ✅ | 🟡 | `StreamableHttpTransport` and public modern/legacy HTTP paths exist; aggregate protocol qualification remains unverified |
 | Server request timeout/budget | ✅ | 🟡 | Server dispatch uses asupersync `Budget`; request-owned child-context isolation and end-to-end cleanup qualification remain open (FND-04) |
 | Cancellation behavior | 🟡 | 🟡 | Unix stdio keeps receiving while a bounded worker dispatches and can route a live cancellation; non-Unix stdio and custom/SSE/WebSocket paths retain sequential/blocking boundaries, and request-owned child `Cx` isolation plus cleanup qualification remain open |
@@ -122,9 +122,9 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| `@tool` / `#[tool]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch and exact-2024 session dispatch both drive `call_async_in_request`. The session path still `block_on`s that request-owned future |
-| `@resource` / `#[resource]` | ✅ | 🟡 | Macro plus RFC 6570 reversible templates exist; lossy prefix/explode forms are refused rather than guessed |
-| `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch and exact-2024 session dispatch both drive `get_async_in_request`. The session path still `block_on`s that request-owned future |
+| `@tool` / `#[tool]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch and exact-2024 session dispatch both drive `call_async_in_request`. Async `#[tool]` now generates `call_final_async` that promotes `call_async`, so modern `tools/call` reaches the async body instead of the sync `call` rejection. Live `bind_http` a generated async `#[tool]` composes `ctx.call_tool` + `ctx.read_resource`. Live `Client::sse` on LegacyOnly composes the same nested pair through session `call_async_in_request`. The session path still `block_on`s the request-owned future |
+| `@resource` / `#[resource]` | ✅ | 🟡 | Macro plus RFC 6570 reversible templates exist; lossy prefix/explode forms are refused rather than guessed. Async `#[resource]` now generates `read_final_outcome_async_with_uri_in_request` so modern `resources/read` reaches the async body instead of the sync `read` rejection. Live `bind_http` `resources/read` composes `ctx.call_tool` + `ctx.read_resource` through that hook for both a handwritten resource and a generated async `#[resource]`. Live exact-2024 `Client::sse` composes the same nested pair through session `read_async_with_uri_in_request` |
+| `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch and exact-2024 session dispatch both drive `get_async_in_request`. Async `#[prompt]` now also generates `get_final_outcome_async_in_request` so modern `prompts/get` reaches the async body instead of the sync `get` rejection. Live `bind_http` `prompts/get` composes `ctx.call_tool` + `ctx.read_resource` through that hook for both a handwritten prompt and a generated async `#[prompt]`. Live exact-2024 `Client::sse` composes the same nested pair through session `get_async_in_request` and retains the handler `InvalidRequest` message instead of rewriting it to a fixed adapter string. The session path still `block_on`s that request-owned future |
 | Auto JSON schema | ✅ | ✅ | `#[derive(JsonSchema)]` + inline generation |
 | Description from docstrings | ✅ | ✅ | Doc comments → descriptions |
 | Default parameter values | ✅ | ✅ | Implemented via `defaults(...)` on `#[tool]`/`#[prompt]`. Live `bind_http` a generated default is advertised, injected when omitted, overridable, and a missing required sibling argument is refused |
@@ -278,9 +278,9 @@ The following bidirectional building blocks exist in source. This inventory does
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Resource reading from handler** | ✅ | ✅ | `ctx.read_resource()` in context.rs. Live `bind_http` compose reads the peer resource through the request-owned reader |
-| **Tool calling from handler** | ✅ | ✅ | `ctx.call_tool()` in context.rs. Live `bind_http` compose calls the peer tool through the request-owned caller |
-| **MCP capabilities access** | ✅ | ✅ | `ctx.client_capabilities()`, `ctx.server_capabilities()`. Live `bind_http` attaches the advertised server slice on every request; a default client sees `sampling=false;roots=false;tools=true;resources=true` on a resource-bearing server, advertising only sampling+roots flips those client flags, and omitting the resource registration clears only `resources` |
+| **Resource reading from handler** | ✅ | ✅ | `ctx.read_resource()` in context.rs. Live `bind_http` compose reads the peer resource through the request-owned reader from a tool handler, a prompt handler, and a resource handler |
+| **Tool calling from handler** | ✅ | ✅ | `ctx.call_tool()` in context.rs. Live `bind_http` compose calls the peer tool through the request-owned caller from a tool handler, a prompt handler, and a resource handler |
+| **MCP capabilities access** | ✅ | ✅ | `ctx.client_capabilities()`, `ctx.server_capabilities()`. Live modern `bind_http` attaches the advertised server slice on every request. Live exact-2024 `Client::sse` now copies initialize sampling/roots onto the handler context: a default client sees `sampling=false;roots=false;tools=true;resources=true`, advertising sampling+roots (with matching reverse handlers) flips those client flags, and omitting the resource registration clears only `resources` |
 
 ---
 
@@ -413,7 +413,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 5. ✅ **CLI commands** - dev, test, and tasks command paths are present; this is not an end-to-end verification claim
 6. 🟡 **FilesystemProvider** - Public construction and live `bind_http` list+read work on Linux/macOS, including through a prefixed `as_proxy_typed` gateway that keeps the exact `file:///` template; other targets remain fail-closed
 7. ✅ **Auto-initialize** - Client auto-initialization (client/builder.rs)
-8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs). Live `bind_http` a handler `ctx.call_tool_text` plus `ctx.read_resource_text` returns `compose:tool:alpha|resource:deterministic`; a near-identical unknown nested tool or resource is refused without invoking the missing peer
+8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs). Live modern `bind_http` a handler `ctx.call_tool_text` plus `ctx.read_resource_text` returns `compose:tool:alpha|resource:deterministic` on both the public SSE client and a raw `Accept: application/json` POST, including when the composer is a handwritten or generated async `#[tool]`, `#[prompt]`, or `#[resource]`. Live exact-2024 `Client::sse` on LegacyOnly composes the same nested pair through session `call_async_in_request`, `get_async_in_request`, and `read_async_with_uri_in_request`. A near-identical unknown nested tool or resource is refused without invoking the missing peer
 9. ✅ **Capabilities access** - ctx.client_capabilities(), ctx.server_capabilities() (context.rs)
 10. ✅ **Per-handler timeout** - Handler-level configuration exists and both modern and exact-2024 session dispatch now enforce it through `run_handler_in_request`. Live `bind_http` refuses a late tool and still admits a fast peer; panic-boundary hardening remains unit-proven
 11. ✅ **Output schema** - Tool output schema support (macros, handler.rs)
