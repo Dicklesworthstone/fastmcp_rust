@@ -670,19 +670,13 @@ fn spawn_modern_mounted_http_server() -> HttpServerFixture {
                 cx.set_cancel_requested(true);
                 return Err("mounted HTTP server control receiver went away".to_owned());
             }
-            let tool_child = modern::ServerBuilder::new("facade-mounted-tools", "1.0.0")
+            let child = modern::ServerBuilder::new("facade-mounted-child", "1.0.0")
                 .tool(PublicHttpValue)
-                .build();
-            let prompt_child = modern::ServerBuilder::new("facade-mounted-prompts", "1.0.0")
                 .prompt(PublicHttpInstructionPrompt)
-                .build();
-            let resource_child = modern::ServerBuilder::new("facade-mounted-resource", "1.0.0")
                 .resource(PublicHttpSnapshotResource)
                 .build();
             let server = modern::ServerBuilder::new("facade-mounted-parent", "1.0.0")
-                .mount_tools(tool_child, Some("child"))
-                .mount_prompts(prompt_child, Some("child"))
-                .mount_resources(resource_child, None)
+                .mount(child, Some("child"))
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -1617,6 +1611,14 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
 
 #[cfg(feature = "proxy")]
 fn spawn_modern_http_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    spawn_modern_http_proxy_gateway_with_prefix(upstream, None)
+}
+
+#[cfg(feature = "proxy")]
+fn spawn_modern_http_proxy_gateway_with_prefix(
+    upstream: SocketAddr,
+    prefix: Option<&'static str>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -1711,10 +1713,16 @@ fn spawn_modern_http_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
                     "live HTTP proxy catalog omitted {PUBLIC_HTTP_RESOURCE_URI}: {resource_uris:?}"
                 ));
             }
-            let server = modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
-                .proxy_typed(proxy, catalog)
-                .map_err(|error| format!("proxy_typed install failed: {error}"))?
-                .build();
+            let server = match prefix {
+                Some(prefix) => modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
+                    .as_proxy_typed(prefix, proxy, catalog)
+                    .map_err(|error| format!("as_proxy_typed install failed: {error}"))?
+                    .build(),
+                None => modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
+                    .proxy_typed(proxy, catalog)
+                    .map_err(|error| format!("proxy_typed install failed: {error}"))?
+                    .build(),
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -1908,6 +1916,382 @@ fn e2e_public_http_proxy_gateway_forwards_live_bind_http_tool() {
     upstream.shutdown();
 }
 
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_forwards_prefixed_tool_and_unprefixed_resource() {
+    const PREFIXED_TOOL_NAME: &str = "ext/public-http-e2e-tool";
+    const PREFIXED_PROMPT_NAME: &str = "ext/public-http-e2e-prompt";
+
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_facade_http_server(false, None, true);
+    let gateway = spawn_modern_http_proxy_gateway_with_prefix(upstream.address(), Some("ext"));
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-as-proxy-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live prefixed as_proxy HTTP gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live prefixed gateway must advertise the upstream tools/list catalog");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PREFIXED_TOOL_NAME),
+        "as_proxy_typed must prefix the live upstream tool name: {listed:?}"
+    );
+    assert!(
+        !listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+        "a nonempty as_proxy prefix must not keep the unprefixed upstream tool: {listed:?}"
+    );
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PREFIXED_TOOL_NAME,
+            json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+        ),
+    )
+    .expect("the live prefixed gateway must forward tools/call to the upstream bind_http server");
+    assert!(
+        result.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == PUBLIC_HTTP_TOOL_TEXT,
+            _ => false,
+        }),
+        "the prefixed live tool must retain the upstream handler value: {result:?}"
+    );
+
+    let listed_prompts = runtime_block_on_bounded(&cx, client.list_prompts(&cx, None))
+        .expect("the live prefixed gateway must advertise the upstream prompts/list catalog");
+    assert!(
+        listed_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == PREFIXED_PROMPT_NAME),
+        "as_proxy_typed must prefix the live upstream prompt name: {listed_prompts:?}"
+    );
+    let prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PREFIXED_PROMPT_NAME,
+            HashMap::from([("subject".to_owned(), PUBLIC_HTTP_TOOL_ARGUMENT.to_owned())]),
+        ),
+    )
+    .expect("the live prefixed gateway must forward prompts/get to the upstream bind_http server");
+    let prompt = serde_json::to_value(prompt)
+        .expect("the prefixed prompt result serializes for its observable assertion");
+    assert_eq!(
+        prompt["messages"][0]["content"]["text"],
+        json!(PUBLIC_HTTP_PROMPT_TEXT),
+        "the prefixed live prompt must retain the upstream handler value: {prompt:?}"
+    );
+
+    let listed_resources = runtime_block_on_bounded(&cx, client.list_resources(&cx, None)).expect(
+        "the live prefixed gateway must advertise the exact upstream resources/list catalog",
+    );
+    assert!(
+        listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_RESOURCE_URI),
+        "as_proxy_typed must keep the exact final resource URI: {listed_resources:?}"
+    );
+    assert!(
+        listed_resources
+            .resources
+            .iter()
+            .all(|resource| { !resource.uri.as_str().starts_with("ext/") }),
+        "a nonempty as_proxy prefix must not invent a non-absolute modern resource URI: {listed_resources:?}"
+    );
+    let resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_RESOURCE_URI),
+    )
+    .expect(
+        "the live prefixed gateway must forward resources/read to the upstream bind_http server",
+    );
+    assert!(
+        matches!(
+            resource.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_RESOURCE_TEXT
+        ),
+        "the prefixed live resource must retain the upstream handler value: {:?}",
+        resource.contents
+    );
+
+    let completion = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: PREFIXED_PROMPT_NAME.to_owned(),
+                    title: "Public HTTP E2E Prompt".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                context: Some(modern::FinalCompletionContext {
+                    arguments: Some(std::collections::BTreeMap::from([(
+                        "region".to_owned(),
+                        "us-east-1".to_owned(),
+                    )])),
+                }),
+            },
+        ),
+    )
+    .expect(
+        "the live prefixed gateway must forward completion/complete to the upstream bind_http server",
+    );
+    assert_eq!(
+        completion.completion.values,
+        vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+        "the prefixed live completion must retain the upstream provider values: {completion:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+fn spawn_modern_http_template_proxy_gateway(
+    upstream: SocketAddr,
+    expected_template: &'static str,
+) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("template proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("template proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "template proxy gateway HTTP server control receiver went away".to_owned(),
+                );
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream, "/mcp")),
+                None,
+                None,
+                "e2e-http-template-proxy-gateway".to_owned(),
+                "e2e-http-template-proxy-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .map_err(|error| format!("template proxy gateway HTTP plan failed: {error}"))?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-live-template-upstream",
+                    "native-h1:e2e-live-template-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-http-template-proxy".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .map_err(|error| {
+                    format!("live HTTP template proxy upstream connect failed: {error}")
+                })?;
+            let catalog = proxy
+                .catalog_typed()
+                .map_err(|error| format!("live HTTP template proxy catalog failed: {error}"))?;
+            let templates = catalog
+                .final_resource_templates()
+                .map(|templates| {
+                    templates
+                        .iter()
+                        .map(|template| template.uri_template.as_str())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !templates.contains(&expected_template) {
+                return Err(format!(
+                    "live HTTP template proxy catalog omitted {expected_template}: {templates:?}"
+                ));
+            }
+            let server = modern::ServerBuilder::new("e2e-http-template-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .map_err(|error| format!("as_proxy_typed template install failed: {error}"))?
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("template proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("template proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "template proxy gateway HTTP server startup receiver went away".to_owned(),
+                );
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("template proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("template proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("template proxy gateway HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("template proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_forwards_unprefixed_resource_template() {
+    let cx = Cx::for_request();
+    let (upstream, reads) = spawn_modern_template_http_server();
+    let gateway =
+        spawn_modern_http_template_proxy_gateway(upstream.address(), PUBLIC_HTTP_TEMPLATE);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-as-proxy-template-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live template as_proxy HTTP gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_resource_templates(&cx, None))
+        .expect("the live prefixed gateway must advertise the exact upstream resource template");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_TEMPLATE
+                && template.name == PUBLIC_HTTP_TEMPLATE_NAME),
+        "as_proxy_typed must keep the exact final resource template: {:?}",
+        listed.resource_templates
+    );
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .all(|template| !template.uri_template.starts_with("ext/")),
+        "a nonempty as_proxy prefix must not invent a non-absolute template URI: {:?}",
+        listed.resource_templates
+    );
+
+    let matched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_TEMPLATE_MATCHED_URI),
+    )
+    .expect("the live prefixed gateway must expand a URI that matches the upstream template");
+    assert!(
+        matches!(
+            matched.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == "item:alpha"
+        ),
+        "the proxied matched template read must retain the extracted id: {:?}",
+        matched.contents
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "a matching proxied resources/read must invoke the upstream templated handler once"
+    );
+
+    let unmatched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_TEMPLATE_UNMATCHED_URI),
+    )
+    .expect_err(
+        "changing only the path that the template cannot bind must refuse before upstream dispatch",
+    );
+    assert!(
+        matches!(
+            unmatched,
+            modern::HttpClientError::CoreResult(ref error)
+                if error.code == McpErrorCode::InvalidParams
+        ),
+        "an unmatched proxied template URI must stay InvalidParams: {unmatched:?}"
+    );
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        1,
+        "the unmatched URI must leave the upstream templated handler uninvoked"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
 #[test]
 fn e2e_public_http_mount_forwards_prefixed_tool_and_unprefixed_resource() {
     const MOUNTED_TOOL_NAME: &str = "child/public-http-e2e-tool";
@@ -2024,9 +2408,15 @@ const PUBLIC_HTTP_FS_FILE_TEXT: &str = "filesystem:deterministic";
 /// Starts a public ModernOnly facade whose catalog is one live FilesystemProvider.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn spawn_modern_filesystem_http_server() -> HttpServerFixture {
+    spawn_modern_filesystem_http_server_named("direct")
+}
+
+fn spawn_modern_filesystem_http_server_named(label: &'static str) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
-    let root =
-        std::env::temp_dir().join(format!("fastmcp-public-http-fs-e2e-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!(
+        "fastmcp-public-http-fs-e2e-{}-{label}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&root).expect("the filesystem e2e root is created");
     std::fs::write(
         root.join(PUBLIC_HTTP_FS_FILE_NAME),
@@ -2050,9 +2440,18 @@ fn spawn_modern_filesystem_http_server() -> HttpServerFixture {
                 .with_exclude(&[])
                 .build()
                 .map_err(|error| format!("FilesystemProvider::build failed: {error}"))?;
-            let server = modern::ServerBuilder::new("facade-filesystem-http", "1.0.0")
-                .resource(handler)
-                .build();
+            let server = if label == "mounted" {
+                let child = modern::ServerBuilder::new("facade-filesystem-child", "1.0.0")
+                    .resource(handler)
+                    .build();
+                modern::ServerBuilder::new("facade-filesystem-parent", "1.0.0")
+                    .mount(child, Some("child"))
+                    .build()
+            } else {
+                modern::ServerBuilder::new("facade-filesystem-http", "1.0.0")
+                    .resource(handler)
+                    .build()
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -2167,6 +2566,139 @@ fn e2e_public_http_filesystem_provider_lists_and_reads_live_file() {
             [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_FS_FILE_TEXT
         ),
         "the live filesystem read must retain the file bytes: {:?}",
+        file.contents
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(all(feature = "proxy", any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn e2e_public_http_prefixed_as_proxy_forwards_filesystem_template() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_filesystem_http_server_named("as-proxy");
+    let gateway =
+        spawn_modern_http_template_proxy_gateway(upstream.address(), PUBLIC_HTTP_FS_TEMPLATE);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-as-proxy-fs-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live filesystem as_proxy HTTP gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_resource_templates(&cx, None))
+        .expect("the live prefixed gateway must advertise the exact filesystem template");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_FS_TEMPLATE
+                && template.name == PUBLIC_HTTP_FS_PREFIX),
+        "as_proxy_typed must keep the exact filesystem template: {:?}",
+        listed.resource_templates
+    );
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .all(|template| !template.uri_template.starts_with("ext/")),
+        "a nonempty as_proxy prefix must not invent a non-absolute filesystem template URI: {:?}",
+        listed.resource_templates
+    );
+
+    let unmatched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "file:///other/note.txt"),
+    )
+    .expect_err(
+        "changing only the prefix the template cannot bind must refuse before upstream dispatch",
+    );
+    assert!(
+        matches!(
+            unmatched,
+            modern::HttpClientError::CoreResult(ref error)
+                if error.code == McpErrorCode::InvalidParams
+        ),
+        "an unmatched proxied filesystem URI must stay InvalidParams: {unmatched:?}"
+    );
+
+    let file = runtime_block_on_bounded(&cx, client.read_resource(&cx, PUBLIC_HTTP_FS_FILE_URI))
+        .expect("the live prefixed gateway must expand the live file URI through the upstream filesystem handler");
+    assert!(
+        matches!(
+            file.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_FS_FILE_TEXT
+        ),
+        "the proxied live filesystem read must retain the file bytes: {:?}",
+        file.contents
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn e2e_public_http_mount_forwards_unprefixed_filesystem_template() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_filesystem_http_server_named("mounted");
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-mount-fs-client", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live mounted filesystem HTTP server");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_resource_templates(&cx, None))
+        .expect("the mounted parent must advertise the exact filesystem template");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_FS_TEMPLATE
+                && template.name == PUBLIC_HTTP_FS_PREFIX),
+        "mount() must keep the exact filesystem template: {:?}",
+        listed.resource_templates
+    );
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .all(|template| !template.uri_template.starts_with("child/")),
+        "a nonempty mount prefix must not invent a non-absolute filesystem template URI: {:?}",
+        listed.resource_templates
+    );
+
+    let unmatched = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "file:///other/note.txt"),
+    )
+    .expect_err(
+        "changing only the prefix the template cannot bind must refuse before the child handler",
+    );
+    assert!(
+        matches!(
+            unmatched,
+            modern::HttpClientError::CoreResult(ref error)
+                if error.code == McpErrorCode::InvalidParams
+        ),
+        "an unmatched mounted filesystem URI must stay InvalidParams: {unmatched:?}"
+    );
+
+    let file = runtime_block_on_bounded(&cx, client.read_resource(&cx, PUBLIC_HTTP_FS_FILE_URI))
+        .expect(
+            "the mounted parent must expand the live file URI through the child filesystem handler",
+        );
+    assert!(
+        matches!(
+            file.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == PUBLIC_HTTP_FS_FILE_TEXT
+        ),
+        "the mounted live filesystem read must retain the file bytes: {:?}",
         file.contents
     );
 
