@@ -28,16 +28,16 @@ use fastmcp_rust::{
     ClientCapabilities, ClientHttpConnectionError, ClientHttpResponse, ClientProtocolPlan,
     CompleteResult, CompletionHandler, Content, ContentBlock, CoreResult, Cx, DuplicateBehavior,
     EmbeddedResourceContents, FinalCallToolResult, FinalCoreResult, FinalElicitationContextExt,
-    FinalEmbeddedRootsListParams, FinalResourceTemplate, FinalRootsContextExt,
-    FinalSamplingContextExt, FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown,
-    HttpShutdownSettlement, JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode,
-    McpOutcome, McpRequestCancellation, McpResult, Middleware, MiddlewareDecision,
-    ModernHttpResponseKind, ModernHttpResponseStream, Outcome, Prompt, PromptHandler,
-    PromptMessage, ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent,
-    ResourceHandler, ResourceTemplate, ResultMeta, Role, SseLimits, StaticTokenVerifier,
-    TokenAuthProvider, TokenVerifier, Tool, ToolAnnotations, ToolErrorKind, ToolHandler, auto,
-    caching, core, legacy_2024, modern, prompt, providers, rate_limiting, resource, tool,
-    transform,
+    FinalEmbeddedRootsListParams, FinalGetPromptResult, FinalPromptMessage,
+    FinalReadResourceResult, FinalResourceTemplate, FinalRootsContextExt, FinalSamplingContextExt,
+    FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
+    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode, McpOutcome,
+    McpRequestCancellation, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
+    ModernHttpResponseStream, Outcome, Prompt, PromptArgument, PromptHandler, PromptMessage,
+    ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
+    ResourceTemplate, ResultMeta, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider,
+    TokenVerifier, Tool, ToolAnnotations, ToolErrorKind, ToolHandler, auto, caching, core,
+    legacy_2024, modern, prompt, providers, rate_limiting, resource, tool, transform,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_rust::{
@@ -69,6 +69,17 @@ const PUBLIC_HTTP_PLAIN_TOOL_NAME: &str = "public-http-e2e-plain";
 const PUBLIC_HTTP_ICON_SRC: &str = "https://example.test/e2e-icon.png";
 const PUBLIC_HTTP_OUTPUT_TOOL_NAME: &str = "public-http-e2e-output";
 const PUBLIC_HTTP_COMPOSE_TOOL_NAME: &str = "public-http-e2e-compose";
+const PUBLIC_HTTP_COMPOSE_PROMPT_NAME: &str = "public-http-e2e-compose-prompt";
+const PUBLIC_HTTP_MACRO_COMPOSE_PROMPT_NAME: &str = "public-http-e2e-macro-compose";
+const PUBLIC_HTTP_MACRO_COMPOSE_TOOL_NAME: &str = "public-http-e2e-macro-compose-tool";
+const PUBLIC_HTTP_MACRO_COMPOSE_RESOURCE_URI: &str = "test://public-http-e2e/macro-compose";
+const PUBLIC_HTTP_MACRO_COMPOSE_MISSING_TOOL_RESOURCE_URI: &str =
+    "test://public-http-e2e/macro-compose-missing-tool";
+const PUBLIC_HTTP_COMPOSE_RESOURCE_URI: &str = "test://public-http-e2e/compose";
+const PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI: &str =
+    "test://public-http-e2e/compose-missing-tool";
+const PUBLIC_HTTP_COMPOSE_MISSING_RESOURCE_URI: &str =
+    "test://public-http-e2e/compose-missing-resource";
 const PUBLIC_HTTP_STATE_TOOL_NAME: &str = "public-http-e2e-state";
 const PUBLIC_HTTP_STATE_KEY: &str = "e2e-request-local-state";
 const PUBLIC_HTTP_CAPS_TOOL_NAME: &str = "public-http-e2e-caps";
@@ -117,6 +128,108 @@ fn public_http_instruction(_ctx: &McpContext, subject: String) -> Vec<PromptMess
             text: format!("prompt:{subject}"),
         },
     }]
+}
+
+/// Generated async `#[prompt]` that composes nested tool and resource reads.
+#[prompt(name = "public-http-e2e-macro-compose")]
+async fn public_http_macro_compose(
+    ctx: &McpContext,
+    value: String,
+    tool: String,
+    resource: String,
+) -> McpResult<Vec<PromptMessage>> {
+    if !ctx.can_call_tools() || !ctx.can_read_resources() {
+        return Err(McpError::invalid_request(format!(
+            "compose-no-router: can_call_tools={} can_read_resources={}",
+            ctx.can_call_tools(),
+            ctx.can_read_resources()
+        )));
+    }
+    let tool_text = ctx
+        .call_tool_text(&tool, json!({ "value": value }))
+        .await
+        .map_err(|error| {
+            McpError::invalid_request(format!(
+                "compose-nested-tool:{tool}:{:?}:{}",
+                error.code, error.message
+            ))
+        })?;
+    let resource_text = ctx.read_resource_text(&resource).await.map_err(|error| {
+        McpError::invalid_request(format!(
+            "compose-nested-resource:{resource}:{:?}:{}",
+            error.code, error.message
+        ))
+    })?;
+    Ok(vec![PromptMessage {
+        role: Role::User,
+        content: Content::text(format!("compose:{tool_text}|{resource_text}")),
+    }])
+}
+
+async fn public_http_compose_nested(
+    ctx: &McpContext,
+    value: &str,
+    tool: &str,
+    resource: &str,
+) -> McpResult<String> {
+    if !ctx.can_call_tools() || !ctx.can_read_resources() {
+        return Err(McpError::invalid_request(format!(
+            "compose-no-router: can_call_tools={} can_read_resources={}",
+            ctx.can_call_tools(),
+            ctx.can_read_resources()
+        )));
+    }
+    let tool_text = ctx
+        .call_tool_text(tool, json!({ "value": value }))
+        .await
+        .map_err(|error| {
+            McpError::invalid_request(format!(
+                "compose-nested-tool:{tool}:{:?}:{}",
+                error.code, error.message
+            ))
+        })?;
+    let resource_text = ctx.read_resource_text(resource).await.map_err(|error| {
+        McpError::invalid_request(format!(
+            "compose-nested-resource:{resource}:{:?}:{}",
+            error.code, error.message
+        ))
+    })?;
+    Ok(format!("compose:{tool_text}|{resource_text}"))
+}
+
+/// Generated async `#[tool]` that composes nested tool and resource reads.
+#[tool(name = "public-http-e2e-macro-compose-tool")]
+async fn public_http_macro_compose_tool(
+    ctx: &McpContext,
+    value: String,
+    tool: String,
+    resource: String,
+) -> McpResult<String> {
+    public_http_compose_nested(ctx, &value, &tool, &resource).await
+}
+
+/// Generated async `#[resource]` that composes nested tool and resource reads.
+#[resource(uri = "test://public-http-e2e/macro-compose")]
+async fn public_http_macro_compose_view(ctx: &McpContext) -> McpResult<String> {
+    public_http_compose_nested(
+        ctx,
+        "alpha",
+        PUBLIC_HTTP_TOOL_NAME,
+        PUBLIC_HTTP_RESOURCE_URI,
+    )
+    .await
+}
+
+/// Near-identical generated resource whose only change is the nested tool name.
+#[resource(uri = "test://public-http-e2e/macro-compose-missing-tool")]
+async fn public_http_macro_compose_missing(ctx: &McpContext) -> McpResult<String> {
+    public_http_compose_nested(
+        ctx,
+        "alpha",
+        "public-http-e2e-missing",
+        PUBLIC_HTTP_RESOURCE_URI,
+    )
+    .await
 }
 
 /// Live modern HTTP tool whose omitted `suffix` is injected from `#[tool]` defaults.
@@ -518,6 +631,22 @@ impl ToolHandler for PublicHttpComposeTool {
         ))
     }
 
+    fn call_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        Box::pin(async move {
+            match self.compose_text(ctx, request_cx, arguments).await {
+                Outcome::Ok(text) => Outcome::Ok(vec![Content::text(text)]),
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(cancelled) => Outcome::Cancelled(cancelled),
+                Outcome::Panicked(panic) => Outcome::Panicked(panic),
+            }
+        })
+    }
+
     fn call_final_outcome_async_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -539,12 +668,12 @@ impl ToolHandler for PublicHttpComposeTool {
 }
 
 impl PublicHttpComposeTool {
-    fn compose_from_request<'a>(
+    fn compose_text<'a>(
         &'a self,
         ctx: &'a McpContext,
         _request_cx: &'a Cx,
         arguments: serde_json::Value,
-    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+    ) -> BoxFuture<'a, McpOutcome<String>> {
         Box::pin(async move {
             if !ctx.can_call_tools() || !ctx.can_read_resources() {
                 return Outcome::Err(McpError::invalid_request(format!(
@@ -586,16 +715,343 @@ impl PublicHttpComposeTool {
                     )));
                 }
             };
-            Outcome::Ok(FinalToolOutcome::Complete(CompleteResult::new(
-                FinalCallToolResult {
-                    content: vec![ContentBlock::text(format!(
-                        "compose:{tool_text}|{resource_text}"
-                    ))],
-                    is_error: false,
-                    structured_content: None,
+            Outcome::Ok(format!("compose:{tool_text}|{resource_text}"))
+        })
+    }
+
+    fn compose_from_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            match self.compose_text(ctx, request_cx, arguments).await {
+                Outcome::Ok(text) => Outcome::Ok(FinalToolOutcome::Complete(CompleteResult::new(
+                    FinalCallToolResult {
+                        content: vec![ContentBlock::text(text)],
+                        is_error: false,
+                        structured_content: None,
+                    },
+                    ResultMeta::empty(),
+                ))),
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(cancelled) => Outcome::Cancelled(cancelled),
+                Outcome::Panicked(panic) => Outcome::Panicked(panic),
+            }
+        })
+    }
+}
+
+/// Nested `ctx.call_tool` + `ctx.read_resource` from a prompt handler.
+struct PublicHttpComposePrompt;
+
+impl PromptHandler for PublicHttpComposePrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: PUBLIC_HTTP_COMPOSE_PROMPT_NAME.to_owned(),
+            description: Some(
+                "Composes a nested tools/call and resources/read from prompts/get".to_owned(),
+            ),
+            arguments: vec![
+                PromptArgument {
+                    name: "value".to_owned(),
+                    description: Some("Value forwarded to the nested tool".to_owned()),
+                    required: true,
                 },
-                ResultMeta::empty(),
-            )))
+                PromptArgument {
+                    name: "tool".to_owned(),
+                    description: Some("Nested tool name".to_owned()),
+                    required: false,
+                },
+                PromptArgument {
+                    name: "resource".to_owned(),
+                    description: Some("Nested resource URI".to_owned()),
+                    required: false,
+                },
+            ],
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Err(McpError::invalid_request(
+            "compose-sync-hook: prompt compose must run through the request-owned async hook",
+        ))
+    }
+
+    fn get_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
+        Box::pin(async move {
+            match self.compose_text(ctx, request_cx, arguments).await {
+                Outcome::Ok(text) => Outcome::Ok(vec![PromptMessage {
+                    role: Role::User,
+                    content: Content::text(text),
+                }]),
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(cancelled) => Outcome::Cancelled(cancelled),
+                Outcome::Panicked(panic) => Outcome::Panicked(panic),
+            }
+        })
+    }
+
+    fn get_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.compose_from_request(ctx, request_cx, arguments)
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+        _resume_inputs: Option<&'a fastmcp_rust::MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        self.compose_from_request(ctx, request_cx, arguments)
+    }
+}
+
+impl PublicHttpComposePrompt {
+    fn compose_text<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<String>> {
+        Box::pin(async move {
+            if !ctx.can_call_tools() || !ctx.can_read_resources() {
+                return Outcome::Err(McpError::invalid_request(format!(
+                    "compose-no-router: can_call_tools={} can_read_resources={}",
+                    ctx.can_call_tools(),
+                    ctx.can_read_resources()
+                )));
+            }
+            let value = arguments
+                .get("value")
+                .map(String::as_str)
+                .unwrap_or("missing");
+            let tool_name = arguments
+                .get("tool")
+                .map(String::as_str)
+                .unwrap_or(PUBLIC_HTTP_TOOL_NAME);
+            let resource_uri = arguments
+                .get("resource")
+                .map(String::as_str)
+                .unwrap_or(PUBLIC_HTTP_RESOURCE_URI);
+            let tool_text = match ctx
+                .call_tool_text(tool_name, json!({ "value": value }))
+                .await
+            {
+                Ok(text) => text,
+                Err(error) => {
+                    return Outcome::Err(McpError::invalid_request(format!(
+                        "compose-nested-tool:{tool_name}:{:?}:{}",
+                        error.code, error.message
+                    )));
+                }
+            };
+            let resource_text = match ctx.read_resource_text(resource_uri).await {
+                Ok(text) => text,
+                Err(error) => {
+                    return Outcome::Err(McpError::invalid_request(format!(
+                        "compose-nested-resource:{resource_uri}:{:?}:{}",
+                        error.code, error.message
+                    )));
+                }
+            };
+            Outcome::Ok(format!("compose:{tool_text}|{resource_text}"))
+        })
+    }
+
+    fn compose_from_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            match self.compose_text(ctx, request_cx, arguments).await {
+                Outcome::Ok(text) => {
+                    Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+                        FinalGetPromptResult {
+                            description: None,
+                            messages: vec![FinalPromptMessage {
+                                role: Role::User,
+                                content: ContentBlock::text(text),
+                            }],
+                        },
+                        ResultMeta::empty(),
+                    )))
+                }
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(cancelled) => Outcome::Cancelled(cancelled),
+                Outcome::Panicked(panic) => Outcome::Panicked(panic),
+            }
+        })
+    }
+}
+
+/// Nested `ctx.call_tool` + `ctx.read_resource` from a resource handler.
+struct PublicHttpComposeResource {
+    uri: &'static str,
+    tool: &'static str,
+    resource: &'static str,
+}
+
+impl ResourceHandler for PublicHttpComposeResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: self.uri.to_owned(),
+            name: self.uri.to_owned(),
+            description: Some(
+                "Composes a nested tools/call and resources/read from resources/read".to_owned(),
+            ),
+            mime_type: Some("text/plain".to_owned()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Err(McpError::invalid_request(
+            "compose-sync-hook: resource compose must run through the request-owned async hook",
+        ))
+    }
+
+    fn read_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        Box::pin(async move {
+            match self.compose_text(ctx, request_cx).await {
+                Outcome::Ok(text) => Outcome::Ok(vec![ResourceContent {
+                    uri: uri.to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    text: Some(text),
+                    blob: None,
+                }]),
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(cancelled) => Outcome::Cancelled(cancelled),
+                Outcome::Panicked(panic) => Outcome::Panicked(panic),
+            }
+        })
+    }
+
+    fn read_final_outcome_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        self.compose_from_request(ctx, request_cx, uri)
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a HashMap<String, String>,
+        _resume_inputs: Option<&'a fastmcp_rust::MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        self.compose_from_request(ctx, request_cx, uri)
+    }
+}
+
+impl PublicHttpComposeResource {
+    fn compose_text<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+    ) -> BoxFuture<'a, McpOutcome<String>> {
+        Box::pin(async move {
+            if !ctx.can_call_tools() || !ctx.can_read_resources() {
+                return Outcome::Err(McpError::invalid_request(format!(
+                    "compose-no-router: can_call_tools={} can_read_resources={}",
+                    ctx.can_call_tools(),
+                    ctx.can_read_resources()
+                )));
+            }
+            let tool_text = match ctx
+                .call_tool_text(self.tool, json!({ "value": "alpha" }))
+                .await
+            {
+                Ok(text) => text,
+                Err(error) => {
+                    return Outcome::Err(McpError::invalid_request(format!(
+                        "compose-nested-tool:{}:{:?}:{}",
+                        self.tool, error.code, error.message
+                    )));
+                }
+            };
+            let resource_text = match ctx.read_resource_text(self.resource).await {
+                Ok(text) => text,
+                Err(error) => {
+                    return Outcome::Err(McpError::invalid_request(format!(
+                        "compose-nested-resource:{}:{:?}:{}",
+                        self.resource, error.code, error.message
+                    )));
+                }
+            };
+            Outcome::Ok(format!("compose:{tool_text}|{resource_text}"))
+        })
+    }
+
+    fn compose_from_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            match self.compose_text(ctx, request_cx).await {
+                Outcome::Ok(text) => {
+                    let parsed = match modern::AbsoluteUri::parse(uri) {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            return Outcome::Err(McpError::invalid_request(format!(
+                                "compose-resource-uri:{error}"
+                            )));
+                        }
+                    };
+                    Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+                        FinalReadResourceResult {
+                            contents: vec![EmbeddedResourceContents::Text {
+                                uri: parsed,
+                                text,
+                                mime_type: Some("text/plain".to_owned()),
+                                meta: None,
+                                additional: std::collections::BTreeMap::new(),
+                            }],
+                            ttl_ms: CacheTtl::milliseconds(3_600_000),
+                            cache_scope: CacheScope::Private,
+                        },
+                        ResultMeta::empty(),
+                    )))
+                }
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(cancelled) => Outcome::Cancelled(cancelled),
+                Outcome::Panicked(panic) => Outcome::Panicked(panic),
+            }
         })
     }
 }
@@ -2174,6 +2630,548 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
     );
     drop(client);
     server.shutdown();
+}
+
+fn spawn_legacy_compose_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let resource_calls = Arc::clone(&handler_calls);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy compose HTTP server control receiver went away".to_owned());
+            }
+            let server = ServerBuilder::new("facade-http-legacy-compose", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .tool(CountingPublicHttpValue {
+                    counters: Arc::clone(&tool_calls),
+                })
+                .tool(PublicHttpComposeTool)
+                .resource(CountingPublicHttpSnapshot {
+                    counters: resource_calls,
+                })
+                .resource(PublicHttpComposeResource {
+                    uri: PUBLIC_HTTP_COMPOSE_RESOURCE_URI,
+                    tool: PUBLIC_HTTP_TOOL_NAME,
+                    resource: PUBLIC_HTTP_RESOURCE_URI,
+                })
+                .resource(PublicHttpComposeResource {
+                    uri: PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI,
+                    tool: "public-http-e2e-missing",
+                    resource: PUBLIC_HTTP_RESOURCE_URI,
+                })
+                .resource(PublicHttpComposeResource {
+                    uri: PUBLIC_HTTP_COMPOSE_MISSING_RESOURCE_URI,
+                    tool: PUBLIC_HTTP_TOOL_NAME,
+                    resource: "test://public-http-e2e/missing",
+                })
+                .prompt(PublicHttpComposePrompt)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("legacy compose HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("legacy compose HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy compose HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy compose HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy compose HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("legacy compose HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy compose HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_sse_compose_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_compose_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        fastmcp_rust::Client::sse_with_cx(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+            &cx,
+        ),
+    )
+    .expect("Client::sse_with_cx connects exact-2024 SSE to the compose server");
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            json!({"value": "alpha"}),
+        ),
+    )
+    .expect("exact-2024 SSE must compose a nested tool call and resource read");
+    let CoreResult::Legacy(legacy_2024::LegacyCoreResult::ToolsCall(result)) = result else {
+        panic!("Client::sse compose must stay on the exact-2024 tool result: {result:?}");
+    };
+    let tool = serde_json::to_value(result).expect("the exact-2024 SSE compose result serializes");
+    assert_eq!(
+        tool["content"][0]["text"],
+        json!("compose:tool:alpha|resource:deterministic"),
+        "exact-2024 session dispatch must attach request-scoped callers: {tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+        ),
+    );
+    let missing = match missing {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-tool")
+            || missing.contains("Unknown tool")
+            || missing.contains("not found"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_sse_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_compose_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        fastmcp_rust::Client::sse_with_cx(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+            &cx,
+        ),
+    )
+    .expect("Client::sse_with_cx connects exact-2024 SSE to the prompt compose server");
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+            HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect("exact-2024 SSE must compose a nested tool call and resource read from prompts/get");
+    let CoreResult::Legacy(legacy_2024::LegacyCoreResult::PromptsGet(result)) = result else {
+        panic!("Client::sse prompt compose must stay on the exact-2024 prompt result: {result:?}");
+    };
+    let prompt = serde_json::to_value(result).expect("the exact-2024 SSE prompt result serializes");
+    assert_eq!(
+        prompt["messages"][0]["content"]["text"],
+        json!("compose:tool:alpha|resource:deterministic"),
+        "exact-2024 session prompt dispatch must attach request-scoped callers: {prompt}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+            HashMap::from([
+                ("value".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+            ]),
+        ),
+    );
+    let missing = match missing {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-tool")
+            || missing.contains("Unknown tool")
+            || missing.contains("not found"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_sse_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_compose_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        fastmcp_rust::Client::sse_with_cx(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+            &cx,
+        ),
+    )
+    .expect("Client::sse_with_cx connects exact-2024 SSE to the resource compose server");
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_RESOURCE_URI),
+    )
+    .expect("exact-2024 SSE must compose a nested tool call and resource read from resources/read");
+    let CoreResult::Legacy(legacy_2024::LegacyCoreResult::ResourcesRead(result)) = result else {
+        panic!(
+            "Client::sse resource compose must stay on the exact-2024 resource result: {result:?}"
+        );
+    };
+    let resource =
+        serde_json::to_value(result).expect("the exact-2024 SSE resource result serializes");
+    assert_eq!(
+        resource["contents"][0]["text"],
+        json!("compose:tool:alpha|resource:deterministic"),
+        "exact-2024 session resource dispatch must attach request-scoped callers: {resource}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI),
+    );
+    let missing = match missing {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-tool")
+            || missing.contains("Unknown tool")
+            || missing.contains("not found"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_legacy_caps_http_server(with_resource: bool) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy caps HTTP server control receiver went away".to_owned());
+            }
+            let builder = ServerBuilder::new("facade-http-legacy-caps", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .tool(PublicHttpCapsTool);
+            let builder = if with_resource {
+                builder.resource(PublicHttpSnapshotResource)
+            } else {
+                builder
+            };
+            let server = builder.build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("legacy caps HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("legacy caps HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy caps HTTP server startup receiver went away".to_owned());
+            }
+            bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("legacy caps HTTP server stopped unexpectedly: {error}"))
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy caps HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("legacy caps HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy caps HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+fn legacy_caps_text(result: &legacy_2024::CallToolResult) -> String {
+    serde_json::to_value(result)
+        .ok()
+        .and_then(|value| value["content"][0]["text"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("missing text: {result:?}"))
+}
+
+#[test]
+fn e2e_public_sse_handler_sees_initialized_client_capabilities() {
+    let cx = Cx::for_request();
+    let with_resources = spawn_legacy_caps_http_server(true);
+    let without_resources = spawn_legacy_caps_http_server(false);
+
+    let mut default_client = runtime_block_on_bounded(
+        &cx,
+        legacy_2024::http_client_builder(
+            public_http_target(with_resources.address(), "/sse"),
+            public_http_target(with_resources.address(), "/messages"),
+        )
+        .expect("default exact-2024 SSE endpoints form one plan")
+        .client_info("e2e-legacy-caps-default", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the default exact-2024 client connects");
+    let default = runtime_block_on_bounded(
+        &cx,
+        default_client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_CAPS_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("default exact-2024 tools/call must reach the capability handler");
+    assert_eq!(
+        legacy_caps_text(&default),
+        "caps:sampling=false;roots=false;tools=true;resources=true",
+        "a default initialize must not invent sampling/roots, and a resource-bearing server must advertise both"
+    );
+
+    let mut sampling_client = runtime_block_on_bounded(
+        &cx,
+        legacy_2024::http_client_builder(
+            public_http_target(with_resources.address(), "/sse"),
+            public_http_target(with_resources.address(), "/messages"),
+        )
+        .expect("sampling exact-2024 SSE endpoints form one plan")
+        .client_info("e2e-legacy-caps-sampling", "1.0.0")
+        .capabilities(ClientCapabilities {
+            sampling: Some(Default::default()),
+            elicitation: None,
+            roots: Some(Default::default()),
+        })
+        .reverse_request_handlers(
+            legacy_2024::LegacyReverseRequestHandlers::new()
+                .with_sampling_create_message(|_cx, _cancel, _params| {
+                    Box::pin(async {
+                        Ok(legacy_2024::LegacyCreateMessageResult::text(
+                            "e2e-unused-sample",
+                            "e2e-unused-model",
+                        ))
+                    })
+                })
+                .with_roots_list(|_cx, _cancel, _params| {
+                    Box::pin(async { Ok(legacy_2024::LegacyListRootsResult::empty()) })
+                }),
+        )
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the sampling/roots exact-2024 client connects");
+    let sampling = runtime_block_on_bounded(
+        &cx,
+        sampling_client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_CAPS_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("sampling exact-2024 tools/call must reach the capability handler");
+    assert_eq!(
+        legacy_caps_text(&sampling),
+        "caps:sampling=true;roots=true;tools=true;resources=true",
+        "initialize sampling+roots must reach ctx.client_capabilities on the exact-2024 session path"
+    );
+
+    let mut bare_client = runtime_block_on_bounded(
+        &cx,
+        legacy_2024::http_client_builder(
+            public_http_target(without_resources.address(), "/sse"),
+            public_http_target(without_resources.address(), "/messages"),
+        )
+        .expect("bare exact-2024 SSE endpoints form one plan")
+        .client_info("e2e-legacy-caps-bare", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the default client connects to the tool-only exact-2024 server");
+    let bare = runtime_block_on_bounded(
+        &cx,
+        bare_client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_CAPS_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("tool-only exact-2024 tools/call must reach the capability handler");
+    assert_eq!(
+        legacy_caps_text(&bare),
+        "caps:sampling=false;roots=false;tools=true;resources=false",
+        "omitting the resource registration must clear only the handler-visible resources flag"
+    );
+
+    drop(default_client);
+    drop(sampling_client);
+    drop(bare_client);
+    with_resources.shutdown();
+    without_resources.shutdown();
 }
 
 #[cfg(feature = "proxy")]
@@ -10000,10 +10998,30 @@ fn spawn_modern_compose_and_state_http_server() -> HttpServerFixture {
                     counters: Arc::clone(&tool_calls),
                 })
                 .tool(PublicHttpComposeTool)
+                .tool(PublicHttpMacroComposeTool)
                 .tool(PublicHttpStateTool)
                 .resource(CountingPublicHttpSnapshot {
                     counters: resource_calls,
                 })
+                .resource(PublicHttpMacroComposeViewResource)
+                .resource(PublicHttpMacroComposeMissingResource)
+                .resource(PublicHttpComposeResource {
+                    uri: PUBLIC_HTTP_COMPOSE_RESOURCE_URI,
+                    tool: PUBLIC_HTTP_TOOL_NAME,
+                    resource: PUBLIC_HTTP_RESOURCE_URI,
+                })
+                .resource(PublicHttpComposeResource {
+                    uri: PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI,
+                    tool: "public-http-e2e-missing",
+                    resource: PUBLIC_HTTP_RESOURCE_URI,
+                })
+                .resource(PublicHttpComposeResource {
+                    uri: PUBLIC_HTTP_COMPOSE_MISSING_RESOURCE_URI,
+                    tool: PUBLIC_HTTP_TOOL_NAME,
+                    resource: "test://public-http-e2e/missing",
+                })
+                .prompt(PublicHttpComposePrompt)
+                .prompt(PublicHttpMacroComposePrompt)
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -10164,6 +11182,455 @@ fn e2e_public_http_handler_ctx_call_tool_and_read_resource() {
         Ok(result) => panic!(
             "changing only the nested resource URI must refuse after the peer tool runs: {result:?}"
         ),
+    };
+    assert!(
+        missing_resource.contains("test://public-http-e2e/missing")
+            || missing_resource.contains("not found")
+            || missing_resource.contains("ResourceNotFound")
+            || missing_resource.contains("compose-nested-resource"),
+        "the nested unknown resource must stay a handler-visible refusal: {missing_resource}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        2,
+        "the peer tool must still run when only the nested resource URI changes"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "an unknown nested resource URI must not invoke the peer resource"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_and_state_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-prompt-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the prompt compose HTTP server");
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+            HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect("live bind_http prompts/get must compose a nested tool call and resource read");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text == "compose:tool:alpha|resource:deterministic"
+                }
+                _ => false,
+            }),
+        "prompt ctx.call_tool and ctx.read_resource must reach the live peer handlers: {composed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+            HashMap::from([
+                ("value".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+            ]),
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must refuse before the peer handlers run: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("Unknown tool")
+            || missing_tool.contains("not found")
+            || missing_tool.contains("MethodNotFound")
+            || missing_tool.contains("compose-nested-tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "an unknown nested tool name must not reach the peer resource"
+    );
+
+    let missing_resource = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+            HashMap::from([
+                ("value".to_owned(), "beta".to_owned()),
+                (
+                    "resource".to_owned(),
+                    "test://public-http-e2e/missing".to_owned(),
+                ),
+            ]),
+        ),
+    );
+    let missing_resource = match missing_resource {
+        Ok(result) => panic!(
+            "changing only the nested resource URI must refuse after the peer tool runs: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_resource.contains("test://public-http-e2e/missing")
+            || missing_resource.contains("not found")
+            || missing_resource.contains("ResourceNotFound")
+            || missing_resource.contains("compose-nested-resource"),
+        "the nested unknown resource must stay a handler-visible refusal: {missing_resource}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        2,
+        "the peer tool must still run when only the nested resource URI changes"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "an unknown nested resource URI must not invoke the peer resource"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_macro_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_and_state_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-macro-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the macro prompt compose HTTP server");
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_MACRO_COMPOSE_PROMPT_NAME,
+            HashMap::from([
+                ("value".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), PUBLIC_HTTP_TOOL_NAME.to_owned()),
+                ("resource".to_owned(), PUBLIC_HTTP_RESOURCE_URI.to_owned()),
+            ]),
+        ),
+    )
+    .expect("live bind_http async #[prompt] must compose a nested tool call and resource read");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text == "compose:tool:alpha|resource:deterministic"
+                }
+                _ => false,
+            }),
+        "async #[prompt] ctx.call_tool and ctx.read_resource must reach the live peer handlers: {composed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_MACRO_COMPOSE_PROMPT_NAME,
+            HashMap::from([
+                ("value".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+                ("resource".to_owned(), PUBLIC_HTTP_RESOURCE_URI.to_owned()),
+            ]),
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must refuse before the peer handlers run: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("Unknown tool")
+            || missing_tool.contains("not found")
+            || missing_tool.contains("MethodNotFound")
+            || missing_tool.contains("compose-nested-tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_macro_tool_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_and_state_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-macro-tool-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the macro tool compose HTTP server");
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_MACRO_COMPOSE_TOOL_NAME,
+            json!({
+                "value": "alpha",
+                "tool": PUBLIC_HTTP_TOOL_NAME,
+                "resource": PUBLIC_HTTP_RESOURCE_URI
+            }),
+        ),
+    )
+    .expect("live bind_http async #[tool] must compose a nested tool call and resource read");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "compose:tool:alpha|resource:deterministic"
+            }
+            _ => false,
+        }),
+        "async #[tool] ctx.call_tool and ctx.read_resource must reach the live peer handlers: {composed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_MACRO_COMPOSE_TOOL_NAME,
+            json!({
+                "value": "alpha",
+                "tool": "public-http-e2e-missing",
+                "resource": PUBLIC_HTTP_RESOURCE_URI
+            }),
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!(
+            "changing only the nested tool name must refuse before the peer handlers run: {result:?}"
+        ),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("Unknown tool")
+            || missing_tool.contains("not found")
+            || missing_tool.contains("MethodNotFound")
+            || missing_tool.contains("compose-nested-tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_macro_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_and_state_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-macro-resource-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the macro resource compose HTTP server");
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_MACRO_COMPOSE_RESOURCE_URI),
+    )
+    .expect("live bind_http async #[resource] must compose a nested tool call and resource read");
+    assert!(
+        matches!(
+            composed.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }]
+                if text == "compose:tool:alpha|resource:deterministic"
+        ),
+        "async #[resource] ctx.call_tool and ctx.read_resource must reach the live peer handlers: {composed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_MACRO_COMPOSE_MISSING_TOOL_RESOURCE_URI),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must refuse before the peer handlers run: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("Unknown tool")
+            || missing_tool.contains("not found")
+            || missing_tool.contains("MethodNotFound")
+            || missing_tool.contains("compose-nested-tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_and_state_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-resource-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the resource compose HTTP server");
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_RESOURCE_URI),
+    )
+    .expect("live bind_http resources/read must compose a nested tool call and resource read");
+    assert!(
+        matches!(
+            composed.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }]
+                if text == "compose:tool:alpha|resource:deterministic"
+        ),
+        "resource ctx.call_tool and ctx.read_resource must reach the live peer handlers: {composed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must refuse before the peer handlers run: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("Unknown tool")
+            || missing_tool.contains("not found")
+            || missing_tool.contains("MethodNotFound")
+            || missing_tool.contains("compose-nested-tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "an unknown nested tool name must not reach the peer resource"
+    );
+
+    let missing_resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_MISSING_RESOURCE_URI),
+    );
+    let missing_resource = match missing_resource {
+        Ok(result) => panic!(
+            "changing only the nested resource URI must refuse after the peer tool runs: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
     };
     assert!(
         missing_resource.contains("test://public-http-e2e/missing")
