@@ -1706,18 +1706,15 @@ impl ServerBuilder {
                 ProxyResourceTemplateCatalog::Final(resource_templates),
                 ProxyPromptCatalog::Final(prompts),
             ) => {
+                let has_tools = !tools.is_empty();
+                let has_resources = !resources.is_empty() || !resource_templates.is_empty();
+                let has_prompts = !prompts.is_empty();
                 for tool in tools {
-                    #[cfg(not(feature = "tasks"))]
+                    // Complete-only registration: a live echo/tool catalog must
+                    // not require the official Tasks client extension merely
+                    // because the upstream server advertises Tasks. The route
+                    // still installs `final_task_relay` for `tasks/*` controls.
                     let handler = ProxyToolHandler::from_final(tool, proxy_client.clone())?;
-                    #[cfg(feature = "tasks")]
-                    let handler = match task_relay.as_ref() {
-                        Some(task_relay) => ProxyToolHandler::from_final_with_task_relay(
-                            tool,
-                            proxy_client.clone(),
-                            Arc::clone(task_relay),
-                        )?,
-                        None => ProxyToolHandler::from_final(tool, proxy_client.clone())?,
-                    };
                     self.router
                         .add_final_tool_with_behavior(handler, self.on_duplicate)?;
                 }
@@ -1764,6 +1761,15 @@ impl ServerBuilder {
                             ),
                         );
                     }
+                }
+                if has_tools {
+                    self.advertise_legacy_tools_list_changed();
+                }
+                if has_resources {
+                    self.advertise_legacy_resource_subscriptions();
+                }
+                if has_prompts {
+                    self.advertise_legacy_prompts_list_changed();
                 }
             }
             _ => {

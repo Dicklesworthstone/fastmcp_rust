@@ -227,8 +227,12 @@ impl InboundRequestContext {
     }
 
     pub(crate) fn request_context(&self) -> McpContext {
+        // Anonymous modern HTTP POSTs are request-local. Give each one a
+        // fresh SessionState so disable_*/enable_* can mutate and publish
+        // list_changed to live subscriptions/listen streams without inventing
+        // a durable Mcp-Session-Id.
         self.state.clone().map_or_else(
-            || McpContext::new(self.cx.clone(), self.request_id),
+            || McpContext::with_state(self.cx.clone(), self.request_id, SessionState::new()),
             |state| McpContext::with_state(self.cx.clone(), self.request_id, state),
         )
     }

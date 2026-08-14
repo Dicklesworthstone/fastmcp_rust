@@ -40,7 +40,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
-use fastmcp_protocol::{Resource, ResourceContent, ResourceTemplate};
+use fastmcp_protocol::{FinalResourceTemplate, Resource, ResourceContent, ResourceTemplate};
 
 use crate::handler::{BoxFuture, ResourceHandler, UriParams};
 
@@ -1268,6 +1268,23 @@ impl ResourceHandler for FilesystemResourceHandler {
         })
     }
 
+    fn final_template_definition(&self) -> Option<FinalResourceTemplate> {
+        Some(FinalResourceTemplate {
+            uri_template: self.provider.uri_template(),
+            name: self
+                .provider
+                .prefix
+                .clone()
+                .unwrap_or_else(|| "files".to_string()),
+            title: None,
+            description: self.provider.description.clone(),
+            icons: None,
+            mime_type: None,
+            annotations: None,
+            meta: None,
+        })
+    }
+
     fn read_async<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -1383,7 +1400,6 @@ impl ResourceHandler for FilesystemResourceHandler {
 
         Ok(vec![resource_content])
     }
-
 }
 
 impl std::fmt::Debug for FilesystemResourceHandler {
