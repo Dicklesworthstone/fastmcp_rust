@@ -392,7 +392,8 @@ modern WebSocket (`WebSocketClient::open_subscriptions_listener`), and
 HTTP and WebSocket clients also expose typed `list_tools`/`call_tool`/
 `read_resource`/`get_prompt` verbs so callers do not have to decode a raw
 core result for ordinary catalog and invocation traffic. HTTP and WebSocket
-`list_tools_with_cancellation`/`call_tool_with_cancellation` honor a
+`list_tools_with_cancellation`/`call_tool_with_cancellation`/
+`read_resource_with_cancellation`/`get_prompt_with_cancellation` honor a
 caller-owned cancellation domain for those ordinary verbs.
 Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse` when the GET event
 stream and POST message endpoints are already known.
