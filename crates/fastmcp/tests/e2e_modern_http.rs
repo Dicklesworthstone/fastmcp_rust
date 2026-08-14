@@ -8104,6 +8104,110 @@ fn e2e_public_http_strict_input_validation_refuses_unknown_property_and_admits_d
     lenient_server.shutdown();
 }
 
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_official_tasks_create_get_and_cancel_on_bind_http() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_task_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-direct-tasks", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the official Tasks HTTP server");
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("live bind_http must create one official Task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the task-capable live tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let input_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    let mut next_id = 3_i64;
+    let observed = loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(&cx, RequestId::Number(next_id), task_id.clone(), 1 << 20),
+        )
+        .expect("live bind_http must serve tasks/get of the created Task");
+        next_id = next_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::InputRequired { .. }) {
+            break observed;
+        }
+        if Instant::now() >= input_deadline {
+            panic!("live bind_http must observe the created input_required Task: {observed:?}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "tasks/get must return the created Task: {observed:?}"
+    );
+
+    let missing = FinalTaskId::parse("missing-direct-task")
+        .expect("the planted-missing task id is a valid official TaskId");
+    let missing_get = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(next_id), missing.clone(), 1 << 20),
+    )
+    .expect_err("changing only the task id must not invent a Task");
+    let _ = missing_get;
+    next_id += 1;
+
+    let missing_cancel = runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(next_id), missing, 1 << 20),
+    )
+    .expect_err("changing only the task id must not invent a cancellation");
+    let _ = missing_cancel;
+    next_id += 1;
+
+    runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(next_id), task_id.clone(), 1 << 20),
+    )
+    .expect("live bind_http must serve tasks/cancel of the created Task");
+    next_id += 1;
+
+    let cancel_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let observed = runtime_block_on_bounded(
+            &cx,
+            client.get_task(&cx, RequestId::Number(next_id), task_id.clone(), 1 << 20),
+        )
+        .expect("live bind_http must keep serving tasks/get after cancel");
+        next_id = next_id
+            .checked_add(1)
+            .expect("the official Tasks request id space does not overflow");
+        if matches!(observed.task, FinalTask::Cancelled(_)) {
+            break;
+        }
+        if Instant::now() >= cancel_deadline {
+            panic!("live bind_http must observe the cancelled Task: {observed:?}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    drop(client);
+    server.shutdown();
+}
+
 fn spawn_modern_cache_http_server() -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let tool_calls = Arc::clone(&handler_calls);
