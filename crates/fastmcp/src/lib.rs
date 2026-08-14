@@ -2745,6 +2745,34 @@ pub mod modern {
             }
         }
 
+        /// Calls one tool and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        ///
+        /// Drain those frames with [`Self::take_progress_notifications`].
+        pub async fn call_tool_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalCallToolResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .call_tool_with_progress_marker(cx, name, arguments, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern WebSocket client received a non-final tools/call result",
+                )),
+            }
+        }
+
         /// Calls one tool and retains either a complete result or a live
         /// `input_required` branch on this modern WebSocket session.
         pub async fn call_tool_result(
@@ -3209,6 +3237,29 @@ pub mod modern {
             arguments: JsonValue,
         ) -> McpResult<FinalCallToolResult> {
             self.inner.call_tool_final(name, arguments)
+        }
+
+        /// Calls one tool and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        ///
+        /// Drain those frames with [`Self::take_progress_notifications`].
+        pub fn call_tool_with_progress_marker(
+            &mut self,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalCallToolResult> {
+            match self
+                .inner
+                .call_tool_with_progress_marker(name, arguments, progress_marker)?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final tools/call result",
+                )),
+            }
         }
 
         /// Calls one tool under a request-local cancellation domain.
@@ -3832,6 +3883,29 @@ pub mod modern {
             }
         }
 
+        /// Calls one tool and admits request-scoped `notifications/progress`
+        /// for the supplied progress marker.
+        ///
+        /// Drain those frames with [`Self::take_progress_notifications`].
+        pub async fn call_tool_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: ProgressMarker,
+        ) -> Result<FinalCallToolResult, HttpClientError> {
+            match self
+                .inner
+                .call_tool_with_progress_marker(cx, name, arguments, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsCall { result, .. },
+                ) => Ok(result.payload),
+                _ => Err(unexpected_modern_http_result("tools/call")),
+            }
+        }
+
         /// Lists one page of tools under a caller-owned cancellation domain.
         pub async fn list_tools_with_cancellation(
             &mut self,
@@ -3965,6 +4039,37 @@ pub mod modern {
         /// Stores modern request `logLevel` metadata; never sends `logging/setLevel`.
         pub fn set_log_level(&mut self, level: LoggingLevel) -> Result<(), HttpClientError> {
             self.inner.set_log_level_typed(level)
+        }
+
+        /// Returns the modern request `logLevel` stored by [`Self::set_log_level`].
+        #[must_use]
+        pub fn log_level(&self) -> Option<LoggingLevel> {
+            self.inner.log_level()
+        }
+
+        /// Drains exact final progress notifications received on request-owned
+        /// modern HTTP SSE bodies.
+        #[must_use]
+        pub fn take_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
+            self.inner.take_final_progress_notifications()
+        }
+
+        /// Drains admitted final server notifications received on request-owned
+        /// modern HTTP SSE bodies.
+        ///
+        /// Progress is kept in a distinct typed queue so exact JSON number
+        /// lexemes survive. Reconstituting [`ServerNotification::Progress`]
+        /// here gives facade callers one exhaustive surface.
+        #[must_use]
+        pub fn take_server_notifications(&mut self) -> Vec<ServerNotification> {
+            let mut notifications = self.inner.take_final_server_notifications();
+            notifications.extend(
+                self.inner
+                    .take_final_progress_notifications()
+                    .into_iter()
+                    .map(ServerNotification::Progress),
+            );
+            notifications
         }
 
         /// Lists one exact final page of tools through the policy-bound HTTP client.
@@ -8497,6 +8602,14 @@ mod tests {
                 let _ = client
                     .list_tools_with_cancellation(cx, cancellation, None)
                     .await?;
+                let _ = client
+                    .call_tool_with_progress_marker(
+                        cx,
+                        "example",
+                        serde_json::json!({}),
+                        modern::ProgressMarker::from("ws-progress"),
+                    )
+                    .await?;
                 client
                     .call_tool_with_cancellation(cx, cancellation, "example", serde_json::json!({}))
                     .await
@@ -8509,6 +8622,13 @@ mod tests {
         let _: for<'a> fn(
             &'a mut modern::Client,
         ) -> modern::McpResult<&'a modern::ServerDiscoverResult> = modern::Client::server_discovery;
+        let _: fn(
+            &mut modern::Client,
+            &str,
+            serde_json::Value,
+            modern::ProgressMarker,
+        ) -> modern::McpResult<modern::FinalCallToolResult> =
+            modern::Client::call_tool_with_progress_marker;
         let _: fn(&mut modern::Client) -> Vec<modern::FinalProgressNotificationParams> =
             modern::Client::take_progress_notifications;
         let _: fn(&mut modern::Client) -> Vec<modern::ServerNotification> =
@@ -8732,6 +8852,10 @@ mod tests {
             Ok(event)
         }
 
+        let _: fn(&mut modern::HttpClient) -> Vec<modern::ServerNotification> =
+            modern::HttpClient::take_server_notifications;
+        let _: fn(&mut modern::HttpClient) -> Vec<modern::FinalProgressNotificationParams> =
+            modern::HttpClient::take_progress_notifications;
         let _ = modern::HttpClient::connect;
         let _ = bind_modern_http;
         let _ = serve_modern_http;

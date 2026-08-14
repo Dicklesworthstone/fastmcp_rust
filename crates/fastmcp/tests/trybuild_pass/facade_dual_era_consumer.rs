@@ -711,6 +711,9 @@ fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::ping;
     let _ = modern::HttpClient::ping_with_cancellation;
     let _ = modern::HttpClient::set_log_level;
+    let _ = modern::HttpClient::take_server_notifications;
+    let _ = modern::HttpClient::take_progress_notifications;
+    let _ = modern::HttpClient::call_tool_with_progress_marker;
     let _ = modern::HttpClient::list_tools_with_cancellation;
     let _ = modern::HttpClient::list_resources_with_cancellation;
     let _ = modern::HttpClient::list_resource_templates_with_cancellation;
@@ -796,6 +799,7 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
     let _: fn(&mut modern::Client, &str) -> modern::McpResult<modern::FinalReadResourceResult> =
         modern::Client::read_resource;
     let _ = modern::Client::call_tool_result;
+    let _ = modern::Client::call_tool_with_progress_marker;
     let _ = modern::Client::read_resource_result;
     let _ = modern::Client::get_prompt_result;
     let _ = modern::Client::ping;
