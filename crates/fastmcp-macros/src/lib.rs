@@ -2328,6 +2328,20 @@ fn generate_final_resource_result_conversion(output: &syn::ReturnType) -> Option
     }
 }
 
+/// Marks a final `#[resource]` expansion as the author of its cache hints.
+fn explicit_final_resource_cache_hint_methods() -> TokenStream2 {
+    let server = handler_crate_paths()
+        .map(|paths| paths.server)
+        .unwrap_or_else(|_| quote!(::fastmcp_server));
+    quote! {
+        fn final_resource_read_cache_hint_provenance(
+            &self,
+        ) -> #server::FinalResourceReadCacheHintProvenance {
+            #server::FinalResourceReadCacheHintProvenance::Explicit
+        }
+    }
+}
+
 /// Converts a resource's complete-or-input-required final algebra without
 /// projecting it through the legacy resource result surface.
 fn generate_final_resource_outcome_conversion(output: &syn::ReturnType) -> Option<TokenStream2> {
@@ -2445,6 +2459,12 @@ fn generate_resource_execution_methods(
                 conversion,
             )
         });
+    let explicit_cache_hints =
+        if final_result_conversion.is_some() || final_outcome_conversion.is_some() {
+            explicit_final_resource_cache_hint_methods()
+        } else {
+            TokenStream2::new()
+        };
     if !is_async {
         let final_method = final_result_conversion.map_or_else(TokenStream2::new, |conversion| {
             quote! {
@@ -2522,6 +2542,7 @@ fn generate_resource_execution_methods(
         };
         return quote! {
             #legacy_methods
+            #explicit_cache_hints
             #final_method
             #final_outcome_method
             #modern_request_methods
@@ -2636,6 +2657,7 @@ fn generate_resource_execution_methods(
 
     quote! {
         #legacy_methods
+        #explicit_cache_hints
         #final_method
         #final_outcome_method
         #modern_request_methods
@@ -2798,6 +2820,10 @@ mod async_handler_expansion_tests {
         );
         assert!(
             resource.contains("fn read_final_async_with_uri_in_request"),
+            "{resource}"
+        );
+        assert!(
+            resource.contains("FinalResourceReadCacheHintProvenance :: Explicit"),
             "{resource}"
         );
 
@@ -3164,6 +3190,10 @@ mod async_handler_expansion_tests {
         assert!(resource_final_hook.contains("FinalReadResourceResult"));
         assert!(resource_final_hook.contains("uri_params . get"));
         assert!(resource_final_hook.contains("segment"));
+        assert!(
+            resource_tokens.contains("FinalResourceReadCacheHintProvenance :: Explicit"),
+            "{resource_tokens}"
+        );
         assert!(resource_final_hook.contains("Ok (result)"));
         assert!(!resource_final_hook.contains("payload"));
         assert!(!resource_final_hook.contains("contents . into_iter"));
@@ -3600,11 +3630,14 @@ fn generate_resource_mrtr_outcome_methods(
             Err(error) => fastmcp_core::Outcome::Err(error),
         }
     };
+    let explicit_cache_hints = explicit_final_resource_cache_hint_methods();
 
     quote! {
         fn declares_final_mrtr(&self) -> bool {
             true
         }
+
+        #explicit_cache_hints
 
         fn read_final_outcome_async_with_uri_in_request<'a>(
             &'a self,
@@ -4200,6 +4233,10 @@ mod mrtr_resume_expansion_tests {
         );
         assert!(
             resource.contains("fn declares_final_mrtr (& self) -> bool { true }"),
+            "{resource}"
+        );
+        assert!(
+            resource.contains("FinalResourceReadCacheHintProvenance :: Explicit"),
             "{resource}"
         );
 
