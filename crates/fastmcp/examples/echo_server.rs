@@ -46,6 +46,38 @@ fn echo(ctx: &McpContext, message: String) -> String {
     message
 }
 
+/// Publishes `notifications/resources/updated` for the shipped server info resource.
+#[tool]
+fn touch_server_info(ctx: &McpContext) -> String {
+    if ctx.notify_resource_updated("info://server") {
+        "notified".to_owned()
+    } else {
+        "silent".to_owned()
+    }
+}
+
+/// Disables the shipped echo tool and publishes `notifications/tools/list_changed`.
+#[tool]
+fn hide_echo(ctx: &McpContext) -> String {
+    if ctx.disable_tool("echo") {
+        "hidden".to_owned()
+    } else {
+        "silent".to_owned()
+    }
+}
+
+/// Disables a shipped resource and prompt and publishes both list_changed events.
+#[tool]
+fn hide_catalog(ctx: &McpContext) -> String {
+    let resource = ctx.disable_resource("info://server");
+    let prompt = ctx.disable_prompt("greeting");
+    if resource && prompt {
+        "hidden".to_owned()
+    } else {
+        "silent".to_owned()
+    }
+}
+
 /// Add two numbers together.
 #[tool(description = "Calculate the sum of two numbers")]
 fn add(_ctx: &McpContext, a: i64, b: i64) -> String {
@@ -81,7 +113,8 @@ async fn client_root_uri(ctx: &McpContext) -> McpResult<String> {
 
 /// Returns server information.
 #[resource(uri = "info://server")]
-fn server_info(_ctx: &McpContext) -> String {
+fn server_info(ctx: &McpContext) -> String {
+    ctx.report_progress(1.0, Some("info"));
     r#"{
     "name": "echo-server",
     "version": "1.0.0",
@@ -184,7 +217,8 @@ fn mrtr_resource(
 
 /// A simple greeting prompt.
 #[prompt(description = "Generate a friendly greeting")]
-fn greeting(_ctx: &McpContext, name: String) -> Vec<PromptMessage> {
+fn greeting(ctx: &McpContext, name: String) -> Vec<PromptMessage> {
+    ctx.report_progress(1.0, Some("greeted"));
     vec![PromptMessage {
         role: Role::User,
         content: Content::Text {
@@ -291,7 +325,7 @@ impl CompletionHandler for GreetingCompletion {
 
     fn complete_final(
         &self,
-        _ctx: &McpContext,
+        ctx: &McpContext,
         params: FinalCompletionParams,
     ) -> McpResult<FinalCompletionValues> {
         let call_count = GREETING_COMPLETION_CALLS.fetch_add(1, Ordering::SeqCst) + 1;
@@ -314,6 +348,7 @@ impl CompletionHandler for GreetingCompletion {
             ));
         }
 
+        ctx.report_progress(0.5, Some("stdio-completion-halfway"));
         Ok(FinalCompletionValues {
             values: vec![format!("stdio-completion-{call_count}")],
             total: Some(JsonInteger::from(
@@ -443,7 +478,8 @@ async fn run_tasks_stdio(
 
     let mut stdio = cx
         .spawn_blocking(move |stdio_cx| {
-            server.run_transport_returning_with_cx(&stdio_cx, StdioTransport::stdio())
+            let (recv_half, send_half) = StdioTransport::stdio().into_split();
+            server.run_split_transport_returning_with_cx(&stdio_cx, recv_half, send_half)
         })
         .map_err(|error| {
             McpError::internal_error(format!("stdio service admission failed: {error}"))
@@ -474,7 +510,8 @@ async fn run_tasks_stdio(
 async fn run_stdio(server: fastmcp_server::Server, cx: &Cx) -> McpResult<()> {
     let mut stdio = cx
         .spawn_blocking(move |stdio_cx| {
-            server.run_transport_returning_with_cx(&stdio_cx, StdioTransport::stdio())
+            let (recv_half, send_half) = StdioTransport::stdio().into_split();
+            server.run_split_transport_returning_with_cx(&stdio_cx, recv_half, send_half)
         })
         .map_err(|error| {
             McpError::internal_error(format!("stdio service admission failed: {error}"))
@@ -503,6 +540,9 @@ fn main() {
     let server = ServerBuilder::new("echo-server", "1.0.0")
         // Register tools
         .tool(Echo)
+        .tool(TouchServerInfo)
+        .tool(HideEcho)
+        .tool(HideCatalog)
         .tool(Add)
         .tool(Reverse)
         .tool(CountWords)
