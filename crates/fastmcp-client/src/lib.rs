@@ -10256,6 +10256,10 @@ impl HttpClient {
         server: Vec<ServerNotification>,
         progress: Vec<FinalProgressNotificationParams>,
     ) {
+        for notification in &server {
+            self.final_result_cache
+                .invalidate_notification(notification);
+        }
         self.final_server_notifications.extend(server);
         self.final_progress_notifications.extend(progress);
     }
@@ -17533,9 +17537,8 @@ impl Client {
         progress_marker: ProgressMarker,
     ) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
-        let token = serde_json::to_value(progress_marker).map_err(|_| {
-            McpError::internal_error("stdio progress token could not be encoded")
-        })?;
+        let token = serde_json::to_value(progress_marker)
+            .map_err(|_| McpError::internal_error("stdio progress token could not be encoded"))?;
         let mut parameters = match self.session.selected_era() {
             Some(ProtocolEra::Modern2026) => serde_json::to_value(params).map_err(|_| {
                 McpError::internal_error("stdio modern completion parameters could not serialize")

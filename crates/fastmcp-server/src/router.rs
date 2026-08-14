@@ -4232,12 +4232,16 @@ impl Router {
     ) -> McpResult<serde_json::Value> {
         #[cfg(feature = "tasks")]
         let request_metadata = params.meta.clone();
+        let session_state = request_ctx
+            .session_state()
+            .cloned()
+            .unwrap_or_else(SessionState::new);
         let outcome = self
             .handle_tools_call_final_in_request(
                 request_ctx,
                 request_cx,
                 params,
-                SessionState::new(),
+                session_state,
                 None,
                 None,
                 resume_inputs.as_ref(),
@@ -4298,12 +4302,16 @@ impl Router {
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
+        let session_state = request_ctx
+            .session_state()
+            .cloned()
+            .unwrap_or_else(SessionState::new);
         match self
             .handle_resources_read_final_in_request(
                 request_ctx,
                 request_cx,
                 params,
-                SessionState::new(),
+                session_state,
                 None,
                 None,
                 resume_inputs.as_ref(),
@@ -4336,12 +4344,16 @@ impl Router {
         resume_inputs: Option<MrtrCompletedInputs>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
+        let session_state = request_ctx
+            .session_state()
+            .cloned()
+            .unwrap_or_else(SessionState::new);
         match self
             .handle_prompts_get_final_in_request(
                 request_ctx,
                 request_cx,
                 params,
-                SessionState::new(),
+                session_state,
                 None,
                 None,
                 resume_inputs.as_ref(),
@@ -20093,6 +20105,75 @@ mod router_tests {
         assert!(legacy_resources.resources.is_empty());
         assert!(legacy_templates.resource_templates.is_empty());
         assert!(legacy_prompts.prompts.is_empty());
+
+        let later_inbound = InboundRequestContext::with_modern_connection(
+            request_ctx.cx().clone(),
+            630,
+            InboundRequestTransport::Stdio,
+            &connection,
+        );
+        let later_ctx = later_inbound.request_context();
+        let read_error = router
+            .dispatch_stateless(
+                &later_ctx,
+                &JsonRpcRequest::new(
+                    "resources/read",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "uri": "file:///connection-scoped-resource",
+                    })),
+                    631_i64,
+                ),
+            )
+            .expect_err(
+                "a later inbound on the same modern connection must refuse the disabled resource",
+            );
+        assert_eq!(read_error.code, McpErrorCode::ResourceNotFound);
+        assert!(
+            read_error.message.contains("disabled"),
+            "the refused resource read must keep the session-disabled message: {read_error:?}"
+        );
+        let prompt_error = router
+            .dispatch_stateless(
+                &later_ctx,
+                &JsonRpcRequest::new(
+                    "prompts/get",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "name": "connection-scoped-prompt",
+                    })),
+                    632_i64,
+                ),
+            )
+            .expect_err(
+                "a later inbound on the same modern connection must refuse the disabled prompt",
+            );
+        assert_eq!(prompt_error.code, McpErrorCode::PromptNotFound);
+        assert!(
+            prompt_error.message.contains("disabled"),
+            "the refused prompt get must keep the session-disabled message: {prompt_error:?}"
+        );
+        let tool_error = router
+            .dispatch_stateless(
+                &later_ctx,
+                &JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "_meta": metadata,
+                        "name": "connection-scoped-tool",
+                        "arguments": {},
+                    })),
+                    633_i64,
+                ),
+            )
+            .expect_err(
+                "a later inbound on the same modern connection must refuse the disabled tool",
+            );
+        assert_eq!(tool_error.code, McpErrorCode::MethodNotFound);
+        assert!(
+            tool_error.message.contains("disabled"),
+            "the refused tool call must keep the session-disabled message: {tool_error:?}"
+        );
     }
 
     #[test]
