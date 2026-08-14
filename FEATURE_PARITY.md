@@ -88,7 +88,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 |---------|--------|------|-------|
 | Basic server creation | ✅ | ✅ | `Server::new()` |
 | Server builder pattern | ✅ | ✅ | `ServerBuilder` with fluent API |
-| Name/version/instructions | ✅ | ✅ | All configured via builder |
+| Name/version/instructions | ✅ | ✅ | All configured via builder. Live `bind_http` `server_discovery().instructions()` retains the configured string; a peer without instructions stays bare |
 | Stdio transport | ✅ | ✅ | NDJSON implementation present |
 | SSE transport | ✅ | ✅ | `run_sse()` with `SseServerTransport` |
 | WebSocket transport | ✅ | ✅ | `run_websocket()` with `WsTransport` and caller-provided reader/writer integration |
@@ -96,9 +96,9 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | **Streamable HTTP transport** | ✅ | 🟡 | `StreamableHttpTransport` and public modern/legacy HTTP paths exist; aggregate protocol qualification remains unverified |
 | Server request timeout/budget | ✅ | 🟡 | Server dispatch uses asupersync `Budget`; request-owned child-context isolation and end-to-end cleanup qualification remain open (FND-04) |
 | Cancellation behavior | 🟡 | 🟡 | Unix stdio keeps receiving while a bounded worker dispatches and can route a live cancellation; non-Unix stdio and custom/SSE/WebSocket paths retain sequential/blocking boundaries, and request-owned child `Cx` isolation plus cleanup qualification remain open |
-| HTTP multi-client isolation | ✅ | 🟡 | The unsafe shared-Session listener is quarantined and unreachable. Current public HTTP routing separates modern MCP 2026-07-28 admission from exact MCP 2024-11-05 lifecycle handling; aggregate multi-client and request-execution qualification remains unverified |
-| Lifecycle hooks (lifespan) | ✅ | ✅ | `on_startup()` / `on_shutdown()` |
-| Ping/health check | ✅ | ✅ | `ping` method handled |
+| HTTP multi-client isolation | ✅ | 🟡 | The unsafe shared-Session listener is quarantined and unreachable. Live `bind_http` two independent ModernOnly clients each invoke the same tool with distinct arguments and both handler results are retained. Aggregate request-execution qualification remains unverified |
+| Lifecycle hooks (lifespan) | ✅ | ✅ | `on_startup()` / `on_shutdown()`. Live `bind_http` public facade hooks run once: startup before traffic, shutdown on cooperative drain; a peer without hooks stays unhooked |
+| Ping/health check | ✅ | ✅ | `ping` method handled. Live `bind_http` answers `ping` without invoking a tools/call handler, then admits a later `tools/call` |
 | Statistics collection | ❌ | ✅ | `ServerStats` with snapshots |
 | Console/banner rendering | ❌ | ✅ | `fastmcp-console` crate |
 
@@ -127,7 +127,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `@prompt` / `#[prompt]` | ✅ | 🟡 | Macro implementation exists; modern request-owned dispatch and exact-2024 session dispatch both drive `get_async_in_request`. The session path still `block_on`s that request-owned future |
 | Auto JSON schema | ✅ | ✅ | `#[derive(JsonSchema)]` + inline generation |
 | Description from docstrings | ✅ | ✅ | Doc comments → descriptions |
-| Default parameter values | ✅ | ✅ | Implemented via `defaults(...)` on `#[tool]`/`#[prompt]` (e.g. `#[tool(defaults(foo = 123, bar = \"baz\"))]`) |
+| Default parameter values | ✅ | ✅ | Implemented via `defaults(...)` on `#[tool]`/`#[prompt]`. Live `bind_http` a generated default is advertised, injected when omitted, overridable, and a missing required sibling argument is refused |
 | name/description override | ✅ | ✅ | Attribute parameters supported |
 
 ### Historical macro gap-closure inventory
@@ -136,7 +136,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 |---------|--------|------|-------|
 | **Icons** | ✅ | ✅ | `#[tool]`, `#[resource]`, and `#[prompt]` accept `icon = "..."` (URL or data URI) |
 | **Tags** | ✅ | ✅ | Supported for filtering in router.rs |
-| **Output schema** | ✅ | ✅ | Tool output schema in macros, handler.rs |
+| **Output schema** | ✅ | ✅ | Tool output schema in macros, handler.rs. Live `bind_http` `tools/list` retains `outputSchema` and `tools/call` retains matching `structuredContent`; a peer without an output schema stays bare |
 | **Tool annotations** | ✅ | ✅ | MCP annotations in types.rs, handler.rs |
 | **Timeout per handler** | ✅ | ✅ | Handler timeout surface exists. Live `bind_http` a 10ms tool timeout refuses a late `tools/call` and still admits a near-identical fast peer tool. Panic-boundary hardening remains unit-proven, not a live hang-tool e2e |
 
@@ -174,7 +174,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `resources/unsubscribe` | ✅ | ✅ | Protocol support |
 | `prompts/list` | ✅ | ✅ | With cursor pagination |
 | `prompts/get` | ✅ | ✅ | With argument support |
-| `completion/complete` | ✅ | ✅ | Session and stateless dispatch serve a registered handler; both `completion_handler()` and `legacy_completion_handler()` advertise `capabilities.completions` on initialize. Final discover still requires a modern provider |
+| `completion/complete` | ✅ | ✅ | Session and stateless dispatch serve a registered handler; both `completion_handler()` and `legacy_completion_handler()` advertise `capabilities.completions` on initialize. Live `bind_http` discovery advertises `completions` only when a handler is installed; `completion/complete` retains provider values, a missing required prompt argument is refused, and a peer without a handler omits the capability and refuses complete |
 | `logging/setLevel` | ✅ | ✅ | Exact-2024 sends `logging/setLevel`. Modern stdio, HTTP, and WebSocket `set_log_level` store `io.modelcontextprotocol/logLevel` on later requests and never send the removed final RPC |
 | `notifications/cancelled` | ✅ | 🟡 | Stdio can receive and route the notification while its dispatch worker runs. Custom/SSE/WebSocket loops remain sequential; end-to-end interruption, request ownership, and reliable `awaitCleanup` remain unverified |
 | `notifications/progress` | ✅ | ✅ | Progress token support |
@@ -267,7 +267,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Region ID access | ❌ | ✅ | `region_id()` (Rust-only) |
 | Task ID access | ❌ | ✅ | `task_id()` (Rust-only) |
 | Masked critical sections | ❌ | ✅ | `masked()` (Rust-only) |
-| Session state | ✅ | ✅ | `get_state()` / `set_state()` / `remove_state()` |
+| Session state | ✅ | ✅ | `get_state()` / `set_state()` / `remove_state()`. Live modern `bind_http` writes and reads on the same POST; a later POST does not reuse that request-local bag |
 | Auth context | ✅ | ✅ | `auth()` / `set_auth()` |
 | Parallel combinators | ❌ | ✅ | `join_all()`, `race()`, `quorum()`, `first_ok()` |
 | Sampling from handler | ✅ | 🟡 | Exact-2024 `ctx.sample()` / `ctx.sample_with_request()` use reverse JSON-RPC on stdio. Modern handlers use `ctx.final_sampling` → `input_required`; public HTTP/WebSocket `call_tool` and public stdio `call_tool` / `read_resource` / `get_prompt` fulfill installed sampling handlers locally. Custom-loop qualification remains open |
@@ -278,9 +278,9 @@ The following bidirectional building blocks exist in source. This inventory does
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Resource reading from handler** | ✅ | ✅ | `ctx.read_resource()` in context.rs |
-| **Tool calling from handler** | ✅ | ✅ | `ctx.call_tool()` in context.rs |
-| **MCP capabilities access** | ✅ | ✅ | `ctx.client_capabilities()`, `ctx.server_capabilities()` |
+| **Resource reading from handler** | ✅ | ✅ | `ctx.read_resource()` in context.rs. Live `bind_http` compose reads the peer resource through the request-owned reader |
+| **Tool calling from handler** | ✅ | ✅ | `ctx.call_tool()` in context.rs. Live `bind_http` compose calls the peer tool through the request-owned caller |
+| **MCP capabilities access** | ✅ | ✅ | `ctx.client_capabilities()`, `ctx.server_capabilities()`. Live `bind_http` attaches the advertised server slice on every request; a default client sees `sampling=false;roots=false;tools=true;resources=true` on a resource-bearing server, advertising only sampling+roots flips those client flags, and omitting the resource registration clears only `resources` |
 
 ---
 
@@ -289,8 +289,8 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | AuthProvider base trait | ✅ | ✅ | `AuthProvider` trait |
-| Token verification | ✅ | 🟡 | `TokenVerifier` extension surface exists and provider failures are sanitized at the framework boundary. Live `bind_http` native admission refuses a missing `Authorization` header and a near-identical wrong bearer token with HTTP 401 `WWW-Authenticate: Bearer` before the handler runs; the matching bearer commits the verifier subject into `ctx.auth()`. Raw `AccessToken` custody and aggregate transport/auth promotion remain open |
-| Static token verifier | ✅ | 🟡 | Configuration now rejects empty, malformed, duplicate, or unbounded tokens/schemes. Live `bind_http` `StaticTokenVerifier` plus `TokenAuthProvider` admits `Bearer alpha` and refuses missing/wrong tokens before dispatch. Raw `AccessToken` custody remains a promotion gate |
+| Token verification | ✅ | 🟡 | `TokenVerifier` extension surface exists and provider failures are sanitized at the framework boundary. Live `bind_http` native admission refuses a missing `Authorization` header and a near-identical wrong bearer token with HTTP 401 `WWW-Authenticate: Bearer` before the handler runs; the matching bearer commits the verifier subject into `ctx.auth()`. Live `bind_http` a custom `TokenVerifier` (not `StaticTokenVerifier`) admits `Bearer gamma` and commits its own subject, while missing/wrong tokens stay HTTP 401. Raw `AccessToken` custody and aggregate transport/auth promotion remain open |
+| Static token verifier | ✅ | 🟡 | Configuration now rejects empty, malformed, duplicate, or unbounded tokens/schemes. Live `bind_http` `StaticTokenVerifier` plus `TokenAuthProvider` admits `Bearer alpha` and refuses missing/wrong tokens before dispatch. Live `bind_http` a custom verifier that is not static still uses the same native 401 challenge. Raw `AccessToken` custody remains a promotion gate |
 | JWT support | ✅ | 🚧 | No public production JWT verifier is promoted by FND-01; `jsonwebtoken` and the old `jwt` feature are absent from the default graph |
 | Access token handling | ✅ | 🟡 | Native authorization uses strict scheme/token68 grammar; malformed, multiple, or mixed credential locations fail closed and provider error payloads are sanitized. Live `bind_http` challenges missing and wrong bearer credentials with HTTP 401 before dispatch and commits the matching subject into `ctx.auth()`. JSON-RPC fields remain a stripped legacy fallback, and raw `AccessToken` strings remain a custody promotion gate |
 | **OAuth 2.0/2.1 server code** | ✅ | 🚧 | Public `oauth.rs` building blocks are present for development; production security/profile conformance remains unverified and quarantined from support claims |
@@ -396,7 +396,7 @@ The following bidirectional building blocks exist in source. This inventory does
 |---------|--------|------|-------|
 | **Docket (distributed tasks)** | ✅ | 🚧 | Historical/test-only task-manager source remains; official in-process Tasks RPC is served by default, while Redis Docket is gated by TASKR-01 and absent from the default FND-01 graph |
 | **EventStore** | ✅ | ✅ | `event_store.rs` - SSE resumability with TTL |
-| **Rich content types** | ✅ | ✅ | `Content` supports `audio` and includes helpers: `Content::{text,image_base64,image_bytes,audio_base64,audio_bytes,resource_text,resource_blob_base64,resource_blob_bytes}` |
+| **Rich content types** | ✅ | ✅ | `Content` supports `audio` and includes helpers: `Content::{text,image_base64,image_bytes,audio_base64,audio_bytes,resource_text,resource_blob_base64,resource_blob_bytes}`. Live `bind_http` `tools/call` retains authored image and audio blocks; a text-only peer stays text-only |
 
 ---
 
@@ -413,7 +413,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 5. ✅ **CLI commands** - dev, test, and tasks command paths are present; this is not an end-to-end verification claim
 6. 🟡 **FilesystemProvider** - Public construction and live `bind_http` list+read work on Linux/macOS, including through a prefixed `as_proxy_typed` gateway that keeps the exact `file:///` template; other targets remain fail-closed
 7. ✅ **Auto-initialize** - Client auto-initialization (client/builder.rs)
-8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs)
+8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs). Live `bind_http` a handler `ctx.call_tool_text` plus `ctx.read_resource_text` returns `compose:tool:alpha|resource:deterministic`; a near-identical unknown nested tool or resource is refused without invoking the missing peer
 9. ✅ **Capabilities access** - ctx.client_capabilities(), ctx.server_capabilities() (context.rs)
 10. ✅ **Per-handler timeout** - Handler-level configuration exists and both modern and exact-2024 session dispatch now enforce it through `run_handler_in_request`. Live `bind_http` refuses a late tool and still admits a fast peer; panic-boundary hardening remains unit-proven
 11. ✅ **Output schema** - Tool output schema support (macros, handler.rs)
