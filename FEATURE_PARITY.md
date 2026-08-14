@@ -113,7 +113,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | **Error masking** | ✅ | ✅ | `mask_error_details` in builder.rs |
 | **Strict input validation** | ✅ | ✅ | `strict_input_validation` in router.rs |
 | **Duplicate handling** | ✅ | ✅ | `on_duplicate` in builder.rs |
-| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete`. Live `bind_http` `as_proxy_typed("ext", …)` prefixes tools/prompts as `ext/...`, keeps exact-final resource URIs and RFC 6570 templates unprefixed, and forwards `tools/call`, `prompts/get`, `resources/read` (including a matched template URI and a live FilesystemProvider file URI), and `completion/complete`. A near-identical unmatched template path stays `InvalidParams` before the upstream handler. Prefixed `as_proxy_typed` now installs the same route-bound official Tasks relay as `proxy_typed` (complete-only tools stay unwrapped; `tasks/*` forwards) instead of the disconnected default in-memory store. `as_proxy(prefix, Client)` remains the stdio-client path; `as_proxy_typed` keeps the live ModernHttp binding |
+| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete`. Live `bind_http` `as_proxy_typed("ext", …)` prefixes tools/prompts as `ext/...`, keeps exact-final resource URIs and RFC 6570 templates unprefixed, and forwards `tools/call`, `prompts/get`, `resources/read` (including a matched template URI and a live FilesystemProvider file URI), and `completion/complete`. A near-identical unmatched template path stays `InvalidParams` before the upstream handler. Prefixed `as_proxy_typed` installs the same route-bound official Tasks relay as `proxy_typed` (complete-only tools stay unwrapped; `tasks/*` forwards) instead of the disconnected default in-memory store. Live official Tasks through that relay: `tasks/get` of an upstream-created Task, `tasks/update` of its `input_required` snapshot (a near-identical wrong-kind roots payload is refused and leaves the Task in place), and `tasks/cancel` of the resumed Task. A near-identical missing id stays an error for `tasks/get` and `tasks/cancel`. Live `as_proxy("ext", stdio Client)` against the shipped echo server binds HTTP, prefixes tools/prompts as `ext/echo` and `ext/greeting`, forwards `tools/call`, `prompts/get`, `completion/complete` of `ext/greeting` (rewritten to upstream `greeting`), and `resources/read` of unprefixed `info://server`, and refuses the unprefixed tool/prompt/completion names. Live `ext/hide_echo` forwards the session-local disable: the gateway snapshot still lists `ext/echo`, a later `ext/echo` is a `Method not found` tool error, and `ext/add` still returns `5`. Live official Tasks on that same stdio client: `tasks/get` of its `input_required` snapshot, `tasks/update` with matching roots, and `tasks/cancel` of the resumed Task; a near-identical missing id stays an error. `as_proxy_typed` keeps the live ModernHttp binding |
 | **mount() composition** | ✅ | ✅ | Implemented in builder.rs, router.rs. Public Auto/modern facades `mount()` prefix tools/prompts and keep exact resource URIs so they stay on the modern catalog. Live `bind_http` `mount(child, Some("child"))` lists `child/...` tools/prompts and reads the original resource URI. Live `mount()` of a FilesystemProvider child keeps `file:///{prefix}/{+path}` exact, expands a matching file URI, and refuses an unmatched prefix before the child handler. Legacy `mount()` still prefixes every key. `mount_tools` / `mount_resources` / `mount_prompts` remain available |
 
 ---
@@ -189,10 +189,10 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
 | `tasks/list` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
-| `tasks/get` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
-| `tasks/update` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
+| `tasks/get` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store. Live `as_proxy_typed("ext", …)` and live `as_proxy("ext", stdio Client)` forward `tasks/get` of an upstream-created Task and refuse a near-identical missing id |
+| `tasks/update` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store. Live `as_proxy_typed("ext", …)` and live `as_proxy("ext", stdio Client)` forward a matching `tasks/update` of an upstream `input_required` Task. The HTTP path also refuses a near-identical wrong-kind roots payload without leaving that Task |
 | `tasks/submit` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
-| `tasks/cancel` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store |
+| `tasks/cancel` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store. Live `as_proxy_typed("ext", …)` and live `as_proxy("ext", stdio Client)` forward `tasks/cancel` of an upstream-created Task and refuse a near-identical missing id |
 
 The historical `TaskManager` source remains test-only for implementation
 archaeology. Production builds expose neither a manager constructor/builder
@@ -249,7 +249,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | **Auto-initialize** | ✅ | ✅ | Implemented in client builder.rs |
-| **Task client methods** | ✅ | 🟡 | Client methods exist; the default server serves official `tasks/get`, `tasks/update`, and `tasks/cancel` |
+| **Task client methods** | ✅ | 🟡 | Client methods exist; the default server serves official `tasks/get`, `tasks/update`, and `tasks/cancel`. Live `as_proxy_typed` HTTP forwards those three verbs to an upstream-created Task |
 
 ---
 
