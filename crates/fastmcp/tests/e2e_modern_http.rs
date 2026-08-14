@@ -10188,6 +10188,176 @@ fn e2e_public_http_handler_ctx_call_tool_and_read_resource() {
 }
 
 #[test]
+fn e2e_public_http_json_only_accept_composes_nested_tool_and_resource() {
+    const MAX_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+
+    fn exchange(address: SocketAddr, body: &[u8]) -> Vec<u8> {
+        let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+            .expect("JSON-only client connects to the compose listener");
+        stream
+            .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("JSON-only client read deadline is configured");
+        stream
+            .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("JSON-only client write deadline is configured");
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\nAccept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {PUBLIC_HTTP_COMPOSE_TOOL_NAME}\r\nContent-Length: {}\r\n\r\n",
+            modern::PROTOCOL_VERSION,
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(body))
+            .expect("JSON-only compose request commits");
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("JSON-only compose response reads within its deadline");
+            if read == 0 {
+                break;
+            }
+            assert!(
+                response
+                    .len()
+                    .checked_add(read)
+                    .is_some_and(|size| size <= MAX_NATIVE_HTTP_RESPONSE_BYTES),
+                "JSON-only compose response exceeds the bounded budget"
+            );
+            response.extend_from_slice(&buffer[..read]);
+        }
+        response
+    }
+
+    fn response_json_body(response: &[u8]) -> serde_json::Value {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("JSON-only response contains a header terminator");
+        let headers = std::str::from_utf8(&response[..header_end])
+            .expect("JSON-only response headers are ASCII");
+        let body = &response[header_end + 4..];
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        });
+        let decoded = if headers.lines().any(|line| {
+            line.to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+        }) {
+            let mut cursor = 0;
+            let mut decoded = Vec::new();
+            loop {
+                let size_end = body[cursor..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                    .map(|offset| cursor + offset)
+                    .expect("chunked JSON response contains a chunk-size line");
+                let size_line =
+                    std::str::from_utf8(&body[cursor..size_end]).expect("chunk size is ASCII");
+                let size =
+                    usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+                        .expect("chunk size is hexadecimal");
+                cursor = size_end + 2;
+                if size == 0 {
+                    break decoded;
+                }
+                let chunk_end = cursor
+                    .checked_add(size)
+                    .expect("chunk length does not overflow");
+                decoded.extend_from_slice(&body[cursor..chunk_end]);
+                cursor = chunk_end + 2;
+            }
+        } else {
+            let content_length =
+                content_length.expect("JSON response uses Content-Length or chunked framing");
+            body[..content_length].to_vec()
+        };
+        serde_json::from_slice(&decoded).expect("JSON-only compose response is JSON-RPC")
+    }
+
+    let server = spawn_modern_compose_and_state_http_server();
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            "arguments": {"value": "alpha"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        7_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("JSON-only compose request serializes");
+    let admitted = exchange(server.address(), &tool_body);
+    assert!(
+        admitted.starts_with(b"HTTP/1.1 200"),
+        "JSON-only Accept must admit composed tools/call: {}",
+        String::from_utf8_lossy(&admitted)
+    );
+    let admitted = response_json_body(&admitted);
+    assert!(
+        admitted.get("error").is_none(),
+        "JSON-only compose must not be a JSON-RPC error: {admitted}"
+    );
+    let content = admitted["result"]["content"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        content.iter().any(|block| {
+            block["text"].as_str() == Some("compose:tool:alpha|resource:deterministic")
+        }),
+        "JSON-only Accept must compose through the same request-owned callers: {admitted}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "JSON-only compose must invoke the nested tool once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "JSON-only compose must invoke the nested resource once"
+    );
+
+    let missing = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            "arguments": {"value": "alpha", "tool": "public-http-e2e-missing"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        })),
+        8_i64,
+    );
+    let missing_body =
+        serde_json::to_vec(&missing).expect("JSON-only missing-tool request serializes");
+    let refused = exchange(server.address(), &missing_body);
+    let refused = response_json_body(&refused);
+    let refused_text = format!("{refused:?}");
+    assert!(
+        refused_text.contains("public-http-e2e-missing")
+            || refused_text.contains("compose-nested-tool"),
+        "JSON-only compose must keep the nested unknown tool visible: {refused}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "a nested unknown tool name must not invoke the peer tool"
+    );
+    server.shutdown();
+}
+
+#[test]
 fn e2e_public_http_session_state_is_request_local_across_posts() {
     let cx = Cx::for_request();
     let server = spawn_modern_compose_and_state_http_server();
