@@ -198,8 +198,8 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=d0049253e#d0049253eea8027c820dcd687fab46b30ec1e9de"
+version = "0.4.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=fffc0a4c3#fffc0a4c3f1ef45da54af35b7aa720978db0dffc"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -259,8 +259,8 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.4.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=d0049253e#d0049253eea8027c820dcd687fab46b30ec1e9de"
+version = "0.4.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=fffc0a4c3#fffc0a4c3f1ef45da54af35b7aa720978db0dffc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1164,8 +1164,8 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.4.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=d0049253e#d0049253eea8027c820dcd687fab46b30ec1e9de"
+version = "0.4.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=fffc0a4c3#fffc0a4c3f1ef45da54af35b7aa720978db0dffc"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1174,8 +1174,8 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=d0049253e#d0049253eea8027c820dcd687fab46b30ec1e9de"
+version = "0.4.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=fffc0a4c3#fffc0a4c3f1ef45da54af35b7aa720978db0dffc"
 dependencies = [
  "serde",
  "serde_json",
@@ -1183,8 +1183,8 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.3"
-source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=d0049253e#d0049253eea8027c820dcd687fab46b30ec1e9de"
+version = "0.4.4"
+source = "git+https://github.com/Dicklesworthstone/asupersync.git?rev=fffc0a4c3#fffc0a4c3f1ef45da54af35b7aa720978db0dffc"
 dependencies = [
  "serde",
 ]
