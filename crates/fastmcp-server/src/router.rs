@@ -7545,8 +7545,10 @@ impl ResourceReader for RouterResourceReader {
                     nested_state,
                 )));
 
-            // Read the resource
-            let outcome = block_on(run_handler_in_request(
+            // Read the resource on the request-owned future. Nested
+            // `block_on` would replace the ambient Cx and can stall the
+            // already-running HTTP/stdio dispatcher.
+            let outcome = run_handler_in_request(
                 &child_ctx,
                 parent_ctx.cx(),
                 effective_budget,
@@ -7559,7 +7561,8 @@ impl ResourceReader for RouterResourceReader {
                         &resolved.params,
                     )
                 },
-            ))?;
+            )
+            .await?;
 
             // Convert outcome to result
             let contents = match outcome {
@@ -7732,14 +7735,17 @@ impl ToolCaller for RouterToolCaller {
                     nested_state,
                 )));
 
-            // Call the tool
-            let outcome = block_on(run_handler_in_request(
+            // Call the tool on the request-owned future. Nested `block_on`
+            // would replace the ambient Cx and can stall the already-running
+            // HTTP/stdio dispatcher.
+            let outcome = run_handler_in_request(
                 &child_ctx,
                 parent_ctx.cx(),
                 effective_budget,
                 "tool",
                 |request_cx| handler.call_async_in_request(&child_ctx, request_cx, args),
-            ))?;
+            )
+            .await?;
 
             // Convert outcome to result
             match outcome {
