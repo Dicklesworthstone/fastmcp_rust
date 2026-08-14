@@ -39,8 +39,8 @@ use fastmcp_rust::{
     McpError, McpErrorCode, McpRequestCancellation, McpResult, Middleware, MiddlewareDecision,
     ModernHttpResponseKind, ModernHttpResponseStream, Prompt, PromptHandler, PromptMessage,
     ProtocolEra, ProtocolPolicy, Resource, ResourceContent, ResourceHandler, ResourceTemplate,
-    Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, core,
-    legacy_2024, modern, prompt, providers, resource, tool,
+    Role, SseLimits, StaticTokenVerifier, TokenAuthProvider, Tool, ToolHandler, auto, caching,
+    core, legacy_2024, modern, prompt, providers, rate_limiting, resource, tool, transform,
 };
 #[cfg(feature = "proxy")]
 use fastmcp_rust::{ClientInfo, ProxyClient, StdioSubscriptionEvent};
@@ -7347,6 +7347,1104 @@ fn e2e_public_http_mask_error_details_hides_resource_execution_secret() {
     );
     drop(unmasked_client);
     unmasked_server.shutdown();
+}
+
+fn spawn_modern_rate_limit_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("rate-limit HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-rate-limit", "1.0.0")
+                .middleware(rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1))
+                .tool(PublicHttpTouchTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("rate-limit facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("rate-limit facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("rate-limit HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("rate-limit facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("rate-limit facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("rate-limit facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("rate-limit facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_rate_limit_refuses_second_same_method_and_admits_another() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_rate_limit_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-rate-limit", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the rate-limited HTTP server");
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOUCH_TOOL_NAME, json!({})),
+    )
+    .expect("the first tools/call must be admitted by the live rate limiter");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "notified" || text == "silent",
+            _ => false,
+        }),
+        "the first live tools/call must reach the touch handler: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOUCH_TOOL_NAME, json!({})),
+    )
+    .expect_err("a second tools/call must be refused by the live rate limiter");
+    let limited = format!("{limited:?}");
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second tools/call must keep the rate-limit error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("changing only the method must still be admitted by the live rate limiter");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOUCH_TOOL_NAME),
+        "tools/list must stay callable after tools/call is rate-limited: {listed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_modern_sliding_window_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("sliding-window HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-sliding-window", "1.0.0")
+                .middleware(rate_limiting::SlidingWindowRateLimitingMiddleware::new(
+                    1, 60,
+                ))
+                .tool(PublicHttpTouchTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("sliding-window facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("sliding-window facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("sliding-window HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("sliding-window facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("sliding-window facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("sliding-window facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("sliding-window facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_sliding_window_refuses_second_same_method_and_admits_another() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_sliding_window_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-sliding-window", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the sliding-window HTTP server");
+
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOUCH_TOOL_NAME, json!({})),
+    )
+    .expect("the first tools/call must be admitted by the live sliding window");
+
+    let limited = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOUCH_TOOL_NAME, json!({})),
+    )
+    .expect_err("a second tools/call must be refused by the live sliding window");
+    let limited = format!("{limited:?}");
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second tools/call must keep the sliding-window error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("changing only the method must still be admitted by the live sliding window");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOUCH_TOOL_NAME),
+        "tools/list must stay callable after tools/call is sliding-window limited: {listed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_TRANSFORMED_TOOL_NAME: &str = "public-http-e2e-lookup";
+
+fn spawn_modern_transform_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("transform HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-transform", "1.0.0")
+                .tool(
+                    transform::TransformedTool::from_tool(PublicHttpValue)
+                        .name(PUBLIC_HTTP_TRANSFORMED_TOOL_NAME)
+                        .rename_arg("value", "query")
+                        .build(),
+                )
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("transform facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("transform facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("transform HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("transform facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("transform facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("transform facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("transform facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_transformed_tool_renames_catalog_and_argument() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_transform_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-transform", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the transformed-tool HTTP server");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("live bind_http must list the transformed tool");
+    let transformed = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_TRANSFORMED_TOOL_NAME)
+        .unwrap_or_else(|| {
+            panic!("the transformed catalog must advertise the new name: {listed:?}")
+        });
+    assert!(
+        listed
+            .tools
+            .iter()
+            .all(|tool| tool.name != PUBLIC_HTTP_TOOL_NAME),
+        "the parent tool name must leave the transformed catalog: {listed:?}"
+    );
+    let schema = serde_json::to_string(&transformed.input_schema)
+        .expect("the transformed input schema serializes");
+    assert!(
+        schema.contains("query"),
+        "the transformed schema must advertise the renamed argument: {schema}"
+    );
+    assert!(
+        !schema.contains("\"value\""),
+        "the transformed schema must drop the original argument name: {schema}"
+    );
+
+    let looked_up = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_TRANSFORMED_TOOL_NAME,
+            json!({"query": "alpha"}),
+        ),
+    )
+    .expect("the transformed tools/call must rewrite query back to value");
+    assert!(
+        looked_up.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the rewritten argument must reach the parent handler: {looked_up:?}"
+    );
+
+    let original = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect_err("the parent tool name must stay unadvertised");
+    let original = format!("{original:?}");
+    assert!(
+        original.contains("Unknown tool")
+            || original.contains("Method not found")
+            || original.contains("MethodNotFound"),
+        "calling the pre-transform name must stay unknown: {original}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_HIDDEN_TOOL_NAME: &str = "public-http-e2e-hidden";
+
+fn spawn_modern_hide_arg_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("hide-arg HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-hide-arg", "1.0.0")
+                .tool(
+                    transform::TransformedTool::from_tool(PublicHttpValue)
+                        .name(PUBLIC_HTTP_HIDDEN_TOOL_NAME)
+                        .hide_arg("value", "hidden-default")
+                        .build(),
+                )
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("hide-arg facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("hide-arg facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("hide-arg HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("hide-arg facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("hide-arg facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("hide-arg facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("hide-arg facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_transformed_tool_hides_argument_and_injects_default() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_hide_arg_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-hide-arg", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the hide-arg HTTP server");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("live bind_http must list the hide-arg tool");
+    let hidden = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_HIDDEN_TOOL_NAME)
+        .unwrap_or_else(|| panic!("the hide-arg catalog must advertise the new name: {listed:?}"));
+    let schema =
+        serde_json::to_string(&hidden.input_schema).expect("the hide-arg input schema serializes");
+    assert!(
+        !schema.contains("\"value\""),
+        "the hide-arg schema must drop the hidden argument: {schema}"
+    );
+
+    let injected = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_HIDDEN_TOOL_NAME, json!({})),
+    )
+    .expect("the hide-arg tools/call must inject the configured default");
+    assert!(
+        injected.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:hidden-default",
+            _ => false,
+        }),
+        "the hidden default must reach the parent handler: {injected:?}"
+    );
+
+    let original = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect_err("the parent tool name must stay unadvertised");
+    let original = format!("{original:?}");
+    assert!(
+        original.contains("Unknown tool")
+            || original.contains("Method not found")
+            || original.contains("MethodNotFound"),
+        "calling the pre-transform name must stay unknown: {original}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_modern_strict_validation_http_server(strict: bool) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("strict-validation HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-strict-validation", "1.0.0")
+                .strict_input_validation(strict)
+                .tool(PublicHttpValue)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("strict-validation facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("strict-validation facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("strict-validation HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("strict-validation facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("strict-validation facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("strict-validation facade HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("strict-validation facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_strict_input_validation_refuses_unknown_property_and_admits_declared_args() {
+    let cx = Cx::for_request();
+    let strict_server = spawn_modern_strict_validation_http_server(true);
+    let mut strict_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-strict-on", "1.0.0")
+            .connect_http_with_cx(public_http_target(strict_server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the strict-validation HTTP server");
+
+    let admitted = runtime_block_on_bounded(
+        &cx,
+        strict_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("strict validation must still admit declared arguments");
+    assert!(
+        !admitted.is_error,
+        "declared arguments must not become a tool-level error: {admitted:?}"
+    );
+    assert!(
+        admitted.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "declared arguments must reach the handler under strict validation: {admitted:?}"
+    );
+
+    let refused = runtime_block_on_bounded(
+        &cx,
+        strict_client.call_tool(
+            &cx,
+            PUBLIC_HTTP_TOOL_NAME,
+            json!({"value": "alpha", "extra": 1}),
+        ),
+    )
+    .expect("strict validation returns a complete tools/call result, not a transport failure");
+    assert!(
+        refused.is_error,
+        "an unknown property must become a tool-level error when strict validation is on: {refused:?}"
+    );
+    assert!(
+        refused.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text.contains("do not match the declared input schema")
+            }
+            _ => false,
+        }),
+        "the strict refusal must name the input-schema mismatch: {refused:?}"
+    );
+
+    drop(strict_client);
+    strict_server.shutdown();
+
+    let lenient_server = spawn_modern_strict_validation_http_server(false);
+    let mut lenient_client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-strict-off", "1.0.0")
+            .connect_http_with_cx(public_http_target(lenient_server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the lenient-validation HTTP server");
+
+    let extra = runtime_block_on_bounded(
+        &cx,
+        lenient_client.call_tool(
+            &cx,
+            PUBLIC_HTTP_TOOL_NAME,
+            json!({"value": "alpha", "extra": 1}),
+        ),
+    )
+    .expect("lenient validation must admit the same extra property");
+    assert!(
+        !extra.is_error,
+        "changing only the strict flag must admit the extra property: {extra:?}"
+    );
+    assert!(
+        extra.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the extra property must not change the handler result when strict is off: {extra:?}"
+    );
+
+    drop(lenient_client);
+    lenient_server.shutdown();
+}
+
+fn spawn_modern_cache_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("cache HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-cache", "1.0.0")
+                .middleware(
+                    caching::ResponseCachingMiddleware::new()
+                        .include_tools(vec![PUBLIC_HTTP_TOOL_NAME.to_owned()]),
+                )
+                .tool(CountingPublicHttpValue {
+                    counters: tool_calls,
+                })
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("cache facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("cache facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("cache HTTP server startup receiver went away".to_owned());
+            }
+            bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("cache facade HTTP server stopped unexpectedly: {error}"))
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("cache facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("cache facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("cache facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_response_cache_hits_same_allowlisted_call_and_misses_changed_args() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_cache_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-cache", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the cached HTTP server");
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("the first allowlisted tools/call must miss and reach the handler");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the first live tools/call must return the handler result: {first:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the first allowlisted tools/call must invoke the counting handler"
+    );
+
+    let cached = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect("the second identical allowlisted tools/call must be a cache hit");
+    assert!(
+        cached.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the cache hit must keep the first complete result: {cached:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "a cache hit must not invoke the counting handler again"
+    );
+
+    let missed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "beta"})),
+    )
+    .expect("changing only the arguments must miss the cache");
+    assert!(
+        missed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:beta",
+            _ => false,
+        }),
+        "the cache miss must reach the handler with the new arguments: {missed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        2,
+        "a different-arguments tools/call must invoke the counting handler"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_SLOW_TOOL_NAME: &str = "public-http-e2e-slow";
+const PUBLIC_HTTP_FAST_TOOL_NAME: &str = "public-http-e2e-fast";
+
+/// Live modern HTTP tool whose handler timeout expires before its delay finishes.
+struct PublicHttpSlowTool;
+
+impl ToolHandler for PublicHttpSlowTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_SLOW_TOOL_NAME.to_owned(),
+            description: Some("Proves live facade HTTP handler timeout".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        thread::sleep(Duration::from_millis(80));
+        Ok(vec![Content::text("late")])
+    }
+}
+
+/// Live modern HTTP peer tool that stays inside the request budget.
+struct PublicHttpFastTool;
+
+impl ToolHandler for PublicHttpFastTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_FAST_TOOL_NAME.to_owned(),
+            description: Some(
+                "Proves live facade HTTP handler timeout does not starve peers".to_owned(),
+            ),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("fast")])
+    }
+}
+
+fn spawn_modern_handler_timeout_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("handler-timeout HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-handler-timeout", "1.0.0")
+                .tool(PublicHttpSlowTool)
+                .tool(PublicHttpFastTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("handler-timeout facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("handler-timeout facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("handler-timeout HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("handler-timeout facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("handler-timeout facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("handler-timeout facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("handler-timeout facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_handler_timeout_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-handler-timeout", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the handler-timeout HTTP server");
+
+    let timed_out = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_SLOW_TOOL_NAME, json!({})),
+    )
+    .expect_err("a handler that outlives its timeout must be refused");
+    let timed_out = format!("{timed_out:?}");
+    assert!(
+        timed_out.contains("Request timeout exceeded") || timed_out.contains("RequestCancelled"),
+        "the refused late tools/call must keep the handler-timeout error: {timed_out}"
+    );
+
+    let fast = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+    )
+    .expect("changing only the tool must still be admitted after a handler timeout");
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the fast peer tool must still complete: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
 }
 
 #[test]
