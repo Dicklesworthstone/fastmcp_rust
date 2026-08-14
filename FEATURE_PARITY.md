@@ -106,14 +106,14 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
-| **Dynamic enable/disable** | ✅ | ✅ | Per-session visibility via state.rs, context.rs; `disable_*`/`enable_*` emit 2024 `list_changed` and publish the same events to modern `subscriptions/listen`. Live `bind_http` incremental listen retains handler `disable_tool` / `disable_resource` / `disable_prompt` publication and same-request `enable_tool` after `disable_tool`; anonymous HTTP POSTs get a request-local `SessionState` so that mutation can fire without inventing `Mcp-Session-Id` |
+| **Dynamic enable/disable** | ✅ | ✅ | Per-session visibility via state.rs, context.rs; `disable_*`/`enable_*` emit 2024 `list_changed` and publish the same events to modern `subscriptions/listen`. Live `bind_http` incremental listen retains handler `disable_tool` / `disable_resource` / `disable_prompt` publication and same-request `enable_tool` after `disable_tool`; anonymous HTTP POSTs get a request-local `SessionState` so that mutation can fire without inventing `Mcp-Session-Id`. Live shipped-echo stdio `hide_catalog` refuses a later `info://server` read and `greeting` get on the same session; `show_catalog` restores both |
 | **Component versioning** | ✅ | ✅ | Version fields on Tool, Resource, Prompt types |
 | **Tags for filtering** | ✅ | ✅ | `include_tags`/`exclude_tags` in router.rs |
 | **Icons support** | ✅ | ✅ | Icon metadata in types.rs, handler.rs |
-| **Error masking** | ✅ | ✅ | `mask_error_details` in builder.rs |
+| **Error masking** | ✅ | ✅ | `mask_error_details` in builder.rs. Live `bind_http` `mask_error_details(true)` replaces a resource `ToolExecutionError` secret with `Internal server error`; changing only that flag to `false` keeps the secret |
 | **Strict input validation** | ✅ | ✅ | `strict_input_validation` in router.rs |
 | **Duplicate handling** | ✅ | ✅ | `on_duplicate` in builder.rs |
-| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete`. Live `bind_http` `as_proxy_typed("ext", …)` prefixes tools/prompts as `ext/...`, keeps exact-final resource URIs and RFC 6570 templates unprefixed, and forwards `tools/call`, `prompts/get`, `resources/read` (including a matched template URI and a live FilesystemProvider file URI), and `completion/complete`. A near-identical unmatched template path stays `InvalidParams` before the upstream handler. Prefixed `as_proxy_typed` installs the same route-bound official Tasks relay as `proxy_typed` (complete-only tools stay unwrapped; `tasks/*` forwards) instead of the disconnected default in-memory store. Live official Tasks through that relay: `tasks/get` of an upstream-created Task, `tasks/update` of its `input_required` snapshot (a near-identical wrong-kind roots payload is refused and leaves the Task in place), and `tasks/cancel` of the resumed Task. A near-identical missing id stays an error for `tasks/get` and `tasks/cancel`. Live `as_proxy("ext", stdio Client)` against the shipped echo server binds HTTP, prefixes tools/prompts as `ext/echo` and `ext/greeting`, forwards `tools/call`, `prompts/get`, `completion/complete` of `ext/greeting` (rewritten to upstream `greeting`), and `resources/read` of unprefixed `info://server`, and refuses the unprefixed tool/prompt/completion names. Live `ext/hide_echo` forwards the session-local disable: the gateway snapshot still lists `ext/echo`, a later `ext/echo` is a `Method not found` tool error, and `ext/add` still returns `5`. Live official Tasks on that same stdio client: `tasks/get` of its `input_required` snapshot, `tasks/update` with matching roots, and `tasks/cancel` of the resumed Task; a near-identical missing id stays an error. `as_proxy_typed` keeps the live ModernHttp binding |
+| **as_proxy() method** | ✅ | ✅ | Implemented in builder.rs, proxy.rs. Live `bind_http` `proxy_typed` lists the upstream catalog and forwards `tools/call`, `prompts/get`, `resources/read`, and `completion/complete`. Live `bind_http` `as_proxy_typed("ext", …)` prefixes tools/prompts as `ext/...`, keeps exact-final resource URIs and RFC 6570 templates unprefixed, and forwards `tools/call`, `prompts/get`, `resources/read` (including a matched template URI and a live FilesystemProvider file URI), and `completion/complete`. A near-identical unmatched template path stays `InvalidParams` before the upstream handler. Prefixed `as_proxy_typed` installs the same route-bound official Tasks relay as `proxy_typed` (complete-only tools stay unwrapped; `tasks/*` forwards) instead of the disconnected default in-memory store. Live official Tasks through that relay: `tasks/get` of an upstream-created Task, `tasks/update` of its `input_required` snapshot (a near-identical wrong-kind roots payload is refused and leaves the Task in place), and `tasks/cancel` of the resumed Task. A near-identical missing id stays an error for `tasks/get` and `tasks/cancel`. Live `as_proxy("ext", stdio Client)` against the shipped echo server binds HTTP, prefixes tools/prompts as `ext/echo` and `ext/greeting`, forwards `tools/call`, `prompts/get`, `completion/complete` of `ext/greeting` (rewritten to upstream `greeting`), and `resources/read` of unprefixed `info://server`, and refuses the unprefixed tool/prompt/completion names. Live `ext/hide_echo` forwards the session-local disable: the gateway snapshot still lists `ext/echo`, a later `ext/echo` is a `Method not found` tool error, and `ext/add` still returns `5`. Live `ext/show_echo` restores that same prefixed echo tool. Live `ext/hide_catalog` keeps the gateway snapshot, leaves a warmed HTTP client's cached `info://server` read in place, refuses a later uncached `info://server` read and `ext/greeting` get, and live `ext/show_catalog` restores a later uncached read and the prefixed greeting get. Live official Tasks on that same stdio client: `tasks/get` of its `input_required` snapshot, `tasks/update` with matching roots, and `tasks/cancel` of the resumed Task; a near-identical missing id stays an error. Live `ProxyClient::start_catalog_listener` against a modern `bind_http` upstream retains `notifications/tools/list_changed` after a forwarded hide tool. `as_proxy_typed` keeps the live ModernHttp binding |
 | **mount() composition** | ✅ | ✅ | Implemented in builder.rs, router.rs. Public Auto/modern facades `mount()` prefix tools/prompts and keep exact resource URIs so they stay on the modern catalog. Live `bind_http` `mount(child, Some("child"))` lists `child/...` tools/prompts and reads the original resource URI. Live `mount()` of a FilesystemProvider child keeps `file:///{prefix}/{+path}` exact, expands a matching file URI, and refuses an unmatched prefix before the child handler. Legacy `mount()` still prefixes every key. `mount_tools` / `mount_resources` / `mount_prompts` remain available |
 
 ---
@@ -138,7 +138,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | **Tags** | ✅ | ✅ | Supported for filtering in router.rs |
 | **Output schema** | ✅ | ✅ | Tool output schema in macros, handler.rs |
 | **Tool annotations** | ✅ | ✅ | MCP annotations in types.rs, handler.rs |
-| **Timeout per handler** | ✅ | 🟡 | Handler timeout surface exists; enforcement and panic-boundary hardening are active work |
+| **Timeout per handler** | ✅ | ✅ | Handler timeout surface exists. Live `bind_http` a 10ms tool timeout refuses a late `tools/call` and still admits a near-identical fast peer tool. Panic-boundary hardening remains unit-proven, not a live hang-tool e2e |
 
 ---
 
@@ -182,7 +182,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `notifications/resources/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
 | `notifications/prompts/list_changed` | ✅ | ✅ | Emitted on session catalog mutation and published to `subscriptions/listen` |
 | `notifications/resources/updated` | ✅ | ✅ | `ctx.notify_resource_updated` plus matching listen filters |
-| `subscriptions/listen` | ✅ | 🟡 | Owned HTTP incremental listener (`start_subscriptions_listener` keeps the same `HttpClient` free to issue requests), stdio incremental catalog/Tasks listeners on the same `Client`, `ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams, WebSocket incremental catalog listen (`WebSocketClient::open_subscriptions_listener`), detached sequential pumps, and `Server::open_subscription_listen` for in-process callers. Live `bind_http` incremental listen retains handler `notifications/resources/updated` and tool/resource/prompt `list_changed`. Live shipped-echo stdio uses split stdin/stdout so listen acknowledgements, `resources/updated`, and tool/resource/prompt `list_changed` publish while the receive pump is blocked. `dispatch_stateless` rejects listen instead of returning `MethodNotFound`. Collect-to-terminal stdio/WebSocket and the borrowing HTTP listener remain available |
+| `subscriptions/listen` | ✅ | 🟡 | Owned HTTP incremental listener (`start_subscriptions_listener` keeps the same `HttpClient` free to issue requests), stdio incremental catalog/Tasks listeners on the same `Client`, `ProxyClient::start_catalog_listener` for stdio and modern HTTP upstreams, WebSocket incremental catalog listen (`WebSocketClient::open_subscriptions_listener`), detached sequential pumps, and `Server::open_subscription_listen` for in-process callers. Live `bind_http` incremental listen retains handler `notifications/resources/updated` and tool/resource/prompt `list_changed`. Live shipped-echo stdio uses split stdin/stdout so listen acknowledgements, `resources/updated`, and tool/resource/prompt `list_changed` publish while the receive pump is blocked. Live `ProxyClient::start_catalog_listener` against a modern `bind_http` upstream retains `notifications/tools/list_changed` after a forwarded hide tool while a near-identical non-mutating touch does not enqueue a tools event. `dispatch_stateless` rejects listen instead of returning `MethodNotFound`. Collect-to-terminal stdio/WebSocket and the borrowing HTTP listener remain available |
 
 ### Background Tasks (Docket/SEP-1686; network surface quarantined)
 
@@ -313,9 +313,9 @@ The following bidirectional building blocks exist in source. This inventory does
 | Response transformation | ✅ | ✅ | `on_response()` |
 | Error handling | ✅ | ✅ | `on_error()` |
 | Middleware chain | ✅ | ✅ | Vec<Box<dyn Middleware>> |
-| **ResponseCachingMiddleware** | ✅ | 🟡 | Eligible entries use committed-auth plus opaque session/revision partitions and fail closed on ambiguous admission or state mutation; broader production and conformance qualification remains incomplete |
-| **RateLimitingMiddleware** | ✅ | ✅ | `rate_limiting.rs` - Token bucket |
-| **SlidingWindowRateLimiting** | ✅ | ✅ | `rate_limiting.rs` - Sliding window |
+| **ResponseCachingMiddleware** | ✅ | ✅ | Eligible entries use committed-auth plus opaque session/revision partitions and fail closed on ambiguous admission or state mutation. Live `bind_http` `include_tools` serves a second identical `tools/call` from cache without re-invoking the counting handler; changing only the arguments misses and increments the handler. Request-local modern HTTP sessions share the stateless partition so a per-POST bag cannot orphan every entry |
+| **RateLimitingMiddleware** | ✅ | ✅ | `rate_limiting.rs` - Token bucket. Live `bind_http` burst-1 refuses a second `tools/call` with `Rate limit exceeded` and still admits `tools/list` on the method-partitioned limiter |
+| **SlidingWindowRateLimiting** | ✅ | ✅ | `rate_limiting.rs` - Sliding window. Live `bind_http` a 1-request/60s window refuses a second `tools/call` with `Rate limit exceeded` and still admits `tools/list` |
 
 ---
 
@@ -346,7 +346,7 @@ The following bidirectional building blocks exist in source. This inventory does
 |---------|--------|------|-------|
 | Log level configuration | ✅ | ✅ | Via environment + LoggingConfig |
 | Console configuration | ✅ | ✅ | ConsoleConfig |
-| Timeout configuration | ✅ | 🟡 | Builder surface exists; end-to-end enforcement gates remain |
+| Timeout configuration | ✅ | ✅ | Builder surface exists. Live `bind_http` enforces a per-handler timeout through `run_handler_in_request` |
 | Banner configuration | ✅ | ✅ | BannerStyle enum |
 | Traffic verbosity | ✅ | ✅ | TrafficVerbosity enum |
 | Environment variables | ✅ | ✅ | FASTMCP_LOG, FASTMCP_NO_BANNER, etc. |
@@ -358,7 +358,7 @@ The following bidirectional building blocks exist in source. This inventory does
 | Config | Python | Rust | Notes |
 |--------|--------|------|-------|
 | **include_tags/exclude_tags** | ✅ | ✅ | Component filtering in router.rs |
-| **mask_error_details** | ✅ | ✅ | Implemented in builder.rs |
+| **mask_error_details** | ✅ | ✅ | Implemented in builder.rs. Live `bind_http` `mask_error_details(true)` replaces a resource execution secret with `Internal server error`; the same handler with masking off keeps the secret |
 | **check_for_updates** | ✅ | ⊘ | Removed for FND-01; the CLI has no eager crates.io/`ureq` update client |
 
 ---
@@ -415,7 +415,7 @@ The list below is a historical Phase-5 gap-closure inventory. It does **not** ce
 7. ✅ **Auto-initialize** - Client auto-initialization (client/builder.rs)
 8. ✅ **Cross-component access** - ctx.read_resource(), ctx.call_tool() (context.rs)
 9. ✅ **Capabilities access** - ctx.client_capabilities(), ctx.server_capabilities() (context.rs)
-10. 🟡 **Per-handler timeout** - Handler-level configuration exists and both modern and exact-2024 session dispatch now enforce it through `run_handler_in_request`; panic-boundary hardening remains active
+10. ✅ **Per-handler timeout** - Handler-level configuration exists and both modern and exact-2024 session dispatch now enforce it through `run_handler_in_request`. Live `bind_http` refuses a late tool and still admits a fast peer; panic-boundary hardening remains unit-proven
 11. ✅ **Output schema** - Tool output schema support (macros, handler.rs)
 12. ✅ **Tool annotations** - MCP tool annotations (types.rs, handler.rs)
 13. ✅ **Strict validation** - strict_input_validation setting (router.rs, builder.rs)
