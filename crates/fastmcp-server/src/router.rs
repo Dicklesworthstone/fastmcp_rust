@@ -286,8 +286,19 @@ pub(crate) struct ModernConnectionRequestContext {
 
 impl ModernConnection {
     pub(crate) fn new() -> Self {
+        Self::with_state(SessionState::new())
+    }
+
+    /// One modern HTTP POST. The bag is request-local: disable/enable can
+    /// publish `list_changed` without a durable `Mcp-Session-Id`, and the
+    /// response cache must not treat it as a partition identity.
+    pub(crate) fn new_request_local() -> Self {
+        Self::with_state(SessionState::ephemeral())
+    }
+
+    fn with_state(state: SessionState) -> Self {
         Self {
-            state: SessionState::new(),
+            state,
             continuation_cancellation: fastmcp_core::McpRequestCancellation::new(),
             principal_binding: SessionPrincipalBinding::default(),
         }
@@ -4952,7 +4963,14 @@ impl Router {
             .arguments
             .into_value()
             .unwrap_or_else(|| serde_json::json!({}));
-        if input_schema.is_some_and(|schema| schema.validate(&arguments).is_err()) {
+        if input_schema.is_some_and(|schema| {
+            let validation = if self.strict_input_validation {
+                validate_strict(schema.schema(), &arguments)
+            } else {
+                schema.validate(&arguments)
+            };
+            validation.is_err()
+        }) {
             let mut result = crate::handler::promote_legacy_tool_content(vec![Content::text(
                 "Tool arguments do not match the declared input schema.",
             )])?;

@@ -1817,6 +1817,16 @@ fn retained_raw_params<'a>(
 
 /// Re-admits a middleware-produced final core response through the request's
 /// exact result algebra and returns its canonical wire representation.
+/// A response-cache hit may complete a final core method. Arbitrary
+/// middleware still cannot invent a typed final result.
+fn middleware_may_complete_final_core_from_cache(
+    ctx: &McpContext,
+    value: &serde_json::Value,
+) -> bool {
+    ctx.response_was_served_from_cache()
+        && value.get("resultType").and_then(serde_json::Value::as_str) == Some("complete")
+}
+
 fn validate_final_core_middleware_response(
     core_request: Option<&CoreRequest>,
     request: &JsonRpcRequest,
@@ -6890,7 +6900,7 @@ impl ServerHttpEndpoint {
             legacy_pending_requests,
             #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_runtime,
-            modern_connection: Arc::new(ModernConnection::new()),
+            modern_connection: Arc::new(ModernConnection::new_request_local()),
             modern_dispatches: Arc::new(Mutex::new(Vec::new())),
             selected_era: None,
             closed: false,
@@ -11027,7 +11037,9 @@ impl Server {
                 match catch_extension_unwind(|| middleware.on_request(&request_ctx, &request)) {
                     Ok(Ok(MiddlewareDecision::Continue)) => {}
                     Ok(Ok(MiddlewareDecision::Respond(value))) => {
-                        if final_core_request.is_some() {
+                        if final_core_request.is_some()
+                            && !middleware_may_complete_final_core_from_cache(&request_ctx, &value)
+                        {
                             return Err(McpError::internal_error(
                                 "middleware cannot short-circuit a final core response",
                             ));
@@ -11304,13 +11316,17 @@ impl Server {
             match decision {
                 Ok(MiddlewareDecision::Continue) => {}
                 Ok(MiddlewareDecision::Respond(value)) => {
-                    middleware_result = Some(if final_core_request.is_some() {
-                        Err(McpError::internal_error(
-                            "middleware cannot short-circuit a final core response",
-                        ))
-                    } else {
-                        Ok(value)
-                    });
+                    middleware_result = Some(
+                        if final_core_request.is_some()
+                            && !middleware_may_complete_final_core_from_cache(&request_ctx, &value)
+                        {
+                            Err(McpError::internal_error(
+                                "middleware cannot short-circuit a final core response",
+                            ))
+                        } else {
+                            Ok(value)
+                        },
+                    );
                     break;
                 }
                 Err(error) => {
