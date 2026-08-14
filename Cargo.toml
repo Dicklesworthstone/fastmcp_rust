@@ -32,7 +32,7 @@ readme = "README.md"
 # path-patch this checkout can resolve a single asupersync version. 0.3.10's
 # only breaking change (TrackedSender::try_reserve/&Cx, CommittedProof) is
 # unused in this workspace. See mcp_agent_mail_rust bead br-noizk.
-asupersync = { version = "=0.4.3" }
+asupersync = { version = "=0.4.4" }
 rich_rust = { version = "=0.2.2" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
@@ -189,4 +189,4 @@ rich_rust = { path = "../rich_rust" }
 # asupersync is pinned to the sibling git rev (8ffba4c) via this patch so the
 # manifest matches the git source recorded in Cargo.lock; `cargo *--locked`
 # fails without it. Drop once the rev is published to crates.io as >0.4.3.
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "d0049253e" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "fffc0a4c3" }
