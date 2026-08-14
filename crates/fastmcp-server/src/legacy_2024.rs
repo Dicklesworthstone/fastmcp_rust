@@ -212,7 +212,11 @@ pub trait Legacy2024Handler {
         method: &'static str,
         params: Option<&'a Value>,
     ) -> crate::BoxFuture<'a, Result<Value, Legacy2024HandlerError>> {
-        Box::pin(async move { self.handle_legacy_2024_with_request_id(request_id, method, params) })
+        // Bridge the sync handler without holding `&mut self` across the future:
+        // BoxFuture requires Send, but `&mut Self` is not Send when Self is not.
+        // Compute the owned result eagerly and return a ready future over it.
+        let outcome = self.handle_legacy_2024_with_request_id(request_id, method, params);
+        Box::pin(async move { outcome })
     }
 }
 
