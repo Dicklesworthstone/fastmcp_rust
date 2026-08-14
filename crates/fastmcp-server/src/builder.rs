@@ -6658,7 +6658,6 @@ mod tests {
             );
         }
 
-        #[test]
         #[cfg(feature = "tasks")]
         #[test]
         fn as_proxy_typed_installs_route_bound_final_tasks_relay() {
@@ -6689,6 +6688,7 @@ mod tests {
             );
         }
 
+        #[test]
         fn as_proxy_raw_propagates_duplicate_registration_errors() {
             let result = ServerBuilder::new("srv", "1.0")
                 .on_duplicate(DuplicateBehavior::Error)

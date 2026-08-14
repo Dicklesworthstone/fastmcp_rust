@@ -1714,10 +1714,19 @@ fn spawn_modern_http_proxy_gateway_with_prefix(
                 ));
             }
             let server = match prefix {
-                Some(prefix) => modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
-                    .as_proxy_typed(prefix, proxy, catalog)
-                    .map_err(|error| format!("as_proxy_typed install failed: {error}"))?
-                    .build(),
+                Some(prefix) => {
+                    let server = modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
+                        .as_proxy_typed(prefix, proxy, catalog)
+                        .map_err(|error| format!("as_proxy_typed install failed: {error}"))?
+                        .build();
+                    if server.final_task_runtime().is_some() {
+                        return Err(
+                            "as_proxy_typed must install the route-bound Tasks relay instead of the default in-memory store"
+                                .to_owned(),
+                        );
+                    }
+                    server
+                }
                 None => modern::ServerBuilder::new("e2e-http-gateway", "1.0.0")
                     .proxy_typed(proxy, catalog)
                     .map_err(|error| format!("proxy_typed install failed: {error}"))?
