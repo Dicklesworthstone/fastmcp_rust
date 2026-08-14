@@ -26,8 +26,8 @@ use fastmcp_protocol::extensions::ExtensionDirection;
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
 use fastmcp_protocol::methods::{
-    Final2026Direction, Final2026EnvelopeKind, NOTIFICATIONS_PROGRESS, PING, PROMPTS_GET,
-    RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
+    Final2026Direction, Final2026EnvelopeKind, Final2026Peer, NOTIFICATIONS_PROGRESS, PING,
+    PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
@@ -74,6 +74,41 @@ use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 pub const MODERN_MCP_ACCEPT: &str = "application/json, text/event-stream";
 pub const MODERN_MCP_ACCEPT_ENCODING: &str = "identity";
 pub const MODERN_MCP_CONTENT_TYPE: &str = "application/json";
+
+fn is_modern_http_final_server_notification(request: &JsonRpcRequest) -> bool {
+    request.id.is_none()
+        && final_2026_07_28_method(&request.method)
+            .is_some_and(|method| method.admits_notification_from(Final2026Peer::Server))
+}
+
+enum ModernHttpRequestScopedNotification {
+    Server(ServerNotification),
+    Progress(FinalProgressNotificationParams),
+    Ignored,
+}
+
+fn classify_modern_http_request_scoped_notification(
+    request: &JsonRpcRequest,
+    frame: &[u8],
+) -> Result<ModernHttpRequestScopedNotification, FinalNotificationError> {
+    if !is_modern_http_final_server_notification(request) {
+        return Ok(ModernHttpRequestScopedNotification::Ignored);
+    }
+    if request.method == "notifications/cancelled" {
+        return Ok(ModernHttpRequestScopedNotification::Ignored);
+    }
+    let raw_params = raw_final_notification_params(request, frame)?;
+    let notification = match raw_params.as_deref() {
+        Some(raw_params) => ServerNotification::decode_with_raw_params(request, raw_params),
+        None => ServerNotification::decode(request),
+    }?;
+    Ok(match notification {
+        ServerNotification::Progress(progress) => {
+            ModernHttpRequestScopedNotification::Progress(progress)
+        }
+        notification => ModernHttpRequestScopedNotification::Server(notification),
+    })
+}
 
 fn raw_final_notification_params(
     request: &JsonRpcRequest,
@@ -3341,7 +3376,7 @@ impl ClientHttpConnection {
             maximum_response_bytes,
         )
         .await
-        .map(|(response, result_source, _)| (response, result_source))
+        .map(|(response, result_source, _, _, _)| (response, result_source))
     }
 
     /// Sends one request and retains the monotonic receipt instant captured
@@ -3358,7 +3393,16 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
-    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+    ) -> Result<
+        (
+            JsonRpcResponse,
+            Option<String>,
+            Instant,
+            Vec<ServerNotification>,
+            Vec<FinalProgressNotificationParams>,
+        ),
+        ClientHttpConnectionError,
+    > {
         self.request_json_with_result_source_at_inner(
             cx,
             None,
@@ -3385,7 +3429,16 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
-    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+    ) -> Result<
+        (
+            JsonRpcResponse,
+            Option<String>,
+            Instant,
+            Vec<ServerNotification>,
+            Vec<FinalProgressNotificationParams>,
+        ),
+        ClientHttpConnectionError,
+    > {
         self.admit_final_extension_method(extension_id, method)
             .map_err(ClientHttpConnectionError::FinalExtensionAdmission)?;
         self.request_json_with_result_source_at_inner(
@@ -3411,7 +3464,16 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
-    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+    ) -> Result<
+        (
+            JsonRpcResponse,
+            Option<String>,
+            Instant,
+            Vec<ServerNotification>,
+            Vec<FinalProgressNotificationParams>,
+        ),
+        ClientHttpConnectionError,
+    > {
         if cancellation.is_cancel_requested() {
             return Err(ClientHttpConnectionError::Modern(
                 ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled),
@@ -3436,7 +3498,16 @@ impl ClientHttpConnection {
         parameters: serde_json::Value,
         request_id: RequestId,
         maximum_response_bytes: usize,
-    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+    ) -> Result<
+        (
+            JsonRpcResponse,
+            Option<String>,
+            Instant,
+            Vec<ServerNotification>,
+            Vec<FinalProgressNotificationParams>,
+        ),
+        ClientHttpConnectionError,
+    > {
         let response = match admission {
             ModernRequestAdmission::Core(method) => {
                 self.request_with_optional_cancellation(
@@ -3479,7 +3550,7 @@ impl ClientHttpConnection {
         match response {
             #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) => {
-                Ok((response, None, Instant::now()))
+                Ok((response, None, Instant::now(), Vec::new(), Vec::new()))
             }
             #[cfg(feature = "legacy-2024-11-05")]
             ClientHttpResponse::Legacy(JsonRpcMessage::Request(_)) => {
@@ -3507,6 +3578,9 @@ impl ClientHttpConnection {
                             ))
                         })?;
                         admit_modern_json_response_body(&body, &request_id, maximum_response_bytes)
+                            .map(|(response, result_source, receipt)| {
+                                (response, result_source, receipt, Vec::new(), Vec::new())
+                            })
                     }
                     ModernHttpResponseKind::Sse => {
                         self.drain_modern_sse_json_response(
@@ -3531,7 +3605,16 @@ impl ClientHttpConnection {
         response: ModernHttpResponseStream,
         request_id: RequestId,
         maximum_response_bytes: usize,
-    ) -> Result<(JsonRpcResponse, Option<String>, Instant), ClientHttpConnectionError> {
+    ) -> Result<
+        (
+            JsonRpcResponse,
+            Option<String>,
+            Instant,
+            Vec<ServerNotification>,
+            Vec<FinalProgressNotificationParams>,
+        ),
+        ClientHttpConnectionError,
+    > {
         let Self::Modern(client) = self else {
             return Err(ClientHttpConnectionError::ExpectedJsonResponse {
                 actual: ModernHttpResponseKind::Sse,
@@ -3549,6 +3632,8 @@ impl ClientHttpConnection {
             ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
         })?;
         let mut interleaved_control_frames = 0_usize;
+        let mut server_notifications = Vec::new();
+        let mut progress_notifications = Vec::new();
         loop {
             if cx.checkpoint().is_err()
                 || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
@@ -3588,7 +3673,16 @@ impl ClientHttpConnection {
                         event.as_bytes(),
                         &request_id,
                         maximum_response_bytes,
-                    );
+                    )
+                    .map(|(response, result_source, receipt)| {
+                        (
+                            response,
+                            result_source,
+                            receipt,
+                            server_notifications,
+                            progress_notifications,
+                        )
+                    });
                 }
                 JsonRpcMessage::Request(request) if request.is_notification() => {
                     interleaved_control_frames = interleaved_control_frames.checked_add(1).ok_or(
@@ -3602,6 +3696,23 @@ impl ClientHttpConnection {
                                 limit: MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES,
                             },
                         );
+                    }
+                    match classify_modern_http_request_scoped_notification(
+                        &request,
+                        event.as_bytes(),
+                    )
+                    .map_err(|_| {
+                        ClientHttpConnectionError::UnexpectedResponseMessage {
+                            request_id: request_id.clone(),
+                        }
+                    })? {
+                        ModernHttpRequestScopedNotification::Server(notification) => {
+                            server_notifications.push(notification);
+                        }
+                        ModernHttpRequestScopedNotification::Progress(progress) => {
+                            progress_notifications.push(progress);
+                        }
+                        ModernHttpRequestScopedNotification::Ignored => {}
                     }
                 }
                 JsonRpcMessage::Request(server_request) => {

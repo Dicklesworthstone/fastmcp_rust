@@ -1269,6 +1269,24 @@ fn admit_final_tasks_result_discriminator(
         })
 }
 
+fn insert_final_request_log_level(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    level: Option<LoggingLevel>,
+) -> McpResult<()> {
+    let Some(level) = level else {
+        return Ok(());
+    };
+    metadata.insert(
+        "io.modelcontextprotocol/logLevel".to_owned(),
+        serde_json::to_value(level).map_err(|error| {
+            McpError::internal_error(format!(
+                "Failed to serialize modern logging configuration: {error}"
+            ))
+        })?,
+    );
+    Ok(())
+}
+
 fn final_log_level(level: LogLevel) -> LoggingLevel {
     match level {
         LogLevel::Debug => LoggingLevel::Debug,
@@ -5954,6 +5972,36 @@ where
         .await
     }
 
+    /// Calls one tool and admits request-scoped `notifications/progress` for
+    /// the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub async fn call_tool_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            McpError::internal_error("WebSocket progress token could not be encoded")
+        })?;
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "tools/call",
+            serde_json::json!({
+                "name": name,
+                "arguments": arguments,
+                "_meta": { "progressToken": token },
+            }),
+        )
+        .await
+    }
+
     async fn follow_installed_mrtr(
         &mut self,
         cx: &Cx,
@@ -7061,16 +7109,7 @@ where
                     .or_insert_with(|| value.clone());
             }
         }
-        if let Some(level) = self.final_log_level {
-            generated.insert(
-                "io.modelcontextprotocol/logLevel".to_owned(),
-                serde_json::to_value(level).map_err(|error| {
-                    McpError::internal_error(format!(
-                        "Failed to serialize modern logging configuration: {error}"
-                    ))
-                })?,
-            );
-        }
+        insert_final_request_log_level(generated, self.final_log_level)?;
         object.insert("_meta".to_owned(), metadata);
         Ok(params)
     }
@@ -9372,6 +9411,11 @@ pub struct HttpClient {
     /// [`Self::set_log_level_typed`] stores a severity; never sent as the
     /// removed final `logging/setLevel` RPC.
     final_log_level: Option<LoggingLevel>,
+    /// Request-scoped final server notifications retained from modern SSE
+    /// response bodies. Progress is kept in a separate queue so exact JSON
+    /// number lexemes survive.
+    final_server_notifications: VecDeque<ServerNotification>,
+    final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
 }
 
 /// Errors raised while composing a ready public HTTP client.
@@ -9900,6 +9944,8 @@ impl HttpClient {
             mcp_apps_settings,
             live_subscription: None,
             final_log_level: None,
+            final_server_notifications: VecDeque::new(),
+            final_progress_notifications: VecDeque::new(),
         })
     }
 
@@ -10092,6 +10138,32 @@ impl HttpClient {
         self.connection.take_legacy_notification()
     }
 
+    /// Drains non-progress final server notifications received on modern HTTP
+    /// request-owned SSE bodies.
+    ///
+    /// Exact 2024-11-05 sessions never retain values here; use
+    /// [`Self::take_legacy_notification`] for the shared legacy SSE stream.
+    #[must_use]
+    pub fn take_final_server_notifications(&mut self) -> Vec<ServerNotification> {
+        self.final_server_notifications.drain(..).collect()
+    }
+
+    /// Drains exact final progress notifications received on modern HTTP
+    /// request-owned SSE bodies.
+    #[must_use]
+    pub fn take_final_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
+        self.final_progress_notifications.drain(..).collect()
+    }
+
+    fn retain_final_http_notifications(
+        &mut self,
+        server: Vec<ServerNotification>,
+        progress: Vec<FinalProgressNotificationParams>,
+    ) {
+        self.final_server_notifications.extend(server);
+        self.final_progress_notifications.extend(progress);
+    }
+
     /// Consumes the high-level wrapper and returns its transport.
     #[must_use]
     pub fn into_connection(self) -> ClientHttpConnection {
@@ -10278,7 +10350,7 @@ impl HttpClient {
                         cx,
                         cancellation,
                         method,
-                        parameters,
+                        core_parameters,
                         request_id,
                         DEFAULT_FINAL_CACHE_MAX_BYTES,
                     )
@@ -10289,7 +10361,7 @@ impl HttpClient {
                     .request_json_with_result_source_at(
                         cx,
                         method,
-                        parameters,
+                        core_parameters,
                         request_id,
                         DEFAULT_FINAL_CACHE_MAX_BYTES,
                     )
@@ -10297,7 +10369,9 @@ impl HttpClient {
             }
         }
         .map_err(HttpClientError::Connection)?;
-        let (mut response, result_source, receipt) = response;
+        let (mut response, result_source, receipt, server_notifications, progress_notifications) =
+            response;
+        self.retain_final_http_notifications(server_notifications, progress_notifications);
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
@@ -10458,7 +10532,8 @@ impl HttpClient {
             }
         }
         .map_err(HttpClientError::Connection)?;
-        let (mut response, _, _) = response;
+        let (mut response, _, _, server_notifications, progress_notifications) = response;
+        self.retain_final_http_notifications(server_notifications, progress_notifications);
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
@@ -10486,6 +10561,12 @@ impl HttpClient {
     /// Configures one of the RFC 5424 severities supported by both protocol eras.
     pub fn set_log_level(&mut self, level: LogLevel) -> Result<(), HttpClientError> {
         self.set_log_level_typed(final_log_level(level))
+    }
+
+    /// Returns the modern request `logLevel` stored by [`Self::set_log_level_typed`].
+    #[must_use]
+    pub fn log_level(&self) -> Option<LoggingLevel> {
+        self.final_log_level
     }
 
     /// Lists one page of tools under a caller-owned cancellation domain.
@@ -10726,6 +10807,35 @@ impl HttpClient {
         .await
     }
 
+    /// Calls one tool and admits request-scoped `notifications/progress` for
+    /// the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub async fn call_tool_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: ProgressMarker,
+    ) -> Result<CoreResult, HttpClientError> {
+        let token = serde_json::to_value(progress_marker).map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "HTTP progress token could not be encoded",
+            ))
+        })?;
+        self.follow_installed_mrtr(
+            cx,
+            None,
+            "tools/call",
+            serde_json::json!({
+                "name": name,
+                "arguments": arguments,
+                "_meta": { "progressToken": token },
+            }),
+        )
+        .await
+    }
+
     async fn follow_installed_mrtr(
         &mut self,
         cx: &Cx,
@@ -10795,7 +10905,7 @@ impl HttpClient {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
         let request_id = self.next_request_id()?;
-        let (mut response, result_source, _) = self
+        let (mut response, result_source, _, server_notifications, progress_notifications) = self
             .connection
             .request_final_extension_json_with_result_source_at(
                 cx,
@@ -10807,6 +10917,7 @@ impl HttpClient {
             )
             .await
             .map_err(HttpClientError::Connection)?;
+        self.retain_final_http_notifications(server_notifications, progress_notifications);
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
@@ -11157,20 +11268,17 @@ impl HttpClient {
                 "HTTP client metadata could not form a core request",
             ))
         })?;
-        if let Some(level) = self.final_log_level {
-            let object = metadata.as_object_mut().ok_or_else(|| {
-                HttpClientError::CoreResult(McpError::internal_error(
-                    "HTTP client metadata is not an object",
-                ))
-            })?;
-            object.insert(
-                "io.modelcontextprotocol/logLevel".to_owned(),
-                serde_json::to_value(level).map_err(|error| {
-                    HttpClientError::CoreResult(McpError::internal_error(format!(
-                        "Failed to serialize modern logging configuration: {error}"
-                    )))
-                })?,
-            );
+        if let Some(object) = metadata.as_object_mut() {
+            insert_final_request_log_level(object, self.final_log_level)
+                .map_err(HttpClientError::CoreResult)?;
+            if let Some(caller) = parameters
+                .get("_meta")
+                .and_then(serde_json::Value::as_object)
+            {
+                for (key, value) in caller {
+                    object.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
         }
         parameters.insert("_meta".to_owned(), metadata);
         Ok(serde_json::Value::Object(parameters))
@@ -13326,16 +13434,7 @@ impl Client {
             );
         }
         metadata.extend(final_metadata);
-        if let Some(level) = self.final_log_level {
-            metadata.insert(
-                "io.modelcontextprotocol/logLevel".to_owned(),
-                serde_json::to_value(level).map_err(|error| {
-                    McpError::internal_error(format!(
-                        "Failed to serialize modern logging configuration: {error}"
-                    ))
-                })?,
-            );
-        }
+        insert_final_request_log_level(metadata, self.final_log_level)?;
         Ok(params)
     }
 
@@ -16084,6 +16183,27 @@ impl Client {
             CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => Ok(result.payload),
             _ => Err(unexpected_convenience_result("tools/call")),
         }
+    }
+
+    /// Calls one tool and admits request-scoped `notifications/progress` for
+    /// the supplied progress marker.
+    ///
+    /// Drain those frames with [`Self::take_final_progress_notifications`].
+    pub fn call_tool_with_progress_marker(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let params = CallToolParams {
+            name: name.to_string(),
+            arguments: Some(arguments),
+            meta: Some(RequestMeta {
+                progress_marker: Some(progress_marker),
+            }),
+        };
+        self.send_typed_core_request("tools/call", params)
     }
 
     /// Calls a tool and returns its exact MCP 2024-11-05 result payload.
@@ -22030,6 +22150,10 @@ mod tests {
         let _: fn(&mut ClientHttpConnection) -> Option<JsonRpcRequest> =
             ClientHttpConnection::take_legacy_notification;
         let _: fn(&mut HttpClient) -> Option<JsonRpcRequest> = HttpClient::take_legacy_notification;
+        let _: fn(&mut HttpClient) -> Vec<ServerNotification> =
+            HttpClient::take_final_server_notifications;
+        let _: fn(&mut HttpClient) -> Vec<FinalProgressNotificationParams> =
+            HttpClient::take_final_progress_notifications;
         let _ = ModernHttpConnectOutcome::into_legacy_sse;
         let _ = LegacySseHttpClient::connect;
         let _ = LegacyHttpRequest::wait;
@@ -24261,7 +24385,7 @@ mod tests {
             ClientCapabilities::default(),
         ))
         .expect("public HTTP connection completes discovery");
-        let (response, result_source, receipt) =
+        let (response, result_source, receipt, _, _) =
             http_test_runtime_block_on(connection.request_json_with_result_source_at(
                 &cx,
                 "tools/list",
@@ -27752,6 +27876,37 @@ mod tests {
         assert!(formatted.contains("logger_present=false"));
         assert!(formatted.contains("data_kind=object"));
         assert!(formatted.contains("data_extent=small"));
+    }
+
+    #[test]
+    #[test]
+    fn insert_final_request_log_level_stamps_only_when_configured() {
+        let mut metadata = serde_json::Map::new();
+        insert_final_request_log_level(&mut metadata, None)
+            .expect("absent logLevel leaves request metadata unchanged");
+        assert!(metadata.is_empty());
+
+        insert_final_request_log_level(&mut metadata, Some(LoggingLevel::Info))
+            .expect("a configured logLevel is request metadata");
+        assert_eq!(
+            metadata.get("io.modelcontextprotocol/logLevel"),
+            Some(&serde_json::json!("info"))
+        );
+
+        insert_final_request_log_level(&mut metadata, Some(LoggingLevel::Emergency))
+            .expect("changing only the rank overwrites the same metadata key");
+        assert_eq!(
+            metadata.get("io.modelcontextprotocol/logLevel"),
+            Some(&serde_json::json!("emergency"))
+        );
+    }
+
+    #[test]
+    fn public_http_client_exposes_final_notification_take() {
+        let _: fn(&mut HttpClient) -> Vec<ServerNotification> =
+            HttpClient::take_final_server_notifications;
+        let _: fn(&mut HttpClient) -> Vec<FinalProgressNotificationParams> =
+            HttpClient::take_final_progress_notifications;
     }
 
     #[test]
