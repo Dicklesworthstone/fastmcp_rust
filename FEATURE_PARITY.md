@@ -168,7 +168,7 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `tools/list` | ✅ | ✅ | With cursor pagination |
 | `tools/call` | ✅ | ✅ | With progress token support |
 | `resources/list` | ✅ | ✅ | With cursor pagination |
-| `resources/read` | ✅ | ✅ | With progress token support |
+| `resources/read` | ✅ | ✅ | With progress token support. Final `#[resource]` handlers that author a complete result keep their `ttlMs` / `cacheScope`; the router default (one hour, private) applies only to the legacy-bridge projection |
 | `resources/templates/list` | ✅ | 🟡 | Listing plus RFC 6570 reversible matching exist; lossy prefix/explode templates are refused rather than guessed |
 | `resources/subscribe` | ✅ | ✅ | Session dispatch serves subscribe for registered URIs; registering a resource or template advertises `resources.subscribe` on initialize |
 | `resources/unsubscribe` | ✅ | ✅ | Protocol support |
@@ -208,8 +208,8 @@ edge nor a network capability while TASK-01/TASK-02 remain open.
 
 | MCP Method | Python | Rust | Notes |
 |------------|--------|------|-------|
-| **Elicitation** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` plus stdio response routing exist. Modern WebSocket and modern HTTP answer typed `elicitation/create` reverse requests when a modern handler is installed. Modern server elicitation is MRTR `input_required` (`ctx.final_elicitation_form` / `final_elicitation_url`); live `bind_http` `read_resource_result` / `get_prompt_result` return that branch for form elicitation. Public `call_tool` fulfills an installed elicitation handler locally. Custom-loop qualification remains open |
-| **Roots** | ✅ | 🟡 | `TransportRootsProvider` exists. Modern WebSocket and modern HTTP answer typed `roots/list` reverse requests when a modern handler is installed. Modern server roots are MRTR `input_required`, not reverse JSON-RPC; public `call_tool` fulfills an installed roots handler locally |
+| **Elicitation** | ✅ | 🟡 | `ctx.elicit_form()`, `ctx.elicit_url()`, and `ctx.elicit_with_request()` plus stdio response routing exist. Modern WebSocket and modern HTTP answer typed `elicitation/create` reverse requests when a modern handler is installed. Modern server elicitation is MRTR `input_required` (`ctx.final_elicitation_form` / `final_elicitation_url`); live `bind_http` `read_resource_result` / `get_prompt_result` return the form branch, and live `bind_http` `call_tool_result` returns the URL branch when the client advertises `elicitation.url` and rejects when it does not. Public `call_tool` / `read_resource` / `get_prompt` fulfill an installed elicitation handler locally. Custom-loop qualification remains open |
+| **Roots** | ✅ | 🟡 | `TransportRootsProvider` exists. Modern WebSocket and modern HTTP answer typed `roots/list` reverse requests when a modern handler is installed. Modern server roots are MRTR `input_required` via `ctx.final_roots` (capability-gated, same pattern as `ctx.final_sampling`); live `bind_http` `call_tool_result` returns that branch when the client advertises `roots` and rejects `InvalidRequest` when it does not. Public `call_tool` fulfills an installed roots handler locally. Custom-loop qualification remains open |
 
 ### Bidirectional Communication Infrastructure
 
@@ -230,19 +230,19 @@ The following bidirectional building blocks exist in source. This inventory does
 | Feature | Python | Rust | Notes |
 |---------|--------|------|-------|
 | Subprocess spawning | ✅ | 🟡 | Stdio subprocess integration exists. Explicit `Client::close` returns cleanup failures; opt-in anchored group ownership is Unix-only and is not portable process-tree containment |
-| Client transport integration | ✅ | 🟡 | Public `Client` covers subprocess stdio, HTTP (`Client::http` with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` plus cancellation variants), and exact-2024 SSE (`Client::sse`); WebSocket (`websocket-experimental`) has incremental catalog listen plus the same typed verbs and `list_tools_with_cancellation`/`call_tool_with_cancellation` so the same connection can keep issuing or cancel ordinary requests |
+| Client transport integration | ✅ | 🟡 | Public `Client` covers subprocess stdio, HTTP (`Client::http` with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` plus cancellation variants), and exact-2024 SSE (`Client::sse`); `modern::Client` stdio `call_tool_result` / `read_resource_result` / `get_prompt_result` keep a live `input_required` branch the same way the HTTP/WebSocket result verbs do. A Modern2026 stdio session stamps the same `_meta` protocol version and client capabilities on `start_multiplexed_request` that the typed verbs already send. Public stdio `read_resource` / `get_prompt` follow installed modern reverse handlers the same way `call_tool` does. Public stdio `modern::Client` also exposes `list_tools_with_cancellation` / `call_tool_with_cancellation`. WebSocket (`websocket-experimental`) has incremental catalog listen plus the same typed verbs and `list_tools_with_cancellation`/`call_tool_with_cancellation` so the same connection can keep issuing or cancel ordinary requests |
 | Tool invocation | ✅ | ✅ | `call_tool()` |
 | Resource reading | ✅ | ✅ | `read_resource()` |
 | Prompt fetching | ✅ | ✅ | `get_prompt()` |
 | Progress callbacks | ✅ | ✅ | `call_tool_with_progress()` |
 | List operations | ✅ | ✅ | Tool/resource/prompt list methods exist |
-| Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the Unix stdio receive pump can route it during dispatch. Public HTTP `request_final_core_with_cancellation` plus typed `list_tools_with_cancellation`/`call_tool_with_cancellation` honor a caller-owned cancellation domain for ordinary core requests. WebSocket typed `list_tools_with_cancellation`/`call_tool_with_cancellation` reject before send and retire after send; a blocked ingress wait still belongs to the connection `Cx` until the next frame. Non-Unix stdio and custom/SSE loops retain sequential/blocking boundaries; reliable interruption, cleanup waiting, and request-owned isolation remain open |
+| Request cancellation | ✅ | 🟡 | `cancel_request()` emits the notification and the Unix stdio receive pump can route it during dispatch. Public HTTP `request_final_core_with_cancellation` plus typed `list_tools_with_cancellation`/`call_tool_with_cancellation` honor a caller-owned cancellation domain for ordinary core requests. Public stdio `modern::Client` now exposes the same typed `list_tools_with_cancellation`/`call_tool_with_cancellation` verbs and rejects before send when the domain is already cancelled. WebSocket typed `list_tools_with_cancellation`/`call_tool_with_cancellation` reject before send and retire after send; a blocked ingress wait still belongs to the connection `Cx` until the next frame. Non-Unix stdio and custom/SSE loops retain sequential/blocking boundaries; reliable interruption, cleanup waiting, and request-owned isolation remain open |
 | Log level setting | ✅ | ✅ | `set_log_level()` |
 | Response ID validation | ✅ | ✅ | Validates response IDs |
 | Client request idle/absolute deadlines | ✅ | 🟡 | Ordinary requests use monotonic `Instant` deadlines that begin after send commit (30-second idle and 120-second non-resettable absolute defaults). Unix subprocess stdout receives, including silent and partial frames, are bounded; generic blocking `recv`, non-Unix child pipes, synchronous writes, and best-effort Drop prevent a portable end-to-end wall-clock guarantee (FND-04) |
 | **MCPConfig client creation** | ✅ | ✅ | `mcp_config.rs` with JSON/TOML parsing |
-| **SamplingHandler** | ✅ | 🟡 | Context and transport sender paths exist with stdio response routing. Modern HTTP/WebSocket `call_tool` fulfills an installed sampling handler against server `input_required`. Custom transport routing and lifecycle qualification remain open |
-| **ElicitationHandler** | ✅ | 🟡 | Context and transport sender paths exist with stdio response routing. Modern HTTP/WebSocket `call_tool` fulfills an installed elicitation handler against server `input_required`. Custom transport routing and lifecycle qualification remain open |
+| **SamplingHandler** | ✅ | 🟡 | Context and transport sender paths exist with stdio response routing. Modern HTTP/WebSocket `call_tool` and public stdio `call_tool` / `read_resource` / `get_prompt` fulfill an installed sampling handler against server `input_required`. Custom transport routing and lifecycle qualification remain open |
+| **ElicitationHandler** | ✅ | 🟡 | Context and transport sender paths exist with stdio response routing. Modern HTTP/WebSocket `call_tool` and public stdio `call_tool` / `read_resource` / `get_prompt` fulfill an installed elicitation handler against server `input_required`. Custom transport routing and lifecycle qualification remain open |
 
 ### Historical client gap-closure inventory
 
@@ -270,8 +270,9 @@ The following bidirectional building blocks exist in source. This inventory does
 | Session state | ✅ | ✅ | `get_state()` / `set_state()` / `remove_state()` |
 | Auth context | ✅ | ✅ | `auth()` / `set_auth()` |
 | Parallel combinators | ❌ | ✅ | `join_all()`, `race()`, `quorum()`, `first_ok()` |
-| Sampling from handler | ✅ | 🟡 | Exact-2024 `ctx.sample()` / `ctx.sample_with_request()` use reverse JSON-RPC on stdio. Modern handlers use `ctx.final_sampling` → `input_required`; public HTTP/WebSocket `call_tool` fulfills installed sampling handlers locally. Custom-loop qualification remains open |
-| **Elicitation from handler** | ✅ | 🟡 | Exact-2024 `ctx.elicit_form()` / `ctx.elicit_url()` use reverse JSON-RPC on stdio. Modern handlers use `ctx.final_elicitation_form` / `final_elicitation_url` → `input_required`; public HTTP/WebSocket `call_tool` fulfills installed elicitation handlers locally. Custom-loop qualification remains open |
+| Sampling from handler | ✅ | 🟡 | Exact-2024 `ctx.sample()` / `ctx.sample_with_request()` use reverse JSON-RPC on stdio. Modern handlers use `ctx.final_sampling` → `input_required`; public HTTP/WebSocket `call_tool` and public stdio `call_tool` / `read_resource` / `get_prompt` fulfill installed sampling handlers locally. Custom-loop qualification remains open |
+| **Elicitation from handler** | ✅ | 🟡 | Exact-2024 `ctx.elicit_form()` / `ctx.elicit_url()` use reverse JSON-RPC on stdio. Modern handlers use `ctx.final_elicitation_form` / `final_elicitation_url` → `input_required`; public HTTP/WebSocket `call_tool` and public stdio `call_tool` / `read_resource` / `get_prompt` fulfill installed elicitation handlers locally. Custom-loop qualification remains open |
+| Roots from handler | ✅ | 🟡 | Exact-2024 `ctx.list_roots()` uses reverse JSON-RPC on stdio. Modern handlers use `ctx.final_roots` → `input_required`; live `bind_http` `call_tool_result` returns that branch. Public `call_tool` / `read_resource` / `get_prompt` fulfill an installed roots handler locally on HTTP, WebSocket, and stdio. Custom-loop qualification remains open |
 
 ### Historical context gap-closure inventory
 
