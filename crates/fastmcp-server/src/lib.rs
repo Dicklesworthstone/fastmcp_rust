@@ -1446,44 +1446,60 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
         method: &'static str,
         params: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, Legacy2024HandlerError> {
-        let request_id = serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
-            Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
-        })?;
-        let request_cancellation = self
-            .queue_state
-            .as_ref()
-            .and_then(|queue| queue.admitted_request_cancellation(&request_id));
-        let request = JsonRpcRequest::new(method, params.cloned(), request_id.clone());
-        let dispatch = self
-            .server
-            .dispatch_legacy_2024(
-                &self.cx,
-                self.session_id,
-                &self.session_principal,
-                Some(&self.runtime),
-                request_cancellation,
-                &request,
-            )
-            .map_err(|error| {
+        block_on(self.handle_legacy_2024_with_request_id_async(request_id, method, params))
+    }
+
+    fn handle_legacy_2024_with_request_id_async<'a>(
+        &'a mut self,
+        request_id: &'a serde_json::Value,
+        method: &'static str,
+        params: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value, Legacy2024HandlerError>> {
+        Box::pin(async move {
+            let request_id =
+                serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
+                    Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
+                })?;
+            let request_cancellation = self
+                .queue_state
+                .as_ref()
+                .and_then(|queue| queue.admitted_request_cancellation(&request_id));
+            let request = JsonRpcRequest::new(method, params.cloned(), request_id.clone());
+            let dispatch = self
+                .server
+                .dispatch_legacy_2024(
+                    &self.cx,
+                    self.session_id,
+                    &self.session_principal,
+                    Some(&self.runtime),
+                    request_cancellation,
+                    &request,
+                )
+                .await
+                .map_err(|error| {
+                    Legacy2024HandlerError::with_code(
+                        i64::from(i32::from(error.code)),
+                        error.message,
+                    )
+                })?;
+            let LiveLegacy2024Dispatch {
+                result,
+                active_request,
+            } = dispatch;
+            let mut retained = self
+                .active_request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retained.is_some() {
+                return Err(Legacy2024HandlerError::new(
+                    "legacy runtime attempted to overlap exact request finalization",
+                ));
+            }
+            *retained = Some(active_request);
+            drop(retained);
+            result.map_err(|error| {
                 Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
-            })?;
-        let LiveLegacy2024Dispatch {
-            result,
-            active_request,
-        } = dispatch;
-        let mut retained = self
-            .active_request
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if retained.is_some() {
-            return Err(Legacy2024HandlerError::new(
-                "legacy runtime attempted to overlap exact request finalization",
-            ));
-        }
-        *retained = Some(active_request);
-        drop(retained);
-        result.map_err(|error| {
-            Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
+            })
         })
     }
 }
@@ -1521,48 +1537,64 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
         method: &'static str,
         params: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, Legacy2024HandlerError> {
-        let request_id = serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
-            Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
-        })?;
-        let request = JsonRpcRequest::new(method, params.cloned(), request_id.clone());
-        let request_cx = self
-            .request_cx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let request_cancellation = self
-            .legacy_admissions
-            .admitted_request_cancellation(&request_id);
-        let dispatch = self
-            .server
-            .dispatch_legacy_2024(
-                &request_cx,
-                self.session_id,
-                &self.session_principal,
-                Some(&self.runtime),
-                request_cancellation,
-                &request,
-            )
-            .map_err(|error| {
+        block_on(self.handle_legacy_2024_with_request_id_async(request_id, method, params))
+    }
+
+    fn handle_legacy_2024_with_request_id_async<'a>(
+        &'a mut self,
+        request_id: &'a serde_json::Value,
+        method: &'static str,
+        params: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value, Legacy2024HandlerError>> {
+        Box::pin(async move {
+            let request_id =
+                serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
+                    Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
+                })?;
+            let request = JsonRpcRequest::new(method, params.cloned(), request_id.clone());
+            let request_cx = self
+                .request_cx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let request_cancellation = self
+                .legacy_admissions
+                .admitted_request_cancellation(&request_id);
+            let dispatch = self
+                .server
+                .dispatch_legacy_2024(
+                    &request_cx,
+                    self.session_id,
+                    &self.session_principal,
+                    Some(&self.runtime),
+                    request_cancellation,
+                    &request,
+                )
+                .await
+                .map_err(|error| {
+                    Legacy2024HandlerError::with_code(
+                        i64::from(i32::from(error.code)),
+                        error.message,
+                    )
+                })?;
+            let LiveLegacy2024Dispatch {
+                result,
+                active_request,
+            } = dispatch;
+            let mut retained = self
+                .active_request
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if retained.is_some() {
+                return Err(Legacy2024HandlerError::new(
+                    "legacy runtime attempted to overlap exact request finalization",
+                ));
+            }
+            *retained = Some(active_request);
+            drop(retained);
+            result.map_err(|error| {
                 Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
-            })?;
-        let LiveLegacy2024Dispatch {
-            result,
-            active_request,
-        } = dispatch;
-        let mut retained = self
-            .active_request
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if retained.is_some() {
-            return Err(Legacy2024HandlerError::new(
-                "legacy runtime attempted to overlap exact request finalization",
-            ));
-        }
-        *retained = Some(active_request);
-        drop(retained);
-        result.map_err(|error| {
-            Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
+            })
         })
     }
 }
@@ -2025,9 +2057,17 @@ fn legacy_adapter_response<H: Legacy2024Handler>(
     binding: LegacyPeerBinding,
     request: &JsonRpcRequest,
 ) -> Result<Option<JsonRpcResponse>, Legacy2024AdapterError> {
+    block_on(legacy_adapter_response_async(adapter, binding, request))
+}
+
+async fn legacy_adapter_response_async<H: Legacy2024Handler>(
+    adapter: &mut Legacy2024ServerAdapter<H>,
+    binding: LegacyPeerBinding,
+    request: &JsonRpcRequest,
+) -> Result<Option<JsonRpcResponse>, Legacy2024AdapterError> {
     let wire = serde_json::to_value(request)
         .expect("a validated JSON-RPC request must serialize for the legacy adapter");
-    match adapter.receive(binding, wire)? {
+    match adapter.receive_async(binding, wire).await? {
         Legacy2024Outbound::Response(response) => {
             let response = serde_json::from_value(response)
                 .expect("the legacy adapter must emit a valid JSON-RPC response");
@@ -5196,7 +5236,10 @@ impl HttpLegacyCancellationControl {
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
 struct LiveHttpSession {
-    session: Mutex<ServerHttpSession>,
+    /// `None` while the owning connection child is driving request-owned
+    /// handler futures. Cancellation and reverse-response routing stay
+    /// outside this slot so they never wait on that exclusive borrow.
+    session: Mutex<Option<ServerHttpSession>>,
     cancellation: HttpLegacyCancellationControl,
     /// Reverse request correlation is intentionally outside `session`.
     ///
@@ -5208,6 +5251,23 @@ struct LiveHttpSession {
     /// through `ServerHttpSession::handle`, preserving serialized adapter and
     /// session-state mutation.
     legacy_pending_requests: Arc<PendingRequests>,
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+fn take_live_http_session(session: &LiveHttpSession) -> Option<ServerHttpSession> {
+    session
+        .session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+fn restore_live_http_session(session: &LiveHttpSession, owned: ServerHttpSession) {
+    *session
+        .session
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owned);
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -5702,10 +5762,15 @@ async fn close_live_http_sessions(cx: &Cx, sessions: &LiveHttpSessionRegistry) {
         // waits on that serialized mutex before revoking admitted work.
         session.cancellation.cancel_all_admitted_requests();
         match session.session.try_lock() {
-            Ok(mut session) => dispatches.extend(session.begin_close()),
+            Ok(mut session) => {
+                if let Some(session) = session.as_mut() {
+                    dispatches.extend(session.begin_close());
+                }
+            }
             Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                let mut session = poisoned.into_inner();
-                dispatches.extend(session.begin_close());
+                if let Some(session) = poisoned.into_inner().as_mut() {
+                    dispatches.extend(session.begin_close());
+                }
             }
             Err(std::sync::TryLockError::WouldBlock) => {
                 // The owning connection child is cancelled and joined below.
@@ -7050,7 +7115,17 @@ impl ServerHttpSession {
         cx: &Cx,
         request: HttpRequest,
     ) -> Result<ServerHttpEndpointResponse, ServerHttpEndpointError> {
-        self.handle_with_modern_request_cancellation(cx, request, None)
+        block_on(self.handle_async(cx, request))
+    }
+
+    /// Routes one HTTP request on the caller's `Cx` instead of `block_on`.
+    pub async fn handle_async(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+    ) -> Result<ServerHttpEndpointResponse, ServerHttpEndpointError> {
+        self.handle_with_modern_request_cancellation_async(cx, request, None)
+            .await
             .map_err(ServerHttpEndpointError::from_internal)
     }
 
@@ -7062,19 +7137,50 @@ impl ServerHttpSession {
         request: HttpRequest,
         modern_request_cancellation: Option<McpRequestCancellation>,
     ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        block_on(self.handle_with_modern_request_cancellation_async(
+            cx,
+            request,
+            modern_request_cancellation,
+        ))
+    }
+
+    async fn handle_with_modern_request_cancellation_async(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+        modern_request_cancellation: Option<McpRequestCancellation>,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
         let transport_authorization = match transport_authorization_from_http_request(&request) {
             Ok(authorization) => authorization,
             Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
         };
-        self.handle_with_modern_request_cancellation_and_transport_authorization(
+        self.handle_with_modern_request_cancellation_and_transport_authorization_async(
             cx,
             request,
             transport_authorization,
             modern_request_cancellation,
         )
+        .await
     }
 
     fn handle_with_modern_request_cancellation_and_transport_authorization(
+        &mut self,
+        cx: &Cx,
+        request: HttpRequest,
+        transport_authorization: TransportAuthorization,
+        modern_request_cancellation: Option<McpRequestCancellation>,
+    ) -> Result<ServerHttpEndpointResponse, DualEraHttpEndpointError> {
+        block_on(
+            self.handle_with_modern_request_cancellation_and_transport_authorization_async(
+                cx,
+                request,
+                transport_authorization,
+                modern_request_cancellation,
+            ),
+        )
+    }
+
+    async fn handle_with_modern_request_cancellation_and_transport_authorization_async(
         &mut self,
         cx: &Cx,
         request: HttpRequest,
@@ -7227,7 +7333,7 @@ impl ServerHttpSession {
             );
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
-        return self.handle_legacy(cx, endpoint_response);
+        return self.handle_legacy(cx, endpoint_response).await;
         #[cfg(not(any(feature = "legacy-2024-11-05", test)))]
         {
             let _ = endpoint_response;
@@ -7854,7 +7960,7 @@ impl ServerHttpSession {
     }
 
     #[cfg(any(feature = "legacy-2024-11-05", test))]
-    fn handle_legacy(
+    async fn handle_legacy(
         &mut self,
         cx: &Cx,
         endpoint_response: DualEraHttpEndpointResponse,
@@ -7920,7 +8026,8 @@ impl ServerHttpSession {
                 self.legacy_adapter.insert(adapter)
             }
         };
-        let legacy_response = legacy_adapter_response(adapter, self.legacy_binding, &request)
+        let legacy_response = legacy_adapter_response_async(adapter, self.legacy_binding, &request)
+            .await
             .map_err(|error| {
                 DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::other(
                     error.to_string(),
@@ -9691,6 +9798,25 @@ fn dispatch_http_request(
     request: HttpRequest,
     legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
 ) -> HttpResponse {
+    block_on(dispatch_http_request_async(
+        cx,
+        endpoint,
+        legacy_sessions,
+        modern_sessions,
+        request,
+        legacy_admission,
+    ))
+}
+
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+async fn dispatch_http_request_async(
+    cx: &Cx,
+    endpoint: &ServerHttpEndpoint,
+    legacy_sessions: &LiveHttpSessionRegistry,
+    modern_sessions: &LiveModernHttpSessionRegistry,
+    request: HttpRequest,
+    legacy_admission: Option<HttpLegacyRequestAdmissionGuard>,
+) -> HttpResponse {
     let is_legacy_message = request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.legacy_message_path;
     if is_legacy_message {
@@ -9773,12 +9899,14 @@ fn dispatch_http_request(
                 Legacy2024HttpPostEnvelope::Response(_) => None,
             },
         };
-        let response = session
-            .session
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .handle(cx, request)
+        let Some(mut owned) = take_live_http_session(&session) else {
+            return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
+        };
+        let response = owned
+            .handle_async(cx, request)
+            .await
             .map_err(|_| HttpResponse::bad_request());
+        restore_live_http_session(&session, owned);
         return response.map_or_else(
             |response| response,
             |response| http_endpoint_response_to_static(cx, response),
@@ -9797,7 +9925,8 @@ fn dispatch_http_request(
     };
     let error_request = request.clone();
     session
-        .handle(cx, request)
+        .handle_async(cx, request)
+        .await
         .map(|response| http_endpoint_response_to_static(cx, response))
         .unwrap_or_else(|error| {
             http_endpoint_error_response(
@@ -9987,10 +10116,10 @@ async fn serve_http_connection(
         return;
     }
     if !is_legacy_sse {
-        // Admit correlated legacy work before it enters the bounded blocking
-        // dispatch queue. The captured guard keeps this exact authority alive
-        // while it waits for the session mutex and then crosses into active
-        // dispatch and response finalization.
+        // Admit correlated legacy work before the request-owned handler
+        // future is polled on this connection `Cx`. The captured guard keeps
+        // this exact authority alive while dispatch takes the session slot
+        // and awaits the handler instead of `block_on`.
         let legacy_admission =
             match admit_live_http_legacy_request(&endpoint, &legacy_sessions, &request) {
                 Ok(admission) => admission,
@@ -9999,29 +10128,15 @@ async fn serve_http_connection(
                     return;
                 }
             };
-        let request_endpoint = Arc::clone(&endpoint);
-        let request_legacy_sessions = Arc::clone(&legacy_sessions);
-        let request_modern_sessions = Arc::clone(&modern_sessions);
-        let mut dispatch = match cx.spawn_blocking(move |request_cx| {
-            dispatch_http_request(
-                &request_cx,
-                &request_endpoint,
-                &request_legacy_sessions,
-                &request_modern_sessions,
-                request,
-                legacy_admission,
-            )
-        }) {
-            Ok(dispatch) => dispatch,
-            Err(_) => {
-                let _ = send_h1_response(cx, &mut framed, HttpResponse::internal_error()).await;
-                return;
-            }
-        };
-        let response = match dispatch.join(cx).await {
-            Ok(response) => response,
-            Err(_) => HttpResponse::internal_error(),
-        };
+        let response = dispatch_http_request_async(
+            cx,
+            &endpoint,
+            &legacy_sessions,
+            &modern_sessions,
+            request,
+            legacy_admission,
+        )
+        .await;
         let _ = send_h1_response(cx, &mut framed, response).await;
         return;
     }
@@ -10053,7 +10168,7 @@ async fn serve_http_connection(
     let session = Arc::new(LiveHttpSession {
         cancellation: session.cancellation_control(),
         legacy_pending_requests: Arc::clone(&session.legacy_pending_requests),
-        session: Mutex::new(session),
+        session: Mutex::new(Some(session)),
     });
     legacy_sessions
         .lock()
@@ -10074,7 +10189,9 @@ async fn serve_http_connection(
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .begin_close();
+            .as_mut()
+            .map(ServerHttpSession::begin_close)
+            .unwrap_or_default();
         for mut task in dispatches {
             let _ = task.join(cx).await;
         }
@@ -11874,7 +11991,7 @@ impl Server {
     /// reuse [`Self::dispatch_stateless`]: that modern surface adds
     /// `resultType: "complete"`, which has no exact-2024 representation.
     #[cfg(any(feature = "legacy-2024-11-05", test))]
-    fn dispatch_legacy_2024(
+    async fn dispatch_legacy_2024(
         &self,
         cx: &Cx,
         session_id: u64,
@@ -11906,7 +12023,7 @@ impl Server {
             )
         })?;
         let request_cancellation = active_guard.cancellation();
-        let result = (|| {
+        let result = async {
             let session_state =
                 runtime.map_or_else(SessionState::new, |runtime| runtime.session_state.clone());
             let (mut request_ctx, _request_lease_guard) = self.request_context(
@@ -11966,7 +12083,7 @@ impl Server {
             }
 
             let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
-            let result: McpResult<serde_json::Value> = (|| {
+            let result: McpResult<serde_json::Value> = async {
                 for middleware in self.middleware.iter() {
                     Self::enforce_request_context(&request_ctx)?;
                     entered_middleware.push(middleware.as_ref());
@@ -11982,9 +12099,11 @@ impl Server {
 
                 let params = request.params.clone();
                 match request.method.as_str() {
-                    "completion/complete" => self
-                        .router
-                        .dispatch_legacy_completion(&request_ctx, request),
+                    "completion/complete" => {
+                        self.router
+                            .dispatch_legacy_completion_in_request(&request_ctx, cx, request)
+                            .await
+                    }
                     "tools/list" => {
                         let params: ListToolsParams = parse_params_or_default(params)?;
                         serde_json::to_value(self.router.handle_tools_list(
@@ -11996,13 +12115,18 @@ impl Server {
                     }
                     "tools/call" => {
                         let params: CallToolParams = parse_params(params)?;
-                        serde_json::to_value(self.router.handle_tools_call(
-                            &request_ctx,
-                            params,
-                            session_state.clone(),
-                            runtime.map(|runtime| &runtime.notification_sender),
-                            bidirectional_senders.as_ref(),
-                        )?)
+                        serde_json::to_value(
+                            self.router
+                                .handle_tools_call_in_request(
+                                    &request_ctx,
+                                    cx,
+                                    params,
+                                    session_state.clone(),
+                                    runtime.map(|runtime| &runtime.notification_sender),
+                                    bidirectional_senders.as_ref(),
+                                )
+                                .await?,
+                        )
                         .map_err(McpError::from)
                     }
                     "resources/list" => {
@@ -12025,13 +12149,18 @@ impl Server {
                     }
                     "resources/read" => {
                         let params: ReadResourceParams = parse_params(params)?;
-                        serde_json::to_value(self.router.handle_resources_read(
-                            &request_ctx,
-                            &params,
-                            session_state.clone(),
-                            runtime.map(|runtime| &runtime.notification_sender),
-                            bidirectional_senders.as_ref(),
-                        )?)
+                        serde_json::to_value(
+                            self.router
+                                .handle_resources_read_in_request(
+                                    &request_ctx,
+                                    cx,
+                                    &params,
+                                    session_state.clone(),
+                                    runtime.map(|runtime| &runtime.notification_sender),
+                                    bidirectional_senders.as_ref(),
+                                )
+                                .await?,
+                        )
                         .map_err(McpError::from)
                     }
                     "prompts/list" => {
@@ -12045,18 +12174,24 @@ impl Server {
                     }
                     "prompts/get" => {
                         let params: GetPromptParams = parse_params(params)?;
-                        serde_json::to_value(self.router.handle_prompts_get(
-                            &request_ctx,
-                            params,
-                            session_state,
-                            runtime.map(|runtime| &runtime.notification_sender),
-                            bidirectional_senders.as_ref(),
-                        )?)
+                        serde_json::to_value(
+                            self.router
+                                .handle_prompts_get_in_request(
+                                    &request_ctx,
+                                    cx,
+                                    params,
+                                    session_state,
+                                    runtime.map(|runtime| &runtime.notification_sender),
+                                    bidirectional_senders.as_ref(),
+                                )
+                                .await?,
+                        )
                         .map_err(McpError::from)
                     }
                     _ => Err(McpError::method_not_found(&request.method)),
                 }
-            })();
+            }
+            .await;
 
             let result = self.finalize_middleware_result(
                 &request_cancellation,
@@ -12082,7 +12217,8 @@ impl Server {
                 Ok(value) => Ok(value),
                 Err(error) => Err(error),
             }
-        })();
+        }
+        .await;
 
         Ok(LiveLegacy2024Dispatch {
             result,
