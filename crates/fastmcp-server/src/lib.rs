@@ -113,7 +113,8 @@ pub use handler::{
     FinalRoots, FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
     FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler, ResourceHandler,
     ToolErrorKind, ToolHandler, create_context_with_progress,
-    create_context_with_progress_and_senders,
+    create_context_with_progress_and_senders, promote_legacy_prompt_messages,
+    promote_legacy_resource_contents, promote_legacy_tool_content,
 };
 pub use middleware::{Middleware, MiddlewareDecision};
 use oauth::{
@@ -1464,10 +1465,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
                 &request,
             )
             .map_err(|error| {
-                Legacy2024HandlerError::with_code(
-                    i64::from(i32::from(error.code)),
-                    "legacy runtime handler rejected an admitted request",
-                )
+                Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
             })?;
         let LiveLegacy2024Dispatch {
             result,
@@ -1485,10 +1483,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
         *retained = Some(active_request);
         drop(retained);
         result.map_err(|error| {
-            Legacy2024HandlerError::with_code(
-                i64::from(i32::from(error.code)),
-                "legacy runtime handler rejected an admitted request",
-            )
+            Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
         })
     }
 }
@@ -1549,10 +1544,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
                 &request,
             )
             .map_err(|error| {
-                Legacy2024HandlerError::with_code(
-                    i64::from(i32::from(error.code)),
-                    "legacy runtime handler rejected an admitted request",
-                )
+                Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
             })?;
         let LiveLegacy2024Dispatch {
             result,
@@ -1570,10 +1562,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
         *retained = Some(active_request);
         drop(retained);
         result.map_err(|error| {
-            Legacy2024HandlerError::with_code(
-                i64::from(i32::from(error.code)),
-                "legacy runtime handler rejected an admitted request",
-            )
+            Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
         })
     }
 }
@@ -11932,6 +11921,16 @@ impl Server {
                 runtime.and_then(|runtime| runtime.log_level()),
             );
             if let Some(runtime) = runtime {
+                let mut info = ClientCapabilityInfo::new();
+                if runtime.supports_sampling.load(Ordering::Acquire) {
+                    info = info.with_sampling();
+                }
+                if runtime.supports_roots.load(Ordering::Acquire) {
+                    info = info.with_roots(false);
+                }
+                request_ctx = request_ctx.with_client_capabilities(info);
+            }
+            if let Some(runtime) = runtime {
                 let sender = Arc::clone(&runtime.notification_sender);
                 request_ctx = request_ctx.with_log_sender(Arc::new(
                     crate::handler::LogNotificationSender::new(move |notification| {
@@ -16493,6 +16492,36 @@ impl Server {
         info
     }
 
+    /// Handler-visible slice of a negotiated client capability document.
+    fn handler_visible_client_capabilities(caps: &ClientCapabilities) -> ClientCapabilityInfo {
+        let (elicitation_form, elicitation_url) = caps
+            .elicitation
+            .as_ref()
+            .map_or((false, false), |elicitation| {
+                (elicitation.supports_form(), elicitation.supports_url())
+            });
+        let mut info =
+            ClientCapabilityInfo::new().with_elicitation(elicitation_form, elicitation_url);
+        if caps.sampling.is_some() {
+            info = info.with_sampling();
+        }
+        if let Some(roots) = caps.roots.as_ref() {
+            info = info.with_roots(roots.list_changed);
+        }
+        info
+    }
+
+    fn attach_session_client_capabilities(
+        ctx: McpContext,
+        capabilities: Option<&ClientCapabilities>,
+    ) -> McpContext {
+        match capabilities {
+            Some(capabilities) => ctx
+                .with_client_capabilities(Self::handler_visible_client_capabilities(capabilities)),
+            None => ctx,
+        }
+    }
+
     fn with_final_catalog_publisher(&self, ctx: McpContext) -> McpContext {
         ctx.with_catalog_publisher(Arc::new(FinalCatalogPublisher {
             registry: Arc::clone(&self.final_subscriptions),
@@ -16533,6 +16562,8 @@ impl Server {
             *budget,
         )?;
         let mw_ctx = Self::attach_session_log_floor(mw_ctx, session.log_level());
+        let mw_ctx =
+            Self::attach_session_client_capabilities(mw_ctx, session.client_capabilities());
         let mw_ctx =
             Self::attach_session_resource_subscriptions(mw_ctx, session.subscribed_resource_uris());
         if let Err(error) = Self::enforce_request_context(&mw_ctx) {
@@ -16916,6 +16947,17 @@ impl Server {
             *budget,
         )?;
         let mw_ctx = Self::attach_session_log_floor(mw_ctx, session.log_level);
+        let mut view_caps = ClientCapabilityInfo::new();
+        if session.supports_sampling {
+            view_caps = view_caps.with_sampling();
+        }
+        if session.supports_elicitation {
+            view_caps = view_caps.with_elicitation(true, false);
+        }
+        if session.supports_roots {
+            view_caps = view_caps.with_roots(false);
+        }
+        let mw_ctx = mw_ctx.with_client_capabilities(view_caps);
         let mw_ctx = Self::attach_session_resource_subscriptions(
             mw_ctx,
             session.resource_subscriptions.iter().map(String::as_str),

@@ -234,8 +234,7 @@ impl Legacy2024HandlerError {
         &self.code
     }
 
-    /// Returns the handler-provided diagnostic before the adapter maps it to
-    /// the fixed wire-level internal-error message.
+    /// Returns the handler-provided diagnostic retained on the exact-2024 wire.
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -259,28 +258,28 @@ pub enum Legacy2024Outbound {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Legacy2024AdapterError {
     code: JsonInteger,
-    message: &'static str,
+    message: String,
 }
 
 impl Legacy2024AdapterError {
-    fn invalid_request(message: &'static str) -> Self {
+    fn invalid_request(message: impl Into<String>) -> Self {
         Self {
             code: JsonInteger::from(-32600),
-            message,
+            message: message.into(),
         }
     }
 
-    fn invalid_params(message: &'static str) -> Self {
+    fn invalid_params(message: impl Into<String>) -> Self {
         Self {
             code: JsonInteger::from(-32602),
-            message,
+            message: message.into(),
         }
     }
 
-    fn method_not_found(message: &'static str) -> Self {
+    fn method_not_found(message: impl Into<String>) -> Self {
         Self {
             code: JsonInteger::from(-32601),
-            message,
+            message: message.into(),
         }
     }
 
@@ -290,16 +289,16 @@ impl Legacy2024AdapterError {
         &self.code
     }
 
-    /// Stable exact-2024 refusal message.
+    /// Refusal message retained from the adapter or the live handler.
     #[must_use]
-    pub const fn message(&self) -> &'static str {
-        self.message
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
 impl std::fmt::Display for Legacy2024AdapterError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.message)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -1019,15 +1018,17 @@ where
                     .handle_legacy_2024_with_request_id(request_id, method, params)
                     .map_err(|error| Legacy2024AdapterError {
                         code: error.code().clone(),
-                        message: "legacy handler failed",
+                        message: error.message().to_owned(),
                     })?;
                 match method {
                     TOOLS_CALL | RESOURCES_READ | PROMPTS_GET => {
                         translate_legacy_2024_result(method, result).map_err(|_| {
                             Legacy2024AdapterError {
-                                code: JsonInteger::from(-32603),
-                                message: "handler result is not losslessly representable in exact MCP 2024-11-05",
-                            }
+                        code: JsonInteger::from(-32603),
+                        message:
+                            "handler result is not losslessly representable in exact MCP 2024-11-05"
+                                .to_owned(),
+                    }
                         })
                     }
                     _ => Ok(result),
