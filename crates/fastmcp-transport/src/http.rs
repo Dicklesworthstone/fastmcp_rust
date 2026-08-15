@@ -5996,6 +5996,39 @@ impl DualEraHttpSession {
         if self.closed {
             return Err(DualEraHttpEndpointError::Closed);
         }
+        let data = self.encode_legacy_live_message(message)?;
+        // Serialize liveness observation and the channel commit with body
+        // teardown. A stale response-body capability cannot publish after its
+        // stream has transitioned out of the live generation.
+        let _lifecycle_guard = self
+            .legacy_post_lifecycle_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.commit_legacy_live_message(data)
+    }
+
+    /// Publishes one live-generation message while the caller already holds
+    /// this generation's [`DualEraHttpLegacyLifecycle`] commit guard.
+    ///
+    /// `commit_if_live` and [`Self::publish_legacy_message`] share
+    /// `legacy_post_lifecycle_guard`. Re-entering the locking publisher from
+    /// a live commit deadlocks handler `list_changed`, progress, log, and
+    /// reverse-request send during POST dispatch.
+    pub fn publish_legacy_message_committed(
+        &self,
+        message: &JsonRpcMessage,
+    ) -> Result<(), DualEraHttpEndpointError> {
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
+        let data = self.encode_legacy_live_message(message)?;
+        self.commit_legacy_live_message(data)
+    }
+
+    fn encode_legacy_live_message(
+        &self,
+        message: &JsonRpcMessage,
+    ) -> Result<String, DualEraHttpEndpointError> {
         let mut encoded = match message {
             JsonRpcMessage::Request(request) => self.legacy_codec.encode_request(request)?,
             JsonRpcMessage::Response(response) => self.legacy_codec.encode_response(response)?,
@@ -6008,19 +6041,15 @@ impl DualEraHttpSession {
                 ),
             )));
         }
-        let data = String::from_utf8(encoded).map_err(|error| {
+        String::from_utf8(encoded).map_err(|error| {
             DualEraHttpEndpointError::Transport(TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 error,
             )))
-        })?;
-        // Serialize liveness observation and the channel commit with body
-        // teardown. A stale response-body capability cannot publish after its
-        // stream has transitioned out of the live generation.
-        let _lifecycle_guard = self
-            .legacy_post_lifecycle_guard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        })
+    }
+
+    fn commit_legacy_live_message(&self, data: String) -> Result<(), DualEraHttpEndpointError> {
         let reserves_live_delivery = self.reserve_legacy_live_delivery()?;
         if reserves_live_delivery {
             let Some(sender) = self.legacy_live_sender.as_ref() else {
@@ -11615,6 +11644,69 @@ Content-Length: {}\r\n\
                 .expect("live legacy response stays JSON-RPC"),
             JsonRpcMessage::Response(response) if response.id == Some(RequestId::Number(71))
         ));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn dual_era_endpoint_publishes_committed_notification_without_reentering_lifecycle_guard() {
+        let endpoint = dual_era_endpoint();
+        let mut session = endpoint.open_session().expect("endpoint opens a session");
+        let cx = Cx::for_testing();
+        let codec = Codec::new();
+        let lifecycle = session.legacy_lifecycle();
+
+        let legacy_sse = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/legacy/sse"))
+            .expect("legacy SSE GET is admitted");
+        let DualEraHttpEndpointResponse::LegacySse(mut legacy_sse) = legacy_sse else {
+            panic!("legacy GET creates its live SSE response body");
+        };
+        assert_eq!(
+            legacy_sse
+                .recv_event(&cx)
+                .expect("the advertised legacy POST endpoint is first")
+                .data,
+            session.legacy_message_endpoint()
+        );
+
+        let published = lifecycle
+            .commit_if_live(|| {
+                session.publish_legacy_message_committed(&JsonRpcMessage::Request(
+                    JsonRpcRequest::notification(
+                        "notifications/tools/list_changed",
+                        Some(serde_json::json!({})),
+                    ),
+                ))
+            })
+            .expect("a live generation admits one committed catalog notification");
+        published.expect("committed publish must not re-lock the generation guard");
+
+        let changed = legacy_sse
+            .recv_event(&cx)
+            .expect("the live stream receives the committed catalog notification");
+        assert!(changed.id.is_none());
+        assert!(matches!(
+            codec
+                .decode_complete_message(changed.data.as_bytes())
+                .expect("committed catalog notification stays JSON-RPC"),
+            JsonRpcMessage::Request(request)
+                if request.method == "notifications/tools/list_changed" && request.id.is_none()
+        ));
+
+        drop(legacy_sse);
+        assert!(
+            lifecycle
+                .commit_if_live(|| {
+                    session.publish_legacy_message_committed(&JsonRpcMessage::Request(
+                        JsonRpcRequest::notification(
+                            "notifications/tools/list_changed",
+                            Some(serde_json::json!({})),
+                        ),
+                    ))
+                })
+                .is_none(),
+            "closing only the live body must drop committed-publish authority"
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
