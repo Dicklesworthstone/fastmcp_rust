@@ -1481,13 +1481,11 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
                     Some(&self.runtime),
                     request_cancellation,
                     &request,
+                    None,
                 )
                 .await
                 .map_err(|error| {
-                    Legacy2024HandlerError::with_code(
-                        i64::from(i32::from(error.code)),
-                        error.message,
-                    )
+                    legacy_handler_error_from_mcp(error, self.server.mask_error_details)
                 })?;
             let LiveLegacy2024Dispatch {
                 result,
@@ -1505,7 +1503,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
             *retained = Some(active_request);
             drop(retained);
             result.map_err(|error| {
-                Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
+                legacy_handler_error_from_mcp(error, self.server.mask_error_details)
             })
         })
     }
@@ -1526,6 +1524,8 @@ struct HttpLegacy2024RuntimeHandler {
     /// for the session mutex. Reusing that authority here closes the gap
     /// between a separate cancellation POST and active-request registration.
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
+    /// Native HTTP admission receipt for the in-flight exact-2024 POST.
+    auth_receipt: Arc<Mutex<Option<AuthAdmissionReceipt>>>,
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -1567,6 +1567,11 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
             let request_cancellation = self
                 .legacy_admissions
                 .admitted_request_cancellation(&request_id);
+            let auth_receipt = self
+                .auth_receipt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             let dispatch = self
                 .server
                 .dispatch_legacy_2024(
@@ -1576,13 +1581,11 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
                     Some(&self.runtime),
                     request_cancellation,
                     &request,
+                    auth_receipt.as_ref(),
                 )
                 .await
                 .map_err(|error| {
-                    Legacy2024HandlerError::with_code(
-                        i64::from(i32::from(error.code)),
-                        error.message,
-                    )
+                    legacy_handler_error_from_mcp(error, self.server.mask_error_details)
                 })?;
             let LiveLegacy2024Dispatch {
                 result,
@@ -1600,7 +1603,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
             *retained = Some(active_request);
             drop(retained);
             result.map_err(|error| {
-                Legacy2024HandlerError::with_code(i64::from(i32::from(error.code)), error.message)
+                legacy_handler_error_from_mcp(error, self.server.mask_error_details)
             })
         })
     }
@@ -2961,6 +2964,15 @@ fn mask_peer_error(error: McpError, mask_error_details: bool) -> McpError {
     }
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
+fn legacy_handler_error_from_mcp(
+    error: McpError,
+    mask_error_details: bool,
+) -> Legacy2024HandlerError {
+    let masked = mask_peer_error(error, mask_error_details);
+    Legacy2024HandlerError::with_code(i64::from(i32::from(masked.code)), masked.message)
+}
+
 fn is_canonical_missing_required_client_capability_response(response: &JsonRpcResponse) -> bool {
     response.error.as_ref().is_some_and(|error| {
         error.code.as_i32() == Some(MISSING_REQUIRED_CLIENT_CAPABILITY_ERROR_CODE)
@@ -3660,6 +3672,8 @@ pub struct ServerHttpSession {
     legacy_request_cx: Arc<Mutex<Cx>>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    legacy_auth_receipt: Arc<Mutex<Option<AuthAdmissionReceipt>>>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_pending_requests: Arc<PendingRequests>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -5070,6 +5084,7 @@ impl HttpLegacyRequestAdmissions {
         self: &Arc<Self>,
         request: &JsonRpcRequest,
         principal_binding: &SessionPrincipalBinding,
+        fingerprint: Sha256Digest,
     ) -> Result<Option<HttpLegacyRequestAdmissionGuard>, ()> {
         if request.validate().is_err()
             || request.id.is_none()
@@ -5092,7 +5107,9 @@ impl HttpLegacyRequestAdmissions {
         // both authentication and map lookup. A control POST therefore cannot
         // observe a bound owner without the matching per-ID authority, or an
         // authority whose owner it cannot yet verify.
-        bind_anonymous_connection_principal(principal_binding).map_err(|_| ())?;
+        if !principal_binding.bind_or_verify(fingerprint) {
+            return Err(());
+        }
         if inner.entries.contains_key(&key) {
             return Err(());
         }
@@ -6997,6 +7014,8 @@ impl ServerHttpEndpoint {
             #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_admissions: Arc::new(HttpLegacyRequestAdmissions::default()),
             #[cfg(any(feature = "legacy-2024-11-05", test))]
+            legacy_auth_receipt: Arc::new(Mutex::new(None)),
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_pending_requests,
             #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_runtime,
@@ -7053,6 +7072,36 @@ impl AuthAdmissionReceipt {
             ));
         }
         request.params = self.sanitized_params.clone();
+        let committed = match &self.authenticated {
+            Some(auth) => ctx.set_auth(auth.clone()),
+            None => ctx.commit_anonymous_auth(),
+        };
+        if committed {
+            Ok(self.fingerprint.clone())
+        } else {
+            Err(Server::request_context_error(ctx).unwrap_or_else(|| {
+                McpError::internal_error("authentication admission was already committed")
+            }))
+        }
+    }
+
+    /// Commits this receipt onto an exact-2024 request context.
+    ///
+    /// Legacy HTTP has no [`InboundRequestContext`]; method and wire-id
+    /// equality are the binding between pre-admission and dispatch.
+    fn commit_legacy(
+        &self,
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> Result<Sha256Digest, McpError> {
+        if self.method != request.method
+            || request_id_to_u64(request.id.as_ref()) != self.request_id
+        {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Authentication failed",
+            ));
+        }
         let committed = match &self.authenticated {
             Some(auth) => ctx.set_auth(auth.clone()),
             None => ctx.commit_anonymous_auth(),
@@ -7306,6 +7355,26 @@ impl ServerHttpSession {
             };
         }
         #[cfg(any(feature = "legacy-2024-11-05", test))]
+        if is_legacy {
+            let admitted_request = match &legacy_post_admission {
+                Some(Legacy2024HttpPostEnvelope::ClientMessage(request)) => Some(request),
+                _ => None,
+            };
+            let receipt = match self.preauthenticate_legacy_http_request(
+                cx,
+                admitted_request,
+                &transport_authorization,
+            ) {
+                Ok(receipt) => receipt,
+                Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
+            };
+            let mut stored = self
+                .legacy_auth_receipt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *stored = admitted_request.is_some().then_some(receipt);
+        }
+        #[cfg(any(feature = "legacy-2024-11-05", test))]
         let request_era = if is_modern {
             Some(ProtocolEra::Modern2026)
         } else if is_legacy {
@@ -7454,31 +7523,27 @@ impl ServerHttpSession {
         request: &JsonRpcRequest,
         transport_authorization: &TransportAuthorization,
     ) -> Result<AuthAdmissionReceipt, HttpResponse> {
-        let auth_request = transport_authorization.auth_request(
-            &request.method,
-            request.params.as_ref(),
-            request_id_to_u64(request.id.as_ref()),
-        );
-        if self.server.auth_provider.is_some() && !auth_request.has_any_credential_source() {
-            return Err(native_http_authentication_rejection());
-        }
         self.server
-            .authenticate_request_without_commit(
-                &McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref())),
-                auth_request,
-            )
-            .map(|(fingerprint, authenticated)| {
-                let mut sanitized = request.clone();
-                auth::strip_recognized_access_credentials(&mut sanitized.params);
-                AuthAdmissionReceipt {
-                    method: sanitized.method,
-                    request_id: request_id_to_u64(sanitized.id.as_ref()),
-                    sanitized_params: sanitized.params,
-                    fingerprint,
-                    authenticated,
-                }
-            })
-            .map_err(|_| native_http_authentication_rejection())
+            .preauthenticate_http_request(cx, request, transport_authorization)
+    }
+
+    /// Authenticates an exact-2024 HTTP GET `/sse` or POST `/messages`
+    /// request before the session era can pin or dispatch can run. GET uses a
+    /// synthetic request identity because the SSE open has no JSON-RPC body.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    fn preauthenticate_legacy_http_request(
+        &self,
+        cx: &Cx,
+        request: Option<&JsonRpcRequest>,
+        transport_authorization: &TransportAuthorization,
+    ) -> Result<AuthAdmissionReceipt, HttpResponse> {
+        let synthetic = request
+            .is_none()
+            .then(|| JsonRpcRequest::new("legacy/sse", None, RequestId::Number(0)));
+        let admitted = request
+            .or(synthetic.as_ref())
+            .expect("synthetic fills GET /sse");
+        self.preauthenticate_modern_http_request(cx, admitted, transport_authorization)
     }
 
     fn admit_modern_http_request(
@@ -7508,6 +7573,10 @@ impl ServerHttpSession {
     fn install_legacy_generation(&mut self, cx: &Cx) {
         self.legacy_admissions.cancel_all();
         self.legacy_pending_requests.cancel_all();
+        *self
+            .legacy_auth_receipt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         if let Some(active_request) = take_live_legacy_active_request(&self.legacy_active_request) {
             active_request.cancellation.cancel();
         }
@@ -8062,6 +8131,7 @@ impl ServerHttpSession {
                         request_cx: Arc::clone(&self.legacy_request_cx),
                         runtime: self.legacy_runtime.clone(),
                         legacy_admissions: Arc::clone(&self.legacy_admissions),
+                        auth_receipt: Arc::clone(&self.legacy_auth_receipt),
                     },
                 )
                 .map_err(|error| {
@@ -9600,9 +9670,11 @@ fn http_endpoint_response_to_static(cx: &Cx, response: ServerHttpEndpointRespons
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
 fn admit_live_http_legacy_request(
+    cx: &Cx,
     endpoint: &ServerHttpEndpoint,
     legacy_sessions: &LiveHttpSessionRegistry,
     request: &HttpRequest,
+    transport_authorization: &TransportAuthorization,
 ) -> Result<Option<HttpLegacyRequestAdmissionGuard>, HttpResponse> {
     if request.method != HttpMethod::Post
         || request.path != endpoint.server.http_config.legacy_message_path
@@ -9627,14 +9699,20 @@ fn admit_live_http_legacy_request(
     let Legacy2024HttpPostEnvelope::ClientMessage(request) = admitted else {
         return Ok(None);
     };
+    let receipt = session.cancellation.server.preauthenticate_http_request(
+        cx,
+        &request,
+        transport_authorization,
+    )?;
     session
         .cancellation
         .legacy_lifecycle
         .commit_if_live(|| {
-            session
-                .cancellation
-                .admissions
-                .admit(&request, &session.cancellation.session_principal)
+            session.cancellation.admissions.admit(
+                &request,
+                &session.cancellation.session_principal,
+                receipt.fingerprint,
+            )
         })
         .ok_or_else(|| HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE))?
         .map_err(|()| HttpResponse::bad_request())
@@ -9927,12 +10005,26 @@ async fn dispatch_http_request_async(
             Some(admission) => Some(admission),
             None => match &admitted {
                 Legacy2024HttpPostEnvelope::ClientMessage(message) => {
+                    let transport_authorization =
+                        match transport_authorization_from_http_request(&request) {
+                            Ok(authorization) => authorization,
+                            Err(response) => return response,
+                        };
+                    let receipt = match session.cancellation.server.preauthenticate_http_request(
+                        cx,
+                        message,
+                        &transport_authorization,
+                    ) {
+                        Ok(receipt) => receipt,
+                        Err(response) => return response,
+                    };
                     let Some(admission) =
                         session.cancellation.legacy_lifecycle.commit_if_live(|| {
-                            session
-                                .cancellation
-                                .admissions
-                                .admit(message, &session.cancellation.session_principal)
+                            session.cancellation.admissions.admit(
+                                message,
+                                &session.cancellation.session_principal,
+                                receipt.fingerprint,
+                            )
                         })
                     else {
                         return HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE);
@@ -10167,7 +10259,13 @@ async fn serve_http_connection(
         // this exact authority alive while dispatch takes the session slot
         // and awaits the handler instead of `block_on`.
         let legacy_admission =
-            match admit_live_http_legacy_request(&endpoint, &legacy_sessions, &request) {
+            match admit_live_http_legacy_request(
+                cx,
+                &endpoint,
+                &legacy_sessions,
+                &request,
+                &transport_authorization,
+            ) {
                 Ok(admission) => admission,
                 Err(response) => {
                     let _ = send_h1_response(cx, &mut framed, response).await;
@@ -12051,6 +12149,7 @@ impl Server {
         runtime: Option<&LiveLegacy2024ConnectionRuntime>,
         admitted_cancellation: Option<McpRequestCancellation>,
         request: &JsonRpcRequest,
+        auth_receipt: Option<&AuthAdmissionReceipt>,
     ) -> McpResult<LiveLegacy2024Dispatch> {
         let request_id = request
             .id
@@ -12132,13 +12231,16 @@ impl Server {
                 runtime.bidirectional_senders(self, &request_cancellation, &request_ctx)
             });
             Self::enforce_request_context(&request_ctx)?;
-            if !request_ctx.commit_anonymous_auth() {
+            let fingerprint = if let Some(receipt) = auth_receipt {
+                receipt.commit_legacy(&request_ctx, request)?
+            } else if !request_ctx.commit_anonymous_auth() {
                 return Err(McpError::internal_error(
                     "anonymous request admission could not be committed",
                 ));
-            }
-            let anonymous_principal = auth::principal_fingerprint(None)?;
-            if !session_principal.bind_or_verify(anonymous_principal) {
+            } else {
+                auth::principal_fingerprint(None)?
+            };
+            if !session_principal.bind_or_verify(fingerprint) {
                 return Err(McpError::new(
                     McpErrorCode::ResourceForbidden,
                     "Authenticated principal does not own an admitted session",
@@ -12274,11 +12376,14 @@ impl Server {
             }
 
             match result {
-                Ok(value) if value.get("resultType").is_some() => Err(McpError::internal_error(
-                    "modern result discriminator cannot cross the exact legacy bridge",
+                Ok(value) if value.get("resultType").is_some() => Err(mask_peer_error(
+                    McpError::internal_error(
+                        "modern result discriminator cannot cross the exact legacy bridge",
+                    ),
+                    self.mask_error_details,
                 )),
                 Ok(value) => Ok(value),
-                Err(error) => Err(error),
+                Err(error) => Err(mask_peer_error(error, self.mask_error_details)),
             }
         }
         .await;
@@ -17625,6 +17730,40 @@ impl Server {
         }
 
         Some(senders)
+    }
+
+    /// Authenticates a native HTTP request before session pin, SSE-body
+    /// mutation, or exact-2024 admission can observe it.
+    fn preauthenticate_http_request(
+        &self,
+        cx: &Cx,
+        request: &JsonRpcRequest,
+        transport_authorization: &TransportAuthorization,
+    ) -> Result<AuthAdmissionReceipt, HttpResponse> {
+        let auth_request = transport_authorization.auth_request(
+            &request.method,
+            request.params.as_ref(),
+            request_id_to_u64(request.id.as_ref()),
+        );
+        if self.auth_provider.is_some() && !auth_request.has_any_credential_source() {
+            return Err(native_http_authentication_rejection());
+        }
+        self.authenticate_request_without_commit(
+            &McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref())),
+            auth_request,
+        )
+        .map(|(fingerprint, authenticated)| {
+            let mut sanitized = request.clone();
+            auth::strip_recognized_access_credentials(&mut sanitized.params);
+            AuthAdmissionReceipt {
+                method: sanitized.method,
+                request_id: request_id_to_u64(sanitized.id.as_ref()),
+                sanitized_params: sanitized.params,
+                fingerprint,
+                authenticated,
+            }
+        })
+        .map_err(|_| native_http_authentication_rejection())
     }
 
     /// Authenticates one modern ingress request before extension middleware
@@ -39994,7 +40133,11 @@ mod lib_unit_tests {
         let target = JsonRpcRequest::new("tools/list", None, request_id.clone());
         let _admission = session
             .legacy_admissions
-            .admit(&target, &session.legacy_session.principal_binding())
+            .admit(
+                &target,
+                &session.legacy_session.principal_binding(),
+                auth::principal_fingerprint(None).expect("anonymous principal is admissible"),
+            )
             .expect("target request admission must remain structurally valid")
             .expect("correlated target must allocate cancellation authority");
         let target_cancellation = session
