@@ -20,8 +20,9 @@ use crate::methods::{
     NOTIFICATIONS_PROMPTS_LIST_CHANGED, NOTIFICATIONS_RESOURCES_LIST_CHANGED,
     NOTIFICATIONS_RESOURCES_UPDATED, NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED,
     NOTIFICATIONS_TOOLS_LIST_CHANGED, PING, PROMPTS_GET, PROMPTS_LIST, RESOURCES_LIST,
-    RESOURCES_READ, RESOURCES_TEMPLATES_LIST, SAMPLING_CREATE_MESSAGE, SERVER_DISCOVER,
-    SUBSCRIPTIONS_LISTEN, TOOLS_CALL, TOOLS_LIST, final_2026_07_28_method,
+    RESOURCES_READ, RESOURCES_SUBSCRIBE, RESOURCES_TEMPLATES_LIST, RESOURCES_UNSUBSCRIBE,
+    SAMPLING_CREATE_MESSAGE, SERVER_DISCOVER, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, TOOLS_LIST,
+    final_2026_07_28_method,
 };
 use crate::protocol_policy::ProtocolEra;
 use crate::protocol_version::{FINAL_PROTOCOL_VERSION, RequestVersionMetadata};
@@ -3171,6 +3172,10 @@ pub enum LegacyCoreRequest {
     ResourceTemplatesList(ListResourceTemplatesParams),
     /// `resources/read`.
     ResourcesRead(ReadResourceParams),
+    /// `resources/subscribe`.
+    ResourcesSubscribe(SubscribeResourceParams),
+    /// `resources/unsubscribe`.
+    ResourcesUnsubscribe(UnsubscribeResourceParams),
     /// `prompts/list`.
     PromptsList(ListPromptsParams),
     /// `prompts/get`.
@@ -3234,6 +3239,10 @@ pub enum LegacyCoreResult {
     ResourceTemplatesList(ListResourceTemplatesResult),
     /// `resources/read`.
     ResourcesRead(ReadResourceResult),
+    /// `resources/subscribe` acknowledgement.
+    ResourcesSubscribe(LegacyEmptyResult),
+    /// `resources/unsubscribe` acknowledgement.
+    ResourcesUnsubscribe(LegacyEmptyResult),
     /// `prompts/list`.
     PromptsList(ListPromptsResult),
     /// `prompts/get`.
@@ -3760,6 +3769,16 @@ impl CoreRequest {
                     RESOURCES_READ,
                     params,
                 )?),
+                RESOURCES_SUBSCRIBE => LegacyCoreRequest::ResourcesSubscribe(decode_params(
+                    ProtocolEra::Legacy2024,
+                    RESOURCES_SUBSCRIBE,
+                    params,
+                )?),
+                RESOURCES_UNSUBSCRIBE => LegacyCoreRequest::ResourcesUnsubscribe(decode_params(
+                    ProtocolEra::Legacy2024,
+                    RESOURCES_UNSUBSCRIBE,
+                    params,
+                )?),
                 PROMPTS_LIST => LegacyCoreRequest::PromptsList(decode_params(
                     ProtocolEra::Legacy2024,
                     PROMPTS_LIST,
@@ -3854,6 +3873,8 @@ impl LegacyCoreRequest {
             Self::ResourcesList(_) => RESOURCES_LIST,
             Self::ResourceTemplatesList(_) => RESOURCES_TEMPLATES_LIST,
             Self::ResourcesRead(_) => RESOURCES_READ,
+            Self::ResourcesSubscribe(_) => RESOURCES_SUBSCRIBE,
+            Self::ResourcesUnsubscribe(_) => RESOURCES_UNSUBSCRIBE,
             Self::PromptsList(_) => PROMPTS_LIST,
             Self::PromptsGet(_) => PROMPTS_GET,
             Self::SetLogLevel(_) => LOGGING_SET_LEVEL,
@@ -3880,6 +3901,12 @@ impl LegacyCoreRequest {
             }
             Self::ResourcesRead(params) => {
                 encode_params(ProtocolEra::Legacy2024, RESOURCES_READ, params)
+            }
+            Self::ResourcesSubscribe(params) => {
+                encode_params(ProtocolEra::Legacy2024, RESOURCES_SUBSCRIBE, params)
+            }
+            Self::ResourcesUnsubscribe(params) => {
+                encode_params(ProtocolEra::Legacy2024, RESOURCES_UNSUBSCRIBE, params)
             }
             Self::PromptsList(params) => {
                 encode_params(ProtocolEra::Legacy2024, PROMPTS_LIST, params)
@@ -3916,6 +3943,10 @@ impl LegacyCoreRequest {
             Self::ResourcesRead(_) => {
                 decode_legacy_result(RESOURCES_READ, input).map(LegacyCoreResult::ResourcesRead)
             }
+            Self::ResourcesSubscribe(_) => decode_legacy_result(RESOURCES_SUBSCRIBE, input)
+                .map(LegacyCoreResult::ResourcesSubscribe),
+            Self::ResourcesUnsubscribe(_) => decode_legacy_result(RESOURCES_UNSUBSCRIBE, input)
+                .map(LegacyCoreResult::ResourcesUnsubscribe),
             Self::PromptsList(_) => {
                 decode_legacy_result(PROMPTS_LIST, input).map(LegacyCoreResult::PromptsList)
             }
@@ -4133,6 +4164,8 @@ impl LegacyCoreResult {
             Self::ResourcesList(_) => RESOURCES_LIST,
             Self::ResourceTemplatesList(_) => RESOURCES_TEMPLATES_LIST,
             Self::ResourcesRead(_) => RESOURCES_READ,
+            Self::ResourcesSubscribe(_) => RESOURCES_SUBSCRIBE,
+            Self::ResourcesUnsubscribe(_) => RESOURCES_UNSUBSCRIBE,
             Self::PromptsList(_) => PROMPTS_LIST,
             Self::PromptsGet(_) => PROMPTS_GET,
             Self::SetLogLevel(_) => LOGGING_SET_LEVEL,
@@ -4154,6 +4187,10 @@ impl LegacyCoreResult {
                 encode_legacy_result(RESOURCES_TEMPLATES_LIST, result)
             }
             Self::ResourcesRead(result) => encode_legacy_result(RESOURCES_READ, result),
+            Self::ResourcesSubscribe(result) => encode_legacy_result(RESOURCES_SUBSCRIBE, result),
+            Self::ResourcesUnsubscribe(result) => {
+                encode_legacy_result(RESOURCES_UNSUBSCRIBE, result)
+            }
             Self::PromptsList(result) => encode_legacy_result(PROMPTS_LIST, result),
             Self::PromptsGet(result) => encode_legacy_result(PROMPTS_GET, result),
             Self::SetLogLevel(result) => encode_legacy_result(LOGGING_SET_LEVEL, result),
@@ -9339,13 +9376,66 @@ mod tests {
             uri: "file:///workspace/status".to_owned(),
         };
         assert_eq!(
-            serde_json::to_value(legacy_subscribe).expect("legacy subscribe serializes"),
+            serde_json::to_value(&legacy_subscribe).expect("legacy subscribe serializes"),
             serde_json::json!({"uri": "file:///workspace/status"})
         );
         assert_eq!(
-            serde_json::to_value(legacy_unsubscribe).expect("legacy unsubscribe serializes"),
+            serde_json::to_value(&legacy_unsubscribe).expect("legacy unsubscribe serializes"),
             serde_json::json!({"uri": "file:///workspace/status"})
         );
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let subscribe = CoreRequest::decode(
+                ProtocolEra::Legacy2024,
+                RESOURCES_SUBSCRIBE,
+                Some(&serde_json::json!({"uri": "file:///workspace/status"})),
+            )
+            .expect("exact-2024 resources/subscribe is a typed core request");
+            assert!(matches!(
+                subscribe,
+                CoreRequest::Legacy(LegacyCoreRequest::ResourcesSubscribe(params))
+                    if params.uri == "file:///workspace/status"
+            ));
+            let unsubscribe = CoreRequest::decode(
+                ProtocolEra::Legacy2024,
+                RESOURCES_UNSUBSCRIBE,
+                Some(&serde_json::json!({"uri": "file:///workspace/status"})),
+            )
+            .expect("exact-2024 resources/unsubscribe is a typed core request");
+            assert!(matches!(
+                unsubscribe,
+                CoreRequest::Legacy(LegacyCoreRequest::ResourcesUnsubscribe(params))
+                    if params.uri == "file:///workspace/status"
+            ));
+            assert!(
+                matches!(
+                    CoreRequest::decode(
+                        ProtocolEra::Modern2026,
+                        RESOURCES_SUBSCRIBE,
+                        Some(&serde_json::json!({"uri": "file:///workspace/status"})),
+                    ),
+                    Err(CoreDispatchError::UnsupportedMethod {
+                        era: ProtocolEra::Modern2026,
+                        method,
+                    }) if method == RESOURCES_SUBSCRIBE
+                ),
+                "resources/subscribe stays exact-2024-only"
+            );
+            assert!(
+                matches!(
+                    CoreRequest::decode(
+                        ProtocolEra::Legacy2024,
+                        RESOURCES_SUBSCRIBE,
+                        Some(&serde_json::json!({})),
+                    ),
+                    Err(CoreDispatchError::InvalidParams {
+                        era: ProtocolEra::Legacy2024,
+                        method: RESOURCES_SUBSCRIBE,
+                    })
+                ),
+                "resources/subscribe without uri is invalid"
+            );
+        }
     }
 
     #[test]
