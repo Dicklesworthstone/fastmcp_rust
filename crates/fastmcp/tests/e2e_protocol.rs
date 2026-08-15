@@ -1256,11 +1256,23 @@ const STDIO_COMPLETION_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(4);
 const STDIO_COMPLETION_CLEANUP_BOUND: Duration = Duration::from_secs(4);
 
 #[cfg(unix)]
+const ECHO_SERVER_INSTRUCTIONS: &str =
+    "A simple echo server for testing FastMCP. Try calling the 'echo' tool with a message!";
+
+#[cfg(unix)]
 fn connect_bounded_modern_stdio_to_shipped_echo_server(
     server_policy: &str,
 ) -> McpResult<modern::Client> {
+    connect_bounded_modern_stdio_to_shipped_echo_server_with_env(server_policy, &[])
+}
+
+#[cfg(unix)]
+fn connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+    server_policy: &str,
+    extra_env: &[(&str, &str)],
+) -> McpResult<modern::Client> {
     let command = shipped_echo_server_executable();
-    modern::client_builder()
+    let mut builder = modern::client_builder()
         .env("FASTMCP_PROTOCOL_POLICY", server_policy)
         .request_timeout_policy(
             RequestTimeoutPolicy::new(
@@ -1268,8 +1280,11 @@ fn connect_bounded_modern_stdio_to_shipped_echo_server(
                 STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
             )
             .expect("the public completion timeout policy is valid"),
-        )
-        .connect_stdio_with_cx(command, &[], &Cx::for_request())
+        );
+    for (key, value) in extra_env {
+        builder = builder.env(*key, *value);
+    }
+    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
 }
 
 #[cfg(unix)]
@@ -1357,9 +1372,18 @@ fn assert_stdio_capability_gate(result: &modern::FinalCoreResult, kind: &str) {
 fn connect_legacy_stdio_to_shipped_echo_server(
     server_policy: &str,
 ) -> McpResult<legacy_2024::Client> {
-    connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+    connect_legacy_stdio_to_shipped_echo_server_with_env(server_policy, &[])
+}
+
+#[cfg(unix)]
+fn connect_legacy_stdio_to_shipped_echo_server_with_env(
+    server_policy: &str,
+    extra_env: &[(&str, &str)],
+) -> McpResult<legacy_2024::Client> {
+    connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers_and_env(
         server_policy,
         legacy_2024::LegacyReverseRequestHandlers::new(),
+        extra_env,
     )
 }
 
@@ -1368,10 +1392,26 @@ fn connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
     server_policy: &str,
     handlers: legacy_2024::LegacyReverseRequestHandlers,
 ) -> McpResult<legacy_2024::Client> {
+    connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers_and_env(
+        server_policy,
+        handlers,
+        &[],
+    )
+}
+
+#[cfg(unix)]
+fn connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers_and_env(
+    server_policy: &str,
+    handlers: legacy_2024::LegacyReverseRequestHandlers,
+    extra_env: &[(&str, &str)],
+) -> McpResult<legacy_2024::Client> {
     let command = shipped_echo_server_executable();
-    let builder = legacy_2024::client_builder()
+    let mut builder = legacy_2024::client_builder()
         .env("FASTMCP_PROTOCOL_POLICY", server_policy)
         .reverse_request_handlers(handlers);
+    for (key, value) in extra_env {
+        builder = builder.env(*key, *value);
+    }
     assert_eq!(
         builder.protocol_policy(),
         legacy_2024::ProtocolPolicy::LegacyOnly
@@ -1547,6 +1587,40 @@ fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
         "the modern tools/list result must expose the shipped echo tool"
     );
     client.close().expect("modern-only stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_discovery_retains_instructions() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+    assert_eq!(
+        client
+            .instructions()
+            .expect("modern discovery exposes handshake instructions"),
+        Some(ECHO_SERVER_INSTRUCTIONS),
+        "live stdio modern discovery must retain the shipped echo instructions"
+    );
+    client
+        .close()
+        .expect("instructed modern stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_discovery_retains_instructions_peer_stays_bare() {
+    let mut bare = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_NO_INSTRUCTIONS", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the bare echo peer");
+    assert_eq!(
+        bare.instructions()
+            .expect("modern discovery exposes the missing-instructions observable"),
+        None,
+        "changing only the missing instructions must keep the peer bare"
+    );
+    bare.close().expect("bare modern stdio client cleanup");
 }
 
 #[cfg(unix)]
@@ -2436,7 +2510,7 @@ fn e2e_public_stdio_read_resource_and_get_prompt_follow_installed_roots_handler(
 
 #[cfg(unix)]
 #[test]
-fn e2e_public_stdio_modern_sampling_elicitation_keep_input_required_and_fail_closed() {
+fn e2e_public_stdio_modern_sampling_elicitation_keep_input_required() {
     let mut client = connect_bounded_modern_stdio_with_mrtr(
         "modern-only",
         stdio_mrtr_capabilities(true, true, true, true),
@@ -2486,7 +2560,11 @@ fn e2e_public_stdio_modern_sampling_elicitation_keep_input_required_and_fail_clo
     client
         .close()
         .expect("stdio input_required MRTR client cleanup reaps the live subprocess");
+}
 
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_sampling_elicitation_fail_closed_without_capability() {
     let mut no_sampling = connect_bounded_modern_stdio_with_mrtr(
         "modern-only",
         stdio_mrtr_capabilities(false, true, true, true),
@@ -3408,6 +3486,417 @@ fn e2e_public_stdio_legacy_default_parameter_is_injected_and_overridable() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_legacy_output_schema_is_listed_and_call_stays_unstructured() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let listed = client
+        .list_tools()
+        .expect("live exact-2024 stdio must list the output-schema tools");
+    let structured = listed
+        .iter()
+        .find(|tool| tool.name == "structured_echo")
+        .expect("structured_echo must remain on the live catalog");
+    let echo = listed
+        .iter()
+        .find(|tool| tool.name == "echo")
+        .expect("the bare echo peer must remain on the live catalog");
+    assert_eq!(
+        structured
+            .output_schema
+            .as_ref()
+            .and_then(|schema| schema.get("required")),
+        Some(&json!(["value"])),
+        "tools/list must retain the advertised output schema: {structured:?}"
+    );
+    assert_eq!(
+        echo.output_schema, None,
+        "changing only the missing output schema must keep the echo peer bare: {echo:?}"
+    );
+
+    let called = client
+        .call_tool("structured_echo", json!({"value": "alpha"}))
+        .expect("live exact-2024 stdio must admit the structured output tool");
+    assert!(
+        called.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the structured tool must still author text content: {called:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio output-schema client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_rich_content_retains_image_and_peer_stays_text() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let rich = client
+        .call_tool("rich_echo", json!({}))
+        .expect("live exact-2024 stdio must retain the representable image block");
+    assert!(
+        rich.content.iter().any(|content| match content {
+            LegacyContent::Image {
+                data, mime_type, ..
+            } => data == "e2eimage" && mime_type == "image/png",
+            _ => false,
+        }),
+        "tools/call must retain the authored image block: {rich:?}"
+    );
+    assert!(
+        rich.content
+            .iter()
+            .all(|content| !matches!(content, LegacyContent::Text { .. })),
+        "exact-2024 must not invent a text projection of the image: {rich:?}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the text-only echo peer must still be callable");
+    assert!(
+        peer.content
+            .iter()
+            .all(|content| matches!(content, LegacyContent::Text { .. })),
+        "changing only the missing rich content must keep the echo peer text-only: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio rich-content client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_initialize_retains_instructions() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+    assert_eq!(
+        client.instructions(),
+        Some(ECHO_SERVER_INSTRUCTIONS),
+        "live exact-2024 stdio initialize must retain the shipped echo instructions"
+    );
+    client
+        .close()
+        .expect("instructed legacy stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_notification_tools_list_changed_is_retained() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let hidden = client
+        .call_tool("hide_echo", json!({}))
+        .expect("live exact-2024 stdio must admit hide_echo");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "hide_echo must disable the echo tool: {hidden:?}"
+    );
+
+    let notifications = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        notifications.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ToolsListChanged
+        )),
+        "live exact-2024 stdio must retain notifications/tools/list_changed: {notifications:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio list_changed client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_notification_tools_list_changed_peer_stays_silent() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the text-only echo peer must still be callable");
+    let notifications = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !notifications.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ToolsListChanged
+        )),
+        "changing only the missing catalog mutation must keep tools/list_changed silent: {notifications:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio silent list_changed client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_notification_ctx_info_is_retained() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    client
+        .set_log_level(legacy_2024::LogLevel::Info)
+        .expect("exact-2024 logging/setLevel must be admitted");
+    client
+        .call_tool("echo", json!({"message": "log"}))
+        .expect("ctx.info must not prevent the shipped echo tool from completing");
+    let notifications = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        notifications.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Message(message)
+                if message.level == legacy_2024::LogLevel::Info
+                    && message.data == json!("echo-handler-info")
+        )),
+        "live exact-2024 stdio must retain ctx.info after set_log_level(Info): {notifications:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio log client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_notification_ctx_info_peer_stays_silent() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    client
+        .call_tool("echo", json!({"message": "quiet"}))
+        .expect("the echo peer must still be callable without set_log_level");
+    let notifications = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !notifications.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Message(message)
+                if message.data == json!("echo-handler-info")
+        )),
+        "omitting only logging/setLevel must keep ctx.info silent: {notifications:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio silent log client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_progress_marker_is_retained_from_live_echo() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    client
+        .call_tool("echo", json!({"message": "no-token"}))
+        .expect("echo still completes without a progress token");
+    let silent = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !silent.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "without a progressToken the shipped echo tool must not emit request-scoped progress: {silent:?}"
+    );
+
+    let marker = legacy_2024::ProgressMarker::from("stdio-legacy-progress");
+    client
+        .call_tool_with_progress_marker("echo", json!({"message": "token"}), marker.clone())
+        .expect("a progressToken must not prevent the shipped echo tool from completing");
+    let progress = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == marker
+                    && params.message.as_deref() == Some("echoed")
+        )),
+        "live exact-2024 stdio must retain notifications/progress after a progressToken: {progress:?}"
+    );
+
+    client
+        .read_resource("info://server")
+        .expect("a resources/read without a progress token still completes");
+    let silent_resource = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !silent_resource.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "without a progressToken the shipped server_info resource must not emit request-scoped progress: {silent_resource:?}"
+    );
+
+    let resource_marker = legacy_2024::ProgressMarker::from("stdio-legacy-resource-progress");
+    client
+        .read_resource_with_progress_marker("info://server", resource_marker.clone())
+        .expect(
+            "a progressToken must not prevent the shipped server_info resource from completing",
+        );
+    let resource_progress = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        resource_progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == resource_marker
+                    && params.message.as_deref() == Some("info")
+        )),
+        "live exact-2024 stdio must retain resource notifications/progress after a progressToken: {resource_progress:?}"
+    );
+
+    let mut greeting_arguments = std::collections::HashMap::new();
+    greeting_arguments.insert("name".to_owned(), "no-token".to_owned());
+    client
+        .get_prompt("greeting", greeting_arguments)
+        .expect("a prompts/get without a progress token still completes");
+    let silent_prompt = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !silent_prompt.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "without a progressToken the shipped greeting prompt must not emit request-scoped progress: {silent_prompt:?}"
+    );
+
+    let prompt_marker = legacy_2024::ProgressMarker::from("stdio-legacy-prompt-progress");
+    let mut greeting_with_token = std::collections::HashMap::new();
+    greeting_with_token.insert("name".to_owned(), "token".to_owned());
+    client
+        .get_prompt_with_progress_marker("greeting", greeting_with_token, prompt_marker.clone())
+        .expect("a progressToken must not prevent the shipped greeting prompt from completing");
+    let prompt_progress = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        prompt_progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == prompt_marker
+                    && params.message.as_deref() == Some("greeted")
+        )),
+        "live exact-2024 stdio must retain prompt notifications/progress after a progressToken: {prompt_progress:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio progress client cleanup");
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+const STDIO_FS_PREFIX: &str = "e2e";
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+const STDIO_FS_TEMPLATE: &str = "file:///e2e/{+path}";
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+const STDIO_FS_FILE_URI: &str = "file:///e2e/note.txt";
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+const STDIO_FS_FILE_TEXT: &str = "filesystem:stdio";
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn e2e_public_stdio_modern_filesystem_provider_lists_and_reads_live_file() {
+    let root = std::env::temp_dir().join(format!(
+        "fastmcp-public-stdio-fs-e2e-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("the stdio filesystem e2e root is created");
+    std::fs::write(root.join("note.txt"), STDIO_FS_FILE_TEXT)
+        .expect("the stdio filesystem e2e file is written");
+    let root_path = root
+        .to_str()
+        .expect("the stdio filesystem e2e root is utf-8")
+        .to_owned();
+
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[
+            ("FASTMCP_FS_ROOT", root_path.as_str()),
+            ("FASTMCP_FS_PREFIX", STDIO_FS_PREFIX),
+        ],
+    )
+    .expect("a ModernOnly facade client connects to the filesystem echo peer");
+
+    let listed = client
+        .list_resource_templates(None)
+        .expect("live stdio must list the FilesystemProvider template");
+    assert!(
+        listed.resource_templates.iter().any(|template| {
+            template.uri_template == STDIO_FS_TEMPLATE && template.name == STDIO_FS_PREFIX
+        }),
+        "FilesystemProvider must advertise its reversible file template: {:?}",
+        listed.resource_templates
+    );
+
+    let unmatched = client.read_resource("file:///other/note.txt").expect_err(
+        "changing only the prefix the template cannot bind must refuse before dispatch",
+    );
+    assert_eq!(
+        unmatched.code,
+        McpErrorCode::InvalidParams,
+        "an unmatched filesystem URI must stay InvalidParams: {unmatched:?}"
+    );
+
+    let file = client
+        .read_resource(STDIO_FS_FILE_URI)
+        .expect("resources/read must expand the live file URI through the filesystem handler");
+    assert!(
+        matches!(
+            file.contents.as_slice(),
+            [EmbeddedResourceContents::Text { text, .. }] if text == STDIO_FS_FILE_TEXT
+        ),
+        "the live filesystem read must retain the file bytes: {:?}",
+        file.contents
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio filesystem client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_initialize_retains_instructions_peer_stays_bare() {
+    let mut bare = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_NO_INSTRUCTIONS", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the bare echo peer");
+    assert_eq!(
+        bare.instructions(),
+        None,
+        "changing only the missing instructions must keep the peer bare"
+    );
+    bare.close().expect("bare legacy stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_legacy_stdio_roots_callback_reaches_context() {
     let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handlers = legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list({
@@ -3475,6 +3964,77 @@ fn e2e_public_legacy_stdio_roots_without_capability_has_no_callback_authority() 
                 if text == "Roots not available: client does not support roots capability"
         ));
         client.close().expect("legacy roots client cleanup");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_legacy_stdio_sampling_callback_reaches_context() {
+    let callback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handlers = legacy_2024::LegacyReverseRequestHandlers::new().with_sampling_create_message({
+        let callback_calls = Arc::clone(&callback_calls);
+        move |_cx, _cancellation, _params| {
+            callback_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::pin(async {
+                Ok(legacy_2024::LegacyCreateMessageResult::text(
+                    "sampled-legacy",
+                    "stdio-legacy-model",
+                ))
+            })
+        }
+    });
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("legacy sampling runtime builds");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("legacy sampling runtime installs its Cx");
+        let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+            "legacy-only",
+            handlers,
+        )
+        .expect("the sampling callback is configured before exact legacy initialization");
+        let result = client
+            .call_tool_with_cx(&cx, "sample_text", json!({}))
+            .await
+            .expect("the sealed legacy facade services sampling/createMessage before its typed tool result");
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.content.first(),
+            Some(LegacyContent::Text { text, .. }) if text == "sampled-legacy"
+        ));
+        assert_eq!(
+            callback_calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the tool's context authority issues exactly one sampling/createMessage callback"
+        );
+        client.close().expect("legacy sampling client cleanup");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_legacy_stdio_sampling_without_capability_has_no_callback_authority() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("legacy missing-sampling runtime builds");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("legacy missing-sampling runtime installs its Cx");
+        let mut client = connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers(
+            "legacy-only",
+            legacy_2024::LegacyReverseRequestHandlers::new(),
+        )
+        .expect("the exact legacy connection without sampling capability initializes");
+        let result = client
+            .call_tool_with_cx(&cx, "sample_text", json!({}))
+            .await
+            .expect("missing sampling authority remains a typed legacy tool result");
+        assert!(result.is_error);
+        assert!(matches!(
+            result.content.first(),
+            Some(LegacyContent::Text { text, .. })
+                if text.contains("does not support sampling capability")
+        ));
+        client.close().expect("legacy sampling client cleanup");
     });
 }
 
