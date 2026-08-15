@@ -1435,6 +1435,7 @@ struct LiveLegacy2024RuntimeHandler<'a> {
     runtime: LiveLegacy2024ConnectionRuntime,
     queue_state: Option<Arc<DispatchQueueState>>,
     active_request: Arc<Mutex<Option<LiveLegacy2024ActiveRequest>>>,
+    connection_auth: Option<AuthDispatchCustody>,
 }
 
 #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -1482,6 +1483,7 @@ impl Legacy2024Handler for LiveLegacy2024RuntimeHandler<'_> {
                     request_cancellation,
                     &request,
                     None,
+                    self.connection_auth.as_ref(),
                 )
                 .await
                 .map_err(|error| {
@@ -1582,6 +1584,7 @@ impl Legacy2024Handler for HttpLegacy2024RuntimeHandler {
                     request_cancellation,
                     &request,
                     auth_receipt.as_ref(),
+                    None,
                 )
                 .await
                 .map_err(|error| {
@@ -2089,7 +2092,13 @@ fn poll_on_cx<F: Future>(cx: &Cx, future: F) -> F::Output {
 fn bind_anonymous_connection_principal(
     principal_binding: &SessionPrincipalBinding,
 ) -> McpResult<()> {
-    let fingerprint = auth::principal_fingerprint(None)?;
+    bind_connection_principal(principal_binding, auth::principal_fingerprint(None)?)
+}
+
+fn bind_connection_principal(
+    principal_binding: &SessionPrincipalBinding,
+    fingerprint: Sha256Digest,
+) -> McpResult<()> {
     if principal_binding.bind_or_verify(fingerprint) {
         Ok(())
     } else {
@@ -7178,6 +7187,35 @@ impl AuthDispatchCustody {
             }
         }
     }
+
+    fn commit_legacy_connection(&self, ctx: &McpContext) -> Result<Sha256Digest, McpError> {
+        let (authenticated, fingerprint) = match self {
+            Self::Http(receipt) => (receipt.authenticated.clone(), receipt.fingerprint.clone()),
+            #[cfg(feature = "websocket")]
+            Self::WebSocket(custody) => {
+                (custody.authenticated.clone(), custody.fingerprint.clone())
+            }
+        };
+        let committed = match authenticated {
+            Some(auth) => ctx.set_auth(auth),
+            None => ctx.commit_anonymous_auth(),
+        };
+        if committed {
+            Ok(fingerprint)
+        } else {
+            Err(Server::request_context_error(ctx).unwrap_or_else(|| {
+                McpError::internal_error("authentication admission was already committed")
+            }))
+        }
+    }
+
+    fn connection_fingerprint(&self) -> Sha256Digest {
+        match self {
+            Self::Http(receipt) => receipt.fingerprint.clone(),
+            #[cfg(feature = "websocket")]
+            Self::WebSocket(custody) => custody.fingerprint.clone(),
+        }
+    }
 }
 
 #[cfg(feature = "websocket")]
@@ -10258,20 +10296,19 @@ async fn serve_http_connection(
         // future is polled on this connection `Cx`. The captured guard keeps
         // this exact authority alive while dispatch takes the session slot
         // and awaits the handler instead of `block_on`.
-        let legacy_admission =
-            match admit_live_http_legacy_request(
-                cx,
-                &endpoint,
-                &legacy_sessions,
-                &request,
-                &transport_authorization,
-            ) {
-                Ok(admission) => admission,
-                Err(response) => {
-                    let _ = send_h1_response(cx, &mut framed, response).await;
-                    return;
-                }
-            };
+        let legacy_admission = match admit_live_http_legacy_request(
+            cx,
+            &endpoint,
+            &legacy_sessions,
+            &request,
+            &transport_authorization,
+        ) {
+            Ok(admission) => admission,
+            Err(response) => {
+                let _ = send_h1_response(cx, &mut framed, response).await;
+                return;
+            }
+        };
         let response = dispatch_http_request_async(
             cx,
             &endpoint,
@@ -12150,6 +12187,7 @@ impl Server {
         admitted_cancellation: Option<McpRequestCancellation>,
         request: &JsonRpcRequest,
         auth_receipt: Option<&AuthAdmissionReceipt>,
+        connection_auth: Option<&AuthDispatchCustody>,
     ) -> McpResult<LiveLegacy2024Dispatch> {
         let request_id = request
             .id
@@ -12233,6 +12271,8 @@ impl Server {
             Self::enforce_request_context(&request_ctx)?;
             let fingerprint = if let Some(receipt) = auth_receipt {
                 receipt.commit_legacy(&request_ctx, request)?
+            } else if let Some(connection_auth) = connection_auth {
+                connection_auth.commit_legacy_connection(&request_ctx)?
             } else if !request_ctx.commit_anonymous_auth() {
                 return Err(McpError::internal_error(
                     "anonymous request admission could not be committed",
@@ -14356,6 +14396,7 @@ impl Server {
                                 runtime: worker_legacy_runtime.clone(),
                                 queue_state: Some(Arc::clone(&worker_queue_state)),
                                 active_request: Arc::clone(&legacy_active_request),
+                                connection_auth: worker_auth_receipt.clone(),
                             },
                         );
                         let Ok(adapter) = adapter else {
@@ -15206,9 +15247,18 @@ impl Server {
                     });
                     match permit.try_send(queued) {
                         Ok(()) => {
-                            let principal_result = response_id.as_ref().map_or(Ok(()), |_| {
-                                bind_anonymous_connection_principal(&session_principal)
-                            });
+                            let principal_result =
+                                response_id
+                                    .as_ref()
+                                    .map_or(Ok(()), |_| match &auth_receipt {
+                                        Some(custody) => bind_connection_principal(
+                                            &session_principal,
+                                            custody.connection_fingerprint(),
+                                        ),
+                                        None => {
+                                            bind_anonymous_connection_principal(&session_principal)
+                                        }
+                                    });
                             // Id-less messages construct the admission already
                             // admitted; resolving again would trip the
                             // single-transition invariant.
@@ -15649,6 +15699,7 @@ impl Server {
                                         runtime: legacy_runtime.clone(),
                                         queue_state: None,
                                         active_request: Arc::clone(&legacy_active_request),
+                                        connection_auth: None,
                                     },
                                 );
                                 let Ok(adapter) = adapter else {
@@ -16061,6 +16112,7 @@ impl Server {
                                         runtime: legacy_runtime.clone(),
                                         queue_state: None,
                                         active_request: Arc::clone(&legacy_active_request),
+                                        connection_auth: None,
                                     },
                                 );
                                 let Ok(adapter) = adapter else {
