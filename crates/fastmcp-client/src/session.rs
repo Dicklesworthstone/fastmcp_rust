@@ -19,6 +19,7 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, ServerCapabilities, ServerDiscoverResult, ServerInfo,
+    ServerInstructions,
 };
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -424,11 +425,15 @@ pub struct ClientSession {
     server_capabilities: ServerCapabilities,
     /// Exact final discovery state when the modern handshake succeeded.
     ///
-    /// Legacy initialization has no counterpart for final discovery
-    /// capabilities, instructions, result metadata, or cache hints. Retaining
-    /// the typed result keeps those final-only fields available without
-    /// projecting them onto the legacy capability shape.
+    /// Legacy initialization retains instructions separately via
+    /// [`Self::legacy_instructions`]. Discovery capabilities, result
+    /// metadata, and cache hints remain modern-only.
     server_discovery: Option<ServerDiscoverResult>,
+    /// Exact-2024 `initialize` instructions retained from the handshake.
+    ///
+    /// Modern sessions leave this empty and prefer the lossless discovery
+    /// string. `None` means the peer did not advertise instructions.
+    legacy_instructions: Option<String>,
     /// Local MCP Apps settings selected before connection.
     mcp_apps_settings: Option<McpAppsClientSettings>,
     /// Opaque bilateral Apps receipt retained from the current modern discovery
@@ -502,6 +507,7 @@ impl ClientSession {
             server_info,
             server_capabilities,
             server_discovery: None,
+            legacy_instructions: None,
             mcp_apps_settings: None,
             mcp_apps_activation_receipt: None,
             client_extension_runtime: None,
@@ -539,6 +545,11 @@ impl ClientSession {
 
     pub(crate) fn with_server_discovery(mut self, server_discovery: ServerDiscoverResult) -> Self {
         self.server_discovery = Some(server_discovery);
+        self
+    }
+
+    pub(crate) fn with_legacy_instructions(mut self, instructions: Option<String>) -> Self {
+        self.legacy_instructions = instructions;
         self
     }
 
@@ -718,6 +729,26 @@ impl ClientSession {
     #[must_use]
     pub fn server_discovery(&self) -> Option<&ServerDiscoverResult> {
         self.server_discovery.as_ref()
+    }
+
+    /// Returns the exact-2024 initialize instructions when the handshake
+    /// retained them. Modern sessions leave this empty.
+    #[must_use]
+    pub fn legacy_instructions(&self) -> Option<&str> {
+        self.legacy_instructions.as_deref()
+    }
+
+    /// Returns server instructions retained from the successful handshake.
+    ///
+    /// Modern sessions prefer the final discovery string. Exact 2024-11-05
+    /// sessions return the initialize result field. A missing value means the
+    /// peer did not advertise instructions.
+    #[must_use]
+    pub fn instructions(&self) -> Option<&str> {
+        if let Some(discovery) = self.server_discovery.as_ref() {
+            return discovery.instructions().map(ServerInstructions::as_str);
+        }
+        self.legacy_instructions.as_deref()
     }
 
     /// Returns the negotiated protocol version.
@@ -1030,6 +1061,24 @@ mod tests {
         )
         .expect("exact supported protocol version");
         assert!(session.client_capabilities().sampling.is_some());
+    }
+
+    #[test]
+    fn session_retains_legacy_initialize_instructions() {
+        let session = test_session();
+        assert_eq!(session.instructions(), None);
+        assert_eq!(session.legacy_instructions(), None);
+
+        let session = session.with_legacy_instructions(Some("use the tools".to_owned()));
+        assert_eq!(session.instructions(), Some("use the tools"));
+        assert_eq!(session.legacy_instructions(), Some("use the tools"));
+    }
+
+    #[test]
+    fn session_without_legacy_instructions_stays_bare() {
+        let session = test_session().with_legacy_instructions(None);
+        assert_eq!(session.instructions(), None);
+        assert_eq!(session.legacy_instructions(), None);
     }
 
     #[test]

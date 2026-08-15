@@ -861,6 +861,7 @@ fn create_and_initialize_client(
         init_result.protocol_version,
     ) {
         Ok(session) => match session
+            .with_legacy_instructions(init_result.instructions)
             .try_with_protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
         {
             Ok(session) => session,

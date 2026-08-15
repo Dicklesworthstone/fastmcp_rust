@@ -222,7 +222,10 @@ use fastmcp_protocol::extensions::{
 #[cfg(feature = "websocket-experimental")]
 use fastmcp_protocol::methods::Final2026EnvelopeKind;
 use fastmcp_protocol::methods::{
-    Final2026Peer, NOTIFICATIONS_ROOTS_LIST_CHANGED, final_2026_07_28_method,
+    Final2026Peer, NOTIFICATIONS_CANCELLED, NOTIFICATIONS_MESSAGE, NOTIFICATIONS_PROGRESS,
+    NOTIFICATIONS_PROMPTS_LIST_CHANGED, NOTIFICATIONS_RESOURCES_LIST_CHANGED,
+    NOTIFICATIONS_RESOURCES_UPDATED, NOTIFICATIONS_ROOTS_LIST_CHANGED,
+    NOTIFICATIONS_TOOLS_LIST_CHANGED, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 #[cfg(feature = "tasks")]
@@ -3179,10 +3182,26 @@ const WEBSOCKET_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS: u64 = 100_000_000;
 
 const FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR: &str =
     "Final server notification queue capacity exceeded";
+const LEGACY_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR: &str =
+    "Exact 2024-11-05 server notification queue capacity exceeded";
 
 fn is_final_server_notification_method(request: &JsonRpcRequest) -> bool {
     final_2026_07_28_method(&request.method)
         .is_some_and(|method| method.admits_notification_from(Final2026Peer::Server))
+}
+
+fn is_legacy_server_notification_method(request: &JsonRpcRequest) -> bool {
+    request.id.is_none()
+        && matches!(
+            request.method.as_str(),
+            NOTIFICATIONS_CANCELLED
+                | NOTIFICATIONS_PROGRESS
+                | NOTIFICATIONS_MESSAGE
+                | NOTIFICATIONS_PROMPTS_LIST_CHANGED
+                | NOTIFICATIONS_RESOURCES_LIST_CHANGED
+                | NOTIFICATIONS_RESOURCES_UPDATED
+                | NOTIFICATIONS_TOOLS_LIST_CHANGED
+        )
 }
 
 fn final_log_message_sink_projection(message: &FinalLogMessageParams) -> LogMessageParams {
@@ -3923,7 +3942,8 @@ where
                 result.capabilities,
                 result.protocol_version,
             )
-            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?,
+            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
+            .with_legacy_instructions(result.instructions),
             WebSocketInitialization::Modern {
                 server_info,
                 discovery,
@@ -4948,7 +4968,8 @@ where
                     result.server_info,
                     result.capabilities,
                     result.protocol_version,
-                ),
+                )
+                .map(|session| session.with_legacy_instructions(result.instructions)),
                 WebSocketInitialization::Modern {
                     server_info,
                     discovery,
@@ -9495,6 +9516,9 @@ pub struct HttpClient {
     client_capabilities: ClientCapabilities,
     server_info: ServerInfo,
     legacy_server_capabilities: Option<ServerCapabilities>,
+    /// Handshake instructions retained from modern discovery or exact-2024
+    /// initialize. `None` means the peer did not advertise instructions.
+    instructions: Option<String>,
     next_id: AtomicU64,
     final_result_cache: FinalResultCache,
     final_cache_ttl_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
@@ -9969,64 +9993,72 @@ impl HttpClient {
                 .map_err(HttpClientError::Connection)?;
         }
 
-        let (server_info, legacy_server_capabilities) = match connection.selected_protocol_era() {
-            ProtocolEra::Modern2026 => {
-                let server_info = connection
-                    .server_discovery()
-                    .and_then(|discovery| discovery.server_info().cloned())
-                    .ok_or(HttpClientError::ModernDiscoveryMissingServerInfo)?;
-                (server_info, None)
-            }
-            #[cfg(feature = "legacy-2024-11-05")]
-            ProtocolEra::Legacy2024 => {
-                let parameters = serde_json::to_value(InitializeParams {
-                    protocol_version: PROTOCOL_VERSION.to_owned(),
-                    capabilities: client_capabilities.clone(),
-                    client_info: client_info.clone(),
-                })
-                .map_err(|_| HttpClientError::LegacyInitializationInvalidResult)?;
-                let response = connection
-                    .request(cx, "initialize", parameters, RequestId::Number(1))
-                    .await
-                    .map_err(HttpClientError::Connection)?;
-                let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response
-                else {
-                    return Err(HttpClientError::LegacyInitializationInvalidResult);
-                };
-                if response.error.is_some() {
-                    return Err(HttpClientError::LegacyInitializationRejected);
+        let (server_info, legacy_server_capabilities, instructions) =
+            match connection.selected_protocol_era() {
+                ProtocolEra::Modern2026 => {
+                    let discovery = connection.server_discovery();
+                    let server_info = discovery
+                        .as_ref()
+                        .and_then(|discovery| discovery.server_info().cloned())
+                        .ok_or(HttpClientError::ModernDiscoveryMissingServerInfo)?;
+                    let instructions = discovery.and_then(|discovery| {
+                        discovery
+                            .instructions()
+                            .map(|instructions| instructions.as_str().to_owned())
+                    });
+                    (server_info, None, instructions)
                 }
-                let value = response
-                    .result
-                    .ok_or(HttpClientError::LegacyInitializationMissingResult)?;
-                let initialization = serde_json::from_value::<InitializeResult>(value)
+                #[cfg(feature = "legacy-2024-11-05")]
+                ProtocolEra::Legacy2024 => {
+                    let parameters = serde_json::to_value(InitializeParams {
+                        protocol_version: PROTOCOL_VERSION.to_owned(),
+                        capabilities: client_capabilities.clone(),
+                        client_info: client_info.clone(),
+                    })
                     .map_err(|_| HttpClientError::LegacyInitializationInvalidResult)?;
-                if initialization.protocol_version != PROTOCOL_VERSION {
-                    return Err(
-                        HttpClientError::LegacyInitializationUnsupportedProtocolVersion {
-                            actual: initialization.protocol_version,
-                        },
+                    let response = connection
+                        .request(cx, "initialize", parameters, RequestId::Number(1))
+                        .await
+                        .map_err(HttpClientError::Connection)?;
+                    let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response
+                    else {
+                        return Err(HttpClientError::LegacyInitializationInvalidResult);
+                    };
+                    if response.error.is_some() {
+                        return Err(HttpClientError::LegacyInitializationRejected);
+                    }
+                    let value = response
+                        .result
+                        .ok_or(HttpClientError::LegacyInitializationMissingResult)?;
+                    let initialization = serde_json::from_value::<InitializeResult>(value)
+                        .map_err(|_| HttpClientError::LegacyInitializationInvalidResult)?;
+                    if initialization.protocol_version != PROTOCOL_VERSION {
+                        return Err(
+                            HttpClientError::LegacyInitializationUnsupportedProtocolVersion {
+                                actual: initialization.protocol_version,
+                            },
+                        );
+                    }
+                    connection.record_legacy_negotiated_protocol_version(
+                        initialization.protocol_version.clone(),
                     );
+                    connection
+                        .notify(cx, "notifications/initialized", None)
+                        .await
+                        .map_err(HttpClientError::Connection)?;
+                    (
+                        initialization.server_info,
+                        Some(initialization.capabilities),
+                        initialization.instructions,
+                    )
                 }
-                connection.record_legacy_negotiated_protocol_version(
-                    initialization.protocol_version.clone(),
-                );
-                connection
-                    .notify(cx, "notifications/initialized", None)
-                    .await
-                    .map_err(HttpClientError::Connection)?;
-                (
-                    initialization.server_info,
-                    Some(initialization.capabilities),
-                )
-            }
-            #[cfg(not(feature = "legacy-2024-11-05"))]
-            ProtocolEra::Legacy2024 => {
-                return Err(HttpClientError::CoreResult(McpError::invalid_params(
-                    "MCP 2024-11-05 HTTP requires the legacy-2024-11-05 feature",
-                )));
-            }
-        };
+                #[cfg(not(feature = "legacy-2024-11-05"))]
+                ProtocolEra::Legacy2024 => {
+                    return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                        "MCP 2024-11-05 HTTP requires the legacy-2024-11-05 feature",
+                    )));
+                }
+            };
 
         Ok(Self {
             connection,
@@ -10034,6 +10066,7 @@ impl HttpClient {
             client_capabilities,
             server_info,
             legacy_server_capabilities,
+            instructions,
             next_id: AtomicU64::new(2),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
@@ -10199,6 +10232,16 @@ impl HttpClient {
     #[must_use]
     pub const fn server_info(&self) -> &ServerInfo {
         &self.server_info
+    }
+
+    /// Returns server instructions retained from the successful handshake.
+    ///
+    /// Modern HTTP prefers the final discovery string captured at connect.
+    /// Exact 2024-11-05 HTTP returns the initialize result field. A missing
+    /// value means the peer did not advertise instructions.
+    #[must_use]
+    pub fn instructions(&self) -> Option<&str> {
+        self.instructions.as_deref()
     }
 
     /// Returns exact legacy capabilities when the selected peer is legacy.
@@ -12071,6 +12114,11 @@ pub struct Client {
     responses: SharedResponseRegistry,
     /// Exact non-progress notifications received from a modern server.
     final_server_notifications: VecDeque<ServerNotification>,
+    /// Exact-2024 server notifications retained from the stdio receive pump.
+    ///
+    /// Modern sessions leave this empty and use
+    /// [`Self::take_final_server_notifications`] instead.
+    legacy_server_notifications: VecDeque<JsonRpcRequest>,
     /// Exact progress notifications received from a modern server without
     /// converting their JSON numbers to legacy `f64` values.
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
@@ -12413,6 +12461,7 @@ impl Client {
             next_id: Arc::new(AtomicU64::new(1)),
             responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            legacy_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
@@ -12602,6 +12651,7 @@ impl Client {
             next_id: Arc::new(AtomicU64::new(2)), // Start at 2 since initialize used 1
             responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            legacy_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
@@ -12673,6 +12723,7 @@ impl Client {
             next_id: Arc::new(AtomicU64::new(1)), // Start at 1 since initialize hasn't happened
             responses: SharedResponseRegistry::new(),
             final_server_notifications: VecDeque::new(),
+            legacy_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             final_result_cache: FinalResultCache::default(),
             final_cache_ttl_diagnostics: VecDeque::new(),
@@ -12945,6 +12996,16 @@ impl Client {
         self.session.server_discovery()
     }
 
+    /// Returns server instructions retained from the successful handshake.
+    ///
+    /// Modern sessions prefer the final discovery string. Exact 2024-11-05
+    /// sessions return the initialize result field. A missing value means the
+    /// peer did not advertise instructions.
+    #[must_use]
+    pub fn instructions(&self) -> Option<&str> {
+        self.session.instructions()
+    }
+
     /// Returns the generic final extension state frozen by the successful
     /// `server/discover` exchange, if this client selected MCP 2026-07-28 and
     /// was configured through [`ClientBuilder::extension_registry`].
@@ -12980,10 +13041,25 @@ impl Client {
     ///
     /// Use [`Self::take_final_progress_notifications`] to retrieve final
     /// progress values without legacy `f64` conversion. Exact 2024-11-05
-    /// sessions never retain values in either queue.
+    /// sessions never retain values in either queue; use
+    /// [`Self::take_legacy_notifications`] for the 2024 receive pump.
     #[must_use]
     pub fn take_final_server_notifications(&mut self) -> Vec<ServerNotification> {
         self.final_server_notifications.drain(..).collect()
+    }
+
+    /// Pops one exact-2024 server notification retained by the stdio receive
+    /// pump. Modern sessions never retain values here.
+    #[must_use]
+    pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
+        self.legacy_server_notifications.pop_front()
+    }
+
+    /// Drains exact-2024 server notifications retained by the stdio receive
+    /// pump. Modern sessions never retain values here.
+    #[must_use]
+    pub fn take_legacy_notifications(&mut self) -> Vec<JsonRpcRequest> {
+        self.legacy_server_notifications.drain(..).collect()
     }
 
     /// Drains exact final progress notifications received during modern requests.
@@ -13961,6 +14037,29 @@ impl Client {
 
         Ok(Some(ModernServerNotification::Progress(Box::new(progress))))
     }
+
+    fn retain_legacy_server_notification(&mut self, request: &JsonRpcRequest) -> McpResult<bool> {
+        if self.session.selected_era() != Some(ProtocolEra::Legacy2024) {
+            return Ok(false);
+        }
+        if !is_legacy_server_notification_method(request) {
+            return Ok(false);
+        }
+        if self.legacy_server_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+            return Err(McpError::invalid_request(
+                LEGACY_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+            ));
+        }
+        if request.method == NOTIFICATIONS_MESSAGE
+            && let Some(params) = request.params.as_ref()
+            && let Ok(message) = serde_json::from_value::<LogMessageParams>(params.clone())
+        {
+            self.emit_log_message(message);
+        }
+        self.legacy_server_notifications.push_back(request.clone());
+        Ok(true)
+    }
+
     /// Sends a request and waits for response.
     fn send_request<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &mut self,
@@ -14393,6 +14492,13 @@ impl Client {
                 Ok(Some(_)) => continue,
                 Ok(None) => {}
                 Err(error) => return Err(self.terminate_connection(error)),
+            }
+            if let JsonRpcMessage::Request(request) = frame.message() {
+                match self.retain_legacy_server_notification(request) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => return Err(self.terminate_connection(error)),
+                }
             }
             let JsonRpcMessage::Request(request) = frame.into_message() else {
                 unreachable!("the frame was checked as a JSON-RPC request")
@@ -14859,6 +14965,11 @@ impl Client {
             if self.retain_modern_server_notification(&frame)?.is_some() {
                 return Ok(());
             }
+            if let JsonRpcMessage::Request(request) = frame.message()
+                && self.retain_legacy_server_notification(request)?
+            {
+                return Ok(());
+            }
             let JsonRpcMessage::Request(request) = frame.into_message() else {
                 unreachable!("the frame was checked as a JSON-RPC request")
             };
@@ -15235,6 +15346,16 @@ impl Client {
                     return timeout;
                 }
             }
+            if let JsonRpcMessage::Request(request) = frame.message() {
+                match self.retain_legacy_server_notification(request) {
+                    Ok(true) => return timeout,
+                    Ok(false) => {}
+                    Err(error) => {
+                        let _ = self.terminate_connection(error);
+                        return timeout;
+                    }
+                }
+            }
             let JsonRpcMessage::Request(request) = frame.into_message() else {
                 unreachable!("the frame was checked as a JSON-RPC request")
             };
@@ -15401,6 +15522,13 @@ impl Client {
                     Ok(Some(_)) => continue,
                     Ok(None) => {}
                     Err(error) => return Err(self.terminate_connection(error)),
+                }
+                if let JsonRpcMessage::Request(request) = frame.message() {
+                    match self.retain_legacy_server_notification(request) {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(error) => return Err(self.terminate_connection(error)),
+                    }
                 }
                 let JsonRpcMessage::Request(request) = frame.into_message() else {
                     unreachable!("the frame was checked as a JSON-RPC request")
@@ -15814,7 +15942,8 @@ impl Client {
                 result.capabilities,
                 result.protocol_version,
             )
-            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?,
+            .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
+            .with_legacy_instructions(result.instructions),
             ClientInitialization::Modern {
                 server_info,
                 discovery,

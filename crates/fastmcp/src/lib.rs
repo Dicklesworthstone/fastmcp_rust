@@ -3225,6 +3225,14 @@ pub mod modern {
             })
         }
 
+        /// Returns server instructions retained from final discovery.
+        ///
+        /// A missing value means the peer did not advertise instructions.
+        pub fn instructions(&mut self) -> McpResult<Option<&str>> {
+            self.inner.ensure_initialized()?;
+            Ok(self.inner.instructions())
+        }
+
         /// Returns whether final discovery activated the official MCP Apps extension.
         #[must_use]
         #[cfg(feature = "apps")]
@@ -6398,6 +6406,12 @@ pub mod legacy_2024 {
             self.inner.server_capabilities()
         }
 
+        /// Returns the exact-2024 initialize instructions, if the peer advertised them.
+        #[must_use]
+        pub fn instructions(&self) -> Option<&str> {
+            self.inner.instructions()
+        }
+
         /// Sends `notifications/roots/list_changed` on this exact-2024 stdio
         /// connection.
         ///
@@ -6443,6 +6457,29 @@ pub mod legacy_2024 {
             self.inner.call_tool_legacy(name, arguments)
         }
 
+        /// Calls one exact-2024 tool and admits request-scoped
+        /// `notifications/progress` for the supplied progress marker.
+        ///
+        /// Drain those frames with [`Self::take_server_notifications`].
+        pub fn call_tool_with_progress_marker(
+            &mut self,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<CallToolResult> {
+            match self
+                .inner
+                .call_tool_with_progress_marker(name, arguments, progress_marker)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy tools/call result",
+                )),
+            }
+        }
+
         /// Calls one exact-2024 tool while cooperatively driving stdio on a
         /// caller-owned asupersync context.
         ///
@@ -6485,6 +6522,26 @@ pub mod legacy_2024 {
             self.inner.read_resource_legacy(uri)
         }
 
+        /// Reads one exact-2024 resource and admits request-scoped
+        /// `notifications/progress` for the supplied progress marker.
+        pub fn read_resource_with_progress_marker(
+            &mut self,
+            uri: &str,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<ReadResourceResult> {
+            match self
+                .inner
+                .read_resource_with_progress_marker(uri, progress_marker)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy resources/read result",
+                )),
+            }
+        }
+
         /// Starts an exact-2024 resource subscription.
         pub fn subscribe_resource(&mut self, uri: &str) -> McpResult<()> {
             self.inner.subscribe_resource_legacy(uri)
@@ -6507,6 +6564,27 @@ pub mod legacy_2024 {
             arguments: std::collections::HashMap<String, String>,
         ) -> McpResult<GetPromptResult> {
             self.inner.get_prompt_legacy(name, arguments)
+        }
+
+        /// Gets one exact-2024 prompt and admits request-scoped
+        /// `notifications/progress` for the supplied progress marker.
+        pub fn get_prompt_with_progress_marker(
+            &mut self,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<GetPromptResult> {
+            match self
+                .inner
+                .get_prompt_with_progress_marker(name, arguments, progress_marker)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy prompts/get result",
+                )),
+            }
         }
 
         /// Completes one exact-2024 prompt or resource-template argument.
@@ -6555,6 +6633,30 @@ pub mod legacy_2024 {
         /// Sends exact-2024 `logging/setLevel`.
         pub fn set_log_level(&mut self, level: LogLevel) -> McpResult<()> {
             self.inner.set_log_level(level)
+        }
+
+        /// Pops one exact-2024 server notification retained by the stdio receive pump.
+        #[must_use]
+        pub fn take_notification(&mut self) -> Option<JsonRpcRequest> {
+            self.inner.take_legacy_notification()
+        }
+
+        /// Pops and direction-checks one typed exact-2024 server notification.
+        pub fn take_server_notification(&mut self) -> McpResult<Option<ServerNotification>> {
+            self.inner
+                .take_legacy_notification()
+                .map(|notification| ServerNotification::decode(&notification))
+                .transpose()
+        }
+
+        /// Drains and direction-checks exact-2024 server notifications retained
+        /// by the stdio receive pump.
+        pub fn take_server_notifications(&mut self) -> McpResult<Vec<ServerNotification>> {
+            self.inner
+                .take_legacy_notifications()
+                .into_iter()
+                .map(|notification| ServerNotification::decode(&notification))
+                .collect()
         }
 
         /// Closes the exact legacy client and its owned subprocess resources.
@@ -6992,6 +7094,12 @@ pub mod legacy_2024 {
         #[must_use]
         pub fn server_info(&self) -> &ServerInfo {
             self.inner.server_info()
+        }
+
+        /// Returns the exact-2024 initialize instructions, if the peer advertised them.
+        #[must_use]
+        pub fn instructions(&self) -> Option<&str> {
+            self.inner.instructions()
         }
 
         /// Returns the exact-2024 server capabilities admitted at initialization.
@@ -9447,6 +9555,26 @@ mod tests {
             &str,
             legacy_2024::JsonValue,
         ) -> McpResult<legacy_2024::CallToolResult> = legacy_2024::Client::call_tool;
+        let _: fn(
+            &mut legacy_2024::Client,
+            &str,
+            legacy_2024::JsonValue,
+            legacy_2024::ProgressMarker,
+        ) -> McpResult<legacy_2024::CallToolResult> =
+            legacy_2024::Client::call_tool_with_progress_marker;
+        let _: fn(
+            &mut legacy_2024::Client,
+            &str,
+            legacy_2024::ProgressMarker,
+        ) -> McpResult<legacy_2024::ReadResourceResult> =
+            legacy_2024::Client::read_resource_with_progress_marker;
+        let _: fn(
+            &mut legacy_2024::Client,
+            &str,
+            std::collections::HashMap<String, String>,
+            legacy_2024::ProgressMarker,
+        ) -> McpResult<legacy_2024::GetPromptResult> =
+            legacy_2024::Client::get_prompt_with_progress_marker;
         #[cfg(unix)]
         {
             fn legacy_call_tool_with_cx<'a>(
