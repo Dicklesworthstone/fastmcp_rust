@@ -397,11 +397,12 @@ fn decode_cursor_offset(cursor: Option<&str>) -> McpResult<usize> {
         .map_err(|_| McpError::invalid_params("Invalid cursor (offset too large)".to_string()))
 }
 
-/// The final catalog a continuation cursor was minted for.
+/// The catalog a continuation cursor was minted for.
 ///
-/// Exact MCP 2024-11-05 cursors remain offset-only. Final cursors bind the
-/// offset to both this catalog discriminator and the router catalog revision,
-/// so a continuation cannot cross catalog routes or observe a changed catalog.
+/// Paged list cursors bind the offset to this catalog discriminator, the
+/// router catalog revision, and the normalized query filters so a
+/// continuation cannot cross list methods, observe a changed catalog, or
+/// replay under different tag filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FinalCatalogKind {
@@ -1887,11 +1888,10 @@ pub struct Router {
     /// When `None`, list methods return all items in a single response and
     /// `nextCursor` is always omitted.
     list_page_size: Option<usize>,
-    /// Monotonic revision bound into every final catalog continuation cursor.
+    /// Monotonic revision bound into every paged catalog continuation cursor.
     ///
-    /// This advances after each successful catalog mutation. Exact legacy
-    /// cursors intentionally do not carry this state because their wire
-    /// contract remains offset-only.
+    /// This advances after each successful catalog mutation so a retained
+    /// cursor cannot observe a later catalog snapshot.
     final_catalog_revision: u64,
     /// Cache policy emitted on exact modern catalog and resource-read results.
     final_cache_hints: FinalCacheHintPolicy,
@@ -4460,18 +4460,19 @@ impl Router {
                 next_cursor: None,
             });
         };
-
-        let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = offset.saturating_add(page_size).min(tools.len());
-        let next_cursor = if end < tools.len() {
-            Some(encode_cursor_offset(end))
-        } else {
-            None
-        };
-        Ok(ListToolsResult {
-            tools: tools.get(offset..end).unwrap_or_default().to_vec(),
-            next_cursor,
-        })
+        let query = FinalCatalogQuery::from_tag_filters(
+            params.include_tags.as_deref(),
+            params.exclude_tags.as_deref(),
+        );
+        let (tools, next_cursor) = page_final_catalog(
+            tools,
+            params.cursor.as_deref(),
+            Some(page_size),
+            FinalCatalogKind::Tools,
+            self.final_catalog_revision,
+            &query,
+        )?;
+        Ok(ListToolsResult { tools, next_cursor })
     }
 
     /// Handles a final tools/list request using only final-admitted entries.
@@ -5027,16 +5028,20 @@ impl Router {
                 next_cursor: None,
             });
         };
-
-        let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = offset.saturating_add(page_size).min(resources.len());
-        let next_cursor = if end < resources.len() {
-            Some(encode_cursor_offset(end))
-        } else {
-            None
-        };
+        let query = FinalCatalogQuery::from_tag_filters(
+            params.include_tags.as_deref(),
+            params.exclude_tags.as_deref(),
+        );
+        let (resources, next_cursor) = page_final_catalog(
+            resources,
+            params.cursor.as_deref(),
+            Some(page_size),
+            FinalCatalogKind::Resources,
+            self.final_catalog_revision,
+            &query,
+        )?;
         Ok(ListResourcesResult {
-            resources: resources.get(offset..end).unwrap_or_default().to_vec(),
+            resources,
             next_cursor,
         })
     }
@@ -5069,16 +5074,20 @@ impl Router {
                 next_cursor: None,
             });
         };
-
-        let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = offset.saturating_add(page_size).min(templates.len());
-        let next_cursor = if end < templates.len() {
-            Some(encode_cursor_offset(end))
-        } else {
-            None
-        };
+        let query = FinalCatalogQuery::from_tag_filters(
+            params.include_tags.as_deref(),
+            params.exclude_tags.as_deref(),
+        );
+        let (resource_templates, next_cursor) = page_final_catalog(
+            templates,
+            params.cursor.as_deref(),
+            Some(page_size),
+            FinalCatalogKind::ResourceTemplates,
+            self.final_catalog_revision,
+            &query,
+        )?;
         Ok(ListResourceTemplatesResult {
-            resource_templates: templates.get(offset..end).unwrap_or_default().to_vec(),
+            resource_templates,
             next_cursor,
         })
     }
@@ -5360,16 +5369,20 @@ impl Router {
                 next_cursor: None,
             });
         };
-
-        let offset = decode_cursor_offset(params.cursor.as_deref())?;
-        let end = offset.saturating_add(page_size).min(prompts.len());
-        let next_cursor = if end < prompts.len() {
-            Some(encode_cursor_offset(end))
-        } else {
-            None
-        };
+        let query = FinalCatalogQuery::from_tag_filters(
+            params.include_tags.as_deref(),
+            params.exclude_tags.as_deref(),
+        );
+        let (prompts, next_cursor) = page_final_catalog(
+            prompts,
+            params.cursor.as_deref(),
+            Some(page_size),
+            FinalCatalogKind::Prompts,
+            self.final_catalog_revision,
+            &query,
+        )?;
         Ok(ListPromptsResult {
-            prompts: prompts.get(offset..end).unwrap_or_default().to_vec(),
+            prompts,
             next_cursor,
         })
     }
