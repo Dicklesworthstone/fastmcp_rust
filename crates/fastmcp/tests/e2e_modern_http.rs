@@ -6728,6 +6728,27 @@ impl ToolHandler for PublicHttpUrlElicitationTool {
             elicitation.into_input_required()?,
         ))
     }
+
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+        resume_inputs: Option<&'a fastmcp_rust::MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            match resume_inputs {
+                Some(inputs) => match public_http_url_elicitation_complete(inputs) {
+                    Ok(result) => Outcome::Ok(result),
+                    Err(error) => Outcome::Err(error),
+                },
+                None => match self.call_final_outcome(ctx, arguments) {
+                    Ok(result) => Outcome::Ok(result),
+                    Err(error) => Outcome::Err(error),
+                },
+            }
+        })
+    }
 }
 
 fn public_http_form_elicitation(ctx: &McpContext) -> McpResult<fastmcp_rust::InputRequiredResult> {
@@ -6741,6 +6762,104 @@ fn public_http_form_elicitation(ctx: &McpContext) -> McpResult<fastmcp_rust::Inp
         }),
     )?
     .into_input_required()
+}
+
+fn public_http_url_elicitation_complete(
+    completed_inputs: &fastmcp_rust::MrtrCompletedInputs,
+) -> McpResult<FinalToolOutcome> {
+    let elicitation = completed_inputs
+        .elicitation("approval")?
+        .ok_or_else(|| McpError::internal_error("URL elicitation input was not preserved"))?;
+    let action = if elicitation.is_accepted() {
+        "accept"
+    } else if elicitation.is_declined() {
+        "decline"
+    } else {
+        "cancel"
+    };
+    Ok(FinalToolOutcome::Complete(CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![ContentBlock::text(format!("url-elicit:{action}"))],
+            is_error: false,
+            structured_content: None,
+        },
+        ResultMeta::empty(),
+    )))
+}
+
+fn public_http_form_elicitation_action(
+    completed_inputs: &fastmcp_rust::MrtrCompletedInputs,
+) -> McpResult<String> {
+    let elicitation = completed_inputs
+        .elicitation("approval")?
+        .ok_or_else(|| McpError::internal_error("form elicitation input was not preserved"))?;
+    if elicitation.is_accepted() {
+        Ok(format!(
+            "form-elicit:{}",
+            elicitation.get_bool("approved").unwrap_or(false)
+        ))
+    } else if elicitation.is_declined() {
+        Ok("form-elicit:decline".to_owned())
+    } else {
+        Ok("form-elicit:cancel".to_owned())
+    }
+}
+
+fn public_http_form_elicitation_resource_complete(
+    completed_inputs: &fastmcp_rust::MrtrCompletedInputs,
+) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+    let text = public_http_form_elicitation_action(completed_inputs)?;
+    Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+        FinalReadResourceResult {
+            contents: vec![EmbeddedResourceContents::Text {
+                uri: fastmcp_rust::FinalAbsoluteUri::parse(PUBLIC_HTTP_ELICITATION_RESOURCE_URI)
+                    .expect("the public HTTP elicitation resource URI is absolute"),
+                text,
+                mime_type: Some("text/plain".to_owned()),
+                meta: None,
+                additional: BTreeMap::new(),
+            }],
+            ttl_ms: CacheTtl::milliseconds(7),
+            cache_scope: CacheScope::Private,
+        },
+        ResultMeta::empty(),
+    )))
+}
+
+fn public_http_form_elicitation_prompt_complete(
+    completed_inputs: &fastmcp_rust::MrtrCompletedInputs,
+) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+    let text = public_http_form_elicitation_action(completed_inputs)?;
+    Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+        FinalGetPromptResult {
+            description: Some("typed form elicitation prompt result".to_owned()),
+            messages: vec![FinalPromptMessage {
+                role: Role::Assistant,
+                content: ContentBlock::text(text),
+            }],
+        },
+        ResultMeta::empty(),
+    )))
+}
+
+fn public_modern_elicitation_follow_handlers() -> modern::ReverseRequestHandlers {
+    modern::ReverseRequestHandlers::new().with_modern_elicitation_create(
+        |_cx, _cancellation, params| {
+            Box::pin(async move {
+                Ok(match params {
+                    fastmcp_protocol::ElicitRequestParams::Url(_) => {
+                        fastmcp_protocol::ElicitResult::accept_url()
+                    }
+                    fastmcp_protocol::ElicitRequestParams::Form(_) => {
+                        fastmcp_protocol::ElicitResult::accept(HashMap::from([(
+                            "approved".to_owned(),
+                            fastmcp_protocol::ElicitContentValue::Bool(true),
+                        )]))
+                    }
+                })
+            })
+        },
+    )
 }
 
 /// Live modern HTTP resource that returns framework-issued MRTR elicitation.
@@ -6777,6 +6896,28 @@ impl ResourceHandler for PublicHttpElicitationResource {
         ctx: &McpContext,
     ) -> McpResult<FinalMethodOutcome<fastmcp_rust::FinalReadResourceResult>> {
         public_http_form_elicitation(ctx).map(FinalMethodOutcome::InputRequired)
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _uri: &'a str,
+        _params: &'a HashMap<String, String>,
+        resume_inputs: Option<&'a fastmcp_rust::MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            match resume_inputs {
+                Some(inputs) => match public_http_form_elicitation_resource_complete(inputs) {
+                    Ok(result) => Outcome::Ok(result),
+                    Err(error) => Outcome::Err(error),
+                },
+                None => match self.read_final_outcome(ctx) {
+                    Ok(result) => Outcome::Ok(result),
+                    Err(error) => Outcome::Err(error),
+                },
+            }
+        })
     }
 }
 
@@ -6816,6 +6957,27 @@ impl PromptHandler for PublicHttpElicitationPrompt {
         _arguments: HashMap<String, String>,
     ) -> McpResult<FinalMethodOutcome<fastmcp_rust::FinalGetPromptResult>> {
         public_http_form_elicitation(ctx).map(FinalMethodOutcome::InputRequired)
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+        resume_inputs: Option<&'a fastmcp_rust::MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            match resume_inputs {
+                Some(inputs) => match public_http_form_elicitation_prompt_complete(inputs) {
+                    Ok(result) => Outcome::Ok(result),
+                    Err(error) => Outcome::Err(error),
+                },
+                None => match self.get_final_outcome(ctx, arguments) {
+                    Ok(result) => Outcome::Ok(result),
+                    Err(error) => Outcome::Err(error),
+                },
+            }
+        })
     }
 }
 
@@ -7058,6 +7220,43 @@ fn e2e_public_http_result_verbs_return_live_input_required() {
         panic!("live bind_http prompt elicitation must keep input_required: {prompt:?}");
     };
     assert_live_input_required(&result, "approval", "prompts/get");
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_typed_verbs_cannot_resume_stateless_elicitation_request_state() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_sampling_http_server();
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+        .expect("form and url elicitation capabilities are valid");
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-elicit-stateless", "1.0.0")
+            .capabilities(capabilities)
+            .modern_reverse_request_handlers(public_modern_elicitation_follow_handlers())
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade installs an elicitation handler before discovery");
+
+    let retry = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
+    );
+    let retry = match retry {
+        Ok(result) => {
+            panic!("stateless HTTP must not complete elicitation across a second POST: {result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        retry.contains("RequestCancelled")
+            || retry.contains("requestState")
+            || retry.contains("InvalidRequest")
+            || retry.contains("session"),
+        "a second HTTP POST must not resume the first POST's elicitation requestState: {retry}"
+    );
     server.shutdown();
 }
 
@@ -19275,6 +19474,9 @@ mod live_websocket_bind {
             let server = modern::ServerBuilder::new("facade-ws-mrtr", "1.0.0")
                 .tool(PublicHttpSamplingTool)
                 .tool(PublicHttpRootsTool)
+                .tool(PublicHttpUrlElicitationTool)
+                .resource(PublicHttpElicitationResource)
+                .prompt(PublicHttpElicitationPrompt)
                 .build();
             let bound = server
                 .bind_websocket(&cx, "127.0.0.1:0")
@@ -19301,6 +19503,8 @@ mod live_websocket_bind {
             capabilities.sampling = Some(Default::default());
             capabilities.roots =
                 serde_json::from_value(json!({})).expect("roots capability is valid");
+            capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+                .expect("form and url elicitation capabilities are valid");
             let mut client = websocket_client_bounded(
                 &cx,
                 "live bind_websocket MRTR initialize",
@@ -19335,6 +19539,48 @@ mod live_websocket_bind {
                 panic!("live bind_websocket final roots must keep input_required: {rooted:?}");
             };
             assert_live_input_required(&result, "roots", "tools/call");
+
+            let url_elicitation = websocket_client_bounded(
+                &cx,
+                "live bind_websocket URL elicitation tools/call",
+                client.call_tool_result(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("live bind_websocket final URL elicitation must return a typed tools/call result");
+            let FinalCoreResult::ToolsCallInputRequired { result, .. } = url_elicitation else {
+                panic!(
+                    "live bind_websocket final URL elicitation must keep input_required: {url_elicitation:?}"
+                );
+            };
+            assert_live_input_required(&result, "approval", "tools/call");
+
+            let resource = websocket_client_bounded(
+                &cx,
+                "live bind_websocket form elicitation resources/read",
+                client.read_resource_result(&cx, PUBLIC_HTTP_ELICITATION_RESOURCE_URI),
+            )
+            .await
+            .expect("live bind_websocket final resource elicitation must return a typed result");
+            let FinalCoreResult::ResourcesReadInputRequired { result, .. } = resource else {
+                panic!(
+                    "live bind_websocket resource elicitation must keep input_required: {resource:?}"
+                );
+            };
+            assert_live_input_required(&result, "approval", "resources/read");
+
+            let prompt = websocket_client_bounded(
+                &cx,
+                "live bind_websocket form elicitation prompts/get",
+                client.get_prompt_result(&cx, PUBLIC_HTTP_ELICITATION_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect("live bind_websocket final prompt elicitation must return a typed result");
+            let FinalCoreResult::PromptsGetInputRequired { result, .. } = prompt else {
+                panic!(
+                    "live bind_websocket prompt elicitation must keep input_required: {prompt:?}"
+                );
+            };
+            assert_live_input_required(&result, "approval", "prompts/get");
 
             websocket_client_bounded(&cx, "live bind_websocket MRTR close", client.close(&cx))
                 .await
@@ -19385,6 +19631,2289 @@ mod live_websocket_bind {
             .await
             .expect("the no-roots WebSocket client closes after the fail-closed proof");
             drop(no_roots_client);
+
+            let missing_url_transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR missing-url handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("a third WebSocket client must complete RFC 6455 upgrade");
+            let mut no_url = ClientCapabilities::default();
+            no_url.sampling = Some(Default::default());
+            no_url.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+            no_url.elicitation = serde_json::from_value(json!({"form": {}}))
+                .expect("form elicitation capability is valid");
+            let mut no_url_client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR missing-url initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-mrtr-no-url", "1.0.0")
+                    .capabilities(no_url)
+                    .connect_websocket_with_cx(&cx, missing_url_transport),
+            )
+            .await
+            .expect("the ModernOnly public facade connects without advertising URL elicitation");
+            let missing_url = websocket_client_bounded(
+                &cx,
+                "live bind_websocket missing URL elicitation tools/call",
+                no_url_client.call_tool_result(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
+            )
+            .await;
+            let missing_url = match missing_url {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_url.contains("not advertised by the client")
+                    || missing_url.contains("InvalidRequest")
+                    || missing_url.contains("elicitation"),
+                "omitting only URL elicitation must fail closed: {missing_url}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR missing-url close",
+                no_url_client.close(&cx),
+            )
+            .await
+            .expect("the no-url WebSocket client closes after the fail-closed proof");
+            drop(no_url_client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_follows_installed_elicitation_handlers() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned WebSocket elicitation follow runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-elicit-follow", "1.0.0")
+                .tool(PublicHttpUrlElicitationTool)
+                .resource(PublicHttpElicitationResource)
+                .prompt(PublicHttpElicitationPrompt)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket elicitation follow must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket elicitation follow publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public bind_websocket elicitation follow serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket elicitation follow handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket elicitation follow must complete RFC 6455 upgrade");
+            let mut capabilities = ClientCapabilities::default();
+            capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+                .expect("form and url elicitation capabilities are valid");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket elicitation follow initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-elicit-follow", "1.0.0")
+                    .capabilities(capabilities)
+                    .modern_reverse_request_handlers(public_modern_elicitation_follow_handlers())
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade installs an elicitation handler before discovery");
+
+            let url = websocket_client_bounded(
+                &cx,
+                "live bind_websocket URL elicitation follow",
+                client.call_tool(&cx, PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("public WebSocket call_tool follows the installed URL elicitation handler");
+            assert!(
+                url.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "url-elicit:accept",
+                    _ => false,
+                }),
+                "the URL elicitation retry must complete from the installed handler: {url:?}"
+            );
+
+            let resource = websocket_client_bounded(
+                &cx,
+                "live bind_websocket form elicitation resource follow",
+                client.read_resource(&cx, PUBLIC_HTTP_ELICITATION_RESOURCE_URI),
+            )
+            .await
+            .expect("public WebSocket read_resource follows the installed form elicitation handler");
+            assert!(
+                resource.contents.iter().any(|content| match content {
+                    EmbeddedResourceContents::Text { text, .. } => text == "form-elicit:true",
+                    _ => false,
+                }),
+                "the form elicitation resource retry must complete from the installed handler: {resource:?}"
+            );
+
+            let prompt = websocket_client_bounded(
+                &cx,
+                "live bind_websocket form elicitation prompt follow",
+                client.get_prompt(&cx, PUBLIC_HTTP_ELICITATION_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect("public WebSocket get_prompt follows the installed form elicitation handler");
+            assert!(
+                prompt.messages.iter().any(|message| match &message.content {
+                    ContentBlock::Text { text, .. } => text == "form-elicit:true",
+                    _ => false,
+                }),
+                "the form elicitation prompt retry must complete from the installed handler: {prompt:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket elicitation follow close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the elicitation-follow WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_admits_ping_and_tools_call() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket runtime installs an ambient context");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy", "1.0.0")
+                .tool(PublicWebSocketLogTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates over bind_websocket");
+            assert_eq!(
+                client.protocol_version(),
+                "2024-11-05",
+                "the sealed exact-2024 WebSocket session must pin 2024-11-05"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 bind_websocket ping", client.ping(&cx))
+                .await
+                .expect("live LegacyOnly bind_websocket must answer ping");
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket tools/list",
+                client.list_tools(&cx),
+            )
+            .await
+            .expect("live LegacyOnly bind_websocket must list the registered tool");
+            assert!(
+                listed.iter().any(|tool| tool.name == PUBLIC_WS_LOG_TOOL_NAME),
+                "exact-2024 WebSocket tools/list must retain the registered tool: {listed:?}"
+            );
+
+            let called = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket tools/call",
+                client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("live LegacyOnly bind_websocket must reach the registered tool");
+            assert_eq!(
+                legacy_http_tool_text(&called).as_deref(),
+                Some("logged"),
+                "exact-2024 WebSocket tools/call must retain the handler text: {called:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket missing tools/call",
+                client.call_tool(&cx, "public-ws-e2e-missing", json!({})),
+            )
+            .await
+            .expect_err("changing only the missing tool must keep the session refused");
+            assert!(
+                missing.code == McpErrorCode::MethodNotFound
+                    || missing.code == McpErrorCode::InvalidParams
+                    || missing.code == McpErrorCode::InvalidRequest,
+                "a missing exact-2024 WebSocket tool must stay a handler-visible refusal: {missing:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the exact-2024 WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_reads_resource_and_gets_prompt() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket resource runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-catalog", "1.0.0")
+                .resource(PublicHttpSnapshotResource)
+                .prompt(PublicHttpInstructionPrompt)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket catalog must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket catalog publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket catalog serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket catalog must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-catalog", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates catalog verbs over bind_websocket");
+
+            let resources = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket resources/list",
+                client.list_resources(&cx),
+            )
+            .await
+            .expect("live LegacyOnly bind_websocket must list the registered resource");
+            assert!(
+                resources
+                    .iter()
+                    .any(|resource| resource.uri == PUBLIC_HTTP_RESOURCE_URI),
+                "exact-2024 WebSocket resources/list must retain the registered URI: {resources:?}"
+            );
+
+            let read = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_RESOURCE_URI),
+            )
+            .await
+            .expect("live LegacyOnly bind_websocket must read the registered resource");
+            let read_text = serde_json::to_value(&read)
+                .ok()
+                .and_then(|value| value["contents"][0]["text"].as_str().map(str::to_owned));
+            assert_eq!(
+                read_text.as_deref(),
+                Some(PUBLIC_HTTP_RESOURCE_TEXT),
+                "exact-2024 WebSocket resources/read must retain the handler text: {read:?}"
+            );
+
+            let missing_resource = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket missing resources/read",
+                client.read_resource(&cx, "test://public-ws-e2e/missing"),
+            )
+            .await
+            .expect_err("changing only the missing resource must keep the session refused");
+            assert!(
+                missing_resource.code == McpErrorCode::MethodNotFound
+                    || missing_resource.code == McpErrorCode::InvalidParams
+                    || missing_resource.code == McpErrorCode::InvalidRequest
+                    || missing_resource.code == McpErrorCode::ResourceNotFound,
+                "a missing exact-2024 WebSocket resource must stay a handler-visible refusal: {missing_resource:?}"
+            );
+
+            let prompts = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket prompts/list",
+                client.list_prompts(&cx),
+            )
+            .await
+            .expect("live LegacyOnly bind_websocket must list the registered prompt");
+            assert!(
+                prompts
+                    .iter()
+                    .any(|prompt| prompt.name == PUBLIC_HTTP_PROMPT_NAME),
+                "exact-2024 WebSocket prompts/list must retain the registered prompt: {prompts:?}"
+            );
+
+            let prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket prompts/get",
+                client.get_prompt(
+                    &cx,
+                    PUBLIC_HTTP_PROMPT_NAME,
+                    HashMap::from([("subject".to_owned(), "cross-era".to_owned())]),
+                ),
+            )
+            .await
+            .expect("live LegacyOnly bind_websocket must get the registered prompt");
+            let prompt_text = serde_json::to_value(&prompt)
+                .ok()
+                .and_then(|value| value["messages"][0]["content"]["text"].as_str().map(str::to_owned));
+            assert_eq!(
+                prompt_text.as_deref(),
+                Some(PUBLIC_HTTP_PROMPT_TEXT),
+                "exact-2024 WebSocket prompts/get must retain the handler text: {prompt:?}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bind_websocket missing prompts/get",
+                client.get_prompt(&cx, "public-ws-e2e-missing", HashMap::new()),
+            )
+            .await
+            .expect_err("changing only the missing prompt must keep the session refused");
+            assert!(
+                missing_prompt.code == McpErrorCode::MethodNotFound
+                    || missing_prompt.code == McpErrorCode::InvalidParams
+                    || missing_prompt.code == McpErrorCode::InvalidRequest
+                    || missing_prompt.code == McpErrorCode::PromptNotFound,
+                "a missing exact-2024 WebSocket prompt must stay a handler-visible refusal: {missing_prompt:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the exact-2024 catalog WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_retains_ctx_info_after_set_log_level() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket log runtime installs an ambient context");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-log", "1.0.0")
+                .tool(PublicWebSocketLogTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket log must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket log publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket log serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 log handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket log must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 log initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-log", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates logging over bind_websocket");
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 log tools/call before setLevel",
+                client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("ctx.info must not prevent the exact-2024 WebSocket tool from completing");
+            let silent = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications before setLevel must decode");
+            assert!(
+                !silent.iter().any(|notification| {
+                    legacy_http_log_message_is(notification, PUBLIC_WS_HANDLER_LOG_TEXT)
+                }),
+                "omitting only logging/setLevel must keep exact-2024 WebSocket ctx.info silent: {silent:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 logging/setLevel Info",
+                client.set_log_level(&cx, legacy_2024::LogLevel::Info),
+            )
+            .await
+            .expect("exact-2024 WebSocket logging/setLevel must be admitted");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 log tools/call after setLevel Info",
+                client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("ctx.info must not prevent the same tools/call from completing");
+            let info = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications after setLevel Info must decode");
+            assert!(
+                info.iter().any(|notification| {
+                    legacy_http_log_message_is(notification, PUBLIC_WS_HANDLER_LOG_TEXT)
+                }),
+                "live exact-2024 WebSocket must retain ctx.info after set_log_level(Info): {info:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 logging/setLevel Emergency",
+                client.set_log_level(&cx, legacy_2024::LogLevel::Emergency),
+            )
+            .await
+            .expect("raising only the logLevel floor must stay admitted");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 log tools/call after setLevel Emergency",
+                client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("raising only the logLevel floor cannot break the same public tools/call");
+            let emergency = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications after Emergency must decode");
+            assert!(
+                !emergency.iter().any(|notification| {
+                    legacy_http_log_message_is(notification, PUBLIC_WS_HANDLER_LOG_TEXT)
+                }),
+                "raising only the logLevel floor must suppress ctx.info: {emergency:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 log close", client.close(&cx))
+                .await
+                .expect("the exact-2024 log WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_composes_nested_tool_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket compose runtime installs an ambient context");
+            let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-compose", "1.0.0")
+                .tool(CountingPublicHttpValue {
+                    counters: Arc::clone(&handler_calls),
+                })
+                .tool(PublicHttpComposeTool)
+                .resource(CountingPublicHttpSnapshot {
+                    counters: Arc::clone(&handler_calls),
+                })
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket compose must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket compose publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket compose serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-compose", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates compose over bind_websocket");
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose tools/call",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+                    json!({"value": "alpha"}),
+                ),
+            )
+            .await
+            .expect("live exact-2024 WebSocket must compose a nested tool call and resource read");
+            assert_eq!(
+                legacy_http_tool_text(&composed).as_deref(),
+                Some("compose:tool:alpha|resource:deterministic"),
+                "live exact-2024 WebSocket dispatch must attach request-scoped callers: {composed:?}"
+            );
+            assert_eq!(
+                handler_calls.snapshot().tool,
+                1,
+                "the nested tools/call must invoke the peer tool exactly once"
+            );
+            assert_eq!(
+                handler_calls.snapshot().resource,
+                1,
+                "the nested resources/read must invoke the peer resource exactly once"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose missing nested tool",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+                    json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+                ),
+            )
+            .await;
+            let missing = match missing {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing.contains("public-http-e2e-missing")
+                    || missing.contains("compose-nested-tool")
+                    || missing.contains("Unknown tool")
+                    || missing.contains("not found"),
+                "the nested unknown tool must stay a handler-visible refusal: {missing}"
+            );
+            assert_eq!(
+                handler_calls.snapshot().tool,
+                1,
+                "an unknown nested tool name must not invoke the peer tool"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 compose close", client.close(&cx))
+                .await
+                .expect("the exact-2024 compose WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket timeout runtime installs an ambient context");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-timeout", "1.0.0")
+                .tool(PublicHttpSlowTool)
+                .tool(PublicHttpFastTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket timeout must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket timeout publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public LegacyOnly bind_websocket timeout serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 timeout handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket timeout must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 timeout initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-timeout", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates timeout over bind_websocket");
+
+            let timed_out = websocket_client_bounded(
+                &cx,
+                "live exact-2024 late tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_SLOW_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("a handler that outlives its timeout must be refused");
+            let timed_out = format!("{timed_out:?}");
+            assert!(
+                timed_out.contains("Request timeout exceeded")
+                    || timed_out.contains("RequestCancelled"),
+                "the refused late tools/call must keep the handler-timeout error: {timed_out}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live exact-2024 fast tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the tool must still be admitted after a handler timeout");
+            assert_eq!(
+                legacy_http_tool_text(&fast).as_deref(),
+                Some("fast"),
+                "the fast peer tool must still complete: {fast:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 timeout close", client.close(&cx))
+                .await
+                .expect("the exact-2024 timeout WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_retains_tools_list_changed() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket list_changed runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-listen", "1.0.0")
+                .tool(PublicWebSocketTouchTool)
+                .tool(PublicWebSocketHideTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket listen must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket listen publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket listen serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 list_changed handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket listen must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 list_changed initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-listen", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates catalog notifications over bind_websocket");
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 non-mutating tools/call",
+                client.call_tool(&cx, PUBLIC_WS_TOUCH_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("a non-mutating exact-2024 tools/call must complete");
+            let silent = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications before hide must decode");
+            assert!(
+                !silent.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::ToolsListChanged
+                )),
+                "changing only the missing catalog mutation must keep tools/list_changed silent: {silent:?}"
+            );
+
+            let hidden = websocket_client_bounded(
+                &cx,
+                "live exact-2024 hide tools/call",
+                client.call_tool(&cx, PUBLIC_WS_HIDE_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("disabling a peer tool must complete");
+            assert_eq!(
+                legacy_http_tool_text(&hidden).as_deref(),
+                Some("hidden"),
+                "exact-2024 WebSocket session state must let disable_tool publish list_changed: {hidden:?}"
+            );
+            let changed = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications after hide must decode");
+            assert!(
+                changed.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::ToolsListChanged
+                )),
+                "live exact-2024 WebSocket must retain notifications/tools/list_changed: {changed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 list_changed tools/list",
+                client.list_tools(&cx),
+            )
+            .await
+            .expect("a later tools/list on the same WebSocket client must still complete");
+
+            websocket_client_bounded(&cx, "live exact-2024 list_changed close", client.close(&cx))
+                .await
+                .expect("the exact-2024 list_changed WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_retains_resource_updated_after_subscribe() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket subscribe runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-updated", "1.0.0")
+                .resource(PublicWebSocketWatchResource)
+                .tool(PublicWebSocketNotifyTool)
+                .tool(PublicWebSocketMissTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket updated must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket updated publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket updated serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 updated handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket updated must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 updated initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-updated", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates subscribe over bind_websocket");
+
+            let silent_touch = websocket_client_bounded(
+                &cx,
+                "live exact-2024 updated touch without subscribe",
+                client.call_tool(&cx, PUBLIC_WS_NOTIFY_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("touching an unsubscribed resource must complete");
+            assert_eq!(
+                legacy_http_tool_text(&silent_touch).as_deref(),
+                Some("silent"),
+                "without resources/subscribe the handler must not claim updated delivery: {silent_touch:?}"
+            );
+            let silent = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications before subscribe must decode");
+            assert!(
+                !silent.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::ResourceUpdated(_)
+                )),
+                "omitting only resources/subscribe must keep resources/updated silent: {silent:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 resources/subscribe",
+                client.subscribe_resource(&cx, PUBLIC_WS_WATCH_RESOURCE_URI),
+            )
+            .await
+            .expect("exact-2024 WebSocket resources/subscribe must be admitted");
+
+            let missed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unmatched notify",
+                client.call_tool(&cx, PUBLIC_WS_MISS_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("notifying an unwatched URI must complete");
+            assert_eq!(
+                legacy_http_tool_text(&missed).as_deref(),
+                Some("silent"),
+                "an unmatched notify must not claim delivery: {missed:?}"
+            );
+            let unmatched = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications after unmatched notify must decode");
+            assert!(
+                !unmatched.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::ResourceUpdated(_)
+                )),
+                "changing only the URI must keep resources/updated silent: {unmatched:?}"
+            );
+
+            let touched = websocket_client_bounded(
+                &cx,
+                "live exact-2024 matching notify",
+                client.call_tool(&cx, PUBLIC_WS_NOTIFY_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("touching a subscribed resource must complete");
+            assert_eq!(
+                legacy_http_tool_text(&touched).as_deref(),
+                Some("notified"),
+                "resources/subscribe must count as notify_resource_updated delivery: {touched:?}"
+            );
+            let updated = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications after matching notify must decode");
+            assert!(
+                updated.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::ResourceUpdated(params)
+                        if params.uri == PUBLIC_WS_WATCH_RESOURCE_URI
+                )),
+                "live exact-2024 WebSocket must retain notifications/resources/updated: {updated:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 updated close", client.close(&cx))
+                .await
+                .expect("the exact-2024 updated WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_sampling_callback_reaches_context() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket sampling runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-sample", "1.0.0")
+                .tool(PublicHttpSampleTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket sampling must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket sampling publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket sampling serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 sampling handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket sampling must complete RFC 6455 upgrade");
+            let callback_calls = Arc::new(AtomicUsize::new(0));
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 sampling initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-sample", "1.0.0")
+                    .capabilities(ClientCapabilities {
+                        sampling: Some(Default::default()),
+                        elicitation: None,
+                        roots: None,
+                    })
+                    .reverse_request_handlers(
+                        legacy_2024::LegacyReverseRequestHandlers::new()
+                            .with_sampling_create_message({
+                                let callback_calls = Arc::clone(&callback_calls);
+                                move |_cx, _cancel, _params| {
+                                    callback_calls.fetch_add(1, Ordering::Relaxed);
+                                    Box::pin(async {
+                                        Ok(legacy_2024::LegacyCreateMessageResult::text(
+                                            PUBLIC_HTTP_SAMPLED_TEXT,
+                                            "e2e-legacy-ws-model",
+                                        ))
+                                    })
+                                }
+                            }),
+                    )
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the sampling callback is configured before exact-2024 WebSocket initialization");
+
+            let sampled = websocket_client_bounded(
+                &cx,
+                "live exact-2024 sampling tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_SAMPLE_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("the sealed exact-2024 WebSocket facade must service sampling/createMessage before its typed tool result");
+            assert_eq!(
+                legacy_http_tool_text(&sampled).as_deref(),
+                Some(PUBLIC_HTTP_SAMPLED_TEXT),
+                "live exact-2024 WebSocket sampling must retain the callback text: {sampled:?}"
+            );
+            assert_eq!(
+                callback_calls.load(Ordering::Relaxed),
+                1,
+                "the tool's context authority issues exactly one sampling/createMessage callback"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 sampling close", client.close(&cx))
+                .await
+                .expect("the exact-2024 sampling WebSocket client closes after the live proof");
+            drop(client);
+
+            let bare_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 sampling bare handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("a bare exact-2024 WebSocket client must complete RFC 6455 upgrade");
+            let mut bare = websocket_client_bounded(
+                &cx,
+                "live exact-2024 sampling bare initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-sample-bare", "1.0.0")
+                    .connect_websocket_with_cx(&cx, bare_transport),
+            )
+            .await
+            .expect("a bare exact-2024 WebSocket peer must still initialize");
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 sampling tools/call without capability",
+                bare.call_tool(&cx, PUBLIC_HTTP_SAMPLE_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("missing sampling authority remains a typed exact-2024 tool result");
+            let text = legacy_http_tool_text(&missing).unwrap_or_default();
+            assert!(
+                missing.is_error || text.contains("does not support sampling capability"),
+                "omitting only the sampling capability must fail closed: {missing:?}"
+            );
+            assert_ne!(
+                text.as_str(),
+                PUBLIC_HTTP_SAMPLED_TEXT,
+                "a bare peer must not invent a sampling callback result: {missing:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 sampling bare close", bare.close(&cx))
+                .await
+                .expect("the bare exact-2024 sampling WebSocket client closes after the planted refusal");
+            drop(bare);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_roots_callback_reaches_context() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket roots runtime installs an ambient context");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-roots", "1.0.0")
+                .tool(PublicHttpLegacyRootsTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket roots must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket roots publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket roots serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket roots must complete RFC 6455 upgrade");
+            let callback_calls = Arc::new(AtomicUsize::new(0));
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-roots", "1.0.0")
+                    .capabilities(ClientCapabilities {
+                        sampling: None,
+                        elicitation: None,
+                        roots: Some(Default::default()),
+                    })
+                    .reverse_request_handlers(
+                        legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list({
+                            let callback_calls = Arc::clone(&callback_calls);
+                            move |_cx, _cancel, _params| {
+                                callback_calls.fetch_add(1, Ordering::Relaxed);
+                                Box::pin(async {
+                                    Ok(legacy_2024::ListRootsResult::new(vec![
+                                        legacy_2024::Root::with_name(
+                                            PUBLIC_HTTP_LEGACY_ROOT_URI,
+                                            "workspace",
+                                        ),
+                                    ]))
+                                })
+                            }
+                        }),
+                    )
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the roots callback is configured before exact-2024 WebSocket initialization");
+
+            let rooted = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_LEGACY_ROOTS_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("the sealed exact-2024 WebSocket facade must service roots/list before its typed tool result");
+            assert_eq!(
+                legacy_http_tool_text(&rooted).as_deref(),
+                Some(PUBLIC_HTTP_LEGACY_ROOT_URI),
+                "live exact-2024 WebSocket roots must retain the callback URI: {rooted:?}"
+            );
+            assert_eq!(
+                callback_calls.load(Ordering::Relaxed),
+                1,
+                "the tool's context authority issues exactly one roots/list callback"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 roots close", client.close(&cx))
+                .await
+                .expect("the exact-2024 roots WebSocket client closes after the live proof");
+            drop(client);
+
+            let bare_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots bare handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("a bare exact-2024 WebSocket client must complete RFC 6455 upgrade");
+            let mut bare = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots bare initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-roots-bare", "1.0.0")
+                    .connect_websocket_with_cx(&cx, bare_transport),
+            )
+            .await
+            .expect("a bare exact-2024 WebSocket peer must still initialize");
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots tools/call without capability",
+                bare.call_tool(&cx, PUBLIC_HTTP_LEGACY_ROOTS_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("missing roots authority remains a typed exact-2024 tool result");
+            let text = legacy_http_tool_text(&missing).unwrap_or_default();
+            assert!(
+                missing.is_error || text.contains("does not support roots capability"),
+                "omitting only the roots capability must fail closed: {missing:?}"
+            );
+            assert_ne!(
+                text.as_str(),
+                PUBLIC_HTTP_LEGACY_ROOT_URI,
+                "a bare peer must not invent a roots callback result: {missing:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 roots bare close", bare.close(&cx))
+                .await
+                .expect("the bare exact-2024 roots WebSocket client closes after the planted refusal");
+            drop(bare);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_complete_is_retained_and_peer_without_handler_is_refused() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket complete runtime installs an ambient context",
+            );
+            let advertised = legacy_2024::ServerBuilder::new("facade-ws-legacy-complete", "1.0.0")
+                .prompt(PublicHttpCatalogPrompt)
+                .completion_handler(CountingPublicHttpCompletion {
+                    counters: Arc::new(PublicHttpHandlerCallCounters::default()),
+                })
+                .build();
+            let advertised_bound = advertised
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket complete must bind a localhost listener");
+            let advertised_address = advertised_bound.local_addr().expect(
+                "public LegacyOnly bind_websocket complete publishes its bound address",
+            );
+            let omitted = legacy_2024::ServerBuilder::new(
+                "facade-ws-legacy-complete-omitted",
+                "1.0.0",
+            )
+            .prompt(PublicHttpCatalogPrompt)
+            .build();
+            let omitted_bound = omitted
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("the omitted-completion WebSocket server must bind");
+            let omitted_address = omitted_bound
+                .local_addr()
+                .expect("the omitted-completion WebSocket server publishes its bound address");
+            let scope = cx.scope();
+            let advertised_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    advertised_bound.serve(&serve_cx).await
+                })
+                .expect("advertised complete serve must be admitted");
+            let omitted_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    omitted_bound.serve(&serve_cx).await
+                })
+                .expect("omitted complete serve must be admitted");
+
+            let advertised_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 complete handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{advertised_address}/mcp")),
+            )
+            .await
+            .expect("advertised complete WebSocket must complete RFC 6455 upgrade");
+            let mut advertised_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 complete initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-complete", "1.0.0")
+                    .connect_websocket_with_cx(&cx, advertised_transport),
+            )
+            .await
+            .expect("the advertised complete WebSocket peer must initialize");
+            assert!(
+                advertised_client
+                    .server_capabilities()
+                    .completions
+                    .is_some(),
+                "installing a legacy completion handler must advertise completions: {:?}",
+                advertised_client.server_capabilities()
+            );
+
+            let omitted_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 complete omitted handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{omitted_address}/mcp")),
+            )
+            .await
+            .expect("omitted complete WebSocket must complete RFC 6455 upgrade");
+            let mut omitted_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 complete omitted initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-complete-omitted", "1.0.0")
+                    .connect_websocket_with_cx(&cx, omitted_transport),
+            )
+            .await
+            .expect("the omitted complete WebSocket peer must initialize");
+            assert!(
+                omitted_client.server_capabilities().completions.is_none(),
+                "changing only the missing completion handler must omit completions: {:?}",
+                omitted_client.server_capabilities()
+            );
+
+            let params = legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: PUBLIC_HTTP_CATALOG_PROMPT_NAME.to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+            };
+            let completed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 WebSocket completion/complete",
+                advertised_client.complete(&cx, params.clone()),
+            )
+            .await
+            .expect("live exact-2024 WebSocket must complete when completions are advertised");
+            assert_eq!(
+                completed.completion.values,
+                vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+                "the advertised exact-2024 completion provider must retain its values: {completed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 WebSocket complete without handler",
+                omitted_client.complete(&cx, params),
+            )
+            .await
+            .expect_err("changing only the missing completion handler must refuse complete");
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 complete advertised close",
+                advertised_client.close(&cx),
+            )
+            .await
+            .expect("the advertised complete WebSocket client closes after the live proof");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 complete omitted close",
+                omitted_client.close(&cx),
+            )
+            .await
+            .expect("the omitted complete WebSocket client closes after the planted refusal");
+            drop(advertised_client);
+            drop(omitted_client);
+            cx.set_cancel_requested(true);
+            advertised_listener.abort();
+            omitted_listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_static_token_refuses_missing_and_wrong_and_commits_subject()
+    {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket auth runtime installs an ambient context");
+            let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+            let verifier = StaticTokenVerifier::new([(
+                "alpha",
+                AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+            )])
+            .expect("the deterministic exact-2024 WebSocket bearer verifier is valid")
+            .with_allowed_schemes(["Bearer"])
+            .expect("the bearer scheme allowlist is valid");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-auth", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(verifier))
+                .tool(PublicHttpAuthSubject {
+                    counters: Arc::clone(&handler_calls),
+                })
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket auth must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket auth publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket auth serve must be admitted");
+
+            let (missing, _missing_stream) = websocket_upgrade_status(&cx, address, None).await;
+            assert!(
+                missing.starts_with(b"HTTP/1.1 401"),
+                "omitting Authorization must refuse the exact-2024 WebSocket upgrade: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert!(
+                String::from_utf8_lossy(&missing)
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate"),
+                "the missing-token exact-2024 WebSocket upgrade must challenge Bearer: {}",
+                String::from_utf8_lossy(&missing)
+            );
+
+            let (wrong, _wrong_stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer wrong")).await;
+            assert!(
+                wrong.starts_with(b"HTTP/1.1 401"),
+                "a wrong bearer token must refuse the exact-2024 WebSocket upgrade: {}",
+                String::from_utf8_lossy(&wrong)
+            );
+
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the matching bearer token must complete RFC 6455 upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 auth initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-auth", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("an admitted WebSocket upgrade must negotiate LegacyOnly");
+
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live exact-2024 auth tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_AUTH_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("the matching bearer token must reach the authenticated handler");
+            let expected_subject = format!("subject:{PUBLIC_HTTP_AUTH_SUBJECT}");
+            assert_eq!(
+                legacy_http_tool_text(&admitted).as_deref(),
+                Some(expected_subject.as_str()),
+                "admitted exact-2024 WebSocket must commit the static token subject into ctx.auth(): {admitted:?}"
+            );
+            assert_eq!(
+                handler_calls.snapshot().tool,
+                1,
+                "only the matching bearer token may invoke the authenticated handler"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 auth close", client.close(&cx))
+                .await
+                .expect("the exact-2024 WebSocket auth client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn e2e_public_websocket_legacy_bind_filesystem_provider_lists_and_reads_live_file() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket filesystem runtime installs an ambient context",
+            );
+            let root = std::env::temp_dir().join(format!(
+                "fastmcp-public-ws-legacy-fs-e2e-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("the exact-2024 WebSocket filesystem root is created");
+            std::fs::write(root.join(PUBLIC_HTTP_FS_FILE_NAME), PUBLIC_HTTP_FS_FILE_TEXT)
+                .expect("the exact-2024 WebSocket filesystem file is written");
+            let handler = providers::FilesystemProvider::new(&root)
+                .with_prefix(PUBLIC_HTTP_FS_PREFIX)
+                .with_exclude(&[])
+                .build()
+                .expect("FilesystemProvider::build must succeed for the live WebSocket proof");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-fs", "1.0.0")
+                .resource(handler)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket filesystem must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket filesystem publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket filesystem serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 filesystem handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket filesystem must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 filesystem initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-fs", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates filesystem templates over bind_websocket");
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 resources/templates/list",
+                client.list_resource_templates(&cx),
+            )
+            .await
+            .expect("live exact-2024 bind_websocket must list the FilesystemProvider template");
+            assert!(
+                listed.iter().any(|template| template.uri_template == PUBLIC_HTTP_FS_TEMPLATE
+                    && template.name == PUBLIC_HTTP_FS_PREFIX),
+                "FilesystemProvider must advertise its reversible file template: {listed:?}"
+            );
+
+            let unmatched = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unmatched filesystem resources/read",
+                client.read_resource(&cx, "file:///other/note.txt"),
+            )
+            .await
+            .expect_err("changing only the prefix the template cannot bind must refuse before dispatch");
+            assert_eq!(
+                unmatched.code,
+                McpErrorCode::ResourceNotFound,
+                "an unmatched filesystem URI must stay ResourceNotFound on exact-2024: {unmatched:?}"
+            );
+
+            let file = websocket_client_bounded(
+                &cx,
+                "live exact-2024 matched filesystem resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_FS_FILE_URI),
+            )
+            .await
+            .expect("resources/read must expand the live file URI through the filesystem handler");
+            let file_text = serde_json::to_value(&file)
+                .ok()
+                .and_then(|value| value["contents"][0]["text"].as_str().map(str::to_owned));
+            assert_eq!(
+                file_text.as_deref(),
+                Some(PUBLIC_HTTP_FS_FILE_TEXT),
+                "the live exact-2024 WebSocket filesystem read must retain the file bytes: {file:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 filesystem close", client.close(&cx))
+                .await
+                .expect("the exact-2024 filesystem WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_progress_marker_is_retained() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket progress runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-progress", "1.0.0")
+                .tool(PublicHttpProgressTool)
+                .resource(PublicHttpProgressResource)
+                .prompt(PublicHttpProgressPrompt)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket progress must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket progress publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket progress serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket progress must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-progress", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates progress over bind_websocket");
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress tools/call without token",
+                client.call_tool(&cx, PUBLIC_HTTP_PROGRESS_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("a tools/call without a progress token still completes");
+            let silent = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket notifications without a token must decode");
+            assert!(
+                !silent.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(_)
+                )),
+                "without a progressToken the exact-2024 WebSocket tool must stay silent: {silent:?}"
+            );
+
+            let marker = legacy_2024::ProgressMarker::from("ws-legacy-progress");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress tools/call with token",
+                client.call_tool_with_progress_marker(
+                    &cx,
+                    PUBLIC_HTTP_PROGRESS_TOOL_NAME,
+                    json!({}),
+                    marker.clone(),
+                ),
+            )
+            .await
+            .expect("a progressToken must not prevent the exact-2024 WebSocket tool from completing");
+            let progress = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket progress notifications must decode");
+            assert!(
+                progress.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(params)
+                        if params.progress_marker == marker
+                            && params.message.as_deref() == Some("halfway")
+                )),
+                "live exact-2024 WebSocket must retain notifications/progress after a progressToken: {progress:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress resources/read without token",
+                client.read_resource(&cx, PUBLIC_HTTP_PROGRESS_RESOURCE_URI),
+            )
+            .await
+            .expect("a resources/read without a progress token still completes");
+            let silent_resource = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket resource notifications without a token must decode");
+            assert!(
+                !silent_resource.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(_)
+                )),
+                "without a progressToken the exact-2024 WebSocket resource must stay silent: {silent_resource:?}"
+            );
+
+            let resource_marker = legacy_2024::ProgressMarker::from("ws-legacy-resource-progress");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress resources/read with token",
+                client.read_resource_with_progress_marker(
+                    &cx,
+                    PUBLIC_HTTP_PROGRESS_RESOURCE_URI,
+                    resource_marker.clone(),
+                ),
+            )
+            .await
+            .expect("a progressToken must not prevent the exact-2024 WebSocket resource from completing");
+            let resource_progress = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket resource progress notifications must decode");
+            assert!(
+                resource_progress.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(params)
+                        if params.progress_marker == resource_marker
+                            && params.message.as_deref() == Some("resource-halfway")
+                )),
+                "live exact-2024 WebSocket must retain resource notifications/progress after a progressToken: {resource_progress:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress prompts/get without token",
+                client.get_prompt(&cx, PUBLIC_HTTP_PROGRESS_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect("a prompts/get without a progress token still completes");
+            let silent_prompt = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket prompt notifications without a token must decode");
+            assert!(
+                !silent_prompt.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(_)
+                )),
+                "without a progressToken the exact-2024 WebSocket prompt must stay silent: {silent_prompt:?}"
+            );
+
+            let prompt_marker = legacy_2024::ProgressMarker::from("ws-legacy-prompt-progress");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 progress prompts/get with token",
+                client.get_prompt_with_progress_marker(
+                    &cx,
+                    PUBLIC_HTTP_PROGRESS_PROMPT_NAME,
+                    HashMap::new(),
+                    prompt_marker.clone(),
+                ),
+            )
+            .await
+            .expect("a progressToken must not prevent the exact-2024 WebSocket prompt from completing");
+            let prompt_progress = client
+                .take_server_notifications()
+                .expect("exact-2024 WebSocket prompt progress notifications must decode");
+            assert!(
+                prompt_progress.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(params)
+                        if params.progress_marker == prompt_marker
+                            && params.message.as_deref() == Some("prompt-halfway")
+                )),
+                "live exact-2024 WebSocket must retain prompt notifications/progress after a progressToken: {prompt_progress:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 progress close", client.close(&cx))
+                .await
+                .expect("the exact-2024 progress WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_initialize_retains_instructions_and_peer_stays_bare() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket instructions runtime installs an ambient context",
+            );
+            let instructed =
+                legacy_2024::ServerBuilder::new("facade-ws-legacy-instructions", "1.0.0")
+                    .instructions(PUBLIC_HTTP_INSTRUCTIONS)
+                    .tool(PublicHttpValue)
+                    .build();
+            let instructed_bound = instructed
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("instructed exact-2024 WebSocket must bind");
+            let instructed_address = instructed_bound
+                .local_addr()
+                .expect("instructed exact-2024 WebSocket publishes its address");
+            let bare =
+                legacy_2024::ServerBuilder::new("facade-ws-legacy-instructions-bare", "1.0.0")
+                    .tool(PublicHttpValue)
+                    .build();
+            let bare_bound = bare
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("bare exact-2024 WebSocket must bind");
+            let bare_address = bare_bound
+                .local_addr()
+                .expect("bare exact-2024 WebSocket publishes its address");
+            let scope = cx.scope();
+            let instructed_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    instructed_bound.serve(&serve_cx).await
+                })
+                .expect("instructed exact-2024 WebSocket serve must be admitted");
+            let bare_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bare_bound.serve(&serve_cx).await
+                })
+                .expect("bare exact-2024 WebSocket serve must be admitted");
+
+            let instructed_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 instructed handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{instructed_address}/mcp")),
+            )
+            .await
+            .expect("instructed exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let instructed_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 instructed initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-instructions", "1.0.0")
+                    .connect_websocket_with_cx(&cx, instructed_transport),
+            )
+            .await
+            .expect("the instructed exact-2024 WebSocket peer must initialize");
+            assert_eq!(
+                instructed_client.instructions(),
+                Some(PUBLIC_HTTP_INSTRUCTIONS),
+                "live exact-2024 bind_websocket initialize must retain the configured instructions"
+            );
+
+            let bare_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bare handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{bare_address}/mcp")),
+            )
+            .await
+            .expect("bare exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let bare_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 bare initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-instructions-bare", "1.0.0")
+                    .connect_websocket_with_cx(&cx, bare_transport),
+            )
+            .await
+            .expect("the bare exact-2024 WebSocket peer must initialize");
+            assert_eq!(
+                bare_client.instructions(),
+                None,
+                "changing only the missing instructions must keep the peer bare"
+            );
+
+            drop(instructed_client);
+            drop(bare_client);
+            cx.set_cancel_requested(true);
+            instructed_listener.abort();
+            bare_listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_startup_hook_runs_and_peer_stays_unhooked() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket lifespan runtime installs an ambient context");
+            let hooked_startup = Arc::new(AtomicBool::new(false));
+            let bare_startup = Arc::new(AtomicBool::new(false));
+            let hooked = legacy_2024::ServerBuilder::new("facade-ws-legacy-lifespan", "1.0.0")
+                .tool(PublicHttpValue)
+                .on_startup({
+                    let hooked_startup = Arc::clone(&hooked_startup);
+                    move || -> Result<(), std::io::Error> {
+                        hooked_startup.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                })
+                .build();
+            let hooked_bound = hooked
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("hooked exact-2024 WebSocket must bind");
+            let hooked_address = hooked_bound
+                .local_addr()
+                .expect("hooked exact-2024 WebSocket publishes its address");
+            let bare = legacy_2024::ServerBuilder::new("facade-ws-legacy-lifespan-bare", "1.0.0")
+                .tool(PublicHttpValue)
+                .build();
+            let bare_bound = bare
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("unhooked exact-2024 WebSocket must bind");
+            let bare_address = bare_bound
+                .local_addr()
+                .expect("unhooked exact-2024 WebSocket publishes its address");
+            let scope = cx.scope();
+            let hooked_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    hooked_bound.serve(&serve_cx).await
+                })
+                .expect("hooked exact-2024 WebSocket serve must be admitted");
+            let bare_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bare_bound.serve(&serve_cx).await
+                })
+                .expect("unhooked exact-2024 WebSocket serve must be admitted");
+
+            let hooked_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 hooked handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{hooked_address}/mcp")),
+            )
+            .await
+            .expect("hooked exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut hooked_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 hooked initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-lifespan", "1.0.0")
+                    .connect_websocket_with_cx(&cx, hooked_transport),
+            )
+            .await
+            .expect("the hooked exact-2024 WebSocket peer must initialize");
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live exact-2024 hooked tools/call",
+                hooked_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("tools/call must be admitted after the startup hook");
+            assert_eq!(
+                legacy_http_tool_text(&admitted).as_deref(),
+                Some("tool:alpha"),
+                "the hooked exact-2024 WebSocket peer must still return its text: {admitted:?}"
+            );
+            assert!(
+                hooked_startup.load(Ordering::SeqCst),
+                "LegacyOnly bind_websocket serve must run the public startup hook before admitting traffic"
+            );
+            assert!(
+                !bare_startup.load(Ordering::SeqCst),
+                "a peer without hooks must not invent lifespan events"
+            );
+
+            let bare_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unhooked handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{bare_address}/mcp")),
+            )
+            .await
+            .expect("unhooked exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut bare_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unhooked initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-lifespan-bare", "1.0.0")
+                    .connect_websocket_with_cx(&cx, bare_transport),
+            )
+            .await
+            .expect("the unhooked exact-2024 WebSocket peer must initialize");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 unhooked tools/call",
+                bare_client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the unhooked peer must still admit tools/call");
+            assert!(
+                !bare_startup.load(Ordering::SeqCst),
+                "omitting only the startup hook must keep the peer unhooked"
+            );
+
+            drop(hooked_client);
+            drop(bare_client);
+            cx.set_cancel_requested(true);
+            hooked_listener.abort();
+            bare_listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_session_state_is_retained_and_peer_stays_isolated() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket state runtime installs an ambient context");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-state", "1.0.0")
+                .tool(PublicHttpStateTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket state must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket state publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket state serve must be admitted");
+
+            let writer_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 state writer handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("writer exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut writer = websocket_client_bounded(
+                &cx,
+                "live exact-2024 state writer initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-state", "1.0.0")
+                    .connect_websocket_with_cx(&cx, writer_transport),
+            )
+            .await
+            .expect("the writer exact-2024 WebSocket peer must initialize");
+            let written = websocket_client_bounded(
+                &cx,
+                "live exact-2024 session state write",
+                writer.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_STATE_TOOL_NAME,
+                    json!({"action": "write", "value": "alpha"}),
+                ),
+            )
+            .await
+            .expect("live exact-2024 WebSocket must write session state");
+            assert_eq!(
+                legacy_http_tool_text(&written).as_deref(),
+                Some("state:alpha"),
+                "set_state then get_state on the same WebSocket session must retain the value: {written:?}"
+            );
+            let later_read = websocket_client_bounded(
+                &cx,
+                "live exact-2024 session state later read",
+                writer.call_tool(&cx, PUBLIC_HTTP_STATE_TOOL_NAME, json!({"action": "read"})),
+            )
+            .await
+            .expect("a later exact-2024 WebSocket tools/call must still be admitted");
+            assert_eq!(
+                legacy_http_tool_text(&later_read).as_deref(),
+                Some("state:alpha"),
+                "the same WebSocket session must reuse the previous bag: {later_read:?}"
+            );
+
+            let peer_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 state peer handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("peer exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut peer = websocket_client_bounded(
+                &cx,
+                "live exact-2024 state peer initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-state-peer", "1.0.0")
+                    .connect_websocket_with_cx(&cx, peer_transport),
+            )
+            .await
+            .expect("the peer exact-2024 WebSocket session must initialize");
+            let peer_read = websocket_client_bounded(
+                &cx,
+                "live exact-2024 session state peer read",
+                peer.call_tool(&cx, PUBLIC_HTTP_STATE_TOOL_NAME, json!({"action": "read"})),
+            )
+            .await
+            .expect("a peer WebSocket session must still be admitted");
+            assert_eq!(
+                legacy_http_tool_text(&peer_read).as_deref(),
+                Some("state:missing"),
+                "changing only the WebSocket session must not reuse the other session bag: {peer_read:?}"
+            );
+
+            drop(writer);
+            drop(peer);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_mask_error_details_hides_resource_execution_secret() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket mask runtime installs an ambient context");
+            let masked = legacy_2024::ServerBuilder::new("facade-ws-legacy-mask", "1.0.0")
+                .mask_error_details(true)
+                .resource(PublicHttpLeakResource)
+                .build();
+            let masked_bound = masked
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("masked exact-2024 WebSocket must bind");
+            let masked_address = masked_bound
+                .local_addr()
+                .expect("masked exact-2024 WebSocket publishes its address");
+            let unmasked = legacy_2024::ServerBuilder::new("facade-ws-legacy-unmask", "1.0.0")
+                .mask_error_details(false)
+                .resource(PublicHttpLeakResource)
+                .build();
+            let unmasked_bound = unmasked
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("unmasked exact-2024 WebSocket must bind");
+            let unmasked_address = unmasked_bound
+                .local_addr()
+                .expect("unmasked exact-2024 WebSocket publishes its address");
+            let scope = cx.scope();
+            let masked_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    masked_bound.serve(&serve_cx).await
+                })
+                .expect("masked exact-2024 WebSocket serve must be admitted");
+            let unmasked_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    unmasked_bound.serve(&serve_cx).await
+                })
+                .expect("unmasked exact-2024 WebSocket serve must be admitted");
+
+            let masked_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 masked handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{masked_address}/mcp")),
+            )
+            .await
+            .expect("masked exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut masked_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 masked initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-mask", "1.0.0")
+                    .connect_websocket_with_cx(&cx, masked_transport),
+            )
+            .await
+            .expect("the masked exact-2024 WebSocket peer must initialize");
+            let masked = websocket_client_bounded(
+                &cx,
+                "live exact-2024 masked resources/read",
+                masked_client.read_resource(&cx, PUBLIC_HTTP_LEAK_RESOURCE_URI),
+            )
+            .await
+            .expect_err("a leaking resource must stay a resources/read error");
+            let masked = format!("{masked:?}");
+            assert!(
+                masked.contains("Internal server error"),
+                "exact-2024 WebSocket mask_error_details must replace the execution secret: {masked}"
+            );
+            assert!(
+                !masked.contains(PUBLIC_HTTP_LEAK_SECRET),
+                "exact-2024 WebSocket mask_error_details must not leak the execution secret: {masked}"
+            );
+
+            let unmasked_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unmasked handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{unmasked_address}/mcp")),
+            )
+            .await
+            .expect("unmasked exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut unmasked_client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unmasked initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-unmask", "1.0.0")
+                    .connect_websocket_with_cx(&cx, unmasked_transport),
+            )
+            .await
+            .expect("the unmasked exact-2024 WebSocket peer must initialize");
+            let unmasked = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unmasked resources/read",
+                unmasked_client.read_resource(&cx, PUBLIC_HTTP_LEAK_RESOURCE_URI),
+            )
+            .await
+            .expect_err("changing only mask_error_details must still refuse the leaking resource");
+            let unmasked = format!("{unmasked:?}");
+            assert!(
+                unmasked.contains(PUBLIC_HTTP_LEAK_SECRET),
+                "disabling exact-2024 WebSocket mask_error_details must keep the execution secret: {unmasked}"
+            );
+
+            drop(masked_client);
+            drop(unmasked_client);
+            cx.set_cancel_requested(true);
+            masked_listener.abort();
+            unmasked_listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_mount_prefixes_tool_prompt_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket mount runtime installs an ambient context");
+            let child = legacy_2024::ServerBuilder::new("facade-ws-legacy-mounted-child", "1.0.0")
+                .tool(PublicHttpValue)
+                .prompt(PublicHttpInstructionPrompt)
+                .resource(PublicHttpSnapshotResource)
+                .build();
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-mounted-parent", "1.0.0")
+                .mount(child, Some("child"))
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket mount must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket mount publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket mount serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mount handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket mount must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mount initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-mount", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates a mounted catalog over bind_websocket");
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mounted tools/list",
+                client.list_tools(&cx),
+            )
+            .await
+            .expect("live exact-2024 WebSocket must list the prefixed child tool");
+            assert!(
+                listed
+                    .iter()
+                    .any(|tool| tool.name == PUBLIC_HTTP_LEGACY_MOUNTED_TOOL_NAME),
+                "legacy mount() must rewrite the child tool name: {listed:?}"
+            );
+            assert!(
+                !listed.iter().any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+                "a nonempty mount prefix must not keep the unprefixed child tool: {listed:?}"
+            );
+            let called = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mounted tools/call",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_LEGACY_MOUNTED_TOOL_NAME,
+                    json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+                ),
+            )
+            .await
+            .expect("the prefixed child tool must dispatch");
+            assert_eq!(
+                legacy_http_tool_text(&called).as_deref(),
+                Some(PUBLIC_HTTP_TOOL_TEXT),
+                "the mounted live tool must retain the child handler value: {called:?}"
+            );
+
+            let listed_prompts = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mounted prompts/list",
+                client.list_prompts(&cx),
+            )
+            .await
+            .expect("live exact-2024 WebSocket must list the prefixed child prompt");
+            assert!(
+                listed_prompts
+                    .iter()
+                    .any(|prompt| prompt.name == PUBLIC_HTTP_LEGACY_MOUNTED_PROMPT_NAME),
+                "legacy mount() must rewrite the child prompt name: {listed_prompts:?}"
+            );
+            let prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mounted prompts/get",
+                client.get_prompt(
+                    &cx,
+                    PUBLIC_HTTP_LEGACY_MOUNTED_PROMPT_NAME,
+                    HashMap::from([(
+                        "subject".to_owned(),
+                        PUBLIC_HTTP_TOOL_ARGUMENT.to_owned(),
+                    )]),
+                ),
+            )
+            .await
+            .expect("the prefixed child prompt must dispatch");
+            let prompt = serde_json::to_value(prompt)
+                .expect("the mounted prompt result serializes for its observable assertion");
+            assert_eq!(
+                prompt["messages"][0]["content"]["text"],
+                json!(PUBLIC_HTTP_PROMPT_TEXT),
+                "the mounted live prompt must retain the child handler value: {prompt:?}"
+            );
+
+            let listed_resources = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mounted resources/list",
+                client.list_resources(&cx),
+            )
+            .await
+            .expect("live exact-2024 WebSocket must list the prefixed child resource");
+            assert!(
+                listed_resources
+                    .iter()
+                    .any(|resource| resource.uri == PUBLIC_HTTP_LEGACY_MOUNTED_RESOURCE_URI),
+                "legacy mount() must prefix every resource key: {listed_resources:?}"
+            );
+            assert!(
+                !listed_resources
+                    .iter()
+                    .any(|resource| resource.uri == PUBLIC_HTTP_RESOURCE_URI),
+                "legacy mount() must not keep the unprefixed child resource URI: {listed_resources:?}"
+            );
+            let resource = websocket_client_bounded(
+                &cx,
+                "live exact-2024 mounted resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_LEGACY_MOUNTED_RESOURCE_URI),
+            )
+            .await
+            .expect("the prefixed child resource must dispatch");
+            let resource_text = serde_json::to_value(&resource)
+                .ok()
+                .and_then(|value| value["contents"][0]["text"].as_str().map(str::to_owned));
+            assert_eq!(
+                resource_text.as_deref(),
+                Some(PUBLIC_HTTP_RESOURCE_TEXT),
+                "the mounted live resource must retain the child handler value: {resource:?}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 mount close", client.close(&cx))
+                .await
+                .expect("the exact-2024 mount WebSocket client closes after the live proof");
+            drop(client);
             cx.set_cancel_requested(true);
             listener.abort();
         });
