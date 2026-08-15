@@ -1273,6 +1273,87 @@ fn connect_bounded_modern_stdio_to_shipped_echo_server(
 }
 
 #[cfg(unix)]
+fn stdio_mrtr_capabilities(
+    sampling: bool,
+    roots: bool,
+    form: bool,
+    url: bool,
+) -> modern::ClientCapabilities {
+    let mut capabilities = modern::ClientCapabilities::default();
+    if sampling {
+        capabilities.sampling = Some(Default::default());
+    }
+    if roots {
+        capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+    }
+    if form || url {
+        let mut elicitation = json!({});
+        if form {
+            elicitation["form"] = json!({});
+        }
+        if url {
+            elicitation["url"] = json!({});
+        }
+        capabilities.elicitation =
+            serde_json::from_value(elicitation).expect("elicitation capability is valid");
+    }
+    capabilities
+}
+
+#[cfg(unix)]
+fn connect_bounded_modern_stdio_with_mrtr(
+    server_policy: &str,
+    capabilities: modern::ClientCapabilities,
+    handlers: modern::ReverseRequestHandlers,
+) -> McpResult<modern::Client> {
+    let command = shipped_echo_server_executable();
+    modern::client_builder()
+        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+        .request_timeout_policy(
+            RequestTimeoutPolicy::new(
+                STDIO_COMPLETION_IDLE_TIMEOUT,
+                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+            )
+            .expect("the public completion timeout policy is valid"),
+        )
+        .capabilities(capabilities)
+        .modern_reverse_request_handlers(handlers)
+        .connect_stdio_with_cx(command, &[], &Cx::for_request())
+}
+
+#[cfg(unix)]
+fn assert_stdio_input_required(result: &modern::InputRequiredResult, key: &str, kind: &str) {
+    assert!(
+        result.request_state().is_some(),
+        "{kind} must return framework-issued requestState"
+    );
+    assert!(
+        result
+            .input_requests()
+            .is_some_and(|requests| requests.get(key).is_some()),
+        "{kind} must retain its {key} input request"
+    );
+}
+
+#[cfg(unix)]
+fn assert_stdio_capability_gate(result: &modern::FinalCoreResult, kind: &str) {
+    let modern::FinalCoreResult::ToolsCall { result, .. } = result else {
+        panic!("{kind} missing capability must fail closed as a tool error: {result:?}");
+    };
+    assert!(
+        result.payload.is_error,
+        "{kind} missing capability must fail closed: {result:?}"
+    );
+    assert!(
+        result.payload.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("not advertised by the client"),
+            _ => false,
+        }),
+        "{kind} missing capability must name the capability gate: {result:?}"
+    );
+}
+
+#[cfg(unix)]
 fn connect_legacy_stdio_to_shipped_echo_server(
     server_policy: &str,
 ) -> McpResult<legacy_2024::Client> {
@@ -1470,6 +1551,396 @@ fn e2e_public_stdio_modern_only_round_trips_with_the_shipped_facade_server() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_modern_composes_nested_tool_and_resource() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let composed = client
+        .call_tool("compose_echo", json!({"message": "alpha"}))
+        .expect("live modern stdio compose_echo must nest echo and info://server");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text.starts_with("compose:alpha|") && text.contains("echo-server")
+            }
+            _ => false,
+        }),
+        "compose_echo must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = client.call_tool(
+        "compose_echo",
+        json!({
+            "message": "alpha",
+            "tool": "stdio-e2e-missing",
+        }),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!(
+            "changing only the nested tool name must refuse before the peer resource: {result:?}"
+        ),
+    };
+    assert!(
+        missing_tool.contains("stdio-e2e-missing")
+            || missing_tool.contains("compose-nested-tool")
+            || missing_tool.contains("Unknown tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+
+    let missing_resource = client.call_tool(
+        "compose_echo",
+        json!({
+            "message": "beta",
+            "resource": "info://stdio-e2e-missing",
+        }),
+    );
+    let missing_resource = match missing_resource {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!(
+            "changing only the nested resource URI must refuse after the peer tool: {result:?}"
+        ),
+    };
+    assert!(
+        missing_resource.contains("info://stdio-e2e-missing")
+            || missing_resource.contains("compose-nested-resource")
+            || missing_resource.contains("not found"),
+        "the nested unknown resource must stay a handler-visible refusal: {missing_resource}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio compose client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_prompt_composes_nested_tool_and_resource() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let composed = client
+        .get_prompt(
+            "compose_greeting",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "echo".to_owned()),
+                ("resource".to_owned(), "info://server".to_owned()),
+            ]),
+        )
+        .expect("live modern stdio compose_greeting must nest echo and info://server");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text.starts_with("compose:alpha|") && text.contains("echo-server")
+                }
+                _ => false,
+            }),
+        "compose_greeting must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = client
+        .get_prompt(
+            "compose_greeting",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "stdio-e2e-missing".to_owned()),
+                ("resource".to_owned(), "info://server".to_owned()),
+            ]),
+        )
+        .expect_err("changing only the nested tool name must refuse before the peer resource");
+    let missing_tool = format!("{missing_tool:?}");
+    assert!(
+        missing_tool.contains("stdio-e2e-missing")
+            || missing_tool.contains("compose-nested-tool")
+            || missing_tool.contains("Unknown tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio prompt compose client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_resource_composes_nested_tool_and_resource() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let composed = client
+        .read_resource("info://compose")
+        .expect("live modern stdio info://compose must nest echo and info://server");
+    assert!(
+        composed.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => {
+                text.starts_with("compose:alpha|") && text.contains("echo-server")
+            }
+            _ => false,
+        }),
+        "info://compose must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = client
+        .read_resource("info://compose-missing-tool")
+        .expect_err("changing only the nested tool name must refuse before the peer resource");
+    let missing_tool = format!("{missing_tool:?}");
+    assert!(
+        missing_tool.contains("stdio-e2e-missing")
+            || missing_tool.contains("compose-nested-tool")
+            || missing_tool.contains("Unknown tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+
+    let missing_resource = client
+        .read_resource("info://compose-missing-resource")
+        .expect_err("changing only the nested resource URI must refuse after the peer tool");
+    let missing_resource = format!("{missing_resource:?}");
+    assert!(
+        missing_resource.contains("info://stdio-e2e-missing")
+            || missing_resource.contains("compose-nested-resource")
+            || missing_resource.contains("not found"),
+        "the nested unknown resource must stay a handler-visible refusal: {missing_resource}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio resource compose client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let timed_out = client
+        .call_tool("slow_echo", json!({}))
+        .expect_err("a handler that outlives its timeout must be refused");
+    let timed_out = format!("{timed_out:?}");
+    assert!(
+        timed_out.contains("Request timeout exceeded") || timed_out.contains("RequestCancelled"),
+        "the refused late tools/call must keep the handler-timeout error: {timed_out}"
+    );
+
+    let fast = client
+        .call_tool("fast_echo", json!({}))
+        .expect("changing only the tool must still be admitted after a handler timeout");
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the fast peer tool must still complete: {fast:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio handler-timeout client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_default_parameter_is_injected_and_overridable() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let injected = client
+        .call_tool("greet", json!({"name": "World"}))
+        .expect("omitting the defaulted argument must still be admitted");
+    assert!(
+        injected.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "greet:World!",
+            _ => false,
+        }),
+        "the generated default must be injected at call time: {injected:?}"
+    );
+
+    let overridden = client
+        .call_tool("greet", json!({"name": "World", "suffix": "?"}))
+        .expect("supplying the defaulted argument must override the generated default");
+    assert!(
+        overridden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "greet:World?",
+            _ => false,
+        }),
+        "changing only the suffix must override the generated default: {overridden:?}"
+    );
+
+    let missing_name = client.call_tool("greet", json!({"suffix": "!"}));
+    let missing_name = match missing_name {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => {
+            panic!("a missing required generated argument must stay an error: {result:?}")
+        }
+    };
+    assert!(
+        missing_name.contains("name")
+            || missing_name.contains("required")
+            || missing_name.contains("Invalid")
+            || missing_name.contains("input schema")
+            || missing_name.contains("inputSchema"),
+        "omitting only the required sibling must stay a handler-visible refusal: {missing_name}"
+    );
+
+    let listed_prompts = client
+        .list_prompts(None)
+        .expect("live modern stdio must list the default-parameter prompt");
+    let compose = listed_prompts
+        .prompts
+        .iter()
+        .find(|prompt| prompt.name == "compose_greeting")
+        .expect("compose_greeting must remain on the live catalog");
+    let arguments = compose.arguments.as_deref().unwrap_or(&[]);
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| { argument.name == "name" && argument.required == Some(true) }),
+        "compose_greeting must still require name: {compose:?}"
+    );
+    assert!(
+        arguments
+            .iter()
+            .any(|argument| { argument.name == "tool" && argument.required != Some(true) }),
+        "the defaulted tool argument must not stay required: {compose:?}"
+    );
+
+    let injected_prompt = client
+        .get_prompt(
+            "compose_greeting",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        )
+        .expect("omitting defaulted prompt arguments must still compose echo and info://server");
+    assert!(
+        injected_prompt
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text.starts_with("compose:alpha|") && text.contains("echo-server")
+                }
+                _ => false,
+            }),
+        "prompt defaults must inject echo and info://server: {injected_prompt:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio default-parameter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_output_schema_retains_structured_content_and_peer_stays_bare() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let listed = client
+        .list_tools(None)
+        .expect("live modern stdio must list the output-schema tools");
+    let structured = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == "structured_echo")
+        .expect("structured_echo must remain on the live catalog");
+    let echo = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == "echo")
+        .expect("the bare echo peer must remain on the live catalog");
+    assert_eq!(
+        structured
+            .output_schema
+            .as_ref()
+            .and_then(|schema| schema.get("required")),
+        Some(&json!(["value"])),
+        "tools/list must retain the advertised output schema: {structured:?}"
+    );
+    assert_eq!(
+        echo.output_schema, None,
+        "changing only the missing output schema must keep the echo peer bare: {echo:?}"
+    );
+
+    let called = client
+        .call_tool("structured_echo", json!({"value": "alpha"}))
+        .expect("live modern stdio must admit the structured output tool");
+    assert!(
+        called.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the structured tool must still author text content: {called:?}"
+    );
+    assert_eq!(
+        called.structured_content,
+        Some(json!({"value": "alpha"})),
+        "tools/call must retain structuredContent matching the advertised schema: {called:?}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the bare echo peer must still be callable");
+    assert_eq!(
+        peer.structured_content, None,
+        "changing only the missing output schema must not invent structuredContent: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio output-schema client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_rich_content_retains_image_and_audio_blocks() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let rich = client
+        .call_tool("rich_echo", json!({}))
+        .expect("live modern stdio must retain image and audio content blocks");
+    assert!(
+        rich.content.iter().any(|content| match content {
+            ContentBlock::Image {
+                data, mime_type, ..
+            } => data == "e2eimage" && mime_type == "image/png",
+            _ => false,
+        }),
+        "tools/call must retain the authored image block: {rich:?}"
+    );
+    assert!(
+        rich.content.iter().any(|content| match content {
+            ContentBlock::Audio {
+                data, mime_type, ..
+            } => data == "e2eaudio" && mime_type == "audio/wav",
+            _ => false,
+        }),
+        "tools/call must retain the authored audio block: {rich:?}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the text-only echo peer must still be callable");
+    assert!(
+        peer.content
+            .iter()
+            .all(|content| matches!(content, ContentBlock::Text { .. })),
+        "changing only the missing rich content must keep the echo peer text-only: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio rich-content client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_progress_marker_is_retained_from_live_echo() {
     let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
@@ -1510,7 +1981,9 @@ fn e2e_public_stdio_progress_marker_is_retained_from_live_echo() {
     let resource_marker = modern::ProgressMarker::from("stdio-resource-progress");
     client
         .read_resource_with_progress_marker("info://server", resource_marker.clone())
-        .expect("a progressToken must not prevent the shipped server_info resource from completing");
+        .expect(
+            "a progressToken must not prevent the shipped server_info resource from completing",
+        );
     let resource_progress = client.take_progress_notifications();
     assert!(
         resource_progress.iter().any(|notification| {
@@ -1959,6 +2432,198 @@ fn e2e_public_stdio_read_resource_and_get_prompt_follow_installed_roots_handler(
     client
         .close()
         .expect("stdio follow-handler client cleanup reaps the live subprocess");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_sampling_elicitation_keep_input_required_and_fail_closed() {
+    let mut client = connect_bounded_modern_stdio_with_mrtr(
+        "modern-only",
+        stdio_mrtr_capabilities(true, true, true, true),
+        modern::ReverseRequestHandlers::new(),
+    )
+    .expect("a ModernOnly facade client advertises sampling, roots, and elicitation");
+
+    let sampling = client
+        .call_tool_result("sample_echo", json!({}))
+        .expect("live stdio ctx.final_sampling must return a typed tools/call result");
+    let modern::FinalCoreResult::ToolsCallInputRequired { result, .. } = sampling else {
+        panic!("live stdio final sampling must keep input_required: {sampling:?}");
+    };
+    assert_stdio_input_required(&result, "sample", "tools/call sampling");
+
+    let roots = client
+        .call_tool_result("roots_echo", json!({}))
+        .expect("live stdio ctx.final_roots must return a typed tools/call result");
+    let modern::FinalCoreResult::ToolsCallInputRequired { result, .. } = roots else {
+        panic!("live stdio final roots must keep input_required: {roots:?}");
+    };
+    assert_stdio_input_required(&result, "roots", "tools/call roots");
+
+    let url = client
+        .call_tool_result("url_elicit_echo", json!({}))
+        .expect("live stdio ctx.final_elicitation_url must return a typed tools/call result");
+    let modern::FinalCoreResult::ToolsCallInputRequired { result, .. } = url else {
+        panic!("live stdio final URL elicitation must keep input_required: {url:?}");
+    };
+    assert_stdio_input_required(&result, "approval", "tools/call URL elicitation");
+
+    let resource = client
+        .read_resource_result("info://elicit-form")
+        .expect("live stdio form elicitation resource must return a typed result");
+    let modern::FinalCoreResult::ResourcesReadInputRequired { result, .. } = resource else {
+        panic!("live stdio resource form elicitation must keep input_required: {resource:?}");
+    };
+    assert_stdio_input_required(&result, "approval", "resources/read form elicitation");
+
+    let prompt = client
+        .get_prompt_result("elicit_form_greeting", HashMap::new())
+        .expect("live stdio form elicitation prompt must return a typed result");
+    let modern::FinalCoreResult::PromptsGetInputRequired { result, .. } = prompt else {
+        panic!("live stdio prompt form elicitation must keep input_required: {prompt:?}");
+    };
+    assert_stdio_input_required(&result, "approval", "prompts/get form elicitation");
+    client
+        .close()
+        .expect("stdio input_required MRTR client cleanup reaps the live subprocess");
+
+    let mut no_sampling = connect_bounded_modern_stdio_with_mrtr(
+        "modern-only",
+        stdio_mrtr_capabilities(false, true, true, true),
+        modern::ReverseRequestHandlers::new(),
+    )
+    .expect("a ModernOnly facade client connects without advertising sampling");
+    let missing_sampling = no_sampling
+        .call_tool_result("sample_echo", json!({}))
+        .expect("missing sampling capability must still return a typed tools/call result");
+    assert_stdio_capability_gate(&missing_sampling, "sampling");
+    no_sampling
+        .close()
+        .expect("stdio no-sampling client cleanup reaps the live subprocess");
+
+    let mut no_url = connect_bounded_modern_stdio_with_mrtr(
+        "modern-only",
+        stdio_mrtr_capabilities(true, true, true, false),
+        modern::ReverseRequestHandlers::new(),
+    )
+    .expect("a ModernOnly facade client connects without advertising URL elicitation");
+    let missing_url = no_url
+        .call_tool_result("url_elicit_echo", json!({}))
+        .expect("missing URL elicitation capability must still return a typed tools/call result");
+    assert_stdio_capability_gate(&missing_url, "URL elicitation");
+    no_url
+        .close()
+        .expect("stdio no-url-elicitation client cleanup reaps the live subprocess");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_sampling_elicitation_follow_installed_handlers() {
+    let handlers = modern::ReverseRequestHandlers::new()
+        .with_modern_sampling_create_message(|_cx, _cancellation, _params| {
+            Box::pin(async {
+                Ok(modern::FinalCreateMessageResult {
+                    content: modern::FinalSamplingMessageContent::Block(
+                        modern::FinalSamplingMessageContentBlock::Text {
+                            text: "sampled".to_owned(),
+                            annotations: None,
+                            meta: None,
+                            additional: std::collections::BTreeMap::new(),
+                        },
+                    ),
+                    model: "stdio-sample-model".to_owned(),
+                    role: Role::Assistant,
+                    stop_reason: None,
+                    meta: None,
+                })
+            })
+        })
+        .with_modern_roots_list(|_cx, _cancellation, _params| {
+            Box::pin(async { Ok(modern::FinalEmbeddedRootsListResult { roots: vec![] }) })
+        })
+        .with_modern_elicitation_create(|_cx, _cancellation, params| {
+            Box::pin(async move {
+                Ok(match params {
+                    fastmcp_protocol::ElicitRequestParams::Url(_) => {
+                        fastmcp_protocol::ElicitResult::accept_url()
+                    }
+                    fastmcp_protocol::ElicitRequestParams::Form(_) => {
+                        fastmcp_protocol::ElicitResult::accept(HashMap::from([(
+                            "approved".to_owned(),
+                            fastmcp_protocol::ElicitContentValue::Bool(true),
+                        )]))
+                    }
+                })
+            })
+        });
+    let mut client = connect_bounded_modern_stdio_with_mrtr(
+        "modern-only",
+        stdio_mrtr_capabilities(true, true, true, true),
+        handlers,
+    )
+    .expect("a ModernOnly facade client installs sampling, roots, and elicitation handlers");
+
+    let sampled = client
+        .call_tool("sample_echo", json!({}))
+        .expect("public stdio call_tool follows the installed sampling handler");
+    assert!(
+        sampled.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "sampled:stdio-sample-model",
+            _ => false,
+        }),
+        "the sampling retry must complete from the installed handler: {sampled:?}"
+    );
+
+    let roots = client
+        .call_tool("roots_echo", json!({}))
+        .expect("public stdio call_tool follows the installed roots handler");
+    assert!(
+        roots.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "roots:0",
+            _ => false,
+        }),
+        "the roots retry must complete from the installed handler: {roots:?}"
+    );
+
+    let url = client
+        .call_tool("url_elicit_echo", json!({}))
+        .expect("public stdio call_tool follows the installed URL elicitation handler");
+    assert!(
+        url.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "url-elicit:accept",
+            _ => false,
+        }),
+        "the URL elicitation retry must complete from the installed handler: {url:?}"
+    );
+
+    let resource = client
+        .read_resource("info://elicit-form")
+        .expect("public stdio read_resource follows the installed form elicitation handler");
+    assert!(
+        resource.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => text == "form-elicit:true",
+            _ => false,
+        }),
+        "the form elicitation resource retry must complete from the installed handler: {resource:?}"
+    );
+
+    let prompt = client
+        .get_prompt("elicit_form_greeting", HashMap::new())
+        .expect("public stdio get_prompt follows the installed form elicitation handler");
+    assert!(
+        prompt
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => text == "form-elicit:true",
+                _ => false,
+            }),
+        "the form elicitation prompt retry must complete from the installed handler: {prompt:?}"
+    );
+
+    client
+        .close()
+        .expect("stdio follow-handler MRTR client cleanup reaps the live subprocess");
 }
 
 #[cfg(unix)]
@@ -2466,6 +3131,279 @@ fn e2e_public_stdio_legacy_only_round_trips_with_the_shipped_facade_server() {
         "final #[prompt] handlers must be invoked through PromptHandler::get_final"
     );
     client.close().expect("legacy-only stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_composes_nested_tool_and_resource() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let composed = client
+        .call_tool("compose_echo", json!({"message": "alpha"}))
+        .expect("live exact-2024 stdio compose_echo must nest echo and info://server");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => {
+                text.starts_with("compose:alpha|") && text.contains("echo-server")
+            }
+            _ => false,
+        }),
+        "compose_echo must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = client.call_tool(
+        "compose_echo",
+        json!({
+            "message": "alpha",
+            "tool": "stdio-e2e-missing",
+        }),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!(
+            "changing only the nested tool name must refuse before the peer resource: {result:?}"
+        ),
+    };
+    assert!(
+        missing_tool.contains("stdio-e2e-missing")
+            || missing_tool.contains("compose-nested-tool")
+            || missing_tool.contains("Unknown tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+
+    let missing_resource = client.call_tool(
+        "compose_echo",
+        json!({
+            "message": "beta",
+            "resource": "info://stdio-e2e-missing",
+        }),
+    );
+    let missing_resource = match missing_resource {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!(
+            "changing only the nested resource URI must refuse after the peer tool: {result:?}"
+        ),
+    };
+    assert!(
+        missing_resource.contains("info://stdio-e2e-missing")
+            || missing_resource.contains("compose-nested-resource")
+            || missing_resource.contains("not found"),
+        "the nested unknown resource must stay a handler-visible refusal: {missing_resource}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio compose client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_prompt_composes_nested_tool_and_resource() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let composed = client
+        .get_prompt(
+            "compose_greeting",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "echo".to_owned()),
+                ("resource".to_owned(), "info://server".to_owned()),
+            ]),
+        )
+        .expect("live exact-2024 stdio compose_greeting must nest echo and info://server");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                LegacyContent::Text { text, .. } => {
+                    text.starts_with("compose:alpha|") && text.contains("echo-server")
+                }
+                _ => false,
+            }),
+        "compose_greeting must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = client
+        .get_prompt(
+            "compose_greeting",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "stdio-e2e-missing".to_owned()),
+                ("resource".to_owned(), "info://server".to_owned()),
+            ]),
+        )
+        .expect_err("changing only the nested tool name must refuse before the peer resource");
+    let missing_tool = format!("{missing_tool:?}");
+    assert!(
+        missing_tool.contains("stdio-e2e-missing")
+            || missing_tool.contains("compose-nested-tool")
+            || missing_tool.contains("Unknown tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio prompt compose client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_resource_composes_nested_tool_and_resource() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let composed = client
+        .read_resource("info://compose")
+        .expect("live exact-2024 stdio info://compose must nest echo and info://server");
+    assert!(
+        composed.contents.iter().any(|content| match content {
+            LegacyResourceContent::Text { text, .. } => {
+                text.starts_with("compose:alpha|") && text.contains("echo-server")
+            }
+            _ => false,
+        }),
+        "info://compose must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = client
+        .read_resource("info://compose-missing-tool")
+        .expect_err("changing only the nested tool name must refuse before the peer resource");
+    let missing_tool = format!("{missing_tool:?}");
+    assert!(
+        missing_tool.contains("stdio-e2e-missing")
+            || missing_tool.contains("compose-nested-tool")
+            || missing_tool.contains("Unknown tool"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing_tool}"
+    );
+
+    let missing_resource = client
+        .read_resource("info://compose-missing-resource")
+        .expect_err("changing only the nested resource URI must refuse after the peer tool");
+    let missing_resource = format!("{missing_resource:?}");
+    assert!(
+        missing_resource.contains("info://stdio-e2e-missing")
+            || missing_resource.contains("compose-nested-resource")
+            || missing_resource.contains("not found"),
+        "the nested unknown resource must stay a handler-visible refusal: {missing_resource}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio resource compose client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
+    let mut client = legacy_2024::client_builder()
+        .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
+        .request_timeout_policy(
+            RequestTimeoutPolicy::new(
+                STDIO_COMPLETION_IDLE_TIMEOUT,
+                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+            )
+            .expect("the public handler-timeout client policy is valid"),
+        )
+        .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request())
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let timed_out = client
+        .call_tool("slow_echo", json!({}))
+        .expect_err("a handler that outlives its timeout must be refused");
+    let timed_out = format!("{timed_out:?}");
+    assert!(
+        timed_out.contains("Request timeout exceeded") || timed_out.contains("RequestCancelled"),
+        "the refused late tools/call must keep the handler-timeout error: {timed_out}"
+    );
+
+    let fast = client
+        .call_tool("fast_echo", json!({}))
+        .expect("changing only the tool must still be admitted after a handler timeout");
+    assert!(
+        fast.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the fast peer tool must still complete: {fast:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio handler-timeout client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_default_parameter_is_injected_and_overridable() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let injected = client
+        .call_tool("greet", json!({"name": "World"}))
+        .expect("omitting the defaulted argument must still be admitted");
+    assert!(
+        injected.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "greet:World!",
+            _ => false,
+        }),
+        "the generated default must be injected at call time: {injected:?}"
+    );
+
+    let overridden = client
+        .call_tool("greet", json!({"name": "World", "suffix": "?"}))
+        .expect("supplying the defaulted argument must override the generated default");
+    assert!(
+        overridden.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "greet:World?",
+            _ => false,
+        }),
+        "changing only the suffix must override the generated default: {overridden:?}"
+    );
+
+    let missing_name = client.call_tool("greet", json!({"suffix": "!"}));
+    let missing_name = match missing_name {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => {
+            panic!("a missing required generated argument must stay an error: {result:?}")
+        }
+    };
+    assert!(
+        missing_name.contains("name")
+            || missing_name.contains("required")
+            || missing_name.contains("Invalid")
+            || missing_name.contains("input schema")
+            || missing_name.contains("inputSchema"),
+        "omitting only the required sibling must stay a handler-visible refusal: {missing_name}"
+    );
+
+    let injected_prompt = client
+        .get_prompt(
+            "compose_greeting",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        )
+        .expect("omitting defaulted prompt arguments must still compose echo and info://server");
+    assert!(
+        injected_prompt
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                LegacyContent::Text { text, .. } => {
+                    text.starts_with("compose:alpha|") && text.contains("echo-server")
+                }
+                _ => false,
+            }),
+        "prompt defaults must inject echo and info://server: {injected_prompt:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio default-parameter client cleanup");
 }
 
 #[cfg(unix)]
