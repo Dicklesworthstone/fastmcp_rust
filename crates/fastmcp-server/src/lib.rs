@@ -2028,6 +2028,45 @@ fn runtime_legacy_binding(generation: u64) -> LegacyPeerBinding {
     )
 }
 
+/// Polls `future` on `cx` instead of the process-global `block_on` runtime.
+///
+/// Stdio workers and sequential pumps already own a request/connection `Cx`.
+/// Driving the handler future here keeps cancellation, budget, and nested
+/// `ctx.call_tool` / `ctx.read_resource` on that same context. A 1ms park
+/// timeout is the same bound the multiplexed worker already uses for an
+/// empty dispatch queue, so a missed wake cannot deadlock the pump.
+fn poll_on_cx<F: Future>(cx: &Cx, future: F) -> F::Output {
+    use std::task::{Context as TaskContext, Poll, Wake, Waker};
+
+    struct ThreadWake(std::thread::Thread);
+
+    impl Wake for ThreadWake {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let _guard = Cx::set_current(Some(cx.clone()));
+    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+    let mut task_cx = TaskContext::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
+            return output;
+        }
+        if cx.is_cancel_requested()
+            && let Poll::Ready(output) = future.as_mut().poll(&mut task_cx)
+        {
+            return output;
+        }
+        std::thread::park_timeout(Duration::from_millis(1));
+    }
+}
+
 /// Establishes or verifies the connection owner at an ordinary request's
 /// admission boundary.
 ///
@@ -11892,18 +11931,21 @@ impl Server {
                     let notification_sender = Arc::clone(&notification_sender);
                     let request_cancellation = request_cancellation.clone();
                     move || {
-                        let response = block_on(server.dispatch_with_protocol_policy_owned(
-                            policy,
-                            &inbound,
-                            request,
-                            None,
-                            auth_receipt,
-                            auth_custody_generation,
-                            None,
-                            request_cancellation,
-                            None,
-                            notification_sender,
-                        ));
+                        let response = poll_on_cx(
+                            &send_cx,
+                            server.dispatch_with_protocol_policy_owned(
+                                policy,
+                                &inbound,
+                                request,
+                                None,
+                                auth_receipt,
+                                auth_custody_generation,
+                                None,
+                                request_cancellation,
+                                None,
+                                notification_sender,
+                            ),
+                        );
                         if let Some(response) = response {
                             let mut send_guard = send
                                 .lock()
@@ -11924,18 +11966,21 @@ impl Server {
                 )),
             };
         }
-        block_on(server.dispatch_with_protocol_policy_owned(
-            policy,
-            &inbound,
-            request,
-            None,
-            auth_receipt,
-            auth_custody_generation,
-            None,
-            request_cancellation,
-            None,
-            notification_sender,
-        ))
+        poll_on_cx(
+            cx,
+            server.dispatch_with_protocol_policy_owned(
+                policy,
+                &inbound,
+                request,
+                None,
+                auth_receipt,
+                auth_custody_generation,
+                None,
+                request_cancellation,
+                None,
+                notification_sender,
+            ),
+        )
     }
 
     async fn dispatch_with_protocol_policy_owned(
@@ -14141,7 +14186,8 @@ impl Server {
                             notification_cancellation.cancel();
                         }
                     });
-                    let response = block_on(
+                    let response = poll_on_cx(
+                        &worker_cx,
                         Arc::clone(&worker_server).dispatch_with_protocol_policy_owned(
                             worker_server.protocol_policy,
                             &inbound,
@@ -14198,7 +14244,10 @@ impl Server {
                         legacy_adapter.insert(adapter)
                     }
                 };
-                let legacy_response = legacy_adapter_response(adapter, legacy_binding, &request);
+                let legacy_response = poll_on_cx(
+                    &worker_cx,
+                    legacy_adapter_response_async(adapter, legacy_binding, &request),
+                );
                 sync_live_legacy_runtime_from_adapter(&worker_legacy_runtime, adapter);
                 let active_request = take_live_legacy_active_request(&legacy_active_request);
                 let handled = match legacy_response {
@@ -14845,7 +14894,8 @@ impl Server {
                                                     }
                                                 },
                                             );
-                                            let response = block_on(
+                                            let response = poll_on_cx(
+                                                &request_cx,
                                                 Arc::clone(&request_server)
                                                     .dispatch_with_protocol_policy_owned(
                                                         request_server.protocol_policy,
@@ -15484,8 +15534,10 @@ impl Server {
                                 legacy_adapter.insert(adapter)
                             }
                         };
-                        let legacy_response =
-                            legacy_adapter_response(adapter, legacy_binding, &request);
+                        let legacy_response = poll_on_cx(
+                            cx,
+                            legacy_adapter_response_async(adapter, legacy_binding, &request),
+                        );
                         sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
                         let active_request =
                             take_live_legacy_active_request(&legacy_active_request);
@@ -15899,8 +15951,10 @@ impl Server {
                                 legacy_adapter.insert(adapter)
                             }
                         };
-                        let legacy_response =
-                            legacy_adapter_response(adapter, legacy_binding, &request);
+                        let legacy_response = poll_on_cx(
+                            cx,
+                            legacy_adapter_response_async(adapter, legacy_binding, &request),
+                        );
                         sync_live_legacy_runtime_from_adapter(&legacy_runtime, adapter);
                         let active_request =
                             take_live_legacy_active_request(&legacy_active_request);
