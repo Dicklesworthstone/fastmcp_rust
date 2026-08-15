@@ -1829,6 +1829,9 @@ fn derive_handler_context(
         if let Some(ref elicitation) = senders.elicitation {
             handler_ctx = handler_ctx.with_elicitation(elicitation.clone());
         }
+        if let Some(ref roots) = senders.roots {
+            handler_ctx = handler_ctx.with_roots_provider(roots.clone());
+        }
     }
 
     handler_ctx
