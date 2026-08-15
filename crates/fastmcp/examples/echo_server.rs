@@ -1020,9 +1020,15 @@ fn main() {
         .prompt(ElicitFormGreetingPrompt)
         .prompt(CodeReviewPromptPrompt)
         .prompt(MrtrPromptPrompt)
-        .prompt_completion_handler("greeting", GreetingCompletion)
         // Set timeout (30 seconds per request)
         .request_timeout(30);
+    let builder = if std::env::var("FASTMCP_NO_COMPLETIONS").as_deref() == Ok("1") {
+        builder
+    } else {
+        builder
+            .prompt_completion_handler("greeting", GreetingCompletion)
+            .legacy_completion_handler(GreetingCompletion)
+    };
     let builder = if std::env::var("FASTMCP_NO_INSTRUCTIONS").as_deref() == Ok("1") {
         builder
     } else {
