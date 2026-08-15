@@ -1246,10 +1246,18 @@ fn runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
 /// itself is bounded against the supplied caller-owned context clock, so a
 /// stalled peer cannot hold this test thread indefinitely.
 fn runtime_block_on_bounded<F: std::future::Future>(cx: &Cx, future: F) -> F::Output {
+    runtime_block_on_bounded_named(cx, "public HTTP operation", future)
+}
+
+fn runtime_block_on_bounded_named<F: std::future::Future>(
+    cx: &Cx,
+    operation: &str,
+    future: F,
+) -> F::Output {
     runtime_block_on(async {
         asupersync::time::timeout(cx.now(), HTTP_OPERATION_BOUND, future)
             .await
-            .expect("public HTTP operation stays within its caller-owned deadline")
+            .unwrap_or_else(|_| panic!("{operation} stays within its caller-owned deadline"))
     })
 }
 
@@ -12288,6 +12296,1337 @@ fn e2e_public_http_discovery_retains_instructions_and_peer_stays_bare() {
     drop(bare_client);
     instructed.shutdown();
     bare.shutdown();
+}
+
+fn spawn_legacy_instructions_http_server(with_instructions: bool) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy instructions HTTP server control receiver went away".to_owned());
+            }
+            let builder = ServerBuilder::new("facade-http-legacy-instructions", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .tool(PublicHttpValue);
+            let builder = if with_instructions {
+                builder.instructions(PUBLIC_HTTP_INSTRUCTIONS)
+            } else {
+                builder
+            };
+            let server = builder.build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("legacy instructions facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("legacy instructions facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy instructions HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy instructions facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy instructions facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("legacy instructions facade HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy instructions facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_legacy_initialize_retains_instructions_and_peer_stays_bare() {
+    let cx = Cx::for_request();
+    let instructed = spawn_legacy_instructions_http_server(true);
+    let bare = spawn_legacy_instructions_http_server(false);
+    let instructed_client = runtime_block_on_bounded(
+        &cx,
+        legacy_2024::http_client_builder(
+            public_http_target(instructed.address(), "/sse"),
+            public_http_target(instructed.address(), "/messages"),
+        )
+        .expect("the exact-2024 instructed HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-legacy-instructions", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the LegacyOnly public facade connects to the instructed HTTP server");
+    let bare_client = runtime_block_on_bounded(
+        &cx,
+        legacy_2024::http_client_builder(
+            public_http_target(bare.address(), "/sse"),
+            public_http_target(bare.address(), "/messages"),
+        )
+        .expect("the exact-2024 bare HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-legacy-instructions-bare", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the LegacyOnly public facade connects to the bare HTTP server");
+
+    assert_eq!(
+        instructed_client.instructions(),
+        Some(PUBLIC_HTTP_INSTRUCTIONS),
+        "live exact-2024 bind_http initialize must retain the configured instructions"
+    );
+    assert_eq!(
+        bare_client.instructions(),
+        None,
+        "changing only the missing instructions must keep the peer bare"
+    );
+
+    drop(instructed_client);
+    drop(bare_client);
+    instructed.shutdown();
+    bare.shutdown();
+}
+
+fn spawn_legacy_catalog_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy catalog HTTP server control receiver went away".to_owned());
+            }
+            let server = ServerBuilder::new("facade-http-legacy-catalog", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .tool(PublicHttpValue)
+                .tool(PublicHttpTouchTool)
+                .tool(PublicHttpHideTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("legacy catalog facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("legacy catalog facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy catalog HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy catalog facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy catalog facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("legacy catalog facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy catalog facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+fn take_legacy_http_notifications_until(
+    client: &mut legacy_2024::HttpClient,
+    deadline: Instant,
+) -> Vec<legacy_2024::ServerNotification> {
+    let mut notifications = Vec::new();
+    loop {
+        match client.take_server_notification() {
+            Ok(Some(notification)) => notifications.push(notification),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("exact-2024 HTTP SSE notification must decode: {error}"),
+        }
+    }
+    notifications
+}
+
+#[test]
+fn e2e_public_http_legacy_tools_list_changed_is_retained_on_sse() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_catalog_http_server();
+    let mut client = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 catalog HTTP connect",
+        legacy_2024::http_client_builder(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+        )
+        .expect("the exact-2024 catalog HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-legacy-list-changed", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the LegacyOnly public facade connects to the catalog HTTP server");
+
+    let quiet = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 non-mutating tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TOOL_NAME.to_owned(),
+                arguments: Some(json!({ "value": "quiet" })),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a non-mutating exact-2024 tools/call must complete");
+    assert!(
+        serde_json::to_value(&quiet)
+            .ok()
+            .and_then(|value| value["content"][0]["text"].as_str().map(str::to_owned))
+            .as_deref()
+            == Some("tool:quiet"),
+        "the non-mutating peer must still return its text: {quiet:?}"
+    );
+    let silent = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ToolsListChanged
+        )),
+        "changing only the missing catalog mutation must keep tools/list_changed silent: {silent:?}"
+    );
+
+    let hidden = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 hide tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_HIDE_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("disabling a peer tool must complete");
+    assert!(
+        serde_json::to_value(&hidden)
+            .ok()
+            .and_then(|value| value["content"][0]["text"].as_str().map(str::to_owned))
+            .as_deref()
+            == Some("hidden"),
+        "exact-2024 SSE session state must let disable_tool publish list_changed: {hidden:?}"
+    );
+    let changed =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        changed.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ToolsListChanged
+        )),
+        "live exact-2024 HTTP SSE must retain notifications/tools/list_changed: {changed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_legacy_progress_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy progress HTTP server control receiver went away".to_owned());
+            }
+            let server = ServerBuilder::new("facade-http-legacy-progress", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .tool(PublicHttpProgressTool)
+                .resource(PublicHttpProgressResource)
+                .prompt(PublicHttpProgressPrompt)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("legacy progress facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("legacy progress facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy progress HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy progress facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy progress facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("legacy progress facade HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy progress facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+fn legacy_http_progress_meta(
+    marker: legacy_2024::ProgressMarker,
+) -> Option<legacy_2024::RequestMeta> {
+    Some(legacy_2024::RequestMeta {
+        progress_marker: Some(marker),
+    })
+}
+
+#[test]
+fn e2e_public_http_legacy_progress_marker_is_retained_on_sse() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_progress_http_server();
+    let mut client = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 progress HTTP connect",
+        legacy_2024::http_client_builder(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+        )
+        .expect("the exact-2024 progress HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-legacy-progress", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the LegacyOnly public facade connects to the progress HTTP server");
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 progress tools/call without token",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_PROGRESS_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a tools/call without a progress token still completes");
+    let silent = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "without a progressToken the exact-2024 HTTP tool must stay silent: {silent:?}"
+    );
+
+    let marker = legacy_2024::ProgressMarker::from("http-legacy-progress");
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 progress tools/call with token",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_PROGRESS_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: legacy_http_progress_meta(marker.clone()),
+            },
+        ),
+    )
+    .expect("a progressToken must not prevent the exact-2024 HTTP tool from completing");
+    let progress =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == marker
+                    && params.message.as_deref() == Some("halfway")
+        )),
+        "live exact-2024 HTTP SSE must retain notifications/progress after a progressToken: {progress:?}"
+    );
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 progress resources/read without token",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_PROGRESS_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a resources/read without a progress token still completes");
+    let silent_resource = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent_resource.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "without a progressToken the exact-2024 HTTP resource must stay silent: {silent_resource:?}"
+    );
+
+    let resource_marker = legacy_2024::ProgressMarker::from("http-legacy-resource-progress");
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 progress resources/read with token",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_PROGRESS_RESOURCE_URI.to_owned(),
+                meta: legacy_http_progress_meta(resource_marker.clone()),
+            },
+        ),
+    )
+    .expect("a progressToken must not prevent the exact-2024 HTTP resource from completing");
+    let resource_progress =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        resource_progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == resource_marker
+                    && params.message.as_deref() == Some("resource-halfway")
+        )),
+        "live exact-2024 HTTP SSE must retain resource notifications/progress after a progressToken: {resource_progress:?}"
+    );
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 progress prompts/get without token",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_PROGRESS_PROMPT_NAME.to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    )
+    .expect("a prompts/get without a progress token still completes");
+    let silent_prompt = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent_prompt.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "without a progressToken the exact-2024 HTTP prompt must stay silent: {silent_prompt:?}"
+    );
+
+    let prompt_marker = legacy_2024::ProgressMarker::from("http-legacy-prompt-progress");
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 progress prompts/get with token",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_PROGRESS_PROMPT_NAME.to_owned(),
+                arguments: None,
+                meta: legacy_http_progress_meta(prompt_marker.clone()),
+            },
+        ),
+    )
+    .expect("a progressToken must not prevent the exact-2024 HTTP prompt from completing");
+    let prompt_progress =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        prompt_progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == prompt_marker
+                    && params.message.as_deref() == Some("prompt-halfway")
+        )),
+        "live exact-2024 HTTP SSE must retain prompt notifications/progress after a progressToken: {prompt_progress:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_legacy_log_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy log HTTP server control receiver went away".to_owned());
+            }
+            let server = ServerBuilder::new("facade-http-legacy-log", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .tool(PublicHttpLogTool)
+                .resource(PublicHttpLogResource)
+                .prompt(PublicHttpLogPrompt)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("legacy log facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!("legacy log facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy log HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy log facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy log facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("legacy log facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy log facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+fn legacy_http_log_message_is(
+    notification: &legacy_2024::ServerNotification,
+    expected: &str,
+) -> bool {
+    matches!(
+        notification,
+        legacy_2024::ServerNotification::Message(message)
+            if message.level == legacy_2024::LogLevel::Info
+                && message.data == json!(expected)
+    )
+}
+
+#[test]
+fn e2e_public_http_legacy_ctx_info_is_retained_on_sse() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_log_http_server();
+    let mut client = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 log HTTP connect",
+        legacy_2024::http_client_builder(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+        )
+        .expect("the exact-2024 log HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-legacy-log", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the LegacyOnly public facade connects to the log HTTP server");
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 tools/call before setLevel",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_LOG_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("ctx.info must not prevent the exact-2024 HTTP tool from completing");
+    let silent = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent.iter().any(|notification| legacy_http_log_message_is(
+            notification,
+            PUBLIC_HTTP_HANDLER_LOG_TEXT
+        )),
+        "omitting only logging/setLevel must keep exact-2024 HTTP ctx.info silent: {silent:?}"
+    );
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 logging/setLevel Info",
+        client.set_log_level(&cx, legacy_2024::LogLevel::Info),
+    )
+    .expect("exact-2024 HTTP logging/setLevel must be admitted");
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 tools/call after setLevel Info",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_LOG_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("ctx.info must not prevent the exact-2024 HTTP tool from completing");
+    let info =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        info.iter().any(|notification| legacy_http_log_message_is(
+            notification,
+            PUBLIC_HTTP_HANDLER_LOG_TEXT
+        )),
+        "live exact-2024 HTTP SSE must retain ctx.info after set_log_level(Info): {info:?}"
+    );
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 resources/read after setLevel Info",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_LOG_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("ctx.info must not prevent the exact-2024 HTTP resource from completing");
+    let resource_info =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        resource_info
+            .iter()
+            .any(|notification| legacy_http_log_message_is(
+                notification,
+                PUBLIC_HTTP_RESOURCE_LOG_TEXT
+            )),
+        "live exact-2024 HTTP SSE must retain resource ctx.info after set_log_level(Info): {resource_info:?}"
+    );
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 prompts/get after setLevel Info",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_LOG_PROMPT_NAME.to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    )
+    .expect("ctx.info must not prevent the exact-2024 HTTP prompt from completing");
+    let prompt_info =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        prompt_info
+            .iter()
+            .any(|notification| legacy_http_log_message_is(
+                notification,
+                PUBLIC_HTTP_PROMPT_LOG_TEXT
+            )),
+        "live exact-2024 HTTP SSE must retain prompt ctx.info after set_log_level(Info): {prompt_info:?}"
+    );
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 logging/setLevel Emergency",
+        client.set_log_level(&cx, legacy_2024::LogLevel::Emergency),
+    )
+    .expect("raising the exact-2024 HTTP log floor must be admitted");
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 tools/call after setLevel Emergency",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_LOG_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("raising the log floor must not prevent the exact-2024 HTTP tool from completing");
+    let emergency = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !emergency
+            .iter()
+            .any(|notification| legacy_http_log_message_is(
+                notification,
+                PUBLIC_HTTP_HANDLER_LOG_TEXT
+            )),
+        "raising only the logLevel floor must suppress exact-2024 HTTP ctx.info: {emergency:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_legacy_subscription_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy subscription HTTP server control receiver went away".to_owned());
+            }
+            let server = ServerBuilder::new("facade-http-legacy-subscription", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .resource(PublicHttpWatchResource)
+                .prompt(PublicHttpCatalogPrompt)
+                .tool(PublicHttpTouchTool)
+                .tool(PublicHttpHideCatalogTool)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("legacy subscription facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("legacy subscription facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy subscription HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy subscription facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy subscription facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("legacy subscription facade HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy subscription facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+fn connect_legacy_subscription_http_client(
+    cx: &Cx,
+    address: SocketAddr,
+    name: &str,
+) -> legacy_2024::HttpClient {
+    runtime_block_on_bounded_named(
+        cx,
+        "exact-2024 subscription HTTP connect",
+        legacy_2024::http_client_builder(
+            public_http_target(address, "/sse"),
+            public_http_target(address, "/messages"),
+        )
+        .expect("the exact-2024 subscription HTTP endpoints form one public facade plan")
+        .client_info(name, "1.0.0")
+        .connect_http_client_with_cx(cx),
+    )
+    .expect("the LegacyOnly public facade connects to the subscription HTTP server")
+}
+
+fn legacy_http_tool_text(result: &legacy_2024::CallToolResult) -> Option<String> {
+    serde_json::to_value(result)
+        .ok()
+        .and_then(|value| value["content"][0]["text"].as_str().map(str::to_owned))
+}
+
+#[test]
+fn e2e_public_http_legacy_resource_updated_is_retained_on_sse() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_subscription_http_server();
+    let mut client = connect_legacy_subscription_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-updated",
+    );
+
+    let silent_touch = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 resources/updated touch without subscribe",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TOUCH_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("touching an unsubscribed resource must complete");
+    assert_eq!(
+        legacy_http_tool_text(&silent_touch).as_deref(),
+        Some("silent"),
+        "without resources/subscribe the handler must not claim updated delivery: {silent_touch:?}"
+    );
+    let silent = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ResourceUpdated(_)
+        )),
+        "omitting only resources/subscribe must keep resources/updated silent: {silent:?}"
+    );
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 resources/subscribe",
+        client.subscribe_resource(
+            &cx,
+            legacy_2024::SubscribeResourceParams {
+                uri: PUBLIC_HTTP_WATCH_RESOURCE_URI.to_owned(),
+            },
+        ),
+    )
+    .expect("exact-2024 HTTP resources/subscribe must be admitted");
+    let touched = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 resources/updated touch after subscribe",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TOUCH_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("touching a subscribed resource must complete");
+    assert_eq!(
+        legacy_http_tool_text(&touched).as_deref(),
+        Some("notified"),
+        "resources/subscribe must count as notify_resource_updated delivery: {touched:?}"
+    );
+    let updated =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        updated.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ResourceUpdated(params)
+                if params.uri == PUBLIC_HTTP_WATCH_RESOURCE_URI
+        )),
+        "live exact-2024 HTTP SSE must retain notifications/resources/updated: {updated:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_resource_and_prompt_list_changed_are_retained_on_sse() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_subscription_http_server();
+    let mut client = connect_legacy_subscription_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-catalog",
+    );
+
+    let quiet = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 catalog touch without mutation",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TOUCH_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a non-mutating exact-2024 tools/call must complete");
+    assert_eq!(
+        legacy_http_tool_text(&quiet).as_deref(),
+        Some("silent"),
+        "the unsubscribed touch peer must stay non-mutating: {quiet:?}"
+    );
+    let silent = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ResourcesListChanged
+                | legacy_2024::ServerNotification::PromptsListChanged
+        )),
+        "changing only the missing catalog mutation must keep resource/prompt list_changed silent: {silent:?}"
+    );
+
+    let hidden = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 hide catalog tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_HIDE_CATALOG_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("disabling a peer resource and prompt must complete");
+    assert_eq!(
+        legacy_http_tool_text(&hidden).as_deref(),
+        Some("hidden"),
+        "exact-2024 SSE session state must let disable_resource/disable_prompt publish: {hidden:?}"
+    );
+    let changed =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        changed.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ResourcesListChanged
+        )),
+        "live exact-2024 HTTP SSE must retain notifications/resources/list_changed: {changed:?}"
+    );
+    assert!(
+        changed.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::PromptsListChanged
+        )),
+        "live exact-2024 HTTP SSE must retain notifications/prompts/list_changed: {changed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn spawn_legacy_filesystem_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let root = std::env::temp_dir().join(format!(
+        "fastmcp-public-http-legacy-fs-e2e-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("the legacy filesystem e2e root is created");
+    std::fs::write(
+        root.join(PUBLIC_HTTP_FS_FILE_NAME),
+        PUBLIC_HTTP_FS_FILE_TEXT,
+    )
+    .expect("the legacy filesystem e2e file is written");
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy filesystem HTTP server control receiver went away".to_owned());
+            }
+            let handler = providers::FilesystemProvider::new(&root)
+                .with_prefix(PUBLIC_HTTP_FS_PREFIX)
+                .with_exclude(&[])
+                .build()
+                .map_err(|error| format!("FilesystemProvider::build failed: {error}"))?;
+            let server = ServerBuilder::new("facade-http-legacy-filesystem", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .resource(handler)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("legacy filesystem facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("legacy filesystem facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy filesystem HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy filesystem facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy filesystem facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("legacy filesystem facade HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy filesystem facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn e2e_public_http_legacy_filesystem_provider_lists_and_reads_live_file() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_filesystem_http_server();
+    let mut client = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 filesystem HTTP connect",
+        legacy_2024::http_client_builder(
+            public_http_target(server.address(), "/sse"),
+            public_http_target(server.address(), "/messages"),
+        )
+        .expect("the exact-2024 filesystem HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-legacy-fs", "1.0.0")
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("the LegacyOnly public facade connects to the filesystem HTTP server");
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 resources/templates/list",
+        client.list_resource_templates(&cx, legacy_2024::ListResourceTemplatesParams::default()),
+    )
+    .expect("live exact-2024 bind_http must list the FilesystemProvider template");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_FS_TEMPLATE
+                && template.name == PUBLIC_HTTP_FS_PREFIX),
+        "FilesystemProvider must advertise its reversible file template: {:?}",
+        listed.resource_templates
+    );
+
+    let unmatched = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 unmatched filesystem resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "file:///other/note.txt".to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the prefix the template cannot bind must refuse before dispatch");
+    assert!(
+        matches!(
+            unmatched,
+            legacy_2024::HttpClientError::CoreResult(ref error)
+                if error.code == McpErrorCode::ResourceNotFound
+        ),
+        "an unmatched filesystem URI must stay ResourceNotFound on exact-2024: {unmatched:?}"
+    );
+
+    let file = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 matched filesystem resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_FS_FILE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("resources/read must expand the live file URI through the filesystem handler");
+    let file_text = serde_json::to_value(&file)
+        .ok()
+        .and_then(|value| value["contents"][0]["text"].as_str().map(str::to_owned));
+    assert_eq!(
+        file_text.as_deref(),
+        Some(PUBLIC_HTTP_FS_FILE_TEXT),
+        "the live exact-2024 filesystem read must retain the file bytes: {file:?}"
+    );
+
+    drop(client);
+    server.shutdown();
 }
 
 #[test]
