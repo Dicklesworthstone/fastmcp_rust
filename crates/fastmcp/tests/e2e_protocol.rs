@@ -4040,6 +4040,161 @@ fn e2e_public_legacy_stdio_sampling_without_capability_has_no_callback_authority
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_legacy_ping_is_admitted_and_missing_tool_stays_refused() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    client
+        .ping()
+        .expect("live exact-2024 stdio must admit ping");
+
+    let missing = client
+        .call_tool("stdio-e2e-missing", json!({}))
+        .expect_err("changing only the missing tool must keep the session refused");
+    let missing = format!("{missing:?}");
+    assert!(
+        missing.contains("MethodNotFound")
+            || missing.contains("InvalidParams")
+            || missing.contains("InvalidRequest")
+            || missing.contains("not found")
+            || missing.contains("Unknown tool"),
+        "a missing exact-2024 stdio tool must stay a handler-visible refusal: {missing}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio ping client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_complete_is_retained_and_unknown_prompt_is_refused() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    assert!(
+        client.server_capabilities().completions.is_some(),
+        "the shipped echo server must advertise completions: {:?}",
+        client.server_capabilities()
+    );
+
+    let completed = client
+        .complete(legacy_2024::LegacyCompletionParams {
+            reference: legacy_2024::LegacyCompletionReference::Prompt {
+                name: "greeting".to_owned(),
+            },
+            argument: legacy_2024::LegacyCompletionArgument {
+                name: "name".to_owned(),
+                value: "co".to_owned(),
+            },
+        })
+        .expect("live exact-2024 stdio must complete the shipped greeting provider");
+    assert_eq!(
+        completed.completion.values,
+        vec!["stdio-completion-legacy".to_owned()],
+        "the exact-2024 completion provider must retain its values: {completed:?}"
+    );
+
+    client
+        .complete(legacy_2024::LegacyCompletionParams {
+            reference: legacy_2024::LegacyCompletionReference::Prompt {
+                name: "stdio-e2e-missing-prompt".to_owned(),
+            },
+            argument: legacy_2024::LegacyCompletionArgument {
+                name: "name".to_owned(),
+                value: "co".to_owned(),
+            },
+        })
+        .expect_err("changing only the missing prompt must refuse complete");
+
+    client
+        .close()
+        .expect("legacy-only stdio complete client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_subscribe_then_unsubscribe_gates_resource_updated() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let silent = client
+        .call_tool("touch_server_info", json!({}))
+        .expect("touching an unsubscribed resource must complete");
+    assert!(
+        silent.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "silent",
+            _ => false,
+        }),
+        "without resources/subscribe the handler must not claim updated delivery: {silent:?}"
+    );
+    let notifications = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !notifications.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ResourceUpdated(_)
+        )),
+        "omitting only resources/subscribe must keep resources/updated silent: {notifications:?}"
+    );
+
+    client
+        .subscribe_resource("info://server")
+        .expect("exact-2024 stdio resources/subscribe must be admitted");
+    let notified = client
+        .call_tool("touch_server_info", json!({}))
+        .expect("touching a subscribed resource must complete");
+    assert!(
+        notified.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "notified",
+            _ => false,
+        }),
+        "resources/subscribe must count as notify_resource_updated delivery: {notified:?}"
+    );
+    let notifications = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        notifications.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ResourceUpdated(params)
+                if params.uri == "info://server"
+        )),
+        "live exact-2024 stdio must retain notifications/resources/updated: {notifications:?}"
+    );
+
+    client
+        .unsubscribe_resource("info://server")
+        .expect("exact-2024 stdio resources/unsubscribe must be admitted");
+    let silent_again = client
+        .call_tool("touch_server_info", json!({}))
+        .expect("touching an unsubscribed resource must complete");
+    assert!(
+        silent_again.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "silent",
+            _ => false,
+        }),
+        "resources/unsubscribe must stop notify_resource_updated delivery: {silent_again:?}"
+    );
+    let notifications = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !notifications.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::ResourceUpdated(_)
+        )),
+        "changing only resources/unsubscribe must keep later resources/updated silent: {notifications:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio subscribe client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_legacy_only_rejects_the_modern_shipped_server() {
     // This differs from the matched LegacyOnly positive only in the child
     // server's policy. The public client must not infer a legacy lifecycle.
