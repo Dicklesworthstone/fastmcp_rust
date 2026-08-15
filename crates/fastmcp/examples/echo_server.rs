@@ -298,10 +298,39 @@ impl ToolHandler for RichEcho {
     }
 
     fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
-        Ok(vec![
-            Content::image_base64("e2eimage", "image/png"),
-            Content::audio_base64("e2eaudio", "audio/wav"),
-        ])
+        // Exact 2024-11-05 has image but not audio. Keep the representable
+        // block here; the final hook below authors both.
+        Ok(vec![Content::image_base64("e2eimage", "image/png")])
+    }
+
+    fn call_final(
+        &self,
+        _ctx: &McpContext,
+        _arguments: serde_json::Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        Ok(CompleteResult::new(
+            FinalCallToolResult {
+                content: vec![
+                    ContentBlock::Image {
+                        data: "e2eimage".to_owned(),
+                        mime_type: "image/png".to_owned(),
+                        annotations: None,
+                        meta: None,
+                        additional: BTreeMap::new(),
+                    },
+                    ContentBlock::Audio {
+                        data: "e2eaudio".to_owned(),
+                        mime_type: "audio/wav".to_owned(),
+                        annotations: None,
+                        meta: None,
+                        additional: BTreeMap::new(),
+                    },
+                ],
+                is_error: false,
+                structured_content: None,
+            },
+            ResultMeta::empty(),
+        ))
     }
 }
 
@@ -313,6 +342,13 @@ async fn client_root_uri(ctx: &McpContext) -> McpResult<String> {
         .first()
         .map(|root| root.uri.clone())
         .unwrap_or_else(|| "<no client roots>".to_string()))
+}
+
+/// Requests one exact-2024 reverse-JSON-RPC sample from the connected client.
+#[tool]
+async fn sample_text(ctx: &McpContext) -> McpResult<String> {
+    let response = ctx.sample("echo", 16).await?;
+    Ok(response.text)
 }
 
 fn complete_text_tool(text: impl Into<String>) -> FinalToolOutcome {
@@ -331,7 +367,7 @@ fn complete_text_tool(text: impl Into<String>) -> FinalToolOutcome {
 fn sample_echo(
     ctx: &McpContext,
     completed_inputs: Option<&MrtrCompletedInputs>,
-) -> McpResult<FinalToolOutcome> {
+) -> McpResult<fastmcp_rust::FinalToolOutcome> {
     if let Some(completed_inputs) = completed_inputs {
         let sampled = completed_inputs
             .sampling("sample")?
@@ -359,7 +395,7 @@ fn sample_echo(
 fn url_elicit_echo(
     ctx: &McpContext,
     completed_inputs: Option<&MrtrCompletedInputs>,
-) -> McpResult<FinalToolOutcome> {
+) -> McpResult<fastmcp_rust::FinalToolOutcome> {
     if let Some(completed_inputs) = completed_inputs {
         let elicitation = completed_inputs
             .elicitation("approval")?
@@ -388,7 +424,7 @@ fn url_elicit_echo(
 fn roots_echo(
     ctx: &McpContext,
     completed_inputs: Option<&MrtrCompletedInputs>,
-) -> McpResult<FinalToolOutcome> {
+) -> McpResult<fastmcp_rust::FinalToolOutcome> {
     if let Some(completed_inputs) = completed_inputs {
         let roots_len = completed_mrtr_roots_len(completed_inputs, "roots")?;
         return Ok(complete_text_tool(format!("roots:{roots_len}")));
@@ -948,7 +984,7 @@ fn main() {
         .install_task_service(1, std::sync::Arc::new(DurableTaskSupervisor))
         .expect("the caller-owned example Task service installs once");
 
-    let server = ServerBuilder::new("echo-server", "1.0.0")
+    let builder = ServerBuilder::new("echo-server", "1.0.0")
         // Register tools
         .tool(Echo)
         .tool(TouchServerInfo)
@@ -966,6 +1002,7 @@ fn main() {
         .tool(StructuredEcho)
         .tool(RichEcho)
         .tool(ClientRootUri)
+        .tool(SampleText)
         .tool(SampleEcho)
         .tool(UrlElicitEcho)
         .tool(RootsEcho)
@@ -985,11 +1022,36 @@ fn main() {
         .prompt(MrtrPromptPrompt)
         .prompt_completion_handler("greeting", GreetingCompletion)
         // Set timeout (30 seconds per request)
-        .request_timeout(30)
-        // Set server instructions
-        .instructions(
+        .request_timeout(30);
+    let builder = if std::env::var("FASTMCP_NO_INSTRUCTIONS").as_deref() == Ok("1") {
+        builder
+    } else {
+        builder.instructions(
             "A simple echo server for testing FastMCP. Try calling the 'echo' tool with a message!",
         )
+    };
+    let builder = match std::env::var("FASTMCP_FS_ROOT") {
+        Ok(root) if !root.is_empty() => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let prefix =
+                    std::env::var("FASTMCP_FS_PREFIX").unwrap_or_else(|_| "e2e".to_owned());
+                let handler = FilesystemProvider::new(root)
+                    .with_prefix(prefix)
+                    .with_exclude(&[])
+                    .build()
+                    .expect("FASTMCP_FS_ROOT installs a live FilesystemProvider on linux/macos");
+                builder.resource(handler)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = root;
+                builder
+            }
+        }
+        _ => builder,
+    };
+    let server = builder
         .tool(DurableTaskTool)
         .final_tasks(task_runtime.clone())
         .expect("the official Tasks extension installs on the modern-capable example server")
