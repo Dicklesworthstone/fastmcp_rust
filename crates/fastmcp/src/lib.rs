@@ -6193,6 +6193,29 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Runs once when the bound listener begins serving.
+        #[must_use]
+        pub fn on_startup<F, E>(self, hook: F) -> Self
+        where
+            F: FnOnce() -> Result<(), E> + Send + 'static,
+            E: std::error::Error + Send + Sync + 'static,
+        {
+            Self {
+                inner: self.inner.on_startup(hook),
+            }
+        }
+
+        /// Runs once when the bound listener shuts down cooperatively.
+        #[must_use]
+        pub fn on_shutdown<F>(self, hook: F) -> Self
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            Self {
+                inner: self.inner.on_shutdown(hook),
+            }
+        }
+
         /// Builds an exact-2024 server.
         #[must_use]
         pub fn build(self) -> Server {
@@ -6930,6 +6953,18 @@ pub mod legacy_2024 {
             LEGACY_PROTOCOL_VERSION
         }
 
+        /// Returns the exact-2024 server capabilities admitted at initialize.
+        #[must_use]
+        pub fn server_capabilities(&self) -> &ServerCapabilities {
+            self.inner.session().server_capabilities()
+        }
+
+        /// Returns the exact-2024 initialize instructions, if the peer advertised them.
+        #[must_use]
+        pub fn instructions(&self) -> Option<&str> {
+            self.inner.session().instructions()
+        }
+
         /// Structurally closes the connection through the caller Cx.
         pub async fn close(&mut self, cx: &Cx) -> McpResult<()> {
             self.inner.close(cx).await
@@ -6994,6 +7029,256 @@ pub mod legacy_2024 {
                     "LegacyOnly WebSocket facade received an unexpected completion result",
                 )),
             }
+        }
+
+        /// Sends exact-2024 `ping` on this sealed WebSocket session.
+        pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.ping(cx).await
+        }
+
+        /// Lists exact-2024 tools through the pinned WebSocket session.
+        pub async fn list_tools(&mut self, cx: &Cx) -> McpResult<Vec<Tool>>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_tools(cx, None).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                    Ok(result.tools)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy tools/list result",
+                )),
+            }
+        }
+
+        /// Calls one exact-2024 tool through the pinned WebSocket session.
+        pub async fn call_tool(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<CallToolResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.call_tool(cx, name, arguments).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy tools/call result",
+                )),
+            }
+        }
+
+        /// Calls one exact-2024 tool and admits request-scoped
+        /// `notifications/progress` for the supplied progress marker.
+        ///
+        /// Drain those frames with [`Self::take_server_notifications`].
+        pub async fn call_tool_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<CallToolResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .call_tool_with_progress_marker(cx, name, arguments, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy tools/call result",
+                )),
+            }
+        }
+
+        /// Lists exact-2024 resources through the pinned WebSocket session.
+        pub async fn list_resources(&mut self, cx: &Cx) -> McpResult<Vec<Resource>>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_resources(cx, None).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                    Ok(result.resources)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/list result",
+                )),
+            }
+        }
+
+        /// Lists exact-2024 resource templates through the pinned WebSocket session.
+        pub async fn list_resource_templates(&mut self, cx: &Cx) -> McpResult<Vec<ResourceTemplate>>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_resource_templates(cx, None).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(
+                    result,
+                )) => Ok(result.resource_templates),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/templates/list result",
+                )),
+            }
+        }
+
+        /// Reads one exact-2024 resource through the pinned WebSocket session.
+        pub async fn read_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<ReadResourceResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.read_resource(cx, uri).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/read result",
+                )),
+            }
+        }
+
+        /// Reads one exact-2024 resource and admits request-scoped
+        /// `notifications/progress` for the supplied progress marker.
+        pub async fn read_resource_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            uri: &str,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<ReadResourceResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .read_resource_with_progress_marker(cx, uri, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/read result",
+                )),
+            }
+        }
+
+        /// Lists exact-2024 prompts through the pinned WebSocket session.
+        pub async fn list_prompts(&mut self, cx: &Cx) -> McpResult<Vec<Prompt>>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_prompts(cx, None).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                    Ok(result.prompts)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy prompts/list result",
+                )),
+            }
+        }
+
+        /// Gets one exact-2024 prompt through the pinned WebSocket session.
+        pub async fn get_prompt(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<GetPromptResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.get_prompt(cx, name, arguments).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy prompts/get result",
+                )),
+            }
+        }
+
+        /// Gets one exact-2024 prompt and admits request-scoped
+        /// `notifications/progress` for the supplied progress marker.
+        pub async fn get_prompt_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<GetPromptResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .get_prompt_with_progress_marker(cx, name, arguments, progress_marker)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy prompts/get result",
+                )),
+            }
+        }
+
+        /// Sends exact-2024 `logging/setLevel` on this sealed WebSocket session.
+        pub async fn set_log_level(&mut self, cx: &Cx, level: LogLevel) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.set_legacy_log_level(cx, level).await
+        }
+
+        /// Pops one exact-2024 server notification retained by this socket.
+        #[must_use]
+        pub fn take_notification(&mut self) -> Option<JsonRpcRequest> {
+            self.inner.take_legacy_notification()
+        }
+
+        /// Pops and direction-checks one typed exact-2024 server notification.
+        pub fn take_server_notification(&mut self) -> McpResult<Option<ServerNotification>> {
+            self.inner
+                .take_legacy_notification()
+                .map(|notification| ServerNotification::decode(&notification))
+                .transpose()
+        }
+
+        /// Drains and direction-checks exact-2024 server notifications retained
+        /// by this socket.
+        pub fn take_server_notifications(&mut self) -> McpResult<Vec<ServerNotification>> {
+            self.inner
+                .take_legacy_notifications()
+                .into_iter()
+                .map(|notification| ServerNotification::decode(&notification))
+                .collect()
+        }
+
+        /// Starts one exact-2024 resource subscription on this socket.
+        pub async fn subscribe_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.subscribe_resource(cx, uri).await
+        }
+
+        /// Ends one exact-2024 resource subscription on this socket.
+        pub async fn unsubscribe_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.unsubscribe_resource(cx, uri).await
         }
     }
 
