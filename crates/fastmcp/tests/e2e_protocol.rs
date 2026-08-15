@@ -4096,20 +4096,39 @@ fn e2e_public_stdio_legacy_complete_is_retained_and_unknown_prompt_is_refused() 
     );
 
     client
+        .close()
+        .expect("legacy-only stdio complete client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_complete_peer_without_handler_is_refused() {
+    let mut omitted = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_NO_COMPLETIONS", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the completions-omitted echo peer");
+
+    assert!(
+        omitted.server_capabilities().completions.is_none(),
+        "changing only the missing completion handler must omit completions: {:?}",
+        omitted.server_capabilities()
+    );
+    omitted
         .complete(legacy_2024::LegacyCompletionParams {
             reference: legacy_2024::LegacyCompletionReference::Prompt {
-                name: "stdio-e2e-missing-prompt".to_owned(),
+                name: "greeting".to_owned(),
             },
             argument: legacy_2024::LegacyCompletionArgument {
                 name: "name".to_owned(),
                 value: "co".to_owned(),
             },
         })
-        .expect_err("changing only the missing prompt must refuse complete");
+        .expect_err("changing only the missing completion handler must refuse complete");
 
-    client
+    omitted
         .close()
-        .expect("legacy-only stdio complete client cleanup");
+        .expect("legacy-only stdio complete-omitted client cleanup");
 }
 
 #[cfg(unix)]
