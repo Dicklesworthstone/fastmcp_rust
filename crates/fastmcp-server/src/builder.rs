@@ -1455,14 +1455,17 @@ impl ServerBuilder {
                     resource_templates.len(),
                     prompts.len(),
                 );
+                // Prefixed legacy keys (`{prefix}/{uri}`) are not absolute
+                // final URIs. Register them exact-2024-only so they are not
+                // projected into the modern catalog.
                 for tool in tools {
-                    self.router.add_tool_with_behavior(
+                    self.router.add_legacy_tool_with_behavior(
                         ProxyToolHandler::with_prefix(tool, prefix, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
                 }
                 for resource in resources {
-                    self.router.add_resource_with_behavior(
+                    self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::with_prefix(resource, prefix, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
@@ -1472,7 +1475,7 @@ impl ServerBuilder {
                     let downstream_uri = format!("{prefix}/{upstream_uri}");
                     let completion_target_admitted =
                         self.proxy_resource_template_wins_admission(&downstream_uri);
-                    self.router.add_resource_with_behavior(
+                    self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::from_template_with_prefix(
                             template,
                             prefix,
@@ -1496,7 +1499,7 @@ impl ServerBuilder {
                     let downstream_name = format!("{prefix}/{upstream_name}");
                     let completion_target_admitted =
                         self.proxy_prompt_wins_admission(&downstream_name);
-                    self.router.add_prompt_with_behavior(
+                    self.router.add_legacy_prompt_with_behavior(
                         ProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
                         self.on_duplicate,
                     )?;
