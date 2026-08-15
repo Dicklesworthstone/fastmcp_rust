@@ -4786,6 +4786,8 @@ where
     reverse_callback_pool: WebSocketReverseCallbackPool<IO>,
     final_server_notifications: VecDeque<ServerNotification>,
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
+    /// Exact-2024 server notifications retained from the WebSocket receive loop.
+    legacy_server_notifications: VecDeque<JsonRpcRequest>,
     retired_response_keys: VecDeque<CorrelationKey>,
     live_catalog_subscription: Option<LiveWebSocketCatalogSubscription>,
     next_id: u64,
@@ -5015,6 +5017,7 @@ where
             reverse_callback_pool,
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
+            legacy_server_notifications: VecDeque::new(),
             retired_response_keys: VecDeque::new(),
             live_catalog_subscription: None,
             next_id: 2,
@@ -5152,6 +5155,18 @@ where
     #[must_use]
     pub fn take_final_progress_notifications(&mut self) -> Vec<FinalProgressNotificationParams> {
         self.final_progress_notifications.drain(..).collect()
+    }
+
+    /// Pops one exact-2024 server notification retained by the WebSocket receive loop.
+    #[must_use]
+    pub fn take_legacy_notification(&mut self) -> Option<JsonRpcRequest> {
+        self.legacy_server_notifications.pop_front()
+    }
+
+    /// Drains exact-2024 server notifications retained by the WebSocket receive loop.
+    #[must_use]
+    pub fn take_legacy_notifications(&mut self) -> Vec<JsonRpcRequest> {
+        self.legacy_server_notifications.drain(..).collect()
     }
 
     /// Sends one admitted client request and retains the exact peer result source.
@@ -5355,6 +5370,22 @@ where
         Ok(true)
     }
 
+    fn retain_legacy_websocket_notification(
+        &mut self,
+        request: &JsonRpcRequest,
+    ) -> McpResult<bool> {
+        if !is_legacy_server_notification_method(request) {
+            return Ok(false);
+        }
+        if self.legacy_server_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+            return Err(McpError::invalid_request(
+                LEGACY_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+            ));
+        }
+        self.legacy_server_notifications.push_back(request.clone());
+        Ok(true)
+    }
+
     async fn handle_unsolicited_websocket_request(
         &mut self,
         cx: &Cx,
@@ -5383,6 +5414,12 @@ where
             return Err(McpError::invalid_request(
                 "MCP 2026-07-28 WebSocket client rejected a non-notification server request",
             ));
+        }
+        if self.retain_legacy_websocket_notification(request)? {
+            if request.method == "notifications/cancelled" {
+                let _ = self.cancel_legacy_reverse_callback(request);
+            }
+            return Ok(());
         }
         if request.method == "notifications/cancelled" {
             let _ = self.cancel_legacy_reverse_callback(request);
@@ -5712,6 +5749,83 @@ where
         IO: Send + 'static,
     {
         self.set_log_level_typed(final_log_level(level))
+    }
+
+    /// Sends exact-2024 `logging/setLevel` on this WebSocket session.
+    ///
+    /// Modern sessions must use [`Self::set_log_level_typed`] instead.
+    pub async fn set_legacy_log_level(&mut self, cx: &Cx, level: LogLevel) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        if self.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Err(McpError::invalid_params(
+                "logging/setLevel is only for MCP 2024-11-05",
+            ));
+        }
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        let parameters = serde_json::to_value(SetLogLevelParams { level }).map_err(|error| {
+            McpError::invalid_params(format!(
+                "WebSocket logging/setLevel parameters could not serialize: {error}"
+            ))
+        })?;
+        let received = self
+            .request_with_raw_result(cx, "logging/setLevel", Some(parameters))
+            .await?;
+        if let Some(error) = received.response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        Ok(())
+    }
+
+    /// Starts one exact-2024 `resources/subscribe` on this WebSocket session.
+    pub async fn subscribe_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        self.request_legacy_empty(cx, "resources/subscribe", serde_json::json!({ "uri": uri }))
+            .await
+    }
+
+    /// Ends one exact-2024 `resources/unsubscribe` on this WebSocket session.
+    pub async fn unsubscribe_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        self.request_legacy_empty(
+            cx,
+            "resources/unsubscribe",
+            serde_json::json!({ "uri": uri }),
+        )
+        .await
+    }
+
+    async fn request_legacy_empty(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        if self.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Err(McpError::invalid_params(format!(
+                "{method} is only for MCP 2024-11-05"
+            )));
+        }
+        let received = self
+            .request_with_raw_result(cx, method, Some(parameters))
+            .await?;
+        if let Some(error) = received.response.error {
+            return Err(json_rpc_error_to_mcp(error));
+        }
+        Ok(())
     }
 
     /// Lists one page of resources through the negotiated WebSocket era.
