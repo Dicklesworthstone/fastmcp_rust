@@ -14998,6 +14998,1142 @@ fn e2e_public_http_legacy_session_state_is_retained_across_sse_calls() {
     server.shutdown();
 }
 
+fn spawn_legacy_mask_http_server(mask_error_details: bool) -> HttpServerFixture {
+    spawn_legacy_http_server("legacy mask", move || {
+        ServerBuilder::new("facade-http-legacy-mask", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .mask_error_details(mask_error_details)
+            .resource(PublicHttpLeakResource)
+            .build()
+    })
+}
+
+fn spawn_legacy_rate_limit_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy rate-limit", || {
+        ServerBuilder::new("facade-http-legacy-rate-limit", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .middleware(rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1))
+            .tool(PublicHttpTouchTool)
+            .build()
+    })
+}
+
+fn spawn_legacy_sliding_window_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy sliding-window", || {
+        ServerBuilder::new("facade-http-legacy-sliding-window", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .middleware(rate_limiting::SlidingWindowRateLimitingMiddleware::new(
+                1, 60,
+            ))
+            .tool(PublicHttpTouchTool)
+            .build()
+    })
+}
+
+fn spawn_legacy_strict_validation_http_server(strict: bool) -> HttpServerFixture {
+    spawn_legacy_http_server("legacy strict", move || {
+        ServerBuilder::new("facade-http-legacy-strict", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .strict_input_validation(strict)
+            .tool(PublicHttpValue)
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_legacy_mask_error_details_hides_resource_execution_secret() {
+    let cx = Cx::for_request();
+    let masked_server = spawn_legacy_mask_http_server(true);
+    let mut masked_client =
+        connect_legacy_http_client(&cx, masked_server.address(), "e2e-public-http-legacy-mask");
+    let masked = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 masked resources/read",
+        masked_client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_LEAK_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("a leaking resource must stay a resources/read error");
+    let masked = format!("{masked:?}");
+    assert!(
+        masked.contains("Internal server error"),
+        "exact-2024 HTTP mask_error_details must replace the execution secret: {masked}"
+    );
+    assert!(
+        !masked.contains(PUBLIC_HTTP_LEAK_SECRET),
+        "exact-2024 HTTP mask_error_details must not leak the execution secret: {masked}"
+    );
+    drop(masked_client);
+    masked_server.shutdown();
+
+    let unmasked_server = spawn_legacy_mask_http_server(false);
+    let mut unmasked_client = connect_legacy_http_client(
+        &cx,
+        unmasked_server.address(),
+        "e2e-public-http-legacy-unmask",
+    );
+    let unmasked = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 unmasked resources/read",
+        unmasked_client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_LEAK_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only mask_error_details must still refuse the leaking resource");
+    let unmasked = format!("{unmasked:?}");
+    assert!(
+        unmasked.contains(PUBLIC_HTTP_LEAK_SECRET),
+        "disabling exact-2024 HTTP mask_error_details must keep the execution secret: {unmasked}"
+    );
+    drop(unmasked_client);
+    unmasked_server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_rate_limit_refuses_second_same_method_and_admits_another() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_rate_limit_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-rate-limit");
+
+    let first = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOUCH_TOOL_NAME,
+        json!({}),
+        "exact-2024 first rate-limited tools/call",
+    )
+    .expect("the first exact-2024 HTTP tools/call must be admitted by the live rate limiter");
+    let first_text = legacy_http_tool_text(&first);
+    assert!(
+        first_text.as_deref() == Some("notified") || first_text.as_deref() == Some("silent"),
+        "the first live tools/call must reach the touch handler: {first:?}"
+    );
+
+    let limited = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOUCH_TOOL_NAME,
+        json!({}),
+        "exact-2024 second rate-limited tools/call",
+    );
+    let limited = match limited {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a second tools/call must stay an error result: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 HTTP tools/call must keep the rate-limit error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 tools/list after rate limit",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("changing only the method must still be admitted by the live rate limiter");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOUCH_TOOL_NAME),
+        "exact-2024 HTTP tools/list must stay callable after tools/call is rate-limited: {listed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_sliding_window_refuses_second_same_method_and_admits_another() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_sliding_window_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-sliding-window",
+    );
+
+    let first = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOUCH_TOOL_NAME,
+        json!({}),
+        "exact-2024 first sliding-window tools/call",
+    )
+    .expect("the first exact-2024 HTTP tools/call must be admitted by the sliding window");
+    let first_text = legacy_http_tool_text(&first);
+    assert!(
+        first_text.as_deref() == Some("notified") || first_text.as_deref() == Some("silent"),
+        "the first live tools/call must reach the touch handler: {first:?}"
+    );
+
+    let limited = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOUCH_TOOL_NAME,
+        json!({}),
+        "exact-2024 second sliding-window tools/call",
+    );
+    let limited = match limited {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a second tools/call must stay an error result: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 HTTP tools/call must keep the sliding-window error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 tools/list after sliding window",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("changing only the method must still be admitted by the sliding window");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOUCH_TOOL_NAME),
+        "exact-2024 HTTP tools/list must stay callable after tools/call is window-limited: {listed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_strict_input_validation_refuses_unknown_property_and_admits_declared_args()
+ {
+    let cx = Cx::for_request();
+    let strict_server = spawn_legacy_strict_validation_http_server(true);
+    let mut strict_client = connect_legacy_http_client(
+        &cx,
+        strict_server.address(),
+        "e2e-public-http-legacy-strict-on",
+    );
+
+    let admitted = legacy_http_call(
+        &cx,
+        &mut strict_client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 strict declared tools/call",
+    )
+    .expect("strict validation must still admit declared arguments");
+    assert!(
+        !admitted.is_error,
+        "declared arguments must not become a tool-level error: {admitted:?}"
+    );
+    assert_eq!(
+        legacy_http_tool_text(&admitted).as_deref(),
+        Some("tool:alpha"),
+        "declared arguments must reach the handler under strict validation: {admitted:?}"
+    );
+
+    let refused = legacy_http_call(
+        &cx,
+        &mut strict_client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha", "extra": 1}),
+        "exact-2024 strict extra-property tools/call",
+    );
+    let refused = match refused {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "an unknown property must become a tool-level error when strict validation is on: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        refused.contains("do not match the declared input schema")
+            || refused.contains("unknown")
+            || refused.contains("InvalidParams")
+            || refused.contains("extra"),
+        "the strict refusal must name the input-schema mismatch: {refused}"
+    );
+
+    drop(strict_client);
+    strict_server.shutdown();
+
+    let lenient_server = spawn_legacy_strict_validation_http_server(false);
+    let mut lenient_client = connect_legacy_http_client(
+        &cx,
+        lenient_server.address(),
+        "e2e-public-http-legacy-strict-off",
+    );
+    let extra = legacy_http_call(
+        &cx,
+        &mut lenient_client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha", "extra": 1}),
+        "exact-2024 lenient extra-property tools/call",
+    )
+    .expect("lenient validation must admit the same extra property");
+    assert!(
+        !extra.is_error,
+        "changing only the strict flag must admit the extra property: {extra:?}"
+    );
+    assert_eq!(
+        legacy_http_tool_text(&extra).as_deref(),
+        Some("tool:alpha"),
+        "the extra property must still reach the handler when strict validation is off: {extra:?}"
+    );
+
+    drop(lenient_client);
+    lenient_server.shutdown();
+}
+
+fn spawn_legacy_auth_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let mut server = spawn_legacy_http_server("legacy auth", move || {
+        let verifier = StaticTokenVerifier::new([(
+            "alpha",
+            AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+        )])
+        .expect("the deterministic native bearer verifier is valid")
+        .with_allowed_schemes(["Bearer"])
+        .expect("the bearer scheme allowlist is valid");
+        ServerBuilder::new("facade-http-legacy-auth", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .auth_provider(TokenAuthProvider::new(verifier))
+            .tool(PublicHttpAuthSubject {
+                counters: tool_calls,
+            })
+            .build()
+    });
+    server.handler_calls = handler_calls;
+    server
+}
+
+const MAX_LEGACY_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+
+fn write_legacy_native_http(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    authorization: Option<&str>,
+    body: &[u8],
+    keep_open: bool,
+) -> (std::net::TcpStream, Vec<u8>) {
+    let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+        .expect("native HTTP client connects to the exact-2024 listener");
+    stream
+        .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client read deadline is configured");
+    stream
+        .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client write deadline is configured");
+    let authorization_header =
+        authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
+    let extra_headers = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {address}\r\n{authorization_header}Accept: text/event-stream\r\n{extra_headers}\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .expect("native HTTP request commits to the exact-2024 listener");
+    if !keep_open {
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+    }
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    let deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                assert!(
+                    response
+                        .len()
+                        .checked_add(read)
+                        .is_some_and(|size| size <= MAX_LEGACY_NATIVE_HTTP_RESPONSE_BYTES),
+                    "native HTTP response exceeds the test's bounded response budget"
+                );
+                response.extend_from_slice(&buffer[..read]);
+                if !keep_open {
+                    continue;
+                }
+                if response.windows(4).any(|window| window == b"\r\n\r\n")
+                    && (response.starts_with(b"HTTP/1.1 401")
+                        || response
+                            .windows(b"event: endpoint".len())
+                            .any(|window| window == b"event: endpoint"))
+                {
+                    break;
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(error) => {
+                panic!("native HTTP response reads within its configured deadline: {error}")
+            }
+        }
+    }
+    (stream, response)
+}
+
+fn legacy_native_http_headers(response: &[u8]) -> &str {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap_or(response.len());
+    std::str::from_utf8(&response[..header_end]).unwrap_or("")
+}
+
+fn assert_legacy_bearer_challenge(response: &[u8], label: &str) {
+    assert!(
+        response.starts_with(b"HTTP/1.1 401"),
+        "{label} must be refused before dispatch: {}",
+        String::from_utf8_lossy(response)
+    );
+    assert!(
+        legacy_native_http_headers(response)
+            .lines()
+            .any(
+                |header| header.to_ascii_lowercase().starts_with("www-authenticate:")
+                    && header.to_ascii_lowercase().contains("bearer")
+            ),
+        "{label} challenge must advertise Bearer: {}",
+        String::from_utf8_lossy(response)
+    );
+}
+
+fn legacy_sse_session_id(response: &[u8]) -> String {
+    let text = String::from_utf8_lossy(response);
+    let data = text
+        .split("data:")
+        .nth(1)
+        .expect("exact-2024 SSE open emits an endpoint event");
+    let endpoint = data
+        .lines()
+        .next()
+        .expect("endpoint data is one line")
+        .trim();
+    endpoint
+        .split("session_id=")
+        .nth(1)
+        .and_then(|rest| rest.split(['&', ' ', '\r', '\n']).next())
+        .filter(|id| !id.is_empty())
+        .expect("endpoint event carries session_id")
+        .to_owned()
+}
+
+fn drain_legacy_sse(
+    stream: &mut std::net::TcpStream,
+    haystack: &mut Vec<u8>,
+    bound: Duration,
+) -> String {
+    let previous = stream.read_timeout().ok().flatten();
+    stream
+        .set_read_timeout(Some(bound))
+        .expect("legacy SSE drain deadline is configured");
+    let mut buffer = [0_u8; 8 * 1024];
+    let deadline = Instant::now() + bound;
+    while Instant::now() < deadline {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                assert!(
+                    haystack
+                        .len()
+                        .checked_add(read)
+                        .is_some_and(|size| size <= MAX_LEGACY_NATIVE_HTTP_RESPONSE_BYTES),
+                    "legacy SSE drain exceeds the test's bounded response budget"
+                );
+                haystack.extend_from_slice(&buffer[..read]);
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(error) => panic!("legacy SSE drain reads within its configured deadline: {error}"),
+        }
+    }
+    if let Some(timeout) = previous {
+        let _ = stream.set_read_timeout(Some(timeout));
+    }
+    String::from_utf8_lossy(haystack).into_owned()
+}
+
+fn read_legacy_sse_until(
+    stream: &mut std::net::TcpStream,
+    haystack: &mut Vec<u8>,
+    needle: &str,
+) -> String {
+    let mut buffer = [0_u8; 8 * 1024];
+    let deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        if String::from_utf8_lossy(haystack).contains(needle) {
+            return String::from_utf8_lossy(haystack).into_owned();
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "exact-2024 SSE did not retain {needle:?} within the bound: {}",
+                String::from_utf8_lossy(haystack)
+            );
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => panic!(
+                "exact-2024 SSE closed before retaining {needle:?}: {}",
+                String::from_utf8_lossy(haystack)
+            ),
+            Ok(read) => {
+                assert!(
+                    haystack
+                        .len()
+                        .checked_add(read)
+                        .is_some_and(|size| size <= MAX_LEGACY_NATIVE_HTTP_RESPONSE_BYTES),
+                    "exact-2024 SSE exceeds the test's bounded response budget"
+                );
+                haystack.extend_from_slice(&buffer[..read]);
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("exact-2024 SSE read failed: {error}"),
+        }
+    }
+}
+
+fn initialize_legacy_native_session(
+    address: SocketAddr,
+    authorization: Option<&str>,
+    client_name: &str,
+) -> (std::net::TcpStream, Vec<u8>, String) {
+    let (sse, opened) = write_legacy_native_http(address, "GET", "/sse", authorization, &[], true);
+    assert!(
+        opened.starts_with(b"HTTP/1.1 200"),
+        "GET /sse must open the exact-2024 session: {}",
+        String::from_utf8_lossy(&opened)
+    );
+    let session_id = legacy_sse_session_id(&opened);
+    let messages = format!("/messages?session_id={session_id}");
+    let initialize = JsonRpcRequest::new(
+        "initialize",
+        Some(json!({
+            "protocolVersion": legacy_2024::PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": client_name, "version": "1.0.0" },
+        })),
+        1_i64,
+    );
+    let initialize_body =
+        serde_json::to_vec(&initialize).expect("exact-2024 initialize serializes");
+    let (_init_stream, init_response) = write_legacy_native_http(
+        address,
+        "POST",
+        &messages,
+        authorization,
+        &initialize_body,
+        false,
+    );
+    assert!(
+        init_response.starts_with(b"HTTP/1.1 202") || init_response.starts_with(b"HTTP/1.1 200"),
+        "initialize must be admitted: {}",
+        String::from_utf8_lossy(&init_response)
+    );
+    let initialized = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized",
+    });
+    let initialized_body =
+        serde_json::to_vec(&initialized).expect("exact-2024 initialized serializes");
+    let (_initialized_stream, initialized_response) = write_legacy_native_http(
+        address,
+        "POST",
+        &messages,
+        authorization,
+        &initialized_body,
+        false,
+    );
+    assert!(
+        initialized_response.starts_with(b"HTTP/1.1 202")
+            || initialized_response.starts_with(b"HTTP/1.1 200"),
+        "initialized notification must be admitted: {}",
+        String::from_utf8_lossy(&initialized_response)
+    );
+    (sse, opened, messages)
+}
+
+#[test]
+fn e2e_public_http_legacy_static_token_refuses_missing_and_wrong_and_commits_subject() {
+    let server = spawn_legacy_auth_http_server();
+
+    let (_missing_stream, missing) =
+        write_legacy_native_http(server.address(), "GET", "/sse", None, &[], false);
+    assert_legacy_bearer_challenge(&missing, "missing Authorization on GET /sse");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "missing Authorization must not invoke the authenticated handler"
+    );
+
+    let (_wrong_stream, wrong) = write_legacy_native_http(
+        server.address(),
+        "GET",
+        "/sse",
+        Some("Bearer beta"),
+        &[],
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong, "wrong bearer on GET /sse");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "a wrong bearer token must not invoke the authenticated handler"
+    );
+
+    let (mut sse, opened, messages) = initialize_legacy_native_session(
+        server.address(),
+        Some("Bearer alpha"),
+        "e2e-public-http-legacy-auth",
+    );
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+            "arguments": {},
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("exact-2024 tools/call serializes");
+
+    let (_missing_post, missing_post) =
+        write_legacy_native_http(server.address(), "POST", &messages, None, &tool_body, false);
+    assert_legacy_bearer_challenge(&missing_post, "missing Authorization on POST /messages");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "missing Authorization on POST /messages must not invoke the handler"
+    );
+
+    let (_wrong_post, wrong_post) = write_legacy_native_http(
+        server.address(),
+        "POST",
+        &messages,
+        Some("Bearer beta"),
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong_post, "wrong bearer on POST /messages");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "a wrong bearer token on POST /messages must not invoke the handler"
+    );
+
+    let (_tool_stream, tool_response) = write_legacy_native_http(
+        server.address(),
+        "POST",
+        &messages,
+        Some("Bearer alpha"),
+        &tool_body,
+        false,
+    );
+    assert!(
+        tool_response.starts_with(b"HTTP/1.1 202") || tool_response.starts_with(b"HTTP/1.1 200"),
+        "the matching bearer token must admit tools/call: {}",
+        String::from_utf8_lossy(&tool_response)
+    );
+
+    let mut sse_body = opened;
+    let retained = read_legacy_sse_until(
+        &mut sse,
+        &mut sse_body,
+        &format!("subject:{PUBLIC_HTTP_AUTH_SUBJECT}"),
+    );
+    assert!(
+        retained.contains(&format!("subject:{PUBLIC_HTTP_AUTH_SUBJECT}")),
+        "admitted exact-2024 HTTP must commit the verifier subject into ctx.auth(): {retained}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "only the matching bearer token may invoke the authenticated handler"
+    );
+
+    drop(sse);
+    server.shutdown();
+}
+
+fn spawn_legacy_custom_auth_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let mut server = spawn_legacy_http_server("legacy custom auth", move || {
+        ServerBuilder::new("facade-http-legacy-custom-auth", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
+            .tool(PublicHttpAuthSubject {
+                counters: tool_calls,
+            })
+            .build()
+    });
+    server.handler_calls = handler_calls;
+    server
+}
+
+#[test]
+fn e2e_public_http_legacy_custom_token_refuses_wrong_and_commits_subject() {
+    let server = spawn_legacy_custom_auth_http_server();
+    let matching = format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}");
+
+    let (_missing_stream, missing) =
+        write_legacy_native_http(server.address(), "GET", "/sse", None, &[], false);
+    assert_legacy_bearer_challenge(&missing, "missing Authorization on custom GET /sse");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "missing Authorization must not invoke the custom-verified handler"
+    );
+
+    let (_wrong_stream, wrong) = write_legacy_native_http(
+        server.address(),
+        "GET",
+        "/sse",
+        Some("Bearer alpha"),
+        &[],
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong, "static token on custom GET /sse");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "changing only the custom verifier token must not invoke the handler"
+    );
+
+    let (mut sse, opened, messages) = initialize_legacy_native_session(
+        server.address(),
+        Some(matching.as_str()),
+        "e2e-public-http-legacy-custom-auth",
+    );
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_AUTH_TOOL_NAME,
+            "arguments": {},
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("exact-2024 tools/call serializes");
+
+    let (_wrong_post, wrong_post) = write_legacy_native_http(
+        server.address(),
+        "POST",
+        &messages,
+        Some("Bearer alpha"),
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong_post, "static token on custom POST /messages");
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        0,
+        "a rejected custom verifier token must not invoke the handler"
+    );
+
+    let (_tool_stream, tool_response) = write_legacy_native_http(
+        server.address(),
+        "POST",
+        &messages,
+        Some(matching.as_str()),
+        &tool_body,
+        false,
+    );
+    assert!(
+        tool_response.starts_with(b"HTTP/1.1 202") || tool_response.starts_with(b"HTTP/1.1 200"),
+        "the matching custom verifier token must admit tools/call: {}",
+        String::from_utf8_lossy(&tool_response)
+    );
+
+    let mut sse_body = opened;
+    let retained = read_legacy_sse_until(
+        &mut sse,
+        &mut sse_body,
+        &format!("subject:{PUBLIC_HTTP_CUSTOM_AUTH_SUBJECT}"),
+    );
+    assert!(
+        retained.contains(&format!("subject:{PUBLIC_HTTP_CUSTOM_AUTH_SUBJECT}")),
+        "admitted exact-2024 HTTP must commit the custom verifier subject: {retained}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "only the matching custom verifier token may invoke the handler"
+    );
+
+    drop(sse);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_LEGACY_WAIT_TOOL_NAME: &str = "public-http-e2e-legacy-wait";
+
+/// Cooperative wait tool so an in-flight exact-2024 HTTP cancel can be observed.
+struct PublicHttpLegacyWaitTool {
+    started: Arc<AtomicBool>,
+    observed_cancellation: Arc<AtomicBool>,
+}
+
+impl ToolHandler for PublicHttpLegacyWaitTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_LEGACY_WAIT_TOOL_NAME.to_owned(),
+            description: Some("Waits until cancelled or the bound elapses".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        if ctx.is_cancelled() || ctx.checkpoint().is_err() {
+            self.observed_cancellation.store(true, Ordering::Release);
+            return Err(McpError::request_cancelled());
+        }
+        Ok(vec![Content::text("waited")])
+    }
+
+    fn call_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        _arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        Box::pin(async move {
+            self.started.store(true, Ordering::Release);
+            // Stay well past the HTTP operation bound unless cancel arrives.
+            for _ in 0..500 {
+                if ctx.is_cancelled()
+                    || ctx.checkpoint().is_err()
+                    || request_cx.checkpoint().is_err()
+                {
+                    self.observed_cancellation.store(true, Ordering::Release);
+                    return Outcome::Err(McpError::request_cancelled());
+                }
+                asupersync::time::sleep(request_cx.now(), Duration::from_millis(10)).await;
+            }
+            Outcome::Ok(vec![Content::text("waited")])
+        })
+    }
+}
+
+fn spawn_legacy_cancel_http_server() -> (HttpServerFixture, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let started = Arc::new(AtomicBool::new(false));
+    let observed_cancellation = Arc::new(AtomicBool::new(false));
+    let wait_started = Arc::clone(&started);
+    let wait_observed = Arc::clone(&observed_cancellation);
+    let server = spawn_legacy_http_server("legacy cancel", move || {
+        ServerBuilder::new("facade-http-legacy-cancel", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpLegacyWaitTool {
+                started: wait_started,
+                observed_cancellation: wait_observed,
+            })
+            .tool(PublicHttpFastTool)
+            .build()
+    });
+    (server, started, observed_cancellation)
+}
+
+#[test]
+fn e2e_public_http_legacy_cancel_stops_in_flight_tools_call_and_peer_stays_admitted() {
+    let (server, started, observed_cancellation) = spawn_legacy_cancel_http_server();
+    let (mut sse, opened, messages) =
+        initialize_legacy_native_session(server.address(), None, "e2e-public-http-legacy-cancel");
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": PUBLIC_HTTP_LEGACY_WAIT_TOOL_NAME,
+            "arguments": {},
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("exact-2024 wait tools/call serializes");
+    let address = server.address();
+    let messages_for_call = messages.clone();
+    let call = thread::spawn(move || {
+        write_legacy_native_http(address, "POST", &messages_for_call, None, &tool_body, false)
+    });
+
+    let start_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        started.load(Ordering::Acquire),
+        "the exact-2024 wait tool must start before notifications/cancelled is posted"
+    );
+
+    let cancel = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {
+            "requestId": 2,
+            "reason": "e2e-legacy-http-cancel",
+        },
+    });
+    let cancel_body = serde_json::to_vec(&cancel).expect("exact-2024 cancel serializes");
+    let (_cancel_stream, cancel_response) = write_legacy_native_http(
+        server.address(),
+        "POST",
+        &messages,
+        None,
+        &cancel_body,
+        false,
+    );
+    assert!(
+        cancel_response.starts_with(b"HTTP/1.1 202")
+            || cancel_response.starts_with(b"HTTP/1.1 200"),
+        "notifications/cancelled must be admitted without waiting for the handler: {}",
+        String::from_utf8_lossy(&cancel_response)
+    );
+
+    let (_call_stream, call_response) = call.join().expect("in-flight tools/call thread joins");
+    assert!(
+        call_response.starts_with(b"HTTP/1.1 202") || call_response.starts_with(b"HTTP/1.1 200"),
+        "the cancelled tools/call POST must still complete its HTTP envelope: {}",
+        String::from_utf8_lossy(&call_response)
+    );
+    assert!(
+        observed_cancellation.load(Ordering::Acquire),
+        "notifications/cancelled must reach the in-flight exact-2024 wait handler"
+    );
+
+    let mut sse_body = opened;
+    let retained = drain_legacy_sse(&mut sse, &mut sse_body, Duration::from_millis(150));
+    assert!(
+        !retained.contains("waited"),
+        "a cancelled wait tool must not publish its completion text: {retained}"
+    );
+    assert!(
+        !retained.contains("\"id\":2"),
+        "exact MCP 2024-11-05 suppresses the JSON-RPC result of a cancelled request: {retained}"
+    );
+
+    drop(sse);
+    let cx = Cx::for_request();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-cancel-peer");
+    let peer = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_FAST_TOOL_NAME,
+        json!({}),
+        "exact-2024 peer tools/call after cancel",
+    )
+    .expect("a peer tools/call must stay admitted after cancellation");
+    assert_eq!(
+        legacy_http_tool_text(&peer).as_deref(),
+        Some("fast"),
+        "changing only the cancelled request must not starve the peer: {peer:?}"
+    );
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_legacy_duplicate_http_server(behavior: DuplicateBehavior) -> HttpServerFixture {
+    spawn_legacy_http_server("legacy duplicate", move || {
+        ServerBuilder::new("facade-http-legacy-duplicate", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .on_duplicate(behavior)
+            .tool(PublicHttpValue)
+            .tool(ReplacedPublicHttpValue)
+            .build()
+    })
+}
+
+fn spawn_legacy_cache_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let mut server = spawn_legacy_http_server("legacy cache", move || {
+        ServerBuilder::new("facade-http-legacy-cache", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .middleware(
+                caching::ResponseCachingMiddleware::new()
+                    .include_tools(vec![PUBLIC_HTTP_TOOL_NAME.to_owned()]),
+            )
+            .tool(CountingPublicHttpValue {
+                counters: tool_calls,
+            })
+            .build()
+    });
+    server.handler_calls = handler_calls;
+    server
+}
+
+#[test]
+fn e2e_public_http_legacy_on_duplicate_error_keeps_first_and_replace_installs_second() {
+    let cx = Cx::for_request();
+
+    let keep_server = spawn_legacy_duplicate_http_server(DuplicateBehavior::Error);
+    let mut keep_client = connect_legacy_http_client(
+        &cx,
+        keep_server.address(),
+        "e2e-public-http-legacy-duplicate-error",
+    );
+    let kept = legacy_http_call(
+        &cx,
+        &mut keep_client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 duplicate-error tools/call",
+    )
+    .expect("Error must keep the first registration callable");
+    assert_eq!(
+        legacy_http_tool_text(&kept).as_deref(),
+        Some("tool:alpha"),
+        "on_duplicate Error must keep the first handler: {kept:?}"
+    );
+    drop(keep_client);
+    keep_server.shutdown();
+
+    let replace_server = spawn_legacy_duplicate_http_server(DuplicateBehavior::Replace);
+    let mut replace_client = connect_legacy_http_client(
+        &cx,
+        replace_server.address(),
+        "e2e-public-http-legacy-duplicate-replace",
+    );
+    let replaced = legacy_http_call(
+        &cx,
+        &mut replace_client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 duplicate-replace tools/call",
+    )
+    .expect("Replace must install the second registration");
+    assert_eq!(
+        legacy_http_tool_text(&replaced).as_deref(),
+        Some("replaced:alpha"),
+        "changing only on_duplicate to Replace must reach the second handler: {replaced:?}"
+    );
+    drop(replace_client);
+    replace_server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_response_cache_hits_same_allowlisted_call_and_misses_changed_args() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_cache_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-cache");
+
+    let first = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 first cached tools/call",
+    )
+    .expect("the first allowlisted tools/call must miss and reach the handler");
+    assert_eq!(
+        legacy_http_tool_text(&first).as_deref(),
+        Some("tool:alpha"),
+        "the first live tools/call must return the handler result: {first:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the first allowlisted tools/call must invoke the counting handler"
+    );
+
+    let cached = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 cached tools/call",
+    )
+    .expect("the second identical allowlisted tools/call must be a cache hit");
+    assert_eq!(
+        legacy_http_tool_text(&cached).as_deref(),
+        Some("tool:alpha"),
+        "the cache hit must keep the first complete result: {cached:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the second identical tools/call must not re-invoke the counting handler"
+    );
+
+    let missed = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "beta"}),
+        "exact-2024 cache-miss tools/call",
+    )
+    .expect("changing only the arguments must miss the cache");
+    assert_eq!(
+        legacy_http_tool_text(&missed).as_deref(),
+        Some("tool:beta"),
+        "the cache miss must reach the handler with the new arguments: {missed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        2,
+        "changing only the arguments must increment the counting handler"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
 #[test]
 fn e2e_public_http_lifespan_hooks_run_once_and_peer_stays_unhooked() {
     let cx = Cx::for_request();
