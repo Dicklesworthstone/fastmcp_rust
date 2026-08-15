@@ -1302,6 +1302,7 @@ struct LiveLegacy2024ConnectionRuntime {
     request_sender: Option<RequestSender>,
     supports_sampling: Arc<AtomicBool>,
     supports_roots: Arc<AtomicBool>,
+    resource_subscriptions: Arc<Mutex<Vec<String>>>,
     log_level: Arc<Mutex<Option<LogLevel>>>,
     logging_ceiling: LevelFilter,
 }
@@ -1357,6 +1358,7 @@ impl LiveLegacy2024ConnectionRuntime {
             request_sender,
             supports_sampling: Arc::new(AtomicBool::new(false)),
             supports_roots: Arc::new(AtomicBool::new(false)),
+            resource_subscriptions: Arc::new(Mutex::new(Vec::new())),
             log_level: Arc::new(Mutex::new(None)),
             logging_ceiling,
         }
@@ -1405,6 +1407,11 @@ impl LiveLegacy2024ConnectionRuntime {
                 })
                 .is_some_and(|capabilities| capabilities.roots.is_some());
         self.supports_roots.store(supports_roots, Ordering::Release);
+
+        *self
+            .resource_subscriptions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = snapshot.subscriptions.clone();
 
         let log_level = snapshot
             .logging_level
@@ -7531,7 +7538,7 @@ impl ServerHttpSession {
                     endpoint_session
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .publish_legacy_message(&JsonRpcMessage::Request(notification))
+                        .publish_legacy_message_committed(&JsonRpcMessage::Request(notification))
                 });
             })
         };
@@ -7543,7 +7550,7 @@ impl ServerHttpSession {
                         endpoint_session
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .publish_legacy_message(message)
+                            .publish_legacy_message_committed(message)
                     })
                     .ok_or_else(|| "Legacy SSE generation is closed".to_owned())?
                     .map_err(|error| error.to_string())
@@ -12083,6 +12090,17 @@ impl Server {
                 runtime.and_then(|runtime| runtime.log_level()),
             );
             if let Some(runtime) = runtime {
+                let subscriptions = runtime
+                    .resource_subscriptions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                request_ctx = Self::attach_session_resource_subscriptions(
+                    request_ctx,
+                    subscriptions.iter().map(String::as_str),
+                );
+            }
+            if let Some(runtime) = runtime {
                 let mut info = ClientCapabilityInfo::new();
                 if runtime.supports_sampling.load(Ordering::Acquire) {
                     info = info.with_sampling();
@@ -12155,7 +12173,7 @@ impl Server {
                             &request_ctx,
                             params,
                             Some(&session_state),
-                        ))
+                        )?)
                         .map_err(McpError::from)
                     }
                     "tools/call" => {
@@ -12180,7 +12198,7 @@ impl Server {
                             &request_ctx,
                             params,
                             Some(&session_state),
-                        ))
+                        )?)
                         .map_err(McpError::from)
                     }
                     "resources/templates/list" => {
@@ -12189,7 +12207,7 @@ impl Server {
                             &request_ctx,
                             params,
                             Some(&session_state),
-                        ))
+                        )?)
                         .map_err(McpError::from)
                     }
                     "resources/read" => {
@@ -12214,7 +12232,7 @@ impl Server {
                             &request_ctx,
                             params,
                             Some(&session_state),
-                        ))
+                        )?)
                         .map_err(McpError::from)
                     }
                     "prompts/get" => {
