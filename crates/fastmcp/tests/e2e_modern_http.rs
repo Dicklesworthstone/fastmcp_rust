@@ -45,8 +45,15 @@ use fastmcp_rust::{
     FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
     FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolCallOutcome, RequestId,
 };
+#[cfg(feature = "websocket-experimental")]
+use fastmcp_rust::{
+    AsyncWsClientTransport, WebSocketNonquiescentShutdown, WebSocketServerShutdown,
+};
 #[cfg(feature = "proxy")]
-use fastmcp_rust::{ClientInfo, ProxyClient, StdioSubscriptionEvent};
+use fastmcp_rust::{
+    ClientInfo, ProxyClient, ProxyPromptCatalog, ProxyResourceCatalog, ProxyToolCatalog,
+    StdioSubscriptionEvent,
+};
 use fastmcp_server::ServerBuilder;
 use serde_json::json;
 
@@ -117,6 +124,32 @@ fn public_http_cursor_other(_ctx: &McpContext) -> String {
 #[resource(uri = "test://public-http-e2e/resource")]
 fn public_http_snapshot(_ctx: &McpContext) -> String {
     PUBLIC_HTTP_RESOURCE_TEXT.to_owned()
+}
+
+#[resource(uri = "test://public-http-e2e/cursor-a", tags = ["cursor"])]
+fn public_http_cursor_resource_a(_ctx: &McpContext) -> String {
+    "cursor-resource-a".to_owned()
+}
+
+#[resource(uri = "test://public-http-e2e/cursor-b", tags = ["cursor"])]
+fn public_http_cursor_resource_b(_ctx: &McpContext) -> String {
+    "cursor-resource-b".to_owned()
+}
+
+#[prompt(name = "public-http-e2e-cursor-prompt-a", tags = ["cursor"])]
+fn public_http_cursor_prompt_a(_ctx: &McpContext) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::text("cursor-prompt-a"),
+    }]
+}
+
+#[prompt(name = "public-http-e2e-cursor-prompt-b", tags = ["cursor"])]
+fn public_http_cursor_prompt_b(_ctx: &McpContext) -> Vec<PromptMessage> {
+    vec![PromptMessage {
+        role: Role::User,
+        content: Content::text("cursor-prompt-b"),
+    }]
 }
 
 /// The deterministic prompt exercised through both public HTTP facades.
@@ -16134,6 +16167,1282 @@ fn e2e_public_http_legacy_response_cache_hits_same_allowlisted_call_and_misses_c
     server.shutdown();
 }
 
+fn spawn_legacy_transform_rename_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy transform rename", || {
+        ServerBuilder::new("facade-http-legacy-transform-rename", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(
+                transform::TransformedTool::from_tool(PublicHttpValue)
+                    .name(PUBLIC_HTTP_TRANSFORMED_TOOL_NAME)
+                    .rename_arg("value", "query")
+                    .build(),
+            )
+            .build()
+    })
+}
+
+fn spawn_legacy_transform_hide_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy transform hide", || {
+        ServerBuilder::new("facade-http-legacy-transform-hide", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(
+                transform::TransformedTool::from_tool(PublicHttpValue)
+                    .name(PUBLIC_HTTP_HIDDEN_TOOL_NAME)
+                    .hide_arg("value", "hidden-default")
+                    .build(),
+            )
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_legacy_transformed_tool_renames_argument_and_keeps_parent_unknown() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_transform_rename_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-transform");
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP transformed tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("live exact-2024 HTTP must list the renamed tool");
+    let renamed = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_TRANSFORMED_TOOL_NAME)
+        .unwrap_or_else(|| {
+            panic!("the transformed catalog must advertise the new name: {listed:?}")
+        });
+    let schema =
+        serde_json::to_string(&renamed.input_schema).expect("the renamed input schema serializes");
+    assert!(
+        schema.contains("\"query\""),
+        "the transformed schema must advertise the renamed argument: {schema}"
+    );
+    assert!(
+        !schema.contains("\"value\""),
+        "the transformed schema must drop the parent argument name: {schema}"
+    );
+
+    let called = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TRANSFORMED_TOOL_NAME,
+        json!({"query": "alpha"}),
+        "exact-2024 renamed tools/call",
+    )
+    .expect("the renamed argument must reach the parent handler");
+    assert_eq!(
+        legacy_http_tool_text(&called).as_deref(),
+        Some("tool:alpha"),
+        "rename_arg must rewrite query back to the parent value: {called:?}"
+    );
+
+    let original = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 parent name after rename",
+    )
+    .expect_err("the parent tool name must stay unadvertised");
+    let original = format!("{original:?}");
+    assert!(
+        original.contains("Unknown tool")
+            || original.contains("Method not found")
+            || original.contains("MethodNotFound"),
+        "calling the pre-transform name must stay unknown: {original}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_transformed_tool_hides_argument_and_injects_default() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_transform_hide_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-hide-arg");
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP hide-arg tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("live exact-2024 HTTP must list the hide-arg tool");
+    let hidden = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_HIDDEN_TOOL_NAME)
+        .unwrap_or_else(|| panic!("the hide-arg catalog must advertise the new name: {listed:?}"));
+    let schema =
+        serde_json::to_string(&hidden.input_schema).expect("the hide-arg input schema serializes");
+    assert!(
+        !schema.contains("\"value\""),
+        "the hide-arg schema must drop the hidden argument: {schema}"
+    );
+
+    let injected = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_HIDDEN_TOOL_NAME,
+        json!({}),
+        "exact-2024 hide-arg tools/call",
+    )
+    .expect("the hide-arg tools/call must inject the configured default");
+    assert_eq!(
+        legacy_http_tool_text(&injected).as_deref(),
+        Some("tool:hidden-default"),
+        "the hidden default must reach the parent handler: {injected:?}"
+    );
+
+    let original = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 parent name after hide-arg",
+    )
+    .expect_err("the parent tool name must stay unadvertised");
+    let original = format!("{original:?}");
+    assert!(
+        original.contains("Unknown tool")
+            || original.contains("Method not found")
+            || original.contains("MethodNotFound"),
+        "calling the pre-transform name must stay unknown: {original}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_LEGACY_MOUNTED_TOOL_NAME: &str = "child/public-http-e2e-tool";
+const PUBLIC_HTTP_LEGACY_MOUNTED_PROMPT_NAME: &str = "child/public-http-e2e-prompt";
+const PUBLIC_HTTP_LEGACY_MOUNTED_RESOURCE_URI: &str = "child/test://public-http-e2e/resource";
+
+fn spawn_legacy_mounted_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy mount", || {
+        let child = ServerBuilder::new("facade-http-legacy-mounted-child", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpValue)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build();
+        ServerBuilder::new("facade-http-legacy-mounted-parent", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .mount(child, Some("child"))
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_legacy_mount_prefixes_tool_prompt_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_mounted_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-mount");
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP mounted tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("live exact-2024 HTTP must list the prefixed child tool");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_LEGACY_MOUNTED_TOOL_NAME),
+        "legacy mount() must rewrite the child tool name: {listed:?}"
+    );
+    assert!(
+        !listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+        "a nonempty mount prefix must not keep the unprefixed child tool: {listed:?}"
+    );
+
+    let called = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_LEGACY_MOUNTED_TOOL_NAME,
+        json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+        "exact-2024 mounted tools/call",
+    )
+    .expect("the prefixed child tool must dispatch");
+    assert_eq!(
+        legacy_http_tool_text(&called).as_deref(),
+        Some(PUBLIC_HTTP_TOOL_TEXT),
+        "the mounted live tool must retain the child handler value: {called:?}"
+    );
+
+    let listed_prompts = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP mounted prompts/list",
+        client.list_prompts(&cx, legacy_2024::ListPromptsParams::default()),
+    )
+    .expect("live exact-2024 HTTP must list the prefixed child prompt");
+    assert!(
+        listed_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == PUBLIC_HTTP_LEGACY_MOUNTED_PROMPT_NAME),
+        "legacy mount() must rewrite the child prompt name: {listed_prompts:?}"
+    );
+
+    let prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP mounted prompts/get",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_LEGACY_MOUNTED_PROMPT_NAME.to_owned(),
+                arguments: Some(HashMap::from([(
+                    "subject".to_owned(),
+                    PUBLIC_HTTP_TOOL_ARGUMENT.to_owned(),
+                )])),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the prefixed child prompt must dispatch");
+    let prompt = serde_json::to_value(prompt)
+        .expect("the mounted prompt result serializes for its observable assertion");
+    assert_eq!(
+        prompt["messages"][0]["content"]["text"],
+        json!(PUBLIC_HTTP_PROMPT_TEXT),
+        "the mounted live prompt must retain the child handler value: {prompt:?}"
+    );
+
+    let listed_resources = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP mounted resources/list",
+        client.list_resources(&cx, legacy_2024::ListResourcesParams::default()),
+    )
+    .expect("live exact-2024 HTTP must list the prefixed child resource");
+    assert!(
+        listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri == PUBLIC_HTTP_LEGACY_MOUNTED_RESOURCE_URI),
+        "legacy mount() must prefix every resource key: {listed_resources:?}"
+    );
+    assert!(
+        !listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri == PUBLIC_HTTP_RESOURCE_URI),
+        "legacy mount() must not keep the unprefixed child resource URI: {listed_resources:?}"
+    );
+
+    let resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP mounted resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_LEGACY_MOUNTED_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the prefixed child resource must dispatch");
+    let resource_text = serde_json::to_value(&resource)
+        .ok()
+        .and_then(|value| value["contents"][0]["text"].as_str().map(str::to_owned));
+    assert_eq!(
+        resource_text.as_deref(),
+        Some(PUBLIC_HTTP_RESOURCE_TEXT),
+        "the mounted live resource must retain the child handler value: {resource:?}"
+    );
+
+    let original = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+        "exact-2024 unprefixed tool after mount",
+    )
+    .expect_err("the unprefixed child tool name must stay unknown");
+    let original = format!("{original:?}");
+    assert!(
+        original.contains("Unknown tool")
+            || original.contains("Method not found")
+            || original.contains("MethodNotFound"),
+        "calling the unprefixed child name must stay unknown: {original}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_legacy_catalog_metadata_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy catalog metadata", || {
+        let icons =
+            vec![RawIcon::try_new(PUBLIC_HTTP_ICON_SRC).expect("the catalog icon source is valid")];
+        ServerBuilder::new("facade-http-legacy-catalog-metadata", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpIconTool { icons })
+            .tool(PublicHttpPlainTool)
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_legacy_list_tools_retains_version_tags_and_annotations() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_catalog_metadata_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-catalog");
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP catalog tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("live exact-2024 HTTP must list the catalog metadata tools");
+    let icon_tool = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_ICON_TOOL_NAME)
+        .expect("the annotated tool must remain on the live catalog");
+    let plain_tool = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == PUBLIC_HTTP_PLAIN_TOOL_NAME)
+        .expect("the plain peer tool must remain on the live catalog");
+
+    assert_eq!(icon_tool.version.as_deref(), Some("1.2.3"));
+    assert!(
+        icon_tool.tags.iter().any(|tag| tag == "catalog"),
+        "the annotated tool must retain its tags: {icon_tool:?}"
+    );
+    let annotations = icon_tool
+        .annotations
+        .as_ref()
+        .expect("the annotated tool must retain its projected annotations");
+    assert_eq!(annotations.read_only, Some(true));
+    assert_eq!(annotations.idempotent, Some(true));
+    assert_eq!(annotations.destructive, None);
+
+    assert_eq!(plain_tool.version, None);
+    assert!(plain_tool.tags.is_empty());
+    assert_eq!(plain_tool.annotations, None);
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_legacy_two_client_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy two-client", || {
+        ServerBuilder::new("facade-http-legacy-two-client", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpValue)
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_legacy_two_clients_call_the_same_tool_independently() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_two_client_http_server();
+    let mut first =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-two-a");
+    let mut second =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-two-b");
+
+    let first_result = legacy_http_call(
+        &cx,
+        &mut first,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 first client tools/call",
+    )
+    .expect("the first live exact-2024 HTTP client must reach the shared tool");
+    let second_result = legacy_http_call(
+        &cx,
+        &mut second,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({"value": "beta"}),
+        "exact-2024 second client tools/call",
+    )
+    .expect("the second live exact-2024 HTTP client must reach the shared tool independently");
+    assert_eq!(
+        legacy_http_tool_text(&first_result).as_deref(),
+        Some("tool:alpha"),
+        "the first client must retain its own handler result: {first_result:?}"
+    );
+    assert_eq!(
+        legacy_http_tool_text(&second_result).as_deref(),
+        Some("tool:beta"),
+        "changing only the peer arguments must not mix client results: {second_result:?}"
+    );
+
+    drop(first);
+    drop(second);
+    server.shutdown();
+}
+
+fn spawn_legacy_cursor_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy cursor", || {
+        ServerBuilder::new("facade-http-legacy-cursor", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .list_page_size(1)
+            .tool(PublicHttpValue)
+            .tool(PublicHttpCursorSecondary)
+            .tool(PublicHttpCursorOther)
+            .resource(PublicHttpSnapshotResource)
+            .resource(PublicHttpCursorResourceAResource)
+            .resource(PublicHttpCursorResourceBResource)
+            .prompt(PublicHttpCursorPromptAPrompt)
+            .prompt(PublicHttpCursorPromptBPrompt)
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_legacy_tools_list_cursor_continues_and_rejects_query_or_kind_change() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_cursor_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-cursor");
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP first cursor tools/list",
+        client.list_tools(
+            &cx,
+            legacy_2024::ListToolsParams {
+                cursor: None,
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("live exact-2024 HTTP must page the cursor-tagged tools");
+    assert_eq!(
+        first.tools.len(),
+        1,
+        "page size 1 must create a real continuation: {first:?}"
+    );
+    assert_eq!(
+        first.tools[0].name, PUBLIC_HTTP_TOOL_NAME,
+        "the first cursor page must retain the primary tagged tool: {first:?}"
+    );
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first filtered page must carry an opaque cursor");
+
+    let second = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP cursor continuation tools/list",
+        client.list_tools(
+            &cx,
+            legacy_2024::ListToolsParams {
+                cursor: Some(cursor.clone()),
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("the exact cursor/query continuation must reach the second live page");
+    assert_eq!(
+        second.tools.len(),
+        1,
+        "the continuation must retain one remaining tagged tool: {second:?}"
+    );
+    assert_eq!(
+        second.tools[0].name, PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME,
+        "the continuation must retain the second tagged tool: {second:?}"
+    );
+    assert!(
+        second.next_cursor.is_none(),
+        "the last cursor page must not invent another continuation: {second:?}"
+    );
+
+    let query_rejection = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP cursor query mismatch",
+        client.list_tools(
+            &cx,
+            legacy_2024::ListToolsParams {
+                cursor: Some(cursor.clone()),
+                include_tags: Some(vec!["other".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect_err("changing only includeTags must reject the cursor before page projection");
+    let query_rejection = format!("{query_rejection:?}");
+    assert!(
+        query_rejection.contains("InvalidParams") || query_rejection.contains("invalid"),
+        "a query-mismatched cursor must stay InvalidParams: {query_rejection}"
+    );
+
+    let kind_rejection = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP cursor kind mismatch",
+        client.list_resources(
+            &cx,
+            legacy_2024::ListResourcesParams {
+                cursor: Some(cursor),
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect_err("changing only the catalog kind must reject the tools cursor");
+    let kind_rejection = format!("{kind_rejection:?}");
+    assert!(
+        kind_rejection.contains("InvalidParams") || kind_rejection.contains("invalid"),
+        "a tools cursor must not select a resources page: {kind_rejection}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_CURSOR_RESOURCE_A_URI: &str = "test://public-http-e2e/cursor-a";
+const PUBLIC_HTTP_CURSOR_RESOURCE_B_URI: &str = "test://public-http-e2e/cursor-b";
+const PUBLIC_HTTP_CURSOR_PROMPT_A_NAME: &str = "public-http-e2e-cursor-prompt-a";
+const PUBLIC_HTTP_CURSOR_PROMPT_B_NAME: &str = "public-http-e2e-cursor-prompt-b";
+
+#[test]
+fn e2e_public_http_legacy_resources_and_prompts_list_cursor_continues() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_cursor_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-catalog-cursor",
+    );
+
+    let first_resources = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP first cursor resources/list",
+        client.list_resources(
+            &cx,
+            legacy_2024::ListResourcesParams {
+                cursor: None,
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("live exact-2024 HTTP must page the cursor-tagged resources");
+    assert_eq!(
+        first_resources.resources.len(),
+        1,
+        "page size 1 must create a real resource continuation: {first_resources:?}"
+    );
+    let first_resource_uri = first_resources.resources[0].uri.clone();
+    assert!(
+        first_resource_uri == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI
+            || first_resource_uri == PUBLIC_HTTP_CURSOR_RESOURCE_B_URI,
+        "the first resource page must retain a cursor-tagged URI: {first_resources:?}"
+    );
+    let resource_cursor = first_resources
+        .next_cursor
+        .clone()
+        .expect("the first filtered resource page must carry an opaque cursor");
+
+    let second_resources = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP cursor continuation resources/list",
+        client.list_resources(
+            &cx,
+            legacy_2024::ListResourcesParams {
+                cursor: Some(resource_cursor.clone()),
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("the exact resource cursor continuation must reach the second live page");
+    assert_eq!(
+        second_resources.resources.len(),
+        1,
+        "the resource continuation must retain one remaining tagged URI: {second_resources:?}"
+    );
+    let second_resource_uri = second_resources.resources[0].uri.as_str();
+    assert_ne!(
+        second_resource_uri, first_resource_uri,
+        "the resource continuation must retain the other tagged URI: {second_resources:?}"
+    );
+    assert!(
+        second_resource_uri == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI
+            || second_resource_uri == PUBLIC_HTTP_CURSOR_RESOURCE_B_URI,
+        "the resource continuation must stay inside the cursor tag: {second_resources:?}"
+    );
+    assert!(
+        second_resources.next_cursor.is_none(),
+        "the last resource cursor page must not invent another continuation: {second_resources:?}"
+    );
+
+    let resource_kind_rejection = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP resource cursor kind mismatch",
+        client.list_prompts(
+            &cx,
+            legacy_2024::ListPromptsParams {
+                cursor: Some(resource_cursor),
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect_err("changing only the catalog kind must reject the resources cursor");
+    let resource_kind_rejection = format!("{resource_kind_rejection:?}");
+    assert!(
+        resource_kind_rejection.contains("InvalidParams")
+            || resource_kind_rejection.contains("invalid"),
+        "a resources cursor must not select a prompts page: {resource_kind_rejection}"
+    );
+
+    let first_prompts = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP first cursor prompts/list",
+        client.list_prompts(
+            &cx,
+            legacy_2024::ListPromptsParams {
+                cursor: None,
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("live exact-2024 HTTP must page the cursor-tagged prompts");
+    assert_eq!(
+        first_prompts.prompts.len(),
+        1,
+        "page size 1 must create a real prompt continuation: {first_prompts:?}"
+    );
+    let first_prompt_name = first_prompts.prompts[0].name.clone();
+    assert!(
+        first_prompt_name == PUBLIC_HTTP_CURSOR_PROMPT_A_NAME
+            || first_prompt_name == PUBLIC_HTTP_CURSOR_PROMPT_B_NAME,
+        "the first prompt page must retain a cursor-tagged name: {first_prompts:?}"
+    );
+    let prompt_cursor = first_prompts
+        .next_cursor
+        .clone()
+        .expect("the first filtered prompt page must carry an opaque cursor");
+
+    let second_prompts = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP cursor continuation prompts/list",
+        client.list_prompts(
+            &cx,
+            legacy_2024::ListPromptsParams {
+                cursor: Some(prompt_cursor.clone()),
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("the exact prompt cursor continuation must reach the second live page");
+    assert_eq!(
+        second_prompts.prompts.len(),
+        1,
+        "the prompt continuation must retain one remaining tagged name: {second_prompts:?}"
+    );
+    let second_prompt_name = second_prompts.prompts[0].name.as_str();
+    assert_ne!(
+        second_prompt_name, first_prompt_name,
+        "the prompt continuation must retain the other tagged name: {second_prompts:?}"
+    );
+    assert!(
+        second_prompt_name == PUBLIC_HTTP_CURSOR_PROMPT_A_NAME
+            || second_prompt_name == PUBLIC_HTTP_CURSOR_PROMPT_B_NAME,
+        "the prompt continuation must stay inside the cursor tag: {second_prompts:?}"
+    );
+    assert!(
+        second_prompts.next_cursor.is_none(),
+        "the last prompt cursor page must not invent another continuation: {second_prompts:?}"
+    );
+
+    let prompt_kind_rejection = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP prompt cursor kind mismatch",
+        client.list_tools(
+            &cx,
+            legacy_2024::ListToolsParams {
+                cursor: Some(prompt_cursor),
+                include_tags: Some(vec!["cursor".to_owned()]),
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect_err("changing only the catalog kind must reject the prompts cursor");
+    let prompt_kind_rejection = format!("{prompt_kind_rejection:?}");
+    assert!(
+        prompt_kind_rejection.contains("InvalidParams")
+            || prompt_kind_rejection.contains("invalid"),
+        "a prompts cursor must not select a tools page: {prompt_kind_rejection}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_compose_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-compose");
+
+    let composed = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 HTTP compose tools/call",
+    )
+    .expect("live exact-2024 HTTP must compose a nested tool call and resource read");
+    assert_eq!(
+        legacy_http_tool_text(&composed).as_deref(),
+        Some("compose:tool:alpha|resource:deterministic"),
+        "exact-2024 HTTP dispatch must attach request-scoped callers: {composed:?}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+        json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+        "exact-2024 HTTP compose missing nested tool",
+    );
+    let missing = match missing {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-tool")
+            || missing.contains("Unknown tool")
+            || missing.contains("not found"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_compose_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-prompt-compose",
+    );
+
+    let prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP compose prompts/get",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_COMPOSE_PROMPT_NAME.to_owned(),
+                arguments: Some(HashMap::from([("value".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "live exact-2024 HTTP must compose a nested tool call and resource read from prompts/get",
+    );
+    let prompt =
+        serde_json::to_value(prompt).expect("the exact-2024 HTTP prompt result serializes");
+    assert_eq!(
+        prompt["messages"][0]["content"]["text"],
+        json!("compose:tool:alpha|resource:deterministic"),
+        "exact-2024 HTTP prompt dispatch must attach request-scoped callers: {prompt}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP compose missing nested tool from prompts/get",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_COMPOSE_PROMPT_NAME.to_owned(),
+                arguments: Some(HashMap::from([
+                    ("value".to_owned(), "alpha".to_owned()),
+                    ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+                ])),
+                meta: None,
+            },
+        ),
+    );
+    let missing = match missing {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-tool")
+            || missing.contains("Unknown tool")
+            || missing.contains("not found"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_compose_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-resource-compose",
+    );
+
+    let resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP compose resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_COMPOSE_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "live exact-2024 HTTP must compose a nested tool call and resource read from resources/read",
+    );
+    let resource =
+        serde_json::to_value(resource).expect("the exact-2024 HTTP resource result serializes");
+    assert_eq!(
+        resource["contents"][0]["text"],
+        json!("compose:tool:alpha|resource:deterministic"),
+        "exact-2024 HTTP resource dispatch must attach request-scoped callers: {resource}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "the nested tools/call must invoke the peer tool exactly once"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().resource,
+        1,
+        "the nested resources/read must invoke the peer resource exactly once"
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP compose missing nested tool from resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    );
+    let missing = match missing {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-tool")
+            || missing.contains("Unknown tool")
+            || missing.contains("not found"),
+        "the nested unknown tool must stay a handler-visible refusal: {missing}"
+    );
+    assert_eq!(
+        server.handler_call_snapshot().tool,
+        1,
+        "an unknown nested tool name must not invoke the peer tool"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+const PUBLIC_HTTP_LEGACY_PROXY_TOOL_NAME: &str = "child/public-http-e2e-tool";
+#[cfg(feature = "proxy")]
+const PUBLIC_HTTP_LEGACY_PROXY_PROMPT_NAME: &str = "child/public-http-e2e-prompt";
+#[cfg(feature = "proxy")]
+const PUBLIC_HTTP_LEGACY_PROXY_RESOURCE_URI: &str = "child/test://public-http-e2e/resource";
+
+#[cfg(feature = "proxy")]
+fn spawn_legacy_upstream_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy as_proxy upstream", || {
+        ServerBuilder::new("facade-http-legacy-proxy-upstream", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpValue)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("legacy as_proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("legacy as_proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("legacy as_proxy gateway HTTP server control receiver went away".to_owned());
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream, "/sse")),
+                Some(public_http_target(upstream, "/messages")),
+                "e2e-legacy-http-proxy-gateway".to_owned(),
+                "e2e-legacy-http-proxy-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .map_err(|error| format!("legacy as_proxy HTTP plan failed: {error}"))?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-live-upstream",
+                    "native-h1:e2e-legacy-live-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-http-proxy".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .map_err(|error| format!("live exact-2024 HTTP proxy upstream connect failed: {error}"))?;
+            let catalog = proxy
+                .catalog_typed()
+                .map_err(|error| format!("live exact-2024 HTTP proxy catalog failed: {error}"))?;
+            let ProxyToolCatalog::Legacy(tools) = &catalog.tools else {
+                return Err(
+                    "exact-2024 HTTP as_proxy catalog must stay on the 2024 tool model".to_owned(),
+                );
+            };
+            if !tools.iter().any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME) {
+                return Err(format!(
+                    "live exact-2024 HTTP proxy catalog omitted {PUBLIC_HTTP_TOOL_NAME}: {tools:?}"
+                ));
+            }
+            let ProxyPromptCatalog::Legacy(prompts) = &catalog.prompts else {
+                return Err(
+                    "exact-2024 HTTP as_proxy catalog must stay on the 2024 prompt model".to_owned(),
+                );
+            };
+            if !prompts
+                .iter()
+                .any(|prompt| prompt.name == PUBLIC_HTTP_PROMPT_NAME)
+            {
+                return Err(format!(
+                    "live exact-2024 HTTP proxy catalog omitted {PUBLIC_HTTP_PROMPT_NAME}: {prompts:?}"
+                ));
+            }
+            let ProxyResourceCatalog::Legacy(resources) = &catalog.resources else {
+                return Err(
+                    "exact-2024 HTTP as_proxy catalog must stay on the 2024 resource model"
+                        .to_owned(),
+                );
+            };
+            if !resources
+                .iter()
+                .any(|resource| resource.uri == PUBLIC_HTTP_RESOURCE_URI)
+            {
+                return Err(format!(
+                    "live exact-2024 HTTP proxy catalog omitted {PUBLIC_HTTP_RESOURCE_URI}: {resources:?}"
+                ));
+            }
+            let server = ServerBuilder::new("e2e-legacy-http-gateway", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .as_proxy_typed("child", proxy, catalog)
+                .map_err(|error| format!("legacy as_proxy_typed install failed: {error}"))?
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("legacy as_proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("legacy as_proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "legacy as_proxy gateway HTTP server startup receiver went away".to_owned(),
+                );
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy as_proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy as_proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("legacy as_proxy gateway HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy as_proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_prefixes_tool_prompt_and_resource() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_upstream_http_server();
+    let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let mut client =
+        connect_legacy_http_client(&cx, gateway.address(), "e2e-public-http-legacy-as-proxy");
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("live exact-2024 HTTP as_proxy must list the prefixed upstream tool");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_LEGACY_PROXY_TOOL_NAME),
+        "legacy as_proxy_typed must rewrite the upstream tool name: {listed:?}"
+    );
+    assert!(
+        !listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+        "a nonempty as_proxy prefix must not keep the unprefixed upstream tool: {listed:?}"
+    );
+
+    let called = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_LEGACY_PROXY_TOOL_NAME,
+        json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+        "exact-2024 as_proxy tools/call",
+    )
+    .expect("the prefixed upstream tool must dispatch through the live as_proxy gateway");
+    assert_eq!(
+        legacy_http_tool_text(&called).as_deref(),
+        Some(PUBLIC_HTTP_TOOL_TEXT),
+        "the proxied live tool must retain the upstream handler value: {called:?}"
+    );
+
+    let listed_prompts = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy prompts/list",
+        client.list_prompts(&cx, legacy_2024::ListPromptsParams::default()),
+    )
+    .expect("live exact-2024 HTTP as_proxy must list the prefixed upstream prompt");
+    assert!(
+        listed_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == PUBLIC_HTTP_LEGACY_PROXY_PROMPT_NAME),
+        "legacy as_proxy_typed must rewrite the upstream prompt name: {listed_prompts:?}"
+    );
+
+    let prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy prompts/get",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_LEGACY_PROXY_PROMPT_NAME.to_owned(),
+                arguments: Some(HashMap::from([(
+                    "subject".to_owned(),
+                    PUBLIC_HTTP_TOOL_ARGUMENT.to_owned(),
+                )])),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the prefixed upstream prompt must dispatch through the live as_proxy gateway");
+    let prompt = serde_json::to_value(prompt)
+        .expect("the proxied prompt result serializes for its observable assertion");
+    assert_eq!(
+        prompt["messages"][0]["content"]["text"],
+        json!(PUBLIC_HTTP_PROMPT_TEXT),
+        "the proxied live prompt must retain the upstream handler value: {prompt:?}"
+    );
+
+    let listed_resources = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resources/list",
+        client.list_resources(&cx, legacy_2024::ListResourcesParams::default()),
+    )
+    .expect("live exact-2024 HTTP as_proxy must list the prefixed upstream resource");
+    assert!(
+        listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri == PUBLIC_HTTP_LEGACY_PROXY_RESOURCE_URI),
+        "legacy as_proxy_typed must prefix every resource key: {listed_resources:?}"
+    );
+    assert!(
+        !listed_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri == PUBLIC_HTTP_RESOURCE_URI),
+        "legacy as_proxy_typed must not keep the unprefixed upstream resource URI: {listed_resources:?}"
+    );
+
+    let resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_LEGACY_PROXY_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the prefixed upstream resource must dispatch through the live as_proxy gateway");
+    let resource_text = serde_json::to_value(&resource)
+        .ok()
+        .and_then(|value| value["contents"][0]["text"].as_str().map(str::to_owned));
+    assert_eq!(
+        resource_text.as_deref(),
+        Some(PUBLIC_HTTP_RESOURCE_TEXT),
+        "the proxied live resource must retain the upstream handler value: {resource:?}"
+    );
+
+    let original = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_TOOL_NAME,
+        json!({ "value": PUBLIC_HTTP_TOOL_ARGUMENT }),
+        "exact-2024 unprefixed tool after as_proxy",
+    )
+    .expect_err("the unprefixed upstream tool name must stay unknown");
+    let original = format!("{original:?}");
+    assert!(
+        original.contains("Unknown tool")
+            || original.contains("Method not found")
+            || original.contains("MethodNotFound"),
+        "calling the unprefixed upstream name must stay unknown: {original}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
 #[test]
 fn e2e_public_http_lifespan_hooks_run_once_and_peer_stays_unhooked() {
     let cx = Cx::for_request();
@@ -16835,9 +18144,8 @@ fn e2e_public_http_custom_token_verifier_refuses_wrong_and_commits_subject() {
     server.shutdown();
 }
 
-#[cfg(any())]
-mod unproven_live_websocket_bind {
-    #![allow(dead_code, unused_imports)]
+#[cfg(feature = "websocket-experimental")]
+mod live_websocket_bind {
     use super::*;
 
     const PUBLIC_WS_LOG_TOOL_NAME: &str = "public-ws-e2e-log";
@@ -16867,6 +18175,60 @@ mod unproven_live_websocket_bind {
             ctx.info(PUBLIC_WS_HANDLER_LOG_TEXT);
             ctx.report_progress(0.5, Some("halfway"));
             Ok(vec![Content::text("logged")])
+        }
+    }
+
+    const PUBLIC_WS_TOUCH_TOOL_NAME: &str = "public-ws-e2e-touch";
+    const PUBLIC_WS_HIDE_TOOL_NAME: &str = "public-ws-e2e-hide";
+
+    struct PublicWebSocketTouchTool;
+
+    impl ToolHandler for PublicWebSocketTouchTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: PUBLIC_WS_TOUCH_TOOL_NAME.to_owned(),
+                description: Some("Catalog subject for live WebSocket list_changed".to_owned()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::text("touched")])
+        }
+    }
+
+    struct PublicWebSocketHideTool;
+
+    impl ToolHandler for PublicWebSocketHideTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: PUBLIC_WS_HIDE_TOOL_NAME.to_owned(),
+                description: Some("Disables the live WebSocket catalog subject".to_owned()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let delivered = ctx.disable_tool(PUBLIC_WS_TOUCH_TOOL_NAME);
+            Ok(vec![Content::text(if delivered {
+                "hidden"
+            } else {
+                "silent"
+            })])
         }
     }
 
@@ -16984,6 +18346,11 @@ mod unproven_live_websocket_bind {
             let ready_for_spawn_failure = ready_tx.clone();
             let finished_for_spawn_failure = finished_tx.clone();
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .with_reactor(
+                    asupersync::runtime::reactor::create_reactor()
+                        .expect("log facade WebSocket server reactor initializes"),
+                )
+                .blocking_threads(4, 64)
                 .build()
                 .expect("log facade WebSocket server installs an owned runtime");
             let outcome = runtime.block_on(async move {
@@ -17067,11 +18434,167 @@ mod unproven_live_websocket_bind {
         }
     }
 
+    async fn websocket_client_bounded<F: std::future::Future>(
+        cx: &Cx,
+        operation: &str,
+        future: F,
+    ) -> F::Output {
+        asupersync::time::timeout(cx.now(), HTTP_OPERATION_BOUND, future)
+            .await
+            .unwrap_or_else(|_| panic!("{operation} stays within its caller-owned deadline"))
+    }
+
+    fn websocket_test_runtime() -> asupersync::runtime::Runtime {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("live bind_websocket reactor initializes"),
+            )
+            .blocking_threads(4, 64)
+            .build()
+            .expect("live bind_websocket installs an owned runtime")
+    }
+
+    const PUBLIC_WS_WATCH_RESOURCE_URI: &str = "test://public-ws-e2e/watched";
+    const PUBLIC_WS_NOTIFY_TOOL_NAME: &str = "public-ws-e2e-notify";
+    const PUBLIC_WS_MISS_TOOL_NAME: &str = "public-ws-e2e-miss";
+
+    struct PublicWebSocketWatchResource;
+
+    impl ResourceHandler for PublicWebSocketWatchResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: PUBLIC_WS_WATCH_RESOURCE_URI.to_owned(),
+                name: "public-ws-e2e-watched".to_owned(),
+                description: Some("Proves live facade WebSocket resources/updated".to_owned()),
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: PUBLIC_WS_WATCH_RESOURCE_URI.to_owned(),
+                mime_type: None,
+                text: Some("watched".to_owned()),
+                blob: None,
+            }])
+        }
+    }
+
+    struct PublicWebSocketNotifyTool;
+
+    impl ToolHandler for PublicWebSocketNotifyTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: PUBLIC_WS_NOTIFY_TOOL_NAME.to_owned(),
+                description: Some("Publishes resources/updated for the watched URI".to_owned()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let delivered = ctx.notify_resource_updated(PUBLIC_WS_WATCH_RESOURCE_URI);
+            Ok(vec![Content::text(if delivered {
+                "notified"
+            } else {
+                "silent"
+            })])
+        }
+    }
+
+    struct PublicWebSocketMissTool;
+
+    impl ToolHandler for PublicWebSocketMissTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: PUBLIC_WS_MISS_TOOL_NAME.to_owned(),
+                description: Some("Publishes resources/updated for an unwatched URI".to_owned()),
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            let delivered = ctx.notify_resource_updated("test://public-ws-e2e/unwatched");
+            Ok(vec![Content::text(if delivered {
+                "notified"
+            } else {
+                "silent"
+            })])
+        }
+    }
+
+    async fn websocket_upgrade_status(
+        cx: &Cx,
+        address: SocketAddr,
+        authorization: Option<&str>,
+    ) -> (Vec<u8>, asupersync::net::TcpStream) {
+        use asupersync::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = asupersync::net::TcpStream::connect(address.to_string())
+            .await
+            .expect("public bind_websocket upgrade client connects");
+        let authorization_header = authorization
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{authorization_header}\r\n"
+        );
+        websocket_client_bounded(cx, "live bind_websocket upgrade write", async {
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("public bind_websocket upgrade request writes");
+            stream
+                .flush()
+                .await
+                .expect("public bind_websocket upgrade request flushes");
+        })
+        .await;
+        let mut received = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = websocket_client_bounded(cx, "live bind_websocket upgrade read", async {
+                stream
+                    .read(&mut byte)
+                    .await
+                    .expect("public bind_websocket upgrade response reads")
+            })
+            .await;
+            if read == 0 {
+                break;
+            }
+            received.push(byte[0]);
+        }
+        (received, stream)
+    }
+
     #[test]
     fn e2e_public_websocket_bind_retains_ping_log_and_progress() {
-        runtime_block_on(async {
-            let cx = Cx::current().expect("facade runtime installs a client context");
-            asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("live bind_websocket reactor initializes"),
+            )
+            .blocking_threads(4, 64)
+            .build()
+            .expect("live bind_websocket installs an owned runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned WebSocket runtime installs an ambient context");
             let server = modern::ServerBuilder::new("facade-ws-log", "1.0.0")
                 .tool(PublicWebSocketLogTool)
                 .build();
@@ -17082,32 +18605,42 @@ mod unproven_live_websocket_bind {
             let address = bound
                 .local_addr()
                 .expect("public bind_websocket publishes its bound address");
-            let serve_cx = cx.clone();
-            let mut server_task = cx
-                .spawn(move |task_cx| async move { bound.serve(&task_cx).await })
-                .expect("public bind_websocket serve must be spawnable on the caller runtime");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public bind_websocket serve must be admitted");
 
-            let transport = AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp"))
-                .await
-                .expect("public bind_websocket must complete RFC 6455 upgrade");
-            let mut client = modern::ClientBuilder::new()
-                .client_info("e2e-public-ws-bind", "1.0.0")
-                .connect_websocket_with_cx(&cx, transport)
-                .await
-                .expect("the ModernOnly public facade negotiates over bind_websocket");
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-bind", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates over bind_websocket");
 
-            client
-                .ping(&cx)
+            websocket_client_bounded(&cx, "live bind_websocket ping", client.ping(&cx))
                 .await
                 .expect("live bind_websocket must answer modern ping");
 
             client
                 .set_log_level(modern::LoggingLevel::Info)
                 .expect("info logLevel is stored as request metadata");
-            client
-                .call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({}))
-                .await
-                .expect("ctx.info must not prevent the same tools/call from completing");
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket tools/call",
+                client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("ctx.info must not prevent the same tools/call from completing");
             let info_notifications = client.take_server_notifications();
             assert!(
                 info_notifications.iter().any(|notification| matches!(
@@ -17124,15 +18657,18 @@ mod unproven_live_websocket_bind {
             );
 
             let marker = modern::ProgressMarker::from("ws-progress");
-            client
-                .call_tool_with_progress_marker(
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket progress tools/call",
+                client.call_tool_with_progress_marker(
                     &cx,
                     PUBLIC_WS_LOG_TOOL_NAME,
                     json!({}),
                     marker.clone(),
-                )
-                .await
-                .expect("a progressToken must not prevent the same tools/call from completing");
+                ),
+            )
+            .await
+            .expect("a progressToken must not prevent the same tools/call from completing");
             let progress = client.take_progress_notifications();
             assert!(
                 progress.iter().any(|notification| {
@@ -17145,14 +18681,18 @@ mod unproven_live_websocket_bind {
                 client.take_progress_notifications().is_empty(),
                 "take_progress_notifications must drain the retained queue"
             );
+            let _ = client.take_server_notifications();
 
             client
                 .set_log_level(modern::LoggingLevel::Emergency)
                 .expect("emergency logLevel still stores request metadata locally");
-            client
-                .call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({}))
-                .await
-                .expect("raising only the logLevel floor cannot break the same public tools/call");
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket emergency tools/call",
+                client.call_tool(&cx, PUBLIC_WS_LOG_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("raising only the logLevel floor cannot break the same public tools/call");
             let emergency_notifications = client.take_server_notifications();
             assert!(
                 !emergency_notifications.iter().any(|notification| matches!(
@@ -17163,18 +18703,690 @@ mod unproven_live_websocket_bind {
                 "raising only the logLevel floor must suppress ctx.info: {emergency_notifications:?}"
             );
 
-            client
-                .close(&cx)
+            websocket_client_bounded(&cx, "live bind_websocket close", client.close(&cx))
                 .await
                 .expect("the public WebSocket client closes after the live bind proof");
-            serve_cx.set_cancel_requested(true);
-            match server_task.join(&cx).await {
-                Ok(Ok(_)) | Err(_) => {}
-                Ok(Err(error)) => panic!("public bind_websocket serve failed: {error}"),
-            }
-        })
-        .await
-        .expect("live bind_websocket proof stays within its caller-owned deadline");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_retains_tools_list_changed_on_incremental_listen() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("live bind_websocket listen reactor initializes"),
+            )
+            .blocking_threads(4, 64)
+            .build()
+            .expect("live bind_websocket listen installs an owned runtime");
+
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned WebSocket listen runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-listen", "1.0.0")
+                .tool(PublicWebSocketTouchTool)
+                .tool(PublicWebSocketHideTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket listen must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket listen publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public bind_websocket listen serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket listen handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket listen must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket listen initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-listen", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates listen over bind_websocket");
+
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket subscriptions/listen",
+                client.open_subscriptions_listener(
+                    &cx,
+                    modern::SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..modern::SubscriptionFilter::default()
+                    },
+                ),
+            )
+            .await
+            .expect("live bind_websocket must admit an incremental subscriptions/listen");
+
+            let cancellation = modern::McpRequestCancellation::new();
+            let acknowledgement = websocket_client_bounded(
+                &cx,
+                "live bind_websocket listen acknowledgement",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("subscriptions/listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    acknowledgement,
+                    StdioSubscriptionEvent::Acknowledged(ref filter)
+                        if filter.tools_list_changed == Some(true)
+                ),
+                "the first incremental WebSocket listen record must be the accepted filter: {acknowledgement:?}"
+            );
+
+            let hidden = websocket_client_bounded(
+                &cx,
+                "live bind_websocket hide tools/call",
+                client.call_tool(&cx, PUBLIC_WS_HIDE_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("disabling a peer tool must complete");
+            assert!(
+                hidden.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "hidden",
+                    _ => false,
+                }),
+                "request-local SessionState must let disable_tool publish list_changed: {hidden:?}"
+            );
+
+            let changed = websocket_client_bounded(
+                &cx,
+                "live bind_websocket list_changed event",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("subscriptions/listen must retain tools/list_changed after the handler mutation");
+            assert!(
+                matches!(
+                    changed,
+                    StdioSubscriptionEvent::Notification(
+                        modern::ServerNotification::ToolsListChanged(_)
+                    )
+                ),
+                "live bind_websocket must retain notifications/tools/list_changed on the incremental listener: {changed:?}"
+            );
+
+            websocket_client_bounded(&cx, "live bind_websocket listen tools/list", client.list_tools(&cx, None))
+                .await
+                .expect("a later tools/list on the same WebSocket client must still complete");
+
+            websocket_client_bounded(&cx, "live bind_websocket listen close", client.close(&cx))
+                .await
+                .expect("the public WebSocket listen client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_composes_nested_tool_and_resource() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("live bind_websocket compose reactor initializes"),
+            )
+            .blocking_threads(4, 64)
+            .build()
+            .expect("live bind_websocket compose installs an owned runtime");
+
+        runtime.block_on(async {
+            let cx =
+                Cx::current().expect("owned WebSocket compose runtime installs an ambient context");
+            let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+            let server = modern::ServerBuilder::new("facade-ws-compose", "1.0.0")
+                .tool(CountingPublicHttpValue {
+                    counters: Arc::clone(&handler_calls),
+                })
+                .tool(PublicHttpComposeTool)
+                .resource(CountingPublicHttpSnapshot {
+                    counters: Arc::clone(&handler_calls),
+                })
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket compose must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket compose publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public bind_websocket compose serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket compose initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-compose", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates compose over bind_websocket");
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live bind_websocket compose tools/call",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+                    json!({"value": "alpha"}),
+                ),
+            )
+            .await
+            .expect("live bind_websocket must compose a nested tool call and resource read");
+            assert!(
+                composed.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => {
+                        text == "compose:tool:alpha|resource:deterministic"
+                    }
+                    _ => false,
+                }),
+                "live bind_websocket dispatch must attach request-scoped callers: {composed:?}"
+            );
+            assert_eq!(
+                handler_calls.snapshot().tool,
+                1,
+                "the nested tools/call must invoke the peer tool exactly once"
+            );
+            assert_eq!(
+                handler_calls.snapshot().resource,
+                1,
+                "the nested resources/read must invoke the peer resource exactly once"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live bind_websocket compose missing nested tool",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+                    json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+                ),
+            )
+            .await;
+            let missing = match missing {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing.contains("public-http-e2e-missing")
+                    || missing.contains("compose-nested-tool")
+                    || missing.contains("Unknown tool")
+                    || missing.contains("not found"),
+                "the nested unknown tool must stay a handler-visible refusal: {missing}"
+            );
+            assert_eq!(
+                handler_calls.snapshot().tool,
+                1,
+                "an unknown nested tool name must not invoke the peer tool"
+            );
+
+            websocket_client_bounded(&cx, "live bind_websocket compose close", client.close(&cx))
+                .await
+                .expect("the public WebSocket compose client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_retains_resource_updated_on_incremental_listen() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned WebSocket updated runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-updated", "1.0.0")
+                .resource(PublicWebSocketWatchResource)
+                .tool(PublicWebSocketNotifyTool)
+                .tool(PublicWebSocketMissTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket updated must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket updated publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public bind_websocket updated serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket updated handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket updated must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket updated initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-updated", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates updated listen over bind_websocket");
+
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket updated subscriptions/listen",
+                client.open_subscriptions_listener(
+                    &cx,
+                    modern::SubscriptionFilter {
+                        resource_subscriptions: Some(vec![PUBLIC_WS_WATCH_RESOURCE_URI.to_owned()]),
+                        ..modern::SubscriptionFilter::default()
+                    },
+                ),
+            )
+            .await
+            .expect("live bind_websocket must admit a resource subscription listen");
+
+            let cancellation = modern::McpRequestCancellation::new();
+            let acknowledgement = websocket_client_bounded(
+                &cx,
+                "live bind_websocket updated acknowledgement",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("subscriptions/listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    acknowledgement,
+                    StdioSubscriptionEvent::Acknowledged(ref filter)
+                        if filter.resource_subscriptions.as_deref()
+                            == Some(&[PUBLIC_WS_WATCH_RESOURCE_URI.to_owned()][..])
+                ),
+                "the first incremental WebSocket listen record must be the accepted resource filter: {acknowledgement:?}"
+            );
+
+            let missed = websocket_client_bounded(
+                &cx,
+                "live bind_websocket unmatched notify",
+                client.call_tool(&cx, PUBLIC_WS_MISS_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("notifying an unwatched URI must complete");
+            assert!(
+                missed.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "silent",
+                    _ => false,
+                }),
+                "an unwatched URI must not count as notify_resource_updated delivery: {missed:?}"
+            );
+
+            let touched = websocket_client_bounded(
+                &cx,
+                "live bind_websocket matching notify",
+                client.call_tool(&cx, PUBLIC_WS_NOTIFY_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("notifying the watched URI must complete");
+            assert!(
+                touched.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "notified",
+                    _ => false,
+                }),
+                "a matching incremental listener must count as notify_resource_updated delivery: {touched:?}"
+            );
+
+            let updated = websocket_client_bounded(
+                &cx,
+                "live bind_websocket resources/updated event",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("subscriptions/listen must retain resources/updated after the matching publish");
+            assert!(
+                matches!(
+                    updated,
+                    StdioSubscriptionEvent::Notification(
+                        modern::ServerNotification::ResourceUpdated(ref params)
+                    ) if params.uri.as_str() == PUBLIC_WS_WATCH_RESOURCE_URI
+                ),
+                "live bind_websocket must retain notifications/resources/updated on the incremental listener: {updated:?}"
+            );
+
+            websocket_client_bounded(&cx, "live bind_websocket updated close", client.close(&cx))
+                .await
+                .expect("the public WebSocket updated client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx =
+                Cx::current().expect("owned WebSocket timeout runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-timeout", "1.0.0")
+                .tool(PublicHttpSlowTool)
+                .tool(PublicHttpFastTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket timeout must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket timeout publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public bind_websocket timeout serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket timeout handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket timeout must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket timeout initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-timeout", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates timeout over bind_websocket");
+
+            let timed_out = websocket_client_bounded(
+                &cx,
+                "live bind_websocket late tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_SLOW_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("a handler that outlives its timeout must be refused");
+            let timed_out = format!("{timed_out:?}");
+            assert!(
+                timed_out.contains("Request timeout exceeded")
+                    || timed_out.contains("RequestCancelled"),
+                "the refused late tools/call must keep the handler-timeout error: {timed_out}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live bind_websocket fast tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the tool must still be admitted after a handler timeout");
+            assert!(
+                fast.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "the fast peer tool must still complete: {fast:?}"
+            );
+
+            websocket_client_bounded(&cx, "live bind_websocket timeout close", client.close(&cx))
+                .await
+                .expect("the public WebSocket timeout client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_static_token_refuses_missing_and_wrong_and_commits_subject() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned WebSocket auth runtime installs an ambient context");
+            let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+            let verifier = StaticTokenVerifier::new([(
+                "alpha",
+                AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+            )])
+            .expect("the deterministic WebSocket bearer verifier is valid")
+            .with_allowed_schemes(["Bearer"])
+            .expect("the bearer scheme allowlist is valid");
+            let server = modern::ServerBuilder::new("facade-ws-auth", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(verifier))
+                .tool(PublicHttpAuthSubject {
+                    counters: Arc::clone(&handler_calls),
+                })
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket auth must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket auth publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public bind_websocket auth serve must be admitted");
+
+            let (missing, _missing_stream) =
+                websocket_upgrade_status(&cx, address, None).await;
+            assert!(
+                missing.starts_with(b"HTTP/1.1 401"),
+                "omitting Authorization must refuse the WebSocket upgrade: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert!(
+                String::from_utf8_lossy(&missing).to_ascii_lowercase().contains("www-authenticate"),
+                "the missing-token WebSocket upgrade must challenge Bearer: {}",
+                String::from_utf8_lossy(&missing)
+            );
+
+            let (wrong, _wrong_stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer wrong")).await;
+            assert!(
+                wrong.starts_with(b"HTTP/1.1 401"),
+                "a wrong bearer token must refuse the WebSocket upgrade: {}",
+                String::from_utf8_lossy(&wrong)
+            );
+
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the matching bearer token must complete RFC 6455 upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket auth initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-auth", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("an admitted WebSocket upgrade must negotiate ModernOnly");
+
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live bind_websocket auth tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_AUTH_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("the matching bearer token must reach the authenticated handler");
+            assert!(
+                admitted.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => {
+                        text == &format!("subject:{PUBLIC_HTTP_AUTH_SUBJECT}")
+                    }
+                    _ => false,
+                }),
+                "admitted WebSocket must commit the static token subject into ctx.auth(): {admitted:?}"
+            );
+            assert_eq!(
+                handler_calls.snapshot().tool,
+                1,
+                "only the matching bearer token may invoke the authenticated handler"
+            );
+
+            websocket_client_bounded(&cx, "live bind_websocket auth close", client.close(&cx))
+                .await
+                .expect("the public WebSocket auth client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_result_verbs_return_live_input_required() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx =
+                Cx::current().expect("owned WebSocket MRTR runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-mrtr", "1.0.0")
+                .tool(PublicHttpSamplingTool)
+                .tool(PublicHttpRootsTool)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket MRTR must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket MRTR publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public bind_websocket MRTR serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket MRTR must complete RFC 6455 upgrade");
+            let mut capabilities = ClientCapabilities::default();
+            capabilities.sampling = Some(Default::default());
+            capabilities.roots =
+                serde_json::from_value(json!({})).expect("roots capability is valid");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-mrtr", "1.0.0")
+                    .capabilities(capabilities)
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates MRTR over bind_websocket");
+
+            let sampled = websocket_client_bounded(
+                &cx,
+                "live bind_websocket sampling tools/call",
+                client.call_tool_result(&cx, PUBLIC_HTTP_SAMPLING_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("live bind_websocket final sampling must return a typed tools/call result");
+            let FinalCoreResult::ToolsCallInputRequired { result, .. } = sampled else {
+                panic!("live bind_websocket final sampling must keep input_required: {sampled:?}");
+            };
+            assert_live_input_required(&result, "sample", "tools/call");
+
+            let rooted = websocket_client_bounded(
+                &cx,
+                "live bind_websocket roots tools/call",
+                client.call_tool_result(&cx, PUBLIC_HTTP_ROOTS_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("live bind_websocket final roots must return a typed tools/call result");
+            let FinalCoreResult::ToolsCallInputRequired { result, .. } = rooted else {
+                panic!("live bind_websocket final roots must keep input_required: {rooted:?}");
+            };
+            assert_live_input_required(&result, "roots", "tools/call");
+
+            websocket_client_bounded(&cx, "live bind_websocket MRTR close", client.close(&cx))
+                .await
+                .expect("the advertised MRTR WebSocket client closes after the live proof");
+            drop(client);
+
+            let missing_transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR missing-roots handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("a second WebSocket client must complete RFC 6455 upgrade");
+            let mut no_roots = ClientCapabilities::default();
+            no_roots.sampling = Some(Default::default());
+            let mut no_roots_client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR missing-roots initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-mrtr-no-roots", "1.0.0")
+                    .capabilities(no_roots)
+                    .connect_websocket_with_cx(&cx, missing_transport),
+            )
+            .await
+            .expect("the ModernOnly public facade connects without advertising roots");
+            let missing_roots = websocket_client_bounded(
+                &cx,
+                "live bind_websocket missing roots tools/call",
+                no_roots_client.call_tool_result(&cx, PUBLIC_HTTP_ROOTS_TOOL_NAME, json!({})),
+            )
+            .await;
+            let missing_roots = match missing_roots {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_roots.contains("not advertised by the client")
+                    || missing_roots.contains("InvalidRequest")
+                    || missing_roots.contains("roots"),
+                "omitting only the roots capability must fail closed: {missing_roots}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket MRTR missing-roots close",
+                no_roots_client.close(&cx),
+            )
+            .await
+            .expect("the no-roots WebSocket client closes after the fail-closed proof");
+            drop(no_roots_client);
+            cx.set_cancel_requested(true);
+            listener.abort();
         });
     }
 }
