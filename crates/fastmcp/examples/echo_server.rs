@@ -22,11 +22,14 @@ use std::time::Duration;
 use fastmcp_rust::modern::{FinalMethodOutcome, MrtrCompletedInputs};
 use fastmcp_rust::prelude::*;
 use fastmcp_rust::{
-    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, CacheScope, EmbeddedResourceContents,
-    FinalAbsoluteUri, FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
-    FinalPromptMessage, FinalTaskInputRequests, FinalTaskRuntime, FinalTaskRuntimeConfig,
-    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    FinalToolOutcome, InputRequiredResult, ResultMeta, StdioTransport, ToolHandler,
+    ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, CacheScope, CompleteResult,
+    ContentBlock, EmbeddedResourceContents, FinalAbsoluteUri, FinalCallToolResult,
+    FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
+    FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalPromptMessage,
+    FinalRootsContextExt, FinalSamplingContextExt, FinalTaskInputRequests, FinalTaskRuntime,
+    FinalTaskRuntimeConfig, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
+    FinalTaskWorkDescriptor, FinalToolOutcome, InputRequiredResult, ResultMeta, StdioTransport,
+    ToolErrorKind, ToolHandler,
 };
 use fastmcp_server::ServerBuilder;
 
@@ -106,6 +109,12 @@ fn add(_ctx: &McpContext, a: i64, b: i64) -> String {
     format!("{}", a + b)
 }
 
+/// Greets a name and injects an omitted suffix from the generated default.
+#[tool(defaults(suffix = "!"))]
+fn greet(_ctx: &McpContext, name: String, suffix: String) -> String {
+    format!("greet:{name}{suffix}")
+}
+
 /// Reverse a string.
 #[tool]
 fn reverse(_ctx: &McpContext, text: String) -> String {
@@ -119,6 +128,183 @@ fn count_words(_ctx: &McpContext, text: String) -> String {
     format!("{count}")
 }
 
+async fn compose_nested_echo(
+    ctx: &McpContext,
+    message: &str,
+    tool: &str,
+    resource: &str,
+) -> McpResult<String> {
+    let echoed = ctx
+        .call_tool_text(tool, serde_json::json!({ "message": message }))
+        .await
+        .map_err(|error| {
+            McpError::invalid_request(format!("compose-nested-tool:{tool}:{}", error.message))
+        })?;
+    let info = ctx.read_resource_text(resource).await.map_err(|error| {
+        McpError::invalid_request(format!(
+            "compose-nested-resource:{resource}:{}",
+            error.message
+        ))
+    })?;
+    Ok(format!("compose:{echoed}|{info}"))
+}
+
+/// Composes the shipped `echo` tool and `info://server` resource.
+///
+/// Optional `tool` / `resource` arguments default to those peers so a
+/// near-identical missing-name call is the planted negative.
+#[tool(defaults(tool = "echo", resource = "info://server"))]
+async fn compose_echo(
+    ctx: &McpContext,
+    message: String,
+    tool: String,
+    resource: String,
+) -> McpResult<String> {
+    compose_nested_echo(ctx, &message, &tool, &resource).await
+}
+
+/// Handler whose per-tool timeout expires before its blocking delay finishes.
+struct SlowEcho;
+
+impl ToolHandler for SlowEcho {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "slow_echo".to_owned(),
+            description: Some("Proves live stdio handler timeout".to_owned()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        Some(Duration::from_millis(10))
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        std::thread::sleep(Duration::from_millis(80));
+        Ok(vec![Content::text("late")])
+    }
+}
+
+/// Peer tool that stays inside the same request budget as `slow_echo`.
+struct FastEcho;
+
+impl ToolHandler for FastEcho {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "fast_echo".to_owned(),
+            description: Some("Proves live stdio handler timeout does not starve peers".to_owned()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![Content::text("fast")])
+    }
+}
+
+/// Advertises an output schema and authors matching structured content.
+struct StructuredEcho;
+
+impl ToolHandler for StructuredEcho {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "structured_echo".to_owned(),
+            description: Some(
+                "Returns structured output matching the advertised schema".to_owned(),
+            ),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            }),
+            output_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"]
+            })),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn final_tool_error_structured_content(
+        &self,
+        kind: ToolErrorKind,
+    ) -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "value": match kind {
+                ToolErrorKind::InputValidation => "input-error",
+                ToolErrorKind::Handler => "handler-error",
+            }
+        }))
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let value = arguments
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        Ok(vec![Content::text(format!("tool:{value}"))])
+    }
+
+    fn call_final(
+        &self,
+        _ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        let value = arguments
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+            .to_owned();
+        Ok(CompleteResult::new(
+            FinalCallToolResult {
+                content: vec![ContentBlock::text(format!("tool:{value}"))],
+                is_error: false,
+                structured_content: Some(serde_json::json!({"value": value})),
+            },
+            ResultMeta::empty(),
+        ))
+    }
+}
+
+/// Returns image and audio content blocks on a live tools/call.
+struct RichEcho;
+
+impl ToolHandler for RichEcho {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "rich_echo".to_owned(),
+            description: Some("Returns image and audio content blocks".to_owned()),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        Ok(vec![
+            Content::image_base64("e2eimage", "image/png"),
+            Content::audio_base64("e2eaudio", "audio/wav"),
+        ])
+    }
+}
+
 /// Returns the first filesystem root exposed by the connected client.
 #[tool]
 async fn client_root_uri(ctx: &McpContext) -> McpResult<String> {
@@ -127,6 +313,90 @@ async fn client_root_uri(ctx: &McpContext) -> McpResult<String> {
         .first()
         .map(|root| root.uri.clone())
         .unwrap_or_else(|| "<no client roots>".to_string()))
+}
+
+fn complete_text_tool(text: impl Into<String>) -> FinalToolOutcome {
+    FinalToolOutcome::Complete(CompleteResult::new(
+        FinalCallToolResult {
+            content: vec![ContentBlock::text(text.into())],
+            is_error: false,
+            structured_content: None,
+        },
+        ResultMeta::empty(),
+    ))
+}
+
+/// Returns framework-issued MRTR sampling input, then completes from the retry.
+#[tool]
+fn sample_echo(
+    ctx: &McpContext,
+    completed_inputs: Option<&MrtrCompletedInputs>,
+) -> McpResult<FinalToolOutcome> {
+    if let Some(completed_inputs) = completed_inputs {
+        let sampled = completed_inputs
+            .sampling("sample")?
+            .ok_or_else(|| McpError::internal_error("sampling input was not preserved"))?;
+        return Ok(complete_text_tool(format!("sampled:{}", sampled.model)));
+    }
+    let sampling = ctx.final_sampling(
+        "sample",
+        serde_json::from_value(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": { "type": "text", "text": "echo" },
+            }],
+            "maxTokens": 16,
+        }))
+        .map_err(|error| McpError::internal_error(error.to_string()))?,
+    )?;
+    Ok(FinalToolOutcome::InputRequired(
+        sampling.into_input_required()?,
+    ))
+}
+
+/// Returns framework-issued MRTR URL elicitation, then completes from the retry.
+#[tool]
+fn url_elicit_echo(
+    ctx: &McpContext,
+    completed_inputs: Option<&MrtrCompletedInputs>,
+) -> McpResult<FinalToolOutcome> {
+    if let Some(completed_inputs) = completed_inputs {
+        let elicitation = completed_inputs
+            .elicitation("approval")?
+            .ok_or_else(|| McpError::internal_error("URL elicitation input was not preserved"))?;
+        let action = if elicitation.is_accepted() {
+            "accept"
+        } else if elicitation.is_declined() {
+            "decline"
+        } else {
+            "cancel"
+        };
+        return Ok(complete_text_tool(format!("url-elicit:{action}")));
+    }
+    let elicitation = ctx.final_elicitation_url(
+        "approval",
+        "Approve this operation",
+        "https://example.com/approve",
+    )?;
+    Ok(FinalToolOutcome::InputRequired(
+        elicitation.into_input_required()?,
+    ))
+}
+
+/// Returns framework-issued MRTR roots input, then completes from the retry.
+#[tool]
+fn roots_echo(
+    ctx: &McpContext,
+    completed_inputs: Option<&MrtrCompletedInputs>,
+) -> McpResult<FinalToolOutcome> {
+    if let Some(completed_inputs) = completed_inputs {
+        let roots_len = completed_mrtr_roots_len(completed_inputs, "roots")?;
+        return Ok(complete_text_tool(format!("roots:{roots_len}")));
+    }
+    let roots = ctx.final_roots("roots", FinalEmbeddedRootsListParams::default())?;
+    Ok(FinalToolOutcome::InputRequired(
+        roots.into_input_required()?,
+    ))
 }
 
 // ============================================================================
@@ -143,6 +413,80 @@ fn server_info(ctx: &McpContext) -> String {
     "description": "A simple example MCP server"
 }"#
     .to_string()
+}
+
+/// Composes the shipped `echo` tool and `info://server` resource from a resource.
+#[resource(uri = "info://compose")]
+async fn compose_info(ctx: &McpContext) -> McpResult<String> {
+    compose_nested_echo(ctx, "alpha", "echo", "info://server").await
+}
+
+/// Near-identical resource whose only change is the nested tool name.
+#[resource(uri = "info://compose-missing-tool")]
+async fn compose_info_missing_tool(ctx: &McpContext) -> McpResult<String> {
+    compose_nested_echo(ctx, "alpha", "stdio-e2e-missing", "info://server").await
+}
+
+/// Near-identical resource whose only change is the nested resource URI.
+#[resource(uri = "info://compose-missing-resource")]
+async fn compose_info_missing_resource(ctx: &McpContext) -> McpResult<String> {
+    compose_nested_echo(ctx, "alpha", "echo", "info://stdio-e2e-missing").await
+}
+
+fn form_elicitation_input_required(ctx: &McpContext) -> McpResult<InputRequiredResult> {
+    ctx.final_elicitation_form(
+        "approval",
+        "Approve this operation",
+        serde_json::json!({
+            "type": "object",
+            "properties": {"approved": {"type": "boolean"}},
+            "required": ["approved"],
+        }),
+    )?
+    .into_input_required()
+}
+
+fn form_elicitation_action(completed_inputs: &MrtrCompletedInputs) -> McpResult<String> {
+    let elicitation = completed_inputs
+        .elicitation("approval")?
+        .ok_or_else(|| McpError::internal_error("form elicitation input was not preserved"))?;
+    if elicitation.is_accepted() {
+        Ok(format!(
+            "form-elicit:{}",
+            elicitation.get_bool("approved").unwrap_or(false)
+        ))
+    } else if elicitation.is_declined() {
+        Ok("form-elicit:decline".to_owned())
+    } else {
+        Ok("form-elicit:cancel".to_owned())
+    }
+}
+
+/// Returns framework-issued MRTR form elicitation, then completes from the retry.
+#[resource(uri = "info://elicit-form")]
+fn elicit_form_info(
+    ctx: &McpContext,
+    completed_inputs: Option<&MrtrCompletedInputs>,
+) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+    if let Some(completed_inputs) = completed_inputs {
+        let text = form_elicitation_action(completed_inputs)?;
+        return Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+            FinalReadResourceResult {
+                contents: vec![EmbeddedResourceContents::Text {
+                    uri: FinalAbsoluteUri::parse("info://elicit-form/result")
+                        .expect("the shipped form-elicitation resource URI is absolute"),
+                    text,
+                    mime_type: Some("text/plain".to_owned()),
+                    meta: None,
+                    additional: BTreeMap::new(),
+                }],
+                ttl_ms: CacheTtl::milliseconds(7),
+                cache_scope: CacheScope::Private,
+            },
+            ResultMeta::empty(),
+        )));
+    }
+    form_elicitation_input_required(ctx).map(FinalMethodOutcome::InputRequired)
 }
 
 /// Returns current timestamp.
@@ -247,6 +591,51 @@ fn greeting(ctx: &McpContext, name: String) -> Vec<PromptMessage> {
             text: format!("Please greet {name} in a friendly way."),
         },
     }]
+}
+
+/// Composes the shipped `echo` tool and `info://server` resource from a prompt.
+///
+/// Optional `tool` / `resource` arguments default to those peers so a
+/// near-identical missing-name call is the planted negative.
+#[prompt(defaults(tool = "echo", resource = "info://server"))]
+async fn compose_greeting(
+    ctx: &McpContext,
+    name: String,
+    tool: String,
+    resource: String,
+) -> McpResult<Vec<PromptMessage>> {
+    let composed = compose_nested_echo(ctx, &name, &tool, &resource).await?;
+    Ok(vec![PromptMessage {
+        role: Role::User,
+        content: Content::text(composed),
+    }])
+}
+
+/// Returns framework-issued MRTR form elicitation, then completes from the retry.
+#[prompt]
+fn elicit_form_greeting(
+    ctx: &McpContext,
+    completed_inputs: Option<&MrtrCompletedInputs>,
+) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+    if let Some(completed_inputs) = completed_inputs {
+        let text = form_elicitation_action(completed_inputs)?;
+        return Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+            FinalGetPromptResult {
+                description: Some("typed form elicitation prompt result".to_owned()),
+                messages: vec![FinalPromptMessage {
+                    role: Role::Assistant,
+                    content: ContentBlock::Text {
+                        text,
+                        annotations: None,
+                        meta: None,
+                        additional: BTreeMap::new(),
+                    },
+                }],
+            },
+            ResultMeta::empty(),
+        )));
+    }
+    form_elicitation_input_required(ctx).map(FinalMethodOutcome::InputRequired)
 }
 
 /// A code review prompt.
@@ -568,15 +957,30 @@ fn main() {
         .tool(ShowEcho)
         .tool(ShowCatalog)
         .tool(Add)
+        .tool(Greet)
         .tool(Reverse)
         .tool(CountWords)
+        .tool(ComposeEcho)
+        .tool(SlowEcho)
+        .tool(FastEcho)
+        .tool(StructuredEcho)
+        .tool(RichEcho)
         .tool(ClientRootUri)
+        .tool(SampleEcho)
+        .tool(UrlElicitEcho)
+        .tool(RootsEcho)
         // Register resources
         .resource(ServerInfoResource)
+        .resource(ComposeInfoResource)
+        .resource(ComposeInfoMissingToolResource)
+        .resource(ComposeInfoMissingResourceResource)
+        .resource(ElicitFormInfoResource)
         .resource(CurrentTimeResource)
         .resource(MrtrResourceResource)
         // Register prompts
         .prompt(GreetingPrompt)
+        .prompt(ComposeGreetingPrompt)
+        .prompt(ElicitFormGreetingPrompt)
         .prompt(CodeReviewPromptPrompt)
         .prompt(MrtrPromptPrompt)
         .prompt_completion_handler("greeting", GreetingCompletion)
