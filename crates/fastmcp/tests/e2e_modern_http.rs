@@ -24935,6 +24935,175 @@ mod live_websocket_bind {
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
+    fn e2e_public_websocket_as_proxy_forwards_inbound_log_level() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy log runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_log_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-log-gateway".to_owned(),
+                "e2e-ws-as-proxy-log-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket log gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-log-upstream",
+                    "native-h1:e2e-ws-as-proxy-log-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-log".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP log proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP log proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-log-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed log install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy log must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy log publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy log serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket log must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-log", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy log over bind_websocket");
+
+            let prefixed = format!("ext/{PUBLIC_HTTP_LOG_TOOL_NAME}");
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log list_tools",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("the live as_proxy WebSocket gateway must advertise the prefixed log tool");
+            assert!(
+                listed.tools.iter().any(|tool| tool.name == prefixed),
+                "as_proxy_typed must prefix the live log tool over WebSocket: {listed:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log unprefixed",
+                client.call_tool(&cx, PUBLIC_HTTP_LOG_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed log handler");
+            let _ = missing;
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log tools/call before set_log_level",
+                client.call_tool(&cx, &prefixed, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must still forward the prefixed log tool before set_log_level");
+            assert!(
+                !client.take_server_notifications().iter().any(|notification| {
+                    matches!(
+                        notification,
+                        modern::ServerNotification::Message(message)
+                            if message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+                    )
+                }),
+                "omitting only set_log_level must keep as_proxy WebSocket ctx.info silent"
+            );
+
+            client
+                .set_log_level(modern::LoggingLevel::Info)
+                .expect("info logLevel is stored as request metadata");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log tools/call after Info",
+                client.call_tool(&cx, &prefixed, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward the prefixed log tool after set_log_level(Info)");
+            let info_notifications = client.take_server_notifications();
+            assert!(
+                info_notifications.iter().any(|notification| matches!(
+                    notification,
+                    modern::ServerNotification::Message(message)
+                        if message.level == modern::LoggingLevel::Info
+                            && message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+                )),
+                "as_proxy WebSocket must retain upstream ctx.info after inbound set_log_level(Info): {info_notifications:?}"
+            );
+
+            client
+                .set_log_level(modern::LoggingLevel::Emergency)
+                .expect("emergency logLevel still stores request metadata locally");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log tools/call after Emergency",
+                client.call_tool(&cx, &prefixed, json!({})),
+            )
+            .await
+            .expect("raising only the logLevel floor cannot break the same as_proxy WebSocket tools/call");
+            let emergency_notifications = client.take_server_notifications();
+            assert!(
+                !emergency_notifications.iter().any(|notification| matches!(
+                    notification,
+                    modern::ServerNotification::Message(message)
+                        if message.level == modern::LoggingLevel::Info
+                            && message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+                )),
+                "raising only the inbound logLevel floor must suppress as_proxy WebSocket ctx.info: {emergency_notifications:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy log close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the as_proxy WebSocket log client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
     fn e2e_public_websocket_as_proxy_creates_official_task_with_progress_marker() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
