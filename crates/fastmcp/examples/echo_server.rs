@@ -15,7 +15,7 @@
 // MCP handlers receive String from JSON deserialization, so this is intentional.
 #![allow(clippy::needless_pass_by_value)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -148,6 +148,28 @@ fn cache_probe(_ctx: &McpContext, token: String) -> String {
     format!("{token}:{n}")
 }
 
+/// Env-gated panic so live stdio can prove the handler unwind boundary.
+///
+/// Registered only when `FASTMCP_PANIC_TOOL=1`. The distinctive payload must
+/// never reach the peer: dispatch sanitizes `Outcome::Panicked` to a fixed
+/// InternalError.
+#[tool]
+fn panic_probe(_ctx: &McpContext) -> String {
+    panic!("planted-handler-panic-payload")
+}
+
+/// Env-gated resource panic. Registered only when `FASTMCP_PANIC_CATALOG=1`.
+#[resource(uri = "info://panic")]
+fn panic_info(_ctx: &McpContext) -> String {
+    panic!("planted-handler-panic-payload")
+}
+
+/// Env-gated prompt panic. Registered only when `FASTMCP_PANIC_CATALOG=1`.
+#[prompt]
+fn panic_greeting(_ctx: &McpContext) -> Vec<PromptMessage> {
+    panic!("planted-handler-panic-payload")
+}
+
 async fn compose_nested_echo(
     ctx: &McpContext,
     message: &str,
@@ -181,6 +203,28 @@ async fn compose_echo(
     resource: String,
 ) -> McpResult<String> {
     compose_nested_echo(ctx, &message, &tool, &resource).await
+}
+
+/// Composes the shipped `greeting` prompt through `ctx.get_prompt`.
+///
+/// Optional `prompt` defaults to `greeting` so a near-identical missing-name
+/// call is the planted negative.
+#[tool(defaults(prompt = "greeting"))]
+async fn compose_prompt(ctx: &McpContext, name: String, prompt: String) -> McpResult<String> {
+    compose_nested_prompt(ctx, &name, &prompt).await
+}
+
+async fn compose_nested_prompt(ctx: &McpContext, name: &str, prompt: &str) -> McpResult<String> {
+    let text = ctx
+        .get_prompt_text(
+            prompt,
+            HashMap::from([("name".to_owned(), name.to_owned())]),
+        )
+        .await
+        .map_err(|error| {
+            McpError::invalid_request(format!("compose-nested-prompt:{prompt}:{}", error.message))
+        })?;
+    Ok(format!("compose-prompt:{text}"))
 }
 
 /// Handler whose per-tool timeout expires before its blocking delay finishes.
@@ -497,6 +541,18 @@ async fn compose_info_missing_tool(ctx: &McpContext) -> McpResult<String> {
     compose_nested_echo(ctx, "alpha", "stdio-e2e-missing", "info://server").await
 }
 
+/// Composes the shipped `greeting` prompt from a resource.
+#[resource(uri = "info://compose-prompt")]
+async fn compose_info_prompt(ctx: &McpContext) -> McpResult<String> {
+    compose_nested_prompt(ctx, "alpha", "greeting").await
+}
+
+/// Near-identical resource whose only change is the nested prompt name.
+#[resource(uri = "info://compose-prompt-missing")]
+async fn compose_info_prompt_missing(ctx: &McpContext) -> McpResult<String> {
+    compose_nested_prompt(ctx, "alpha", "stdio-e2e-missing").await
+}
+
 /// Near-identical resource whose only change is the nested resource URI.
 #[resource(uri = "info://compose-missing-resource")]
 async fn compose_info_missing_resource(ctx: &McpContext) -> McpResult<String> {
@@ -692,6 +748,20 @@ async fn compose_greeting(
     }])
 }
 
+/// Composes the shipped `greeting` prompt through `ctx.get_prompt`.
+#[prompt(defaults(prompt = "greeting"), tags = ["compose"])]
+async fn compose_from_prompt(
+    ctx: &McpContext,
+    name: String,
+    prompt: String,
+) -> McpResult<Vec<PromptMessage>> {
+    let composed = compose_nested_prompt(ctx, &name, &prompt).await?;
+    Ok(vec![PromptMessage {
+        role: Role::User,
+        content: Content::text(composed),
+    }])
+}
+
 /// Returns framework-issued MRTR form elicitation, then completes from the retry.
 #[prompt]
 fn elicit_form_greeting(
@@ -806,8 +876,17 @@ impl CompletionHandler for GreetingCompletion {
     fn complete_legacy(
         &self,
         _ctx: &McpContext,
-        _params: fastmcp_rust::legacy_2024::LegacyCompletionParams,
+        params: fastmcp_rust::legacy_2024::LegacyCompletionParams,
     ) -> McpResult<fastmcp_rust::legacy_2024::CompletionValues> {
+        match &params.reference {
+            fastmcp_rust::legacy_2024::LegacyCompletionReference::Prompt { name }
+                if name == "greeting" => {}
+            _ => {
+                return Err(McpError::invalid_params(
+                    "greeting completion requires the greeting prompt",
+                ));
+            }
+        }
         Ok(fastmcp_rust::legacy_2024::CompletionValues {
             values: vec!["stdio-completion-legacy".to_owned()],
             total: Some(1),
@@ -848,6 +927,75 @@ impl CompletionHandler for GreetingCompletion {
             )),
             has_more: Some(false),
         })
+    }
+}
+
+/// Completion provider for the shipped `note://{name}` resource template.
+struct NoteCompletion;
+
+impl CompletionHandler for NoteCompletion {
+    fn complete_legacy(
+        &self,
+        _ctx: &McpContext,
+        params: fastmcp_rust::legacy_2024::LegacyCompletionParams,
+    ) -> McpResult<fastmcp_rust::legacy_2024::CompletionValues> {
+        match &params.reference {
+            fastmcp_rust::legacy_2024::LegacyCompletionReference::Resource { uri }
+                if uri == "note://{name}" && params.argument.name == "name" => {}
+            _ => {
+                return Err(McpError::invalid_params(
+                    "note completion requires the exact resource template",
+                ));
+            }
+        }
+        Ok(fastmcp_rust::legacy_2024::CompletionValues {
+            values: vec!["stdio-note-completion-legacy".to_owned()],
+            total: Some(1),
+            has_more: Some(false),
+        })
+    }
+
+    fn complete_final(
+        &self,
+        _ctx: &McpContext,
+        params: FinalCompletionParams,
+    ) -> McpResult<FinalCompletionValues> {
+        if !matches!(
+            &params.reference,
+            FinalCompletionReference::Resource { uri } if uri == "note://{name}"
+        ) || params.argument.name != "name"
+            || params.argument.value != "al"
+        {
+            return Err(McpError::invalid_params(
+                "note completion requires the exact modern request shape",
+            ));
+        }
+        Ok(FinalCompletionValues {
+            values: vec!["alice".to_owned()],
+            total: Some(JsonInteger::from(1_u64)),
+            has_more: Some(false),
+        })
+    }
+}
+
+/// Env-gated completion panic. Installed only when `FASTMCP_PANIC_COMPLETE=1`.
+struct PanicCompletion;
+
+impl CompletionHandler for PanicCompletion {
+    fn complete_legacy(
+        &self,
+        _ctx: &McpContext,
+        _params: fastmcp_rust::legacy_2024::LegacyCompletionParams,
+    ) -> McpResult<fastmcp_rust::legacy_2024::CompletionValues> {
+        panic!("planted-handler-panic-payload")
+    }
+
+    fn complete_final(
+        &self,
+        _ctx: &McpContext,
+        _params: FinalCompletionParams,
+    ) -> McpResult<FinalCompletionValues> {
+        panic!("planted-handler-panic-payload")
     }
 }
 
@@ -1043,6 +1191,7 @@ fn main() {
         .tool(CountWords)
         .tool(CacheProbe)
         .tool(ComposeEcho)
+        .tool(ComposePrompt)
         .tool(SlowEcho)
         .tool(FastEcho)
         .tool(StructuredEcho)
@@ -1059,6 +1208,8 @@ fn main() {
         .resource(ComposeInfoResource)
         .resource(ComposeInfoMissingToolResource)
         .resource(ComposeInfoMissingResourceResource)
+        .resource(ComposeInfoPromptResource)
+        .resource(ComposeInfoPromptMissingResource)
         .resource(ElicitFormInfoResource)
         .resource(LeakInfoResource)
         .resource(CurrentTimeResource)
@@ -1066,17 +1217,24 @@ fn main() {
         // Register prompts
         .prompt(GreetingPrompt)
         .prompt(ComposeGreetingPrompt)
+        .prompt(ComposeFromPromptPrompt)
         .prompt(ElicitFormGreetingPrompt)
         .prompt(CodeReviewPromptPrompt)
         .prompt(MrtrPromptPrompt)
         // Set timeout (30 seconds per request)
         .request_timeout(30);
-    let builder = if std::env::var("FASTMCP_NO_COMPLETIONS").as_deref() == Ok("1") {
+    let builder = if std::env::var("FASTMCP_PANIC_COMPLETE").as_deref() == Ok("1") {
+        builder
+            .prompt_completion_handler("greeting", PanicCompletion)
+            .legacy_completion_handler(PanicCompletion)
+    } else if std::env::var("FASTMCP_NO_COMPLETIONS").as_deref() == Ok("1") {
         builder
     } else {
         builder
             .prompt_completion_handler("greeting", GreetingCompletion)
             .legacy_completion_handler(GreetingCompletion)
+            .resource_template_completion_handler("note://{name}", NoteCompletion)
+            .legacy_resource_template_completion_handler("note://{name}", NoteCompletion)
     };
     let builder = if std::env::var("FASTMCP_NO_INSTRUCTIONS").as_deref() == Ok("1") {
         builder
@@ -1144,6 +1302,18 @@ fn main() {
         builder.middleware(
             ResponseCachingMiddleware::new().include_tools(vec!["cache_probe".to_owned()]),
         )
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_PANIC_TOOL").as_deref() == Ok("1") {
+        builder.tool(PanicProbe)
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_PANIC_CATALOG").as_deref() == Ok("1") {
+        builder
+            .resource(PanicInfoResource)
+            .prompt(PanicGreetingPrompt)
     } else {
         builder
     };
