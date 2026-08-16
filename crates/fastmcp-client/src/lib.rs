@@ -19614,7 +19614,10 @@ impl Client {
     /// original transport failure instead of silently converting it into a
     /// successful local cancellation.
     #[cfg(feature = "tasks")]
-    fn cancel_live_final_task_subscription(&mut self, cx: &Cx) -> McpResult<()> {
+    pub fn cancel_live_final_task_subscription(&mut self, cx: &Cx) -> McpResult<()> {
+        if self.live_task_subscription.is_none() {
+            return Ok(());
+        }
         let cancellation = {
             let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
                 McpError::invalid_request("No live final Tasks stdio subscription is active")
@@ -19648,6 +19651,26 @@ impl Client {
         cx: &Cx,
         cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<StdioTaskSubscriptionEvent> {
+        loop {
+            if let Some(event) = self.try_next_final_task_subscription_event(cx, cancellation)? {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// Takes one already-queued Tasks listener event, or drives one bounded
+    /// stdio receive turn when the queue is empty.
+    ///
+    /// A gateway listen must release the route mutex between receive turns so
+    /// a peer `tasks/cancel` can write on the same stdio session. `None` means
+    /// the bounded receive completed without a Tasks event.
+    #[cfg(feature = "tasks")]
+    pub fn try_next_final_task_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<StdioTaskSubscriptionEvent>> {
+        const STDIO_TASK_LISTEN_RECEIVE_BOUND: Duration = Duration::from_millis(20);
         if let Some(error) = self
             .live_task_subscription
             .as_ref()
@@ -19659,51 +19682,60 @@ impl Client {
             self.cancel_live_final_task_subscription(cx)?;
             return Err(McpError::request_cancelled());
         }
-        loop {
-            let event = {
-                let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
-                    McpError::invalid_request("No live final Tasks stdio subscription is active")
-                })?;
-                if !subscription.acknowledgement_delivered
-                    && let Some(acknowledged) = subscription
-                        .executor
-                        .tasks_subscription_acknowledgement(&subscription.execution)?
-                {
-                    subscription.acknowledgement_delivered = true;
-                    Some(StdioTaskSubscriptionEvent::Acknowledged(acknowledged))
-                } else {
-                    if subscription.pending_notifications.is_empty() {
-                        subscription.pending_notifications.extend(
-                            subscription
-                                .executor
-                                .take_tasks_subscription_notifications(&subscription.execution)?,
-                        );
-                    }
-                    if let Some(notification) = subscription.pending_notifications.pop_front() {
-                        Some(StdioTaskSubscriptionEvent::Notification(notification))
-                    } else if subscription
-                        .executor
-                        .try_take_tasks_subscription_terminal(&mut subscription.execution)?
-                        .is_some()
-                    {
-                        Some(StdioTaskSubscriptionEvent::Terminal)
-                    } else {
-                        None
-                    }
-                }
-            };
-            if let Some(event) = event {
-                if matches!(event, StdioTaskSubscriptionEvent::Terminal) {
-                    self.live_task_subscription = None;
-                }
-                return Ok(event);
-            }
-            self.drive_multiplexed_stdio(cx)?;
-            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
-                self.cancel_live_final_task_subscription(cx)?;
-                return Err(McpError::request_cancelled());
-            }
+        if let Some(event) = self.take_ready_final_task_subscription_event()? {
+            return Ok(Some(event));
         }
+        self.drive_multiplexed_stdio_until(
+            cx,
+            Some(Instant::now() + STDIO_TASK_LISTEN_RECEIVE_BOUND),
+        )?;
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.cancel_live_final_task_subscription(cx)?;
+            return Err(McpError::request_cancelled());
+        }
+        self.take_ready_final_task_subscription_event()
+    }
+
+    #[cfg(feature = "tasks")]
+    fn take_ready_final_task_subscription_event(
+        &mut self,
+    ) -> McpResult<Option<StdioTaskSubscriptionEvent>> {
+        let event = {
+            let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final Tasks stdio subscription is active")
+            })?;
+            if !subscription.acknowledgement_delivered
+                && let Some(acknowledged) = subscription
+                    .executor
+                    .tasks_subscription_acknowledgement(&subscription.execution)?
+            {
+                subscription.acknowledgement_delivered = true;
+                Some(StdioTaskSubscriptionEvent::Acknowledged(acknowledged))
+            } else {
+                if subscription.pending_notifications.is_empty() {
+                    subscription.pending_notifications.extend(
+                        subscription
+                            .executor
+                            .take_tasks_subscription_notifications(&subscription.execution)?,
+                    );
+                }
+                if let Some(notification) = subscription.pending_notifications.pop_front() {
+                    Some(StdioTaskSubscriptionEvent::Notification(notification))
+                } else if subscription
+                    .executor
+                    .try_take_tasks_subscription_terminal(&mut subscription.execution)?
+                    .is_some()
+                {
+                    Some(StdioTaskSubscriptionEvent::Terminal)
+                } else {
+                    None
+                }
+            }
+        };
+        if matches!(event, Some(StdioTaskSubscriptionEvent::Terminal)) {
+            self.live_task_subscription = None;
+        }
+        Ok(event)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
