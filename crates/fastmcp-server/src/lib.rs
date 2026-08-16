@@ -6123,8 +6123,11 @@ const WEBSOCKET_HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 #[cfg(feature = "websocket")]
 const WEBSOCKET_DRIVER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 #[cfg(feature = "websocket")]
-#[cfg(feature = "websocket")]
 const WEBSOCKET_CONNECTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wake `accept` often enough that a cancelled listener Cx can leave the
+/// accept loop without waiting for the next inbound connection.
+#[cfg(feature = "websocket")]
+const WEBSOCKET_ACCEPT_CANCEL_POLL: Duration = Duration::from_millis(20);
 #[cfg(feature = "websocket")]
 static NEXT_WEBSOCKET_AUTH_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -6263,7 +6266,17 @@ impl BoundWebSocketServer {
             if cx.checkpoint().is_err() {
                 break Ok(());
             }
-            let (stream, _) = match self.listener.accept().await {
+            let accepted = match asupersync::time::timeout(
+                cx.now(),
+                WEBSOCKET_ACCEPT_CANCEL_POLL,
+                self.listener.accept(),
+            )
+            .await
+            {
+                Ok(accepted) => accepted,
+                Err(_) => continue,
+            };
+            let (stream, _) = match accepted {
                 Ok(connection) => connection,
                 Err(_) if cx.checkpoint().is_err() => break Ok(()),
                 Err(error) => {
