@@ -16,7 +16,7 @@ use serde::{
 };
 use serde_json::{Value, value::RawValue};
 
-use crate::common_types::OpenMetadata;
+use crate::common_types::{Implementation, OpenMetadata};
 use crate::result::{
     CacheTtl, ExactJsonObject, FinalResultMetadataRole, encode_exact_object,
     parse_exact_result_object, validate_final_result_metadata_entries,
@@ -518,6 +518,7 @@ fn validate_extensions(extensions: &BTreeMap<String, Value>) -> Result<(), Serve
 #[derive(Clone, Debug, Default)]
 struct ServerDiscoverResultMetadata {
     server_info: Option<ServerInfo>,
+    implementation: Option<Implementation>,
     extras: BTreeMap<String, Value>,
 }
 
@@ -525,12 +526,18 @@ impl ServerDiscoverResultMetadata {
     fn server_generated(server_info: ServerInfo) -> Self {
         Self {
             server_info: Some(server_info),
+            implementation: None,
             extras: BTreeMap::new(),
         }
     }
 
+    fn with_implementation(mut self, implementation: Implementation) -> Self {
+        self.implementation = Some(implementation);
+        self
+    }
+
     fn is_empty(&self) -> bool {
-        self.server_info.is_none() && self.extras.is_empty()
+        self.server_info.is_none() && self.implementation.is_none() && self.extras.is_empty()
     }
 }
 
@@ -540,9 +547,12 @@ impl Serialize for ServerDiscoverResultMetadata {
         S: Serializer,
     {
         let mut map = serializer.serialize_map(Some(
-            self.extras.len() + usize::from(self.server_info.is_some()),
+            self.extras.len()
+                + usize::from(self.implementation.is_some() || self.server_info.is_some()),
         ))?;
-        if let Some(server_info) = &self.server_info {
+        if let Some(implementation) = &self.implementation {
+            map.serialize_entry(SERVER_DISCOVER_SERVER_INFO_META_KEY, implementation)?;
+        } else if let Some(server_info) = &self.server_info {
             map.serialize_entry(SERVER_DISCOVER_SERVER_INFO_META_KEY, server_info)?;
         }
         for (name, value) in &self.extras {
@@ -560,13 +570,24 @@ impl<'de> Deserialize<'de> for ServerDiscoverResultMetadata {
         let mut members = BTreeMap::<String, Value>::deserialize(deserializer)?;
         validate_final_result_metadata_entries(&members, FinalResultMetadataRole::Ordinary)
             .map_err(D::Error::custom)?;
-        let server_info = members
-            .remove(SERVER_DISCOVER_SERVER_INFO_META_KEY)
+        let identity = members.remove(SERVER_DISCOVER_SERVER_INFO_META_KEY);
+        let implementation = identity
+            .as_ref()
+            .and_then(|value| serde_json::from_value::<Implementation>(value.clone()).ok())
+            .filter(|implementation| {
+                implementation.title.is_some()
+                    || implementation.description.is_some()
+                    || implementation.website_url.is_some()
+                    || !implementation.icons.is_empty()
+                    || !implementation.additional.is_empty()
+            });
+        let server_info = identity
             .map(serde_json::from_value)
             .transpose()
             .map_err(D::Error::custom)?;
         Ok(Self {
             server_info,
+            implementation,
             extras: members,
         })
     }
@@ -631,6 +652,22 @@ impl ServerDiscoverResult {
             extras: BTreeMap::new(),
             exact_peer_result: None,
         }
+    }
+
+    /// Replaces discovery `_meta` server identity with a final Implementation.
+    ///
+    /// Exact-2024 initialize still projects name and version only. This richer
+    /// identity is for modern `server/discover`.
+    #[must_use]
+    pub fn with_implementation(mut self, implementation: Implementation) -> Self {
+        self.metadata = self.metadata.with_implementation(implementation);
+        self
+    }
+
+    /// Returns the final Implementation identity when one was stored.
+    #[must_use]
+    pub fn implementation(&self) -> Option<&Implementation> {
+        self.metadata.implementation.as_ref()
     }
 
     /// Returns the protocol versions advertised by this server.
@@ -896,6 +933,7 @@ mod tests {
         SERVER_DISCOVER_SERVER_INFO_META_KEY, SERVER_DISCOVER_SUPPORTED_VERSIONS, ServerBehavior,
         ServerBehaviorRegistry, ServerDiscoverCapabilities, ServerDiscoverRequest,
         ServerDiscoverResult, ServerDiscoveryError, ServerInfo, ServerInstructions,
+        common_types::Implementation,
     };
 
     fn fully_installed_capabilities() -> ServerDiscoverCapabilities {
@@ -1355,6 +1393,67 @@ mod tests {
             serde_json::to_value(&absent).expect("the admitted result remains unchanged"),
             absent_wire,
             "the rejected instruction value cannot mutate the admitted result"
+        );
+    }
+
+    #[test]
+    fn server_discover_retains_implementation_identity_only_when_extras_are_present() {
+        let bare = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "contract-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let bare_wire = serde_json::to_value(&bare).expect("bare discovery encodes");
+        let bare_decoded: ServerDiscoverResult =
+            serde_json::from_value(bare_wire).expect("bare discovery decodes");
+        assert!(
+            bare_decoded.implementation().is_none(),
+            "name/version-only serverInfo must stay Implementation-absent: {:?}",
+            bare_decoded.implementation()
+        );
+        assert_eq!(
+            bare_decoded
+                .server_info()
+                .map(|info| (info.name.as_str(), info.version.as_str())),
+            Some(("contract-server", "1.0.0"))
+        );
+
+        let mut implementation = Implementation::try_new("contract-server", "1.0.0")
+            .expect("the identity name and version are nonempty");
+        implementation.title = Some("Identity Title".to_owned());
+        implementation.description = Some("Identity description".to_owned());
+        implementation.website_url = Some(
+            crate::common_types::AbsoluteUri::parse("https://example.test/fastmcp")
+                .expect("the identity website is an absolute URI"),
+        );
+        implementation.icons = vec![
+            crate::common_types::RawIcon::try_new("https://example.test/e2e-icon.png")
+                .expect("the identity icon source is an absolute URI"),
+        ];
+        let identified = bare.with_implementation(implementation);
+        let identified_wire =
+            serde_json::to_value(&identified).expect("identified discovery encodes");
+        let identified_decoded: ServerDiscoverResult =
+            serde_json::from_value(identified_wire).expect("identified discovery decodes");
+        let identified_impl = identified_decoded
+            .implementation()
+            .expect("title/description/website/icons must retain Implementation");
+        assert_eq!(identified_impl.title.as_deref(), Some("Identity Title"));
+        assert_eq!(
+            identified_impl.description.as_deref(),
+            Some("Identity description")
+        );
+        assert_eq!(
+            identified_impl.website_url.as_ref().map(|uri| uri.as_str()),
+            Some("https://example.test/fastmcp")
+        );
+        assert_eq!(
+            identified_impl.icons.first().map(|icon| icon.src.as_str()),
+            Some("https://example.test/e2e-icon.png")
         );
     }
 }

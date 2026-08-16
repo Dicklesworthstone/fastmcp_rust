@@ -147,7 +147,7 @@ pub struct FinalRequestMeta {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    pub client_info: Option<ClientInfo>,
+    pub client_info: Option<crate::common_types::Implementation>,
     /// Additional metadata retained without granting protocol capability.
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub additional_metadata: BTreeMap<String, Value>,
@@ -622,6 +622,9 @@ pub struct LegacyCompletionParams {
     pub reference: LegacyCompletionReference,
     /// Argument being completed.
     pub argument: LegacyCompletionArgument,
+    /// Request metadata (progress token, etc.).
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<RequestMeta>,
 }
 
 /// Final reference accepted by `completion/complete`.

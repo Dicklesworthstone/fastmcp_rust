@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::common_types::{
-    AbsoluteUri, Annotations, ContentBlock, JsonInteger, OpenMetadata, RawIcon,
+    AbsoluteUri, Annotations, ContentBlock, Implementation, JsonInteger, OpenMetadata, RawIcon,
     SamplingContentBlock,
 };
 use crate::extensions::MCP_APPS_HTML_MIME_TYPE;
@@ -230,6 +230,27 @@ pub struct ClientInfo {
     pub name: String,
     /// Client version.
     pub version: String,
+}
+
+impl ClientInfo {
+    /// Projects this exact-2024 name/version pair into a final Implementation.
+    ///
+    /// Empty name or version is replaced with a nonempty fallback so modern
+    /// request `_meta` can always carry a typed identity object.
+    #[must_use]
+    pub fn to_implementation(&self) -> Implementation {
+        let name = if self.name.is_empty() {
+            "unknown"
+        } else {
+            self.name.as_str()
+        };
+        let version = if self.version.is_empty() {
+            "0"
+        } else {
+            self.version.as_str()
+        };
+        Implementation::try_new(name, version).expect("the fallback client identity is nonempty")
+    }
 }
 
 // ============================================================================
