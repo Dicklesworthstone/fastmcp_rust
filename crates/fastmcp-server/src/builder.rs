@@ -1563,10 +1563,23 @@ impl ServerBuilder {
                     prompts.len(),
                 );
                 for tool in tools {
-                    self.router.add_final_tool_with_behavior(
-                        ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?,
-                        self.on_duplicate,
-                    )?;
+                    #[cfg(feature = "tasks")]
+                    let handler = match task_relay.as_ref() {
+                        Some(task_relay) => ProxyToolHandler::with_prefix_final_with_task_relay(
+                            tool,
+                            prefix,
+                            proxy_client.clone(),
+                            Arc::clone(task_relay),
+                        )?,
+                        None => {
+                            ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?
+                        }
+                    };
+                    #[cfg(not(feature = "tasks"))]
+                    let handler =
+                        ProxyToolHandler::with_prefix_final(tool, prefix, proxy_client.clone())?;
+                    self.router
+                        .add_final_tool_with_behavior(handler, self.on_duplicate)?;
                 }
                 for resource in resources {
                     self.router.add_final_resource_with_behavior(

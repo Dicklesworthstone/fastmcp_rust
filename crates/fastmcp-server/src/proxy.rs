@@ -6499,6 +6499,20 @@ impl ProxyToolHandler {
         handler.external_name = external_name;
         Ok(handler)
     }
+
+    /// Creates a prefixed final handler whose task branch is bound to the
+    /// supplied single upstream relay.
+    #[cfg(feature = "tasks")]
+    pub(crate) fn with_prefix_final_with_task_relay(
+        tool: fastmcp_protocol::FinalTool,
+        prefix: &str,
+        client: ProxyClient,
+        task_relay: Arc<ProxyFinalTaskRelay>,
+    ) -> McpResult<Self> {
+        let mut handler = Self::with_prefix_final(tool, prefix, client)?;
+        handler.task_relay = Some(task_relay);
+        Ok(handler)
+    }
 }
 
 impl ToolHandler for ProxyToolHandler {
