@@ -1139,7 +1139,8 @@ pub mod limits {
 
 pub use auth::{AccessToken, AuthContext, MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES};
 pub use context::{
-    CancelledError, CatalogChangePublisher, ClientCapabilityInfo, ClientRoot, ElicitationAction,
+    CancelledError, CatalogChangePublisher, ClientCapabilityInfo, ClientImplementationInfo,
+    ClientRoot, ElicitationAction,
     ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender, IntoOutcome,
     MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext,
     McpContextLeaseGuard, McpLogLevel, McpRequestCancellation, NoOpElicitationSender,

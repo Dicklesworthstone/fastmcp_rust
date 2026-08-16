@@ -1175,6 +1175,50 @@ impl ClientCapabilityInfo {
     }
 }
 
+/// Handler-visible slice of the self-reported modern client Implementation.
+///
+/// This is not authority. It is the request `_meta` identity the peer
+/// advertised. Name and version are always present when this value exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientImplementationInfo {
+    /// Programmatic client name.
+    pub name: String,
+    /// Client version.
+    pub version: String,
+    /// Optional display title. An empty present title remains present.
+    pub title: Option<String>,
+    /// Optional human-readable description.
+    pub description: Option<String>,
+    /// Optional website identity as advertised, not validated as authority.
+    pub website_url: Option<String>,
+    /// Optional icon source URIs in wire order.
+    pub icon_sources: Vec<String>,
+}
+
+impl ClientImplementationInfo {
+    /// Constructs a handler-visible identity from required nonempty fields.
+    #[must_use]
+    pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: version.into(),
+            title: None,
+            description: None,
+            website_url: None,
+            icon_sources: Vec::new(),
+        }
+    }
+
+    /// Returns whether any Implementation extras beyond name/version are present.
+    #[must_use]
+    pub fn has_extras(&self) -> bool {
+        self.title.is_some()
+            || self.description.is_some()
+            || self.website_url.is_some()
+            || !self.icon_sources.is_empty()
+    }
+}
+
 /// Server capability information accessible from handlers.
 ///
 /// This provides a simplified view of what capabilities this server advertises.
@@ -1435,6 +1479,8 @@ pub struct McpContext {
     prompt_get_depth: u32,
     /// Client capability information.
     client_capabilities: Option<ClientCapabilityInfo>,
+    /// Self-reported modern client Implementation identity, when advertised.
+    client_implementation: Option<ClientImplementationInfo>,
     /// Server capability information.
     server_capabilities: Option<ServerCapabilityInfo>,
     /// Optional log sender for `notifications/message`.
@@ -1513,6 +1559,7 @@ impl std::fmt::Debug for McpContext {
             .field("prompt_caller", &self.prompt_caller.is_some())
             .field("prompt_get_depth", &self.prompt_get_depth)
             .field("client_capabilities", &self.client_capabilities)
+            .field("client_implementation", &self.client_implementation)
             .field("server_capabilities", &self.server_capabilities)
             .field("log_sender", &self.log_sender.is_some())
             .field("min_log_level", &self.min_log_level)
@@ -1636,6 +1683,7 @@ impl McpContext {
             prompt_caller: None,
             prompt_get_depth: 0,
             client_capabilities: None,
+            client_implementation: None,
             server_capabilities: None,
             log_sender: None,
             min_log_level: None,
@@ -1676,6 +1724,7 @@ impl McpContext {
             prompt_caller: None,
             prompt_get_depth: 0,
             client_capabilities: None,
+            client_implementation: None,
             server_capabilities: None,
             log_sender: None,
             min_log_level: None,
@@ -1717,6 +1766,7 @@ impl McpContext {
             prompt_caller: None,
             prompt_get_depth: 0,
             client_capabilities: None,
+            client_implementation: None,
             server_capabilities: None,
             log_sender: None,
             min_log_level: None,
@@ -1762,6 +1812,7 @@ impl McpContext {
             prompt_caller: None,
             prompt_get_depth: 0,
             client_capabilities: None,
+            client_implementation: None,
             server_capabilities: None,
             log_sender: None,
             min_log_level: None,
@@ -2000,6 +2051,13 @@ impl McpContext {
     #[must_use]
     pub fn with_client_capabilities(mut self, capabilities: ClientCapabilityInfo) -> Self {
         self.client_capabilities = Some(capabilities);
+        self
+    }
+
+    /// Attaches the self-reported modern client Implementation identity.
+    #[must_use]
+    pub fn with_client_implementation(mut self, identity: ClientImplementationInfo) -> Self {
+        self.client_implementation = Some(identity);
         self
     }
 
@@ -2954,6 +3012,15 @@ impl McpContext {
     #[must_use]
     pub fn client_capabilities(&self) -> Option<&ClientCapabilityInfo> {
         self.client_capabilities.as_ref()
+    }
+
+    /// Returns the self-reported modern client Implementation, if advertised.
+    ///
+    /// This is request `_meta` identity, not authentication. A missing value
+    /// means the peer did not send `io.modelcontextprotocol/clientInfo`.
+    #[must_use]
+    pub fn client_implementation(&self) -> Option<&ClientImplementationInfo> {
+        self.client_implementation.as_ref()
     }
 
     /// Returns the server capability information, if available.
@@ -5345,6 +5412,22 @@ mod tests {
         assert!(ctx.client_supports_elicitation_form());
         assert!(!ctx.client_supports_elicitation_url());
         assert!(ctx.client_supports_roots());
+    }
+
+    #[test]
+    fn test_mcp_context_with_client_implementation() {
+        let cx = Cx::for_testing();
+        let mut identity = ClientImplementationInfo::new("e2e-client", "1.0.0");
+        identity.title = Some("Client Title".to_owned());
+        let ctx = McpContext::new(cx, 1).with_client_implementation(identity);
+        let observed = ctx
+            .client_implementation()
+            .expect("the attached identity must be retained");
+        assert_eq!(observed.name, "e2e-client");
+        assert_eq!(observed.title.as_deref(), Some("Client Title"));
+        assert!(observed.has_extras());
+        let bare = McpContext::new(Cx::for_testing(), 2);
+        assert!(bare.client_implementation().is_none());
     }
 
     #[test]
