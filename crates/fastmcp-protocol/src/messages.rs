@@ -125,6 +125,9 @@ pub const FINAL_CLIENT_CAPABILITIES_META_KEY: &str = "io.modelcontextprotocol/cl
 /// `_meta` key carrying optional client identity on a final request.
 pub const FINAL_CLIENT_INFO_META_KEY: &str = "io.modelcontextprotocol/clientInfo";
 
+/// `_meta` key carrying the client-selected logging floor on a final request.
+pub const FINAL_LOG_LEVEL_META_KEY: &str = "io.modelcontextprotocol/logLevel";
+
 /// `_meta` key carrying optional server identity on a final response.
 pub const FINAL_SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 
