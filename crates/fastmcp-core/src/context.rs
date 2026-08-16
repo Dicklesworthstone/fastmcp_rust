@@ -1850,6 +1850,14 @@ impl McpContext {
         self
     }
 
+    /// Returns the client-selected minimum log level for this request.
+    ///
+    /// `None` means the client has not opted into `notifications/message`.
+    #[must_use]
+    pub fn min_log_level(&self) -> Option<McpLogLevel> {
+        self.min_log_level
+    }
+
     /// Records the resource URIs this session has subscribed to.
     #[must_use]
     pub fn with_resource_subscriptions(
@@ -4772,6 +4780,7 @@ mod tests {
         assert!(captured.lock().expect("lock").is_empty());
 
         let ctx = silent.with_min_log_level(Some(McpLogLevel::Info));
+        assert_eq!(ctx.min_log_level(), Some(McpLogLevel::Info));
         ctx.debug("too-low");
         ctx.info("admitted");
         ctx.warning("also-admitted");
