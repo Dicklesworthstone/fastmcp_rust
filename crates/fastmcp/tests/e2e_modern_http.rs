@@ -179,6 +179,27 @@ fn public_http_instruction(_ctx: &McpContext, subject: String) -> Vec<PromptMess
     }]
 }
 
+const PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME: &str = "public-http-e2e-prompt-compose";
+
+/// Composes the public HTTP e2e prompt through `ctx.get_prompt`.
+#[tool(
+    name = "public-http-e2e-prompt-compose",
+    defaults(prompt = "public-http-e2e-prompt")
+)]
+async fn public_http_prompt_compose(
+    ctx: &McpContext,
+    subject: String,
+    prompt: String,
+) -> McpResult<String> {
+    let text = ctx
+        .get_prompt_text(&prompt, HashMap::from([("subject".to_owned(), subject)]))
+        .await
+        .map_err(|error| {
+            McpError::invalid_request(format!("compose-nested-prompt:{prompt}:{}", error.message))
+        })?;
+    Ok(format!("compose-prompt:{text}"))
+}
+
 /// Generated async `#[prompt]` that composes nested tool and resource reads.
 #[prompt(name = "public-http-e2e-macro-compose")]
 async fn public_http_macro_compose(
@@ -11002,6 +11023,148 @@ impl ToolHandler for PublicHttpFastTool {
     }
 }
 
+const PUBLIC_HTTP_PANIC_TOOL_NAME: &str = "public-http-e2e-panic";
+const PUBLIC_HTTP_PANIC_PAYLOAD: &str = "planted-handler-panic-payload";
+
+/// Live HTTP/WebSocket tool whose handler unwinds with a distinctive payload.
+struct PublicHttpPanicTool;
+
+impl ToolHandler for PublicHttpPanicTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_PANIC_TOOL_NAME.to_owned(),
+            description: Some("Proves live facade HTTP handler panic sanitization".to_owned()),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        panic!("{PUBLIC_HTTP_PANIC_PAYLOAD}")
+    }
+}
+
+const PUBLIC_HTTP_PANIC_RESOURCE_URI: &str = "test://public-http-e2e/panic";
+const PUBLIC_HTTP_PANIC_PROMPT_NAME: &str = "public-http-e2e-panic-prompt";
+
+/// Live HTTP/WebSocket resource whose handler unwinds with a distinctive payload.
+struct PublicHttpPanicResource;
+
+impl ResourceHandler for PublicHttpPanicResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PUBLIC_HTTP_PANIC_RESOURCE_URI.to_owned(),
+            name: "panic-resource".to_owned(),
+            description: Some("Proves live facade HTTP resource panic sanitization".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read(&self, _context: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        panic!("{PUBLIC_HTTP_PANIC_PAYLOAD}")
+    }
+}
+
+/// Live HTTP/WebSocket prompt whose handler unwinds with a distinctive payload.
+struct PublicHttpPanicPrompt;
+
+impl PromptHandler for PublicHttpPanicPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: PUBLIC_HTTP_PANIC_PROMPT_NAME.to_owned(),
+            description: Some("Proves live facade HTTP prompt panic sanitization".to_owned()),
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        panic!("{PUBLIC_HTTP_PANIC_PAYLOAD}")
+    }
+}
+
+const PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME: &str = "public-http-e2e-complete-peer";
+
+/// Peer prompt that declares a completion argument so final dispatch reaches
+/// the panic completion handler instead of refusing before invocation.
+struct PublicHttpCompletePeerPrompt;
+
+impl PromptHandler for PublicHttpCompletePeerPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME.to_owned(),
+            description: Some("Peer prompt for live completion panic sanitization".to_owned()),
+            arguments: vec![PromptArgument {
+                name: "subject".to_owned(),
+                description: Some("Declared completion argument".to_owned()),
+                required: false,
+            }],
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::text("complete-peer"),
+        }])
+    }
+}
+
+/// Live HTTP/WebSocket completion whose handler unwinds with a distinctive payload.
+struct PublicHttpPanicCompletion;
+
+impl CompletionHandler for PublicHttpPanicCompletion {
+    fn complete_legacy(
+        &self,
+        _ctx: &McpContext,
+        _params: legacy_2024::LegacyCompletionParams,
+    ) -> McpResult<legacy_2024::CompletionValues> {
+        panic!("{PUBLIC_HTTP_PANIC_PAYLOAD}")
+    }
+
+    fn complete_final(
+        &self,
+        _ctx: &McpContext,
+        _params: modern::FinalCompletionParams,
+    ) -> McpResult<modern::FinalCompletionValues> {
+        panic!("{PUBLIC_HTTP_PANIC_PAYLOAD}")
+    }
+}
+
+fn public_http_panic_completion_params() -> modern::CompletionParams {
+    modern::CompletionParams {
+        reference: modern::CompletionReference::PromptWithTitle {
+            name: PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME.to_owned(),
+            title: "Complete Peer".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "subject".to_owned(),
+            value: "cross-era".to_owned(),
+        },
+        context: None,
+    }
+}
+
 fn spawn_modern_handler_timeout_http_server() -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -11123,6 +11286,439 @@ fn e2e_public_http_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
             _ => false,
         }),
         "the fast peer tool must still complete: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_modern_handler_panic_http_server() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let outcome = runtime_block_on(async move {
+            let cx = Cx::current().expect("facade runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("handler-panic HTTP server control receiver went away".to_owned());
+            }
+            let server = modern::ServerBuilder::new("facade-http-handler-panic", "1.0.0")
+                .tool(PublicHttpPanicTool)
+                .tool(PublicHttpFastTool)
+                .resource(PublicHttpPanicResource)
+                .resource(PublicHttpPlainResource)
+                .prompt(PublicHttpPanicPrompt)
+                .prompt(PublicHttpPlainPrompt)
+                .prompt(PublicHttpCompletePeerPrompt)
+                .prompt_completion_handler(
+                    PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME,
+                    PublicHttpPanicCompletion,
+                )
+                .completion_handler(PublicHttpPanicCompletion)
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!("handler-panic facade HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("handler-panic facade HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err("handler-panic HTTP server startup receiver went away".to_owned());
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("handler-panic facade HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("handler-panic facade HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => panic!("handler-panic facade HTTP server failed to start: {error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("handler-panic facade HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[test]
+fn e2e_public_http_handler_panic_is_sanitized_and_admits_fast_peer() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_handler_panic_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-handler-panic", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the handler-panic HTTP server");
+
+    let panicked = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_PANIC_TOOL_NAME, json!({})),
+    )
+    .expect_err("a panicking tools/call must stay a protocol error");
+    let panicked = format!("{panicked:?}");
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "a handler panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "a handler panic must not leak the unwind payload: {panicked}"
+    );
+
+    let fast = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+    )
+    .expect("changing only the tool must still be admitted after a sanitized panic");
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the fast peer tool must still complete after a sanitized panic: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_catalog_panic_is_sanitized_and_admits_fast_peer() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_handler_panic_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-catalog-panic", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the catalog-panic HTTP server");
+
+    let panicked_resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_PANIC_RESOURCE_URI),
+    )
+    .expect_err("a panicking resources/read must stay a protocol error");
+    let panicked_resource = format!("{panicked_resource:?}");
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "a resource panic must become the sanitized InternalError: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "a resource panic must not leak the unwind payload: {panicked_resource}"
+    );
+
+    let panicked_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, PUBLIC_HTTP_PANIC_PROMPT_NAME, HashMap::new()),
+    )
+    .expect_err("a panicking prompts/get must stay a protocol error");
+    let panicked_prompt = format!("{panicked_prompt:?}");
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "a prompt panic must become the sanitized InternalError: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "a prompt panic must not leak the unwind payload: {panicked_prompt}"
+    );
+
+    let peer_resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_PLAIN_RESOURCE_URI),
+    )
+    .expect("changing only the resource must still be admitted after a sanitized panic");
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains("plain-resource"),
+        "the peer resource must still complete after a sanitized catalog panic: {peer_resource}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, PUBLIC_HTTP_PLAIN_PROMPT_NAME, HashMap::new()),
+    )
+    .expect("changing only the prompt must still be admitted after a sanitized panic");
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("plain")
+            || peer_prompt.contains("icon-prompt")
+            || !peer_prompt.is_empty(),
+        "the peer prompt must still complete after a sanitized catalog panic: {peer_prompt}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_completion_panic_is_sanitized_and_admits_fast_peer() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_handler_panic_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-completion-panic", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the completion-panic HTTP server");
+
+    let panicked = runtime_block_on_bounded(
+        &cx,
+        client.complete(&cx, public_http_panic_completion_params()),
+    )
+    .expect_err("a panicking completion/complete must stay a protocol error");
+    let panicked = format!("{panicked:?}");
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "a completion panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "a completion panic must not leak the unwind payload: {panicked}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME, HashMap::new()),
+    )
+    .expect(
+        "changing only the method must still admit prompts/get after a sanitized completion panic",
+    );
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("complete-peer"),
+        "the peer prompt must still complete after a sanitized completion panic: {peer_prompt}"
+    );
+
+    let fast = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+    )
+    .expect(
+        "changing only the method must still admit tools/call after a sanitized completion panic",
+    );
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the fast peer tool must still complete after a sanitized completion panic: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_TEMPLATE_COMPLETION_VALUE: &str = "alice";
+const PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE: &str = "http-note-completion-legacy";
+
+struct PublicHttpTemplateCompletion;
+
+impl CompletionHandler for PublicHttpTemplateCompletion {
+    fn complete_legacy(
+        &self,
+        _context: &McpContext,
+        params: legacy_2024::LegacyCompletionParams,
+    ) -> McpResult<legacy_2024::CompletionValues> {
+        match &params.reference {
+            legacy_2024::LegacyCompletionReference::Resource { uri }
+                if uri == PUBLIC_HTTP_CURSOR_TEMPLATE && params.argument.name == "id" => {}
+            _ => {
+                return Err(McpError::invalid_params(
+                    "template completion requires the exact resource template",
+                ));
+            }
+        }
+        Ok(legacy_2024::CompletionValues {
+            values: vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE.to_owned()],
+            total: Some(1),
+            has_more: Some(false),
+        })
+    }
+
+    fn complete_final(
+        &self,
+        _context: &McpContext,
+        params: modern::FinalCompletionParams,
+    ) -> McpResult<modern::FinalCompletionValues> {
+        if !matches!(
+            &params.reference,
+            modern::FinalCompletionReference::Resource { uri }
+                if uri == PUBLIC_HTTP_CURSOR_TEMPLATE
+        ) || params.argument.name != "id"
+            || params.argument.value != "al"
+        {
+            return Err(McpError::invalid_params(
+                "template completion requires the exact modern request shape",
+            ));
+        }
+        Ok(modern::FinalCompletionValues {
+            values: vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_VALUE.to_owned()],
+            total: Some(modern::JsonInteger::from(1_i64)),
+            has_more: Some(false),
+        })
+    }
+}
+
+fn public_http_template_completion_params() -> modern::CompletionParams {
+    modern::CompletionParams {
+        reference: modern::CompletionReference::Resource {
+            uri: PUBLIC_HTTP_CURSOR_TEMPLATE.to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "id".to_owned(),
+            value: "al".to_owned(),
+        },
+        context: None,
+    }
+}
+
+fn spawn_modern_template_completion_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("modern template completion", || {
+        ServerBuilder::new("facade-http-template-complete", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpFastTool)
+            .resource(PublicHttpCursorTemplateResource)
+            .resource(PublicHttpOtherTemplateResource)
+            .resource_template_completion_handler(
+                PUBLIC_HTTP_CURSOR_TEMPLATE,
+                PublicHttpTemplateCompletion,
+            )
+            .build()
+    })
+}
+
+fn spawn_legacy_template_completion_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy template completion", || {
+        ServerBuilder::new("facade-http-legacy-template-complete", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpFastTool)
+            .resource(PublicHttpCursorTemplateResource)
+            .resource(PublicHttpOtherTemplateResource)
+            .legacy_resource_template_completion_handler(
+                PUBLIC_HTTP_CURSOR_TEMPLATE,
+                PublicHttpTemplateCompletion,
+            )
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_resource_template_completion_is_retained_and_unregistered_template_is_refused() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_template_completion_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-template-complete", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the template-completion HTTP server");
+
+    let advertised = discover_capability_map(&client);
+    assert!(
+        advertised.get("completions").is_some(),
+        "installing a resource-template completion provider must advertise completions: {advertised}"
+    );
+
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.complete(&cx, public_http_template_completion_params()),
+    )
+    .expect("live bind_http must complete the registered resource template provider");
+    assert_eq!(
+        result.completion.values,
+        vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_VALUE.to_owned()],
+        "the exact FinalCompletionResult retains the template provider value: {result:?}"
+    );
+
+    let mut undeclared = public_http_template_completion_params();
+    undeclared.argument.name = "undeclared".to_owned();
+    let undeclared = runtime_block_on_bounded(&cx, client.complete(&cx, undeclared))
+        .expect_err("only an undeclared template variable is rejected");
+    assert!(matches!(
+        undeclared,
+        modern::HttpClientError::CoreResult(error) if error.code == McpErrorCode::InvalidParams
+    ));
+
+    let mut other_template = public_http_template_completion_params();
+    other_template.reference = modern::CompletionReference::Resource {
+        uri: PUBLIC_HTTP_OTHER_TEMPLATE.to_owned(),
+    };
+    let missing = runtime_block_on_bounded(&cx, client.complete(&cx, other_template))
+        .expect_err("changing only the template URI must refuse a missing provider");
+    assert!(matches!(
+        missing,
+        modern::HttpClientError::CoreResult(error) if error.code == McpErrorCode::InvalidParams
+    ));
+
+    let fast = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+    )
+    .expect("changing only the method must still admit tools/call after template completion");
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the fast peer tool must still complete after template completion: {fast:?}"
     );
 
     drop(client);
@@ -15435,6 +16031,23 @@ fn spawn_legacy_timeout_http_server() -> HttpServerFixture {
     })
 }
 
+fn spawn_legacy_panic_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy panic", || {
+        ServerBuilder::new("facade-http-legacy-panic", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpPanicTool)
+            .tool(PublicHttpFastTool)
+            .resource(PublicHttpPanicResource)
+            .resource(PublicHttpPlainResource)
+            .prompt(PublicHttpPanicPrompt)
+            .prompt(PublicHttpPlainPrompt)
+            .prompt(PublicHttpCompletePeerPrompt)
+            .legacy_completion_handler(PublicHttpPanicCompletion)
+            .build()
+    })
+}
+
 fn spawn_legacy_surface_http_server() -> HttpServerFixture {
     spawn_legacy_http_server("legacy surface", || {
         ServerBuilder::new("facade-http-legacy-surface", "1.0.0")
@@ -15514,6 +16127,473 @@ fn e2e_public_http_legacy_handler_timeout_refuses_late_tool_and_admits_fast_peer
         legacy_http_tool_text(&fast).as_deref(),
         Some("fast"),
         "the fast exact-2024 HTTP peer tool must still complete: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_handler_panic_is_sanitized_and_admits_fast_peer() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_panic_http_server();
+    let mut client =
+        connect_legacy_http_client(&cx, server.address(), "e2e-public-http-legacy-panic");
+
+    let panicked = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_PANIC_TOOL_NAME,
+        json!({}),
+        "exact-2024 HTTP panic tools/call",
+    );
+    let panicked = match panicked {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a panicking exact-2024 HTTP tools/call must stay an error result: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "an exact-2024 HTTP handler panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "an exact-2024 HTTP handler panic must not leak the unwind payload: {panicked}"
+    );
+
+    let fast = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_FAST_TOOL_NAME,
+        json!({}),
+        "exact-2024 HTTP fast tools/call after panic",
+    )
+    .expect("changing only the tool must still be admitted after a sanitized exact-2024 panic");
+    assert_eq!(
+        legacy_http_tool_text(&fast).as_deref(),
+        Some("fast"),
+        "the fast exact-2024 HTTP peer tool must still complete after a sanitized panic: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_catalog_panic_is_sanitized_and_admits_fast_peer() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_panic_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-catalog-panic",
+    );
+
+    let panicked_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP panic resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_PANIC_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    );
+    let panicked_resource = match panicked_resource {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "an exact-2024 HTTP resource panic must become the sanitized InternalError: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "an exact-2024 HTTP resource panic must not leak the unwind payload: {panicked_resource}"
+    );
+
+    let panicked_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP panic prompts/get",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_PANIC_PROMPT_NAME.to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    );
+    let panicked_prompt = match panicked_prompt {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "an exact-2024 HTTP prompt panic must become the sanitized InternalError: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "an exact-2024 HTTP prompt panic must not leak the unwind payload: {panicked_prompt}"
+    );
+
+    let peer_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP peer resources/read after panic",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_PLAIN_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the resource must still be admitted after a sanitized exact-2024 panic");
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains("plain-resource"),
+        "the exact-2024 HTTP peer resource must still complete after a sanitized catalog panic: {peer_resource}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP peer prompts/get after panic",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_PLAIN_PROMPT_NAME.to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the prompt must still be admitted after a sanitized exact-2024 panic");
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("plain") || !peer_prompt.is_empty(),
+        "the exact-2024 HTTP peer prompt must still complete after a sanitized catalog panic: {peer_prompt}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_completion_panic_is_sanitized_and_admits_fast_peer() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_panic_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-completion-panic",
+    );
+
+    let panicked = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP panic completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME.to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+            },
+        ),
+    );
+    let panicked = match panicked {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "an exact-2024 HTTP completion panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "an exact-2024 HTTP completion panic must not leak the unwind payload: {panicked}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP peer prompts/get after completion panic",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME.to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the method must still admit prompts/get after a sanitized exact-2024 completion panic");
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("complete-peer"),
+        "the exact-2024 HTTP peer prompt must still complete after a sanitized completion panic: {peer_prompt}"
+    );
+
+    let fast = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_FAST_TOOL_NAME,
+        json!({}),
+        "exact-2024 HTTP fast tools/call after completion panic",
+    )
+    .expect("changing only the method must still admit tools/call after a sanitized exact-2024 completion panic");
+    assert_eq!(
+        legacy_http_tool_text(&fast).as_deref(),
+        Some("fast"),
+        "the fast exact-2024 HTTP peer tool must still complete after a sanitized completion panic: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_resource_template_completion_is_retained_and_unregistered_template_is_refused()
+ {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_template_completion_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-template-complete",
+    );
+
+    assert!(
+        client.server_capabilities().completions.is_some(),
+        "installing a legacy resource-template completion provider must advertise completions: {:?}",
+        client.server_capabilities()
+    );
+
+    let completed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP template completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: PUBLIC_HTTP_CURSOR_TEMPLATE.to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "id".to_owned(),
+                    value: "al".to_owned(),
+                },
+            },
+        ),
+    )
+    .expect("live exact-2024 HTTP must complete the registered resource template provider");
+    assert_eq!(
+        completed.completion.values,
+        vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE.to_owned()],
+        "the exact-2024 template provider must retain its values: {completed:?}"
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP unregistered template completion",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: PUBLIC_HTTP_OTHER_TEMPLATE.to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "id".to_owned(),
+                    value: "al".to_owned(),
+                },
+            },
+        ),
+    )
+    .expect_err("changing only the template URI must refuse a missing exact-2024 provider");
+    let missing = format!("{missing:?}");
+    assert!(
+        missing.contains("MethodNotFound") || missing.contains("InvalidParams"),
+        "an unregistered exact-2024 template completion must stay refused: {missing}"
+    );
+
+    let fast = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_FAST_TOOL_NAME,
+        json!({}),
+        "exact-2024 HTTP fast tools/call after template completion",
+    )
+    .expect("changing only the method must still admit tools/call after template completion");
+    assert_eq!(
+        legacy_http_tool_text(&fast).as_deref(),
+        Some("fast"),
+        "the fast exact-2024 HTTP peer tool must still complete after template completion: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+fn spawn_modern_compose_prompt_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("modern compose prompt", || {
+        ServerBuilder::new("facade-http-compose-prompt", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpPromptCompose)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .build()
+    })
+}
+
+fn spawn_legacy_compose_prompt_http_server() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy compose prompt", || {
+        ServerBuilder::new("facade-http-legacy-compose-prompt", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpPromptCompose)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .build()
+    })
+}
+
+#[test]
+fn e2e_public_http_composes_nested_prompt_and_refuses_missing_name() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_compose_prompt_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-compose-prompt", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the compose-prompt HTTP server");
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+            json!({"subject": "alpha"}),
+        ),
+    )
+    .expect("live bind_http compose_prompt must nest the instruction prompt");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "compose-prompt:prompt:alpha",
+            _ => false,
+        }),
+        "compose_prompt must retain the nested prompt text: {composed:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+            json!({
+                "subject": "alpha",
+                "prompt": "public-http-e2e-missing",
+            }),
+        ),
+    );
+    let missing = match missing {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!("changing only the nested prompt name must refuse: {result:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-prompt")
+            || missing.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing}"
+    );
+
+    let fast = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+    )
+    .expect("changing only the method must still admit tools/call after prompt compose");
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the fast peer tool must still complete after prompt compose: {fast:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_legacy_composes_nested_prompt_and_refuses_missing_name() {
+    let cx = Cx::for_request();
+    let server = spawn_legacy_compose_prompt_http_server();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        server.address(),
+        "e2e-public-http-legacy-compose-prompt",
+    );
+
+    let composed = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+        json!({"subject": "alpha"}),
+        "exact-2024 HTTP compose_prompt",
+    )
+    .expect("live exact-2024 HTTP compose_prompt must nest the instruction prompt");
+    assert_eq!(
+        legacy_http_tool_text(&composed).as_deref(),
+        Some("compose-prompt:prompt:alpha"),
+        "compose_prompt must retain the nested prompt text: {composed:?}"
+    );
+
+    let missing = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+        json!({
+            "subject": "alpha",
+            "prompt": "public-http-e2e-missing",
+        }),
+        "exact-2024 HTTP missing nested prompt",
+    );
+    let missing = match missing {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!("changing only the nested prompt name must refuse: {result:?}"),
+    };
+    assert!(
+        missing.contains("public-http-e2e-missing")
+            || missing.contains("compose-nested-prompt")
+            || missing.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing}"
+    );
+
+    let fast = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_FAST_TOOL_NAME,
+        json!({}),
+        "exact-2024 HTTP fast tools/call after prompt compose",
+    )
+    .expect("changing only the method must still admit tools/call after prompt compose");
+    assert_eq!(
+        legacy_http_tool_text(&fast).as_deref(),
+        Some("fast"),
+        "the fast exact-2024 HTTP peer tool must still complete after prompt compose: {fast:?}"
     );
 
     drop(client);
@@ -20202,6 +21282,256 @@ mod live_websocket_bind {
     }
 
     #[test]
+    fn e2e_public_websocket_bind_handler_panic_is_sanitized_and_admits_fast_peer() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx =
+                Cx::current().expect("owned WebSocket panic runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-panic", "1.0.0")
+                .tool(PublicHttpPanicTool)
+                .tool(PublicHttpFastTool)
+                .resource(PublicHttpPanicResource)
+                .resource(PublicHttpPlainResource)
+                .prompt(PublicHttpPanicPrompt)
+                .prompt(PublicHttpPlainPrompt)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket panic must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket panic publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public bind_websocket panic serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket panic initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates panic over bind_websocket");
+
+            let panicked = websocket_client_bounded(
+                &cx,
+                "live bind_websocket panic tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_PANIC_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("a panicking tools/call must stay a protocol error");
+            let panicked = format!("{panicked:?}");
+            assert!(
+                panicked.contains("Internal server error") || panicked.contains("InternalError"),
+                "a handler panic must become the sanitized InternalError: {panicked}"
+            );
+            assert!(
+                !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "a handler panic must not leak the unwind payload: {panicked}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live bind_websocket fast tools/call after panic",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the tool must still be admitted after a sanitized panic");
+            assert!(
+                fast.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "the fast peer tool must still complete after a sanitized panic: {fast:?}"
+            );
+
+            let panicked_resource = websocket_client_bounded(
+                &cx,
+                "live bind_websocket panic resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_PANIC_RESOURCE_URI),
+            )
+            .await
+            .expect_err("a panicking resources/read must stay a protocol error");
+            let panicked_resource = format!("{panicked_resource:?}");
+            assert!(
+                panicked_resource.contains("Internal server error")
+                    || panicked_resource.contains("InternalError"),
+                "a resource panic must become the sanitized InternalError: {panicked_resource}"
+            );
+            assert!(
+                !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "a resource panic must not leak the unwind payload: {panicked_resource}"
+            );
+            let peer_resource = websocket_client_bounded(
+                &cx,
+                "live bind_websocket peer resources/read after panic",
+                client.read_resource(&cx, PUBLIC_HTTP_PLAIN_RESOURCE_URI),
+            )
+            .await
+            .expect("changing only the resource must still be admitted after a sanitized panic");
+            let peer_resource = format!("{peer_resource:?}");
+            assert!(
+                peer_resource.contains("plain-resource"),
+                "the peer resource must still complete after a sanitized catalog panic: {peer_resource}"
+            );
+
+            let panicked_prompt = websocket_client_bounded(
+                &cx,
+                "live bind_websocket panic prompts/get",
+                client.get_prompt(&cx, PUBLIC_HTTP_PANIC_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect_err("a panicking prompts/get must stay a protocol error");
+            let panicked_prompt = format!("{panicked_prompt:?}");
+            assert!(
+                panicked_prompt.contains("Internal server error")
+                    || panicked_prompt.contains("InternalError"),
+                "a prompt panic must become the sanitized InternalError: {panicked_prompt}"
+            );
+            assert!(
+                !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "a prompt panic must not leak the unwind payload: {panicked_prompt}"
+            );
+            let peer_prompt = websocket_client_bounded(
+                &cx,
+                "live bind_websocket peer prompts/get after panic",
+                client.get_prompt(&cx, PUBLIC_HTTP_PLAIN_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect("changing only the prompt must still be admitted after a sanitized panic");
+            let peer_prompt = format!("{peer_prompt:?}");
+            assert!(
+                peer_prompt.contains("plain") || !peer_prompt.is_empty(),
+                "the peer prompt must still complete after a sanitized catalog panic: {peer_prompt}"
+            );
+
+            websocket_client_bounded(&cx, "live bind_websocket panic close", client.close(&cx))
+                .await
+                .expect("the public WebSocket panic client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_completion_panic_is_sanitized_and_admits_fast_peer() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned WebSocket completion-panic runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-completion-panic", "1.0.0")
+                .tool(PublicHttpFastTool)
+                .prompt(PublicHttpCompletePeerPrompt)
+                .prompt_completion_handler(
+                    PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME,
+                    PublicHttpPanicCompletion,
+                )
+                .completion_handler(PublicHttpPanicCompletion)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public bind_websocket completion panic must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public bind_websocket completion panic publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public bind_websocket completion panic serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live bind_websocket completion-panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public bind_websocket completion panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live bind_websocket completion-panic initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-completion-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates completion panic over bind_websocket");
+
+            let panicked = websocket_client_bounded(
+                &cx,
+                "live bind_websocket panic completion/complete",
+                client.complete(&cx, public_http_panic_completion_params()),
+            )
+            .await
+            .expect_err("a panicking completion/complete must stay a protocol error");
+            let panicked = format!("{panicked:?}");
+            assert!(
+                panicked.contains("Internal server error") || panicked.contains("InternalError"),
+                "a completion panic must become the sanitized InternalError: {panicked}"
+            );
+            assert!(
+                !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "a completion panic must not leak the unwind payload: {panicked}"
+            );
+
+            let peer_prompt = websocket_client_bounded(
+                &cx,
+                "live bind_websocket peer prompts/get after completion panic",
+                client.get_prompt(&cx, PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect("changing only the method must still admit prompts/get after a sanitized completion panic");
+            let peer_prompt = format!("{peer_prompt:?}");
+            assert!(
+                peer_prompt.contains("complete-peer"),
+                "the peer prompt must still complete after a sanitized completion panic: {peer_prompt}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live bind_websocket fast tools/call after completion panic",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after a sanitized completion panic");
+            assert!(
+                fast.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "the fast peer tool must still complete after a sanitized completion panic: {fast:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live bind_websocket completion-panic close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the public WebSocket completion-panic client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
     fn e2e_public_websocket_bind_static_token_refuses_missing_and_wrong_and_commits_subject() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
@@ -21682,6 +23012,262 @@ mod live_websocket_bind {
     }
 
     #[test]
+    fn e2e_public_websocket_legacy_bind_handler_panic_is_sanitized_and_admits_fast_peer() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned exact-2024 WebSocket panic runtime installs an ambient context");
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-panic", "1.0.0")
+                .tool(PublicHttpPanicTool)
+                .tool(PublicHttpFastTool)
+                .resource(PublicHttpPanicResource)
+                .resource(PublicHttpPlainResource)
+                .prompt(PublicHttpPanicPrompt)
+                .prompt(PublicHttpPlainPrompt)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket panic must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket panic publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public LegacyOnly bind_websocket panic serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 panic initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates panic over bind_websocket");
+
+            let panicked = websocket_client_bounded(
+                &cx,
+                "live exact-2024 panic tools/call",
+                client.call_tool(&cx, PUBLIC_HTTP_PANIC_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("a panicking exact-2024 tools/call must stay a protocol error");
+            let panicked = format!("{panicked:?}");
+            assert!(
+                panicked.contains("Internal server error") || panicked.contains("InternalError"),
+                "an exact-2024 WebSocket handler panic must become the sanitized InternalError: {panicked}"
+            );
+            assert!(
+                !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "an exact-2024 WebSocket handler panic must not leak the unwind payload: {panicked}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live exact-2024 fast tools/call after panic",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the tool must still be admitted after a sanitized exact-2024 panic");
+            assert_eq!(
+                legacy_http_tool_text(&fast).as_deref(),
+                Some("fast"),
+                "the fast exact-2024 WebSocket peer tool must still complete after a sanitized panic: {fast:?}"
+            );
+
+            let panicked_resource = websocket_client_bounded(
+                &cx,
+                "live exact-2024 panic resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_PANIC_RESOURCE_URI),
+            )
+            .await
+            .expect_err("a panicking exact-2024 resources/read must stay a protocol error");
+            let panicked_resource = format!("{panicked_resource:?}");
+            assert!(
+                panicked_resource.contains("Internal server error")
+                    || panicked_resource.contains("InternalError"),
+                "an exact-2024 WebSocket resource panic must become the sanitized InternalError: {panicked_resource}"
+            );
+            assert!(
+                !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "an exact-2024 WebSocket resource panic must not leak the unwind payload: {panicked_resource}"
+            );
+            let peer_resource = websocket_client_bounded(
+                &cx,
+                "live exact-2024 peer resources/read after panic",
+                client.read_resource(&cx, PUBLIC_HTTP_PLAIN_RESOURCE_URI),
+            )
+            .await
+            .expect("changing only the resource must still be admitted after a sanitized exact-2024 panic");
+            let peer_resource = format!("{peer_resource:?}");
+            assert!(
+                peer_resource.contains("plain-resource"),
+                "the exact-2024 WebSocket peer resource must still complete after a sanitized catalog panic: {peer_resource}"
+            );
+
+            let panicked_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 panic prompts/get",
+                client.get_prompt(&cx, PUBLIC_HTTP_PANIC_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect_err("a panicking exact-2024 prompts/get must stay a protocol error");
+            let panicked_prompt = format!("{panicked_prompt:?}");
+            assert!(
+                panicked_prompt.contains("Internal server error")
+                    || panicked_prompt.contains("InternalError"),
+                "an exact-2024 WebSocket prompt panic must become the sanitized InternalError: {panicked_prompt}"
+            );
+            assert!(
+                !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "an exact-2024 WebSocket prompt panic must not leak the unwind payload: {panicked_prompt}"
+            );
+            let peer_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 peer prompts/get after panic",
+                client.get_prompt(&cx, PUBLIC_HTTP_PLAIN_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect("changing only the prompt must still be admitted after a sanitized exact-2024 panic");
+            let peer_prompt = format!("{peer_prompt:?}");
+            assert!(
+                peer_prompt.contains("plain") || !peer_prompt.is_empty(),
+                "the exact-2024 WebSocket peer prompt must still complete after a sanitized catalog panic: {peer_prompt}"
+            );
+
+            websocket_client_bounded(&cx, "live exact-2024 panic close", client.close(&cx))
+                .await
+                .expect("the exact-2024 panic WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_completion_panic_is_sanitized_and_admits_fast_peer() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket completion-panic runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-completion-panic", "1.0.0")
+                .tool(PublicHttpFastTool)
+                .prompt(PublicHttpCompletePeerPrompt)
+                .completion_handler(PublicHttpPanicCompletion)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket completion panic must bind a localhost listener");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket completion panic publishes its bound address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public LegacyOnly bind_websocket completion panic serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 completion-panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket completion panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 completion-panic initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-completion-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates completion panic over bind_websocket");
+
+            let panicked = websocket_client_bounded(
+                &cx,
+                "live exact-2024 panic completion/complete",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Prompt {
+                            name: PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME.to_owned(),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "subject".to_owned(),
+                            value: "cross-era".to_owned(),
+                        },
+                    },
+                ),
+            )
+            .await;
+            let panicked = match panicked {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked.contains("Internal server error") || panicked.contains("InternalError"),
+                "an exact-2024 WebSocket completion panic must become the sanitized InternalError: {panicked}"
+            );
+            assert!(
+                !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "an exact-2024 WebSocket completion panic must not leak the unwind payload: {panicked}"
+            );
+
+            let peer_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 peer prompts/get after completion panic",
+                client.get_prompt(&cx, PUBLIC_HTTP_COMPLETE_PEER_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect("changing only the method must still admit prompts/get after a sanitized exact-2024 completion panic");
+            let peer_prompt = format!("{peer_prompt:?}");
+            assert!(
+                peer_prompt.contains("complete-peer"),
+                "the exact-2024 WebSocket peer prompt must still complete after a sanitized completion panic: {peer_prompt}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live exact-2024 fast tools/call after completion panic",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after a sanitized exact-2024 completion panic");
+            assert_eq!(
+                legacy_http_tool_text(&fast).as_deref(),
+                Some("fast"),
+                "the fast exact-2024 WebSocket peer tool must still complete after a sanitized completion panic: {fast:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 completion-panic close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the exact-2024 completion-panic WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
     fn e2e_public_websocket_legacy_bind_retains_tools_list_changed() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
@@ -22300,6 +23886,249 @@ mod live_websocket_bind {
             cx.set_cancel_requested(true);
             advertised_listener.abort();
             omitted_listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_resource_template_completion_is_retained_and_unregistered_template_is_refused()
+     {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket template-complete runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new(
+                "facade-ws-legacy-template-complete",
+                "1.0.0",
+            )
+            .tool(PublicHttpFastTool)
+            .resource(PublicHttpCursorTemplateResource)
+            .resource(PublicHttpOtherTemplateResource)
+            .resource_template_completion_handler(
+                PUBLIC_HTTP_CURSOR_TEMPLATE,
+                PublicHttpTemplateCompletion,
+            )
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect(
+                    "public LegacyOnly bind_websocket template complete must bind a localhost listener",
+                );
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket template complete publishes its bound address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("legacy template-complete serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 template-complete handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("template-complete exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 template-complete initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-template-complete", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the template-complete exact-2024 WebSocket peer must initialize");
+            assert!(
+                client.server_capabilities().completions.is_some(),
+                "installing a legacy resource-template completion provider must advertise completions: {:?}",
+                client.server_capabilities()
+            );
+
+            let completed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 template completion/complete",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Resource {
+                            uri: PUBLIC_HTTP_CURSOR_TEMPLATE.to_owned(),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "id".to_owned(),
+                            value: "al".to_owned(),
+                        },
+                    },
+                ),
+            )
+            .await
+            .expect("live exact-2024 WebSocket must complete the registered resource template provider");
+            assert_eq!(
+                completed.completion.values,
+                vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE.to_owned()],
+                "the exact-2024 WebSocket template provider must retain its values: {completed:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unregistered template completion",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Resource {
+                            uri: PUBLIC_HTTP_OTHER_TEMPLATE.to_owned(),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "id".to_owned(),
+                            value: "al".to_owned(),
+                        },
+                    },
+                ),
+            )
+            .await
+            .expect_err("changing only the template URI must refuse a missing exact-2024 provider");
+            let missing = format!("{missing:?}");
+            assert!(
+                missing.contains("MethodNotFound") || missing.contains("InvalidParams"),
+                "an unregistered exact-2024 WebSocket template completion must stay refused: {missing}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live exact-2024 fast tools/call after template completion",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after template completion");
+            assert_eq!(
+                legacy_http_tool_text(&fast).as_deref(),
+                Some("fast"),
+                "the fast exact-2024 WebSocket peer tool must still complete after template completion: {fast:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 template-complete close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the exact-2024 template-complete WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_composes_nested_prompt_and_refuses_missing_name() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket compose-prompt runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-compose-prompt", "1.0.0")
+                .tool(PublicHttpPromptCompose)
+                .tool(PublicHttpFastTool)
+                .prompt(PublicHttpInstructionPrompt)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket compose-prompt must bind");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket compose-prompt publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("legacy compose-prompt serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("compose-prompt exact-2024 WebSocket must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose-prompt initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-compose-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the compose-prompt exact-2024 WebSocket peer must initialize");
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose_prompt",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+                    json!({"subject": "alpha"}),
+                ),
+            )
+            .await
+            .expect("live exact-2024 WebSocket compose_prompt must nest the instruction prompt");
+            assert_eq!(
+                legacy_http_tool_text(&composed).as_deref(),
+                Some("compose-prompt:prompt:alpha"),
+                "compose_prompt must retain the nested prompt text: {composed:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 missing nested prompt",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+                    json!({
+                        "subject": "alpha",
+                        "prompt": "public-http-e2e-missing",
+                    }),
+                ),
+            )
+            .await;
+            let missing = match missing {
+                Ok(result) if result.is_error => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+                Ok(result) => panic!("changing only the nested prompt name must refuse: {result:?}"),
+            };
+            assert!(
+                missing.contains("public-http-e2e-missing")
+                    || missing.contains("compose-nested-prompt")
+                    || missing.contains("not found"),
+                "the nested unknown prompt must stay a handler-visible refusal: {missing}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live exact-2024 fast tools/call after prompt compose",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after prompt compose");
+            assert_eq!(
+                legacy_http_tool_text(&fast).as_deref(),
+                Some("fast"),
+                "the fast exact-2024 WebSocket peer tool must still complete after prompt compose: {fast:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 compose-prompt close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the exact-2024 compose-prompt WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
         });
     }
 
@@ -24923,6 +26752,243 @@ mod live_websocket_bind {
             cx.set_cancel_requested(true);
             advertised_listener.abort();
             omitted_listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_resource_template_completion_is_retained_and_unregistered_template_is_refused()
+     {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket template-complete runtime installs an ambient context",
+            );
+            let server = modern::ServerBuilder::new("facade-ws-template-complete", "1.0.0")
+                .tool(PublicHttpFastTool)
+                .resource(PublicHttpCursorTemplateResource)
+                .resource(PublicHttpOtherTemplateResource)
+                .resource_template_completion_handler(
+                    PUBLIC_HTTP_CURSOR_TEMPLATE,
+                    PublicHttpTemplateCompletion,
+                )
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect(
+                    "public ModernOnly bind_websocket template complete must bind a localhost listener",
+                );
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket template complete publishes its bound address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("modern template-complete serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern template-complete handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("template-complete modern WebSocket must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern template-complete initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-template-complete", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the template-complete modern WebSocket peer must initialize");
+            let discovery = client
+                .session()
+                .server_discovery()
+                .expect("a modern WebSocket handshake retains server/discover");
+            let advertised_caps = serde_json::to_value(discovery.capabilities())
+                .expect("modern discovery capabilities serialize");
+            assert_eq!(
+                advertised_caps.get("completions"),
+                Some(&json!({})),
+                "installing a resource-template completion provider must advertise completions: {advertised_caps:?}"
+            );
+
+            let completed = websocket_client_bounded(
+                &cx,
+                "live modern template completion/complete",
+                client.complete(&cx, public_http_template_completion_params()),
+            )
+            .await
+            .expect("live bind_websocket must complete the registered resource template provider");
+            assert_eq!(
+                completed.completion.values,
+                vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_VALUE.to_owned()],
+                "the modern WebSocket template provider must retain its values: {completed:?}"
+            );
+
+            let mut undeclared = public_http_template_completion_params();
+            undeclared.argument.name = "undeclared".to_owned();
+            websocket_client_bounded(
+                &cx,
+                "live modern undeclared template completion",
+                client.complete(&cx, undeclared),
+            )
+            .await
+            .expect_err("only an undeclared template variable is rejected");
+
+            let mut other_template = public_http_template_completion_params();
+            other_template.reference = modern::CompletionReference::Resource {
+                uri: PUBLIC_HTTP_OTHER_TEMPLATE.to_owned(),
+            };
+            websocket_client_bounded(
+                &cx,
+                "live modern unregistered template completion",
+                client.complete(&cx, other_template),
+            )
+            .await
+            .expect_err("changing only the template URI must refuse a missing provider");
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live modern fast tools/call after template completion",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after template completion");
+            assert!(
+                fast.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "the fast peer tool must still complete after template completion: {fast:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern template-complete close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern template-complete WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_composes_nested_prompt_and_refuses_missing_name() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket compose-prompt runtime installs an ambient context",
+            );
+            let server = modern::ServerBuilder::new("facade-ws-compose-prompt", "1.0.0")
+                .tool(PublicHttpPromptCompose)
+                .tool(PublicHttpFastTool)
+                .prompt(PublicHttpInstructionPrompt)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket compose-prompt must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket compose-prompt publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("modern compose-prompt serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern compose-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("compose-prompt modern WebSocket must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern compose-prompt initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-compose-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the compose-prompt modern WebSocket peer must initialize");
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live modern compose_prompt",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+                    json!({"subject": "alpha"}),
+                ),
+            )
+            .await
+            .expect("live bind_websocket compose_prompt must nest the instruction prompt");
+            assert!(
+                composed.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "compose-prompt:prompt:alpha",
+                    _ => false,
+                }),
+                "compose_prompt must retain the nested prompt text: {composed:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern missing nested prompt",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+                    json!({
+                        "subject": "alpha",
+                        "prompt": "public-http-e2e-missing",
+                    }),
+                ),
+            )
+            .await;
+            let missing = match missing {
+                Ok(result) if result.is_error => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+                Ok(result) => {
+                    panic!("changing only the nested prompt name must refuse: {result:?}")
+                }
+            };
+            assert!(
+                missing.contains("public-http-e2e-missing")
+                    || missing.contains("compose-nested-prompt")
+                    || missing.contains("not found"),
+                "the nested unknown prompt must stay a handler-visible refusal: {missing}"
+            );
+
+            let fast = websocket_client_bounded(
+                &cx,
+                "live modern fast tools/call after prompt compose",
+                client.call_tool(&cx, PUBLIC_HTTP_FAST_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after prompt compose");
+            assert!(
+                fast.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "the fast peer tool must still complete after prompt compose: {fast:?}"
+            );
+
+            websocket_client_bounded(&cx, "live modern compose-prompt close", client.close(&cx))
+                .await
+                .expect("the modern compose-prompt WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
         });
     }
 
