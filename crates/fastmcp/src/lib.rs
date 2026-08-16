@@ -3354,7 +3354,18 @@ pub mod modern {
         }
 
         pub fn list_tools(&mut self, cursor: Option<&str>) -> McpResult<FinalListToolsResult> {
-            match self.inner.list_tools_typed(cursor)? {
+            self.list_tools_with_params(crate::ListToolsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..crate::ListToolsParams::default()
+            })
+        }
+
+        /// Lists one exact final page of tools with include/exclude tag filters.
+        pub fn list_tools_with_params(
+            &mut self,
+            params: crate::ListToolsParams,
+        ) -> McpResult<FinalListToolsResult> {
+            match self.inner.list_tools_typed_with_params(params)? {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
                 ) => Ok(result.payload),
@@ -6531,6 +6542,38 @@ pub mod legacy_2024 {
         /// Lists exact-2024 tools.
         pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
             self.inner.list_tools()
+        }
+
+        /// Follows exact-2024 tools/list cursors with include/exclude tag filters.
+        pub fn list_tools_with_params(&mut self, params: ListToolsParams) -> McpResult<Vec<Tool>> {
+            self.inner.list_tools_with_params(params)
+        }
+
+        /// Lists one exact-2024 tools page without following the peer cursor.
+        pub fn list_tools_page(
+            &mut self,
+            cursor: Option<&str>,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<Tool>> {
+            self.inner.list_tools_page(cursor, limits)
+        }
+
+        /// Lists one exact-2024 tools page with include/exclude tag filters.
+        pub fn list_tools_page_with_params(
+            &mut self,
+            params: ListToolsParams,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<Tool>> {
+            self.inner.list_tools_page_with_params(params, limits)
+        }
+
+        /// Lists one exact-2024 resources page without following the peer cursor.
+        pub fn list_resources_page(
+            &mut self,
+            cursor: Option<&str>,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<Resource>> {
+            self.inner.list_resources_page(cursor, limits)
         }
 
         /// Calls one exact-2024 tool without final-result projection.
