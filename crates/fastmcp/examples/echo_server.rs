@@ -460,7 +460,21 @@ fn roots_echo(
 // ============================================================================
 
 /// Returns server information.
-#[resource(uri = "info://server")]
+#[resource(uri = "note://{name}", tags = ["notes"])]
+fn note_card(_ctx: &McpContext, name: String) -> String {
+    format!("note:{name}")
+}
+
+#[resource(uri = "memo://{name}", tags = ["memos"])]
+fn memo_card(_ctx: &McpContext, name: String) -> String {
+    format!("memo:{name}")
+}
+
+#[resource(
+    uri = "info://server",
+    tags = ["server"],
+    icon = "https://example.test/echo-server.png"
+)]
 fn server_info(ctx: &McpContext) -> String {
     ctx.report_progress(1.0, Some("info"));
     r#"{
@@ -547,7 +561,7 @@ fn elicit_form_info(
 
 /// Returns an execution error that carries an internal secret so
 /// `FASTMCP_MASK_ERROR_DETAILS=1` can prove live stdio masking.
-#[resource(uri = "info://leak")]
+#[resource(uri = "info://leak", tags = ["secret"])]
 fn leak_info(_ctx: &McpContext) -> McpResult<String> {
     Err(McpError::tool_error("secret-db-dsn"))
 }
@@ -645,7 +659,11 @@ fn mrtr_resource(
 // ============================================================================
 
 /// A simple greeting prompt.
-#[prompt(description = "Generate a friendly greeting")]
+#[prompt(
+    description = "Generate a friendly greeting",
+    tags = ["onboarding"],
+    icon = "https://example.test/echo-greeting.png"
+)]
 fn greeting(ctx: &McpContext, name: String) -> Vec<PromptMessage> {
     ctx.report_progress(1.0, Some("greeted"));
     vec![PromptMessage {
@@ -660,7 +678,7 @@ fn greeting(ctx: &McpContext, name: String) -> Vec<PromptMessage> {
 ///
 /// Optional `tool` / `resource` arguments default to those peers so a
 /// near-identical missing-name call is the planted negative.
-#[prompt(defaults(tool = "echo", resource = "info://server"))]
+#[prompt(defaults(tool = "echo", resource = "info://server"), tags = ["compose"])]
 async fn compose_greeting(
     ctx: &McpContext,
     name: String,
@@ -1036,6 +1054,8 @@ fn main() {
         .tool(RootsEcho)
         // Register resources
         .resource(ServerInfoResource)
+        .resource(NoteCardResource)
+        .resource(MemoCardResource)
         .resource(ComposeInfoResource)
         .resource(ComposeInfoMissingToolResource)
         .resource(ComposeInfoMissingResourceResource)
