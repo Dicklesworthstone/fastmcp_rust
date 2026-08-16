@@ -31,7 +31,8 @@ use fastmcp_rust::{
     FinalEmbeddedRootsListParams, FinalGetPromptResult, FinalPromptMessage,
     FinalReadResourceResult, FinalResourceTemplate, FinalRootsContextExt, FinalSamplingContextExt,
     FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
-    JsonRpcMessage, JsonRpcRequest, McpContext, McpError, McpErrorCode, McpOutcome,
+    JsonRpcMessage, JsonRpcRequest, ListPromptsParams, ListResourceTemplatesParams,
+    ListResourcesParams, ListToolsParams, McpContext, McpError, McpErrorCode, McpOutcome,
     McpRequestCancellation, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
     ModernHttpResponseStream, Outcome, Prompt, PromptArgument, PromptHandler, PromptMessage,
     ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
@@ -62,6 +63,7 @@ const PUBLIC_HTTP_TASK_TOOL_NAME: &str = "public-http-e2e-task";
 const PUBLIC_HTTP_LOG_TOOL_NAME: &str = "public-http-e2e-log";
 const PUBLIC_HTTP_HANDLER_LOG_TEXT: &str = "public-http-handler-info";
 const PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME: &str = "public-http-e2e-cursor-secondary";
+const PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME: &str = "public-http-e2e-cursor-other";
 const PUBLIC_HTTP_RESOURCE_URI: &str = "test://public-http-e2e/resource";
 const PUBLIC_HTTP_PROMPT_NAME: &str = "public-http-e2e-prompt";
 const PUBLIC_HTTP_TOOL_ARGUMENT: &str = "cross-era";
@@ -73,6 +75,10 @@ const PUBLIC_HTTP_AUTH_TOOL_NAME: &str = "public-http-e2e-auth";
 const PUBLIC_HTTP_AUTH_SUBJECT: &str = "e2e-native-http-principal";
 const PUBLIC_HTTP_ICON_TOOL_NAME: &str = "public-http-e2e-icon";
 const PUBLIC_HTTP_PLAIN_TOOL_NAME: &str = "public-http-e2e-plain";
+const PUBLIC_HTTP_ICON_RESOURCE_URI: &str = "test://public-http-e2e/icon-resource";
+const PUBLIC_HTTP_PLAIN_RESOURCE_URI: &str = "test://public-http-e2e/plain-resource";
+const PUBLIC_HTTP_ICON_PROMPT_NAME: &str = "public-http-e2e-icon-prompt";
+const PUBLIC_HTTP_PLAIN_PROMPT_NAME: &str = "public-http-e2e-plain-prompt";
 const PUBLIC_HTTP_ICON_SRC: &str = "https://example.test/e2e-icon.png";
 const PUBLIC_HTTP_OUTPUT_TOOL_NAME: &str = "public-http-e2e-output";
 const PUBLIC_HTTP_COMPOSE_TOOL_NAME: &str = "public-http-e2e-compose";
@@ -150,6 +156,16 @@ fn public_http_cursor_prompt_b(_ctx: &McpContext) -> Vec<PromptMessage> {
         role: Role::User,
         content: Content::text("cursor-prompt-b"),
     }]
+}
+
+#[resource(uri = "test://public-http-e2e/tmpl-cursor/{id}", tags = ["cursor"])]
+fn public_http_cursor_template(_ctx: &McpContext, id: String) -> String {
+    format!("cursor-tmpl:{id}")
+}
+
+#[resource(uri = "test://public-http-e2e/tmpl-other/{id}", tags = ["other"])]
+fn public_http_other_template(_ctx: &McpContext, id: String) -> String {
+    format!("other-tmpl:{id}")
 }
 
 /// The deterministic prompt exercised through both public HTTP facades.
@@ -586,6 +602,132 @@ impl ToolHandler for PublicHttpPlainTool {
         _arguments: serde_json::Value,
     ) -> McpResult<Vec<Content>> {
         Ok(vec![Content::text("plain")])
+    }
+}
+
+/// Advertises exact-final resource catalog icons and title.
+struct PublicHttpIconResource {
+    icons: Vec<RawIcon>,
+}
+
+impl ResourceHandler for PublicHttpIconResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PUBLIC_HTTP_ICON_RESOURCE_URI.to_owned(),
+            name: "icon-resource".to_owned(),
+            description: Some("Catalog metadata resource with final icons".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn final_title(&self) -> Option<&str> {
+        Some("Icon Resource")
+    }
+
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        Some(&self.icons)
+    }
+
+    fn read(&self, _context: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Ok(vec![ResourceContent {
+            uri: PUBLIC_HTTP_ICON_RESOURCE_URI.to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            text: Some("icon-resource".to_owned()),
+            blob: None,
+        }])
+    }
+}
+
+/// Near-identical peer that advertises no final resource icons or title.
+struct PublicHttpPlainResource;
+
+impl ResourceHandler for PublicHttpPlainResource {
+    fn definition(&self) -> Resource {
+        Resource {
+            uri: PUBLIC_HTTP_PLAIN_RESOURCE_URI.to_owned(),
+            name: "plain-resource".to_owned(),
+            description: Some("Catalog metadata peer without final resource icons".to_owned()),
+            mime_type: Some("text/plain".to_owned()),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn read(&self, _context: &McpContext) -> McpResult<Vec<ResourceContent>> {
+        Ok(vec![ResourceContent {
+            uri: PUBLIC_HTTP_PLAIN_RESOURCE_URI.to_owned(),
+            mime_type: Some("text/plain".to_owned()),
+            text: Some("plain-resource".to_owned()),
+            blob: None,
+        }])
+    }
+}
+
+/// Advertises exact-final prompt catalog icons and title.
+struct PublicHttpIconPrompt {
+    icons: Vec<RawIcon>,
+}
+
+impl PromptHandler for PublicHttpIconPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: PUBLIC_HTTP_ICON_PROMPT_NAME.to_owned(),
+            description: Some("Catalog metadata prompt with final icons".to_owned()),
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn final_title(&self) -> Option<&str> {
+        Some("Icon Prompt")
+    }
+
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        Some(&self.icons)
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::text("icon-prompt"),
+        }])
+    }
+}
+
+/// Near-identical peer that advertises no final prompt icons or title.
+struct PublicHttpPlainPrompt;
+
+impl PromptHandler for PublicHttpPlainPrompt {
+    fn definition(&self) -> Prompt {
+        Prompt {
+            name: PUBLIC_HTTP_PLAIN_PROMPT_NAME.to_owned(),
+            description: Some("Catalog metadata peer without final prompt icons".to_owned()),
+            arguments: Vec::new(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn get(
+        &self,
+        _ctx: &McpContext,
+        _arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::text("plain-prompt"),
+        }])
     }
 }
 
@@ -1452,13 +1594,18 @@ impl HttpServerFixture {
         protocol_policy: ProtocolPolicy,
         middleware: Option<Arc<dyn Middleware>>,
     ) -> Self {
-        Self::spawn_with_configuration(protocol_policy, middleware, None)
+        Self::spawn_with_configuration(protocol_policy, middleware, None, false)
+    }
+
+    fn spawn_modern_tagged_catalog() -> Self {
+        Self::spawn_with_configuration(ProtocolPolicy::ModernOnly, None, None, true)
     }
 
     fn spawn_with_configuration(
         protocol_policy: ProtocolPolicy,
         middleware: Option<Arc<dyn Middleware>>,
         page_size: Option<usize>,
+        tagged_catalog: bool,
     ) -> Self {
         let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
         let tool_calls = Arc::clone(&handler_calls);
@@ -1496,6 +1643,15 @@ impl HttpServerFixture {
                     .prompt(CountingPublicHttpInstruction {
                         counters: prompt_calls,
                     });
+                let builder = if tagged_catalog {
+                    builder
+                        .resource(PublicHttpCursorResourceAResource)
+                        .prompt(PublicHttpCursorPromptAPrompt)
+                        .resource(PublicHttpCursorTemplateResource)
+                        .resource(PublicHttpOtherTemplateResource)
+                } else {
+                    builder
+                };
                 let server = match middleware {
                     Some(middleware) => builder.middleware(middleware).build(),
                     None => builder.build(),
@@ -6059,6 +6215,484 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         before_unchanged_retry.hits + 1,
         "the unchanged original request still resolves from its prior cache entry"
     );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_modern_list_tools_include_and_exclude_tags() {
+    let cx = Cx::for_request();
+    let server = HttpServerFixture::spawn_with_policy(ProtocolPolicy::ModernOnly);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-modern-tag-filter", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the tagged HTTP peer");
+
+    let cursor = runtime_block_on_bounded(
+        &cx,
+        client.list_tools_with_params(
+            &cx,
+            ListToolsParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListToolsParams::default()
+            },
+        ),
+    )
+    .expect("includeTags cursor must list the cursor-tagged HTTP tools");
+    assert!(
+        cursor
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+        "includeTags cursor must retain {PUBLIC_HTTP_TOOL_NAME}: {cursor:?}"
+    );
+    assert!(
+        cursor
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME),
+        "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME}: {cursor:?}"
+    );
+    assert!(
+        cursor
+            .tools
+            .iter()
+            .all(|tool| tool.name != PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+        "includeTags cursor must omit {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {cursor:?}"
+    );
+
+    let other = runtime_block_on_bounded(
+        &cx,
+        client.list_tools_with_params(
+            &cx,
+            ListToolsParams {
+                include_tags: Some(vec!["other".to_owned()]),
+                ..ListToolsParams::default()
+            },
+        ),
+    )
+    .expect("changing only includeTags must list the other-tagged HTTP tool");
+    assert!(
+        other
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+        "includeTags other must retain {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {other:?}"
+    );
+    assert!(
+        other
+            .tools
+            .iter()
+            .all(|tool| tool.name != PUBLIC_HTTP_TOOL_NAME
+                && tool.name != PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME),
+        "includeTags other must omit the cursor-tagged tools: {other:?}"
+    );
+
+    let excluded = runtime_block_on_bounded(
+        &cx,
+        client.list_tools_with_params(
+            &cx,
+            ListToolsParams {
+                exclude_tags: Some(vec!["cursor".to_owned()]),
+                ..ListToolsParams::default()
+            },
+        ),
+    )
+    .expect("excludeTags cursor must omit only the cursor-tagged HTTP tools");
+    assert!(
+        excluded
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+        "excludeTags cursor must keep {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {excluded:?}"
+    );
+    assert!(
+        excluded
+            .tools
+            .iter()
+            .all(|tool| tool.name != PUBLIC_HTTP_TOOL_NAME
+                && tool.name != PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME),
+        "excludeTags cursor must omit the cursor-tagged tools: {excluded:?}"
+    );
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("an unfiltered modern HTTP tools/list must keep both tag groups");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME)
+            && listed
+                .tools
+                .iter()
+                .any(|tool| tool.name == PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+        "omitting only the tag filters must list cursor and other tools: {listed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+const PUBLIC_HTTP_CURSOR_TEMPLATE: &str = "test://public-http-e2e/tmpl-cursor/{id}";
+const PUBLIC_HTTP_OTHER_TEMPLATE: &str = "test://public-http-e2e/tmpl-other/{id}";
+
+#[test]
+fn e2e_public_http_modern_list_resources_prompts_and_templates_include_and_exclude_tags() {
+    let cx = Cx::for_request();
+    let server = HttpServerFixture::spawn_modern_tagged_catalog();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-modern-catalog-tag-filter", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the ModernOnly public facade connects to the tagged HTTP catalog");
+
+    let cursor_resources = runtime_block_on_bounded(
+        &cx,
+        client.list_resources_with_params(
+            &cx,
+            ListResourcesParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListResourcesParams::default()
+            },
+        ),
+    )
+    .expect("includeTags cursor must list the cursor-tagged HTTP resource");
+    assert!(
+        cursor_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+        "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {cursor_resources:?}"
+    );
+    assert!(
+        cursor_resources
+            .resources
+            .iter()
+            .all(|resource| resource.uri.as_str() != PUBLIC_HTTP_RESOURCE_URI),
+        "includeTags cursor must omit {PUBLIC_HTTP_RESOURCE_URI}: {cursor_resources:?}"
+    );
+
+    let excluded_resources = runtime_block_on_bounded(
+        &cx,
+        client.list_resources_with_params(
+            &cx,
+            ListResourcesParams {
+                exclude_tags: Some(vec!["cursor".to_owned()]),
+                ..ListResourcesParams::default()
+            },
+        ),
+    )
+    .expect("excludeTags cursor must omit only the cursor-tagged HTTP resource");
+    assert!(
+        excluded_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_RESOURCE_URI),
+        "excludeTags cursor must keep {PUBLIC_HTTP_RESOURCE_URI}: {excluded_resources:?}"
+    );
+    assert!(
+        excluded_resources
+            .resources
+            .iter()
+            .all(|resource| resource.uri.as_str() != PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+        "excludeTags cursor must omit {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {excluded_resources:?}"
+    );
+
+    let cursor_prompts = runtime_block_on_bounded(
+        &cx,
+        client.list_prompts_with_params(
+            &cx,
+            ListPromptsParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListPromptsParams::default()
+            },
+        ),
+    )
+    .expect("includeTags cursor must list the cursor-tagged HTTP prompt");
+    assert!(
+        cursor_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+        "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {cursor_prompts:?}"
+    );
+    assert!(
+        cursor_prompts
+            .prompts
+            .iter()
+            .all(|prompt| prompt.name != PUBLIC_HTTP_PROMPT_NAME),
+        "includeTags cursor must omit {PUBLIC_HTTP_PROMPT_NAME}: {cursor_prompts:?}"
+    );
+
+    let excluded_prompts = runtime_block_on_bounded(
+        &cx,
+        client.list_prompts_with_params(
+            &cx,
+            ListPromptsParams {
+                exclude_tags: Some(vec!["cursor".to_owned()]),
+                ..ListPromptsParams::default()
+            },
+        ),
+    )
+    .expect("excludeTags cursor must omit only the cursor-tagged HTTP prompt");
+    assert!(
+        excluded_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == PUBLIC_HTTP_PROMPT_NAME),
+        "excludeTags cursor must keep {PUBLIC_HTTP_PROMPT_NAME}: {excluded_prompts:?}"
+    );
+    assert!(
+        excluded_prompts
+            .prompts
+            .iter()
+            .all(|prompt| prompt.name != PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+        "excludeTags cursor must omit {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {excluded_prompts:?}"
+    );
+
+    let cursor_templates = runtime_block_on_bounded(
+        &cx,
+        client.list_resource_templates_with_params(
+            &cx,
+            ListResourceTemplatesParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListResourceTemplatesParams::default()
+            },
+        ),
+    )
+    .expect("includeTags cursor must list the cursor-tagged HTTP template");
+    assert!(
+        cursor_templates
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_CURSOR_TEMPLATE),
+        "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_TEMPLATE}: {cursor_templates:?}"
+    );
+    assert!(
+        cursor_templates
+            .resource_templates
+            .iter()
+            .all(|template| template.uri_template != PUBLIC_HTTP_OTHER_TEMPLATE),
+        "includeTags cursor must omit {PUBLIC_HTTP_OTHER_TEMPLATE}: {cursor_templates:?}"
+    );
+
+    let other_templates = runtime_block_on_bounded(
+        &cx,
+        client.list_resource_templates_with_params(
+            &cx,
+            ListResourceTemplatesParams {
+                include_tags: Some(vec!["other".to_owned()]),
+                ..ListResourceTemplatesParams::default()
+            },
+        ),
+    )
+    .expect("changing only includeTags must list the other-tagged HTTP template");
+    assert!(
+        other_templates
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_OTHER_TEMPLATE),
+        "includeTags other must retain {PUBLIC_HTTP_OTHER_TEMPLATE}: {other_templates:?}"
+    );
+    assert!(
+        other_templates
+            .resource_templates
+            .iter()
+            .all(|template| template.uri_template != PUBLIC_HTTP_CURSOR_TEMPLATE),
+        "includeTags other must omit {PUBLIC_HTTP_CURSOR_TEMPLATE}: {other_templates:?}"
+    );
+
+    let live = McpRequestCancellation::new();
+    let cancelled_filter = runtime_block_on_bounded(
+        &cx,
+        client.list_tools_with_params_and_cancellation(
+            &cx,
+            &live,
+            ListToolsParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListToolsParams::default()
+            },
+        ),
+    )
+    .expect("an uncancelled domain must still send includeTags on tools/list");
+    assert!(
+        cancelled_filter
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+        "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_TOOL_NAME}: {cancelled_filter:?}"
+    );
+    assert!(
+        cancelled_filter
+            .tools
+            .iter()
+            .all(|tool| tool.name != PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+        "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {cancelled_filter:?}"
+    );
+
+    let already = McpRequestCancellation::new();
+    already.cancel();
+    let pre_send = runtime_block_on_bounded(
+        &cx,
+        client.list_tools_with_params_and_cancellation(
+            &cx,
+            &already,
+            ListToolsParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListToolsParams::default()
+            },
+        ),
+    )
+    .expect_err("pre-send cancellation must reject a tagged tools/list locally");
+    assert!(matches!(
+        pre_send,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+
+    let live_resources = McpRequestCancellation::new();
+    let cancelled_resources = runtime_block_on_bounded(
+        &cx,
+        client.list_resources_with_params_and_cancellation(
+            &cx,
+            &live_resources,
+            ListResourcesParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListResourcesParams::default()
+            },
+        ),
+    )
+    .expect("an uncancelled domain must still send includeTags on resources/list");
+    assert!(
+        cancelled_resources
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+        "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {cancelled_resources:?}"
+    );
+    assert!(
+        cancelled_resources
+            .resources
+            .iter()
+            .all(|resource| resource.uri.as_str() != PUBLIC_HTTP_RESOURCE_URI),
+        "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_RESOURCE_URI}: {cancelled_resources:?}"
+    );
+
+    let live_prompts = McpRequestCancellation::new();
+    let cancelled_prompts = runtime_block_on_bounded(
+        &cx,
+        client.list_prompts_with_params_and_cancellation(
+            &cx,
+            &live_prompts,
+            ListPromptsParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListPromptsParams::default()
+            },
+        ),
+    )
+    .expect("an uncancelled domain must still send includeTags on prompts/list");
+    assert!(
+        cancelled_prompts
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+        "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {cancelled_prompts:?}"
+    );
+    assert!(
+        cancelled_prompts
+            .prompts
+            .iter()
+            .all(|prompt| prompt.name != PUBLIC_HTTP_PROMPT_NAME),
+        "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_PROMPT_NAME}: {cancelled_prompts:?}"
+    );
+
+    let live_templates = McpRequestCancellation::new();
+    let cancelled_templates = runtime_block_on_bounded(
+        &cx,
+        client.list_resource_templates_with_params_and_cancellation(
+            &cx,
+            &live_templates,
+            ListResourceTemplatesParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListResourceTemplatesParams::default()
+            },
+        ),
+    )
+    .expect("an uncancelled domain must still send includeTags on resources/templates/list");
+    assert!(
+        cancelled_templates
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == PUBLIC_HTTP_CURSOR_TEMPLATE),
+        "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_CURSOR_TEMPLATE}: {cancelled_templates:?}"
+    );
+    assert!(
+        cancelled_templates
+            .resource_templates
+            .iter()
+            .all(|template| template.uri_template != PUBLIC_HTTP_OTHER_TEMPLATE),
+        "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_OTHER_TEMPLATE}: {cancelled_templates:?}"
+    );
+
+    let already_catalog = McpRequestCancellation::new();
+    already_catalog.cancel();
+    let pre_send_resources = runtime_block_on_bounded(
+        &cx,
+        client.list_resources_with_params_and_cancellation(
+            &cx,
+            &already_catalog,
+            ListResourcesParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListResourcesParams::default()
+            },
+        ),
+    )
+    .expect_err("pre-send cancellation must reject a tagged resources/list locally");
+    assert!(matches!(
+        pre_send_resources,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+    let pre_send_prompts = runtime_block_on_bounded(
+        &cx,
+        client.list_prompts_with_params_and_cancellation(
+            &cx,
+            &already_catalog,
+            ListPromptsParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListPromptsParams::default()
+            },
+        ),
+    )
+    .expect_err("pre-send cancellation must reject a tagged prompts/list locally");
+    assert!(matches!(
+        pre_send_prompts,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
+    let pre_send_templates = runtime_block_on_bounded(
+        &cx,
+        client.list_resource_templates_with_params_and_cancellation(
+            &cx,
+            &already_catalog,
+            ListResourceTemplatesParams {
+                include_tags: Some(vec!["cursor".to_owned()]),
+                ..ListResourceTemplatesParams::default()
+            },
+        ),
+    )
+    .expect_err("pre-send cancellation must reject a tagged resources/templates/list locally");
+    assert!(matches!(
+        pre_send_templates,
+        modern::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::RequestCancelled
+    ));
 
     drop(client);
     server.shutdown();
@@ -10877,8 +11511,16 @@ fn spawn_modern_catalog_metadata_http_server() -> HttpServerFixture {
                 RawIcon::try_new(PUBLIC_HTTP_ICON_SRC).expect("the catalog icon source is valid"),
             ];
             let server = modern::ServerBuilder::new("facade-http-catalog-metadata", "1.0.0")
-                .tool(PublicHttpIconTool { icons })
+                .tool(PublicHttpIconTool {
+                    icons: icons.clone(),
+                })
                 .tool(PublicHttpPlainTool)
+                .resource(PublicHttpIconResource {
+                    icons: icons.clone(),
+                })
+                .resource(PublicHttpPlainResource)
+                .prompt(PublicHttpIconPrompt { icons })
+                .prompt(PublicHttpPlainPrompt)
                 .build();
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
@@ -10994,6 +11636,50 @@ fn e2e_public_http_list_tools_retains_final_icons_title_and_annotations() {
     assert_eq!(plain_tool.title, None);
     assert_eq!(plain_tool.icons, None);
     assert_eq!(plain_tool.annotations, None);
+
+    let listed_resources = runtime_block_on_bounded(&cx, client.list_resources(&cx, None))
+        .expect("live bind_http must list the catalog metadata resources");
+    let icon_resource = listed_resources
+        .resources
+        .iter()
+        .find(|resource| resource.uri.as_str() == PUBLIC_HTTP_ICON_RESOURCE_URI)
+        .expect("the icon resource must remain on the live catalog");
+    let plain_resource = listed_resources
+        .resources
+        .iter()
+        .find(|resource| resource.uri.as_str() == PUBLIC_HTTP_PLAIN_RESOURCE_URI)
+        .expect("the plain peer resource must remain on the live catalog");
+    assert_eq!(icon_resource.title.as_deref(), Some("Icon Resource"));
+    let resource_icons = icon_resource
+        .icons
+        .as_ref()
+        .expect("the icon resource must advertise its exact-final icons");
+    assert_eq!(resource_icons.len(), 1);
+    assert_eq!(resource_icons[0].src.as_str(), PUBLIC_HTTP_ICON_SRC);
+    assert_eq!(plain_resource.title, None);
+    assert_eq!(plain_resource.icons, None);
+
+    let listed_prompts = runtime_block_on_bounded(&cx, client.list_prompts(&cx, None))
+        .expect("live bind_http must list the catalog metadata prompts");
+    let icon_prompt = listed_prompts
+        .prompts
+        .iter()
+        .find(|prompt| prompt.name == PUBLIC_HTTP_ICON_PROMPT_NAME)
+        .expect("the icon prompt must remain on the live catalog");
+    let plain_prompt = listed_prompts
+        .prompts
+        .iter()
+        .find(|prompt| prompt.name == PUBLIC_HTTP_PLAIN_PROMPT_NAME)
+        .expect("the plain peer prompt must remain on the live catalog");
+    assert_eq!(icon_prompt.title.as_deref(), Some("Icon Prompt"));
+    let prompt_icons = icon_prompt
+        .icons
+        .as_ref()
+        .expect("the icon prompt must advertise its exact-final icons");
+    assert_eq!(prompt_icons.len(), 1);
+    assert_eq!(prompt_icons[0].src.as_str(), PUBLIC_HTTP_ICON_SRC);
+    assert_eq!(plain_prompt.title, None);
+    assert_eq!(plain_prompt.icons, None);
 
     drop(client);
     server.shutdown();
@@ -26671,8 +27357,16 @@ mod live_websocket_bind {
                 RawIcon::try_new(PUBLIC_HTTP_ICON_SRC).expect("the catalog icon source is valid"),
             ];
             let server = modern::ServerBuilder::new("facade-ws-catalog-metadata", "1.0.0")
-                .tool(PublicHttpIconTool { icons })
+                .tool(PublicHttpIconTool {
+                    icons: icons.clone(),
+                })
                 .tool(PublicHttpPlainTool)
+                .resource(PublicHttpIconResource {
+                    icons: icons.clone(),
+                })
+                .resource(PublicHttpPlainResource)
+                .prompt(PublicHttpIconPrompt { icons })
+                .prompt(PublicHttpPlainPrompt)
                 .build();
             let bound = server
                 .bind_websocket(&cx, "127.0.0.1:0")
@@ -26744,9 +27438,905 @@ mod live_websocket_bind {
             assert_eq!(plain_tool.icons, None);
             assert_eq!(plain_tool.annotations, None);
 
+            let listed_resources = websocket_client_bounded(
+                &cx,
+                "live modern catalog-metadata resources/list",
+                client.list_resources(&cx, None),
+            )
+            .await
+            .expect("live bind_websocket must list the catalog metadata resources");
+            let icon_resource = listed_resources
+                .resources
+                .iter()
+                .find(|resource| resource.uri.as_str() == PUBLIC_HTTP_ICON_RESOURCE_URI)
+                .expect("the icon resource must remain on the live catalog");
+            let plain_resource = listed_resources
+                .resources
+                .iter()
+                .find(|resource| resource.uri.as_str() == PUBLIC_HTTP_PLAIN_RESOURCE_URI)
+                .expect("the plain peer resource must remain on the live catalog");
+            assert_eq!(icon_resource.title.as_deref(), Some("Icon Resource"));
+            let resource_icons = icon_resource
+                .icons
+                .as_ref()
+                .expect("the icon resource must advertise its exact-final icons");
+            assert_eq!(resource_icons.len(), 1);
+            assert_eq!(resource_icons[0].src.as_str(), PUBLIC_HTTP_ICON_SRC);
+            assert_eq!(plain_resource.title, None);
+            assert_eq!(plain_resource.icons, None);
+
+            let listed_prompts = websocket_client_bounded(
+                &cx,
+                "live modern catalog-metadata prompts/list",
+                client.list_prompts(&cx, None),
+            )
+            .await
+            .expect("live bind_websocket must list the catalog metadata prompts");
+            let icon_prompt = listed_prompts
+                .prompts
+                .iter()
+                .find(|prompt| prompt.name == PUBLIC_HTTP_ICON_PROMPT_NAME)
+                .expect("the icon prompt must remain on the live catalog");
+            let plain_prompt = listed_prompts
+                .prompts
+                .iter()
+                .find(|prompt| prompt.name == PUBLIC_HTTP_PLAIN_PROMPT_NAME)
+                .expect("the plain peer prompt must remain on the live catalog");
+            assert_eq!(icon_prompt.title.as_deref(), Some("Icon Prompt"));
+            let prompt_icons = icon_prompt
+                .icons
+                .as_ref()
+                .expect("the icon prompt must advertise its exact-final icons");
+            assert_eq!(prompt_icons.len(), 1);
+            assert_eq!(prompt_icons[0].src.as_str(), PUBLIC_HTTP_ICON_SRC);
+            assert_eq!(plain_prompt.title, None);
+            assert_eq!(plain_prompt.icons, None);
+
             websocket_client_bounded(&cx, "live modern catalog-metadata close", client.close(&cx))
                 .await
                 .expect("the modern catalog-metadata WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_list_tools_include_and_exclude_tags() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current()
+                .expect("owned modern WebSocket tag-filter runtime installs an ambient context");
+            let server = modern::ServerBuilder::new("facade-ws-tag-filter", "1.0.0")
+                .tool(PublicHttpValue)
+                .tool(PublicHttpCursorSecondary)
+                .tool(PublicHttpCursorOther)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket tag filter must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket tag filter publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect("public ModernOnly bind_websocket tag filter serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public ModernOnly bind_websocket tag filter must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-tag-filter", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates tag filters over bind_websocket");
+
+            let cursor = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter includeTags cursor",
+                client.list_tools_with_params(
+                    &cx,
+                    ListToolsParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListToolsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("includeTags cursor must list the cursor-tagged WebSocket tools");
+            assert!(
+                cursor
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+                "includeTags cursor must retain {PUBLIC_HTTP_TOOL_NAME}: {cursor:?}"
+            );
+            assert!(
+                cursor
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name != PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+                "includeTags cursor must omit {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {cursor:?}"
+            );
+
+            let other = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter includeTags other",
+                client.list_tools_with_params(
+                    &cx,
+                    ListToolsParams {
+                        include_tags: Some(vec!["other".to_owned()]),
+                        ..ListToolsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("changing only includeTags must list the other-tagged WebSocket tool");
+            assert!(
+                other
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+                "includeTags other must retain {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {other:?}"
+            );
+            assert!(
+                other
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name != PUBLIC_HTTP_TOOL_NAME),
+                "includeTags other must omit {PUBLIC_HTTP_TOOL_NAME}: {other:?}"
+            );
+
+            let excluded = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter excludeTags cursor",
+                client.list_tools_with_params(
+                    &cx,
+                    ListToolsParams {
+                        exclude_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListToolsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("excludeTags cursor must omit only the cursor-tagged WebSocket tools");
+            assert!(
+                excluded
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+                "excludeTags cursor must keep {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {excluded:?}"
+            );
+            assert!(
+                excluded
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name != PUBLIC_HTTP_TOOL_NAME),
+                "excludeTags cursor must omit {PUBLIC_HTTP_TOOL_NAME}: {excluded:?}"
+            );
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter unfiltered tools/list",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("an unfiltered modern WebSocket tools/list must keep both tag groups");
+            assert!(
+                listed
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME)
+                    && listed
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+                "omitting only the tag filters must list cursor and other tools: {listed:?}"
+            );
+
+            let live = McpRequestCancellation::new();
+            let live_filtered = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter cancellation domain includeTags",
+                client.list_tools_with_params_and_cancellation(
+                    &cx,
+                    &live,
+                    ListToolsParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListToolsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("an uncancelled WebSocket domain must still send includeTags on tools/list");
+            assert!(
+                live_filtered
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME),
+                "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_TOOL_NAME}: {live_filtered:?}"
+            );
+            assert!(
+                live_filtered
+                    .tools
+                    .iter()
+                    .all(|tool| tool.name != PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME),
+                "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_CURSOR_OTHER_TOOL_NAME}: {live_filtered:?}"
+            );
+
+            let already = McpRequestCancellation::new();
+            already.cancel();
+            let pre_send = websocket_client_bounded(
+                &cx,
+                "live modern tag-filter pre-send cancellation",
+                client.list_tools_with_params_and_cancellation(
+                    &cx,
+                    &already,
+                    ListToolsParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListToolsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect_err("pre-send WebSocket cancellation must reject a tagged tools/list locally");
+            assert_eq!(
+                pre_send.code,
+                McpErrorCode::RequestCancelled,
+                "pre-send cancellation must stay RequestCancelled: {pre_send:?}"
+            );
+
+            websocket_client_bounded(&cx, "live modern tag-filter close", client.close(&cx))
+                .await
+                .expect("the modern tag-filter WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_bind_list_resources_prompts_and_templates_include_and_exclude_tags() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket catalog tag-filter runtime installs an ambient context",
+            );
+            let server = modern::ServerBuilder::new("facade-ws-catalog-tag-filter", "1.0.0")
+                .resource(PublicHttpSnapshotResource)
+                .resource(PublicHttpCursorResourceAResource)
+                .prompt(PublicHttpInstructionPrompt)
+                .prompt(PublicHttpCursorPromptAPrompt)
+                .resource(PublicHttpCursorTemplateResource)
+                .resource(PublicHttpOtherTemplateResource)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket catalog tag filter must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket catalog tag filter publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect(
+                    "public ModernOnly bind_websocket catalog tag filter serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect(
+                "public ModernOnly bind_websocket catalog tag filter must complete RFC 6455 upgrade",
+            );
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-catalog-tag-filter", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates catalog tag filters over bind_websocket",
+            );
+
+            let cursor_resources = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter includeTags cursor resources",
+                client.list_resources_with_params(
+                    &cx,
+                    ListResourcesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourcesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("includeTags cursor must list the cursor-tagged WebSocket resource");
+            assert!(
+                cursor_resources
+                    .resources
+                    .iter()
+                    .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+                "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {cursor_resources:?}"
+            );
+            assert!(
+                cursor_resources
+                    .resources
+                    .iter()
+                    .all(|resource| resource.uri.as_str() != PUBLIC_HTTP_RESOURCE_URI),
+                "includeTags cursor must omit {PUBLIC_HTTP_RESOURCE_URI}: {cursor_resources:?}"
+            );
+
+            let excluded_resources = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter excludeTags cursor resources",
+                client.list_resources_with_params(
+                    &cx,
+                    ListResourcesParams {
+                        exclude_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourcesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("excludeTags cursor must omit only the cursor-tagged WebSocket resource");
+            assert!(
+                excluded_resources
+                    .resources
+                    .iter()
+                    .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_RESOURCE_URI),
+                "excludeTags cursor must keep {PUBLIC_HTTP_RESOURCE_URI}: {excluded_resources:?}"
+            );
+            assert!(
+                excluded_resources
+                    .resources
+                    .iter()
+                    .all(|resource| resource.uri.as_str() != PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+                "excludeTags cursor must omit {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {excluded_resources:?}"
+            );
+
+            let cursor_prompts = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter includeTags cursor prompts",
+                client.list_prompts_with_params(
+                    &cx,
+                    ListPromptsParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListPromptsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("includeTags cursor must list the cursor-tagged WebSocket prompt");
+            assert!(
+                cursor_prompts
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.name == PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+                "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {cursor_prompts:?}"
+            );
+            assert!(
+                cursor_prompts
+                    .prompts
+                    .iter()
+                    .all(|prompt| prompt.name != PUBLIC_HTTP_PROMPT_NAME),
+                "includeTags cursor must omit {PUBLIC_HTTP_PROMPT_NAME}: {cursor_prompts:?}"
+            );
+
+            let excluded_prompts = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter excludeTags cursor prompts",
+                client.list_prompts_with_params(
+                    &cx,
+                    ListPromptsParams {
+                        exclude_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListPromptsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("excludeTags cursor must omit only the cursor-tagged WebSocket prompt");
+            assert!(
+                excluded_prompts
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.name == PUBLIC_HTTP_PROMPT_NAME),
+                "excludeTags cursor must keep {PUBLIC_HTTP_PROMPT_NAME}: {excluded_prompts:?}"
+            );
+            assert!(
+                excluded_prompts
+                    .prompts
+                    .iter()
+                    .all(|prompt| prompt.name != PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+                "excludeTags cursor must omit {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {excluded_prompts:?}"
+            );
+
+            let cursor_templates = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter includeTags cursor templates",
+                client.list_resource_templates_with_params(
+                    &cx,
+                    ListResourceTemplatesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourceTemplatesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("includeTags cursor must list the cursor-tagged WebSocket template");
+            assert!(
+                cursor_templates
+                    .resource_templates
+                    .iter()
+                    .any(|template| template.uri_template == PUBLIC_HTTP_CURSOR_TEMPLATE),
+                "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_TEMPLATE}: {cursor_templates:?}"
+            );
+            assert!(
+                cursor_templates
+                    .resource_templates
+                    .iter()
+                    .all(|template| template.uri_template != PUBLIC_HTTP_OTHER_TEMPLATE),
+                "includeTags cursor must omit {PUBLIC_HTTP_OTHER_TEMPLATE}: {cursor_templates:?}"
+            );
+
+            let other_templates = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter includeTags other templates",
+                client.list_resource_templates_with_params(
+                    &cx,
+                    ListResourceTemplatesParams {
+                        include_tags: Some(vec!["other".to_owned()]),
+                        ..ListResourceTemplatesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("changing only includeTags must list the other-tagged WebSocket template");
+            assert!(
+                other_templates
+                    .resource_templates
+                    .iter()
+                    .any(|template| template.uri_template == PUBLIC_HTTP_OTHER_TEMPLATE),
+                "includeTags other must retain {PUBLIC_HTTP_OTHER_TEMPLATE}: {other_templates:?}"
+            );
+            assert!(
+                other_templates
+                    .resource_templates
+                    .iter()
+                    .all(|template| template.uri_template != PUBLIC_HTTP_CURSOR_TEMPLATE),
+                "includeTags other must omit {PUBLIC_HTTP_CURSOR_TEMPLATE}: {other_templates:?}"
+            );
+
+            let live_resources = McpRequestCancellation::new();
+            let cancelled_resources = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter cancellation domain includeTags resources",
+                client.list_resources_with_params_and_cancellation(
+                    &cx,
+                    &live_resources,
+                    ListResourcesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourcesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect(
+                "an uncancelled WebSocket domain must still send includeTags on resources/list",
+            );
+            assert!(
+                cancelled_resources
+                    .resources
+                    .iter()
+                    .any(|resource| resource.uri.as_str() == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+                "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {cancelled_resources:?}"
+            );
+            assert!(
+                cancelled_resources
+                    .resources
+                    .iter()
+                    .all(|resource| resource.uri.as_str() != PUBLIC_HTTP_RESOURCE_URI),
+                "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_RESOURCE_URI}: {cancelled_resources:?}"
+            );
+
+            let live_prompts = McpRequestCancellation::new();
+            let cancelled_prompts = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter cancellation domain includeTags prompts",
+                client.list_prompts_with_params_and_cancellation(
+                    &cx,
+                    &live_prompts,
+                    ListPromptsParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListPromptsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("an uncancelled WebSocket domain must still send includeTags on prompts/list");
+            assert!(
+                cancelled_prompts
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.name == PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+                "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {cancelled_prompts:?}"
+            );
+            assert!(
+                cancelled_prompts
+                    .prompts
+                    .iter()
+                    .all(|prompt| prompt.name != PUBLIC_HTTP_PROMPT_NAME),
+                "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_PROMPT_NAME}: {cancelled_prompts:?}"
+            );
+
+            let live_templates = McpRequestCancellation::new();
+            let cancelled_templates = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter cancellation domain includeTags templates",
+                client.list_resource_templates_with_params_and_cancellation(
+                    &cx,
+                    &live_templates,
+                    ListResourceTemplatesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourceTemplatesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect(
+                "an uncancelled WebSocket domain must still send includeTags on resources/templates/list",
+            );
+            assert!(
+                cancelled_templates
+                    .resource_templates
+                    .iter()
+                    .any(|template| template.uri_template == PUBLIC_HTTP_CURSOR_TEMPLATE),
+                "live cancellation domain plus includeTags cursor must retain {PUBLIC_HTTP_CURSOR_TEMPLATE}: {cancelled_templates:?}"
+            );
+            assert!(
+                cancelled_templates
+                    .resource_templates
+                    .iter()
+                    .all(|template| template.uri_template != PUBLIC_HTTP_OTHER_TEMPLATE),
+                "live cancellation domain plus includeTags cursor must omit {PUBLIC_HTTP_OTHER_TEMPLATE}: {cancelled_templates:?}"
+            );
+
+            let already = McpRequestCancellation::new();
+            already.cancel();
+            let pre_send_resources = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter pre-send resources cancellation",
+                client.list_resources_with_params_and_cancellation(
+                    &cx,
+                    &already,
+                    ListResourcesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourcesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect_err(
+                "pre-send WebSocket cancellation must reject a tagged resources/list locally",
+            );
+            assert_eq!(
+                pre_send_resources.code,
+                McpErrorCode::RequestCancelled,
+                "pre-send resources cancellation must stay RequestCancelled: {pre_send_resources:?}"
+            );
+            let pre_send_prompts = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter pre-send prompts cancellation",
+                client.list_prompts_with_params_and_cancellation(
+                    &cx,
+                    &already,
+                    ListPromptsParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListPromptsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect_err(
+                "pre-send WebSocket cancellation must reject a tagged prompts/list locally",
+            );
+            assert_eq!(
+                pre_send_prompts.code,
+                McpErrorCode::RequestCancelled,
+                "pre-send prompts cancellation must stay RequestCancelled: {pre_send_prompts:?}"
+            );
+            let pre_send_templates = websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter pre-send templates cancellation",
+                client.list_resource_templates_with_params_and_cancellation(
+                    &cx,
+                    &already,
+                    ListResourceTemplatesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourceTemplatesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect_err(
+                "pre-send WebSocket cancellation must reject a tagged resources/templates/list locally",
+            );
+            assert_eq!(
+                pre_send_templates.code,
+                McpErrorCode::RequestCancelled,
+                "pre-send templates cancellation must stay RequestCancelled: {pre_send_templates:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern catalog tag-filter close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern catalog tag-filter WebSocket client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_bind_list_resources_prompts_and_templates_include_and_exclude_tags()
+     {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket catalog tag-filter runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-catalog-tag-filter", "1.0.0")
+                .resource(PublicHttpSnapshotResource)
+                .resource(PublicHttpCursorResourceAResource)
+                .prompt(PublicHttpInstructionPrompt)
+                .prompt(PublicHttpCursorPromptAPrompt)
+                .resource(PublicHttpCursorTemplateResource)
+                .resource(PublicHttpOtherTemplateResource)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket catalog tag filter must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket catalog tag filter publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    bound.serve(&serve_cx).await
+                })
+                .expect(
+                    "public LegacyOnly bind_websocket catalog tag filter serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect(
+                "public LegacyOnly bind_websocket catalog tag filter must complete RFC 6455 upgrade",
+            );
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-catalog-tag-filter", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates catalog tag filters over bind_websocket",
+            );
+
+            let cursor_resources = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter includeTags cursor resources",
+                client.list_resources_page(
+                    &cx,
+                    ListResourcesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourcesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("includeTags cursor must list the cursor-tagged exact-2024 WebSocket resource");
+            assert!(
+                cursor_resources
+                    .resources
+                    .iter()
+                    .any(|resource| resource.uri == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+                "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {cursor_resources:?}"
+            );
+            assert!(
+                cursor_resources
+                    .resources
+                    .iter()
+                    .all(|resource| resource.uri != PUBLIC_HTTP_RESOURCE_URI),
+                "includeTags cursor must omit {PUBLIC_HTTP_RESOURCE_URI}: {cursor_resources:?}"
+            );
+            assert!(
+                cursor_resources.resources.iter().any(|resource| {
+                    resource.uri == PUBLIC_HTTP_CURSOR_RESOURCE_A_URI
+                        && resource.tags.iter().any(|tag| tag == "cursor")
+                }),
+                "exact-2024 includeTags must retain the cursor tag: {cursor_resources:?}"
+            );
+
+            let excluded_resources = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter excludeTags cursor resources",
+                client.list_resources_page(
+                    &cx,
+                    ListResourcesParams {
+                        exclude_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourcesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("excludeTags cursor must omit only the cursor-tagged exact-2024 resource");
+            assert!(
+                excluded_resources
+                    .resources
+                    .iter()
+                    .any(|resource| resource.uri == PUBLIC_HTTP_RESOURCE_URI),
+                "excludeTags cursor must keep {PUBLIC_HTTP_RESOURCE_URI}: {excluded_resources:?}"
+            );
+            assert!(
+                excluded_resources
+                    .resources
+                    .iter()
+                    .all(|resource| resource.uri != PUBLIC_HTTP_CURSOR_RESOURCE_A_URI),
+                "excludeTags cursor must omit {PUBLIC_HTTP_CURSOR_RESOURCE_A_URI}: {excluded_resources:?}"
+            );
+
+            let cursor_prompts = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter includeTags cursor prompts",
+                client.list_prompts_page(
+                    &cx,
+                    ListPromptsParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListPromptsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("includeTags cursor must list the cursor-tagged exact-2024 WebSocket prompt");
+            assert!(
+                cursor_prompts
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.name == PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+                "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {cursor_prompts:?}"
+            );
+            assert!(
+                cursor_prompts
+                    .prompts
+                    .iter()
+                    .all(|prompt| prompt.name != PUBLIC_HTTP_PROMPT_NAME),
+                "includeTags cursor must omit {PUBLIC_HTTP_PROMPT_NAME}: {cursor_prompts:?}"
+            );
+
+            let excluded_prompts = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter excludeTags cursor prompts",
+                client.list_prompts_page(
+                    &cx,
+                    ListPromptsParams {
+                        exclude_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListPromptsParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("excludeTags cursor must omit only the cursor-tagged exact-2024 prompt");
+            assert!(
+                excluded_prompts
+                    .prompts
+                    .iter()
+                    .any(|prompt| prompt.name == PUBLIC_HTTP_PROMPT_NAME),
+                "excludeTags cursor must keep {PUBLIC_HTTP_PROMPT_NAME}: {excluded_prompts:?}"
+            );
+            assert!(
+                excluded_prompts
+                    .prompts
+                    .iter()
+                    .all(|prompt| prompt.name != PUBLIC_HTTP_CURSOR_PROMPT_A_NAME),
+                "excludeTags cursor must omit {PUBLIC_HTTP_CURSOR_PROMPT_A_NAME}: {excluded_prompts:?}"
+            );
+
+            let cursor_templates = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter includeTags cursor templates",
+                client.list_resource_templates_page(
+                    &cx,
+                    ListResourceTemplatesParams {
+                        include_tags: Some(vec!["cursor".to_owned()]),
+                        ..ListResourceTemplatesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("includeTags cursor must list the cursor-tagged exact-2024 template");
+            assert!(
+                cursor_templates
+                    .resource_templates
+                    .iter()
+                    .any(|template| template.uri_template == PUBLIC_HTTP_CURSOR_TEMPLATE),
+                "includeTags cursor must retain {PUBLIC_HTTP_CURSOR_TEMPLATE}: {cursor_templates:?}"
+            );
+            assert!(
+                cursor_templates
+                    .resource_templates
+                    .iter()
+                    .all(|template| template.uri_template != PUBLIC_HTTP_OTHER_TEMPLATE),
+                "includeTags cursor must omit {PUBLIC_HTTP_OTHER_TEMPLATE}: {cursor_templates:?}"
+            );
+
+            let other_templates = websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter includeTags other templates",
+                client.list_resource_templates_page(
+                    &cx,
+                    ListResourceTemplatesParams {
+                        include_tags: Some(vec!["other".to_owned()]),
+                        ..ListResourceTemplatesParams::default()
+                    },
+                ),
+            )
+            .await
+            .expect("changing only includeTags must list the other-tagged exact-2024 template");
+            assert!(
+                other_templates
+                    .resource_templates
+                    .iter()
+                    .any(|template| template.uri_template == PUBLIC_HTTP_OTHER_TEMPLATE),
+                "includeTags other must retain {PUBLIC_HTTP_OTHER_TEMPLATE}: {other_templates:?}"
+            );
+            assert!(
+                other_templates
+                    .resource_templates
+                    .iter()
+                    .all(|template| template.uri_template != PUBLIC_HTTP_CURSOR_TEMPLATE),
+                "includeTags other must omit {PUBLIC_HTTP_CURSOR_TEMPLATE}: {other_templates:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 catalog tag-filter close",
+                client.close(&cx),
+            )
+            .await
+            .expect(
+                "the exact-2024 catalog tag-filter WebSocket client closes after the live proof",
+            );
             drop(client);
             cx.set_cancel_requested(true);
             listener.abort();
