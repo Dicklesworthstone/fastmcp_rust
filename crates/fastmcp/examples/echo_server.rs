@@ -32,13 +32,16 @@ use fastmcp_rust::{
     ToolErrorKind, ToolHandler,
 };
 use fastmcp_server::ServerBuilder;
+use fastmcp_server::caching::ResponseCachingMiddleware;
+use fastmcp_server::rate_limiting::{RateLimitingMiddleware, SlidingWindowRateLimitingMiddleware};
+use fastmcp_server::transform::TransformedTool;
 
 // ============================================================================
 // Tools
 // ============================================================================
 
 /// Echo the input message back.
-#[tool]
+#[tool(tags = ["demo"])]
 fn echo(ctx: &McpContext, message: String) -> String {
     // Check for cancellation (optional but recommended)
     if ctx.is_cancelled() {
@@ -47,6 +50,13 @@ fn echo(ctx: &McpContext, message: String) -> String {
     ctx.report_progress(1.0, Some("echoed"));
     ctx.info("echo-handler-info");
     message
+}
+
+/// Replacement `echo` used only when `FASTMCP_REPLACE_ECHO=1` sets
+/// `DuplicateBehavior::Replace`.
+#[tool(name = "echo")]
+fn echo_replaced(_ctx: &McpContext, message: String) -> String {
+    format!("replaced:{message}")
 }
 
 /// Publishes `notifications/resources/updated` for the shipped server info resource.
@@ -104,7 +114,7 @@ fn show_catalog(ctx: &McpContext) -> String {
 }
 
 /// Add two numbers together.
-#[tool(description = "Calculate the sum of two numbers")]
+#[tool(description = "Calculate the sum of two numbers", tags = ["math"])]
 fn add(_ctx: &McpContext, a: i64, b: i64) -> String {
     format!("{}", a + b)
 }
@@ -126,6 +136,16 @@ fn reverse(_ctx: &McpContext, text: String) -> String {
 fn count_words(_ctx: &McpContext, text: String) -> String {
     let count = text.split_whitespace().count();
     format!("{count}")
+}
+
+static CACHE_PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Increments a process-local counter so `FASTMCP_CACHE_TOOLS=1` can prove
+/// live stdio cache hits without re-invoking the handler.
+#[tool]
+fn cache_probe(_ctx: &McpContext, token: String) -> String {
+    let n = CACHE_PROBE_CALLS.fetch_add(1, Ordering::SeqCst);
+    format!("{token}:{n}")
 }
 
 async fn compose_nested_echo(
@@ -523,6 +543,13 @@ fn elicit_form_info(
         )));
     }
     form_elicitation_input_required(ctx).map(FinalMethodOutcome::InputRequired)
+}
+
+/// Returns an execution error that carries an internal secret so
+/// `FASTMCP_MASK_ERROR_DETAILS=1` can prove live stdio masking.
+#[resource(uri = "info://leak")]
+fn leak_info(_ctx: &McpContext) -> McpResult<String> {
+    Err(McpError::tool_error("secret-db-dsn"))
 }
 
 /// Returns current timestamp.
@@ -996,6 +1023,7 @@ fn main() {
         .tool(Greet)
         .tool(Reverse)
         .tool(CountWords)
+        .tool(CacheProbe)
         .tool(ComposeEcho)
         .tool(SlowEcho)
         .tool(FastEcho)
@@ -1012,6 +1040,7 @@ fn main() {
         .resource(ComposeInfoMissingToolResource)
         .resource(ComposeInfoMissingResourceResource)
         .resource(ElicitFormInfoResource)
+        .resource(LeakInfoResource)
         .resource(CurrentTimeResource)
         .resource(MrtrResourceResource)
         // Register prompts
@@ -1035,6 +1064,68 @@ fn main() {
         builder.instructions(
             "A simple echo server for testing FastMCP. Try calling the 'echo' tool with a message!",
         )
+    };
+    let builder = if std::env::var("FASTMCP_MASK_ERROR_DETAILS").as_deref() == Ok("1") {
+        builder.mask_error_details(true)
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_STRICT_INPUT").as_deref() == Ok("1") {
+        builder.strict_input_validation(true)
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_SLIDING_WINDOW").as_deref() == Ok("1") {
+        builder.middleware(SlidingWindowRateLimitingMiddleware::new(1, 60))
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_RATE_LIMIT").as_deref() == Ok("1") {
+        builder.middleware(RateLimitingMiddleware::new(1.0e-300).burst_capacity(1))
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_REPLACE_ECHO").as_deref() == Ok("1") {
+        builder
+            .on_duplicate(DuplicateBehavior::Replace)
+            .tool(EchoReplaced)
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_TRANSFORM_ECHO").as_deref() == Ok("1") {
+        builder.tool(
+            TransformedTool::from_tool(Echo)
+                .name("echo_text")
+                .rename_arg("message", "text")
+                .build(),
+        )
+    } else {
+        builder
+    };
+    let builder = if std::env::var("FASTMCP_TRANSFORM_HIDE").as_deref() == Ok("1") {
+        builder.tool(
+            TransformedTool::from_tool(Echo)
+                .name("echo_hidden")
+                .hide_arg("message", "hidden-default")
+                .build(),
+        )
+    } else {
+        builder
+    };
+    let builder = match std::env::var("FASTMCP_LIST_PAGE_SIZE") {
+        Ok(value) if !value.is_empty() => builder.list_page_size(
+            value
+                .parse::<usize>()
+                .expect("FASTMCP_LIST_PAGE_SIZE must be a usize"),
+        ),
+        _ => builder,
+    };
+    let builder = if std::env::var("FASTMCP_CACHE_TOOLS").as_deref() == Ok("1") {
+        builder.middleware(
+            ResponseCachingMiddleware::new().include_tools(vec!["cache_probe".to_owned()]),
+        )
+    } else {
+        builder
     };
     let builder = match std::env::var("FASTMCP_FS_ROOT") {
         Ok(root) if !root.is_empty() => {
