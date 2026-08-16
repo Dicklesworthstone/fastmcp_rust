@@ -3562,15 +3562,54 @@ fn unexpected_convenience_result(method: &str) -> McpError {
     ))
 }
 
-fn list_tools_semantic_parameters(params: &ListToolsParams) -> serde_json::Value {
+fn list_catalog_semantic_parameters(
+    include_tags: Option<&Vec<String>>,
+    exclude_tags: Option<&Vec<String>>,
+) -> serde_json::Value {
     let mut members = serde_json::Map::new();
-    if let Some(include_tags) = &params.include_tags {
+    if let Some(include_tags) = include_tags {
         members.insert("includeTags".to_owned(), serde_json::json!(include_tags));
     }
-    if let Some(exclude_tags) = &params.exclude_tags {
+    if let Some(exclude_tags) = exclude_tags {
         members.insert("excludeTags".to_owned(), serde_json::json!(exclude_tags));
     }
     serde_json::Value::Object(members)
+}
+
+fn list_catalog_wire_parameters(
+    cursor: Option<&str>,
+    include_tags: Option<&Vec<String>>,
+    exclude_tags: Option<&Vec<String>>,
+) -> serde_json::Value {
+    let mut members = serde_json::Map::new();
+    if let Some(cursor) = cursor {
+        members.insert("cursor".to_owned(), serde_json::json!(cursor));
+    }
+    if let Some(include_tags) = include_tags {
+        members.insert("includeTags".to_owned(), serde_json::json!(include_tags));
+    }
+    if let Some(exclude_tags) = exclude_tags {
+        members.insert("excludeTags".to_owned(), serde_json::json!(exclude_tags));
+    }
+    serde_json::Value::Object(members)
+}
+
+fn list_tools_semantic_parameters(params: &ListToolsParams) -> serde_json::Value {
+    list_catalog_semantic_parameters(params.include_tags.as_ref(), params.exclude_tags.as_ref())
+}
+
+fn list_resources_semantic_parameters(params: &ListResourcesParams) -> serde_json::Value {
+    list_catalog_semantic_parameters(params.include_tags.as_ref(), params.exclude_tags.as_ref())
+}
+
+fn list_prompts_semantic_parameters(params: &ListPromptsParams) -> serde_json::Value {
+    list_catalog_semantic_parameters(params.include_tags.as_ref(), params.exclude_tags.as_ref())
+}
+
+fn list_resource_templates_semantic_parameters(
+    params: &ListResourceTemplatesParams,
+) -> serde_json::Value {
+    list_catalog_semantic_parameters(params.include_tags.as_ref(), params.exclude_tags.as_ref())
 }
 
 fn convenience_tools_page(result: CoreResult) -> McpResult<(Vec<Tool>, Option<String>)> {
@@ -5667,10 +5706,7 @@ where
     }
 
     fn websocket_list_parameters(cursor: Option<&str>) -> serde_json::Value {
-        cursor.map_or_else(
-            || serde_json::json!({}),
-            |cursor| serde_json::json!({ "cursor": cursor }),
-        )
+        list_catalog_wire_parameters(cursor, None, None)
     }
 
     /// Lists one page of tools through the negotiated WebSocket era.
@@ -5678,8 +5714,35 @@ where
     where
         IO: Send + 'static,
     {
-        self.request_core_verb(cx, "tools/list", Self::websocket_list_parameters(cursor))
-            .await
+        self.list_tools_with_params(
+            cx,
+            ListToolsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListToolsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of tools with include/exclude tag filters.
+    pub async fn list_tools_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListToolsParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(
+            cx,
+            "tools/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+        )
+        .await
     }
 
     /// Lists one catalog page through the negotiated WebSocket era.
@@ -5865,10 +5928,33 @@ where
     where
         IO: Send + 'static,
     {
+        self.list_resources_with_params(
+            cx,
+            ListResourcesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourcesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of resources with include/exclude tag filters.
+    pub async fn list_resources_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListResourcesParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.request_core_verb(
             cx,
             "resources/list",
-            Self::websocket_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -5882,10 +5968,33 @@ where
     where
         IO: Send + 'static,
     {
+        self.list_resource_templates_with_params(
+            cx,
+            ListResourceTemplatesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourceTemplatesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of resource templates with include/exclude tag filters.
+    pub async fn list_resource_templates_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.request_core_verb(
             cx,
             "resources/templates/list",
-            Self::websocket_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -5895,8 +6004,35 @@ where
     where
         IO: Send + 'static,
     {
-        self.request_core_verb(cx, "prompts/list", Self::websocket_list_parameters(cursor))
-            .await
+        self.list_prompts_with_params(
+            cx,
+            ListPromptsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListPromptsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of prompts with include/exclude tag filters.
+    pub async fn list_prompts_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListPromptsParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(
+            cx,
+            "prompts/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+        )
+        .await
     }
 
     fn websocket_prompt_parameters(
@@ -6145,11 +6281,36 @@ where
     where
         IO: Send + 'static,
     {
+        self.list_tools_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListToolsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListToolsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered tools page under a caller-owned cancellation domain.
+    pub async fn list_tools_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListToolsParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.request_core_verb_with_cancellation(
             cx,
             cancellation,
             "tools/list",
-            Self::websocket_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -6164,11 +6325,36 @@ where
     where
         IO: Send + 'static,
     {
+        self.list_resources_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListResourcesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourcesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered resources page under a caller-owned cancellation domain.
+    pub async fn list_resources_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourcesParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.request_core_verb_with_cancellation(
             cx,
             cancellation,
             "resources/list",
-            Self::websocket_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -6184,11 +6370,36 @@ where
     where
         IO: Send + 'static,
     {
+        self.list_resource_templates_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListResourceTemplatesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourceTemplatesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered templates page under a caller-owned cancellation domain.
+    pub async fn list_resource_templates_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.request_core_verb_with_cancellation(
             cx,
             cancellation,
             "resources/templates/list",
-            Self::websocket_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -6203,11 +6414,36 @@ where
     where
         IO: Send + 'static,
     {
+        self.list_prompts_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListPromptsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListPromptsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered prompts page under a caller-owned cancellation domain.
+    pub async fn list_prompts_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListPromptsParams,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
         self.request_core_verb_with_cancellation(
             cx,
             cancellation,
             "prompts/list",
-            Self::websocket_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -10839,10 +11075,7 @@ impl HttpClient {
     }
 
     fn http_list_parameters(cursor: Option<&str>) -> serde_json::Value {
-        cursor.map_or_else(
-            || serde_json::json!({}),
-            |cursor| serde_json::json!({ "cursor": cursor }),
-        )
+        list_catalog_wire_parameters(cursor, None, None)
     }
 
     /// Lists one page of tools through the negotiated HTTP era.
@@ -10851,8 +11084,32 @@ impl HttpClient {
         cx: &Cx,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
-        self.request_final_core(cx, "tools/list", Self::http_list_parameters(cursor))
-            .await
+        self.list_tools_with_params(
+            cx,
+            ListToolsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListToolsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of tools with include/exclude tag filters.
+    pub async fn list_tools_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListToolsParams,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(
+            cx,
+            "tools/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+        )
+        .await
     }
 
     /// Sends `ping` through the negotiated HTTP era.
@@ -10952,11 +11209,33 @@ impl HttpClient {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
+        self.list_tools_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListToolsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListToolsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered tools page under a caller-owned cancellation domain.
+    pub async fn list_tools_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListToolsParams,
+    ) -> Result<CoreResult, HttpClientError> {
         self.request_final_core_with_cancellation(
             cx,
             cancellation,
             "tools/list",
-            Self::http_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -10968,11 +11247,33 @@ impl HttpClient {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
+        self.list_resources_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListResourcesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourcesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered resources page under a caller-owned cancellation domain.
+    pub async fn list_resources_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourcesParams,
+    ) -> Result<CoreResult, HttpClientError> {
         self.request_final_core_with_cancellation(
             cx,
             cancellation,
             "resources/list",
-            Self::http_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -10985,11 +11286,33 @@ impl HttpClient {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
+        self.list_resource_templates_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListResourceTemplatesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourceTemplatesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered templates page under a caller-owned cancellation domain.
+    pub async fn list_resource_templates_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourceTemplatesParams,
+    ) -> Result<CoreResult, HttpClientError> {
         self.request_final_core_with_cancellation(
             cx,
             cancellation,
             "resources/templates/list",
-            Self::http_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -11001,11 +11324,33 @@ impl HttpClient {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
+        self.list_prompts_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListPromptsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListPromptsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one tag-filtered prompts page under a caller-owned cancellation domain.
+    pub async fn list_prompts_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListPromptsParams,
+    ) -> Result<CoreResult, HttpClientError> {
         self.request_final_core_with_cancellation(
             cx,
             cancellation,
             "prompts/list",
-            Self::http_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -11016,8 +11361,32 @@ impl HttpClient {
         cx: &Cx,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
-        self.request_final_core(cx, "resources/list", Self::http_list_parameters(cursor))
-            .await
+        self.list_resources_with_params(
+            cx,
+            ListResourcesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourcesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of resources with include/exclude tag filters.
+    pub async fn list_resources_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListResourcesParams,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(
+            cx,
+            "resources/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+        )
+        .await
     }
 
     /// Lists one page of resource templates through the negotiated HTTP era.
@@ -11026,10 +11395,30 @@ impl HttpClient {
         cx: &Cx,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
+        self.list_resource_templates_with_params(
+            cx,
+            ListResourceTemplatesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourceTemplatesParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of resource templates with include/exclude tag filters.
+    pub async fn list_resource_templates_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListResourceTemplatesParams,
+    ) -> Result<CoreResult, HttpClientError> {
         self.request_final_core(
             cx,
             "resources/templates/list",
-            Self::http_list_parameters(cursor),
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
         )
         .await
     }
@@ -11040,8 +11429,32 @@ impl HttpClient {
         cx: &Cx,
         cursor: Option<&str>,
     ) -> Result<CoreResult, HttpClientError> {
-        self.request_final_core(cx, "prompts/list", Self::http_list_parameters(cursor))
-            .await
+        self.list_prompts_with_params(
+            cx,
+            ListPromptsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListPromptsParams::default()
+            },
+        )
+        .await
+    }
+
+    /// Lists one page of prompts with include/exclude tag filters.
+    pub async fn list_prompts_with_params(
+        &mut self,
+        cx: &Cx,
+        params: ListPromptsParams,
+    ) -> Result<CoreResult, HttpClientError> {
+        self.request_final_core(
+            cx,
+            "prompts/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+        )
+        .await
     }
 
     fn http_prompt_parameters(
@@ -16299,10 +16712,23 @@ impl Client {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> McpResult<CoreResult> {
-        let params = ListToolsParams {
-            cursor: cursor.map(ToOwned::to_owned),
-            ..ListToolsParams::default()
-        };
+        self.list_tools_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListToolsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListToolsParams::default()
+            },
+        )
+    }
+
+    /// Lists one tag-filtered tools page under a request-local cancellation domain.
+    pub fn list_tools_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListToolsParams,
+    ) -> McpResult<CoreResult> {
         let parameters = serde_json::to_value(params).map_err(|error| {
             McpError::internal_error(format!(
                 "Client tools/list parameters could not serialize: {error}"
@@ -16321,10 +16747,23 @@ impl Client {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> McpResult<CoreResult> {
-        let params = ListResourcesParams {
-            cursor: cursor.map(ToOwned::to_owned),
-            ..ListResourcesParams::default()
-        };
+        self.list_resources_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListResourcesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourcesParams::default()
+            },
+        )
+    }
+
+    /// Lists one tag-filtered resources page under a request-local cancellation domain.
+    pub fn list_resources_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourcesParams,
+    ) -> McpResult<CoreResult> {
         let parameters = serde_json::to_value(params).map_err(|error| {
             McpError::internal_error(format!(
                 "Client resources/list parameters could not serialize: {error}"
@@ -16341,10 +16780,23 @@ impl Client {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> McpResult<CoreResult> {
-        let params = ListResourceTemplatesParams {
-            cursor: cursor.map(ToOwned::to_owned),
-            ..ListResourceTemplatesParams::default()
-        };
+        self.list_resource_templates_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListResourceTemplatesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourceTemplatesParams::default()
+            },
+        )
+    }
+
+    /// Lists one tag-filtered templates page under a request-local cancellation domain.
+    pub fn list_resource_templates_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CoreResult> {
         let parameters = serde_json::to_value(params).map_err(|error| {
             McpError::internal_error(format!(
                 "Client resources/templates/list parameters could not serialize: {error}"
@@ -16366,10 +16818,23 @@ impl Client {
         cancellation: &McpRequestCancellation,
         cursor: Option<&str>,
     ) -> McpResult<CoreResult> {
-        let params = ListPromptsParams {
-            cursor: cursor.map(ToOwned::to_owned),
-            ..ListPromptsParams::default()
-        };
+        self.list_prompts_with_params_and_cancellation(
+            cx,
+            cancellation,
+            ListPromptsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListPromptsParams::default()
+            },
+        )
+    }
+
+    /// Lists one tag-filtered prompts page under a request-local cancellation domain.
+    pub fn list_prompts_with_params_and_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListPromptsParams,
+    ) -> McpResult<CoreResult> {
         let parameters = serde_json::to_value(params).map_err(|error| {
             McpError::internal_error(format!(
                 "Client prompts/list parameters could not serialize: {error}"
@@ -17297,15 +17762,26 @@ impl Client {
     /// contract is contradicted. A contradictory core result terminates the
     /// connection.
     pub fn list_resources_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
-        self.ensure_initialized()?;
-        let cursor = cursor.map(ToOwned::to_owned);
-        let params = ListResourcesParams {
-            cursor: cursor.clone(),
+        self.list_resources_typed_with_params(ListResourcesParams {
+            cursor: cursor.map(ToOwned::to_owned),
             ..ListResourcesParams::default()
-        };
+        })
+    }
+
+    /// Lists one page of resources with explicit include/exclude tag filters.
+    ///
+    /// The tag filters are part of the modern list-cache key so a filtered
+    /// page cannot be served from an unfiltered one.
+    pub fn list_resources_typed_with_params(
+        &mut self,
+        params: ListResourcesParams,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let cursor = params.cursor.clone();
+        let semantic_parameters = list_resources_semantic_parameters(&params);
         self.cached_final_core_request(
             "resources/list",
-            serde_json::json!({}),
+            semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::Resources,
             move |client| client.send_typed_core_request("resources/list", params),
@@ -17318,18 +17794,34 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_resources(&mut self) -> McpResult<Vec<Resource>> {
+        self.list_resources_with_params(ListResourcesParams::default())
+    }
+
+    /// Follows peer cursors for one tag-filtered resources/list query.
+    pub fn list_resources_with_params(
+        &mut self,
+        params: ListResourcesParams,
+    ) -> McpResult<Vec<Resource>> {
         self.ensure_initialized()?;
+        let include_tags = params.include_tags.clone();
+        let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = None;
+            let mut cursor: Option<String> = params.cursor.clone();
             let mut budget = PaginationBudget::new();
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
-                let (resources, next_cursor) =
-                    convenience_resources_page(self.list_resources_typed(cursor.as_deref())?)?;
+                let page_params = ListResourcesParams {
+                    cursor: cursor.clone(),
+                    include_tags: include_tags.clone(),
+                    exclude_tags: exclude_tags.clone(),
+                };
+                let (resources, next_cursor) = convenience_resources_page(
+                    self.list_resources_typed_with_params(page_params)?,
+                )?;
                 if self.final_list_restart_needed(&FinalCacheResultSet::Resources, &mut baseline) {
                     restarts += 1;
                     if restarts > 1 {
@@ -17360,11 +17852,31 @@ impl Client {
         cursor: Option<&str>,
         limits: ListPageLimits,
     ) -> McpResult<BoundedListPage<Resource>> {
-        let cursor_parameter = validate_list_page_request(cursor, limits)?;
+        self.list_resources_page_with_params(
+            ListResourcesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourcesParams::default()
+            },
+            limits,
+        )
+    }
+
+    /// Acquires at most one bounded, tag-filtered resources page.
+    pub fn list_resources_page_with_params(
+        &mut self,
+        params: ListResourcesParams,
+        limits: ListPageLimits,
+    ) -> McpResult<BoundedListPage<Resource>> {
+        let request_cursor = params.cursor.clone();
+        let cursor_parameter = validate_list_page_request(request_cursor.as_deref(), limits)?;
         self.ensure_initialized()?;
+        let params = ListResourcesParams {
+            cursor: cursor_parameter,
+            ..params
+        };
         let (resources, next_cursor) =
-            convenience_resources_page(self.list_resources_typed(cursor_parameter.as_deref())?)?;
-        bounded_list_page(resources, cursor, next_cursor, limits)
+            convenience_resources_page(self.list_resources_typed_with_params(params)?)?;
+        bounded_list_page(resources, request_cursor.as_deref(), next_cursor, limits)
     }
 
     /// Lists one page of resource templates and returns its negotiated core
@@ -17381,15 +17893,23 @@ impl Client {
     /// contract is contradicted. A contradictory core result terminates the
     /// connection.
     pub fn list_resource_templates_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
-        self.ensure_initialized()?;
-        let cursor = cursor.map(ToOwned::to_owned);
-        let params = ListResourceTemplatesParams {
-            cursor: cursor.clone(),
+        self.list_resource_templates_typed_with_params(ListResourceTemplatesParams {
+            cursor: cursor.map(ToOwned::to_owned),
             ..ListResourceTemplatesParams::default()
-        };
+        })
+    }
+
+    /// Lists one page of resource templates with explicit include/exclude tag filters.
+    pub fn list_resource_templates_typed_with_params(
+        &mut self,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let cursor = params.cursor.clone();
+        let semantic_parameters = list_resource_templates_semantic_parameters(&params);
         self.cached_final_core_request(
             "resources/templates/list",
-            serde_json::json!({}),
+            semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::ResourceTemplates,
             move |client| client.send_typed_core_request("resources/templates/list", params),
@@ -17402,18 +17922,33 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
+        self.list_resource_templates_with_params(ListResourceTemplatesParams::default())
+    }
+
+    /// Follows peer cursors for one tag-filtered resources/templates/list query.
+    pub fn list_resource_templates_with_params(
+        &mut self,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<Vec<ResourceTemplate>> {
         self.ensure_initialized()?;
+        let include_tags = params.include_tags.clone();
+        let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = None;
+            let mut cursor: Option<String> = params.cursor.clone();
             let mut budget = PaginationBudget::new();
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
+                let page_params = ListResourceTemplatesParams {
+                    cursor: cursor.clone(),
+                    include_tags: include_tags.clone(),
+                    exclude_tags: exclude_tags.clone(),
+                };
                 let (resource_templates, next_cursor) = convenience_resource_templates_page(
-                    self.list_resource_templates_typed(cursor.as_deref())?,
+                    self.list_resource_templates_typed_with_params(page_params)?,
                 )?;
                 if self.final_list_restart_needed(
                     &FinalCacheResultSet::ResourceTemplates,
@@ -17448,12 +17983,37 @@ impl Client {
         cursor: Option<&str>,
         limits: ListPageLimits,
     ) -> McpResult<BoundedListPage<ResourceTemplate>> {
-        let cursor_parameter = validate_list_page_request(cursor, limits)?;
+        self.list_resource_templates_page_with_params(
+            ListResourceTemplatesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListResourceTemplatesParams::default()
+            },
+            limits,
+        )
+    }
+
+    /// Acquires at most one bounded, tag-filtered resource-templates page.
+    pub fn list_resource_templates_page_with_params(
+        &mut self,
+        params: ListResourceTemplatesParams,
+        limits: ListPageLimits,
+    ) -> McpResult<BoundedListPage<ResourceTemplate>> {
+        let request_cursor = params.cursor.clone();
+        let cursor_parameter = validate_list_page_request(request_cursor.as_deref(), limits)?;
         self.ensure_initialized()?;
+        let params = ListResourceTemplatesParams {
+            cursor: cursor_parameter,
+            ..params
+        };
         let (resource_templates, next_cursor) = convenience_resource_templates_page(
-            self.list_resource_templates_typed(cursor_parameter.as_deref())?,
+            self.list_resource_templates_typed_with_params(params)?,
         )?;
-        bounded_list_page(resource_templates, cursor, next_cursor, limits)
+        bounded_list_page(
+            resource_templates,
+            request_cursor.as_deref(),
+            next_cursor,
+            limits,
+        )
     }
 
     /// Configures the selected protocol era's log level behavior.
@@ -17649,15 +18209,26 @@ impl Client {
     /// contract is contradicted. A contradictory core result terminates the
     /// connection.
     pub fn list_prompts_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
-        self.ensure_initialized()?;
-        let cursor = cursor.map(ToOwned::to_owned);
-        let params = ListPromptsParams {
-            cursor: cursor.clone(),
+        self.list_prompts_typed_with_params(ListPromptsParams {
+            cursor: cursor.map(ToOwned::to_owned),
             ..ListPromptsParams::default()
-        };
+        })
+    }
+
+    /// Lists one page of prompts with explicit include/exclude tag filters.
+    ///
+    /// The tag filters are part of the modern list-cache key so a filtered
+    /// page cannot be served from an unfiltered one.
+    pub fn list_prompts_typed_with_params(
+        &mut self,
+        params: ListPromptsParams,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let cursor = params.cursor.clone();
+        let semantic_parameters = list_prompts_semantic_parameters(&params);
         self.cached_final_core_request(
             "prompts/list",
-            serde_json::json!({}),
+            semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::Prompts,
             move |client| client.send_typed_core_request("prompts/list", params),
@@ -17670,18 +18241,33 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
+        self.list_prompts_with_params(ListPromptsParams::default())
+    }
+
+    /// Follows peer cursors for one tag-filtered prompts/list query.
+    pub fn list_prompts_with_params(
+        &mut self,
+        params: ListPromptsParams,
+    ) -> McpResult<Vec<Prompt>> {
         self.ensure_initialized()?;
+        let include_tags = params.include_tags.clone();
+        let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = None;
+            let mut cursor: Option<String> = params.cursor.clone();
             let mut budget = PaginationBudget::new();
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
+                let page_params = ListPromptsParams {
+                    cursor: cursor.clone(),
+                    include_tags: include_tags.clone(),
+                    exclude_tags: exclude_tags.clone(),
+                };
                 let (prompts, next_cursor) =
-                    convenience_prompts_page(self.list_prompts_typed(cursor.as_deref())?)?;
+                    convenience_prompts_page(self.list_prompts_typed_with_params(page_params)?)?;
                 if self.final_list_restart_needed(&FinalCacheResultSet::Prompts, &mut baseline) {
                     restarts += 1;
                     if restarts > 1 {
@@ -17712,11 +18298,31 @@ impl Client {
         cursor: Option<&str>,
         limits: ListPageLimits,
     ) -> McpResult<BoundedListPage<Prompt>> {
-        let cursor_parameter = validate_list_page_request(cursor, limits)?;
+        self.list_prompts_page_with_params(
+            ListPromptsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListPromptsParams::default()
+            },
+            limits,
+        )
+    }
+
+    /// Acquires at most one bounded, tag-filtered prompts page.
+    pub fn list_prompts_page_with_params(
+        &mut self,
+        params: ListPromptsParams,
+        limits: ListPageLimits,
+    ) -> McpResult<BoundedListPage<Prompt>> {
+        let request_cursor = params.cursor.clone();
+        let cursor_parameter = validate_list_page_request(request_cursor.as_deref(), limits)?;
         self.ensure_initialized()?;
+        let params = ListPromptsParams {
+            cursor: cursor_parameter,
+            ..params
+        };
         let (prompts, next_cursor) =
-            convenience_prompts_page(self.list_prompts_typed(cursor_parameter.as_deref())?)?;
-        bounded_list_page(prompts, cursor, next_cursor, limits)
+            convenience_prompts_page(self.list_prompts_typed_with_params(params)?)?;
+        bounded_list_page(prompts, request_cursor.as_deref(), next_cursor, limits)
     }
 
     /// Gets a prompt and returns its negotiated, method-aware core result.
