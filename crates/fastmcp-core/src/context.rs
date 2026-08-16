@@ -1036,6 +1036,90 @@ pub trait ToolCaller: Send + Sync {
 }
 
 // ============================================================================
+// Prompt Caller (Cross-Component Access)
+// ============================================================================
+
+/// Maximum depth for nested prompt gets to prevent infinite recursion.
+pub const MAX_PROMPT_GET_DEPTH: u32 = 10;
+
+/// Role of one prompt message returned through [`McpContext::get_prompt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptMessageRole {
+    /// User-authored prompt turn.
+    User,
+    /// Assistant-authored prompt turn.
+    Assistant,
+}
+
+/// One prompt message returned through [`McpContext::get_prompt`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptMessageItem {
+    /// Message role.
+    pub role: PromptMessageRole,
+    /// Text content when the handler authored a text block.
+    pub text: Option<String>,
+}
+
+impl PromptMessageItem {
+    /// Creates a user text message.
+    #[must_use]
+    pub fn user_text(text: impl Into<String>) -> Self {
+        Self {
+            role: PromptMessageRole::User,
+            text: Some(text.into()),
+        }
+    }
+
+    /// Returns the text content, if present.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+}
+
+/// Result of getting a prompt from within a handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptGetResult {
+    /// Optional prompt description from the catalog definition.
+    pub description: Option<String>,
+    /// Messages returned by the prompt handler.
+    pub messages: Vec<PromptMessageItem>,
+}
+
+impl PromptGetResult {
+    /// Creates a prompt result with the given messages.
+    #[must_use]
+    pub fn new(messages: Vec<PromptMessageItem>) -> Self {
+        Self {
+            description: None,
+            messages,
+        }
+    }
+
+    /// Returns the first text message, if present.
+    #[must_use]
+    pub fn first_text(&self) -> Option<&str> {
+        self.messages.iter().find_map(PromptMessageItem::as_text)
+    }
+}
+
+/// Trait for getting prompts from within handlers.
+///
+/// This trait is implemented by the server's Router to allow tools,
+/// resources, and prompts to get other prompts. It enables
+/// cross-component composition and code reuse.
+pub trait PromptCaller: Send + Sync {
+    /// Gets a prompt by name with the given arguments.
+    fn get_prompt<'a>(
+        &'a self,
+        context: &'a McpContext,
+        name: &'a str,
+        arguments: std::collections::HashMap<String, String>,
+        depth: u32,
+    ) -> Pin<Box<dyn Future<Output = crate::McpResult<PromptGetResult>> + Send + 'a>>;
+}
+
+// ============================================================================
 // Capabilities Info
 // ============================================================================
 
@@ -1345,6 +1429,10 @@ pub struct McpContext {
     tool_caller: Option<Arc<dyn ToolCaller>>,
     /// Current tool call depth (to prevent infinite recursion).
     tool_call_depth: u32,
+    /// Optional prompt caller for cross-component access.
+    prompt_caller: Option<Arc<dyn PromptCaller>>,
+    /// Current prompt get depth (to prevent infinite recursion).
+    prompt_get_depth: u32,
     /// Client capability information.
     client_capabilities: Option<ClientCapabilityInfo>,
     /// Server capability information.
@@ -1422,6 +1510,8 @@ impl std::fmt::Debug for McpContext {
             .field("resource_read_depth", &self.resource_read_depth)
             .field("tool_caller", &self.tool_caller.is_some())
             .field("tool_call_depth", &self.tool_call_depth)
+            .field("prompt_caller", &self.prompt_caller.is_some())
+            .field("prompt_get_depth", &self.prompt_get_depth)
             .field("client_capabilities", &self.client_capabilities)
             .field("server_capabilities", &self.server_capabilities)
             .field("log_sender", &self.log_sender.is_some())
@@ -1543,6 +1633,8 @@ impl McpContext {
             resource_read_depth: 0,
             tool_caller: None,
             tool_call_depth: 0,
+            prompt_caller: None,
+            prompt_get_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
             log_sender: None,
@@ -1581,6 +1673,8 @@ impl McpContext {
             resource_read_depth: 0,
             tool_caller: None,
             tool_call_depth: 0,
+            prompt_caller: None,
+            prompt_get_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
             log_sender: None,
@@ -1620,6 +1714,8 @@ impl McpContext {
             resource_read_depth: 0,
             tool_caller: None,
             tool_call_depth: 0,
+            prompt_caller: None,
+            prompt_get_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
             log_sender: None,
@@ -1663,6 +1759,8 @@ impl McpContext {
             resource_read_depth: 0,
             tool_caller: None,
             tool_call_depth: 0,
+            prompt_caller: None,
+            prompt_get_depth: 0,
             client_capabilities: None,
             server_capabilities: None,
             log_sender: None,
@@ -1872,6 +1970,26 @@ impl McpContext {
     #[must_use]
     pub fn with_tool_call_depth(mut self, depth: u32) -> Self {
         self.tool_call_depth = self.tool_call_depth.max(depth);
+        self
+    }
+
+    /// Sets the prompt caller for this context.
+    ///
+    /// This enables the `get_prompt()` methods to get other prompts from
+    /// within tool, resource, or prompt handlers.
+    #[must_use]
+    pub fn with_prompt_caller(mut self, caller: Arc<dyn PromptCaller>) -> Self {
+        self.prompt_caller = Some(caller);
+        self
+    }
+
+    /// Sets the prompt get depth for this context.
+    ///
+    /// This is used internally to track recursion depth when getting
+    /// prompts from within handlers.
+    #[must_use]
+    pub fn with_prompt_get_depth(mut self, depth: u32) -> Self {
+        self.prompt_get_depth = self.prompt_get_depth.max(depth);
         self
     }
 
@@ -2648,6 +2766,7 @@ impl McpContext {
         self.roots_provider = None;
         self.resource_reader = None;
         self.tool_caller = None;
+        self.prompt_caller = None;
         self
     }
 
@@ -3402,10 +3521,10 @@ impl McpContext {
             )
         })?;
 
-        // Use one effective nesting depth across both cross-component APIs so
-        // alternating tool -> resource -> tool cycles cannot reset either
+        // Use one effective nesting depth across all cross-component APIs so
+        // alternating tool -> resource -> prompt cycles cannot reset a
         // type-specific counter.
-        let nested_dispatch_depth = self.resource_read_depth.max(self.tool_call_depth);
+        let nested_dispatch_depth = self.nested_dispatch_depth();
         if nested_dispatch_depth >= MAX_RESOURCE_READ_DEPTH {
             return Err(crate::McpError::new(
                 crate::McpErrorCode::InternalError,
@@ -3551,9 +3670,9 @@ impl McpContext {
             )
         })?;
 
-        // Share the effective depth with resource reads so alternating cycles
-        // are bounded just like same-kind recursion.
-        let nested_dispatch_depth = self.resource_read_depth.max(self.tool_call_depth);
+        // Share the effective depth with resource reads and prompt gets so
+        // alternating cycles are bounded just like same-kind recursion.
+        let nested_dispatch_depth = self.nested_dispatch_depth();
         if nested_dispatch_depth >= MAX_TOOL_CALL_DEPTH {
             return Err(crate::McpError::new(
                 crate::McpErrorCode::InternalError,
@@ -3649,6 +3768,80 @@ impl McpContext {
             crate::McpError::new(
                 crate::McpErrorCode::InternalError,
                 format!("Failed to parse tool '{}' result as JSON: {}", name, e),
+            )
+        })
+    }
+
+    // ========================================================================
+    // Prompt Getting (Cross-Component Access)
+    // ========================================================================
+
+    /// Returns whether prompt getting is available in this context.
+    #[must_use]
+    pub fn can_get_prompts(&self) -> bool {
+        self.ensure_live().is_ok() && self.prompt_caller.is_some()
+    }
+
+    /// Returns the current prompt get depth.
+    #[must_use]
+    pub fn prompt_get_depth(&self) -> u32 {
+        self.prompt_get_depth
+    }
+
+    fn nested_dispatch_depth(&self) -> u32 {
+        self.resource_read_depth
+            .max(self.tool_call_depth)
+            .max(self.prompt_get_depth)
+    }
+
+    /// Gets a prompt by name with the given arguments.
+    ///
+    /// This allows tools, resources, and prompts to get other prompts
+    /// configured on the same server.
+    pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> crate::McpResult<PromptGetResult> {
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        let caller = self.prompt_caller.as_ref().ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                "Prompt getting not available: no router attached to context",
+            )
+        })?;
+
+        let nested_dispatch_depth = self.nested_dispatch_depth();
+        if nested_dispatch_depth >= MAX_PROMPT_GET_DEPTH {
+            return Err(crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!(
+                    "Maximum prompt get depth ({}) exceeded getting '{}'; possible infinite recursion",
+                    MAX_PROMPT_GET_DEPTH, name
+                ),
+            ));
+        }
+
+        let result = caller
+            .get_prompt(self, name, arguments, nested_dispatch_depth + 1)
+            .await?;
+        self.ensure_live()
+            .map_err(|_| crate::McpError::request_cancelled())?;
+        Ok(result)
+    }
+
+    /// Gets a prompt and extracts the first text message.
+    pub async fn get_prompt_text(
+        &self,
+        name: &str,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> crate::McpResult<String> {
+        let result = self.get_prompt(name, arguments).await?;
+        result.first_text().map(String::from).ok_or_else(|| {
+            crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!("Prompt '{}' returned no text content", name),
             )
         })
     }
