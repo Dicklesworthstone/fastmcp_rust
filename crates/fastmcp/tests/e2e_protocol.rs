@@ -1702,6 +1702,118 @@ fn e2e_public_stdio_modern_composes_nested_tool_and_resource() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_modern_composes_nested_prompt() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let composed = client
+        .call_tool("compose_prompt", json!({"name": "alpha"}))
+        .expect("live modern stdio compose_prompt must nest the greeting prompt");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "compose-prompt:Please greet alpha in a friendly way."
+            }
+            _ => false,
+        }),
+        "compose_prompt must retain the nested greeting text: {composed:?}"
+    );
+
+    let missing = client.call_tool(
+        "compose_prompt",
+        json!({
+            "name": "alpha",
+            "prompt": "stdio-e2e-missing",
+        }),
+    );
+    let missing = match missing {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!("changing only the nested prompt name must refuse: {result:?}"),
+    };
+    assert!(
+        missing.contains("stdio-e2e-missing")
+            || missing.contains("compose-nested-prompt")
+            || missing.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio compose-prompt client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_resource_and_prompt_compose_nested_prompt() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+
+    let resource = client
+        .read_resource("info://compose-prompt")
+        .expect("live modern stdio info://compose-prompt must nest greeting");
+    assert!(
+        resource.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => {
+                text == "compose-prompt:Please greet alpha in a friendly way."
+            }
+            _ => false,
+        }),
+        "info://compose-prompt must retain the nested greeting text: {resource:?}"
+    );
+    let missing_resource = client
+        .read_resource("info://compose-prompt-missing")
+        .expect_err("changing only the nested prompt name must refuse the resource compose");
+    let missing_resource = format!("{missing_resource:?}");
+    assert!(
+        missing_resource.contains("stdio-e2e-missing")
+            || missing_resource.contains("compose-nested-prompt")
+            || missing_resource.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing_resource}"
+    );
+
+    let prompt = client
+        .get_prompt(
+            "compose_from_prompt",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        )
+        .expect("live modern stdio compose_from_prompt must nest greeting");
+    assert!(
+        prompt
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text == "compose-prompt:Please greet alpha in a friendly way."
+                }
+                _ => false,
+            }),
+        "compose_from_prompt must retain the nested greeting text: {prompt:?}"
+    );
+    let missing_prompt = client
+        .get_prompt(
+            "compose_from_prompt",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("prompt".to_owned(), "stdio-e2e-missing".to_owned()),
+            ]),
+        )
+        .expect_err("changing only the nested prompt name must refuse the prompt compose");
+    let missing_prompt = format!("{missing_prompt:?}");
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt")
+            || missing_prompt.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing_prompt}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio resource/prompt compose-prompt client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_modern_prompt_composes_nested_tool_and_resource() {
     let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
@@ -2512,6 +2624,85 @@ fn e2e_public_stdio_modern_completion_returns_typed_result_and_rejects_undeclare
         cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
         "the public close confirms bounded stdio child cleanup and reap"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_resource_template_completion_is_retained_and_unregistered_template_is_refused()
+ {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+    let params = modern::CompletionParams {
+        reference: modern::CompletionReference::Resource {
+            uri: "note://{name}".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "name".to_owned(),
+            value: "al".to_owned(),
+        },
+        context: None,
+    };
+
+    let result = client
+        .complete(params.clone())
+        .expect("the typed ModernOnly client reaches the shipped note template provider");
+    assert_eq!(
+        result.completion.values,
+        vec!["alice".to_owned()],
+        "the exact FinalCompletionResult retains the note template provider value: {result:?}"
+    );
+    assert_eq!(
+        result.completion.total,
+        Some(modern::JsonInteger::from(1_i64))
+    );
+    assert_eq!(result.completion.has_more, Some(false));
+
+    let mut undeclared_argument = params.clone();
+    undeclared_argument.argument.name = "undeclared".to_owned();
+    let undeclared = client
+        .complete(undeclared_argument)
+        .expect_err("only an undeclared template variable is rejected");
+    assert_eq!(undeclared.code, McpErrorCode::InvalidParams);
+
+    let mut other_template = params;
+    other_template.reference = modern::CompletionReference::Resource {
+        uri: "memo://{name}".to_owned(),
+    };
+    let missing_provider = client
+        .complete(other_template)
+        .expect_err("changing only the template URI must refuse a missing provider");
+    assert_eq!(missing_provider.code, McpErrorCode::InvalidParams);
+
+    let greeting = client
+        .complete(modern::CompletionParams {
+            reference: modern::CompletionReference::PromptWithTitle {
+                name: "greeting".to_owned(),
+                title: "Greeting".to_owned(),
+            },
+            argument: modern::FinalCompletionArgument {
+                name: "name".to_owned(),
+                value: "co".to_owned(),
+            },
+            context: Some(modern::FinalCompletionContext {
+                arguments: Some(std::collections::BTreeMap::from([(
+                    "locale".to_owned(),
+                    "en-US".to_owned(),
+                )])),
+            }),
+        })
+        .expect("the note provider must leave the greeting prompt provider usable");
+    assert!(
+        greeting
+            .completion
+            .values
+            .first()
+            .is_some_and(|value| value.starts_with("stdio-completion-")),
+        "the greeting provider must still complete after note template completion: {greeting:?}"
+    );
+
+    client
+        .close()
+        .expect("modern note-completion stdio client cleanup");
 }
 
 #[cfg(unix)]
@@ -3370,6 +3561,118 @@ fn e2e_public_stdio_legacy_composes_nested_tool_and_resource() {
     client
         .close()
         .expect("legacy-only stdio compose client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_composes_nested_prompt() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let composed = client
+        .call_tool("compose_prompt", json!({"name": "alpha"}))
+        .expect("live exact-2024 stdio compose_prompt must nest the greeting prompt");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => {
+                text == "compose-prompt:Please greet alpha in a friendly way."
+            }
+            _ => false,
+        }),
+        "compose_prompt must retain the nested greeting text: {composed:?}"
+    );
+
+    let missing = client.call_tool(
+        "compose_prompt",
+        json!({
+            "name": "alpha",
+            "prompt": "stdio-e2e-missing",
+        }),
+    );
+    let missing = match missing {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => panic!("changing only the nested prompt name must refuse: {result:?}"),
+    };
+    assert!(
+        missing.contains("stdio-e2e-missing")
+            || missing.contains("compose-nested-prompt")
+            || missing.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio compose-prompt client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_resource_and_prompt_compose_nested_prompt() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let resource = client
+        .read_resource("info://compose-prompt")
+        .expect("live exact-2024 stdio info://compose-prompt must nest greeting");
+    assert!(
+        resource.contents.iter().any(|content| match content {
+            LegacyResourceContent::Text { text, .. } => {
+                text == "compose-prompt:Please greet alpha in a friendly way."
+            }
+            _ => false,
+        }),
+        "info://compose-prompt must retain the nested greeting text: {resource:?}"
+    );
+    let missing_resource = client
+        .read_resource("info://compose-prompt-missing")
+        .expect_err("changing only the nested prompt name must refuse the resource compose");
+    let missing_resource = format!("{missing_resource:?}");
+    assert!(
+        missing_resource.contains("stdio-e2e-missing")
+            || missing_resource.contains("compose-nested-prompt")
+            || missing_resource.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing_resource}"
+    );
+
+    let prompt = client
+        .get_prompt(
+            "compose_from_prompt",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        )
+        .expect("live exact-2024 stdio compose_from_prompt must nest greeting");
+    assert!(
+        prompt
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                LegacyContent::Text { text, .. } => {
+                    text == "compose-prompt:Please greet alpha in a friendly way."
+                }
+                _ => false,
+            }),
+        "compose_from_prompt must retain the nested greeting text: {prompt:?}"
+    );
+    let missing_prompt = client
+        .get_prompt(
+            "compose_from_prompt",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("prompt".to_owned(), "stdio-e2e-missing".to_owned()),
+            ]),
+        )
+        .expect_err("changing only the nested prompt name must refuse the prompt compose");
+    let missing_prompt = format!("{missing_prompt:?}");
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt")
+            || missing_prompt.contains("not found"),
+        "the nested unknown prompt must stay a handler-visible refusal: {missing_prompt}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio resource/prompt compose-prompt client cleanup");
 }
 
 #[cfg(unix)]
@@ -5373,6 +5676,386 @@ fn e2e_public_stdio_legacy_default_catalog_list_is_not_forced_to_page_size_one()
 }
 
 #[cfg(unix)]
+const STDIO_PANIC_TOOL: &str = "panic_probe";
+#[cfg(unix)]
+const STDIO_PANIC_PAYLOAD: &str = "planted-handler-panic-payload";
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_handler_panic_is_sanitized_and_admits_fast_peer() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_PANIC_TOOL", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the panic-probe echo peer");
+
+    let panicked = client
+        .call_tool(STDIO_PANIC_TOOL, json!({}))
+        .expect_err("a panicking tools/call must stay a protocol error");
+    let panicked = format!("{panicked:?}");
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "a handler panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(STDIO_PANIC_PAYLOAD),
+        "a handler panic must not leak the unwind payload: {panicked}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "after-panic"}))
+        .expect("changing only the tool must still be admitted after a sanitized panic");
+    assert_eq!(
+        stdio_modern_tool_text(&peer),
+        Some("after-panic"),
+        "the peer echo must still complete after a sanitized panic: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio handler-panic client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_handler_panic_is_sanitized_and_admits_fast_peer() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_PANIC_TOOL", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the panic-probe echo peer");
+
+    let panicked = client
+        .call_tool(STDIO_PANIC_TOOL, json!({}))
+        .expect_err("a panicking exact-2024 tools/call must stay a protocol error");
+    let panicked = format!("{panicked:?}");
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "an exact-2024 handler panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(STDIO_PANIC_PAYLOAD),
+        "an exact-2024 handler panic must not leak the unwind payload: {panicked}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "after-panic"}))
+        .expect("changing only the tool must still be admitted after a sanitized exact-2024 panic");
+    assert_eq!(
+        stdio_legacy_tool_text(&peer),
+        Some("after-panic"),
+        "the exact-2024 peer echo must still complete after a sanitized panic: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio handler-panic client cleanup");
+}
+
+#[cfg(unix)]
+const STDIO_PANIC_RESOURCE_URI: &str = "info://panic";
+#[cfg(unix)]
+const STDIO_PANIC_PROMPT_NAME: &str = "panic_greeting";
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_catalog_panic_is_sanitized_and_admits_fast_peer() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_PANIC_CATALOG", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the panic-catalog echo peer");
+
+    let panicked_resource = client
+        .read_resource(STDIO_PANIC_RESOURCE_URI)
+        .expect_err("a panicking resources/read must stay a protocol error");
+    let panicked_resource = format!("{panicked_resource:?}");
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "a resource panic must become the sanitized InternalError: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(STDIO_PANIC_PAYLOAD),
+        "a resource panic must not leak the unwind payload: {panicked_resource}"
+    );
+
+    let panicked_prompt = client
+        .get_prompt(STDIO_PANIC_PROMPT_NAME, HashMap::new())
+        .expect_err("a panicking prompts/get must stay a protocol error");
+    let panicked_prompt = format!("{panicked_prompt:?}");
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "a prompt panic must become the sanitized InternalError: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(STDIO_PANIC_PAYLOAD),
+        "a prompt panic must not leak the unwind payload: {panicked_prompt}"
+    );
+
+    let peer_resource = client
+        .read_resource("info://server")
+        .expect("changing only the resource must still be admitted after a sanitized panic");
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains("echo-server") || peer_resource.contains("info://server"),
+        "the peer resource must still complete after a sanitized catalog panic: {peer_resource}"
+    );
+
+    let peer_prompt = client
+        .get_prompt(
+            "greeting",
+            HashMap::from([("name".to_owned(), "World".to_owned())]),
+        )
+        .expect("changing only the prompt must still be admitted after a sanitized panic");
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("World") || peer_prompt.contains("greet"),
+        "the peer prompt must still complete after a sanitized catalog panic: {peer_prompt}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio catalog-panic client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_catalog_panic_is_sanitized_and_admits_fast_peer() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_PANIC_CATALOG", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the panic-catalog echo peer");
+
+    let panicked_resource = client
+        .read_resource(STDIO_PANIC_RESOURCE_URI)
+        .expect_err("a panicking exact-2024 resources/read must stay a protocol error");
+    let panicked_resource = format!("{panicked_resource:?}");
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "an exact-2024 resource panic must become the sanitized InternalError: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(STDIO_PANIC_PAYLOAD),
+        "an exact-2024 resource panic must not leak the unwind payload: {panicked_resource}"
+    );
+
+    let panicked_prompt = client
+        .get_prompt(STDIO_PANIC_PROMPT_NAME, HashMap::new())
+        .expect_err("a panicking exact-2024 prompts/get must stay a protocol error");
+    let panicked_prompt = format!("{panicked_prompt:?}");
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "an exact-2024 prompt panic must become the sanitized InternalError: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(STDIO_PANIC_PAYLOAD),
+        "an exact-2024 prompt panic must not leak the unwind payload: {panicked_prompt}"
+    );
+
+    let peer_resource = client.read_resource("info://server").expect(
+        "changing only the resource must still be admitted after a sanitized exact-2024 panic",
+    );
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains("echo-server") || peer_resource.contains("info://server"),
+        "the exact-2024 peer resource must still complete after a sanitized catalog panic: {peer_resource}"
+    );
+
+    let peer_prompt = client
+        .get_prompt(
+            "greeting",
+            HashMap::from([("name".to_owned(), "World".to_owned())]),
+        )
+        .expect(
+            "changing only the prompt must still be admitted after a sanitized exact-2024 panic",
+        );
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("World") || peer_prompt.contains("greet"),
+        "the exact-2024 peer prompt must still complete after a sanitized catalog panic: {peer_prompt}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio catalog-panic client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_completion_panic_is_sanitized_and_admits_fast_peer() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_PANIC_COMPLETE", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the panic-complete echo peer");
+
+    let params = modern::CompletionParams {
+        reference: modern::CompletionReference::PromptWithTitle {
+            name: "greeting".to_owned(),
+            title: "Greeting".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "name".to_owned(),
+            value: "co".to_owned(),
+        },
+        context: Some(modern::FinalCompletionContext {
+            arguments: Some(std::collections::BTreeMap::from([(
+                "locale".to_owned(),
+                "en-US".to_owned(),
+            )])),
+        }),
+    };
+    let panicked = client
+        .complete(params)
+        .expect_err("a panicking completion/complete must stay a protocol error");
+    let panicked = format!("{panicked:?}");
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "a completion panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(STDIO_PANIC_PAYLOAD),
+        "a completion panic must not leak the unwind payload: {panicked}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "after-complete-panic"}))
+        .expect(
+            "changing only the method must still be admitted after a sanitized completion panic",
+        );
+    assert_eq!(
+        stdio_modern_tool_text(&peer),
+        Some("after-complete-panic"),
+        "the peer echo must still complete after a sanitized completion panic: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio completion-panic client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_completion_panic_is_sanitized_and_admits_fast_peer() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_PANIC_COMPLETE", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the panic-complete echo peer");
+
+    let panicked = client
+        .complete(legacy_2024::LegacyCompletionParams {
+            reference: legacy_2024::LegacyCompletionReference::Prompt {
+                name: "greeting".to_owned(),
+            },
+            argument: legacy_2024::LegacyCompletionArgument {
+                name: "name".to_owned(),
+                value: "co".to_owned(),
+            },
+        })
+        .expect_err("a panicking exact-2024 completion/complete must stay a protocol error");
+    let panicked = format!("{panicked:?}");
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "an exact-2024 completion panic must become the sanitized InternalError: {panicked}"
+    );
+    assert!(
+        !panicked.contains(STDIO_PANIC_PAYLOAD),
+        "an exact-2024 completion panic must not leak the unwind payload: {panicked}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "after-complete-panic"}))
+        .expect("changing only the method must still be admitted after a sanitized exact-2024 completion panic");
+    assert_eq!(
+        stdio_legacy_tool_text(&peer),
+        Some("after-complete-panic"),
+        "the exact-2024 peer echo must still complete after a sanitized completion panic: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio completion-panic client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_default_catalog_does_not_register_panic_probe() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the default echo peer");
+
+    let missing = client
+        .call_tool(STDIO_PANIC_TOOL, json!({}))
+        .expect_err("omitting only FASTMCP_PANIC_TOOL must keep panic_probe unregistered");
+    let missing = format!("{missing:?}");
+    assert!(
+        missing.contains("not found")
+            || missing.contains("MethodNotFound")
+            || missing.contains("ToolNotFound")
+            || missing.contains("Unknown"),
+        "changing only the missing panic-tool flag must stay a missing-tool refusal: {missing}"
+    );
+    assert!(
+        !missing.contains(STDIO_PANIC_PAYLOAD),
+        "an unregistered panic_probe must not leak the unwind payload: {missing}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "no-panic-tool"}))
+        .expect("the default catalog must still admit echo");
+    assert_eq!(
+        stdio_modern_tool_text(&peer),
+        Some("no-panic-tool"),
+        "omitting only FASTMCP_PANIC_TOOL must keep echo admitted: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio missing panic-probe client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_default_catalog_does_not_register_panic_probe() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the default echo peer");
+
+    let missing = client.call_tool(STDIO_PANIC_TOOL, json!({})).expect_err(
+        "omitting only FASTMCP_PANIC_TOOL must keep exact-2024 panic_probe unregistered",
+    );
+    let missing = format!("{missing:?}");
+    assert!(
+        missing.contains("not found")
+            || missing.contains("MethodNotFound")
+            || missing.contains("ToolNotFound")
+            || missing.contains("Unknown"),
+        "changing only the missing panic-tool flag must stay a missing-tool refusal: {missing}"
+    );
+    assert!(
+        !missing.contains(STDIO_PANIC_PAYLOAD),
+        "an unregistered exact-2024 panic_probe must not leak the unwind payload: {missing}"
+    );
+
+    let peer = client
+        .call_tool("echo", json!({"message": "no-panic-tool"}))
+        .expect("the exact-2024 default catalog must still admit echo");
+    assert_eq!(
+        stdio_legacy_tool_text(&peer),
+        Some("no-panic-tool"),
+        "omitting only FASTMCP_PANIC_TOOL must keep exact-2024 echo admitted: {peer:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio missing panic-probe client cleanup");
+}
+
+#[cfg(unix)]
 #[test]
 fn e2e_public_stdio_modern_transformed_echo_renames_argument() {
     let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
@@ -6674,6 +7357,65 @@ fn e2e_public_stdio_legacy_complete_is_retained_and_unknown_prompt_is_refused() 
     client
         .close()
         .expect("legacy-only stdio complete client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_resource_template_completion_is_retained_and_unregistered_template_is_refused()
+ {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+
+    let completed = client
+        .complete(legacy_2024::LegacyCompletionParams {
+            reference: legacy_2024::LegacyCompletionReference::Resource {
+                uri: "note://{name}".to_owned(),
+            },
+            argument: legacy_2024::LegacyCompletionArgument {
+                name: "name".to_owned(),
+                value: "al".to_owned(),
+            },
+        })
+        .expect("live exact-2024 stdio must complete the shipped note template provider");
+    assert_eq!(
+        completed.completion.values,
+        vec!["stdio-note-completion-legacy".to_owned()],
+        "the exact-2024 note template provider must retain its values: {completed:?}"
+    );
+
+    let missing_provider = client
+        .complete(legacy_2024::LegacyCompletionParams {
+            reference: legacy_2024::LegacyCompletionReference::Resource {
+                uri: "memo://{name}".to_owned(),
+            },
+            argument: legacy_2024::LegacyCompletionArgument {
+                name: "name".to_owned(),
+                value: "al".to_owned(),
+            },
+        })
+        .expect_err("changing only the template URI must refuse the greeting catch-all");
+    assert_eq!(missing_provider.code, McpErrorCode::InvalidParams);
+
+    let greeting = client
+        .complete(legacy_2024::LegacyCompletionParams {
+            reference: legacy_2024::LegacyCompletionReference::Prompt {
+                name: "greeting".to_owned(),
+            },
+            argument: legacy_2024::LegacyCompletionArgument {
+                name: "name".to_owned(),
+                value: "co".to_owned(),
+            },
+        })
+        .expect("the note provider must leave the greeting prompt provider usable");
+    assert_eq!(
+        greeting.completion.values,
+        vec!["stdio-completion-legacy".to_owned()],
+        "the exact-2024 greeting provider must still complete after note template completion: {greeting:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio note-completion client cleanup");
 }
 
 #[cfg(unix)]
