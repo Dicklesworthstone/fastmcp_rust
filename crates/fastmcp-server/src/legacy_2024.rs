@@ -395,6 +395,7 @@ pub struct Legacy2024ServerAdapter<H> {
     handler: H,
     client_capabilities: Option<Legacy2024ClientCapabilities>,
     client_capabilities_bytes: Vec<u8>,
+    client_info: Option<fastmcp_protocol::ClientInfo>,
     subscriptions: BTreeSet<String>,
     logging_level: Option<String>,
     pending_reverse_request_ids: BTreeSet<i64>,
@@ -635,6 +636,7 @@ where
             handler,
             client_capabilities: None,
             client_capabilities_bytes: Vec::new(),
+            client_info: None,
             subscriptions: BTreeSet::new(),
             logging_level: None,
             pending_reverse_request_ids: BTreeSet::new(),
@@ -662,6 +664,12 @@ where
     #[must_use]
     pub const fn lifecycle(&self) -> Legacy2024Lifecycle {
         self.lifecycle
+    }
+
+    /// Returns the initialize `clientInfo` retained after a successful handshake.
+    #[must_use]
+    pub fn client_info(&self) -> Option<&fastmcp_protocol::ClientInfo> {
+        self.client_info.as_ref()
     }
 
     /// Returns a deterministic state snapshot without exposing handler internals.
@@ -1032,6 +1040,18 @@ where
         let result = initialize_result(&self.config)?;
         self.client_capabilities = Some(client_capabilities);
         self.client_capabilities_bytes = client_capabilities_bytes;
+        self.client_info = Some(fastmcp_protocol::ClientInfo {
+            name: client_info
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned(),
+            version: client_info
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("0")
+                .to_owned(),
+        });
         self.lifecycle = Legacy2024Lifecycle::AwaitInitialized;
         Ok(result)
     }

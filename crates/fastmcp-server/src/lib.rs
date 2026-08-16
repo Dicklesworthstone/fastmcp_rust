@@ -1305,6 +1305,7 @@ struct LiveLegacy2024ConnectionRuntime {
     request_sender: Option<RequestSender>,
     supports_sampling: Arc<AtomicBool>,
     supports_roots: Arc<AtomicBool>,
+    client_info: Arc<Mutex<Option<fastmcp_protocol::ClientInfo>>>,
     resource_subscriptions: Arc<Mutex<Vec<String>>>,
     log_level: Arc<Mutex<Option<LogLevel>>>,
     logging_ceiling: LevelFilter,
@@ -1361,6 +1362,7 @@ impl LiveLegacy2024ConnectionRuntime {
             request_sender,
             supports_sampling: Arc::new(AtomicBool::new(false)),
             supports_roots: Arc::new(AtomicBool::new(false)),
+            client_info: Arc::new(Mutex::new(None)),
             resource_subscriptions: Arc::new(Mutex::new(Vec::new())),
             log_level: Arc::new(Mutex::new(None)),
             logging_ceiling,
@@ -1836,6 +1838,46 @@ fn admitted_final_client_capability_info(
     Ok(Some(capability_info))
 }
 
+fn admitted_final_client_implementation(
+    request: Option<&CoreRequest>,
+) -> McpResult<Option<fastmcp_core::ClientImplementationInfo>> {
+    let Some(CoreRequest::Final(request)) = request else {
+        return Ok(None);
+    };
+    let metadata = match request {
+        FinalCoreRequest::Discover(params) => &params.meta,
+        FinalCoreRequest::Completion(params) => &params.meta,
+        FinalCoreRequest::ToolsList(params)
+        | FinalCoreRequest::ResourcesList(params)
+        | FinalCoreRequest::ResourceTemplatesList(params)
+        | FinalCoreRequest::PromptsList(params) => &params.meta,
+        FinalCoreRequest::ToolsCall(params) => &params.meta,
+        FinalCoreRequest::ResourcesRead(params) => &params.meta,
+        FinalCoreRequest::PromptsGet(params) => &params.meta,
+        FinalCoreRequest::SubscriptionsListen(params) => &params.meta,
+    };
+    let Some(implementation) = metadata
+        .client_info()
+        .map_err(|error| McpError::invalid_params(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(fastmcp_core::ClientImplementationInfo {
+        name: implementation.name,
+        version: implementation.version,
+        title: implementation.title,
+        description: implementation.description,
+        website_url: implementation
+            .website_url
+            .map(|uri| uri.as_str().to_owned()),
+        icon_sources: implementation
+            .icons
+            .iter()
+            .map(|icon| icon.src.as_str().to_owned())
+            .collect(),
+    }))
+}
+
 /// A raw parameter sidecar is usable only while authentication and admission
 /// have left the materialized parameter value untouched.  In particular,
 /// stripping a recognized credential must sever the raw source before router
@@ -2147,6 +2189,10 @@ fn sync_live_legacy_runtime_from_adapter<H: Legacy2024Handler>(
     adapter: &Legacy2024ServerAdapter<H>,
 ) {
     runtime.sync_from_adapter_snapshot(&adapter.snapshot());
+    *runtime
+        .client_info
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = adapter.client_info().cloned();
 }
 
 /// Applies an exact legacy client response to the adapter that allocated its
@@ -10602,6 +10648,10 @@ async fn serve_modern_http_connection(
 /// transports (stdio, SSE, WebSocket).
 pub struct Server {
     info: ServerInfo,
+    title: Option<String>,
+    description: Option<String>,
+    website_url: Option<String>,
+    icons: Vec<fastmcp_protocol::common_types::RawIcon>,
     capabilities: ServerCapabilities,
     router: Arc<Router>,
     instructions: Option<String>,
@@ -10891,12 +10941,35 @@ impl Server {
                 |_| McpError::internal_error("Server discovery capabilities are invalid"),
             )?;
 
-        Ok(ServerDiscoverResult::new(
+        let discovery = ServerDiscoverResult::new(
             capabilities,
             self.info.clone(),
             instructions,
             DiscoveryCacheHints::private_ttl_ms(u64::from(DISCOVERY_CACHE_MAX_AGE_SECONDS) * 1_000),
-        ))
+        );
+        let Some(mut implementation) = fastmcp_protocol::common_types::Implementation::try_new(
+            self.info.name.clone(),
+            self.info.version.clone(),
+        )
+        .ok() else {
+            return Ok(discovery);
+        };
+        implementation.title = self.title.clone();
+        implementation.description = self.description.clone();
+        if let Some(website_url) = self.website_url.as_deref()
+            && let Ok(uri) = fastmcp_protocol::common_types::AbsoluteUri::parse(website_url)
+        {
+            implementation.website_url = Some(uri);
+        }
+        implementation.icons = self.icons.clone();
+        if implementation.title.is_some()
+            || implementation.description.is_some()
+            || implementation.website_url.is_some()
+            || !implementation.icons.is_empty()
+        {
+            return Ok(discovery.with_implementation(implementation));
+        }
+        Ok(discovery)
     }
 
     /// Lists all registered tools.
@@ -11326,6 +11399,16 @@ impl Server {
                 return response_for_error(error);
             }
         };
+        let request_ctx = match admitted_final_client_implementation(final_core_request.as_ref()) {
+            Ok(Some(identity)) => request_ctx.with_client_implementation(identity),
+            Ok(None) => request_ctx,
+            Err(error) => {
+                if let Some(stats) = &self.stats {
+                    stats.record_request(&method, started_at.elapsed(), false);
+                }
+                return response_for_error(error);
+            }
+        };
 
         // The protocol-version marker is part of typed modern admission. Once
         // that admission has completed, keep the marker out of application
@@ -11562,6 +11645,13 @@ impl Server {
         match admitted_final_client_capability_info(final_core_request.as_ref()) {
             Ok(Some(capabilities)) => {
                 request_ctx = request_ctx.with_client_capabilities(capabilities);
+            }
+            Ok(None) => {}
+            Err(error) => return response_for_error(error),
+        }
+        match admitted_final_client_implementation(final_core_request.as_ref()) {
+            Ok(Some(identity)) => {
+                request_ctx = request_ctx.with_client_implementation(identity);
             }
             Ok(None) => {}
             Err(error) => return response_for_error(error),
@@ -12262,6 +12352,13 @@ impl Server {
                     info = info.with_roots(false);
                 }
                 request_ctx = request_ctx.with_client_capabilities(info);
+                let identity = runtime
+                    .client_info
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                request_ctx =
+                    Self::attach_session_client_implementation(request_ctx, identity.as_ref());
             }
             if let Some(runtime) = runtime {
                 let sender = Arc::clone(&runtime.notification_sender);
@@ -16907,6 +17004,31 @@ impl Server {
         }
     }
 
+    fn handler_visible_legacy_client_implementation(
+        info: &fastmcp_protocol::ClientInfo,
+    ) -> fastmcp_core::ClientImplementationInfo {
+        fastmcp_core::ClientImplementationInfo {
+            name: info.name.clone(),
+            version: info.version.clone(),
+            title: None,
+            description: None,
+            website_url: None,
+            icon_sources: Vec::new(),
+        }
+    }
+
+    fn attach_session_client_implementation(
+        ctx: McpContext,
+        client_info: Option<&fastmcp_protocol::ClientInfo>,
+    ) -> McpContext {
+        match client_info {
+            Some(info) => ctx.with_client_implementation(
+                Self::handler_visible_legacy_client_implementation(info),
+            ),
+            None => ctx,
+        }
+    }
+
     fn with_final_catalog_publisher(&self, ctx: McpContext) -> McpContext {
         ctx.with_catalog_publisher(Arc::new(FinalCatalogPublisher {
             registry: Arc::clone(&self.final_subscriptions),
@@ -16949,6 +17071,7 @@ impl Server {
         let mw_ctx = Self::attach_session_log_floor(mw_ctx, session.log_level());
         let mw_ctx =
             Self::attach_session_client_capabilities(mw_ctx, session.client_capabilities());
+        let mw_ctx = Self::attach_session_client_implementation(mw_ctx, session.client_info());
         let mw_ctx =
             Self::attach_session_resource_subscriptions(mw_ctx, session.subscribed_resource_uris());
         if let Err(error) = Self::enforce_request_context(&mw_ctx) {

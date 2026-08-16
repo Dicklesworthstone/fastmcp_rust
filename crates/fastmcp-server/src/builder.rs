@@ -143,6 +143,14 @@ pub struct ServerBuilder {
     capabilities: ServerCapabilities,
     router: Router,
     instructions: Option<String>,
+    /// Optional modern discovery title. Exact-2024 initialize stays name/version.
+    title: Option<String>,
+    /// Optional modern discovery description.
+    description: Option<String>,
+    /// Optional modern discovery website identity.
+    website_url: Option<String>,
+    /// Optional modern discovery icons.
+    icons: Vec<fastmcp_protocol::common_types::RawIcon>,
     /// Request timeout in seconds (0 = no timeout).
     request_timeout_secs: u64,
     /// Whether to enable statistics collection.
@@ -277,6 +285,10 @@ impl ServerBuilder {
             },
             router: Router::new(),
             instructions: None,
+            title: None,
+            description: None,
+            website_url: None,
+            icons: Vec::new(),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             stats_enabled: true,
             mask_error_details: false, // Disabled by default for development
@@ -2159,6 +2171,34 @@ impl ServerBuilder {
         self
     }
 
+    /// Sets the modern discovery title. Exact-2024 initialize stays name/version.
+    #[must_use]
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Sets the modern discovery description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Sets the modern discovery website URL.
+    #[must_use]
+    pub fn website_url(mut self, website_url: impl Into<String>) -> Self {
+        self.website_url = Some(website_url.into());
+        self
+    }
+
+    /// Sets the modern discovery icon set.
+    #[must_use]
+    pub fn icons(mut self, icons: Vec<fastmcp_protocol::common_types::RawIcon>) -> Self {
+        self.icons = icons;
+        self
+    }
+
     /// Sets the log level.
     ///
     /// Default is read from `FASTMCP_LOG` environment variable, or `INFO` if not set.
@@ -2473,6 +2513,10 @@ impl ServerBuilder {
 
         Server {
             info: self.info,
+            title: self.title,
+            description: self.description,
+            website_url: self.website_url,
+            icons: self.icons,
             capabilities: self.capabilities,
             router: Arc::new(self.router),
             instructions: self.instructions,
