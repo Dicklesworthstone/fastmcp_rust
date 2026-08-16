@@ -757,6 +757,7 @@ impl CompletionParams {
                 name: self.argument.name,
                 value: self.argument.value,
             },
+            meta: None,
         })
     }
 }
@@ -4146,7 +4147,7 @@ where
         let mut metadata = serde_json::to_value(FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
             client_capabilities: self.session.client_capabilities().clone(),
-            client_info: Some(self.session.client_info().clone()),
+            client_info: Some(self.session.modern_client_implementation()),
             additional_metadata: BTreeMap::new(),
         })
         .map_err(|_| McpError::internal_error("Modern WebSocket request metadata is invalid"))?;
@@ -4819,6 +4820,21 @@ struct LiveWebSocketCatalogSubscription {
     terminal_response: Option<(JsonRpcResponse, Option<String>)>,
 }
 
+/// One incrementally driven official Tasks subscription on a WebSocket client.
+///
+/// `notifications/tasks` is not a [`ServerNotification`] variant, so this
+/// listener keeps its own typed queue. Catalog listen stays mutually exclusive.
+#[cfg(all(feature = "websocket-experimental", feature = "tasks"))]
+struct LiveWebSocketTaskSubscription {
+    request_id: RequestId,
+    core_request: CoreRequest,
+    requested_filter: SubscriptionFilter,
+    accepted_filter: Option<SubscriptionFilter>,
+    acknowledgement_delivered: bool,
+    pending_notifications: VecDeque<FinalTaskStatusNotification>,
+    terminal_response: Option<(JsonRpcResponse, Option<String>)>,
+}
+
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
 ///
 /// The client owns one source-preserving receive half and one independently
@@ -4844,6 +4860,8 @@ where
     legacy_server_notifications: VecDeque<JsonRpcRequest>,
     retired_response_keys: VecDeque<CorrelationKey>,
     live_catalog_subscription: Option<LiveWebSocketCatalogSubscription>,
+    #[cfg(feature = "tasks")]
+    live_task_subscription: Option<LiveWebSocketTaskSubscription>,
     next_id: u64,
     closed: bool,
     close_settled: bool,
@@ -4906,6 +4924,7 @@ where
             cx,
             protocol_plan,
             client_info,
+            None,
             client_capabilities,
             reverse_request_handlers,
             None,
@@ -4919,6 +4938,7 @@ where
         cx: &Cx,
         protocol_plan: ClientProtocolPlan,
         client_info: ClientInfo,
+        client_implementation: Option<fastmcp_protocol::common_types::Implementation>,
         mut client_capabilities: ClientCapabilities,
         reverse_request_handlers: ReverseRequestHandlers,
         mcp_apps_settings: Option<McpAppsClientSettings>,
@@ -5039,6 +5059,9 @@ where
                 .map(|session| session.with_server_discovery(discovery)),
             }
             .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?;
+            if let Some(implementation) = client_implementation {
+                session = session.with_client_implementation(implementation);
+            }
             session = session
                 .with_mcp_apps_settings(mcp_apps_settings)
                 .with_client_extension_runtime(client_extension_runtime);
@@ -5074,6 +5097,8 @@ where
             legacy_server_notifications: VecDeque::new(),
             retired_response_keys: VecDeque::new(),
             live_catalog_subscription: None,
+            #[cfg(feature = "tasks")]
+            live_task_subscription: None,
             next_id: 2,
             closed: false,
             close_settled: false,
@@ -5152,6 +5177,7 @@ where
             cx,
             ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
             client_info.clone(),
+            None,
             client_capabilities.clone(),
             ReverseRequestHandlers::new(),
             mcp_apps_settings.clone(),
@@ -5171,6 +5197,7 @@ where
                     cx,
                     ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
                     client_info,
+                    None,
                     client_capabilities,
                     reverse_request_handlers,
                     mcp_apps_settings,
@@ -5339,6 +5366,32 @@ where
                 subscription.terminal_response = Some((response, raw_result));
                 continue;
             }
+            #[cfg(feature = "tasks")]
+            if self
+                .live_task_subscription
+                .as_ref()
+                .is_some_and(|subscription| {
+                    response.id.as_ref().is_some_and(|response_id| {
+                        response_id.correlates_with(&subscription.request_id)
+                    })
+                })
+            {
+                let response = response.clone();
+                let raw_result = raw_result_from_admitted_response(&response, frame, "WebSocket")?;
+                let Some(subscription) = self.live_task_subscription.as_mut() else {
+                    continue;
+                };
+                if subscription.terminal_response.is_some() {
+                    return Err(self
+                        .close_after_protocol_error(
+                            cx,
+                            "WebSocket Tasks listener received a duplicate terminal response",
+                        )
+                        .await);
+                }
+                subscription.terminal_response = Some((response, raw_result));
+                continue;
+            }
             if !response
                 .id
                 .as_ref()
@@ -5454,6 +5507,10 @@ where
             ));
         };
         if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+            #[cfg(feature = "tasks")]
+            if self.retain_live_task_status_notification(frame)? {
+                return Ok(());
+            }
             if self.retain_modern_websocket_notification(frame)? {
                 return Ok(());
             }
@@ -5686,7 +5743,7 @@ where
             "_meta".to_owned(),
             serde_json::json!({ "progressToken": token }),
         );
-        self.request_final_core(cx, "completion/complete", parameters)
+        self.request_core_verb(cx, "completion/complete", parameters)
             .await
     }
 
@@ -6769,6 +6826,12 @@ where
                 "A final WebSocket catalog subscription is already active on this client",
             ));
         }
+        #[cfg(feature = "tasks")]
+        if self.live_task_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final Tasks WebSocket subscription is already active on this client",
+            ));
+        }
         self.require_modern("subscriptions/listen")?;
         #[cfg(feature = "tasks")]
         if task_subscription_ids(&notifications)
@@ -7030,6 +7093,12 @@ where
                 "A final WebSocket catalog subscription is already active on this client",
             ));
         }
+        #[cfg(feature = "tasks")]
+        if self.live_task_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final Tasks WebSocket subscription is already active on this client",
+            ));
+        }
         self.require_modern("subscriptions/listen")?;
         #[cfg(feature = "tasks")]
         if task_subscription_ids(&notifications)
@@ -7037,7 +7106,7 @@ where
             .is_some()
         {
             return Err(McpError::invalid_params(
-                "A live catalog subscription cannot include taskIds",
+                "A live catalog subscription cannot include taskIds; use open_final_task_subscription_listener",
             ));
         }
         if !catalog_subscription_requested(&notifications) {
@@ -7390,6 +7459,443 @@ where
         Ok(())
     }
 
+    /// Starts a real, incrementally driven official Tasks subscription on this
+    /// WebSocket connection.
+    ///
+    /// Catalog [`Self::open_subscriptions_listener`] refuses `taskIds`. Call
+    /// [`Self::next_final_task_subscription_event`] so this client can keep
+    /// issuing `tasks/get` / `tasks/cancel` while draining status updates.
+    #[cfg(feature = "tasks")]
+    pub async fn open_final_task_subscription_listener(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        if cx.checkpoint().is_err() {
+            return Err(self.terminal_cancellation(cx).await);
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        if self.live_task_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final Tasks WebSocket subscription is already active on this client",
+            ));
+        }
+        if self.live_catalog_subscription.is_some() {
+            return Err(McpError::invalid_request(
+                "A final WebSocket catalog subscription is already active on this client",
+            ));
+        }
+        self.require_modern("subscriptions/listen")?;
+        if task_subscription_ids(&notifications)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .is_none()
+        {
+            return Err(McpError::invalid_params(
+                "A live final Tasks subscription requires taskIds",
+            ));
+        }
+        self.require_final_tasks_direction(
+            TASK_STATUS_NOTIFICATION,
+            ExtensionDirection::ServerToClient,
+        )?;
+        let parameters = self.with_final_tasks_client_capability(serde_json::json!({
+            "notifications": notifications.clone(),
+        }))?;
+        let core_request = CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            "subscriptions/listen",
+            Some(&parameters),
+        )
+        .map_err(|_| {
+            McpError::invalid_params("Modern WebSocket subscription parameters are invalid")
+        })?;
+        let request_id = self.allocate_request_id()?;
+        let request =
+            JsonRpcRequest::new("subscriptions/listen", Some(parameters), request_id.clone());
+        if let Err(error) = self
+            .send_message(cx, &JsonRpcMessage::Request(request))
+            .await
+        {
+            return Err(self.terminal_transport_error(cx, error).await);
+        }
+        self.live_task_subscription = Some(LiveWebSocketTaskSubscription {
+            request_id,
+            core_request,
+            requested_filter: notifications,
+            accepted_filter: None,
+            acknowledgement_delivered: false,
+            pending_notifications: VecDeque::new(),
+            terminal_response: None,
+        });
+        Ok(())
+    }
+
+    /// Drives the sole WebSocket ingress reader until one live Tasks listener
+    /// event is available.
+    ///
+    /// Status updates admitted while another sequential request (for example
+    /// `tasks/cancel`) is in flight are harvested from the connection-level
+    /// queue, so the same client can observe `Cancelled` without collecting
+    /// this stream to terminal.
+    #[cfg(feature = "tasks")]
+    pub async fn next_final_task_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<StdioTaskSubscriptionEvent>
+    where
+        IO: Send + 'static,
+    {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.cancel_live_task_subscription(cx).await?;
+            return Err(McpError::request_cancelled());
+        }
+        loop {
+            if let Err(error) = self.harvest_live_task_subscription_notifications() {
+                return Err(self.close_after_protocol_error(cx, &error.message).await);
+            }
+            if let Some(event) = self.take_ready_task_subscription_event()? {
+                return Ok(event);
+            }
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.cancel_live_task_subscription(cx).await?;
+                return Err(McpError::request_cancelled());
+            }
+            if let Err(error) = self.drain_completed_reverse_callbacks() {
+                return Err(self.terminal_callback_error(cx, error).await);
+            }
+            let frame = match self.recv_with_callback_terminal(cx, None).await {
+                Ok(frame) => frame,
+                Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
+                    return Err(self
+                        .terminal_callback_error(
+                            cx,
+                            self.reverse_callback_pool
+                                .terminal_error()
+                                .expect("terminal callback error was observed"),
+                        )
+                        .await);
+                }
+                Err(error) => return Err(self.terminal_transport_error(cx, error).await),
+            };
+            match frame.message() {
+                JsonRpcMessage::Response(response) => {
+                    if self.discard_retired_websocket_response(response) {
+                        continue;
+                    }
+                    let listen_id = self
+                        .live_task_subscription
+                        .as_ref()
+                        .map(|subscription| subscription.request_id.clone());
+                    if !response.id.as_ref().is_some_and(|response_id| {
+                        listen_id
+                            .as_ref()
+                            .is_some_and(|listen_id| response_id.correlates_with(listen_id))
+                    }) {
+                        return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket Tasks listener received a response for another request",
+                            )
+                            .await);
+                    }
+                    let response = response.clone();
+                    let raw_result =
+                        raw_result_from_admitted_response(&response, frame, "WebSocket")?;
+                    let Some(subscription) = self.live_task_subscription.as_mut() else {
+                        return Err(McpError::invalid_request(
+                            "No live final Tasks WebSocket subscription is active",
+                        ));
+                    };
+                    if subscription.terminal_response.is_some() {
+                        return Err(self
+                            .close_after_protocol_error(
+                                cx,
+                                "WebSocket Tasks listener received a duplicate terminal response",
+                            )
+                            .await);
+                    }
+                    subscription.terminal_response = Some((response, raw_result));
+                }
+                JsonRpcMessage::Request(_) => {
+                    if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame).await
+                    {
+                        return Err(self.terminal_callback_error(cx, error).await);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn retain_live_task_status_notification(
+        &mut self,
+        frame: &ReceivedTransportFrame,
+    ) -> McpResult<bool> {
+        let JsonRpcMessage::Request(request) = frame.message() else {
+            return Ok(false);
+        };
+        if request.id.is_some() || request.method != TASK_STATUS_NOTIFICATION {
+            return Ok(false);
+        }
+        let Some(subscription) = self.live_task_subscription.as_mut() else {
+            return Ok(false);
+        };
+        let accepted = subscription.accepted_filter.as_ref().ok_or_else(|| {
+            McpError::invalid_request(
+                "WebSocket subscription received a Tasks event before acknowledgement",
+            )
+        })?;
+        let accepted_task_ids = task_subscription_ids(accepted)
+            .map_err(|_| {
+                McpError::invalid_request(
+                    "WebSocket subscription received a Tasks event without an acknowledged Tasks filter",
+                )
+            })?
+            .ok_or_else(|| {
+                McpError::invalid_request(
+                    "WebSocket subscription received a Tasks event without an acknowledged Tasks filter",
+                )
+            })?;
+        let task_notification = serde_json::from_value::<FinalTaskStatusNotification>(
+            serde_json::to_value(request).map_err(|_| {
+                McpError::invalid_request("WebSocket subscription received an invalid Tasks event")
+            })?,
+        )
+        .map_err(|_| {
+            McpError::invalid_request("WebSocket subscription received an invalid Tasks event")
+        })?;
+        let subscription_id = task_notification
+            .params
+            .meta
+            .as_ref()
+            .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok());
+        if !subscription_id.as_ref().is_some_and(|subscription_id| {
+            subscription_id.correlates_with(&subscription.request_id)
+        }) {
+            return Err(McpError::invalid_request(
+                "WebSocket Tasks event subscription ID does not match the listener",
+            ));
+        }
+        if !accepted_task_ids
+            .iter()
+            .any(|task_id| task_id == &task_notification.params.task.base().task_id)
+        {
+            return Err(McpError::invalid_request(
+                "WebSocket Tasks event taskId is outside the acknowledged filter",
+            ));
+        }
+        if subscription.pending_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
+            return Err(McpError::invalid_request(
+                FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR,
+            ));
+        }
+        subscription
+            .pending_notifications
+            .push_back(task_notification);
+        Ok(true)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn harvest_live_task_subscription_notifications(&mut self) -> McpResult<()> {
+        if self.live_task_subscription.is_none() {
+            return Ok(());
+        }
+        let queued: Vec<ServerNotification> = self.final_server_notifications.drain(..).collect();
+        let mut remainder = VecDeque::new();
+        let mut harvest_error = None;
+        for notification in queued {
+            if harvest_error.is_some() {
+                remainder.push_back(notification);
+                continue;
+            }
+            let Some(subscription) = self.live_task_subscription.as_mut() else {
+                remainder.push_back(notification);
+                continue;
+            };
+            match notification {
+                ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                    if subscription.accepted_filter.is_some() {
+                        harvest_error = Some(subscription_listener_protocol_error(
+                            "Subscription listener received a duplicate acknowledgement",
+                        ));
+                        continue;
+                    }
+                    if let Err(error) = validate_subscription_acknowledgement(
+                        &subscription.request_id,
+                        &subscription.requested_filter,
+                        &acknowledgement,
+                    ) {
+                        harvest_error = Some(error);
+                        continue;
+                    }
+                    subscription.accepted_filter = Some(acknowledgement.notifications);
+                }
+                other => remainder.push_back(other),
+            }
+        }
+        self.final_server_notifications = remainder;
+        if let Some(error) = harvest_error {
+            self.live_task_subscription = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "tasks")]
+    fn take_ready_task_subscription_event(
+        &mut self,
+    ) -> McpResult<Option<StdioTaskSubscriptionEvent>> {
+        enum ReadyTask {
+            Event(StdioTaskSubscriptionEvent),
+            Terminal {
+                response: JsonRpcResponse,
+                raw_result: Option<String>,
+                request_id: RequestId,
+                core_request: CoreRequest,
+                accepted_filter: Option<SubscriptionFilter>,
+            },
+            Waiting,
+        }
+
+        let ready = {
+            let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final Tasks WebSocket subscription is active")
+            })?;
+            if !subscription.acknowledgement_delivered
+                && let Some(acknowledged) = subscription.accepted_filter.clone()
+            {
+                subscription.acknowledgement_delivered = true;
+                ReadyTask::Event(StdioTaskSubscriptionEvent::Acknowledged(acknowledged))
+            } else if let Some(notification) = subscription.pending_notifications.pop_front() {
+                ReadyTask::Event(StdioTaskSubscriptionEvent::Notification(notification))
+            } else if let Some((response, raw_result)) = subscription.terminal_response.take() {
+                ReadyTask::Terminal {
+                    response,
+                    raw_result,
+                    request_id: subscription.request_id.clone(),
+                    core_request: subscription.core_request.clone(),
+                    accepted_filter: subscription.accepted_filter.clone(),
+                }
+            } else {
+                ReadyTask::Waiting
+            }
+        };
+        match ready {
+            ReadyTask::Event(event) => Ok(Some(event)),
+            ReadyTask::Waiting => Ok(None),
+            ReadyTask::Terminal {
+                response,
+                raw_result,
+                request_id,
+                core_request,
+                accepted_filter,
+            } => {
+                let Some(raw_result) = raw_result.as_deref() else {
+                    self.live_task_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscriptions/listen response lost its admitted result source",
+                    ));
+                };
+                if let Some(error) = response.error.clone() {
+                    self.live_task_subscription = None;
+                    return Err(json_rpc_error_to_mcp(error));
+                }
+                let result = match decode_core_result_from_source(
+                    &core_request,
+                    response.result.as_ref().ok_or_else(|| {
+                        McpError::invalid_request(
+                            "WebSocket subscription terminal response has no result",
+                        )
+                    })?,
+                    Some(raw_result),
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.live_task_subscription = None;
+                        return Err(error);
+                    }
+                };
+                let CoreResult::Final(FinalCoreResult::SubscriptionsListen {
+                    subscription_id, ..
+                }) = result
+                else {
+                    self.live_task_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscription terminal result is not subscriptions/listen",
+                    ));
+                };
+                if !subscription_id.correlates_with(&request_id) {
+                    self.live_task_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscription terminal ID does not match its request",
+                    ));
+                }
+                if accepted_filter.is_none() {
+                    self.live_task_subscription = None;
+                    return Err(McpError::invalid_request(
+                        "WebSocket subscription terminated before acknowledgement",
+                    ));
+                }
+                self.live_task_subscription = None;
+                Ok(Some(StdioTaskSubscriptionEvent::Terminal))
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn cancel_live_task_subscription(&mut self, cx: &Cx) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        let request_id = self
+            .live_task_subscription
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::invalid_request("No live final Tasks WebSocket subscription is active")
+            })?
+            .request_id
+            .clone();
+        let request_key = request_id.correlation_key().map_err(|_| {
+            McpError::invalid_request("WebSocket Tasks listener request ID is not correlatable")
+        })?;
+        if self.retired_response_keys.len() >= MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS {
+            self.live_task_subscription = None;
+            return Err(self
+                .close_after_protocol_error(
+                    cx,
+                    "WebSocket cancelled-response tombstone capacity exceeded",
+                )
+                .await);
+        }
+        let control = CancellationWireMessage::Modern2026 {
+            sender: CancellationSender::Client,
+            params: FinalCancelledNotificationParams {
+                request_id,
+                reason: None,
+                meta: None,
+                additional: BTreeMap::default(),
+            },
+        }
+        .encode()
+        .map(JsonRpcMessage::Request)
+        .map_err(|error| {
+            McpError::invalid_params(format!("invalid WebSocket cancellation: {error}"))
+        })?;
+        self.retired_response_keys.push_back(request_key);
+        if let Err(error) = self.send_message(cx, &control).await {
+            return Err(self.terminal_transport_error(cx, error).await);
+        }
+        self.live_task_subscription = None;
+        Ok(())
+    }
+
     /// Calls a Tasks-capable modern tool without projecting its result algebra.
     #[cfg(feature = "tasks")]
     pub async fn call_tool_final_outcome(
@@ -7542,7 +8048,7 @@ where
         let mut metadata = serde_json::to_value(FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
             client_capabilities: self.session.client_capabilities().clone(),
-            client_info: Some(self.session.client_info().clone()),
+            client_info: Some(self.session.modern_client_implementation()),
             additional_metadata: BTreeMap::new(),
         })
         .map_err(|_| McpError::internal_error("Modern WebSocket request metadata is invalid"))?;
@@ -10513,6 +11019,14 @@ impl HttpClient {
         self.connection.selected_protocol_era()
     }
 
+    /// Retains modern Implementation extras for later request `_meta` stamps.
+    pub fn set_client_implementation(
+        &mut self,
+        implementation: fastmcp_protocol::common_types::Implementation,
+    ) {
+        self.connection.set_client_implementation(implementation);
+    }
+
     /// Returns whether final discovery activated the official MCP Apps extension.
     #[cfg(feature = "apps")]
     #[must_use]
@@ -12342,6 +12856,7 @@ pub enum StdioSubscriptionEvent {
     clippy::large_enum_variant,
     reason = "this public event deliberately exposes an owned typed Tasks notification so callers can inspect it without an extra allocation or a changed match surface"
 )]
+#[derive(Debug)]
 pub enum StdioTaskSubscriptionEvent {
     /// The upstream accepted the exact filter for this request.
     Acknowledged(SubscriptionFilter),
@@ -13911,7 +14426,7 @@ impl Client {
         let modern_request_meta = (peer_era == ProtocolEra::Modern2026).then(|| FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
             client_capabilities: self.session.client_capabilities().clone(),
-            client_info: Some(self.session.client_info().clone()),
+            client_info: Some(self.session.modern_client_implementation()),
             additional_metadata: BTreeMap::default(),
         });
         self.multiplexed_executor = Some(StdioRequestExecutor::new(
@@ -14255,7 +14770,7 @@ impl Client {
         let final_metadata = FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
             client_capabilities: self.session.client_capabilities().clone(),
-            client_info: Some(self.session.client_info().clone()),
+            client_info: Some(self.session.modern_client_implementation()),
             additional_metadata: BTreeMap::default(),
         };
         let final_metadata = serde_json::to_value(final_metadata).map_err(|error| {
@@ -16536,6 +17051,7 @@ impl Client {
         initialization: ClientInitialization,
     ) -> McpResult<()> {
         let client_info = self.session.client_info().clone();
+        let client_implementation = self.session.modern_client_implementation();
         let client_capabilities = self.session.client_capabilities().clone();
         let mcp_apps_settings = self.session.mcp_apps_settings().cloned();
         let client_extension_runtime = self.session.client_extension_runtime().cloned();
@@ -16563,6 +17079,7 @@ impl Client {
             .map_err(|_| McpError::internal_error(UNSUPPORTED_PROTOCOL_VERSION_ERROR))?
             .with_server_discovery(discovery),
         };
+        session = session.with_client_implementation(client_implementation);
         session = session.with_mcp_apps_settings(mcp_apps_settings);
         session = session.with_client_extension_runtime(client_extension_runtime);
         session.negotiate_client_extensions_after_discovery()?;
@@ -24084,7 +24601,7 @@ mod tests {
         let expected_metadata = serde_json::to_value(FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
             client_capabilities: ClientCapabilities::default(),
-            client_info: Some(client_info.clone()),
+            client_info: Some(client_info.to_implementation()),
             additional_metadata: BTreeMap::new(),
         })
         .expect("exact modern completion metadata serializes");
