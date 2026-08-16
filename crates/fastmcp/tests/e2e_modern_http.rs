@@ -44,7 +44,8 @@ use fastmcp_rust::{
 use fastmcp_rust::{
     ApplicationTaskSupervisor, FinalTask, FinalTaskId, FinalTaskInputRequests,
     FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
-    FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor, FinalToolCallOutcome, RequestId,
+    FinalTaskSupervisorHandoff, FinalTaskWatchEvent, FinalTaskWorkDescriptor, FinalToolCallOutcome,
+    RequestId,
 };
 #[cfg(feature = "websocket-experimental")]
 use fastmcp_rust::{
@@ -9983,6 +9984,221 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
     outcome.expect(
         "the live HTTP ProxyClient official Tasks listener must retain Cancelled after tasks/cancel",
     );
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let cx = Cx::for_request();
+
+    let mut creator = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-tasks-listen-creator", "1.0.0")
+            .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live Tasks upstream");
+    let created = runtime_block_on_bounded(
+        &cx,
+        creator.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("the live upstream must create one official Task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the task-capable live tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+    drop(creator);
+
+    let mut controller = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-tasks-listen-controller", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live as_proxy Tasks gateway");
+
+    let mut watcher = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-tasks-listen-watcher", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects a second as_proxy Tasks watch client");
+    let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
+        .expect("as_proxy must attach the upstream-created Task for watch");
+    let mut watch = runtime_block_on_bounded(
+        &cx,
+        watcher.watch_final_task(
+            &cx,
+            &mut handle,
+            SseLimits::new(1_024, 8_192, 16).expect("bounded as_proxy Tasks SSE limits"),
+        ),
+    )
+    .expect("as_proxy must open one live official Tasks subscription");
+    assert!(
+        matches!(
+            runtime_block_on_bounded(&cx, watch.next_event(&cx))
+                .expect("as_proxy Tasks listen must emit its acknowledgement"),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ),
+        "the first as_proxy Tasks listen record must be the acknowledgement"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        controller.cancel_task(&cx, RequestId::Number(3), task_id.clone(), 1 << 20),
+    )
+    .expect("the live as_proxy gateway must forward tasks/cancel");
+
+    let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let event = runtime_block_on_bounded(&cx, watch.next_event(&cx))
+            .expect("as_proxy Tasks listen must retain later status updates");
+        match event {
+            Some(FinalTaskWatchEvent::TaskUpdated(notification))
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the as_proxy Tasks notification must keep the created id"
+                );
+                break;
+            }
+            Some(FinalTaskWatchEvent::TaskUpdated(_))
+            | Some(FinalTaskWatchEvent::Acknowledged { .. }) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the as_proxy relay publishes cancellation within the public bound"
+                );
+            }
+            Some(FinalTaskWatchEvent::Terminal { .. }) | None => {
+                panic!("the live as_proxy Tasks listener must retain cancellation before terminal")
+            }
+        }
+    }
+
+    drop(watch);
+    drop(watcher);
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        controller.get_task(&cx, RequestId::Number(4), task_id, 1 << 20),
+    )
+    .expect("typed tasks/get remains usable after the gateway listener observed cancellation");
+    assert!(
+        matches!(observed.task, FinalTask::Cancelled(_)),
+        "the same gateway session must still admit tasks/get after listen: {observed:?}"
+    );
+
+    drop(controller);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gateway() {
+    let (gateway, task_id) = spawn_modern_http_stdio_as_proxy_gateway();
+    let cx = Cx::for_request();
+
+    let mut controller = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-tasks-listen-controller", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
+
+    let mut watcher = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-tasks-listen-watcher", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects a second stdio as_proxy Tasks watch client");
+    let mut handle = runtime_block_on_bounded(&cx, watcher.attach_final_task(&cx, task_id.clone()))
+        .expect("stdio as_proxy must attach the upstream-created Task for watch");
+    let mut watch = runtime_block_on_bounded(
+        &cx,
+        watcher.watch_final_task(
+            &cx,
+            &mut handle,
+            SseLimits::new(1_024, 8_192, 16).expect("bounded stdio as_proxy Tasks SSE limits"),
+        ),
+    )
+    .expect("stdio as_proxy must open one live official Tasks subscription");
+    assert!(
+        matches!(
+            runtime_block_on_bounded(&cx, watch.next_event(&cx))
+                .expect("stdio as_proxy Tasks listen must emit its acknowledgement"),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ),
+        "the first stdio as_proxy Tasks listen record must be the acknowledgement"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        controller.cancel_task(&cx, RequestId::Number(3), task_id.clone(), 1 << 20),
+    )
+    .expect("the live stdio as_proxy gateway must forward tasks/cancel");
+
+    let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let event = runtime_block_on_bounded(&cx, watch.next_event(&cx))
+            .expect("stdio as_proxy Tasks listen must retain later status updates");
+        match event {
+            Some(FinalTaskWatchEvent::TaskUpdated(notification))
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the stdio as_proxy Tasks notification must keep the created id"
+                );
+                break;
+            }
+            Some(FinalTaskWatchEvent::TaskUpdated(_))
+            | Some(FinalTaskWatchEvent::Acknowledged { .. }) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the stdio as_proxy relay publishes cancellation within the public bound"
+                );
+            }
+            Some(FinalTaskWatchEvent::Terminal { .. }) | None => {
+                panic!(
+                    "the live stdio as_proxy Tasks listener must retain cancellation before terminal"
+                )
+            }
+        }
+    }
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        controller.get_task(&cx, RequestId::Number(4), task_id, 1 << 20),
+    )
+    .expect(
+        "typed tasks/get remains usable after the stdio gateway listener observed cancellation",
+    );
+    assert!(
+        matches!(observed.task, FinalTask::Cancelled(_)),
+        "the same stdio as_proxy session must still admit tasks/get after listen: {observed:?}"
+    );
+
+    drop(watch);
+    drop(watcher);
+    drop(controller);
+    gateway.shutdown();
 }
 
 const PUBLIC_HTTP_LEAK_RESOURCE_URI: &str = "test://public-http-e2e/leak";
@@ -23269,6 +23485,222 @@ mod live_websocket_bind {
             service.abort();
             cx.set_cancel_requested(true);
             listener.abort();
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "proxy"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_tasks_listen_retains_status_through_the_gateway() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy Tasks listen runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_task_http_server();
+            let mut creator = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen upstream create",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-ws-as-proxy-tasks-listen-creator", "1.0.0")
+                    .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
+            )
+            .await
+            .expect("the public facade connects to the live Tasks upstream");
+            let created = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen tools/call",
+                creator.call_tool_outcome(
+                    &cx,
+                    RequestId::Number(2),
+                    PUBLIC_HTTP_TASK_TOOL_NAME,
+                    json!({}),
+                    1 << 20,
+                ),
+            )
+            .await
+            .expect("the live upstream must create one official Task");
+            let FinalToolCallOutcome::Task(created) = created else {
+                panic!(
+                    "the task-capable live tool must return the official Task result branch: {created:?}"
+                );
+            };
+            let task_id = created.task.base().task_id.clone();
+            drop(creator);
+
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-tasks-gateway".to_owned(),
+                "e2e-ws-as-proxy-tasks-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket Tasks gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-tasks-upstream",
+                    "native-h1:e2e-ws-as-proxy-tasks-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-tasks".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP Tasks proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed Tasks install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy Tasks must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy Tasks publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy Tasks serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public ModernOnly bind_websocket as_proxy Tasks must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-as-proxy-tasks-listen", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy official Tasks over bind_websocket");
+
+            let attached = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen get",
+                client.get_task(&cx, task_id.clone()),
+            )
+            .await
+            .expect("as_proxy must attach the upstream-created Task through the WebSocket gateway");
+            assert_eq!(
+                attached.task.base().task_id,
+                task_id,
+                "as_proxy must return the upstream-created Task: {attached:?}"
+            );
+
+            let mut filter = modern::SubscriptionFilter::default();
+            modern::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+                .expect("the public Tasks filter is valid");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy official Tasks listen open",
+                client.open_final_task_subscription_listener(&cx, filter),
+            )
+            .await
+            .expect("as_proxy bind_websocket must admit an incremental official Tasks listener");
+
+            let cancellation = McpRequestCancellation::new();
+            let acknowledgement = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy official Tasks listen acknowledgement",
+                client.next_final_task_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("as_proxy Tasks listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    acknowledgement,
+                    modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                        if modern::task_subscription_ids(accepted)
+                            .expect("acknowledged Tasks filter stays valid")
+                            .as_deref()
+                            == Some([task_id.clone()].as_slice())
+                ),
+                "the first as_proxy WebSocket Tasks listen record must be the accepted taskIds: {acknowledgement:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy official Tasks listen cancel",
+                client.cancel_task(&cx, task_id.clone()),
+            )
+            .await
+            .expect("the live as_proxy WebSocket gateway must forward tasks/cancel");
+
+            let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+            loop {
+                let event = websocket_client_bounded(
+                    &cx,
+                    "live modern WebSocket as_proxy official Tasks listen status",
+                    client.next_final_task_subscription_event(&cx, &cancellation),
+                )
+                .await
+                .expect("as_proxy Tasks listen must retain later status updates");
+                match event {
+                    modern::StdioTaskSubscriptionEvent::Notification(notification)
+                        if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+                    {
+                        assert_eq!(
+                            notification.params.task.base().task_id,
+                            task_id,
+                            "the as_proxy WebSocket Tasks notification must keep the created id"
+                        );
+                        break;
+                    }
+                    modern::StdioTaskSubscriptionEvent::Notification(_)
+                    | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                        assert!(
+                            Instant::now() < notification_deadline,
+                            "the as_proxy relay publishes cancellation within the public bound"
+                        );
+                    }
+                    modern::StdioTaskSubscriptionEvent::Terminal => {
+                        panic!(
+                            "the live as_proxy WebSocket Tasks listener must retain cancellation before terminal"
+                        )
+                    }
+                }
+            }
+
+            let observed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy official Tasks listen get after cancel",
+                client.get_task(&cx, task_id),
+            )
+            .await
+            .expect("typed tasks/get remains usable after the as_proxy listener observed cancellation");
+            assert!(
+                matches!(observed.task, FinalTask::Cancelled(_)),
+                "the same as_proxy WebSocket session must still admit tasks/get after listen: {observed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks listen close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern WebSocket as_proxy Tasks listen client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
         });
     }
 
