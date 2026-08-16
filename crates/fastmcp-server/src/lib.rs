@@ -12020,8 +12020,13 @@ impl Server {
         let mut relay_listener: Option<Box<dyn ProxyFinalTaskListener>> = None;
         #[cfg(all(feature = "proxy", feature = "tasks"))]
         if tasks_requested && let Some(relay) = self.final_task_relay.as_ref() {
-            let mut listener = relay.open_listener(request_ctx, params.notifications.clone())?;
-            match listener.next(request_ctx.cx(), &request_cancellation)? {
+            let mut listener = relay
+                .open_listener_async(request_ctx, params.notifications.clone())
+                .await?;
+            match listener
+                .next_async(request_ctx.cx(), &request_cancellation)
+                .await?
+            {
                 ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
                     if !subscription_filter_admission_matches(&params.notifications, &accepted)? {
                         return Err(McpError::invalid_params(
@@ -12050,23 +12055,44 @@ impl Server {
         )?;
 
         while !self.final_subscriptions.is_terminating() {
+            if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
+                if lease.has_graceful_completion() {
+                    return self.final_subscription_complete_result(&subscription_id);
+                }
+                return Err(McpError::request_cancelled());
+            }
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             if let Some(listener) = relay_listener.as_mut() {
-                match listener.next(request_ctx.cx(), &request_cancellation)? {
-                    ProxyFinalTaskListenerEvent::Notification(notification) => {
+                match listener
+                    .next_async(request_ctx.cx(), &request_cancellation)
+                    .await
+                {
+                    Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
                         if let Some(relay) = self.final_task_relay.as_ref() {
                             relay.record_notification(&notification)?;
                         }
                         self.final_subscriptions.publish_task(notification)?;
                     }
-                    ProxyFinalTaskListenerEvent::Terminal => {
+                    Ok(ProxyFinalTaskListenerEvent::Terminal) => {
                         return self.final_subscription_complete_result(&subscription_id);
                     }
-                    ProxyFinalTaskListenerEvent::Acknowledged(_) => {
+                    Ok(ProxyFinalTaskListenerEvent::Acknowledged(_)) => {
                         return Err(McpError::invalid_request(
                             "Proxy upstream Tasks listener acknowledged more than once",
                         ));
                     }
+                    Err(error) if error.code == McpErrorCode::RequestCancelled => {
+                        // Shutdown elects graceful completion by cancelling
+                        // this wait. The `?` path would drop that elected
+                        // terminal response because cancellation already won
+                        // the request token, and HTTP teardown would wait out
+                        // both drain budgets.
+                        if lease.has_graceful_completion() {
+                            return self.final_subscription_complete_result(&subscription_id);
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
                 }
             }
             if request_cancellation.is_cancel_requested() {
