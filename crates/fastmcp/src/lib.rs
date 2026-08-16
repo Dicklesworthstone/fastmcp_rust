@@ -148,7 +148,7 @@ pub mod __private {
         };
         pub use fastmcp_protocol::{
             CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
-            FinalReadResourceResult, Prompt, PromptArgument, PromptMessage, Resource,
+            FinalReadResourceResult, Icon, Prompt, PromptArgument, PromptMessage, Resource,
             ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate, UriTemplatePart,
             common_types,
         };
@@ -2616,7 +2616,26 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
-            match self.inner.list_tools(cx, cursor).await? {
+            self.list_tools_with_params(
+                cx,
+                crate::ListToolsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListToolsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of tools with include/exclude tag filters.
+        pub async fn list_tools_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListToolsParams,
+        ) -> McpResult<FinalListToolsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_tools_with_params(cx, params).await? {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
                 ) => Ok(result.payload),
@@ -2635,7 +2654,26 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
-            match self.inner.list_resources(cx, cursor).await? {
+            self.list_resources_with_params(
+                cx,
+                crate::ListResourcesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourcesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of resources with include/exclude tag filters.
+        pub async fn list_resources_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<FinalListResourcesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_resources_with_params(cx, params).await? {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
                 ) => Ok(result.payload),
@@ -2655,7 +2693,30 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
-            match self.inner.list_resource_templates(cx, cursor).await? {
+            self.list_resource_templates_with_params(
+                cx,
+                crate::ListResourceTemplatesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourceTemplatesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of resource templates with include/exclude tag filters.
+        pub async fn list_resource_templates_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<FinalListResourceTemplatesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_resource_templates_with_params(cx, params)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
                 ) => Ok(result.payload),
@@ -2674,7 +2735,26 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
-            match self.inner.list_prompts(cx, cursor).await? {
+            self.list_prompts_with_params(
+                cx,
+                crate::ListPromptsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListPromptsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of prompts with include/exclude tag filters.
+        pub async fn list_prompts_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<FinalListPromptsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self.inner.list_prompts_with_params(cx, params).await? {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::PromptsList { result, .. },
                 ) => Ok(result.payload),
@@ -2957,9 +3037,30 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
+            self.list_tools_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListToolsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListToolsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered tools page under a caller-owned cancellation domain.
+        pub async fn list_tools_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListToolsParams,
+        ) -> McpResult<FinalListToolsResult>
+        where
+            IO: Send + 'static,
+        {
             match self
                 .inner
-                .list_tools_with_cancellation(cx, cancellation, cursor)
+                .list_tools_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -2982,9 +3083,30 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
+            self.list_resources_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListResourcesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourcesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered resources page under a caller-owned cancellation domain.
+        pub async fn list_resources_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<FinalListResourcesResult>
+        where
+            IO: Send + 'static,
+        {
             match self
                 .inner
-                .list_resources_with_cancellation(cx, cancellation, cursor)
+                .list_resources_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -3007,9 +3129,30 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
+            self.list_resource_templates_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListResourceTemplatesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourceTemplatesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered templates page under a caller-owned cancellation domain.
+        pub async fn list_resource_templates_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<FinalListResourceTemplatesResult>
+        where
+            IO: Send + 'static,
+        {
             match self
                 .inner
-                .list_resource_templates_with_cancellation(cx, cancellation, cursor)
+                .list_resource_templates_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -3032,9 +3175,30 @@ pub mod modern {
         where
             IO: Send + 'static,
         {
+            self.list_prompts_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListPromptsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListPromptsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered prompts page under a caller-owned cancellation domain.
+        pub async fn list_prompts_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<FinalListPromptsResult>
+        where
+            IO: Send + 'static,
+        {
             match self
                 .inner
-                .list_prompts_with_cancellation(cx, cancellation, cursor)
+                .list_prompts_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -3383,9 +3547,26 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> McpResult<FinalListToolsResult> {
+            self.list_tools_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListToolsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListToolsParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered tools page under a request-local cancellation domain.
+        pub fn list_tools_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListToolsParams,
+        ) -> McpResult<FinalListToolsResult> {
             match self
                 .inner
-                .list_tools_with_cancellation(cx, cancellation, cursor)?
+                .list_tools_with_params_and_cancellation(cx, cancellation, params)?
             {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
@@ -3404,10 +3585,28 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> McpResult<FinalListResourcesResult> {
-            match self
-                .inner
-                .list_resources_with_cancellation(cx, cancellation, cursor)?
-            {
+            self.list_resources_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListResourcesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourcesParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered resources page under a request-local cancellation domain.
+        pub fn list_resources_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<FinalListResourcesResult> {
+            match self.inner.list_resources_with_params_and_cancellation(
+                cx,
+                cancellation,
+                params,
+            )? {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
                 ) => Ok(result.payload),
@@ -3425,9 +3624,26 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> McpResult<FinalListResourceTemplatesResult> {
+            self.list_resource_templates_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListResourceTemplatesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourceTemplatesParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered templates page under a request-local cancellation domain.
+        pub fn list_resource_templates_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<FinalListResourceTemplatesResult> {
             match self
                 .inner
-                .list_resource_templates_with_cancellation(cx, cancellation, cursor)?
+                .list_resource_templates_with_params_and_cancellation(cx, cancellation, params)?
             {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
@@ -3446,9 +3662,26 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> McpResult<FinalListPromptsResult> {
+            self.list_prompts_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListPromptsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListPromptsParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered prompts page under a request-local cancellation domain.
+        pub fn list_prompts_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<FinalListPromptsResult> {
             match self
                 .inner
-                .list_prompts_with_cancellation(cx, cancellation, cursor)?
+                .list_prompts_with_params_and_cancellation(cx, cancellation, params)?
             {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::PromptsList { result, .. },
@@ -3571,7 +3804,18 @@ pub mod modern {
             &mut self,
             cursor: Option<&str>,
         ) -> McpResult<FinalListResourcesResult> {
-            match self.inner.list_resources_typed(cursor)? {
+            self.list_resources_with_params(crate::ListResourcesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..crate::ListResourcesParams::default()
+            })
+        }
+
+        /// Lists one exact final page of resources with include/exclude tag filters.
+        pub fn list_resources_with_params(
+            &mut self,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<FinalListResourcesResult> {
+            match self.inner.list_resources_typed_with_params(params)? {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ResourcesList { result, .. },
                 ) => Ok(result.payload),
@@ -3586,7 +3830,21 @@ pub mod modern {
             &mut self,
             cursor: Option<&str>,
         ) -> McpResult<FinalListResourceTemplatesResult> {
-            match self.inner.list_resource_templates_typed(cursor)? {
+            self.list_resource_templates_with_params(crate::ListResourceTemplatesParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..crate::ListResourceTemplatesParams::default()
+            })
+        }
+
+        /// Lists one exact final page of resource templates with include/exclude tag filters.
+        pub fn list_resource_templates_with_params(
+            &mut self,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<FinalListResourceTemplatesResult> {
+            match self
+                .inner
+                .list_resource_templates_typed_with_params(params)?
+            {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::ResourceTemplatesList { result, .. },
                 ) => Ok(result.payload),
@@ -3603,7 +3861,18 @@ pub mod modern {
 
         /// Lists one exact final page of prompts without a legacy projection.
         pub fn list_prompts(&mut self, cursor: Option<&str>) -> McpResult<FinalListPromptsResult> {
-            match self.inner.list_prompts_typed(cursor)? {
+            self.list_prompts_with_params(crate::ListPromptsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..crate::ListPromptsParams::default()
+            })
+        }
+
+        /// Lists one exact final page of prompts with include/exclude tag filters.
+        pub fn list_prompts_with_params(
+            &mut self,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<FinalListPromptsResult> {
+            match self.inner.list_prompts_typed_with_params(params)? {
                 fastmcp_protocol::CoreResult::Final(
                     fastmcp_protocol::FinalCoreResult::PromptsList { result, .. },
                 ) => Ok(result.payload),
@@ -4244,9 +4513,27 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> Result<FinalListToolsResult, HttpClientError> {
+            self.list_tools_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListToolsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListToolsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered tools page under a caller-owned cancellation domain.
+        pub async fn list_tools_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListToolsParams,
+        ) -> Result<FinalListToolsResult, HttpClientError> {
             match self
                 .inner
-                .list_tools_with_cancellation(cx, cancellation, cursor)
+                .list_tools_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4263,9 +4550,27 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> Result<FinalListResourcesResult, HttpClientError> {
+            self.list_resources_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListResourcesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourcesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered resources page under a caller-owned cancellation domain.
+        pub async fn list_resources_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourcesParams,
+        ) -> Result<FinalListResourcesResult, HttpClientError> {
             match self
                 .inner
-                .list_resources_with_cancellation(cx, cancellation, cursor)
+                .list_resources_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4283,9 +4588,27 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> Result<FinalListResourceTemplatesResult, HttpClientError> {
+            self.list_resource_templates_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListResourceTemplatesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourceTemplatesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered templates page under a caller-owned cancellation domain.
+        pub async fn list_resource_templates_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourceTemplatesParams,
+        ) -> Result<FinalListResourceTemplatesResult, HttpClientError> {
             match self
                 .inner
-                .list_resource_templates_with_cancellation(cx, cancellation, cursor)
+                .list_resource_templates_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4302,9 +4625,27 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
             cursor: Option<&str>,
         ) -> Result<FinalListPromptsResult, HttpClientError> {
+            self.list_prompts_with_params_and_cancellation(
+                cx,
+                cancellation,
+                crate::ListPromptsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListPromptsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered prompts page under a caller-owned cancellation domain.
+        pub async fn list_prompts_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListPromptsParams,
+        ) -> Result<FinalListPromptsResult, HttpClientError> {
             match self
                 .inner
-                .list_prompts_with_cancellation(cx, cancellation, cursor)
+                .list_prompts_with_params_and_cancellation(cx, cancellation, params)
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4422,9 +4763,33 @@ pub mod modern {
             cx: &Cx,
             cursor: Option<&str>,
         ) -> Result<FinalListToolsResult, HttpClientError> {
+            self.list_tools_with_params(
+                cx,
+                crate::ListToolsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListToolsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of tools with include/exclude tag filters.
+        pub async fn list_tools_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListToolsParams,
+        ) -> Result<FinalListToolsResult, HttpClientError> {
             match self
                 .inner
-                .request_final_core(cx, "tools/list", final_list_parameters(cursor))
+                .request_final_core(
+                    cx,
+                    "tools/list",
+                    final_list_parameters_from(
+                        params.cursor.as_deref(),
+                        params.include_tags.as_ref(),
+                        params.exclude_tags.as_ref(),
+                    ),
+                )
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4440,9 +4805,33 @@ pub mod modern {
             cx: &Cx,
             cursor: Option<&str>,
         ) -> Result<FinalListResourcesResult, HttpClientError> {
+            self.list_resources_with_params(
+                cx,
+                crate::ListResourcesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourcesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of resources with include/exclude tag filters.
+        pub async fn list_resources_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourcesParams,
+        ) -> Result<FinalListResourcesResult, HttpClientError> {
             match self
                 .inner
-                .request_final_core(cx, "resources/list", final_list_parameters(cursor))
+                .request_final_core(
+                    cx,
+                    "resources/list",
+                    final_list_parameters_from(
+                        params.cursor.as_deref(),
+                        params.include_tags.as_ref(),
+                        params.exclude_tags.as_ref(),
+                    ),
+                )
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4458,12 +4847,32 @@ pub mod modern {
             cx: &Cx,
             cursor: Option<&str>,
         ) -> Result<FinalListResourceTemplatesResult, HttpClientError> {
+            self.list_resource_templates_with_params(
+                cx,
+                crate::ListResourceTemplatesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListResourceTemplatesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of resource templates with include/exclude tag filters.
+        pub async fn list_resource_templates_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListResourceTemplatesParams,
+        ) -> Result<FinalListResourceTemplatesResult, HttpClientError> {
             match self
                 .inner
                 .request_final_core(
                     cx,
                     "resources/templates/list",
-                    final_list_parameters(cursor),
+                    final_list_parameters_from(
+                        params.cursor.as_deref(),
+                        params.include_tags.as_ref(),
+                        params.exclude_tags.as_ref(),
+                    ),
                 )
                 .await?
             {
@@ -4491,9 +4900,33 @@ pub mod modern {
             cx: &Cx,
             cursor: Option<&str>,
         ) -> Result<FinalListPromptsResult, HttpClientError> {
+            self.list_prompts_with_params(
+                cx,
+                crate::ListPromptsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..crate::ListPromptsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one exact final page of prompts with include/exclude tag filters.
+        pub async fn list_prompts_with_params(
+            &mut self,
+            cx: &Cx,
+            params: crate::ListPromptsParams,
+        ) -> Result<FinalListPromptsResult, HttpClientError> {
             match self
                 .inner
-                .request_final_core(cx, "prompts/list", final_list_parameters(cursor))
+                .request_final_core(
+                    cx,
+                    "prompts/list",
+                    final_list_parameters_from(
+                        params.cursor.as_deref(),
+                        params.include_tags.as_ref(),
+                        params.exclude_tags.as_ref(),
+                    ),
+                )
                 .await?
             {
                 fastmcp_protocol::CoreResult::Final(
@@ -4959,10 +5392,25 @@ pub mod modern {
     }
 
     fn final_list_parameters(cursor: Option<&str>) -> JsonValue {
-        cursor.map_or_else(
-            || serde_json::json!({}),
-            |cursor| serde_json::json!({ "cursor": cursor }),
-        )
+        final_list_parameters_from(cursor, None, None)
+    }
+
+    fn final_list_parameters_from(
+        cursor: Option<&str>,
+        include_tags: Option<&Vec<String>>,
+        exclude_tags: Option<&Vec<String>>,
+    ) -> JsonValue {
+        let mut members = serde_json::Map::new();
+        if let Some(cursor) = cursor {
+            members.insert("cursor".to_owned(), serde_json::json!(cursor));
+        }
+        if let Some(include_tags) = include_tags {
+            members.insert("includeTags".to_owned(), serde_json::json!(include_tags));
+        }
+        if let Some(exclude_tags) = exclude_tags {
+            members.insert("excludeTags".to_owned(), serde_json::json!(exclude_tags));
+        }
+        serde_json::Value::Object(members)
     }
 
     fn final_stdio_mrtr_result(
@@ -6576,6 +7024,15 @@ pub mod legacy_2024 {
             self.inner.list_resources_page(cursor, limits)
         }
 
+        /// Lists one exact-2024 resources page with include/exclude tag filters.
+        pub fn list_resources_page_with_params(
+            &mut self,
+            params: ListResourcesParams,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<Resource>> {
+            self.inner.list_resources_page_with_params(params, limits)
+        }
+
         /// Calls one exact-2024 tool without final-result projection.
         pub fn call_tool(&mut self, name: &str, arguments: JsonValue) -> McpResult<CallToolResult> {
             self.inner.call_tool_legacy(name, arguments)
@@ -6636,9 +7093,44 @@ pub mod legacy_2024 {
             self.inner.list_resources()
         }
 
+        /// Follows exact-2024 resources/list cursors with include/exclude tag filters.
+        pub fn list_resources_with_params(
+            &mut self,
+            params: ListResourcesParams,
+        ) -> McpResult<Vec<Resource>> {
+            self.inner.list_resources_with_params(params)
+        }
+
         /// Lists exact-2024 resource templates.
         pub fn list_resource_templates(&mut self) -> McpResult<Vec<ResourceTemplate>> {
             self.inner.list_resource_templates()
+        }
+
+        /// Follows exact-2024 resources/templates/list cursors with include/exclude tag filters.
+        pub fn list_resource_templates_with_params(
+            &mut self,
+            params: ListResourceTemplatesParams,
+        ) -> McpResult<Vec<ResourceTemplate>> {
+            self.inner.list_resource_templates_with_params(params)
+        }
+
+        /// Lists one exact-2024 resource-templates page without following the peer cursor.
+        pub fn list_resource_templates_page(
+            &mut self,
+            cursor: Option<&str>,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<ResourceTemplate>> {
+            self.inner.list_resource_templates_page(cursor, limits)
+        }
+
+        /// Lists one exact-2024 resource-templates page with include/exclude tag filters.
+        pub fn list_resource_templates_page_with_params(
+            &mut self,
+            params: ListResourceTemplatesParams,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<ResourceTemplate>> {
+            self.inner
+                .list_resource_templates_page_with_params(params, limits)
         }
 
         /// Reads one exact-2024 resource.
@@ -6679,6 +7171,32 @@ pub mod legacy_2024 {
         /// Lists exact-2024 prompts.
         pub fn list_prompts(&mut self) -> McpResult<Vec<Prompt>> {
             self.inner.list_prompts()
+        }
+
+        /// Follows exact-2024 prompts/list cursors with include/exclude tag filters.
+        pub fn list_prompts_with_params(
+            &mut self,
+            params: ListPromptsParams,
+        ) -> McpResult<Vec<Prompt>> {
+            self.inner.list_prompts_with_params(params)
+        }
+
+        /// Lists one exact-2024 prompts page without following the peer cursor.
+        pub fn list_prompts_page(
+            &mut self,
+            cursor: Option<&str>,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<Prompt>> {
+            self.inner.list_prompts_page(cursor, limits)
+        }
+
+        /// Lists one exact-2024 prompts page with include/exclude tag filters.
+        pub fn list_prompts_page_with_params(
+            &mut self,
+            params: ListPromptsParams,
+            limits: crate::ListPageLimits,
+        ) -> McpResult<crate::BoundedListPage<Prompt>> {
+            self.inner.list_prompts_page_with_params(params, limits)
         }
 
         /// Gets one exact-2024 prompt.
@@ -7235,6 +7753,34 @@ pub mod legacy_2024 {
                 }
                 _ => Err(McpError::internal_error(
                     "LegacyOnly WebSocket facade received a non-legacy prompts/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 resource-templates page, including cursor identity.
+        pub async fn list_resource_templates_page(
+            &mut self,
+            cx: &Cx,
+            params: ListResourceTemplatesParams,
+        ) -> McpResult<ListResourceTemplatesResult>
+        where
+            IO: Send + 'static,
+        {
+            let parameters = serde_json::to_value(params).map_err(|error| {
+                McpError::invalid_params(format!(
+                    "LegacyOnly WebSocket resources/templates/list parameters could not serialize: {error}"
+                ))
+            })?;
+            match self
+                .inner
+                .list_catalog_page(cx, "resources/templates/list", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(
+                    result,
+                )) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/templates/list result",
                 )),
             }
         }
