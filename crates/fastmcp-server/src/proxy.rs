@@ -29,8 +29,8 @@ use fastmcp_client::{
     ClientProtocolPlan, CompletionParams, CompletionReference, ModernHttpSubscriptionListenEvent,
     ModernHttpSubscriptionListener, ReverseRequestHandlers, StdioSubscriptionEvent,
 };
-use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpResult, block_on};
-use fastmcp_protocol::common_types::RawIcon;
+use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpLogLevel, McpResult, block_on};
+use fastmcp_protocol::common_types::{AbsoluteUri, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
@@ -44,8 +44,9 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
-    CompletionValues, Content, CoreRequest, CoreResult, FinalCallToolResult, FinalCompletionParams,
-    FinalCompletionValues, FinalCoreResult, FinalGetPromptResult, FinalProgressNotificationParams,
+    CompletionValues, Content, CoreRequest, CoreResult, FINAL_CLIENT_INFO_META_KEY,
+    FINAL_LOG_LEVEL_META_KEY, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
+    FinalCoreResult, FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, GetPromptResult, InitializeParams, InitializeResult,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
     LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
@@ -136,14 +137,50 @@ impl ProxyFinalTaskRequest {
         on_progress: FinalProgressCallback<'_>,
     ) -> McpResult<ProxyFinalTaskResponse> {
         let Self {
-            client,
+            mut client,
             request_id,
             operation,
             maximum_response_bytes,
         } = self;
+        if let Some(identity) = ctx
+            .client_implementation()
+            .and_then(implementation_from_request_identity)
+        {
+            client.set_client_implementation(identity);
+        }
+        if let Some(level) = inbound_logging_level(ctx) {
+            client.set_log_level(level);
+        }
         match operation {
             ProxyFinalTaskOperation::CallTool { name, arguments } => {
                 let progress_marker = ctx_progress_marker(ctx);
+                // Stateless modern HTTP returns an immediate JSON Task
+                // result. The SSE listener is required when this request
+                // owns a progress token or an inbound logLevel that must
+                // ride the same response body as notifications/message.
+                if progress_marker.is_none() && inbound_logging_level(ctx).is_none() {
+                    return await_proxy_request_or_cancellation(
+                        ctx,
+                        Box::pin(async {
+                            client
+                                .call_tool_final_outcome(
+                                    ctx.cx(),
+                                    request_id,
+                                    &name,
+                                    arguments,
+                                    maximum_response_bytes,
+                                )
+                                .await
+                                .map(ProxyFinalTaskResponse::CallTool)
+                                .map_err(|error| {
+                                    McpError::invalid_request(format!(
+                                        "Proxy HTTP final tools/call failed: {error}"
+                                    ))
+                                })
+                        }),
+                    )
+                    .await;
+                }
                 let mut listener = await_proxy_request_or_cancellation(
                     ctx,
                     Box::pin(async {
@@ -181,7 +218,11 @@ impl ProxyFinalTaskRequest {
                         Some(ModernHttpFinalCoreEvent::Progress(progress)) => {
                             on_progress(progress);
                         }
-                        Some(ModernHttpFinalCoreEvent::Notification(_)) => {}
+                        Some(ModernHttpFinalCoreEvent::Notification(notification)) => {
+                            if let ServerNotification::Message(params) = notification {
+                                relay_upstream_log_message(ctx, &params);
+                            }
+                        }
                         Some(ModernHttpFinalCoreEvent::Terminal(result)) => {
                             let outcome = match result {
                                 FinalCoreResult::ToolsCall { result, .. } => {
@@ -1130,6 +1171,108 @@ fn ctx_progress_marker(ctx: &McpContext) -> Option<fastmcp_protocol::ProgressMar
         .and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
+/// Projects a handler-visible inbound identity back onto the official
+/// Implementation object stamped on an upstream request.
+fn implementation_from_request_identity(
+    identity: &fastmcp_core::ClientImplementationInfo,
+) -> Option<fastmcp_protocol::common_types::Implementation> {
+    let mut implementation =
+        fastmcp_protocol::common_types::Implementation::try_new(&identity.name, &identity.version)
+            .ok()?;
+    implementation.title = identity.title.clone();
+    implementation.description = identity.description.clone();
+    if let Some(website_url) = identity.website_url.as_deref()
+        && let Ok(uri) = AbsoluteUri::parse(website_url)
+    {
+        implementation.website_url = Some(uri);
+    }
+    implementation.icons = identity
+        .icon_sources
+        .iter()
+        .filter_map(|src| RawIcon::try_new(src.clone()).ok())
+        .collect();
+    Some(implementation)
+}
+
+fn inbound_client_info_value(
+    identity: &fastmcp_core::ClientImplementationInfo,
+) -> Option<serde_json::Value> {
+    serde_json::to_value(implementation_from_request_identity(identity)?).ok()
+}
+
+fn inbound_logging_level(ctx: &McpContext) -> Option<LoggingLevel> {
+    ctx.min_log_level().map(logging_level_from_mcp)
+}
+
+fn logging_level_from_mcp(level: McpLogLevel) -> LoggingLevel {
+    match level {
+        McpLogLevel::Debug => LoggingLevel::Debug,
+        McpLogLevel::Info => LoggingLevel::Info,
+        McpLogLevel::Notice => LoggingLevel::Notice,
+        McpLogLevel::Warning => LoggingLevel::Warning,
+        McpLogLevel::Error => LoggingLevel::Error,
+        McpLogLevel::Critical => LoggingLevel::Critical,
+        McpLogLevel::Alert => LoggingLevel::Alert,
+        McpLogLevel::Emergency => LoggingLevel::Emergency,
+    }
+}
+
+fn mcp_log_level_from_logging(level: LoggingLevel) -> McpLogLevel {
+    match level {
+        LoggingLevel::Debug => McpLogLevel::Debug,
+        LoggingLevel::Info => McpLogLevel::Info,
+        LoggingLevel::Notice => McpLogLevel::Notice,
+        LoggingLevel::Warning => McpLogLevel::Warning,
+        LoggingLevel::Error => McpLogLevel::Error,
+        LoggingLevel::Critical => McpLogLevel::Critical,
+        LoggingLevel::Alert => McpLogLevel::Alert,
+        LoggingLevel::Emergency => McpLogLevel::Emergency,
+    }
+}
+
+fn stdio_parameters_with_inbound_identity(
+    mut parameters: serde_json::Value,
+    identity: Option<&fastmcp_core::ClientImplementationInfo>,
+    log_level: Option<LoggingLevel>,
+) -> serde_json::Value {
+    let client_info = identity.and_then(inbound_client_info_value);
+    if client_info.is_none() && log_level.is_none() {
+        return parameters;
+    }
+    let Some(object) = parameters.as_object_mut() else {
+        return parameters;
+    };
+    let metadata = object
+        .entry("_meta")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(metadata) = metadata.as_object_mut() {
+        if let Some(client_info) = client_info {
+            metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), client_info);
+        }
+        if let Some(log_level) = log_level
+            && let Ok(value) = serde_json::to_value(log_level)
+        {
+            metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), value);
+        }
+    }
+    parameters
+}
+
+fn relay_upstream_log_message(ctx: &McpContext, params: &FinalLogMessageParams) {
+    ctx.log_data(
+        mcp_log_level_from_logging(params.level),
+        params.data.clone(),
+    );
+}
+
+fn relay_upstream_log_notifications(ctx: &McpContext, notifications: Vec<ServerNotification>) {
+    for notification in notifications {
+        if let ServerNotification::Message(params) = notification {
+            relay_upstream_log_message(ctx, &params);
+        }
+    }
+}
+
 fn reject_lossy_proxy_projection(
     context: &str,
     annotations_present: bool,
@@ -1771,13 +1914,19 @@ impl ProxyBackend for Client {
         name: &str,
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
-        self.request_core_with_cancellation(
+        let result = self.request_core_with_cancellation(
             ctx.cx(),
             &ctx.request_cancellation(),
             fastmcp_protocol::methods::TOOLS_CALL,
-            serde_json::json!({"name": name, "arguments": arguments}),
+            stdio_parameters_with_inbound_identity(
+                serde_json::json!({"name": name, "arguments": arguments}),
+                ctx.client_implementation(),
+                inbound_logging_level(ctx),
+            ),
             |_| {},
-        )
+        )?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        Ok(result)
     }
 
     fn call_tool_result_with_context_and_final_progress(
@@ -1792,6 +1941,11 @@ impl ProxyBackend for Client {
         if let Some(marker) = expected_marker.as_ref() {
             parameters["_meta"] = serde_json::json!({"progressToken": marker});
         }
+        parameters = stdio_parameters_with_inbound_identity(
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+        );
         let result = self.request_core_with_cancellation(
             ctx.cx(),
             &ctx.request_cancellation(),
@@ -1799,6 +1953,7 @@ impl ProxyBackend for Client {
             parameters,
             |_| {},
         )?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
             if expected_marker.as_ref() == Some(&progress.progress_token) {
                 on_progress(progress);
@@ -1875,6 +2030,9 @@ impl ProxyBackend for Client {
             ));
         }
         let progress_marker = ctx_progress_marker(ctx);
+        let inbound_identity = ctx
+            .client_implementation()
+            .and_then(implementation_from_request_identity);
         let outcome = Client::call_tool_final_outcome_with_cancellation(
             self,
             ctx.cx(),
@@ -1882,7 +2040,10 @@ impl ProxyBackend for Client {
             name,
             arguments,
             progress_marker.as_ref(),
+            inbound_identity.as_ref(),
+            inbound_logging_level(ctx),
         )?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
             if progress_marker.as_ref() == Some(&progress.progress_token) {
                 on_progress(progress);
@@ -3110,6 +3271,8 @@ impl ProxyHttpClient {
     fn request_parameters(
         &self,
         mut parameters: serde_json::Value,
+        inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
+        inbound_log_level: Option<LoggingLevel>,
     ) -> McpResult<serde_json::Value> {
         if self.binding.era() == ProtocolEra::Legacy2024 {
             return Ok(parameters);
@@ -3117,16 +3280,32 @@ impl ProxyHttpClient {
         let object = parameters.as_object_mut().ok_or_else(|| {
             McpError::invalid_params("Proxy HTTP request parameters must be an object")
         })?;
-        let progress_marker = object.remove("_meta").and_then(|meta| {
-            meta.as_object()
-                .and_then(|meta| meta.get("progressToken").cloned())
+        let existing_meta = object.remove("_meta");
+        let existing_meta = existing_meta
+            .as_ref()
+            .and_then(serde_json::Value::as_object);
+        let progress_marker = existing_meta.and_then(|meta| meta.get("progressToken").cloned());
+        let inbound_log_level = inbound_log_level.or_else(|| {
+            existing_meta.and_then(|meta| {
+                meta.get(FINAL_LOG_LEVEL_META_KEY)
+                    .and_then(|value| serde_json::from_value(value.clone()).ok())
+            })
         });
         let mut metadata = FinalRequestMeta::new(self.client_capabilities.clone());
-        metadata.client_info = Some(self.client_info.to_implementation());
+        metadata.client_info = inbound_identity
+            .and_then(implementation_from_request_identity)
+            .or_else(|| Some(self.client_info.to_implementation()));
         if let Some(progress_marker) = progress_marker {
             metadata
                 .additional_metadata
                 .insert("progressToken".to_owned(), progress_marker);
+        }
+        if let Some(log_level) = inbound_log_level
+            && let Ok(value) = serde_json::to_value(log_level)
+        {
+            metadata
+                .additional_metadata
+                .insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), value);
         }
         object.insert(
             "_meta".to_owned(),
@@ -3330,7 +3509,11 @@ impl ProxyHttpClient {
         if self.binding.era() == ProtocolEra::Legacy2024 {
             self.ensure_legacy_initialized()?;
         }
-        let parameters = self.request_parameters(parameters)?;
+        let parameters = self.request_parameters(
+            parameters,
+            ctx.and_then(McpContext::client_implementation),
+            ctx.and_then(inbound_logging_level),
+        )?;
         let request = CoreRequest::decode(self.binding.era(), method, Some(&parameters)).map_err(
             |error| {
                 McpError::invalid_params(format!(
@@ -3481,7 +3664,11 @@ impl ProxyBackend for ProxyHttpClient {
         }
         ctx.checkpoint()?;
         self.ensure_legacy_initialized()?;
-        let parameters = self.request_parameters(parameters)?;
+        let parameters = self.request_parameters(
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+        )?;
         let request = CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&parameters))
             .map_err(|error| {
                 McpError::invalid_params(format!(
@@ -4606,6 +4793,7 @@ fn receive_modern_response(
                         event.as_bytes(),
                         request,
                         &mut *on_progress,
+                        None,
                     )?;
                     continue;
                 }
@@ -4829,7 +5017,12 @@ async fn receive_modern_response_with_cancellation(
                 if let JsonRpcMessage::Request(request) = &message
                     && request.is_notification()
                 {
-                    forward_modern_progress_notification(event.as_bytes(), request, on_progress)?;
+                    forward_modern_progress_notification(
+                        event.as_bytes(),
+                        request,
+                        on_progress,
+                        Some(ctx),
+                    )?;
                     continue;
                 }
                 return response_for_request(event.as_bytes(), request_id);
@@ -4875,10 +5068,17 @@ fn forward_modern_progress_notification(
     raw_frame: &[u8],
     request: &JsonRpcRequest,
     on_progress: FinalProgressCallback<'_>,
+    ctx: Option<&McpContext>,
 ) -> McpResult<()> {
     let notification = decode_modern_server_notification(raw_frame, request)?;
-    if let ServerNotification::Progress(params) = notification {
-        on_progress(params);
+    match notification {
+        ServerNotification::Progress(params) => on_progress(params),
+        ServerNotification::Message(params) => {
+            if let Some(ctx) = ctx {
+                relay_upstream_log_message(ctx, &params);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -6881,9 +7081,14 @@ mod tests {
         };
 
         let mut delivered = Vec::new();
-        forward_modern_progress_notification(wire.as_bytes(), &request, &mut |params| {
-            delivered.push(params);
-        })
+        forward_modern_progress_notification(
+            wire.as_bytes(),
+            &request,
+            &mut |params| {
+                delivered.push(params);
+            },
+            None,
+        )
         .expect("proxy forwards the exact modern progress notification");
         assert_eq!(delivered.len(), 1);
         let params = &delivered[0];
@@ -6927,6 +7132,7 @@ mod tests {
             negative.as_bytes(),
             &negative_request,
             &mut |params| delivered.push(params),
+            None,
         )
         .expect_err("changing only progress to a negative number must be rejected");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
