@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use fastmcp_protocol::common_types::Implementation;
 use fastmcp_protocol::extensions::{
     ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionDirection,
     ExtensionLocalEnablement, ExtensionNegotiationError, ExtensionSettings,
@@ -417,6 +418,8 @@ impl std::error::Error for ClientProtocolPlanError {}
 pub struct ClientSession {
     /// Client info sent during initialization.
     client_info: ClientInfo,
+    /// Modern Implementation extras retained from the builder, if any.
+    client_implementation: Option<Implementation>,
     /// Client capabilities sent during initialization.
     client_capabilities: ClientCapabilities,
     /// Server info received during initialization.
@@ -503,6 +506,7 @@ impl ClientSession {
     ) -> Self {
         Self {
             client_info,
+            client_implementation: None,
             client_capabilities,
             server_info,
             server_capabilities,
@@ -700,6 +704,25 @@ impl ClientSession {
     #[must_use]
     pub fn client_info(&self) -> &ClientInfo {
         &self.client_info
+    }
+
+    /// Returns the modern Implementation identity for this session.
+    ///
+    /// Builder extras (title/description/website/icons) are retained when
+    /// present. Otherwise this projects name and version only.
+    #[must_use]
+    pub fn modern_client_implementation(&self) -> Implementation {
+        self.client_implementation
+            .clone()
+            .unwrap_or_else(|| self.client_info.to_implementation())
+    }
+
+    /// Retains a modern Implementation identity without changing exact-2024
+    /// `clientInfo` name/version.
+    #[must_use]
+    pub fn with_client_implementation(mut self, implementation: Implementation) -> Self {
+        self.client_implementation = Some(implementation);
+        self
     }
 
     /// Returns the client capabilities.

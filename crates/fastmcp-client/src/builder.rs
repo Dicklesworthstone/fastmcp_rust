@@ -164,6 +164,11 @@ impl ConnectionRetryPolicy {
 pub struct ClientBuilder {
     /// Client identification info.
     client_info: ClientInfo,
+    /// Modern-only Implementation extras. Exact-2024 initialize stays name/version.
+    client_title: Option<String>,
+    client_description: Option<String>,
+    client_website_url: Option<String>,
+    client_icons: Vec<fastmcp_protocol::common_types::RawIcon>,
     /// Validated ordinary-request idle/absolute timeout policy.
     timeout_policy: RequestTimeoutPolicy,
     /// Maximum number of connection retries.
@@ -245,6 +250,10 @@ impl ClientBuilder {
                 name: "fastmcp-client".to_owned(),
                 version: env!("CARGO_PKG_VERSION").to_owned(),
             },
+            client_title: None,
+            client_description: None,
+            client_website_url: None,
+            client_icons: Vec::new(),
             timeout_policy: RequestTimeoutPolicy::default(),
             max_retries: 0,
             retry_delay_ms: 1_000,
@@ -272,6 +281,62 @@ impl ClientBuilder {
             version: version.into(),
         };
         self
+    }
+
+    /// Sets the modern discovery/request title. Exact-2024 initialize stays name/version.
+    #[must_use]
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.client_title = Some(title.into());
+        self
+    }
+
+    /// Sets the modern discovery/request description.
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.client_description = Some(description.into());
+        self
+    }
+
+    /// Sets the modern discovery/request website URL.
+    #[must_use]
+    pub fn website_url(mut self, website_url: impl Into<String>) -> Self {
+        self.client_website_url = Some(website_url.into());
+        self
+    }
+
+    /// Sets the modern discovery/request icon set.
+    #[must_use]
+    pub fn icons(mut self, icons: Vec<fastmcp_protocol::common_types::RawIcon>) -> Self {
+        self.client_icons = icons;
+        self
+    }
+
+    fn modern_client_implementation(&self) -> fastmcp_protocol::common_types::Implementation {
+        let mut implementation = self.client_info.to_implementation();
+        implementation.title = self.client_title.clone();
+        implementation.description = self.client_description.clone();
+        if let Some(website_url) = self.client_website_url.as_deref()
+            && let Ok(uri) = fastmcp_protocol::common_types::AbsoluteUri::parse(website_url)
+        {
+            implementation.website_url = Some(uri);
+        }
+        implementation.icons = self.client_icons.clone();
+        implementation
+    }
+
+    fn client_implementation_for_session(
+        &self,
+    ) -> Option<fastmcp_protocol::common_types::Implementation> {
+        let implementation = self.modern_client_implementation();
+        if implementation.title.is_some()
+            || implementation.description.is_some()
+            || implementation.website_url.is_some()
+            || !implementation.icons.is_empty()
+        {
+            Some(implementation)
+        } else {
+            None
+        }
     }
 
     /// Sets the validated idle/absolute policy for ordinary requests.
@@ -568,15 +633,19 @@ impl ClientBuilder {
         }
         let legacy_capabilities =
             legacy_capabilities_for_handlers(&client_capabilities, &reverse_request_handlers);
+        let client_implementation = builder.client_implementation_for_session();
         let mut connection = ClientHttpConnection::connect_with_extensions(
             cx,
             builder.protocol_plan,
-            builder.client_info,
+            builder.client_info.clone(),
             client_capabilities,
             builder.mcp_apps_settings,
             builder.client_extension_runtime,
         )
         .await?;
+        if let Some(implementation) = client_implementation {
+            connection.set_client_implementation(implementation);
+        }
         match connection.selected_protocol_era() {
             fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
                 if reverse_request_handlers.has_modern_handlers() =>
@@ -637,7 +706,8 @@ impl ClientBuilder {
         if reverse_request_handlers.has_modern_handlers() {
             reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
         }
-        HttpClient::connect_with_extensions(
+        let client_implementation = builder.client_implementation_for_session();
+        let mut client = HttpClient::connect_with_extensions(
             cx,
             builder.protocol_plan,
             builder.client_info,
@@ -646,7 +716,11 @@ impl ClientBuilder {
             builder.client_extension_runtime,
             reverse_request_handlers,
         )
-        .await
+        .await?;
+        if let Some(implementation) = client_implementation {
+            client.set_client_implementation(implementation);
+        }
+        Ok(client)
     }
 
     /// Connects to a server via stdio subprocess.
@@ -748,10 +822,12 @@ impl ClientBuilder {
     {
         self.validate_feature_configuration()?;
         self.validate_websocket_configuration()?;
+        let client_implementation = self.client_implementation_for_session();
         WebSocketClient::connect_with_builder_configuration_with_cx(
             cx,
             self.protocol_plan,
             self.client_info,
+            client_implementation,
             self.capabilities,
             self.reverse_request_handlers,
             self.mcp_apps_settings,
@@ -1254,7 +1330,7 @@ impl ClientBuilder {
         timeout_policy: RequestTimeoutPolicy,
     ) -> Client {
         // Create a placeholder session - will be updated on first use
-        let session = ClientSession::new_placeholder(
+        let mut session = ClientSession::new_placeholder(
             self.client_info.clone(),
             self.capabilities.clone(),
             fastmcp_protocol::ServerInfo {
@@ -1266,6 +1342,9 @@ impl ClientBuilder {
         .with_mcp_apps_settings(self.mcp_apps_settings.clone())
         .with_client_extension_runtime(self.client_extension_runtime.clone())
         .with_protocol_plan(protocol_plan);
+        if let Some(implementation) = self.client_implementation_for_session() {
+            session = session.with_client_implementation(implementation);
+        }
 
         let mut client = Client::from_parts_uninitialized_with_ownership(
             child,

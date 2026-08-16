@@ -2124,6 +2124,7 @@ pub struct ModernHttpClient {
     protocol_plan: ClientProtocolPlan,
     modern_post_target: String,
     client_info: ClientInfo,
+    client_implementation: Option<fastmcp_protocol::common_types::Implementation>,
     client_capabilities: ClientCapabilities,
     mcp_apps_settings: Option<McpAppsClientSettings>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
@@ -2908,6 +2909,16 @@ impl ClientHttpConnection {
             Self::Modern(client) => Some(client.server_discovery()),
             #[cfg(feature = "legacy-2024-11-05")]
             Self::LegacySse(_) => None,
+        }
+    }
+
+    /// Retains modern Implementation extras on the modern HTTP connection.
+    pub fn set_client_implementation(
+        &mut self,
+        implementation: fastmcp_protocol::common_types::Implementation,
+    ) {
+        if let Self::Modern(client) = self {
+            client.set_client_implementation(implementation);
         }
     }
 
@@ -4789,7 +4800,7 @@ impl ModernHttpClient {
         );
         let probe_request = build_modern_request_with_extensions(
             &modern_post_target,
-            &client_info,
+            &client_info.to_implementation(),
             &client_capabilities,
             SERVER_DISCOVER,
             serde_json::json!({}),
@@ -4842,6 +4853,7 @@ impl ModernHttpClient {
                     protocol_plan,
                     modern_post_target,
                     client_info,
+                    client_implementation: None,
                     client_capabilities,
                     mcp_apps_settings,
                     client_extension_runtime,
@@ -4918,6 +4930,20 @@ impl ModernHttpClient {
     #[must_use]
     pub fn server_discovery(&self) -> ServerDiscoverResult {
         self.discovery_state.server_discovery.clone()
+    }
+
+    /// Retains modern Implementation extras for later request `_meta` stamps.
+    pub fn set_client_implementation(
+        &mut self,
+        implementation: fastmcp_protocol::common_types::Implementation,
+    ) {
+        self.client_implementation = Some(implementation);
+    }
+
+    fn stamped_client_identity(&self) -> fastmcp_protocol::common_types::Implementation {
+        self.client_implementation
+            .clone()
+            .unwrap_or_else(|| self.client_info.to_implementation())
     }
 
     /// Returns whether final discovery activated the official MCP Apps extension.
@@ -5008,7 +5034,7 @@ impl ModernHttpClient {
         );
         let request = build_modern_request_with_extensions(
             &self.modern_post_target,
-            &self.client_info,
+            &self.stamped_client_identity(),
             &self.client_capabilities,
             method,
             parameters,
@@ -5101,7 +5127,7 @@ impl ModernHttpClient {
         );
         let request = build_modern_request_after_method_validation(
             &self.modern_post_target,
-            &self.client_info,
+            &self.stamped_client_identity(),
             &self.client_capabilities,
             method,
             parameters,
@@ -5867,7 +5893,11 @@ impl ModernHttpClient {
         )]);
         let client_extensions = tasks_extension;
         let mut final_metadata = FinalRequestMeta::new(self.client_capabilities.clone());
-        final_metadata.client_info = Some(self.client_info.clone());
+        final_metadata.client_info = Some(
+            self.client_implementation
+                .clone()
+                .unwrap_or_else(|| self.client_info.to_implementation()),
+        );
         let mut metadata = serde_json::to_value(final_metadata)
             .map_err(|_| ModernHttpClientError::TasksRequestEncoding { method })?;
         let capabilities = metadata
@@ -5933,7 +5963,7 @@ impl ModernHttpClient {
         .ok_or(ModernHttpClientError::TasksRequestEncoding { method })?;
         let request = build_modern_tasks_request(
             &self.modern_post_target,
-            &self.client_info,
+            &self.stamped_client_identity(),
             &self.client_capabilities,
             method,
             parameters,
@@ -7566,7 +7596,7 @@ fn build_modern_request(
 ) -> Result<ModernHttpRequest, ModernHttpClientError> {
     build_modern_request_with_extensions(
         target,
-        client_info,
+        &client_info.to_implementation(),
         client_capabilities,
         method,
         parameters,
@@ -7768,7 +7798,7 @@ fn merge_client_extensions(
 
 fn build_modern_request_with_extensions(
     target: &str,
-    client_info: &ClientInfo,
+    client_info: &fastmcp_protocol::common_types::Implementation,
     client_capabilities: &ClientCapabilities,
     method: &str,
     parameters: serde_json::Value,
@@ -7796,7 +7826,7 @@ fn build_modern_request_with_extensions(
 #[cfg(feature = "tasks")]
 fn build_modern_tasks_request(
     target: &str,
-    client_info: &ClientInfo,
+    client_info: &fastmcp_protocol::common_types::Implementation,
     client_capabilities: &ClientCapabilities,
     method: &'static str,
     parameters: serde_json::Value,
@@ -7824,7 +7854,7 @@ fn build_modern_tasks_request(
 /// reachable through its own core or extension-specific admission path.
 fn build_modern_request_after_method_validation(
     target: &str,
-    client_info: &ClientInfo,
+    client_info: &fastmcp_protocol::common_types::Implementation,
     client_capabilities: &ClientCapabilities,
     method: &str,
     parameters: serde_json::Value,
