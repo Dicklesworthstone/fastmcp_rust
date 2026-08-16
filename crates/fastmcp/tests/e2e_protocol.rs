@@ -26,7 +26,8 @@ use fastmcp_rust::{
 };
 #[cfg(unix)]
 use fastmcp_rust::{
-    Client, Cx, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto, legacy_2024, modern,
+    Client, Cx, ListToolsParams, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto,
+    legacy_2024, modern,
 };
 use serde_json::json;
 
@@ -2212,6 +2213,90 @@ fn e2e_public_stdio_tools_list_changed_is_retained_on_incremental_listen() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_modern_hide_echo_refuses_later_call_and_show_restores() {
+    let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the shipped echo server");
+
+    let before = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the shipped echo tool must be callable before hide_echo");
+    assert!(
+        before.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the live modern stdio echo must retain the handler text: {before:?}"
+    );
+
+    let hidden = client
+        .call_tool("hide_echo", json!({}))
+        .expect("disabling the shipped echo tool must complete");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "modern stdio session state must retain disable_tool: {hidden:?}"
+    );
+
+    let disabled = client.call_tool("echo", json!({"message": "beta"}));
+    let disabled = match disabled {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "hide_echo must turn a later echo call into a tool-level error: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        disabled.contains("disabled")
+            || disabled.contains("echo")
+            || disabled.contains("Method not found")
+            || disabled.contains("MethodNotFound"),
+        "the refused echo call must name the session-disabled tool: {disabled}"
+    );
+
+    let peer = client
+        .call_tool("add", json!({"a": 2, "b": 3}))
+        .expect("changing only the missing hide must keep an undisabled tool callable");
+    assert!(
+        peer.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains('5'),
+            _ => false,
+        }),
+        "an undisabled peer tool must still complete after hide_echo: {peer:?}"
+    );
+
+    let shown = client
+        .call_tool("show_echo", json!({}))
+        .expect("re-enabling the shipped echo tool must complete");
+    assert!(
+        shown.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "shown",
+            _ => false,
+        }),
+        "modern stdio session state must retain enable_tool: {shown:?}"
+    );
+    let restored = client
+        .call_tool("echo", json!({"message": "gamma"}))
+        .expect("show_echo must restore a later echo call on the same modern session");
+    assert!(
+        restored.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("gamma"),
+            _ => false,
+        }),
+        "the restored modern stdio echo must retain the handler text: {restored:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio hide_echo client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_resource_and_prompt_list_changed_are_retained_on_incremental_listen() {
     let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
@@ -3877,6 +3962,1467 @@ fn e2e_public_stdio_modern_filesystem_provider_lists_and_reads_live_file() {
     client
         .close()
         .expect("modern-only stdio filesystem client cleanup");
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn e2e_public_stdio_legacy_filesystem_provider_lists_and_reads_live_file() {
+    let root = std::env::temp_dir().join(format!(
+        "fastmcp-public-stdio-legacy-fs-e2e-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("the exact-2024 stdio filesystem e2e root is created");
+    std::fs::write(root.join("note.txt"), STDIO_FS_FILE_TEXT)
+        .expect("the exact-2024 stdio filesystem e2e file is written");
+    let root_path = root
+        .to_str()
+        .expect("the exact-2024 stdio filesystem e2e root is utf-8")
+        .to_owned();
+
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[
+            ("FASTMCP_FS_ROOT", root_path.as_str()),
+            ("FASTMCP_FS_PREFIX", STDIO_FS_PREFIX),
+        ],
+    )
+    .expect("a LegacyOnly facade client connects to the filesystem echo peer");
+
+    let listed = client
+        .list_resource_templates()
+        .expect("live exact-2024 stdio must list the FilesystemProvider template");
+    assert!(
+        listed.iter().any(|template| {
+            template.uri_template == STDIO_FS_TEMPLATE && template.name == STDIO_FS_PREFIX
+        }),
+        "FilesystemProvider must advertise its reversible file template: {listed:?}"
+    );
+
+    let unmatched = client.read_resource("file:///other/note.txt").expect_err(
+        "changing only the prefix the template cannot bind must refuse before dispatch",
+    );
+    assert_eq!(
+        unmatched.code,
+        McpErrorCode::ResourceNotFound,
+        "an unmatched filesystem URI must stay ResourceNotFound on exact-2024: {unmatched:?}"
+    );
+
+    let file = client
+        .read_resource(STDIO_FS_FILE_URI)
+        .expect("resources/read must expand the live file URI through the filesystem handler");
+    assert!(
+        file.contents.iter().any(|content| match content {
+            LegacyResourceContent::Text { text, .. } => text == STDIO_FS_FILE_TEXT,
+            _ => false,
+        }),
+        "the live exact-2024 filesystem read must retain the file bytes: {:?}",
+        file.contents
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio filesystem client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_hide_catalog_refuses_later_read_and_prompt() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the shipped echo server");
+
+    let before = client
+        .read_resource("info://server")
+        .expect("the shipped echo resource must be readable before hide_catalog");
+    assert!(
+        before.contents.iter().any(|content| match content {
+            LegacyResourceContent::Text { text, .. } => text.contains("echo-server"),
+            _ => false,
+        }),
+        "the live exact-2024 stdio resource must retain the echo handler value: {before:?}"
+    );
+
+    let hidden = client
+        .call_tool("hide_catalog", json!({}))
+        .expect("disabling a shipped resource and prompt must complete");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "exact-2024 stdio session state must retain disable_resource and disable_prompt: {hidden:?}"
+    );
+
+    let disabled_resource = client.read_resource("info://server").expect_err(
+        "hide_catalog must refuse a later info://server read on the same exact-2024 session",
+    );
+    let disabled_resource = format!("{disabled_resource:?}");
+    assert!(
+        disabled_resource.contains("disabled") && disabled_resource.contains("info://server"),
+        "the refused resource read must be the session-disabled URI: {disabled_resource}"
+    );
+    let disabled_prompt = client
+        .get_prompt(
+            "greeting",
+            HashMap::from([("name".to_owned(), "Bea".to_owned())]),
+        )
+        .expect_err("hide_catalog must refuse a later greeting get on the same exact-2024 session");
+    let disabled_prompt = format!("{disabled_prompt:?}");
+    assert!(
+        disabled_prompt.contains("disabled") && disabled_prompt.contains("greeting"),
+        "the refused prompt get must be the session-disabled prompt: {disabled_prompt}"
+    );
+
+    let shown = client
+        .call_tool("show_catalog", json!({}))
+        .expect("re-enabling a shipped resource and prompt must complete");
+    assert!(
+        shown.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "shown",
+            _ => false,
+        }),
+        "exact-2024 stdio session state must retain enable_resource and enable_prompt: {shown:?}"
+    );
+    let restored = client.read_resource("info://server").expect(
+        "show_catalog must restore a later info://server read on the same exact-2024 session",
+    );
+    assert!(
+        restored.contents.iter().any(|content| match content {
+            LegacyResourceContent::Text { text, .. } => text.contains("echo-server"),
+            _ => false,
+        }),
+        "the restored exact-2024 stdio resource must retain the echo handler value: {restored:?}"
+    );
+    let restored_prompt = client
+        .get_prompt(
+            "greeting",
+            HashMap::from([("name".to_owned(), "Cyd".to_owned())]),
+        )
+        .expect("show_catalog must restore a later greeting get on the same exact-2024 session");
+    assert!(
+        restored_prompt
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                LegacyContent::Text { text, .. } => {
+                    text == "Please greet Cyd in a friendly way."
+                }
+                _ => false,
+            }),
+        "the restored exact-2024 stdio prompt must retain the echo handler value: {restored_prompt:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio hide_catalog client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_hide_echo_refuses_later_call_and_show_restores() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the shipped echo server");
+
+    let before = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the shipped echo tool must be callable before hide_echo");
+    assert!(
+        before.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the live exact-2024 stdio echo must retain the handler text: {before:?}"
+    );
+
+    let hidden = client
+        .call_tool("hide_echo", json!({}))
+        .expect("disabling the shipped echo tool must complete");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "exact-2024 stdio session state must retain disable_tool: {hidden:?}"
+    );
+
+    let disabled = client.call_tool("echo", json!({"message": "beta"}));
+    let disabled = match disabled {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "hide_echo must turn a later echo call into a tool-level error: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        disabled.contains("disabled")
+            || disabled.contains("echo")
+            || disabled.contains("Method not found")
+            || disabled.contains("MethodNotFound"),
+        "the refused echo call must name the session-disabled tool: {disabled}"
+    );
+
+    let peer = client
+        .call_tool("add", json!({"a": 2, "b": 3}))
+        .expect("changing only the missing hide must keep an undisabled tool callable");
+    assert!(
+        peer.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text.contains('5'),
+            _ => false,
+        }),
+        "an undisabled peer tool must still complete after hide_echo: {peer:?}"
+    );
+
+    let shown = client
+        .call_tool("show_echo", json!({}))
+        .expect("re-enabling the shipped echo tool must complete");
+    assert!(
+        shown.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text == "shown",
+            _ => false,
+        }),
+        "exact-2024 stdio session state must retain enable_tool: {shown:?}"
+    );
+    let restored = client
+        .call_tool("echo", json!({"message": "gamma"}))
+        .expect("show_echo must restore a later echo call on the same exact-2024 session");
+    assert!(
+        restored.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text.contains("gamma"),
+            _ => false,
+        }),
+        "the restored exact-2024 stdio echo must retain the handler text: {restored:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio hide_echo client cleanup");
+}
+
+#[cfg(unix)]
+const STDIO_LEAK_RESOURCE_URI: &str = "info://leak";
+#[cfg(unix)]
+const STDIO_LEAK_SECRET: &str = "secret-db-dsn";
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_mask_error_details_hides_resource_execution_secret() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_MASK_ERROR_DETAILS", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the masked echo peer");
+    let masked = client
+        .read_resource(STDIO_LEAK_RESOURCE_URI)
+        .expect_err("a leaking resource must stay a resources/read error");
+    let masked = format!("{masked:?}");
+    assert!(
+        masked.contains("Internal server error"),
+        "mask_error_details must replace the execution secret: {masked}"
+    );
+    assert!(
+        !masked.contains(STDIO_LEAK_SECRET),
+        "mask_error_details must not leak the execution secret: {masked}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio masked client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_unmask_error_details_keeps_resource_execution_secret() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the unmasked echo peer");
+    let unmasked = client
+        .read_resource(STDIO_LEAK_RESOURCE_URI)
+        .expect_err("changing only the missing mask flag must still refuse the leaking resource");
+    let unmasked = format!("{unmasked:?}");
+    assert!(
+        unmasked.contains(STDIO_LEAK_SECRET),
+        "disabling mask_error_details must keep the execution secret: {unmasked}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio unmasked client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_mask_error_details_hides_resource_execution_secret() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_MASK_ERROR_DETAILS", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the masked echo peer");
+    let masked = client
+        .read_resource(STDIO_LEAK_RESOURCE_URI)
+        .expect_err("a leaking resource must stay a resources/read error");
+    let masked = format!("{masked:?}");
+    assert!(
+        masked.contains("Internal server error"),
+        "exact-2024 stdio mask_error_details must replace the execution secret: {masked}"
+    );
+    assert!(
+        !masked.contains(STDIO_LEAK_SECRET),
+        "exact-2024 stdio mask_error_details must not leak the execution secret: {masked}"
+    );
+    client
+        .close()
+        .expect("legacy-only stdio masked client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_unmask_error_details_keeps_resource_execution_secret() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the unmasked echo peer");
+    let unmasked = client
+        .read_resource(STDIO_LEAK_RESOURCE_URI)
+        .expect_err("changing only the missing mask flag must still refuse the leaking resource");
+    let unmasked = format!("{unmasked:?}");
+    assert!(
+        unmasked.contains(STDIO_LEAK_SECRET),
+        "disabling exact-2024 stdio mask_error_details must keep the execution secret: {unmasked}"
+    );
+    client
+        .close()
+        .expect("legacy-only stdio unmasked client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_strict_input_validation_refuses_unknown_property() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_STRICT_INPUT", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the strict echo peer");
+    let admitted = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("strict validation must still admit declared arguments");
+    assert!(
+        !admitted.is_error,
+        "declared arguments must not become a tool-level error: {admitted:?}"
+    );
+    assert!(
+        admitted.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "declared arguments must reach the handler under strict validation: {admitted:?}"
+    );
+
+    let refused = client.call_tool("echo", json!({"message": "alpha", "extra": 1}));
+    let refused = match refused {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "an unknown property must become a tool-level error when strict validation is on: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        refused.contains("do not match the declared input schema")
+            || refused.contains("unknown")
+            || refused.contains("InvalidParams")
+            || refused.contains("extra")
+            || refused.contains("additional property"),
+        "the strict refusal must name the input-schema mismatch: {refused}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio strict client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_lenient_input_validation_admits_unknown_property() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the lenient echo peer");
+    let extra = client
+        .call_tool("echo", json!({"message": "alpha", "extra": 1}))
+        .expect("lenient validation must admit the same extra property");
+    assert!(
+        !extra.is_error,
+        "changing only the missing strict flag must admit the extra property: {extra:?}"
+    );
+    assert!(
+        extra.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the extra property must not change the handler result when strict is off: {extra:?}"
+    );
+    client
+        .close()
+        .expect("modern-only stdio lenient client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_strict_input_validation_refuses_unknown_property() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_STRICT_INPUT", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the strict echo peer");
+    let admitted = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("strict validation must still admit declared arguments");
+    assert!(
+        !admitted.is_error,
+        "declared arguments must not become a tool-level error: {admitted:?}"
+    );
+    assert!(
+        admitted.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "declared arguments must reach the handler under strict validation: {admitted:?}"
+    );
+
+    let refused = client.call_tool("echo", json!({"message": "alpha", "extra": 1}));
+    let refused = match refused {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "an unknown property must become a tool-level error when strict validation is on: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        refused.contains("do not match the declared input schema")
+            || refused.contains("unknown")
+            || refused.contains("InvalidParams")
+            || refused.contains("extra")
+            || refused.contains("additional property"),
+        "the exact-2024 strict refusal must name the input-schema mismatch: {refused}"
+    );
+    client
+        .close()
+        .expect("legacy-only stdio strict client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_lenient_input_validation_admits_unknown_property() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the lenient echo peer");
+    let extra = client
+        .call_tool("echo", json!({"message": "alpha", "extra": 1}))
+        .expect("lenient validation must admit the same extra property");
+    assert!(
+        !extra.is_error,
+        "changing only the missing strict flag must admit the extra property: {extra:?}"
+    );
+    assert!(
+        extra.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the extra property must not change the handler result when strict is off: {extra:?}"
+    );
+    client
+        .close()
+        .expect("legacy-only stdio lenient client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_sliding_window_refuses_second_same_method_and_admits_another() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_SLIDING_WINDOW", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the sliding-window echo peer");
+
+    let first = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the first modern stdio tools/call must be admitted by the sliding window");
+    assert!(
+        !first.is_error,
+        "the first sliding-window tools/call must reach the handler: {first:?}"
+    );
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the first sliding-window tools/call must retain the handler text: {first:?}"
+    );
+
+    let limited = client.call_tool("echo", json!({"message": "beta"}));
+    let limited = match limited {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a second tools/call must stay an error result: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second modern stdio tools/call must keep the sliding-window error: {limited}"
+    );
+
+    client
+        .ping()
+        .expect("changing only the method must still be admitted by the live sliding window");
+
+    client
+        .close()
+        .expect("modern-only stdio sliding-window client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_sliding_window_refuses_second_same_method_and_admits_another() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_SLIDING_WINDOW", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the sliding-window echo peer");
+
+    let first = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the first exact-2024 stdio tools/call must be admitted by the sliding window");
+    assert!(
+        !first.is_error,
+        "the first sliding-window tools/call must reach the handler: {first:?}"
+    );
+    assert!(
+        first.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the first sliding-window tools/call must retain the handler text: {first:?}"
+    );
+
+    let limited = client.call_tool("echo", json!({"message": "beta"}));
+    let limited = match limited {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a second tools/call must stay an error result: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 stdio tools/call must keep the sliding-window error: {limited}"
+    );
+
+    let listed = client
+        .list_tools()
+        .expect("changing only the method must still be admitted by the live sliding window");
+    assert!(
+        listed.iter().any(|tool| tool.name == "echo"),
+        "tools/list must stay callable after tools/call is sliding-window limited: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio sliding-window client cleanup");
+}
+
+#[cfg(unix)]
+fn stdio_modern_tool_text(result: &fastmcp_rust::FinalCallToolResult) -> Option<&str> {
+    result.content.iter().find_map(|content| match content {
+        ContentBlock::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+#[cfg(unix)]
+fn stdio_legacy_tool_text(result: &fastmcp_protocol::CallToolResult) -> Option<&str> {
+    result.content.iter().find_map(|content| match content {
+        LegacyContent::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_cache_hits_same_allowlisted_call_and_misses_changed_args() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_CACHE_TOOLS", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the cached echo peer");
+
+    let first = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect("the first allowlisted modern stdio tools/call must miss and reach the handler");
+    assert!(
+        !first.is_error,
+        "the first cache_probe call must reach the handler: {first:?}"
+    );
+    assert_eq!(
+        stdio_modern_tool_text(&first),
+        Some("alpha:0"),
+        "the first cache_probe call must increment the process-local counter: {first:?}"
+    );
+
+    let cached = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect("the second identical allowlisted tools/call must be a cache hit");
+    assert!(
+        !cached.is_error,
+        "the cache hit must stay a complete result: {cached:?}"
+    );
+    assert_eq!(
+        stdio_modern_tool_text(&cached),
+        Some("alpha:0"),
+        "a cache hit must keep the first complete result without incrementing: {cached:?}"
+    );
+
+    let missed = client
+        .call_tool("cache_probe", json!({"token": "beta"}))
+        .expect("changing only the arguments must miss the cache");
+    assert!(
+        !missed.is_error,
+        "a different-arguments tools/call must reach the handler: {missed:?}"
+    );
+    assert_eq!(
+        stdio_modern_tool_text(&missed),
+        Some("beta:1"),
+        "a cache miss must increment the process-local counter: {missed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio cache client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_cache_off_invokes_handler_twice() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the uncached echo peer");
+
+    let first = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect("the first uncached modern stdio tools/call must reach the handler");
+    assert_eq!(
+        stdio_modern_tool_text(&first),
+        Some("alpha:0"),
+        "the first uncached cache_probe call must increment: {first:?}"
+    );
+
+    let second = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect("omitting only FASTMCP_CACHE_TOOLS must invoke the handler again");
+    assert_eq!(
+        stdio_modern_tool_text(&second),
+        Some("alpha:1"),
+        "changing only the missing cache flag must increment again: {second:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio uncached client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_cache_hits_same_allowlisted_call_and_misses_changed_args() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_CACHE_TOOLS", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the cached echo peer");
+
+    let first = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect(
+            "the first allowlisted exact-2024 stdio tools/call must miss and reach the handler",
+        );
+    assert!(
+        !first.is_error,
+        "the first cache_probe call must reach the handler: {first:?}"
+    );
+    assert_eq!(
+        stdio_legacy_tool_text(&first),
+        Some("alpha:0"),
+        "the first cache_probe call must increment the process-local counter: {first:?}"
+    );
+
+    let cached = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect("the second identical allowlisted tools/call must be a cache hit");
+    assert!(
+        !cached.is_error,
+        "the cache hit must stay a complete result: {cached:?}"
+    );
+    assert_eq!(
+        stdio_legacy_tool_text(&cached),
+        Some("alpha:0"),
+        "a cache hit must keep the first complete result without incrementing: {cached:?}"
+    );
+
+    let missed = client
+        .call_tool("cache_probe", json!({"token": "beta"}))
+        .expect("changing only the arguments must miss the cache");
+    assert!(
+        !missed.is_error,
+        "a different-arguments tools/call must reach the handler: {missed:?}"
+    );
+    assert_eq!(
+        stdio_legacy_tool_text(&missed),
+        Some("beta:1"),
+        "a cache miss must increment the process-local counter: {missed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio cache client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_cache_off_invokes_handler_twice() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the uncached echo peer");
+
+    let first = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect("the first uncached exact-2024 stdio tools/call must reach the handler");
+    assert_eq!(
+        stdio_legacy_tool_text(&first),
+        Some("alpha:0"),
+        "the first uncached cache_probe call must increment: {first:?}"
+    );
+
+    let second = client
+        .call_tool("cache_probe", json!({"token": "alpha"}))
+        .expect("omitting only FASTMCP_CACHE_TOOLS must invoke the handler again");
+    assert_eq!(
+        stdio_legacy_tool_text(&second),
+        Some("alpha:1"),
+        "changing only the missing cache flag must increment again: {second:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio uncached client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_rate_limit_refuses_second_same_method_and_admits_another() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_RATE_LIMIT", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the rate-limited echo peer");
+
+    let first = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the first modern stdio tools/call must be admitted by the token bucket");
+    assert!(
+        !first.is_error,
+        "the first rate-limited tools/call must reach the handler: {first:?}"
+    );
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the first rate-limited tools/call must retain the handler text: {first:?}"
+    );
+
+    let limited = client.call_tool("echo", json!({"message": "beta"}));
+    let limited = match limited {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a second tools/call must stay an error result: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second modern stdio tools/call must keep the token-bucket error: {limited}"
+    );
+
+    client
+        .ping()
+        .expect("changing only the method must still be admitted by the live token bucket");
+
+    client
+        .close()
+        .expect("modern-only stdio rate-limit client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_rate_limit_refuses_second_same_method_and_admits_another() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_RATE_LIMIT", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the rate-limited echo peer");
+
+    let first = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the first exact-2024 stdio tools/call must be admitted by the token bucket");
+    assert!(
+        !first.is_error,
+        "the first rate-limited tools/call must reach the handler: {first:?}"
+    );
+    assert!(
+        first.content.iter().any(|content| match content {
+            LegacyContent::Text { text, .. } => text.contains("alpha"),
+            _ => false,
+        }),
+        "the first rate-limited tools/call must retain the handler text: {first:?}"
+    );
+
+    let limited = client.call_tool("echo", json!({"message": "beta"}));
+    let limited = match limited {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a second tools/call must stay an error result: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 stdio tools/call must keep the token-bucket error: {limited}"
+    );
+
+    let listed = client
+        .list_tools()
+        .expect("changing only the method must still be admitted by the live token bucket");
+    assert!(
+        listed.iter().any(|tool| tool.name == "echo"),
+        "tools/list must stay callable after tools/call is token-bucket limited: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio rate-limit client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_replace_echo_installs_second_handler() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_REPLACE_ECHO", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the replace-echo peer");
+
+    let replaced = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("Replace must install the second echo registration");
+    assert!(
+        !replaced.is_error,
+        "the replaced echo must stay a complete result: {replaced:?}"
+    );
+    assert_eq!(
+        stdio_modern_tool_text(&replaced),
+        Some("replaced:alpha"),
+        "changing only on_duplicate to Replace must reach the second handler: {replaced:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio replace-echo client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_default_echo_keeps_first_handler() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the default echo peer");
+
+    let kept = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("omitting only FASTMCP_REPLACE_ECHO must keep the first echo");
+    assert!(
+        !kept.is_error,
+        "the default echo must stay a complete result: {kept:?}"
+    );
+    assert_eq!(
+        stdio_modern_tool_text(&kept),
+        Some("alpha"),
+        "changing only the missing replace flag must keep the first handler: {kept:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio default-echo client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_replace_echo_installs_second_handler() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_REPLACE_ECHO", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the replace-echo peer");
+
+    let replaced = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("Replace must install the second echo registration");
+    assert!(
+        !replaced.is_error,
+        "the replaced echo must stay a complete result: {replaced:?}"
+    );
+    assert_eq!(
+        stdio_legacy_tool_text(&replaced),
+        Some("replaced:alpha"),
+        "changing only on_duplicate to Replace must reach the second handler: {replaced:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio replace-echo client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_default_echo_keeps_first_handler() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the default echo peer");
+
+    let kept = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("omitting only FASTMCP_REPLACE_ECHO must keep the first echo");
+    assert!(
+        !kept.is_error,
+        "the default echo must stay a complete result: {kept:?}"
+    );
+    assert_eq!(
+        stdio_legacy_tool_text(&kept),
+        Some("alpha"),
+        "changing only the missing replace flag must keep the first handler: {kept:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio default-echo client cleanup");
+}
+
+#[cfg(unix)]
+const STDIO_LIST_PAGE_LIMITS: fastmcp_rust::ListPageLimits =
+    fastmcp_rust::ListPageLimits::new(64, 1_048_576);
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_list_page_continues_and_rejects_wrong_catalog_cursor() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_LIST_PAGE_SIZE", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the paged echo peer");
+
+    let first = client
+        .list_tools(None)
+        .expect("the first modern stdio tools/list page must miss and reach the catalog");
+    assert_eq!(
+        first.tools.len(),
+        1,
+        "page size 1 must create a real continuation: {first:?}"
+    );
+    let first_name = first.tools[0].name.clone();
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 tools/list must carry an opaque cursor");
+
+    let second = client
+        .list_tools(Some(&cursor))
+        .expect("the exact cursor continuation must reach the second live page");
+    assert_eq!(
+        second.tools.len(),
+        1,
+        "the continuation must retain one remaining tool: {second:?}"
+    );
+    assert_ne!(
+        second.tools[0].name, first_name,
+        "the continuation must advance to a different tool: {second:?}"
+    );
+
+    let rejected = client
+        .list_resources(Some(&cursor))
+        .expect_err("a tools/list cursor must not page resources/list");
+    let rejected = format!("{rejected:?}");
+    assert!(
+        rejected.contains("InvalidParams") || rejected.contains("invalid"),
+        "a wrong-catalog cursor must stay InvalidParams: {rejected}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio paged client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_default_list_is_not_forced_to_page_size_one() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the unpaged echo peer");
+
+    let listed = client
+        .list_tools(None)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first page");
+    assert!(
+        listed.tools.len() > 1,
+        "changing only the missing page-size flag must keep more than one tool on the first page: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio unpaged client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_list_page_continues_and_rejects_wrong_catalog_cursor() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_LIST_PAGE_SIZE", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the paged echo peer");
+
+    let first = client
+        .list_tools_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("the first exact-2024 stdio tools/list page must miss and reach the catalog");
+    assert_eq!(
+        first.items.len(),
+        1,
+        "page size 1 must create a real continuation: {first:?}"
+    );
+    let first_name = first.items[0].name.clone();
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 tools/list must carry an opaque cursor");
+
+    let second = client
+        .list_tools_page(Some(&cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect("the exact cursor continuation must reach the second live page");
+    assert_eq!(
+        second.items.len(),
+        1,
+        "the continuation must retain one remaining tool: {second:?}"
+    );
+    assert_ne!(
+        second.items[0].name, first_name,
+        "the continuation must advance to a different tool: {second:?}"
+    );
+
+    let rejected = client
+        .list_resources_page(Some(&cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect_err("a tools/list cursor must not page resources/list");
+    let rejected = format!("{rejected:?}");
+    assert!(
+        rejected.contains("InvalidParams") || rejected.contains("invalid"),
+        "a wrong-catalog cursor must stay InvalidParams: {rejected}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio paged client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_default_list_is_not_forced_to_page_size_one() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the unpaged echo peer");
+
+    let listed = client
+        .list_tools_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first page");
+    assert!(
+        listed.items.len() > 1,
+        "changing only the missing page-size flag must keep more than one tool on the first page: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio unpaged client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_transformed_echo_renames_argument() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_TRANSFORM_ECHO", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the transformed echo peer");
+
+    let renamed = client
+        .call_tool("echo_text", json!({"text": "alpha"}))
+        .expect("the renamed argument must reach the parent echo handler");
+    assert_eq!(
+        stdio_modern_tool_text(&renamed),
+        Some("alpha"),
+        "rename_arg must rewrite text back to message: {renamed:?}"
+    );
+
+    let stale = client.call_tool("echo_text", json!({"message": "alpha"}));
+    let stale = match stale {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        stale.contains("InvalidParams")
+            || stale.contains("required")
+            || stale.contains("message")
+            || stale.contains("text")
+            || stale.contains("is_error")
+            || stale.contains("error"),
+        "calling the pre-rename argument name must fail: {stale}"
+    );
+
+    let parent = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the parent echo must stay registered beside the transform");
+    assert_eq!(
+        stdio_modern_tool_text(&parent),
+        Some("alpha"),
+        "the parent echo must keep the original argument name: {parent:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio transformed-echo client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_transformed_echo_renames_argument() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_TRANSFORM_ECHO", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the transformed echo peer");
+
+    let renamed = client
+        .call_tool("echo_text", json!({"text": "alpha"}))
+        .expect("the renamed argument must reach the parent echo handler");
+    assert_eq!(
+        stdio_legacy_tool_text(&renamed),
+        Some("alpha"),
+        "rename_arg must rewrite text back to message: {renamed:?}"
+    );
+
+    let stale = client.call_tool("echo_text", json!({"message": "alpha"}));
+    let stale = match stale {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        stale.contains("InvalidParams")
+            || stale.contains("required")
+            || stale.contains("message")
+            || stale.contains("text")
+            || stale.contains("is_error")
+            || stale.contains("error"),
+        "calling the pre-rename argument name must fail: {stale}"
+    );
+
+    let parent = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the parent echo must stay registered beside the transform");
+    assert_eq!(
+        stdio_legacy_tool_text(&parent),
+        Some("alpha"),
+        "the parent echo must keep the original argument name: {parent:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio transformed-echo client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_transformed_echo_hides_argument_and_injects_default() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_TRANSFORM_HIDE", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the hide-arg echo peer");
+
+    let injected = client
+        .call_tool("echo_hidden", json!({}))
+        .expect("the hide-arg tools/call must inject the configured default");
+    assert_eq!(
+        stdio_modern_tool_text(&injected),
+        Some("hidden-default"),
+        "the hidden default must reach the parent echo handler: {injected:?}"
+    );
+
+    let parent = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the parent echo must stay registered beside the hide-arg transform");
+    assert_eq!(
+        stdio_modern_tool_text(&parent),
+        Some("alpha"),
+        "the parent echo must keep the original argument: {parent:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio hide-arg client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_transformed_echo_hides_argument_and_injects_default() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_TRANSFORM_HIDE", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the hide-arg echo peer");
+
+    let injected = client
+        .call_tool("echo_hidden", json!({}))
+        .expect("the hide-arg tools/call must inject the configured default");
+    assert_eq!(
+        stdio_legacy_tool_text(&injected),
+        Some("hidden-default"),
+        "the hidden default must reach the parent echo handler: {injected:?}"
+    );
+
+    let parent = client
+        .call_tool("echo", json!({"message": "alpha"}))
+        .expect("the parent echo must stay registered beside the hide-arg transform");
+    assert_eq!(
+        stdio_legacy_tool_text(&parent),
+        Some("alpha"),
+        "the parent echo must keep the original argument: {parent:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio hide-arg client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_hide_arg_schema_drops_message() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_TRANSFORM_HIDE", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the hide-arg echo peer");
+
+    let listed = client
+        .list_tools(None)
+        .expect("hide-arg catalog must list echo_hidden");
+    let hidden = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == "echo_hidden")
+        .unwrap_or_else(|| panic!("the hide-arg catalog must advertise echo_hidden: {listed:?}"));
+    let schema =
+        serde_json::to_string(&hidden.input_schema).expect("the hide-arg schema serializes");
+    assert!(
+        !schema.contains("\"message\""),
+        "the hide-arg schema must drop the hidden argument: {schema}"
+    );
+    let parent = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == "echo")
+        .unwrap_or_else(|| panic!("the parent echo must stay listed: {listed:?}"));
+    let parent_schema =
+        serde_json::to_string(&parent.input_schema).expect("the parent schema serializes");
+    assert!(
+        parent_schema.contains("\"message\""),
+        "the parent echo schema must keep message: {parent_schema}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio hide-arg schema client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_hide_arg_schema_drops_message() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_TRANSFORM_HIDE", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the hide-arg echo peer");
+
+    let listed = client
+        .list_tools()
+        .expect("hide-arg catalog must list echo_hidden");
+    let hidden = listed
+        .iter()
+        .find(|tool| tool.name == "echo_hidden")
+        .unwrap_or_else(|| panic!("the hide-arg catalog must advertise echo_hidden: {listed:?}"));
+    let schema =
+        serde_json::to_string(&hidden.input_schema).expect("the hide-arg schema serializes");
+    assert!(
+        !schema.contains("\"message\""),
+        "the hide-arg schema must drop the hidden argument: {schema}"
+    );
+    let parent = listed
+        .iter()
+        .find(|tool| tool.name == "echo")
+        .unwrap_or_else(|| panic!("the parent echo must stay listed: {listed:?}"));
+    let parent_schema =
+        serde_json::to_string(&parent.input_schema).expect("the parent schema serializes");
+    assert!(
+        parent_schema.contains("\"message\""),
+        "the parent echo schema must keep message: {parent_schema}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio hide-arg schema client cleanup");
+}
+
+#[cfg(unix)]
+fn stdio_tool_list_params(include: Option<&[&str]>, exclude: Option<&[&str]>) -> ListToolsParams {
+    ListToolsParams {
+        include_tags: include.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        exclude_tags: exclude.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        ..ListToolsParams::default()
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_list_tools_include_and_exclude_tags() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the tagged echo peer");
+
+    let demo = client
+        .list_tools_with_params(stdio_tool_list_params(Some(&["demo"]), None))
+        .expect("includeTags demo must list the tagged echo tool");
+    assert!(
+        demo.tools.iter().any(|tool| tool.name == "echo"),
+        "includeTags demo must retain echo: {demo:?}"
+    );
+    assert!(
+        demo.tools.iter().all(|tool| tool.name != "add"),
+        "includeTags demo must omit add: {demo:?}"
+    );
+
+    let math = client
+        .list_tools_with_params(stdio_tool_list_params(Some(&["math"]), None))
+        .expect("changing only includeTags must list the math-tagged add tool");
+    assert!(
+        math.tools.iter().any(|tool| tool.name == "add"),
+        "includeTags math must retain add: {math:?}"
+    );
+    assert!(
+        math.tools.iter().all(|tool| tool.name != "echo"),
+        "includeTags math must omit echo: {math:?}"
+    );
+
+    let excluded = client
+        .list_tools_with_params(stdio_tool_list_params(None, Some(&["demo"])))
+        .expect("excludeTags demo must omit only the demo-tagged tool");
+    assert!(
+        excluded.tools.iter().any(|tool| tool.name == "add"),
+        "excludeTags demo must keep add: {excluded:?}"
+    );
+    assert!(
+        excluded.tools.iter().all(|tool| tool.name != "echo"),
+        "excludeTags demo must omit echo: {excluded:?}"
+    );
+
+    let listed = client
+        .list_tools(None)
+        .expect("an unfiltered modern tools/list must keep both tagged tools");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == "echo")
+            && listed.tools.iter().any(|tool| tool.name == "add"),
+        "omitting only the tag filters must list echo and add: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_list_tools_include_and_exclude_tags() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the tagged echo peer");
+
+    let demo = client
+        .list_tools_with_params(stdio_tool_list_params(Some(&["demo"]), None))
+        .expect("includeTags demo must list the tagged echo tool");
+    assert!(
+        demo.iter().any(|tool| tool.name == "echo"),
+        "includeTags demo must retain echo: {demo:?}"
+    );
+    assert!(
+        demo.iter().all(|tool| tool.name != "add"),
+        "includeTags demo must omit add: {demo:?}"
+    );
+    assert!(
+        demo.iter()
+            .any(|tool| tool.name == "echo" && tool.tags.iter().any(|tag| tag == "demo")),
+        "exact-2024 includeTags must retain the demo tag on echo: {demo:?}"
+    );
+
+    let math = client
+        .list_tools_with_params(stdio_tool_list_params(Some(&["math"]), None))
+        .expect("changing only includeTags must list the math-tagged add tool");
+    assert!(
+        math.iter().any(|tool| tool.name == "add"),
+        "includeTags math must retain add: {math:?}"
+    );
+    assert!(
+        math.iter().all(|tool| tool.name != "echo"),
+        "includeTags math must omit echo: {math:?}"
+    );
+
+    let excluded = client
+        .list_tools_with_params(stdio_tool_list_params(None, Some(&["demo"])))
+        .expect("excludeTags demo must omit only the demo-tagged tool");
+    assert!(
+        excluded.iter().any(|tool| tool.name == "add"),
+        "excludeTags demo must keep add: {excluded:?}"
+    );
+    assert!(
+        excluded.iter().all(|tool| tool.name != "echo"),
+        "excludeTags demo must omit echo: {excluded:?}"
+    );
+
+    let listed = client
+        .list_tools()
+        .expect("an unfiltered exact-2024 tools/list must keep both tagged tools");
+    assert!(
+        listed.iter().any(|tool| tool.name == "echo")
+            && listed.iter().any(|tool| tool.name == "add"),
+        "omitting only the tag filters must list echo and add: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio tag-filter client cleanup");
 }
 
 #[cfg(unix)]
