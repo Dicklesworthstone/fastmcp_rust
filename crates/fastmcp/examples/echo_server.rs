@@ -28,8 +28,8 @@ use fastmcp_rust::{
     FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalPromptMessage,
     FinalRootsContextExt, FinalSamplingContextExt, FinalTaskInputRequests, FinalTaskRuntime,
     FinalTaskRuntimeConfig, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-    FinalTaskWorkDescriptor, FinalToolOutcome, InputRequiredResult, ResultMeta, StdioTransport,
-    ToolErrorKind, ToolHandler,
+    FinalTaskWorkDescriptor, FinalToolOutcome, InputRequiredResult, RawIcon, ResultMeta,
+    StdioTransport, ToolErrorKind, ToolHandler,
 };
 use fastmcp_server::ServerBuilder;
 use fastmcp_server::caching::ResponseCachingMiddleware;
@@ -66,6 +66,19 @@ fn touch_server_info(ctx: &McpContext) -> String {
         "notified".to_owned()
     } else {
         "silent".to_owned()
+    }
+}
+
+/// Reports the self-reported modern client Implementation identity.
+#[tool]
+fn client_identity(ctx: &McpContext) -> String {
+    match ctx.client_implementation() {
+        Some(identity) => format!(
+            "name={}|title={}",
+            identity.name,
+            identity.title.as_deref().unwrap_or("none")
+        ),
+        None => "missing".to_owned(),
     }
 }
 
@@ -875,7 +888,7 @@ struct GreetingCompletion;
 impl CompletionHandler for GreetingCompletion {
     fn complete_legacy(
         &self,
-        _ctx: &McpContext,
+        ctx: &McpContext,
         params: fastmcp_rust::legacy_2024::LegacyCompletionParams,
     ) -> McpResult<fastmcp_rust::legacy_2024::CompletionValues> {
         match &params.reference {
@@ -887,6 +900,7 @@ impl CompletionHandler for GreetingCompletion {
                 ));
             }
         }
+        ctx.report_progress(0.5, Some("stdio-completion-legacy-halfway"));
         Ok(fastmcp_rust::legacy_2024::CompletionValues {
             values: vec!["stdio-completion-legacy".to_owned()],
             total: Some(1),
@@ -1180,6 +1194,7 @@ fn main() {
     let builder = ServerBuilder::new("echo-server", "1.0.0")
         // Register tools
         .tool(Echo)
+        .tool(ClientIdentity)
         .tool(TouchServerInfo)
         .tool(HideEcho)
         .tool(HideCatalog)
@@ -1242,6 +1257,18 @@ fn main() {
         builder.instructions(
             "A simple echo server for testing FastMCP. Try calling the 'echo' tool with a message!",
         )
+    };
+    let builder = if std::env::var("FASTMCP_NO_IDENTITY").as_deref() == Ok("1") {
+        builder
+    } else {
+        builder
+            .title("FastMCP Echo")
+            .description("A simple echo server for testing FastMCP.")
+            .website_url("https://example.test/fastmcp")
+            .icons(vec![
+                RawIcon::try_new("https://example.test/echo-icon.png")
+                    .expect("the echo identity icon source is an absolute URI"),
+            ])
     };
     let builder = if std::env::var("FASTMCP_MASK_ERROR_DETAILS").as_deref() == Ok("1") {
         builder.mask_error_details(true)
