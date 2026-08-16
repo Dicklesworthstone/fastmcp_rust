@@ -3358,6 +3358,23 @@ pub mod modern {
                 .await
         }
 
+        /// Calls one Tasks-capable tool while stamping the caller's progress token.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome_with_progress_marker(cx, name, arguments, progress_marker)
+                .await
+        }
+
         /// Reads one task through the official final Tasks extension.
         #[cfg(feature = "tasks")]
         pub async fn get_task(
@@ -4571,6 +4588,34 @@ pub mod modern {
                 .map_err(HttpClientError::Connection)
         }
 
+        /// Calls one Tasks-capable tool while stamping the caller's progress token.
+        ///
+        /// Stateless modern HTTP create still returns JSON `Task`. This method
+        /// completes from that body instead of requiring an SSE stream.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            request_id: RequestId,
+            name: &str,
+            arguments: JsonValue,
+            progress_marker: ProgressMarker,
+            maximum_response_bytes: usize,
+        ) -> Result<FinalToolCallOutcome, HttpClientError> {
+            self.inner
+                .connection()
+                .call_tool_final_outcome_with_progress_marker(
+                    cx,
+                    request_id,
+                    name,
+                    arguments,
+                    &progress_marker,
+                    maximum_response_bytes,
+                )
+                .await
+                .map_err(HttpClientError::Connection)
+        }
+
         /// Calls one tool and retains the exact final content vocabulary.
         ///
         /// When modern reverse handlers are installed, a peer `input_required`
@@ -5473,6 +5518,10 @@ pub mod modern {
         }
 
         /// Starts an incremental HTTP catalog listener on this client.
+        ///
+        /// Catalog listen refuses `taskIds`. Use
+        /// [`Self::open_final_task_subscription_listener`] for official Tasks
+        /// status updates.
         pub async fn start_subscriptions_listener(
             &mut self,
             cx: &Cx,
@@ -5482,6 +5531,33 @@ pub mod modern {
             self.inner
                 .start_subscriptions_listener(cx, notifications, limits)
                 .await
+        }
+
+        /// Starts an incremental official Tasks listener on this HTTP client.
+        ///
+        /// Catalog [`Self::start_subscriptions_listener`] refuses `taskIds`.
+        /// Call [`Self::next_final_task_subscription_event`] so the same
+        /// client can keep issuing `tasks/get` / `tasks/cancel` while
+        /// draining status updates.
+        #[cfg(feature = "tasks")]
+        pub async fn open_final_task_subscription_listener(
+            &mut self,
+            cx: &Cx,
+            notifications: SubscriptionFilter,
+            limits: SseLimits,
+        ) -> Result<(), HttpClientError> {
+            self.inner
+                .open_final_task_subscription_listener(cx, notifications, limits)
+                .await
+        }
+
+        /// Drives one incremental official Tasks listener event.
+        #[cfg(feature = "tasks")]
+        pub async fn next_final_task_subscription_event(
+            &mut self,
+            cx: &Cx,
+        ) -> Result<StdioTaskSubscriptionEvent, HttpClientError> {
+            self.inner.next_final_task_subscription_event(cx).await
         }
 
         /// Drives one incremental HTTP catalog listener event.
@@ -11637,6 +11713,8 @@ mod tests {
             Ok(event)
         }
 
+        let _ = modern::HttpClient::open_final_task_subscription_listener;
+        let _ = modern::HttpClient::next_final_task_subscription_event;
         let _: fn(&mut modern::HttpClient) -> Vec<modern::ServerNotification> =
             modern::HttpClient::take_server_notifications;
         let _: fn(&mut modern::HttpClient) -> Vec<modern::FinalProgressNotificationParams> =

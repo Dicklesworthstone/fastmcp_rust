@@ -20,6 +20,7 @@ use asupersync::http::h1::{
     ClientError, ClientStreamingResponse, HttpClient, Method, RedirectPolicy, RetryPolicy,
 };
 use asupersync::http::{Body, Frame};
+use fastmcp_protocol::common_types::LoggingLevel;
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::ExtensionDirection;
 #[cfg(feature = "tasks")]
@@ -46,9 +47,10 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
     CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, ElicitRequestParams, ElicitResult,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalCreateMessageParams,
-    FinalCreateMessageResult, FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult,
-    FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
+    FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
+    FinalCoreResult, FinalCreateMessageParams, FinalCreateMessageResult,
+    FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult, FinalNotificationError,
+    FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
@@ -480,6 +482,7 @@ impl ModernHttpResponseStream {
             .map_err(ModernHttpFinalCoreListenError::Executor)?;
         Ok(ModernHttpFinalCoreListener {
             stream,
+            immediate_terminal: None,
             core_request,
             request_id,
             maximum_jsonrpc_bytes,
@@ -930,6 +933,12 @@ pub struct ModernHttpFinalCoreCollector {
 #[derive(Debug)]
 pub struct ModernHttpFinalCoreListener {
     stream: ModernHttpSseResponseStream,
+    /// One-shot terminal decoded from a stateless JSON `tools/call` body.
+    ///
+    /// Official Tasks create is JSON on modern HTTP. The SSE listener is still
+    /// required when the same POST actually streams progress; a JSON Task
+    /// result is that stream's degenerate completed form, not a second POST.
+    immediate_terminal: Option<FinalCoreResult>,
     core_request: CoreRequest,
     request_id: RequestId,
     maximum_jsonrpc_bytes: usize,
@@ -963,6 +972,11 @@ impl ModernHttpFinalCoreListener {
     ) -> Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError> {
         if self.terminal_received {
             return Ok(None);
+        }
+        if let Some(terminal) = self.immediate_terminal.take() {
+            self.terminal_received = true;
+            self.stream.close();
+            return Ok(Some(ModernHttpFinalCoreEvent::Terminal(terminal)));
         }
 
         let event = match self.stream.next_event(cx).await {
@@ -1209,6 +1223,55 @@ impl std::error::Error for ModernHttpFinalCoreListenError {
     }
 }
 
+/// Decodes one stateless JSON Tasks `tools/call` body as a completed listener.
+///
+/// Modern HTTP create returns JSON `Task`. Re-issuing the POST as a JSON
+/// convenience call would create a second Task; this path consumes the body
+/// that already arrived.
+#[cfg(feature = "tasks")]
+async fn listener_from_json_tasks_tool_call(
+    cx: &Cx,
+    response: ModernHttpResponseStream,
+    request_id: RequestId,
+    core_request: CoreRequest,
+    limits: SseLimits,
+) -> Result<ModernHttpFinalCoreListener, ModernHttpFinalCoreListenError> {
+    let maximum_jsonrpc_bytes = limits.max_event_bytes();
+    let body = response
+        .read_to_end(cx, maximum_jsonrpc_bytes)
+        .await
+        .map_err(ModernHttpFinalCoreListenError::Executor)?;
+    let message = decode_strict_jsonrpc_message(&body, maximum_jsonrpc_bytes)
+        .map_err(ModernHttpFinalCoreListenError::JsonRpcAdmission)?;
+    let JsonRpcMessage::Response(response) = message else {
+        return Err(ModernHttpFinalCoreListenError::UnexpectedTerminalResult);
+    };
+    let admission = decode_strict_jsonrpc_response(&body, maximum_jsonrpc_bytes)
+        .map_err(ModernHttpFinalCoreListenError::JsonRpcAdmission)?;
+    if admission.response() != &response {
+        return Err(ModernHttpFinalCoreListenError::JsonRpcAdmission(
+            JsonRpcAdmissionError::InvalidEnvelope,
+        ));
+    }
+    let (_, raw_result) = admission.into_parts();
+    let terminal = decode_final_core_terminal(
+        &core_request,
+        response,
+        raw_result.as_deref(),
+        request_id.clone(),
+        true,
+    )?;
+    Ok(ModernHttpFinalCoreListener {
+        stream: ModernHttpSseResponseStream::released(),
+        immediate_terminal: Some(terminal),
+        core_request,
+        request_id,
+        maximum_jsonrpc_bytes,
+        tasks_result_negotiated: true,
+        terminal_received: false,
+    })
+}
+
 fn decode_final_core_terminal(
     core_request: &CoreRequest,
     response: JsonRpcResponse,
@@ -1278,6 +1341,17 @@ impl ModernHttpSseResponseStream {
         self.parser = None;
         self.pending_events.clear();
         self.pending_event_bytes = 0;
+    }
+
+    /// A released stream used when a JSON Task body already supplied the terminal.
+    fn released() -> Self {
+        Self {
+            response: None,
+            parser: None,
+            pending_events: VecDeque::new(),
+            pending_event_bytes: 0,
+            end_of_stream: None,
+        }
     }
 
     /// Retains one completed SSE payload after checking the aggregate budget.
@@ -2125,6 +2199,7 @@ pub struct ModernHttpClient {
     modern_post_target: String,
     client_info: ClientInfo,
     client_implementation: Option<fastmcp_protocol::common_types::Implementation>,
+    final_log_level: Option<LoggingLevel>,
     client_capabilities: ClientCapabilities,
     mcp_apps_settings: Option<McpAppsClientSettings>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
@@ -4109,6 +4184,34 @@ impl ClientHttpConnection {
         }
     }
 
+    /// Calls one Tasks-capable tool while stamping the caller's progress token.
+    #[cfg(feature = "tasks")]
+    pub async fn call_tool_final_outcome_with_progress_marker(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: &fastmcp_protocol::ProgressMarker,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalToolCallOutcome, ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .call_tool_final_outcome_with_progress_marker(
+                    cx,
+                    request_id,
+                    name,
+                    arguments,
+                    progress_marker,
+                    maximum_response_bytes,
+                )
+                .await
+                .map_err(ClientHttpConnectionError::FinalCoreListen),
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::FinalToolCallRequiresModern),
+        }
+    }
+
     /// Sends one client notification through the selected transport.
     ///
     /// Exact legacy notifications are posted to the pinned message endpoint
@@ -4854,6 +4957,7 @@ impl ModernHttpClient {
                     modern_post_target,
                     client_info,
                     client_implementation: None,
+                    final_log_level: None,
                     client_capabilities,
                     mcp_apps_settings,
                     client_extension_runtime,
@@ -4940,6 +5044,11 @@ impl ModernHttpClient {
         self.client_implementation = Some(implementation);
     }
 
+    /// Retains the inbound modern request `logLevel` for later `_meta` stamps.
+    pub fn set_log_level(&mut self, level: LoggingLevel) {
+        self.final_log_level = Some(level);
+    }
+
     fn stamped_client_identity(&self) -> fastmcp_protocol::common_types::Implementation {
         self.client_implementation
             .clone()
@@ -5008,6 +5117,17 @@ impl ModernHttpClient {
                     .or_insert_with(|| settings.clone());
             }
         }
+        #[cfg(feature = "tasks")]
+        if admit_final_tasks_result_discriminator(
+            &self.server_discovery(),
+            OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+        )
+        .is_ok()
+        {
+            extensions
+                .entry(fastmcp_protocol::TASKS_EXTENSION.to_owned())
+                .or_insert_with(|| serde_json::json!({}));
+        }
         (!extensions.is_empty()).then_some(extensions)
     }
 
@@ -5032,6 +5152,20 @@ impl ModernHttpClient {
                 .flatten(),
             client_extension_settings.as_ref(),
         );
+        let mut parameters = parameters;
+        if let Some(level) = self.final_log_level {
+            if let Some(object) = parameters.as_object_mut() {
+                let metadata = object
+                    .entry("_meta")
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                if let Some(metadata) = metadata.as_object_mut()
+                    && !metadata.contains_key(FINAL_LOG_LEVEL_META_KEY)
+                    && let Ok(value) = serde_json::to_value(level)
+                {
+                    metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), value);
+                }
+            }
+        }
         let request = build_modern_request_with_extensions(
             &self.modern_post_target,
             &self.stamped_client_identity(),
@@ -5548,6 +5682,16 @@ impl ModernHttpClient {
             .execute_post_discovery_request(cx, &request)
             .await
             .map_err(ModernHttpFinalCoreListenError::Request)?;
+        if matches!(response.metadata().kind(), ModernHttpResponseKind::Json) {
+            return listener_from_json_tasks_tool_call(
+                cx,
+                response,
+                request_id,
+                core_request,
+                limits,
+            )
+            .await;
+        }
         response.into_final_tasks_tool_call_listener(request_id, core_request, limits)
     }
 
@@ -5705,6 +5849,49 @@ impl ModernHttpClient {
                 Ok(FinalToolCallOutcome::InputRequired(result))
             }
             _ => Err(ModernHttpClientError::UnexpectedToolCallResult),
+        }
+    }
+
+    /// Calls one Tasks-capable tool while stamping the caller's progress token.
+    ///
+    /// Stateless modern HTTP create returns JSON `Task`. That body completes
+    /// this listener without a second POST. An SSE body still yields progress
+    /// frames before the same terminal algebra.
+    #[cfg(feature = "tasks")]
+    pub async fn call_tool_final_outcome_with_progress_marker(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: &fastmcp_protocol::ProgressMarker,
+        maximum_response_bytes: usize,
+    ) -> Result<FinalToolCallOutcome, ModernHttpFinalCoreListenError> {
+        let limits = SseLimits::new(
+            maximum_response_bytes.min(64 * 1024).max(1),
+            maximum_response_bytes.max(1),
+            256,
+        )
+        .ok_or(ModernHttpFinalCoreListenError::InvalidRequestId)?;
+        let collector = self
+            .open_final_tasks_tool_call_listener_with_progress_marker(
+                cx,
+                request_id,
+                name,
+                arguments,
+                Some(progress_marker),
+                limits,
+            )
+            .await?
+            .collect(cx)
+            .await?;
+        match collector.terminal {
+            FinalCoreResult::ToolsCall { result, .. } => Ok(FinalToolCallOutcome::Complete(result)),
+            FinalCoreResult::ToolsCallTask { result } => Ok(FinalToolCallOutcome::Task(result)),
+            FinalCoreResult::ToolsCallInputRequired { result, .. } => {
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            _ => Err(ModernHttpFinalCoreListenError::UnexpectedTerminalResult),
         }
     }
 
@@ -7894,7 +8081,18 @@ fn build_modern_request_after_method_validation(
     let final_metadata = final_metadata
         .as_object()
         .ok_or(ModernHttpClientError::RequestEncodingFailed)?;
+    let inbound_client_info = metadata
+        .get(FINAL_CLIENT_INFO_META_KEY)
+        .cloned()
+        .or_else(|| metadata.get("clientInfo").cloned());
+    let inbound_log_level = metadata.get(FINAL_LOG_LEVEL_META_KEY).cloned();
     metadata.extend(final_metadata.clone());
+    if let Some(inbound_client_info) = inbound_client_info {
+        metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), inbound_client_info);
+    }
+    if let Some(inbound_log_level) = inbound_log_level {
+        metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), inbound_log_level);
+    }
     parameters.insert("_meta".to_owned(), serde_json::Value::Object(metadata));
 
     let request = match request_id {
@@ -10081,6 +10279,89 @@ mod tests {
             "terminal must release the parser"
         );
         server.join().expect("negotiated Tasks peer joins");
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn negotiated_tasks_tool_listener_admits_json_task_result() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind JSON Tasks peer");
+        let address = listener.local_addr().expect("read JSON Tasks peer address");
+        let modern_target = format!("http://{address}/mcp");
+        let server = thread::spawn(move || {
+            let (mut probe, _) = listener.accept().expect("accept Tasks discovery probe");
+            let _ = read_request(&mut probe);
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept JSON Tasks tool POST");
+            let request = read_request(&mut stream);
+            let request = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .expect("JSON Tasks tool request is JSON-RPC");
+            assert_eq!(
+                request["params"]["_meta"]["progressToken"],
+                "json-task-progress"
+            );
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"task-73","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(ClientHttpConnection::connect(
+            &cx,
+            plan(
+                &modern_target,
+                "http://127.0.0.1:9/legacy-sse",
+                "http://127.0.0.1:9/legacy-message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "json-tasks-listener-client".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        ))
+        .expect("Tasks-capable discovery selects modern HTTP");
+        let marker = fastmcp_protocol::ProgressMarker::from("json-task-progress");
+        let mut listener = runtime_block_on(
+            connection.open_final_tasks_tool_call_listener_with_progress_marker(
+                &cx,
+                RequestId::Number(2),
+                "durable-tool",
+                serde_json::json!({}),
+                Some(&marker),
+                SseLimits::new(4_096, 65_536, 8).expect("bounded SSE limits"),
+            ),
+        )
+        .expect("a JSON Task body must complete the Tasks listener without a second POST");
+        assert!(matches!(
+            runtime_block_on(listener.next_event(&cx)),
+            Ok(Some(ModernHttpFinalCoreEvent::Terminal(
+                fastmcp_protocol::FinalCoreResult::ToolsCallTask { .. }
+            )))
+        ));
+        assert!(
+            runtime_block_on(listener.next_event(&cx))
+                .expect("the one-shot JSON terminal is the last event")
+                .is_none(),
+            "a JSON Task listener must not invent a second terminal"
+        );
+        assert!(
+            listener.stream.response.is_none(),
+            "the JSON Task terminal must leave no live body"
+        );
+        assert!(
+            listener.stream.parser.is_none(),
+            "the JSON Task terminal must leave no live parser"
+        );
+        server.join().expect("JSON Tasks peer joins");
     }
 
     #[test]

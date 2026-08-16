@@ -239,9 +239,9 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CallToolParams, CancellationSender, CancellationWireMessage, CancelledParams,
     ClientCapabilities, ClientInfo, CoreDispatchError, CoreRequest, CorrelationKey,
-    ElicitationCapability, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCancelledNotificationParams, FinalCoreRequest, FinalLogMessageParams,
-    FinalProgressNotificationParams, FinalRequestMeta,
+    ElicitationCapability, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
+    FINAL_LOG_LEVEL_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams,
+    FinalCoreRequest, FinalLogMessageParams, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, GetPromptParams, InitializeParams,
     InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, LegacyContent, LegacyPromptMessage, LegacyResourceContent, ListPromptsParams,
@@ -1273,6 +1273,36 @@ fn admit_final_tasks_result_discriminator(
         })
 }
 
+#[cfg(feature = "tasks")]
+fn insert_negotiated_tasks_client_extension(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    discovery: Option<&ServerDiscoverResult>,
+) -> McpResult<()> {
+    let Some(discovery) = discovery else {
+        return Ok(());
+    };
+    if admit_final_tasks_result_discriminator(discovery, OFFICIAL_TASKS_RESULT_DISCRIMINATOR)
+        .is_err()
+    {
+        return Ok(());
+    }
+    let capabilities = metadata
+        .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| {
+            McpError::internal_error("Modern request metadata omitted client capabilities")
+        })?;
+    let extensions = capabilities
+        .entry("extensions")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| McpError::internal_error("Modern client extensions must be an object"))?;
+    extensions
+        .entry(fastmcp_protocol::TASKS_EXTENSION.to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    Ok(())
+}
+
 fn insert_final_request_log_level(
     metadata: &mut serde_json::Map<String, serde_json::Value>,
     level: Option<LoggingLevel>,
@@ -1281,7 +1311,7 @@ fn insert_final_request_log_level(
         return Ok(());
     };
     metadata.insert(
-        "io.modelcontextprotocol/logLevel".to_owned(),
+        FINAL_LOG_LEVEL_META_KEY.to_owned(),
         serde_json::to_value(level).map_err(|error| {
             McpError::internal_error(format!(
                 "Failed to serialize modern logging configuration: {error}"
@@ -7929,6 +7959,41 @@ where
         }
     }
 
+    /// Calls a Tasks-capable modern tool while stamping the caller's progress token.
+    #[cfg(feature = "tasks")]
+    pub async fn call_tool_final_outcome_with_progress_marker(
+        &mut self,
+        cx: &Cx,
+        name: &str,
+        arguments: serde_json::Value,
+        progress_marker: ProgressMarker,
+    ) -> McpResult<FinalToolCallOutcome>
+    where
+        IO: Send + 'static,
+    {
+        self.require_final_tasks_result(OFFICIAL_TASKS_RESULT_DISCRIMINATOR)?;
+        let parameters = self.with_final_tasks_client_capability(serde_json::json!({
+            "name": name,
+            "arguments": arguments,
+            "_meta": { "progressToken": progress_marker },
+        }))?;
+        match self
+            .request_final_core_prepared(cx, "tools/call", parameters)
+            .await?
+        {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolCallOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) => {
+                Ok(FinalToolCallOutcome::Task(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            _ => Err(unexpected_convenience_result("tools/call")),
+        }
+    }
+
     /// Reads one task through the negotiated official Tasks extension.
     #[cfg(feature = "tasks")]
     pub async fn get_task_final(
@@ -8075,6 +8140,8 @@ where
                 extensions.insert(extension_id, settings);
             }
         }
+        #[cfg(feature = "tasks")]
+        insert_negotiated_tasks_client_extension(generated, self.session.server_discovery())?;
         #[cfg(feature = "apps")]
         let advertise_mcp_apps = !self.session.generic_mcp_apps_configured()
             && (self.session.server_discovery().is_none() || self.session.mcp_apps_active());
@@ -8104,6 +8171,10 @@ where
                 settings.to_extension_settings().into_value(),
             );
         }
+        let inbound_log_level = object.get("_meta").and_then(|meta| {
+            meta.as_object()
+                .and_then(|meta| meta.get(FINAL_LOG_LEVEL_META_KEY).cloned())
+        });
         if let Some(existing) = object.remove("_meta") {
             let existing = existing.as_object().ok_or_else(|| {
                 McpError::invalid_params("Modern WebSocket request metadata must be an object")
@@ -8115,6 +8186,9 @@ where
             }
         }
         insert_final_request_log_level(generated, self.final_log_level)?;
+        if let Some(inbound_log_level) = inbound_log_level {
+            generated.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), inbound_log_level);
+        }
         object.insert("_meta".to_owned(), metadata);
         Ok(params)
     }
@@ -10462,6 +10536,10 @@ pub struct HttpClient {
     /// ordinary requests can keep using this connection while events are
     /// drained one at a time.
     live_subscription: Option<ModernHttpSubscriptionListener>,
+    /// At most one incremental official Tasks listener. HTTP catalog listen
+    /// and Tasks listen use separate SSE POSTs, so both may be live.
+    #[cfg(feature = "tasks")]
+    live_task_subscription: Option<ModernHttpSubscriptionListener>,
     /// Modern request-only `io.modelcontextprotocol/logLevel`. Absent until
     /// [`Self::set_log_level_typed`] stores a severity; never sent as the
     /// removed final `logging/setLevel` RPC.
@@ -11007,6 +11085,8 @@ impl HttpClient {
             final_cache_ttl_diagnostics: VecDeque::new(),
             mcp_apps_settings,
             live_subscription: None,
+            #[cfg(feature = "tasks")]
+            live_task_subscription: None,
             final_log_level: None,
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
@@ -12416,6 +12496,7 @@ impl HttpClient {
         notifications: SubscriptionFilter,
         limits: sse::SseLimits,
     ) -> Result<HttpSubscriptionListener<'_>, HttpClientError> {
+        self.refuse_http_catalog_task_ids(&notifications)?;
         if cx.checkpoint().is_err() {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
@@ -12443,6 +12524,7 @@ impl HttpClient {
         notifications: SubscriptionFilter,
         limits: sse::SseLimits,
     ) -> Result<(), HttpClientError> {
+        self.refuse_http_catalog_task_ids(&notifications)?;
         if self.live_subscription.is_some() {
             return Err(HttpClientError::CoreResult(McpError::invalid_request(
                 "A final HTTP subscription is already active on this client",
@@ -12499,6 +12581,113 @@ impl HttpClient {
             self.live_subscription = None;
         }
         Ok(event)
+    }
+
+    fn refuse_http_catalog_task_ids(
+        &self,
+        notifications: &SubscriptionFilter,
+    ) -> Result<(), HttpClientError> {
+        #[cfg(feature = "tasks")]
+        {
+            let tasks_requested = task_subscription_ids(notifications).map_err(|_| {
+                HttpClientError::CoreResult(McpError::invalid_params(
+                    "invalid Tasks subscription filter",
+                ))
+            })?;
+            if tasks_requested.is_some() {
+                return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                    "A live catalog subscription cannot include taskIds; use open_final_task_subscription_listener",
+                )));
+            }
+        }
+        #[cfg(not(feature = "tasks"))]
+        let _ = notifications;
+        Ok(())
+    }
+
+    /// Starts an incremental official Tasks listener on this HTTP client.
+    ///
+    /// Catalog [`Self::start_subscriptions_listener`] refuses `taskIds`. Call
+    /// [`Self::next_final_task_subscription_event`] so the same client can
+    /// keep issuing `tasks/get` / `tasks/cancel` while draining status
+    /// updates. HTTP catalog listen and Tasks listen use separate SSE POSTs,
+    /// so both may be live.
+    #[cfg(feature = "tasks")]
+    pub async fn open_final_task_subscription_listener(
+        &mut self,
+        cx: &Cx,
+        notifications: SubscriptionFilter,
+        limits: sse::SseLimits,
+    ) -> Result<(), HttpClientError> {
+        if self.live_task_subscription.is_some() {
+            return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                "A final HTTP Tasks subscription is already active on this client",
+            )));
+        }
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        let tasks_requested = task_subscription_ids(&notifications).map_err(|_| {
+            HttpClientError::CoreResult(McpError::invalid_params(
+                "invalid Tasks subscription filter",
+            ))
+        })?;
+        if tasks_requested.is_none() {
+            return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                "A live final Tasks subscription requires taskIds",
+            )));
+        }
+        let request_id = self.next_request_id()?;
+        let listener = self
+            .connection
+            .open_subscriptions_listener(cx, request_id, notifications, limits)
+            .await
+            .map_err(HttpClientError::Connection)?;
+        self.live_task_subscription = Some(listener);
+        Ok(())
+    }
+
+    /// Drives one incremental official Tasks listener event.
+    #[cfg(feature = "tasks")]
+    pub async fn next_final_task_subscription_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<StdioTaskSubscriptionEvent, HttpClientError> {
+        loop {
+            let event = {
+                let listener = self.live_task_subscription.as_mut().ok_or_else(|| {
+                    HttpClientError::CoreResult(McpError::invalid_request(
+                        "No live final HTTP Tasks subscription is active",
+                    ))
+                })?;
+                listener.next_event(cx).await
+            };
+            let event = match event {
+                Ok(event) => event,
+                Err(error) => {
+                    self.live_task_subscription = None;
+                    return Err(HttpClientError::Connection(
+                        ClientHttpConnectionError::SubscriptionsListen(error),
+                    ));
+                }
+            };
+            match event {
+                Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
+                    return Ok(StdioTaskSubscriptionEvent::Acknowledged(accepted_filter));
+                }
+                Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => {
+                    return Ok(StdioTaskSubscriptionEvent::Notification(notification));
+                }
+                Some(ModernHttpSubscriptionListenEvent::Notification(notification)) => {
+                    self.final_result_cache
+                        .invalidate_notification(&notification);
+                }
+                Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) | None => {
+                    self.live_task_subscription = None;
+                    return Ok(StdioTaskSubscriptionEvent::Terminal);
+                }
+            }
+        }
     }
 
     /// Collects one typed final HTTP subscription stream.
@@ -14800,6 +14989,11 @@ impl Client {
                 extensions.insert(extension_id, settings);
             }
         }
+        #[cfg(feature = "tasks")]
+        insert_negotiated_tasks_client_extension(
+            &mut final_metadata,
+            self.session.server_discovery(),
+        )?;
         #[cfg(feature = "apps")]
         let advertise_mcp_apps = !self.session.generic_mcp_apps_configured()
             && (self.session.server_discovery().is_none() || self.session.mcp_apps_active());
@@ -14827,8 +15021,19 @@ impl Client {
                 settings.to_extension_settings().into_value(),
             );
         }
+        let inbound_client_info = metadata
+            .get(FINAL_CLIENT_INFO_META_KEY)
+            .cloned()
+            .or_else(|| metadata.get("clientInfo").cloned());
+        let inbound_log_level = metadata.get(FINAL_LOG_LEVEL_META_KEY).cloned();
         metadata.extend(final_metadata);
+        if let Some(inbound_client_info) = inbound_client_info {
+            metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), inbound_client_info);
+        }
         insert_final_request_log_level(metadata, self.final_log_level)?;
+        if let Some(inbound_log_level) = inbound_log_level {
+            metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), inbound_log_level);
+        }
         Ok(params)
     }
 
@@ -17650,6 +17855,8 @@ impl Client {
         name: &str,
         arguments: serde_json::Value,
         progress_marker: Option<&fastmcp_protocol::ProgressMarker>,
+        inbound_identity: Option<&fastmcp_protocol::common_types::Implementation>,
+        inbound_log_level: Option<LoggingLevel>,
     ) -> McpResult<FinalToolCallOutcome> {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
@@ -17669,6 +17876,30 @@ impl Client {
             parameters["_meta"]["progressToken"] = serde_json::to_value(marker).map_err(|_| {
                 McpError::internal_error("Modern Tasks progress token could not be encoded")
             })?;
+        }
+        if inbound_identity.is_some() || inbound_log_level.is_some() {
+            let metadata = parameters
+                .get_mut("_meta")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    McpError::internal_error("Modern Tasks tools/call omitted request metadata")
+                })?;
+            if let Some(identity) = inbound_identity {
+                metadata.insert(
+                    FINAL_CLIENT_INFO_META_KEY.to_owned(),
+                    serde_json::to_value(identity).map_err(|_| {
+                        McpError::internal_error("Inbound client identity could not be encoded")
+                    })?,
+                );
+            }
+            if let Some(level) = inbound_log_level {
+                metadata.insert(
+                    FINAL_LOG_LEVEL_META_KEY.to_owned(),
+                    serde_json::to_value(level).map_err(|_| {
+                        McpError::internal_error("Inbound logLevel could not be encoded")
+                    })?,
+                );
+            }
         }
         let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&parameters))
             .map_err(|_| {
@@ -29683,14 +29914,14 @@ mod tests {
         insert_final_request_log_level(&mut metadata, Some(LoggingLevel::Info))
             .expect("a configured logLevel is request metadata");
         assert_eq!(
-            metadata.get("io.modelcontextprotocol/logLevel"),
+            metadata.get(FINAL_LOG_LEVEL_META_KEY),
             Some(&serde_json::json!("info"))
         );
 
         insert_final_request_log_level(&mut metadata, Some(LoggingLevel::Emergency))
             .expect("changing only the rank overwrites the same metadata key");
         assert_eq!(
-            metadata.get("io.modelcontextprotocol/logLevel"),
+            metadata.get(FINAL_LOG_LEVEL_META_KEY),
             Some(&serde_json::json!("emergency"))
         );
     }
