@@ -1118,6 +1118,7 @@ fn assert_dual_era_completion_exports() {
             name: "prefix".to_owned(),
             value: "bo".to_owned(),
         },
+        meta: None,
     };
     let legacy_result = legacy_2024::LegacyCompletionResult {
         completion: legacy_2024::CompletionValues {

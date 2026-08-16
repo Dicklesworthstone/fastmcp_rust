@@ -1734,6 +1734,7 @@ fn assert_dual_era_facade_surface() {
             name: "prefix".to_owned(),
             value: "bo".to_owned(),
         },
+        meta: None,
     };
     let legacy_completion_result = legacy_2024::LegacyCompletionResult {
         completion: legacy_2024::CompletionValues {

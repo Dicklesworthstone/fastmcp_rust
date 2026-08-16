@@ -205,6 +205,7 @@ pub mod client {
     pub use crate::{
         FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
         FinalTaskWatch, FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult,
+        StdioTaskSubscriptionEvent,
     };
     /// Exact-2024 client staging is present only with the legacy adapter.
     #[cfg(feature = "legacy-2024-11-05")]
@@ -328,13 +329,13 @@ pub use asupersync::{LabConfig, LabRuntime};
 // Re-export core types
 pub use fastmcp_core::{
     AccessToken, AuthContext, Budget, CancelledError, CatalogChangePublisher, ClientCapabilityInfo,
-    ClientRoot, Cx, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
-    ElicitationSender, IntoOutcome, MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH,
-    MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext, McpContextLeaseGuard, McpError, McpErrorCode,
-    McpLogLevel, McpOutcome, McpRequestCancellation, McpResult, NoOpElicitationSender,
-    NoOpNotificationSender, NoOpSamplingSender, Outcome, OutcomeExt, ProgressReporter,
-    PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole, RegionId,
-    ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt, RootsProvider,
+    ClientImplementationInfo, ClientRoot, Cx, ElicitationAction, ElicitationMode,
+    ElicitationRequest, ElicitationResponse, ElicitationSender, IntoOutcome, MAX_PROMPT_GET_DEPTH,
+    MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext, McpContextLeaseGuard,
+    McpError, McpErrorCode, McpLogLevel, McpOutcome, McpRequestCancellation, McpResult,
+    NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, Outcome, OutcomeExt,
+    ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole,
+    RegionId, ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt, RootsProvider,
     SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
     SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
     ToolContentItem, cancelled, err, ok,
@@ -756,6 +757,7 @@ pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 pub use fastmcp_client::{
     FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
     FinalTaskWatch, FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult,
+    StdioTaskSubscriptionEvent,
 };
 
 #[cfg(feature = "apps")]
@@ -808,6 +810,8 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 /// URI transports and has no synchronous split-transport escape route.
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod auto {
+    #[cfg(feature = "tasks")]
+    pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
         ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
@@ -1044,6 +1048,30 @@ pub mod auto {
         #[must_use]
         pub fn client_info(self, name: impl Into<String>, version: impl Into<String>) -> Self {
             Self::from_inner(self.inner.client_info(name, version))
+        }
+
+        /// Sets the modern request/discovery title. Exact-2024 initialize stays name/version.
+        #[must_use]
+        pub fn title(self, title: impl Into<String>) -> Self {
+            Self::from_inner(self.inner.title(title))
+        }
+
+        /// Sets the modern request/discovery description.
+        #[must_use]
+        pub fn description(self, description: impl Into<String>) -> Self {
+            Self::from_inner(self.inner.description(description))
+        }
+
+        /// Sets the modern request/discovery website URL.
+        #[must_use]
+        pub fn website_url(self, website_url: impl Into<String>) -> Self {
+            Self::from_inner(self.inner.website_url(website_url))
+        }
+
+        /// Sets the modern request/discovery icon set.
+        #[must_use]
+        pub fn icons(self, icons: Vec<crate::RawIcon>) -> Self {
+            Self::from_inner(self.inner.icons(icons))
         }
 
         /// Sets the idle and absolute timeout policy for ordinary requests.
@@ -1662,6 +1690,34 @@ pub mod auto {
         }
 
         #[must_use]
+        pub fn title(self, title: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.title(title),
+            }
+        }
+
+        #[must_use]
+        pub fn description(self, description: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.description(description),
+            }
+        }
+
+        #[must_use]
+        pub fn website_url(self, website_url: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.website_url(website_url),
+            }
+        }
+
+        #[must_use]
+        pub fn icons(self, icons: Vec<crate::RawIcon>) -> Self {
+            Self {
+                inner: self.inner.icons(icons),
+            }
+        }
+
+        #[must_use]
         pub fn with_console_config(self, config: crate::ConsoleConfig) -> Self {
             Self {
                 inner: self.inner.with_console_config(config),
@@ -1944,6 +2000,8 @@ pub mod auto {
 /// }
 /// ```
 pub mod modern {
+    #[cfg(feature = "tasks")]
+    pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
         MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
         MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpSubscriptionListenCollector,
@@ -1965,13 +2023,13 @@ pub mod modern {
         SubscriptionListenCollector,
     };
     pub use fastmcp_core::{
-        CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_PROMPT_GET_DEPTH,
-        MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext,
-        McpContextLeaseGuard, McpError, McpLogLevel, McpOutcome, McpRequestCancellation, McpResult,
-        NoOpNotificationSender, NotificationSender, Outcome, ProgressReporter, PromptCaller,
-        PromptGetResult, PromptMessageItem, PromptMessageRole, ResourceContentItem,
-        ResourceReadResult, ResourceReader, RootsProvider, ServerCapabilityInfo, ToolCallResult,
-        ToolCaller, ToolContentItem,
+        CanonicalHttpUrl, ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, Cx,
+        MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind,
+        McpContext, McpContextLeaseGuard, McpError, McpLogLevel, McpOutcome,
+        McpRequestCancellation, McpResult, NoOpNotificationSender, NotificationSender, Outcome,
+        ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole,
+        ResourceContentItem, ResourceReadResult, ResourceReader, RootsProvider,
+        ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
@@ -2266,6 +2324,38 @@ pub mod modern {
         pub fn client_info(self, name: impl Into<String>, version: impl Into<String>) -> Self {
             Self {
                 inner: self.inner.client_info(name, version),
+            }
+        }
+
+        /// Sets the modern request/discovery title.
+        #[must_use]
+        pub fn title(self, title: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.title(title),
+            }
+        }
+
+        /// Sets the modern request/discovery description.
+        #[must_use]
+        pub fn description(self, description: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.description(description),
+            }
+        }
+
+        /// Sets the modern request/discovery website URL.
+        #[must_use]
+        pub fn website_url(self, website_url: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.website_url(website_url),
+            }
+        }
+
+        /// Sets the modern request/discovery icon set.
+        #[must_use]
+        pub fn icons(self, icons: Vec<crate::RawIcon>) -> Self {
+            Self {
+                inner: self.inner.icons(icons),
             }
         }
 
@@ -3432,6 +3522,43 @@ pub mod modern {
         {
             self.inner.next_subscription_event(cx, cancellation).await
         }
+
+        /// Starts an incremental official Tasks listener on this WebSocket
+        /// client.
+        ///
+        /// Catalog [`Self::open_subscriptions_listener`] refuses `taskIds`.
+        /// Call [`Self::next_final_task_subscription_event`] so the same
+        /// client can keep issuing `tasks/get` / `tasks/cancel` while
+        /// draining status updates.
+        #[cfg(feature = "tasks")]
+        pub async fn open_final_task_subscription_listener(
+            &mut self,
+            cx: &Cx,
+            notifications: SubscriptionFilter,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .open_final_task_subscription_listener(cx, notifications)
+                .await
+        }
+
+        /// Drives one incremental official Tasks listener event without
+        /// occupying ingress until the stream ends.
+        #[cfg(feature = "tasks")]
+        pub async fn next_final_task_subscription_event(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<StdioTaskSubscriptionEvent>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .next_final_task_subscription_event(cx, cancellation)
+                .await
+        }
     }
 
     /// Final-only facade over a connected client.
@@ -4134,6 +4261,20 @@ pub mod modern {
             self.inner.open_subscriptions_listener(notifications)
         }
 
+        /// Starts an incremental official Tasks listener on this stdio client.
+        ///
+        /// Catalog `open_subscriptions_listener` refuses `taskIds`. Call
+        /// [`Self::next_final_task_subscription_event`] so the same client can
+        /// keep issuing `tasks/get` / `tasks/cancel` while draining updates.
+        #[cfg(feature = "tasks")]
+        pub fn open_final_task_subscription_listener(
+            &mut self,
+            notifications: SubscriptionFilter,
+        ) -> McpResult<()> {
+            self.inner
+                .open_final_task_subscription_listener(notifications)
+        }
+
         /// Drives one incremental catalog listener event without occupying
         /// ingress until the stream ends.
         pub fn next_subscription_event(
@@ -4142,6 +4283,17 @@ pub mod modern {
             cancellation: &McpRequestCancellation,
         ) -> McpResult<StdioSubscriptionEvent> {
             self.inner.next_subscription_event(cx, cancellation)
+        }
+
+        /// Drives one incremental official Tasks listener event.
+        #[cfg(feature = "tasks")]
+        pub fn next_final_task_subscription_event(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<StdioTaskSubscriptionEvent> {
+            self.inner
+                .next_final_task_subscription_event(cx, cancellation)
         }
 
         /// Drains exact final progress notifications, preserving JSON number lexemes.
@@ -5911,6 +6063,38 @@ pub mod modern {
             }
         }
 
+        /// Sets the modern discovery title.
+        #[must_use]
+        pub fn title(self, title: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.title(title),
+            }
+        }
+
+        /// Sets the modern discovery description.
+        #[must_use]
+        pub fn description(self, description: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.description(description),
+            }
+        }
+
+        /// Sets the modern discovery website URL.
+        #[must_use]
+        pub fn website_url(self, website_url: impl Into<String>) -> Self {
+            Self {
+                inner: self.inner.website_url(website_url),
+            }
+        }
+
+        /// Sets the modern discovery icon set.
+        #[must_use]
+        pub fn icons(self, icons: Vec<crate::RawIcon>) -> Self {
+            Self {
+                inner: self.inner.icons(icons),
+            }
+        }
+
         /// Sets the console configuration without changing the modern-only policy.
         #[must_use]
         pub fn with_console_config(self, config: ConsoleConfig) -> Self {
@@ -7021,6 +7205,17 @@ pub mod legacy_2024 {
             self.inner.ping()
         }
 
+        /// Sends exact-2024 `ping` under a request-local cancellation domain.
+        ///
+        /// A cancellation observed before send makes no transport contact.
+        pub fn ping_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<()> {
+            self.inner.ping_with_cancellation(cx, cancellation)
+        }
+
         /// Lists exact-2024 tools.
         pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
             self.inner.list_tools()
@@ -7049,6 +7244,44 @@ pub mod legacy_2024 {
             self.inner.list_tools_page_with_params(params, limits)
         }
 
+        /// Lists one exact-2024 tools page under a request-local cancellation domain.
+        pub fn list_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListToolsResult> {
+            self.list_tools_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListToolsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListToolsParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered exact-2024 tools page under a request-local
+        /// cancellation domain.
+        pub fn list_tools_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListToolsParams,
+        ) -> McpResult<ListToolsResult> {
+            match self
+                .inner
+                .list_tools_with_params_and_cancellation(cx, cancellation, params)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy tools/list result",
+                )),
+            }
+        }
+
         /// Lists one exact-2024 resources page without following the peer cursor.
         pub fn list_resources_page(
             &mut self,
@@ -7067,9 +7300,71 @@ pub mod legacy_2024 {
             self.inner.list_resources_page_with_params(params, limits)
         }
 
+        /// Lists one exact-2024 resources page under a request-local cancellation domain.
+        pub fn list_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListResourcesResult> {
+            self.list_resources_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListResourcesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListResourcesParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered exact-2024 resources page under a
+        /// request-local cancellation domain.
+        pub fn list_resources_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourcesParams,
+        ) -> McpResult<ListResourcesResult> {
+            match self.inner.list_resources_with_params_and_cancellation(
+                cx,
+                cancellation,
+                params,
+            )? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy resources/list result",
+                )),
+            }
+        }
+
         /// Calls one exact-2024 tool without final-result projection.
         pub fn call_tool(&mut self, name: &str, arguments: JsonValue) -> McpResult<CallToolResult> {
             self.inner.call_tool_legacy(name, arguments)
+        }
+
+        /// Calls one exact-2024 tool under a request-local cancellation domain.
+        ///
+        /// A cancellation observed before send makes no transport contact.
+        pub fn call_tool_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<CallToolResult> {
+            match self
+                .inner
+                .call_tool_with_cancellation(cx, cancellation, name, arguments)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy tools/call result",
+                )),
+            }
         }
 
         /// Calls one exact-2024 tool and admits request-scoped
@@ -7167,9 +7462,68 @@ pub mod legacy_2024 {
                 .list_resource_templates_page_with_params(params, limits)
         }
 
+        /// Lists one exact-2024 resource-templates page under a request-local
+        /// cancellation domain.
+        pub fn list_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListResourceTemplatesResult> {
+            self.list_resource_templates_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListResourceTemplatesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListResourceTemplatesParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered exact-2024 resource-templates page under a
+        /// request-local cancellation domain.
+        pub fn list_resource_templates_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourceTemplatesParams,
+        ) -> McpResult<ListResourceTemplatesResult> {
+            match self
+                .inner
+                .list_resource_templates_with_params_and_cancellation(cx, cancellation, params)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(
+                    result,
+                )) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy resources/templates/list result",
+                )),
+            }
+        }
+
         /// Reads one exact-2024 resource.
         pub fn read_resource(&mut self, uri: &str) -> McpResult<ReadResourceResult> {
             self.inner.read_resource_legacy(uri)
+        }
+
+        /// Reads one exact-2024 resource under a request-local cancellation domain.
+        pub fn read_resource_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<ReadResourceResult> {
+            match self
+                .inner
+                .read_resource_with_cancellation(cx, cancellation, uri)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy resources/read result",
+                )),
+            }
         }
 
         /// Reads one exact-2024 resource and admits request-scoped
@@ -7233,6 +7587,44 @@ pub mod legacy_2024 {
             self.inner.list_prompts_page_with_params(params, limits)
         }
 
+        /// Lists one exact-2024 prompts page under a request-local cancellation domain.
+        pub fn list_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListPromptsResult> {
+            self.list_prompts_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListPromptsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListPromptsParams::default()
+                },
+            )
+        }
+
+        /// Lists one tag-filtered exact-2024 prompts page under a request-local
+        /// cancellation domain.
+        pub fn list_prompts_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListPromptsParams,
+        ) -> McpResult<ListPromptsResult> {
+            match self
+                .inner
+                .list_prompts_with_params_and_cancellation(cx, cancellation, params)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy prompts/list result",
+                )),
+            }
+        }
+
         /// Gets one exact-2024 prompt.
         pub fn get_prompt(
             &mut self,
@@ -7240,6 +7632,27 @@ pub mod legacy_2024 {
             arguments: std::collections::HashMap<String, String>,
         ) -> McpResult<GetPromptResult> {
             self.inner.get_prompt_legacy(name, arguments)
+        }
+
+        /// Gets one exact-2024 prompt under a request-local cancellation domain.
+        pub fn get_prompt_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<GetPromptResult> {
+            match self
+                .inner
+                .get_prompt_with_cancellation(cx, cancellation, name, arguments)?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received a non-legacy prompts/get result",
+                )),
+            }
         }
 
         /// Gets one exact-2024 prompt and admits request-scoped
@@ -7284,6 +7697,89 @@ pub mod legacy_2024 {
                 },
                 context: None,
             })?;
+            match result {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                fastmcp_protocol::CoreResult::Final(_) => Err(McpError::internal_error(
+                    "LegacyOnly facade received a final completion result",
+                )),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected completion result",
+                )),
+            }
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument and
+        /// admits request-scoped `notifications/progress` for the supplied marker.
+        ///
+        /// Drain those frames with [`Self::take_server_notifications`].
+        pub fn complete_with_progress_marker(
+            &mut self,
+            params: LegacyCompletionParams,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<LegacyCompletionResult> {
+            let reference = match params.reference {
+                LegacyCompletionReference::Prompt { name } => {
+                    fastmcp_client::CompletionReference::Prompt { name }
+                }
+                LegacyCompletionReference::Resource { uri } => {
+                    fastmcp_client::CompletionReference::Resource { uri }
+                }
+            };
+            let result = self.inner.complete_with_progress_marker(
+                fastmcp_client::CompletionParams {
+                    reference,
+                    argument: fastmcp_client::CompletionArgument {
+                        name: params.argument.name,
+                        value: params.argument.value,
+                    },
+                    context: None,
+                },
+                progress_marker,
+            )?;
+            match result {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                fastmcp_protocol::CoreResult::Final(_) => Err(McpError::internal_error(
+                    "LegacyOnly facade received a final completion result",
+                )),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly facade received an unexpected completion result",
+                )),
+            }
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument under
+        /// a request-local cancellation domain.
+        pub fn complete_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: LegacyCompletionParams,
+        ) -> McpResult<LegacyCompletionResult> {
+            let reference = match params.reference {
+                LegacyCompletionReference::Prompt { name } => {
+                    fastmcp_client::CompletionReference::Prompt { name }
+                }
+                LegacyCompletionReference::Resource { uri } => {
+                    fastmcp_client::CompletionReference::Resource { uri }
+                }
+            };
+            let result = self.inner.complete_with_cancellation(
+                cx,
+                cancellation,
+                fastmcp_client::CompletionParams {
+                    reference,
+                    argument: fastmcp_client::CompletionArgument {
+                        name: params.argument.name,
+                        value: params.argument.value,
+                    },
+                    context: None,
+                },
+                |_| {},
+            )?;
             match result {
                 fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
                     Ok(result)
@@ -7684,12 +8180,120 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Completes one exact-2024 prompt or resource-template argument and
+        /// admits request-scoped `notifications/progress` for the supplied marker.
+        ///
+        /// Drain those frames with [`Self::take_server_notifications`].
+        pub async fn complete_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            params: LegacyCompletionParams,
+            progress_marker: ProgressMarker,
+        ) -> McpResult<LegacyCompletionResult>
+        where
+            IO: Send + 'static,
+        {
+            let reference = match params.reference {
+                LegacyCompletionReference::Prompt { name } => {
+                    fastmcp_client::CompletionReference::Prompt { name }
+                }
+                LegacyCompletionReference::Resource { uri } => {
+                    fastmcp_client::CompletionReference::Resource { uri }
+                }
+            };
+            match self
+                .inner
+                .complete_with_progress_marker(
+                    cx,
+                    fastmcp_client::CompletionParams {
+                        reference,
+                        argument: fastmcp_client::CompletionArgument {
+                            name: params.argument.name,
+                            value: params.argument.value,
+                        },
+                        context: None,
+                    },
+                    progress_marker,
+                )
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                fastmcp_protocol::CoreResult::Final(_) => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a final completion result",
+                )),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received an unexpected completion result",
+                )),
+            }
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument under
+        /// a caller-owned cancellation domain.
+        pub async fn complete_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: LegacyCompletionParams,
+        ) -> McpResult<LegacyCompletionResult>
+        where
+            IO: Send + 'static,
+        {
+            let reference = match params.reference {
+                LegacyCompletionReference::Prompt { name } => {
+                    fastmcp_client::CompletionReference::Prompt { name }
+                }
+                LegacyCompletionReference::Resource { uri } => {
+                    fastmcp_client::CompletionReference::Resource { uri }
+                }
+            };
+            match self
+                .inner
+                .complete_with_cancellation(
+                    cx,
+                    cancellation,
+                    fastmcp_client::CompletionParams {
+                        reference,
+                        argument: fastmcp_client::CompletionArgument {
+                            name: params.argument.name,
+                            value: params.argument.value,
+                        },
+                        context: None,
+                    },
+                )
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                fastmcp_protocol::CoreResult::Final(_) => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a final completion result",
+                )),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received an unexpected completion result",
+                )),
+            }
+        }
+
         /// Sends exact-2024 `ping` on this sealed WebSocket session.
         pub async fn ping(&mut self, cx: &Cx) -> McpResult<()>
         where
             IO: Send + 'static,
         {
             self.inner.ping(cx).await
+        }
+
+        /// Sends exact-2024 `ping` under a caller-owned cancellation domain.
+        pub async fn ping_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.ping_with_cancellation(cx, cancellation).await
         }
 
         /// Lists exact-2024 tools through the pinned WebSocket session.
@@ -7700,6 +8304,52 @@ pub mod legacy_2024 {
             match self.inner.list_tools(cx, None).await? {
                 fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
                     Ok(result.tools)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy tools/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 tools page under a caller-owned cancellation domain.
+        pub async fn list_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListToolsResult>
+        where
+            IO: Send + 'static,
+        {
+            self.list_tools_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListToolsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListToolsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered exact-2024 tools page under a caller-owned
+        /// cancellation domain.
+        pub async fn list_tools_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListToolsParams,
+        ) -> McpResult<ListToolsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_tools_with_params_and_cancellation(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                    Ok(result)
                 }
                 _ => Err(McpError::internal_error(
                     "LegacyOnly WebSocket facade received a non-legacy tools/list result",
@@ -7912,6 +8562,52 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Lists one exact-2024 resources page under a caller-owned cancellation domain.
+        pub async fn list_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListResourcesResult>
+        where
+            IO: Send + 'static,
+        {
+            self.list_resources_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListResourcesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListResourcesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered exact-2024 resources page under a
+        /// caller-owned cancellation domain.
+        pub async fn list_resources_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourcesParams,
+        ) -> McpResult<ListResourcesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_resources_with_params_and_cancellation(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/list result",
+                )),
+            }
+        }
+
         /// Lists exact-2024 resource templates through the pinned WebSocket session.
         pub async fn list_resource_templates(&mut self, cx: &Cx) -> McpResult<Vec<ResourceTemplate>>
         where
@@ -7927,12 +8623,83 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Lists one exact-2024 resource-templates page under a caller-owned
+        /// cancellation domain.
+        pub async fn list_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListResourceTemplatesResult>
+        where
+            IO: Send + 'static,
+        {
+            self.list_resource_templates_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListResourceTemplatesParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListResourceTemplatesParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered exact-2024 resource-templates page under a
+        /// caller-owned cancellation domain.
+        pub async fn list_resource_templates_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourceTemplatesParams,
+        ) -> McpResult<ListResourceTemplatesResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_resource_templates_with_params_and_cancellation(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourceTemplatesList(
+                    result,
+                )) => Ok(result),
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/templates/list result",
+                )),
+            }
+        }
+
         /// Reads one exact-2024 resource through the pinned WebSocket session.
         pub async fn read_resource(&mut self, cx: &Cx, uri: &str) -> McpResult<ReadResourceResult>
         where
             IO: Send + 'static,
         {
             match self.inner.read_resource(cx, uri).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/read result",
+                )),
+            }
+        }
+
+        /// Reads one exact-2024 resource under a caller-owned cancellation domain.
+        pub async fn read_resource_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<ReadResourceResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .read_resource_with_cancellation(cx, cancellation, uri)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
                     Ok(result)
                 }
@@ -7982,6 +8749,52 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Lists one exact-2024 prompts page under a caller-owned cancellation domain.
+        pub async fn list_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            cursor: Option<&str>,
+        ) -> McpResult<ListPromptsResult>
+        where
+            IO: Send + 'static,
+        {
+            self.list_prompts_with_params_and_cancellation(
+                cx,
+                cancellation,
+                ListPromptsParams {
+                    cursor: cursor.map(ToOwned::to_owned),
+                    ..ListPromptsParams::default()
+                },
+            )
+            .await
+        }
+
+        /// Lists one tag-filtered exact-2024 prompts page under a caller-owned
+        /// cancellation domain.
+        pub async fn list_prompts_with_params_and_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListPromptsParams,
+        ) -> McpResult<ListPromptsResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .list_prompts_with_params_and_cancellation(cx, cancellation, params)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy prompts/list result",
+                )),
+            }
+        }
+
         /// Gets one exact-2024 prompt through the pinned WebSocket session.
         pub async fn get_prompt(
             &mut self,
@@ -7993,6 +8806,31 @@ pub mod legacy_2024 {
             IO: Send + 'static,
         {
             match self.inner.get_prompt(cx, name, arguments).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy prompts/get result",
+                )),
+            }
+        }
+
+        /// Gets one exact-2024 prompt under a caller-owned cancellation domain.
+        pub async fn get_prompt_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<GetPromptResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .get_prompt_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
                     Ok(result)
                 }
@@ -8133,6 +8971,27 @@ pub mod legacy_2024 {
             }
         }
 
+        async fn request_legacy_core_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            method: &'static str,
+            parameters: JsonValue,
+        ) -> Result<LegacyCoreResult, HttpClientError> {
+            match self
+                .inner
+                .request_final_core_with_cancellation(cx, cancellation, method, parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(result) => Ok(result),
+                fastmcp_protocol::CoreResult::Final(_) => {
+                    Err(HttpClientError::CoreResult(McpError::internal_error(
+                        format!("LegacyOnly facade received a final result for {method}"),
+                    )))
+                }
+            }
+        }
+
         async fn request_legacy_empty(
             &mut self,
             cx: &Cx,
@@ -8249,6 +9108,26 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Sends exact-2024 `ping` under a caller-owned cancellation domain.
+        pub async fn ping_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> Result<(), HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::PING,
+                    serde_json::json!({}),
+                )
+                .await?
+            {
+                LegacyCoreResult::Ping(_) => Ok(()),
+                _ => Err(Self::unexpected_result(methods::PING)),
+            }
+        }
+
         /// Lists one exact-2024 tools page.
         pub async fn list_tools(
             &mut self,
@@ -8257,6 +9136,27 @@ pub mod legacy_2024 {
         ) -> Result<ListToolsResult, HttpClientError> {
             match self
                 .request_legacy_core(cx, methods::TOOLS_LIST, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::ToolsList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::TOOLS_LIST)),
+            }
+        }
+
+        /// Lists one exact-2024 tools page under a caller-owned cancellation domain.
+        pub async fn list_tools_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListToolsParams,
+        ) -> Result<ListToolsResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::TOOLS_LIST,
+                    Self::encode_params(params)?,
+                )
                 .await?
             {
                 LegacyCoreResult::ToolsList(result) => Ok(result),
@@ -8279,6 +9179,27 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Calls one exact-2024 tool under a caller-owned cancellation domain.
+        pub async fn call_tool_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: CallToolParams,
+        ) -> Result<CallToolResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::TOOLS_CALL,
+                    Self::encode_params(params)?,
+                )
+                .await?
+            {
+                LegacyCoreResult::ToolsCall(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::TOOLS_CALL)),
+            }
+        }
+
         /// Lists one exact-2024 resources page.
         pub async fn list_resources(
             &mut self,
@@ -8287,6 +9208,27 @@ pub mod legacy_2024 {
         ) -> Result<ListResourcesResult, HttpClientError> {
             match self
                 .request_legacy_core(cx, methods::RESOURCES_LIST, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::ResourcesList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::RESOURCES_LIST)),
+            }
+        }
+
+        /// Lists one exact-2024 resources page under a caller-owned cancellation domain.
+        pub async fn list_resources_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourcesParams,
+        ) -> Result<ListResourcesResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::RESOURCES_LIST,
+                    Self::encode_params(params)?,
+                )
                 .await?
             {
                 LegacyCoreResult::ResourcesList(result) => Ok(result),
@@ -8313,6 +9255,28 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Lists one exact-2024 resource-templates page under a caller-owned
+        /// cancellation domain.
+        pub async fn list_resource_templates_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListResourceTemplatesParams,
+        ) -> Result<ListResourceTemplatesResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::RESOURCES_TEMPLATES_LIST,
+                    Self::encode_params(params)?,
+                )
+                .await?
+            {
+                LegacyCoreResult::ResourceTemplatesList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::RESOURCES_TEMPLATES_LIST)),
+            }
+        }
+
         /// Reads one exact-2024 resource.
         pub async fn read_resource(
             &mut self,
@@ -8321,6 +9285,27 @@ pub mod legacy_2024 {
         ) -> Result<ReadResourceResult, HttpClientError> {
             match self
                 .request_legacy_core(cx, methods::RESOURCES_READ, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::ResourcesRead(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::RESOURCES_READ)),
+            }
+        }
+
+        /// Reads one exact-2024 resource under a caller-owned cancellation domain.
+        pub async fn read_resource_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ReadResourceParams,
+        ) -> Result<ReadResourceResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::RESOURCES_READ,
+                    Self::encode_params(params)?,
+                )
                 .await?
             {
                 LegacyCoreResult::ResourcesRead(result) => Ok(result),
@@ -8371,6 +9356,27 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Lists one exact-2024 prompts page under a caller-owned cancellation domain.
+        pub async fn list_prompts_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: ListPromptsParams,
+        ) -> Result<ListPromptsResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::PROMPTS_LIST,
+                    Self::encode_params(params)?,
+                )
+                .await?
+            {
+                LegacyCoreResult::PromptsList(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::PROMPTS_LIST)),
+            }
+        }
+
         /// Gets one exact-2024 prompt.
         pub async fn get_prompt(
             &mut self,
@@ -8379,6 +9385,27 @@ pub mod legacy_2024 {
         ) -> Result<GetPromptResult, HttpClientError> {
             match self
                 .request_legacy_core(cx, methods::PROMPTS_GET, Self::encode_params(params)?)
+                .await?
+            {
+                LegacyCoreResult::PromptsGet(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::PROMPTS_GET)),
+            }
+        }
+
+        /// Gets one exact-2024 prompt under a caller-owned cancellation domain.
+        pub async fn get_prompt_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: GetPromptParams,
+        ) -> Result<GetPromptResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
+                    methods::PROMPTS_GET,
+                    Self::encode_params(params)?,
+                )
                 .await?
             {
                 LegacyCoreResult::PromptsGet(result) => Ok(result),
@@ -8395,6 +9422,69 @@ pub mod legacy_2024 {
             match self
                 .request_legacy_core(
                     cx,
+                    methods::COMPLETION_COMPLETE,
+                    Self::encode_params(params)?,
+                )
+                .await?
+            {
+                LegacyCoreResult::Completion(result) => Ok(result),
+                _ => Err(Self::unexpected_result(methods::COMPLETION_COMPLETE)),
+            }
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument and
+        /// admits request-scoped `notifications/progress` for the supplied marker.
+        ///
+        /// Drain those frames with [`Self::take_server_notification`].
+        pub async fn complete_with_progress_marker(
+            &mut self,
+            cx: &Cx,
+            params: LegacyCompletionParams,
+            progress_marker: ProgressMarker,
+        ) -> Result<LegacyCompletionResult, HttpClientError> {
+            let reference = match params.reference {
+                LegacyCompletionReference::Prompt { name } => {
+                    fastmcp_client::CompletionReference::Prompt { name }
+                }
+                LegacyCompletionReference::Resource { uri } => {
+                    fastmcp_client::CompletionReference::Resource { uri }
+                }
+            };
+            match self
+                .inner
+                .complete_with_progress_marker(
+                    cx,
+                    fastmcp_client::CompletionParams {
+                        reference,
+                        argument: fastmcp_client::CompletionArgument {
+                            name: params.argument.name,
+                            value: params.argument.value,
+                        },
+                        context: None,
+                    },
+                    progress_marker,
+                )
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::Completion(result)) => {
+                    Ok(result)
+                }
+                _ => Err(Self::unexpected_result(methods::COMPLETION_COMPLETE)),
+            }
+        }
+
+        /// Completes one exact-2024 prompt or resource-template argument under
+        /// a caller-owned cancellation domain.
+        pub async fn complete_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: LegacyCompletionParams,
+        ) -> Result<LegacyCompletionResult, HttpClientError> {
+            match self
+                .request_legacy_core_with_cancellation(
+                    cx,
+                    cancellation,
                     methods::COMPLETION_COMPLETE,
                     Self::encode_params(params)?,
                 )
@@ -8749,11 +9839,11 @@ pub mod prelude {
         WebSocketServerShutdown,
     };
     pub use crate::{
-        CachePartitionKey, ClientCapabilityInfo, ContextNotificationSender,
-        DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ElicitationAction,
-        ElicitationMode, ElicitationRequest, ElicitationResponse, ElicitationSender,
-        FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
-        FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic,
+        CachePartitionKey, ClientCapabilityInfo, ClientImplementationInfo,
+        ContextNotificationSender, DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES,
+        ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
+        ElicitationSender, FinalCacheGeneration, FinalCacheInsert, FinalCacheKey, FinalCacheLookup,
+        FinalCacheMiss, FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic,
         FinalResourceReadCacheHintProvenance, FinalResultCache, FinalToolSchemaAuthority,
         JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
         MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, MAX_PROMPT_GET_DEPTH,
@@ -9264,6 +10354,7 @@ mod tests {
                             name: "environment".to_owned(),
                             value: "sta".to_owned(),
                         },
+                        meta: None,
                     },
                 )
                 .await
@@ -10153,12 +11244,20 @@ mod tests {
             modern::Client::listen_subscriptions;
         let _: fn(&mut modern::Client, modern::SubscriptionFilter) -> modern::McpResult<()> =
             modern::Client::open_subscriptions_listener;
+        let _: fn(&mut modern::Client, modern::SubscriptionFilter) -> modern::McpResult<()> =
+            modern::Client::open_final_task_subscription_listener;
         let _: fn(
             &mut modern::Client,
             &modern::Cx,
             &modern::McpRequestCancellation,
         ) -> modern::McpResult<modern::StdioSubscriptionEvent> =
             modern::Client::next_subscription_event;
+        let _: fn(
+            &mut modern::Client,
+            &modern::Cx,
+            &modern::McpRequestCancellation,
+        ) -> modern::McpResult<modern::StdioTaskSubscriptionEvent> =
+            modern::Client::next_final_task_subscription_event;
         #[cfg(feature = "websocket-experimental")]
         {
             async fn open_modern_websocket_catalog_listener<IO>(
@@ -10247,6 +11346,44 @@ mod tests {
                 open_modern_websocket_catalog_listener::<asupersync::net::tcp::VirtualTcpStream>;
             let _ = next_modern_websocket_catalog_event::<asupersync::net::tcp::VirtualTcpStream>;
             let _ = public_websocket_client_typed_verbs::<asupersync::net::tcp::VirtualTcpStream>;
+            #[cfg(feature = "tasks")]
+            {
+                async fn open_modern_websocket_task_listener<IO>(
+                    client: &mut modern::WebSocketClient<IO>,
+                    cx: &modern::Cx,
+                    filter: modern::SubscriptionFilter,
+                ) -> modern::McpResult<()>
+                where
+                    IO: asupersync::io::AsyncRead
+                        + asupersync::io::AsyncWrite
+                        + Unpin
+                        + Send
+                        + 'static,
+                {
+                    client
+                        .open_final_task_subscription_listener(cx, filter)
+                        .await
+                }
+                async fn next_modern_websocket_task_event<IO>(
+                    client: &mut modern::WebSocketClient<IO>,
+                    cx: &modern::Cx,
+                    cancellation: &modern::McpRequestCancellation,
+                ) -> modern::McpResult<modern::StdioTaskSubscriptionEvent>
+                where
+                    IO: asupersync::io::AsyncRead
+                        + asupersync::io::AsyncWrite
+                        + Unpin
+                        + Send
+                        + 'static,
+                {
+                    client
+                        .next_final_task_subscription_event(cx, cancellation)
+                        .await
+                }
+                let _ =
+                    open_modern_websocket_task_listener::<asupersync::net::tcp::VirtualTcpStream>;
+                let _ = next_modern_websocket_task_event::<asupersync::net::tcp::VirtualTcpStream>;
+            }
         }
         let _: for<'a> fn(
             &'a mut modern::Client,
@@ -10656,6 +11793,12 @@ mod tests {
             legacy_2024::ProgressMarker,
         ) -> McpResult<legacy_2024::GetPromptResult> =
             legacy_2024::Client::get_prompt_with_progress_marker;
+        let _: fn(
+            &mut legacy_2024::Client,
+            legacy_2024::LegacyCompletionParams,
+            legacy_2024::ProgressMarker,
+        ) -> McpResult<legacy_2024::LegacyCompletionResult> =
+            legacy_2024::Client::complete_with_progress_marker;
         #[cfg(unix)]
         {
             fn legacy_call_tool_with_cx<'a>(
@@ -10761,6 +11904,7 @@ mod tests {
                         name: "argument".to_owned(),
                         value: "value".to_owned(),
                     },
+                    meta: None,
                 },
             ));
             std::mem::drop(client.set_log_level(cx, legacy_2024::LogLevel::Info));
