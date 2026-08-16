@@ -3071,6 +3071,64 @@ pub mod modern {
             }
         }
 
+        /// Calls one Tasks-capable tool without projecting its result algebra.
+        #[cfg(feature = "tasks")]
+        pub async fn call_tool_outcome(
+            &mut self,
+            cx: &Cx,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalToolCallOutcome>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .call_tool_final_outcome(cx, name, arguments)
+                .await
+        }
+
+        /// Reads one task through the official final Tasks extension.
+        #[cfg(feature = "tasks")]
+        pub async fn get_task(
+            &mut self,
+            cx: &Cx,
+            task_id: FinalTaskId,
+        ) -> McpResult<FinalGetTaskResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.get_task_final(cx, task_id).await
+        }
+
+        /// Supplies responses to one input-required final task.
+        #[cfg(feature = "tasks")]
+        pub async fn update_task(
+            &mut self,
+            cx: &Cx,
+            task: &FinalTask,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<FinalUpdateTaskResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .update_task_final(cx, task, input_responses)
+                .await
+        }
+
+        /// Requests cancellation through the official final Tasks extension.
+        #[cfg(feature = "tasks")]
+        pub async fn cancel_task(
+            &mut self,
+            cx: &Cx,
+            task_id: FinalTaskId,
+        ) -> McpResult<FinalCancelTaskResult>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.cancel_task_final(cx, task_id).await
+        }
+
         /// Sends one generic final extension request after bilateral
         /// discovery admission, retaining the exact JSON result source.
         pub async fn request_final_extension(
@@ -5622,8 +5680,8 @@ pub mod legacy_2024 {
         SamplingRequestHandler as LegacySamplingRequestHandler,
     };
     pub use fastmcp_core::{
-        CanonicalHttpUrl, ClientRoot, Cx, McpContext, McpError, McpOutcome, McpResult,
-        RootsProvider,
+        CanonicalHttpUrl, ClientRoot, Cx, McpContext, McpError, McpOutcome, McpRequestCancellation,
+        McpResult, RootsProvider,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::JsonInteger;
@@ -7054,6 +7112,90 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Lists one exact-2024 tools page, including cursor identity.
+        pub async fn list_tools_page(
+            &mut self,
+            cx: &Cx,
+            params: ListToolsParams,
+        ) -> McpResult<ListToolsResult>
+        where
+            IO: Send + 'static,
+        {
+            let parameters = serde_json::to_value(params).map_err(|error| {
+                McpError::invalid_params(format!(
+                    "LegacyOnly WebSocket tools/list parameters could not serialize: {error}"
+                ))
+            })?;
+            match self
+                .inner
+                .list_catalog_page(cx, "tools/list", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy tools/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 resources page, including cursor identity.
+        pub async fn list_resources_page(
+            &mut self,
+            cx: &Cx,
+            params: ListResourcesParams,
+        ) -> McpResult<ListResourcesResult>
+        where
+            IO: Send + 'static,
+        {
+            let parameters = serde_json::to_value(params).map_err(|error| {
+                McpError::invalid_params(format!(
+                    "LegacyOnly WebSocket resources/list parameters could not serialize: {error}"
+                ))
+            })?;
+            match self
+                .inner
+                .list_catalog_page(cx, "resources/list", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ResourcesList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy resources/list result",
+                )),
+            }
+        }
+
+        /// Lists one exact-2024 prompts page, including cursor identity.
+        pub async fn list_prompts_page(
+            &mut self,
+            cx: &Cx,
+            params: ListPromptsParams,
+        ) -> McpResult<ListPromptsResult>
+        where
+            IO: Send + 'static,
+        {
+            let parameters = serde_json::to_value(params).map_err(|error| {
+                McpError::invalid_params(format!(
+                    "LegacyOnly WebSocket prompts/list parameters could not serialize: {error}"
+                ))
+            })?;
+            match self
+                .inner
+                .list_catalog_page(cx, "prompts/list", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::PromptsList(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy prompts/list result",
+                )),
+            }
+        }
+
         /// Calls one exact-2024 tool through the pinned WebSocket session.
         pub async fn call_tool(
             &mut self,
@@ -7065,6 +7207,36 @@ pub mod legacy_2024 {
             IO: Send + 'static,
         {
             match self.inner.call_tool(cx, name, arguments).await? {
+                fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                    Ok(result)
+                }
+                _ => Err(McpError::internal_error(
+                    "LegacyOnly WebSocket facade received a non-legacy tools/call result",
+                )),
+            }
+        }
+
+        /// Calls one exact-2024 tool under a caller-owned cancellation domain.
+        ///
+        /// After send, requesting cancellation emits `notifications/cancelled`
+        /// and retires the correlated response. Exact-2024 peers may suppress
+        /// that request's terminal JSON-RPC result; this verb returns
+        /// [`McpError::request_cancelled`] instead of waiting for it.
+        pub async fn call_tool_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<CallToolResult>
+        where
+            IO: Send + 'static,
+        {
+            match self
+                .inner
+                .call_tool_with_cancellation(cx, cancellation, name, arguments)
+                .await?
+            {
                 fastmcp_protocol::CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
                     Ok(result)
                 }
