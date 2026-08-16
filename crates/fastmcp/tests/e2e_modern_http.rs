@@ -4443,8 +4443,28 @@ fn e2e_public_http_prefixed_as_proxy_gets_upstream_created_task() {
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_stdio_as_proxy_gateway() -> (HttpServerFixture, FinalTaskId) {
+    let (gateway, task_id) = spawn_modern_http_stdio_as_proxy_gateway_configured(true);
+    (
+        gateway,
+        task_id.expect("the precreate path always records one official Task"),
+    )
+}
+
+/// Same live stdio `as_proxy("ext")` HTTP gateway, but without occupying the
+/// shipped echo in-memory store (capacity 1). Create-through-gateway proofs
+/// use this so `ext/durable_task` is not immediately capacity-refused.
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task() -> HttpServerFixture {
+    spawn_modern_http_stdio_as_proxy_gateway_configured(false).0
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_stdio_as_proxy_gateway_configured(
+    precreate_task: bool,
+) -> (HttpServerFixture, Option<FinalTaskId>) {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(SocketAddr, FinalTaskId), String>>(1);
+    let (ready_tx, ready_rx) =
+        mpsc::sync_channel::<Result<(SocketAddr, Option<FinalTaskId>), String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
     let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
     let join = Some(thread::spawn(move || {
@@ -4493,17 +4513,27 @@ fn spawn_modern_http_stdio_as_proxy_gateway() -> (HttpServerFixture, FinalTaskId
                         .expect("a failed stdio connect records its last transport error")
                 )
             })?;
-            let created = stdio
-                .call_tool_outcome("durable_task", json!({}))
-                .map_err(|error| {
-                    format!("live stdio as_proxy upstream must create one official Task: {error}")
+            let task_id = if precreate_task {
+                let created = stdio
+                    .call_tool_outcome("durable_task", json!({}))
+                    .map_err(|error| {
+                        format!("live stdio as_proxy upstream must create one official Task: {error}")
+                    })?;
+                let FinalToolCallOutcome::Task(created) = created else {
+                    return Err(format!(
+                        "the shipped durable_task tool must return the official Task result branch: {created:?}"
+                    ));
+                };
+                Some(created.task.base().task_id.clone())
+            } else {
+                // as_proxy catalog listing is the first stdio request on this
+                // path. A live tools/list first proves the echo process is
+                // answering before install consumes the idle deadline.
+                let _ = stdio.list_tools(None).map_err(|error| {
+                    format!("live stdio as_proxy upstream must answer tools/list before install: {error}")
                 })?;
-            let FinalToolCallOutcome::Task(created) = created else {
-                return Err(format!(
-                    "the shipped durable_task tool must return the official Task result branch: {created:?}"
-                ));
+                None
             };
-            let task_id = created.task.base().task_id.clone();
             let server = modern::ServerBuilder::new("e2e-http-stdio-as-proxy", "1.0.0")
                 .as_proxy("ext", stdio)
                 .map_err(|error| format!("as_proxy stdio install failed: {error}"))?
@@ -9988,6 +10018,130 @@ fn e2e_public_http_proxy_client_tasks_listen_retains_status_and_catalog_listen_r
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
+fn e2e_public_http_tasks_listen_retains_status_and_catalog_listen_refuses_task_ids() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_task_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-tasks-listen", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live official Tasks HTTP server");
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("live bind_http must create one official Task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the task-capable live tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
+        .expect("subscription SSE limits must be nonzero");
+    let mut catalog_with_tasks = modern::SubscriptionFilter {
+        tools_list_changed: Some(true),
+        ..modern::SubscriptionFilter::default()
+    };
+    modern::set_task_subscription_ids(&mut catalog_with_tasks, vec![task_id.clone()])
+        .expect("the public Tasks filter must compose");
+    let catalog_refusal = runtime_block_on_bounded(
+        &cx,
+        client.start_subscriptions_listener(&cx, catalog_with_tasks, limits),
+    )
+    .expect_err("catalog listen must refuse taskIds");
+    assert!(
+        catalog_refusal
+            .to_string()
+            .contains("open_final_task_subscription_listener")
+            || catalog_refusal.to_string().contains("taskIds"),
+        "changing only the added taskIds must keep catalog listen refused: {catalog_refusal:?}"
+    );
+
+    let mut filter = modern::SubscriptionFilter::default();
+    modern::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+        .expect("the public Tasks filter is valid");
+    runtime_block_on_bounded(
+        &cx,
+        client.open_final_task_subscription_listener(&cx, filter, limits),
+    )
+    .expect("live bind_http must admit an incremental official Tasks listener");
+
+    let acknowledgement =
+        runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+            .expect("official Tasks listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            acknowledgement,
+            modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                if modern::task_subscription_ids(accepted)
+                    .expect("acknowledged Tasks filter stays valid")
+                    .as_deref()
+                    == Some([task_id.clone()].as_slice())
+        ),
+        "the first incremental Tasks listen record must be the accepted taskIds: {acknowledgement:?}"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(3), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/cancel remains usable while the Tasks listener is live");
+
+    let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let event = runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+            .expect("official Tasks listen must retain later status updates");
+        match event {
+            modern::StdioTaskSubscriptionEvent::Notification(notification)
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the Tasks notification must keep the created id: {notification:?}"
+                );
+                break;
+            }
+            modern::StdioTaskSubscriptionEvent::Notification(_)
+            | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the caller-owned supervisor publishes cancellation within the public bound"
+                );
+            }
+            modern::StdioTaskSubscriptionEvent::Terminal => {
+                panic!("the live Tasks listener must retain cancellation before terminal")
+            }
+        }
+    }
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(4), task_id, 1 << 20),
+    )
+    .expect("typed tasks/get remains usable after listen observed cancel");
+    assert!(
+        matches!(observed.task, FinalTask::Cancelled(_)),
+        "the same HTTP client must still admit tasks/get after listen: {observed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
 fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
     let upstream = spawn_modern_task_http_server();
     let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
@@ -10279,6 +10433,675 @@ fn e2e_public_http_as_proxy_creates_official_task_through_the_gateway() {
     drop(client);
     gateway.shutdown();
     upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_creates_official_task_with_progress_marker() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let prefixed = format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}");
+    let marker = modern::ProgressMarker::from("as-proxy-task-create-progress");
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-tasks-create-progress", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live as_proxy Tasks gateway");
+
+    let unprefixed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome_with_progress_marker(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            marker.clone(),
+            1 << 20,
+        ),
+    )
+    .expect_err(
+        "changing only the tool name must not create a Task on the unprefixed path even with a progress token",
+    );
+    let _ = unprefixed;
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome_with_progress_marker(
+            &cx,
+            RequestId::Number(3),
+            &prefixed,
+            json!({}),
+            marker,
+            1 << 20,
+        ),
+    )
+    .expect(
+        "a progress token must not prevent as_proxy from creating one official Task through the prefixed tool",
+    );
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the prefixed task-capable live tool must return the official Task result branch after a progress token: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/get must return the progress-token gateway-created Task");
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "as_proxy_typed must keep the same id it created under a progress token: {observed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_creates_official_task_through_the_gateway() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    let prefixed = "ext/durable_task";
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-tasks-create", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the prefixed durable task");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "as_proxy must prefix the live stdio durable_task tool: {listed:?}"
+    );
+    assert!(
+        !listed.tools.iter().any(|tool| tool.name == "durable_task"),
+        "a nonempty as_proxy prefix must not keep the unprefixed durable_task tool: {listed:?}"
+    );
+
+    let unprefixed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            "durable_task",
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect_err("changing only the tool name must not create a Task on the unprefixed path");
+    let _ = unprefixed;
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(&cx, RequestId::Number(3), prefixed, json!({}), 1 << 20),
+    )
+    .expect(
+        "the live stdio as_proxy gateway must create one official Task through ext/durable_task",
+    );
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the prefixed stdio durable_task must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/get must return the stdio-gateway-created Task");
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "stdio as_proxy must keep the same id it created: {observed:?}"
+    );
+
+    let missing = FinalTaskId::parse("missing-stdio-gateway-created-task")
+        .expect("the planted-missing task id is a valid official TaskId");
+    let missing_get = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(5), missing, 1 << 20),
+    )
+    .expect_err("changing only the task id must not invent a Task on the stdio as_proxy gateway");
+    let _ = missing_get;
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_creates_official_task_with_progress_marker() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    let prefixed = "ext/durable_task";
+    let marker = modern::ProgressMarker::from("stdio-as-proxy-task-create-progress");
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-tasks-create-progress", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy Tasks gateway");
+
+    let unprefixed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome_with_progress_marker(
+            &cx,
+            RequestId::Number(2),
+            "durable_task",
+            json!({}),
+            marker.clone(),
+            1 << 20,
+        ),
+    )
+    .expect_err(
+        "changing only the tool name must not create a Task on the unprefixed stdio path even with a progress token",
+    );
+    let _ = unprefixed;
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome_with_progress_marker(
+            &cx,
+            RequestId::Number(3),
+            prefixed,
+            json!({}),
+            marker,
+            1 << 20,
+        ),
+    )
+    .expect(
+        "a progress token must not prevent the stdio as_proxy gateway from creating one official Task through ext/durable_task",
+    );
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the prefixed stdio durable_task must return the official Task result branch after a progress token: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/get must return the stdio-gateway-created Task");
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "stdio as_proxy must keep the same id it created under a progress token: {observed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_inbound_client_implementation() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+
+    let mut identified = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-identity", "1.0.0")
+            .title("Caller Title")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the identified public facade connects to the live stdio as_proxy gateway");
+    let mut bare = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-identity-bare", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the bare public facade connects to the live stdio as_proxy gateway");
+
+    let listed = runtime_block_on_bounded(&cx, identified.list_tools(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the prefixed identity tool");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ext/client_identity"),
+        "as_proxy must prefix the shipped echo identity tool: {listed:?}"
+    );
+
+    let missing =
+        runtime_block_on_bounded(&cx, identified.call_tool(&cx, "client_identity", json!({})))
+            .expect_err(
+                "changing only the tool name must not reach the unprefixed stdio identity handler",
+            );
+    let _ = missing;
+
+    let identified_result = runtime_block_on_bounded(
+        &cx,
+        identified.call_tool(&cx, "ext/client_identity", json!({})),
+    )
+    .expect("as_proxy must forward ext/client_identity to the shipped echo handler");
+    assert!(
+        identified_result
+            .content
+            .iter()
+            .any(|content| match content {
+                ContentBlock::Text { text, .. } => {
+                    text == "name=e2e-as-proxy-stdio-identity|title=Caller Title"
+                }
+                _ => false,
+            }),
+        "as_proxy must stamp the inbound ClientBuilder title onto the upstream handler: {identified_result:?}"
+    );
+
+    let bare_result =
+        runtime_block_on_bounded(&cx, bare.call_tool(&cx, "ext/client_identity", json!({})))
+            .expect("as_proxy must still forward ext/client_identity for a bare inbound client");
+    assert!(
+        bare_result.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "name=e2e-as-proxy-stdio-identity-bare|title=none"
+            }
+            _ => false,
+        }),
+        "changing only the missing inbound title must keep the upstream handler extras bare: {bare_result:?}"
+    );
+
+    drop(identified);
+    drop(bare);
+    gateway.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_identity_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("identity proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("identity proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "identity proxy gateway HTTP server control receiver went away".to_owned(),
+                );
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream, "/mcp")),
+                None,
+                None,
+                "e2e-http-identity-proxy-gateway".to_owned(),
+                "e2e-http-identity-proxy-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .map_err(|error| format!("identity proxy gateway HTTP plan failed: {error}"))?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-live-identity-upstream",
+                    "native-h1:e2e-live-identity-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-http-identity-proxy".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .map_err(|error| {
+                    format!("live HTTP identity proxy upstream connect failed: {error}")
+                })?;
+            let catalog = proxy
+                .catalog_typed()
+                .map_err(|error| format!("live HTTP identity proxy catalog failed: {error}"))?;
+            let server = modern::ServerBuilder::new("e2e-http-identity-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .map_err(|error| format!("as_proxy_typed identity install failed: {error}"))?
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("identity as_proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("identity as_proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "identity as_proxy gateway HTTP server startup receiver went away".to_owned(),
+                );
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("identity as_proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("identity as_proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("identity as_proxy gateway HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("identity as_proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_forwards_inbound_client_implementation() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_client_identity_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let prefixed = format!("ext/{PUBLIC_HTTP_CLIENT_IDENTITY_TOOL_NAME}");
+
+    let mut identified = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-identity", "1.0.0")
+            .title("Caller Title")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the identified public facade connects to the live HTTP as_proxy gateway");
+    let mut bare = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-identity-bare", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the bare public facade connects to the live HTTP as_proxy gateway");
+
+    let listed = runtime_block_on_bounded(&cx, identified.list_tools(&cx, None))
+        .expect("the live HTTP as_proxy gateway must advertise the prefixed identity tool");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "as_proxy_typed must prefix the live identity tool: {listed:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        identified.call_tool(&cx, PUBLIC_HTTP_CLIENT_IDENTITY_TOOL_NAME, json!({})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed identity handler");
+    let _ = missing;
+
+    let identified_result =
+        runtime_block_on_bounded(&cx, identified.call_tool(&cx, &prefixed, json!({})))
+            .expect("as_proxy must forward the prefixed identity tool to the live HTTP upstream");
+    assert!(
+        identified_result
+            .content
+            .iter()
+            .any(|content| match content {
+                ContentBlock::Text { text, .. } => {
+                    text == "name=e2e-as-proxy-http-identity|title=Caller Title"
+                }
+                _ => false,
+            }),
+        "as_proxy must stamp the inbound ClientBuilder title onto the upstream handler: {identified_result:?}"
+    );
+
+    let bare_result = runtime_block_on_bounded(&cx, bare.call_tool(&cx, &prefixed, json!({})))
+        .expect("as_proxy must still forward the prefixed identity tool for a bare inbound client");
+    assert!(
+        bare_result.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "name=e2e-as-proxy-http-identity-bare|title=none"
+            }
+            _ => false,
+        }),
+        "changing only the missing inbound title must keep the upstream handler extras bare: {bare_result:?}"
+    );
+
+    drop(identified);
+    drop(bare);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_forwards_inbound_log_level() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_log_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let prefixed = format!("ext/{PUBLIC_HTTP_LOG_TOOL_NAME}");
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-log", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy log gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live HTTP as_proxy gateway must advertise the prefixed log tool");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "as_proxy_typed must prefix the live log tool: {listed:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_LOG_TOOL_NAME, json!({})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed log handler");
+    let _ = missing;
+
+    runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed, json!({})))
+        .expect("as_proxy must still forward the prefixed log tool before set_log_level");
+    assert!(
+        !client
+            .take_server_notifications()
+            .iter()
+            .any(|notification| {
+                matches!(
+                    notification,
+                    modern::ServerNotification::Message(message)
+                        if message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+                )
+            }),
+        "omitting only set_log_level must keep as_proxy ctx.info silent"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("info logLevel is stored as request metadata");
+    runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed, json!({})))
+        .expect("as_proxy must forward the prefixed log tool after set_log_level(Info)");
+    let info_notifications = client.take_server_notifications();
+    assert!(
+        info_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+                    && message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+        )),
+        "as_proxy must retain upstream ctx.info after inbound set_log_level(Info): {info_notifications:?}"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Emergency)
+        .expect("emergency logLevel still stores request metadata locally");
+    runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed, json!({})))
+        .expect("raising only the logLevel floor cannot break the same as_proxy tools/call");
+    let emergency_notifications = client.take_server_notifications();
+    assert!(
+        !emergency_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+                    && message.data == json!(PUBLIC_HTTP_HANDLER_LOG_TEXT)
+        )),
+        "raising only the inbound logLevel floor must suppress as_proxy ctx.info: {emergency_notifications:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_inbound_log_level() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-log", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy log gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the prefixed echo tool");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == "ext/echo"),
+        "as_proxy must prefix the shipped echo tool: {listed:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "echo", json!({"message": "log"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed echo handler");
+    let _ = missing;
+
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "log"})),
+    )
+    .expect("as_proxy must still forward ext/echo before set_log_level");
+    assert!(
+        !client
+            .take_server_notifications()
+            .iter()
+            .any(|notification| {
+                matches!(
+                    notification,
+                    modern::ServerNotification::Message(message)
+                        if message.data == json!("echo-handler-info")
+                )
+            }),
+        "omitting only set_log_level must keep stdio as_proxy ctx.info silent"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Info)
+        .expect("info logLevel is stored as request metadata");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "log"})),
+    )
+    .expect("as_proxy must forward ext/echo after set_log_level(Info)");
+    let info_notifications = client.take_server_notifications();
+    assert!(
+        info_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+                    && message.data == json!("echo-handler-info")
+        )),
+        "stdio as_proxy must retain upstream ctx.info after inbound set_log_level(Info): {info_notifications:?}"
+    );
+
+    client
+        .set_log_level(modern::LoggingLevel::Emergency)
+        .expect("emergency logLevel still stores request metadata locally");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "log"})),
+    )
+    .expect("raising only the logLevel floor cannot break the same stdio as_proxy tools/call");
+    let emergency_notifications = client.take_server_notifications();
+    assert!(
+        !emergency_notifications.iter().any(|notification| matches!(
+            notification,
+            modern::ServerNotification::Message(message)
+                if message.level == modern::LoggingLevel::Info
+                    && message.data == json!("echo-handler-info")
+        )),
+        "raising only the inbound logLevel floor must suppress stdio as_proxy ctx.info: {emergency_notifications:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
 }
 
 const PUBLIC_HTTP_LEAK_RESOURCE_URI: &str = "test://public-http-e2e/leak";
@@ -23777,6 +24600,465 @@ mod live_websocket_bind {
             )
             .await
             .expect("the modern WebSocket as_proxy Tasks listen client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "proxy"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_creates_official_task_through_the_gateway() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy Tasks create runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_task_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-tasks-create-gateway".to_owned(),
+                "e2e-ws-as-proxy-tasks-create-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket Tasks create gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-tasks-create-upstream",
+                    "native-h1:e2e-ws-as-proxy-tasks-create-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-tasks-create".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP Tasks proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-create-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed Tasks install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy Tasks create must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy Tasks create publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy Tasks create serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public ModernOnly bind_websocket as_proxy Tasks create must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-as-proxy-tasks-create", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy official Tasks create over bind_websocket");
+
+            let prefixed = format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}");
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create list_tools",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("the live as_proxy WebSocket gateway must advertise the prefixed Tasks tool");
+            assert!(
+                listed.tools.iter().any(|tool| tool.name == prefixed),
+                "as_proxy_typed must prefix the live Tasks tool over WebSocket: {listed:?}"
+            );
+            assert!(
+                !listed
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == PUBLIC_HTTP_TASK_TOOL_NAME),
+                "a nonempty as_proxy prefix must not keep the unprefixed Tasks tool over WebSocket: {listed:?}"
+            );
+
+            let unprefixed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create unprefixed",
+                client.call_tool_outcome(&cx, PUBLIC_HTTP_TASK_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not create a Task on the unprefixed path");
+            let _ = unprefixed;
+
+            let created = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create tools/call",
+                client.call_tool_outcome(&cx, &prefixed, json!({})),
+            )
+            .await
+            .expect("the live as_proxy WebSocket gateway must create one official Task through the prefixed tool");
+            let FinalToolCallOutcome::Task(created) = created else {
+                panic!(
+                    "the prefixed task-capable live tool must return the official Task result branch: {created:?}"
+                );
+            };
+            let task_id = created.task.base().task_id.clone();
+
+            let observed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create get",
+                client.get_task(&cx, task_id.clone()),
+            )
+            .await
+            .expect("typed tasks/get must return the WebSocket-gateway-created Task");
+            assert_eq!(
+                observed.task.base().task_id,
+                task_id,
+                "as_proxy WebSocket must keep the same id it created: {observed:?}"
+            );
+
+            let missing = FinalTaskId::parse("missing-ws-gateway-created-task")
+                .expect("the planted-missing task id is a valid official TaskId");
+            let missing_get = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create missing get",
+                client.get_task(&cx, missing),
+            )
+            .await
+            .expect_err("changing only the task id must not invent a Task on the as_proxy WebSocket gateway");
+            let _ = missing_get;
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks create close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern WebSocket as_proxy Tasks create client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_forwards_inbound_client_implementation() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy identity runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_client_identity_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-identity-gateway".to_owned(),
+                "e2e-ws-as-proxy-identity-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket identity gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-identity-upstream",
+                    "native-h1:e2e-ws-as-proxy-identity-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-identity".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP identity proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP identity proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-identity-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed identity install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy identity must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy identity publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy identity serve must be admitted");
+
+            let identified_transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("identified as_proxy WebSocket must complete RFC 6455 upgrade");
+            let mut identified = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-identity", "1.0.0")
+                    .title("Caller Title")
+                    .connect_websocket_with_cx(&cx, identified_transport),
+            )
+            .await
+            .expect("the identified ModernOnly public facade negotiates as_proxy identity over bind_websocket");
+
+            let bare_transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity bare handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("bare as_proxy WebSocket must complete RFC 6455 upgrade");
+            let mut bare = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity bare initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-identity-bare", "1.0.0")
+                    .connect_websocket_with_cx(&cx, bare_transport),
+            )
+            .await
+            .expect("the bare ModernOnly public facade negotiates as_proxy identity over bind_websocket");
+
+            let prefixed = format!("ext/{PUBLIC_HTTP_CLIENT_IDENTITY_TOOL_NAME}");
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity list_tools",
+                identified.list_tools(&cx, None),
+            )
+            .await
+            .expect("the live as_proxy WebSocket gateway must advertise the prefixed identity tool");
+            assert!(
+                listed.tools.iter().any(|tool| tool.name == prefixed),
+                "as_proxy_typed must prefix the live identity tool over WebSocket: {listed:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity unprefixed",
+                identified.call_tool(&cx, PUBLIC_HTTP_CLIENT_IDENTITY_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed identity handler");
+            let _ = missing;
+
+            let identified_result = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity tools/call",
+                identified.call_tool(&cx, &prefixed, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward the prefixed identity tool");
+            assert!(
+                identified_result
+                    .content
+                    .iter()
+                    .any(|content| match content {
+                        ContentBlock::Text { text, .. } => {
+                            text == "name=e2e-as-proxy-ws-identity|title=Caller Title"
+                        }
+                        _ => false,
+                    }),
+                "as_proxy WebSocket must stamp the inbound ClientBuilder title onto the upstream handler: {identified_result:?}"
+            );
+
+            let bare_result = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity bare tools/call",
+                bare.call_tool(&cx, &prefixed, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must still forward the prefixed identity tool for a bare inbound client");
+            assert!(
+                bare_result.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => {
+                        text == "name=e2e-as-proxy-ws-identity-bare|title=none"
+                    }
+                    _ => false,
+                }),
+                "changing only the missing inbound title must keep the upstream handler extras bare: {bare_result:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity close",
+                identified.close(&cx),
+            )
+            .await
+            .expect("the identified as_proxy WebSocket client closes after the live proof");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy identity bare close",
+                bare.close(&cx),
+            )
+            .await
+            .expect("the bare as_proxy WebSocket client closes after the live proof");
+            drop(identified);
+            drop(bare);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_creates_official_task_with_progress_marker() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy Tasks progress-create runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_task_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-tasks-progress-gateway".to_owned(),
+                "e2e-ws-as-proxy-tasks-progress-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket Tasks progress-create gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-tasks-progress-upstream",
+                    "native-h1:e2e-ws-as-proxy-tasks-progress-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-tasks-progress".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP Tasks proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP Tasks proxy catalog is typed");
+            let server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-tasks-progress-gateway", "1.0.0")
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed Tasks install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy Tasks progress-create must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy Tasks progress-create publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy Tasks progress-create serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks progress-create handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public ModernOnly bind_websocket as_proxy Tasks progress-create must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks progress-create initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-as-proxy-tasks-progress", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy official Tasks progress-create over bind_websocket");
+
+            let prefixed = format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}");
+            let marker = modern::ProgressMarker::from("ws-as-proxy-task-create-progress");
+            let unprefixed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks progress-create unprefixed",
+                client.call_tool_outcome_with_progress_marker(
+                    &cx,
+                    PUBLIC_HTTP_TASK_TOOL_NAME,
+                    json!({}),
+                    marker.clone(),
+                ),
+            )
+            .await
+            .expect_err(
+                "changing only the tool name must not create a Task on the unprefixed path even with a progress token",
+            );
+            let _ = unprefixed;
+
+            let created = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks progress-create tools/call",
+                client.call_tool_outcome_with_progress_marker(&cx, &prefixed, json!({}), marker),
+            )
+            .await
+            .expect("a progress token must not prevent as_proxy WebSocket from creating one official Task");
+            let FinalToolCallOutcome::Task(created) = created else {
+                panic!(
+                    "the prefixed task-capable live tool must return the official Task result branch after a progress token: {created:?}"
+                );
+            };
+            let task_id = created.task.base().task_id.clone();
+
+            let observed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks progress-create get",
+                client.get_task(&cx, task_id.clone()),
+            )
+            .await
+            .expect("typed tasks/get must return the WebSocket-gateway-created Task");
+            assert_eq!(
+                observed.task.base().task_id,
+                task_id,
+                "as_proxy WebSocket must keep the same id it created under a progress token: {observed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy Tasks progress-create close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern WebSocket as_proxy Tasks progress-create client closes after the live proof");
             drop(client);
             cx.set_cancel_requested(true);
             listener.abort();
