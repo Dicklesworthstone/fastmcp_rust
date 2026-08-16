@@ -329,14 +329,15 @@ pub use asupersync::{LabConfig, LabRuntime};
 pub use fastmcp_core::{
     AccessToken, AuthContext, Budget, CancelledError, CatalogChangePublisher, ClientCapabilityInfo,
     ClientRoot, Cx, ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
-    ElicitationSender, IntoOutcome, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind,
-    McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpLogLevel, McpOutcome,
-    McpRequestCancellation, McpResult, NoOpElicitationSender, NoOpNotificationSender,
-    NoOpSamplingSender, Outcome, OutcomeExt, ProgressReporter, RegionId, ResourceContentItem,
-    ResourceReadResult, ResourceReader, ResultExt, RootsProvider, SamplingRequest,
-    SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason,
-    Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller, ToolContentItem, cancelled,
-    err, ok,
+    ElicitationSender, IntoOutcome, MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH,
+    MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext, McpContextLeaseGuard, McpError, McpErrorCode,
+    McpLogLevel, McpOutcome, McpRequestCancellation, McpResult, NoOpElicitationSender,
+    NoOpNotificationSender, NoOpSamplingSender, Outcome, OutcomeExt, ProgressReporter,
+    PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole, RegionId,
+    ResourceContentItem, ResourceReadResult, ResourceReader, ResultExt, RootsProvider,
+    SamplingRequest, SamplingRequestMessage, SamplingResponse, SamplingRole, SamplingSender,
+    SamplingStopReason, Scope, ServerCapabilityInfo, TaskId, ToolCallResult, ToolCaller,
+    ToolContentItem, cancelled, err, ok,
 };
 pub use fastmcp_core::{
     DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS, DEFAULT_LOGICAL_EXCHANGE_MAX_INPUTS_PER_ROUND,
@@ -1639,6 +1640,21 @@ pub mod auto {
         }
 
         #[must_use]
+        pub fn legacy_resource_template_completion_handler<
+            H: crate::CompletionHandler + 'static,
+        >(
+            self,
+            uri_template: impl Into<String>,
+            handler: H,
+        ) -> Self {
+            Self {
+                inner: self
+                    .inner
+                    .legacy_resource_template_completion_handler(uri_template, handler),
+            }
+        }
+
+        #[must_use]
         pub fn instructions(self, instructions: impl Into<String>) -> Self {
             Self {
                 inner: self.inner.instructions(instructions),
@@ -1949,12 +1965,13 @@ pub mod modern {
         SubscriptionListenCollector,
     };
     pub use fastmcp_core::{
-        CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_RESOURCE_READ_DEPTH,
-        MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext, McpContextLeaseGuard, McpError,
-        McpLogLevel, McpOutcome, McpRequestCancellation, McpResult, NoOpNotificationSender,
-        NotificationSender, Outcome, ProgressReporter, ResourceContentItem, ResourceReadResult,
-        ResourceReader, RootsProvider, ServerCapabilityInfo, ToolCallResult, ToolCaller,
-        ToolContentItem,
+        CanonicalHttpUrl, ClientCapabilityInfo, ClientRoot, Cx, MAX_PROMPT_GET_DEPTH,
+        MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind, McpContext,
+        McpContextLeaseGuard, McpError, McpLogLevel, McpOutcome, McpRequestCancellation, McpResult,
+        NoOpNotificationSender, NotificationSender, Outcome, ProgressReporter, PromptCaller,
+        PromptGetResult, PromptMessageItem, PromptMessageRole, ResourceContentItem,
+        ResourceReadResult, ResourceReader, RootsProvider, ServerCapabilityInfo, ToolCallResult,
+        ToolCaller, ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
@@ -6670,6 +6687,23 @@ pub mod legacy_2024 {
             }
         }
 
+        /// Registers an exact-2024 completion provider for one resource-template URI.
+        ///
+        /// Exact-2024 dispatch selects this provider before the server-wide
+        /// [`Self::completion_handler`] fallback.
+        #[must_use]
+        pub fn resource_template_completion_handler<H: CompletionHandler + 'static>(
+            self,
+            uri_template: impl Into<String>,
+            handler: H,
+        ) -> Self {
+            Self {
+                inner: self
+                    .inner
+                    .legacy_resource_template_completion_handler(uri_template, handler),
+            }
+        }
+
         /// Sets server instructions.
         #[must_use]
         pub fn instructions(self, instructions: impl Into<String>) -> Self {
@@ -8722,10 +8756,11 @@ pub mod prelude {
         FinalCacheResultSet, FinalCacheStats, FinalCacheTtlDiagnostic,
         FinalResourceReadCacheHintProvenance, FinalResultCache, FinalToolSchemaAuthority,
         JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-        MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, MAX_RESOURCE_READ_DEPTH,
-        MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation, NoOpElicitationSender,
-        NoOpNotificationSender, NoOpSamplingSender, PendingRequests, ProgressReporter,
-        PromptHandler, ReceivedTransportFrame, Request, RequestExecution, RequestExecutor,
+        MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES, MAX_PROMPT_GET_DEPTH,
+        MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpContextLeaseGuard, McpRequestCancellation,
+        NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, PendingRequests,
+        ProgressReporter, PromptCaller, PromptGetResult, PromptHandler, PromptMessageItem,
+        PromptMessageRole, ReceivedTransportFrame, Request, RequestExecution, RequestExecutor,
         RequestSender, ResourceContentItem, ResourceHandler, ResourceReadResult, ResourceReader,
         ReverseRequest, ReverseRequestCancellation, SamplingRequest, SamplingRequestMessage,
         SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,

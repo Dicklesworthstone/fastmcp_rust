@@ -1051,6 +1051,25 @@ impl ServerBuilder {
         self
     }
 
+    /// Registers an exact MCP 2024-11-05 completion provider for one resource
+    /// template URI.
+    ///
+    /// Exact-2024 dispatch selects this provider before the server-wide
+    /// [`Self::legacy_completion_handler`] fallback. Initialize advertises
+    /// `capabilities.completions` so a 2024-11-05 client can discover
+    /// `completion/complete`.
+    #[must_use]
+    pub fn legacy_resource_template_completion_handler<H: CompletionHandler + 'static>(
+        mut self,
+        uri_template: impl Into<String>,
+        handler: H,
+    ) -> Self {
+        self.router
+            .add_legacy_resource_template_completion_handler(uri_template, handler);
+        self.capabilities.completions = Some(fastmcp_protocol::CompletionsCapability::default());
+        self
+    }
+
     /// Returns whether this proxy registration will own the exact prompt
     /// target after the configured duplicate policy is applied.
     ///
