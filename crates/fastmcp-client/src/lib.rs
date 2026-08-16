@@ -3179,6 +3179,10 @@ const MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS: usize = 64;
 // cancellation notification is either committed or the connection fails
 // closed; no detached sender survives the caller's cancellation.
 const WEBSOCKET_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS: u64 = 100_000_000;
+/// Wake the one owned ingress reader often enough to observe a caller-owned
+/// cancellation domain without waiting for a peer frame. Exact-2024 peers may
+/// suppress a cancelled request's terminal JSON-RPC result forever.
+const WEBSOCKET_CANCELLED_RECV_POLL_NANOS: u64 = 20_000_000;
 
 const FINAL_SERVER_NOTIFICATION_QUEUE_OVERFLOW_ERROR: &str =
     "Final server notification queue capacity exceeded";
@@ -5230,7 +5234,7 @@ where
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx).await {
+            let frame = match self.recv_with_callback_terminal(cx, cancellation).await {
                 Ok(frame) => frame,
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
@@ -5665,6 +5669,23 @@ where
     {
         self.request_core_verb(cx, "tools/list", Self::websocket_list_parameters(cursor))
             .await
+    }
+
+    /// Lists one catalog page through the negotiated WebSocket era.
+    ///
+    /// Callers supply the already-encoded list-parameter object so exact-2024
+    /// cursor identity (kind + include/exclude tags) can ride the same verb
+    /// as a bare cursor.
+    pub async fn list_catalog_page(
+        &mut self,
+        cx: &Cx,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        self.request_core_verb(cx, method, parameters).await
     }
 
     /// Sends `ping` through the negotiated WebSocket era.
@@ -6556,7 +6577,7 @@ where
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx).await {
+            let frame = match self.recv_with_callback_terminal(cx, None).await {
                 Ok(frame) => frame,
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
@@ -6842,7 +6863,7 @@ where
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx).await {
+            let frame = match self.recv_with_callback_terminal(cx, None).await {
                 Ok(frame) => frame,
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
@@ -7790,15 +7811,25 @@ where
     /// that half to this client on every non-terminal receive outcome. If a
     /// retained callback publishes a terminal failure first, the receive future
     /// is cancel-safely dropped without creating another WebSocket reader.
+    ///
+    /// When a caller-owned cancellation domain is present, ingress is polled
+    /// so a cancelled request can retire without waiting for a peer frame.
+    /// Exact-2024 peers may suppress that request's terminal JSON-RPC result.
     async fn recv_with_callback_terminal(
         &mut self,
         cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
     ) -> Result<ReceivedTransportFrame, TransportError>
     where
         IO: Send + 'static,
     {
         if self.reverse_callback_pool.terminal_error().is_some() {
             return Err(TransportError::Closed);
+        }
+        if cancellation.is_some() {
+            return self
+                .recv_with_callback_terminal_interruptible(cx, cancellation)
+                .await;
         }
         let mut receiver = self.receiver.take().ok_or(TransportError::Closed)?;
         let mut terminal = self.reverse_callback_pool.terminal.subscribe(cx);
@@ -7834,6 +7865,43 @@ where
             Err(_) if cx.checkpoint().is_err() => Err(TransportError::Cancelled),
             Err(_) => Err(TransportError::Closed),
         }
+    }
+
+    async fn recv_with_callback_terminal_interruptible(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+    ) -> Result<ReceivedTransportFrame, TransportError>
+    where
+        IO: Send + 'static,
+    {
+        let mut receiver = self.receiver.take().ok_or(TransportError::Closed)?;
+        let outcome = loop {
+            if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                || cx.checkpoint().is_err()
+            {
+                break Err(TransportError::Cancelled);
+            }
+            if self.reverse_callback_pool.terminal_error().is_some() {
+                break Err(if cx.checkpoint().is_err() {
+                    TransportError::Cancelled
+                } else {
+                    TransportError::Closed
+                });
+            }
+            match asupersync::time::timeout(
+                cx.now(),
+                Duration::from_nanos(WEBSOCKET_CANCELLED_RECV_POLL_NANOS),
+                receiver.recv_with_source(cx),
+            )
+            .await
+            {
+                Ok(result) => break result,
+                Err(_) => continue,
+            }
+        };
+        self.receiver = Some(receiver);
+        outcome
     }
 
     async fn send_message(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
