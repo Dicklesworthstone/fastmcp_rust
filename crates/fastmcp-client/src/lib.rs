@@ -3562,6 +3562,17 @@ fn unexpected_convenience_result(method: &str) -> McpError {
     ))
 }
 
+fn list_tools_semantic_parameters(params: &ListToolsParams) -> serde_json::Value {
+    let mut members = serde_json::Map::new();
+    if let Some(include_tags) = &params.include_tags {
+        members.insert("includeTags".to_owned(), serde_json::json!(include_tags));
+    }
+    if let Some(exclude_tags) = &params.exclude_tags {
+        members.insert("excludeTags".to_owned(), serde_json::json!(exclude_tags));
+    }
+    serde_json::Value::Object(members)
+}
+
 fn convenience_tools_page(result: CoreResult) -> McpResult<(Vec<Tool>, Option<String>)> {
     match result {
         CoreResult::Legacy(LegacyCoreResult::ToolsList(result)) => {
@@ -16252,15 +16263,26 @@ impl Client {
     /// contract is contradicted. A contradictory core result terminates the
     /// connection.
     pub fn list_tools_typed(&mut self, cursor: Option<&str>) -> McpResult<CoreResult> {
-        self.ensure_initialized()?;
-        let cursor = cursor.map(ToOwned::to_owned);
-        let params = ListToolsParams {
-            cursor: cursor.clone(),
+        self.list_tools_typed_with_params(ListToolsParams {
+            cursor: cursor.map(ToOwned::to_owned),
             ..ListToolsParams::default()
-        };
+        })
+    }
+
+    /// Lists one page of tools with explicit include/exclude tag filters.
+    ///
+    /// The tag filters are part of the modern list-cache key so a filtered
+    /// page cannot be served from an unfiltered one.
+    pub fn list_tools_typed_with_params(
+        &mut self,
+        params: ListToolsParams,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let cursor = params.cursor.clone();
+        let semantic_parameters = list_tools_semantic_parameters(&params);
         self.cached_final_core_request(
             "tools/list",
-            serde_json::json!({}),
+            semantic_parameters,
             cursor.as_deref(),
             FinalCacheResultSet::Tools,
             move |client| client.send_typed_core_request("tools/list", params),
@@ -16366,18 +16388,30 @@ impl Client {
     ///
     /// Returns an error if the request fails.
     pub fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
+        self.list_tools_with_params(ListToolsParams::default())
+    }
+
+    /// Follows peer cursors for one tag-filtered tools/list query.
+    pub fn list_tools_with_params(&mut self, params: ListToolsParams) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
+        let include_tags = params.include_tags.clone();
+        let exclude_tags = params.exclude_tags.clone();
         let mut restarts = 0;
         'rebuild: loop {
             let mut all = Vec::new();
-            let mut cursor: Option<String> = None;
+            let mut cursor: Option<String> = params.cursor.clone();
             let mut budget = PaginationBudget::new();
             let mut baseline = None;
 
             loop {
                 budget.begin_page()?;
+                let page_params = ListToolsParams {
+                    cursor: cursor.clone(),
+                    include_tags: include_tags.clone(),
+                    exclude_tags: exclude_tags.clone(),
+                };
                 let (tools, next_cursor) =
-                    convenience_tools_page(self.list_tools_typed(cursor.as_deref())?)?;
+                    convenience_tools_page(self.list_tools_typed_with_params(page_params)?)?;
                 if self.final_list_restart_needed(&FinalCacheResultSet::Tools, &mut baseline) {
                     restarts += 1;
                     if restarts > 1 {
@@ -16413,11 +16447,31 @@ impl Client {
         cursor: Option<&str>,
         limits: ListPageLimits,
     ) -> McpResult<BoundedListPage<Tool>> {
-        let cursor_parameter = validate_list_page_request(cursor, limits)?;
+        self.list_tools_page_with_params(
+            ListToolsParams {
+                cursor: cursor.map(ToOwned::to_owned),
+                ..ListToolsParams::default()
+            },
+            limits,
+        )
+    }
+
+    /// Acquires at most one bounded, tag-filtered tools page.
+    pub fn list_tools_page_with_params(
+        &mut self,
+        params: ListToolsParams,
+        limits: ListPageLimits,
+    ) -> McpResult<BoundedListPage<Tool>> {
+        let request_cursor = params.cursor.clone();
+        let cursor_parameter = validate_list_page_request(request_cursor.as_deref(), limits)?;
         self.ensure_initialized()?;
+        let params = ListToolsParams {
+            cursor: cursor_parameter,
+            ..params
+        };
         let (tools, next_cursor) =
-            convenience_tools_page(self.list_tools_typed(cursor_parameter.as_deref())?)?;
-        bounded_list_page(tools, cursor, next_cursor, limits)
+            convenience_tools_page(self.list_tools_typed_with_params(params)?)?;
+        bounded_list_page(tools, request_cursor.as_deref(), next_cursor, limits)
     }
 
     /// Drives one stdio MRTR operation with one caller context and one
