@@ -26,8 +26,8 @@ use fastmcp_rust::{
 };
 #[cfg(unix)]
 use fastmcp_rust::{
-    Client, Cx, ListToolsParams, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto,
-    legacy_2024, modern,
+    Client, Cx, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
+    ListToolsParams, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto, legacy_2024, modern,
 };
 use serde_json::json;
 
@@ -1243,9 +1243,19 @@ fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
 
 #[cfg(unix)]
 fn connect_modern_stdio_to_shipped_echo_server(server_policy: &str) -> McpResult<modern::Client> {
-    let command = shipped_echo_server_executable();
-    let builder = modern::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
+    connect_modern_stdio_to_shipped_echo_server_with_env(server_policy, &[])
+}
 
+#[cfg(unix)]
+fn connect_modern_stdio_to_shipped_echo_server_with_env(
+    server_policy: &str,
+    extra_env: &[(&str, &str)],
+) -> McpResult<modern::Client> {
+    let command = shipped_echo_server_executable();
+    let mut builder = modern::client_builder().env("FASTMCP_PROTOCOL_POLICY", server_policy);
+    for (key, value) in extra_env {
+        builder = builder.env(*key, *value);
+    }
     builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
 }
 
@@ -5065,6 +5075,305 @@ fn e2e_public_stdio_legacy_default_list_is_not_forced_to_page_size_one() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_modern_catalog_list_page_continues_and_rejects_wrong_kind_cursor() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_LIST_PAGE_SIZE", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the paged echo peer");
+
+    let first_resources = client
+        .list_resources(None)
+        .expect("the first modern stdio resources/list page must miss and reach the catalog");
+    assert_eq!(
+        first_resources.resources.len(),
+        1,
+        "page size 1 must create a real resources continuation: {first_resources:?}"
+    );
+    let first_resource = first_resources.resources[0].uri.as_str().to_owned();
+    let resource_cursor = first_resources
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 resources/list must carry an opaque cursor");
+    let second_resources = client
+        .list_resources(Some(&resource_cursor))
+        .expect("the exact resources cursor continuation must reach the second live page");
+    assert_eq!(
+        second_resources.resources.len(),
+        1,
+        "the resources continuation must retain one remaining resource: {second_resources:?}"
+    );
+    assert_ne!(
+        second_resources.resources[0].uri.as_str(),
+        first_resource,
+        "the resources continuation must advance to a different URI: {second_resources:?}"
+    );
+    let rejected_prompts = client
+        .list_prompts(Some(&resource_cursor))
+        .expect_err("a resources/list cursor must not page prompts/list");
+    let rejected_prompts = format!("{rejected_prompts:?}");
+    assert!(
+        rejected_prompts.contains("InvalidParams") || rejected_prompts.contains("invalid"),
+        "a wrong-catalog resources cursor must stay InvalidParams: {rejected_prompts}"
+    );
+
+    let first_prompts = client
+        .list_prompts(None)
+        .expect("the first modern stdio prompts/list page must miss and reach the catalog");
+    assert_eq!(
+        first_prompts.prompts.len(),
+        1,
+        "page size 1 must create a real prompts continuation: {first_prompts:?}"
+    );
+    let first_prompt = first_prompts.prompts[0].name.clone();
+    let prompt_cursor = first_prompts
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 prompts/list must carry an opaque cursor");
+    let second_prompts = client
+        .list_prompts(Some(&prompt_cursor))
+        .expect("the exact prompts cursor continuation must reach the second live page");
+    assert_eq!(
+        second_prompts.prompts.len(),
+        1,
+        "the prompts continuation must retain one remaining prompt: {second_prompts:?}"
+    );
+    assert_ne!(
+        second_prompts.prompts[0].name, first_prompt,
+        "the prompts continuation must advance to a different name: {second_prompts:?}"
+    );
+    let rejected_tools = client
+        .list_tools(Some(&prompt_cursor))
+        .expect_err("a prompts/list cursor must not page tools/list");
+    let rejected_tools = format!("{rejected_tools:?}");
+    assert!(
+        rejected_tools.contains("InvalidParams") || rejected_tools.contains("invalid"),
+        "a wrong-catalog prompts cursor must stay InvalidParams: {rejected_tools}"
+    );
+
+    let first_templates = client
+        .list_resource_templates(None)
+        .expect("the first modern stdio templates/list page must miss and reach the catalog");
+    assert_eq!(
+        first_templates.resource_templates.len(),
+        1,
+        "page size 1 must create a real templates continuation: {first_templates:?}"
+    );
+    let first_template = first_templates.resource_templates[0].uri_template.clone();
+    let template_cursor = first_templates
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 templates/list must carry an opaque cursor");
+    let second_templates = client
+        .list_resource_templates(Some(&template_cursor))
+        .expect("the exact templates cursor continuation must reach the second live page");
+    assert_eq!(
+        second_templates.resource_templates.len(),
+        1,
+        "the templates continuation must retain one remaining template: {second_templates:?}"
+    );
+    assert_ne!(
+        second_templates.resource_templates[0].uri_template, first_template,
+        "the templates continuation must advance to a different URI template: {second_templates:?}"
+    );
+    let rejected_resources = client
+        .list_resources(Some(&template_cursor))
+        .expect_err("a templates/list cursor must not page resources/list");
+    let rejected_resources = format!("{rejected_resources:?}");
+    assert!(
+        rejected_resources.contains("InvalidParams") || rejected_resources.contains("invalid"),
+        "a wrong-catalog templates cursor must stay InvalidParams: {rejected_resources}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio catalog-paged client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_default_catalog_list_is_not_forced_to_page_size_one() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the unpaged echo peer");
+
+    let resources = client
+        .list_resources(None)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first resources page");
+    assert!(
+        resources.resources.len() > 1,
+        "changing only the missing page-size flag must keep more than one resource on the first page: {resources:?}"
+    );
+    let prompts = client
+        .list_prompts(None)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first prompts page");
+    assert!(
+        prompts.prompts.len() > 1,
+        "changing only the missing page-size flag must keep more than one prompt on the first page: {prompts:?}"
+    );
+    let templates = client
+        .list_resource_templates(None)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first templates page");
+    assert!(
+        templates.resource_templates.len() > 1,
+        "changing only the missing page-size flag must keep more than one template on the first page: {templates:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio unpaged catalog client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_catalog_list_page_continues_and_rejects_wrong_kind_cursor() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server_with_env(
+        "legacy-only",
+        &[("FASTMCP_LIST_PAGE_SIZE", "1")],
+    )
+    .expect("a LegacyOnly facade client connects to the paged echo peer");
+
+    let first_resources = client
+        .list_resources_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("the first exact-2024 stdio resources/list page must miss and reach the catalog");
+    assert_eq!(
+        first_resources.items.len(),
+        1,
+        "page size 1 must create a real resources continuation: {first_resources:?}"
+    );
+    let first_resource = first_resources.items[0].uri.clone();
+    let resource_cursor = first_resources
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 resources/list must carry an opaque cursor");
+    let second_resources = client
+        .list_resources_page(Some(&resource_cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect("the exact resources cursor continuation must reach the second live page");
+    assert_eq!(
+        second_resources.items.len(),
+        1,
+        "the resources continuation must retain one remaining resource: {second_resources:?}"
+    );
+    assert_ne!(
+        second_resources.items[0].uri, first_resource,
+        "the resources continuation must advance to a different URI: {second_resources:?}"
+    );
+    let rejected_prompts = client
+        .list_prompts_page(Some(&resource_cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect_err("a resources/list cursor must not page prompts/list");
+    let rejected_prompts = format!("{rejected_prompts:?}");
+    assert!(
+        rejected_prompts.contains("InvalidParams") || rejected_prompts.contains("invalid"),
+        "a wrong-catalog resources cursor must stay InvalidParams: {rejected_prompts}"
+    );
+
+    let first_prompts = client
+        .list_prompts_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("the first exact-2024 stdio prompts/list page must miss and reach the catalog");
+    assert_eq!(
+        first_prompts.items.len(),
+        1,
+        "page size 1 must create a real prompts continuation: {first_prompts:?}"
+    );
+    let first_prompt = first_prompts.items[0].name.clone();
+    let prompt_cursor = first_prompts
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 prompts/list must carry an opaque cursor");
+    let second_prompts = client
+        .list_prompts_page(Some(&prompt_cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect("the exact prompts cursor continuation must reach the second live page");
+    assert_eq!(
+        second_prompts.items.len(),
+        1,
+        "the prompts continuation must retain one remaining prompt: {second_prompts:?}"
+    );
+    assert_ne!(
+        second_prompts.items[0].name, first_prompt,
+        "the prompts continuation must advance to a different name: {second_prompts:?}"
+    );
+    let rejected_tools = client
+        .list_tools_page(Some(&prompt_cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect_err("a prompts/list cursor must not page tools/list");
+    let rejected_tools = format!("{rejected_tools:?}");
+    assert!(
+        rejected_tools.contains("InvalidParams") || rejected_tools.contains("invalid"),
+        "a wrong-catalog prompts cursor must stay InvalidParams: {rejected_tools}"
+    );
+
+    let first_templates = client
+        .list_resource_templates_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("the first exact-2024 stdio templates/list page must miss and reach the catalog");
+    assert_eq!(
+        first_templates.items.len(),
+        1,
+        "page size 1 must create a real templates continuation: {first_templates:?}"
+    );
+    let first_template = first_templates.items[0].uri_template.clone();
+    let template_cursor = first_templates
+        .next_cursor
+        .clone()
+        .expect("the first page-size-1 templates/list must carry an opaque cursor");
+    let second_templates = client
+        .list_resource_templates_page(Some(&template_cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect("the exact templates cursor continuation must reach the second live page");
+    assert_eq!(
+        second_templates.items.len(),
+        1,
+        "the templates continuation must retain one remaining template: {second_templates:?}"
+    );
+    assert_ne!(
+        second_templates.items[0].uri_template, first_template,
+        "the templates continuation must advance to a different URI template: {second_templates:?}"
+    );
+    let rejected_resources = client
+        .list_resources_page(Some(&template_cursor), STDIO_LIST_PAGE_LIMITS)
+        .expect_err("a templates/list cursor must not page resources/list");
+    let rejected_resources = format!("{rejected_resources:?}");
+    assert!(
+        rejected_resources.contains("InvalidParams") || rejected_resources.contains("invalid"),
+        "a wrong-catalog templates cursor must stay InvalidParams: {rejected_resources}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio catalog-paged client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_default_catalog_list_is_not_forced_to_page_size_one() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the unpaged echo peer");
+
+    let resources = client
+        .list_resources_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first resources page");
+    assert!(
+        resources.items.len() > 1,
+        "changing only the missing page-size flag must keep more than one resource on the first page: {resources:?}"
+    );
+    let prompts = client
+        .list_prompts_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first prompts page");
+    assert!(
+        prompts.items.len() > 1,
+        "changing only the missing page-size flag must keep more than one prompt on the first page: {prompts:?}"
+    );
+    let templates = client
+        .list_resource_templates_page(None, STDIO_LIST_PAGE_LIMITS)
+        .expect("omitting only FASTMCP_LIST_PAGE_SIZE must list the full first templates page");
+    assert!(
+        templates.items.len() > 1,
+        "changing only the missing page-size flag must keep more than one template on the first page: {templates:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio unpaged catalog client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_modern_transformed_echo_renames_argument() {
     let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
         "modern-only",
@@ -5224,7 +5533,7 @@ fn e2e_public_stdio_legacy_transformed_echo_hides_argument_and_injects_default()
 #[cfg(unix)]
 #[test]
 fn e2e_public_stdio_modern_hide_arg_schema_drops_message() {
-    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+    let mut client = connect_modern_stdio_to_shipped_echo_server_with_env(
         "modern-only",
         &[("FASTMCP_TRANSFORM_HIDE", "1")],
     )
@@ -5305,6 +5614,42 @@ fn stdio_tool_list_params(include: Option<&[&str]>, exclude: Option<&[&str]>) ->
         include_tags: include.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
         exclude_tags: exclude.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
         ..ListToolsParams::default()
+    }
+}
+
+#[cfg(unix)]
+fn stdio_resource_list_params(
+    include: Option<&[&str]>,
+    exclude: Option<&[&str]>,
+) -> ListResourcesParams {
+    ListResourcesParams {
+        include_tags: include.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        exclude_tags: exclude.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        ..ListResourcesParams::default()
+    }
+}
+
+#[cfg(unix)]
+fn stdio_prompt_list_params(
+    include: Option<&[&str]>,
+    exclude: Option<&[&str]>,
+) -> ListPromptsParams {
+    ListPromptsParams {
+        include_tags: include.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        exclude_tags: exclude.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        ..ListPromptsParams::default()
+    }
+}
+
+#[cfg(unix)]
+fn stdio_template_list_params(
+    include: Option<&[&str]>,
+    exclude: Option<&[&str]>,
+) -> ListResourceTemplatesParams {
+    ListResourceTemplatesParams {
+        include_tags: include.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        exclude_tags: exclude.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect()),
+        ..ListResourceTemplatesParams::default()
     }
 }
 
@@ -5423,6 +5768,691 @@ fn e2e_public_stdio_legacy_list_tools_include_and_exclude_tags() {
     client
         .close()
         .expect("legacy-only stdio tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_list_resources_include_and_exclude_tags() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the tagged echo peer");
+
+    let server = client
+        .list_resources_with_params(stdio_resource_list_params(Some(&["server"]), None))
+        .expect("includeTags server must list the tagged info://server resource");
+    assert!(
+        server
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://server"),
+        "includeTags server must retain info://server: {server:?}"
+    );
+    assert!(
+        server
+            .resources
+            .iter()
+            .all(|resource| resource.uri.as_str() != "info://leak"),
+        "includeTags server must omit info://leak: {server:?}"
+    );
+
+    let secret = client
+        .list_resources_with_params(stdio_resource_list_params(Some(&["secret"]), None))
+        .expect("changing only includeTags must list the secret-tagged leak resource");
+    assert!(
+        secret
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://leak"),
+        "includeTags secret must retain info://leak: {secret:?}"
+    );
+    assert!(
+        secret
+            .resources
+            .iter()
+            .all(|resource| resource.uri.as_str() != "info://server"),
+        "includeTags secret must omit info://server: {secret:?}"
+    );
+
+    let excluded = client
+        .list_resources_with_params(stdio_resource_list_params(None, Some(&["server"])))
+        .expect("excludeTags server must omit only the server-tagged resource");
+    assert!(
+        excluded
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://leak"),
+        "excludeTags server must keep info://leak: {excluded:?}"
+    );
+    assert!(
+        excluded
+            .resources
+            .iter()
+            .all(|resource| resource.uri.as_str() != "info://server"),
+        "excludeTags server must omit info://server: {excluded:?}"
+    );
+
+    let listed = client
+        .list_resources(None)
+        .expect("an unfiltered modern resources/list must keep both tagged resources");
+    assert!(
+        listed
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://server")
+            && listed
+                .resources
+                .iter()
+                .any(|resource| resource.uri.as_str() == "info://leak"),
+        "omitting only the tag filters must list info://server and info://leak: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio resource tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_list_resources_include_and_exclude_tags() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the tagged echo peer");
+
+    let server = client
+        .list_resources_with_params(stdio_resource_list_params(Some(&["server"]), None))
+        .expect("includeTags server must list the tagged info://server resource");
+    assert!(
+        server
+            .iter()
+            .any(|resource| resource.uri == "info://server"),
+        "includeTags server must retain info://server: {server:?}"
+    );
+    assert!(
+        server.iter().all(|resource| resource.uri != "info://leak"),
+        "includeTags server must omit info://leak: {server:?}"
+    );
+    assert!(
+        server.iter().any(|resource| resource.uri == "info://server"
+            && resource.tags.iter().any(|tag| tag == "server")),
+        "exact-2024 includeTags must retain the server tag on info://server: {server:?}"
+    );
+
+    let secret = client
+        .list_resources_with_params(stdio_resource_list_params(Some(&["secret"]), None))
+        .expect("changing only includeTags must list the secret-tagged leak resource");
+    assert!(
+        secret.iter().any(|resource| resource.uri == "info://leak"),
+        "includeTags secret must retain info://leak: {secret:?}"
+    );
+    assert!(
+        secret
+            .iter()
+            .all(|resource| resource.uri != "info://server"),
+        "includeTags secret must omit info://server: {secret:?}"
+    );
+
+    let excluded = client
+        .list_resources_with_params(stdio_resource_list_params(None, Some(&["server"])))
+        .expect("excludeTags server must omit only the server-tagged resource");
+    assert!(
+        excluded
+            .iter()
+            .any(|resource| resource.uri == "info://leak"),
+        "excludeTags server must keep info://leak: {excluded:?}"
+    );
+    assert!(
+        excluded
+            .iter()
+            .all(|resource| resource.uri != "info://server"),
+        "excludeTags server must omit info://server: {excluded:?}"
+    );
+
+    let listed = client
+        .list_resources()
+        .expect("an unfiltered exact-2024 resources/list must keep both tagged resources");
+    assert!(
+        listed
+            .iter()
+            .any(|resource| resource.uri == "info://server")
+            && listed.iter().any(|resource| resource.uri == "info://leak"),
+        "omitting only the tag filters must list info://server and info://leak: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio resource tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_list_prompts_include_and_exclude_tags() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the tagged echo peer");
+
+    let onboarding = client
+        .list_prompts_with_params(stdio_prompt_list_params(Some(&["onboarding"]), None))
+        .expect("includeTags onboarding must list the tagged greeting prompt");
+    assert!(
+        onboarding
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == "greeting"),
+        "includeTags onboarding must retain greeting: {onboarding:?}"
+    );
+    assert!(
+        onboarding
+            .prompts
+            .iter()
+            .all(|prompt| prompt.name != "compose_greeting"),
+        "includeTags onboarding must omit compose_greeting: {onboarding:?}"
+    );
+
+    let compose = client
+        .list_prompts_with_params(stdio_prompt_list_params(Some(&["compose"]), None))
+        .expect("changing only includeTags must list the compose-tagged prompt");
+    assert!(
+        compose
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == "compose_greeting"),
+        "includeTags compose must retain compose_greeting: {compose:?}"
+    );
+    assert!(
+        compose
+            .prompts
+            .iter()
+            .all(|prompt| prompt.name != "greeting"),
+        "includeTags compose must omit greeting: {compose:?}"
+    );
+
+    let excluded = client
+        .list_prompts_with_params(stdio_prompt_list_params(None, Some(&["onboarding"])))
+        .expect("excludeTags onboarding must omit only the onboarding-tagged prompt");
+    assert!(
+        excluded
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == "compose_greeting"),
+        "excludeTags onboarding must keep compose_greeting: {excluded:?}"
+    );
+    assert!(
+        excluded
+            .prompts
+            .iter()
+            .all(|prompt| prompt.name != "greeting"),
+        "excludeTags onboarding must omit greeting: {excluded:?}"
+    );
+
+    let listed = client
+        .list_prompts(None)
+        .expect("an unfiltered modern prompts/list must keep both tagged prompts");
+    assert!(
+        listed
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == "greeting")
+            && listed
+                .prompts
+                .iter()
+                .any(|prompt| prompt.name == "compose_greeting"),
+        "omitting only the tag filters must list greeting and compose_greeting: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio prompt tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_list_prompts_include_and_exclude_tags() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the tagged echo peer");
+
+    let onboarding = client
+        .list_prompts_with_params(stdio_prompt_list_params(Some(&["onboarding"]), None))
+        .expect("includeTags onboarding must list the tagged greeting prompt");
+    assert!(
+        onboarding.iter().any(|prompt| prompt.name == "greeting"),
+        "includeTags onboarding must retain greeting: {onboarding:?}"
+    );
+    assert!(
+        onboarding
+            .iter()
+            .all(|prompt| prompt.name != "compose_greeting"),
+        "includeTags onboarding must omit compose_greeting: {onboarding:?}"
+    );
+    assert!(
+        onboarding
+            .iter()
+            .any(|prompt| prompt.name == "greeting"
+                && prompt.tags.iter().any(|tag| tag == "onboarding")),
+        "exact-2024 includeTags must retain the onboarding tag on greeting: {onboarding:?}"
+    );
+
+    let compose = client
+        .list_prompts_with_params(stdio_prompt_list_params(Some(&["compose"]), None))
+        .expect("changing only includeTags must list the compose-tagged prompt");
+    assert!(
+        compose
+            .iter()
+            .any(|prompt| prompt.name == "compose_greeting"),
+        "includeTags compose must retain compose_greeting: {compose:?}"
+    );
+    assert!(
+        compose.iter().all(|prompt| prompt.name != "greeting"),
+        "includeTags compose must omit greeting: {compose:?}"
+    );
+
+    let excluded = client
+        .list_prompts_with_params(stdio_prompt_list_params(None, Some(&["onboarding"])))
+        .expect("excludeTags onboarding must omit only the onboarding-tagged prompt");
+    assert!(
+        excluded
+            .iter()
+            .any(|prompt| prompt.name == "compose_greeting"),
+        "excludeTags onboarding must keep compose_greeting: {excluded:?}"
+    );
+    assert!(
+        excluded.iter().all(|prompt| prompt.name != "greeting"),
+        "excludeTags onboarding must omit greeting: {excluded:?}"
+    );
+
+    let listed = client
+        .list_prompts()
+        .expect("an unfiltered exact-2024 prompts/list must keep both tagged prompts");
+    assert!(
+        listed.iter().any(|prompt| prompt.name == "greeting")
+            && listed
+                .iter()
+                .any(|prompt| prompt.name == "compose_greeting"),
+        "omitting only the tag filters must list greeting and compose_greeting: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio prompt tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_list_resource_templates_include_and_exclude_tags() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the tagged echo peer");
+
+    let notes = client
+        .list_resource_templates_with_params(stdio_template_list_params(Some(&["notes"]), None))
+        .expect("includeTags notes must list the note template");
+    assert!(
+        notes
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == "note://{name}"),
+        "includeTags notes must retain note://{{name}}: {notes:?}"
+    );
+    assert!(
+        notes
+            .resource_templates
+            .iter()
+            .all(|template| template.uri_template != "memo://{name}"),
+        "includeTags notes must omit memo://{{name}}: {notes:?}"
+    );
+
+    let memos = client
+        .list_resource_templates_with_params(stdio_template_list_params(Some(&["memos"]), None))
+        .expect("changing only includeTags must list the memo template");
+    assert!(
+        memos
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == "memo://{name}"),
+        "includeTags memos must retain memo://{{name}}: {memos:?}"
+    );
+    assert!(
+        memos
+            .resource_templates
+            .iter()
+            .all(|template| template.uri_template != "note://{name}"),
+        "includeTags memos must omit note://{{name}}: {memos:?}"
+    );
+
+    let excluded = client
+        .list_resource_templates_with_params(stdio_template_list_params(None, Some(&["notes"])))
+        .expect("excludeTags notes must omit only the notes template");
+    assert!(
+        excluded
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == "memo://{name}"),
+        "excludeTags notes must keep memo://{{name}}: {excluded:?}"
+    );
+    assert!(
+        excluded
+            .resource_templates
+            .iter()
+            .all(|template| template.uri_template != "note://{name}"),
+        "excludeTags notes must omit note://{{name}}: {excluded:?}"
+    );
+
+    let listed = client
+        .list_resource_templates(None)
+        .expect("an unfiltered modern templates/list must keep both tagged templates");
+    assert!(
+        listed
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == "note://{name}")
+            && listed
+                .resource_templates
+                .iter()
+                .any(|template| template.uri_template == "memo://{name}"),
+        "omitting only the tag filters must list note and memo templates: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio template tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_list_resource_templates_include_and_exclude_tags() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the tagged echo peer");
+
+    let notes = client
+        .list_resource_templates_with_params(stdio_template_list_params(Some(&["notes"]), None))
+        .expect("includeTags notes must list the note template");
+    assert!(
+        notes
+            .iter()
+            .any(|template| template.uri_template == "note://{name}"),
+        "includeTags notes must retain note://{{name}}: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .all(|template| template.uri_template != "memo://{name}"),
+        "includeTags notes must omit memo://{{name}}: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|template| template.uri_template == "note://{name}"
+                && template.tags.iter().any(|tag| tag == "notes")),
+        "exact-2024 includeTags must retain the notes tag on note://{{name}}: {notes:?}"
+    );
+
+    let memos = client
+        .list_resource_templates_with_params(stdio_template_list_params(Some(&["memos"]), None))
+        .expect("changing only includeTags must list the memo template");
+    assert!(
+        memos
+            .iter()
+            .any(|template| template.uri_template == "memo://{name}"),
+        "includeTags memos must retain memo://{{name}}: {memos:?}"
+    );
+    assert!(
+        memos
+            .iter()
+            .all(|template| template.uri_template != "note://{name}"),
+        "includeTags memos must omit note://{{name}}: {memos:?}"
+    );
+
+    let excluded = client
+        .list_resource_templates_with_params(stdio_template_list_params(None, Some(&["notes"])))
+        .expect("excludeTags notes must omit only the notes template");
+    assert!(
+        excluded
+            .iter()
+            .any(|template| template.uri_template == "memo://{name}"),
+        "excludeTags notes must keep memo://{{name}}: {excluded:?}"
+    );
+    assert!(
+        excluded
+            .iter()
+            .all(|template| template.uri_template != "note://{name}"),
+        "excludeTags notes must omit note://{{name}}: {excluded:?}"
+    );
+
+    let listed = client
+        .list_resource_templates()
+        .expect("an unfiltered exact-2024 templates/list must keep both tagged templates");
+    assert!(
+        listed
+            .iter()
+            .any(|template| template.uri_template == "note://{name}")
+            && listed
+                .iter()
+                .any(|template| template.uri_template == "memo://{name}"),
+        "omitting only the tag filters must list note and memo templates: {listed:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio template tag-filter client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_list_catalog_include_tags_honor_cancellation_domain() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects before tagged catalog cancellation");
+    let cx = Cx::for_request();
+    let live = fastmcp_rust::McpRequestCancellation::new();
+
+    let server = client
+        .list_resources_with_params_and_cancellation(
+            &cx,
+            &live,
+            stdio_resource_list_params(Some(&["server"]), None),
+        )
+        .expect("an uncancelled domain must still send includeTags on resources/list");
+    assert!(
+        server
+            .resources
+            .iter()
+            .any(|resource| resource.uri.as_str() == "info://server"),
+        "live cancellation domain plus includeTags server must retain info://server: {server:?}"
+    );
+    assert!(
+        server
+            .resources
+            .iter()
+            .all(|resource| resource.uri.as_str() != "info://leak"),
+        "live cancellation domain plus includeTags server must omit info://leak: {server:?}"
+    );
+
+    let onboarding = client
+        .list_prompts_with_params_and_cancellation(
+            &cx,
+            &live,
+            stdio_prompt_list_params(Some(&["onboarding"]), None),
+        )
+        .expect("an uncancelled domain must still send includeTags on prompts/list");
+    assert!(
+        onboarding
+            .prompts
+            .iter()
+            .any(|prompt| prompt.name == "greeting"),
+        "live cancellation domain plus includeTags onboarding must retain greeting: {onboarding:?}"
+    );
+    assert!(
+        onboarding
+            .prompts
+            .iter()
+            .all(|prompt| prompt.name != "compose_greeting"),
+        "live cancellation domain plus includeTags onboarding must omit compose_greeting: {onboarding:?}"
+    );
+
+    let notes = client
+        .list_resource_templates_with_params_and_cancellation(
+            &cx,
+            &live,
+            stdio_template_list_params(Some(&["notes"]), None),
+        )
+        .expect("an uncancelled domain must still send includeTags on resources/templates/list");
+    assert!(
+        notes
+            .resource_templates
+            .iter()
+            .any(|template| template.uri_template == "note://{name}"),
+        "live cancellation domain plus includeTags notes must retain note://{{name}}: {notes:?}"
+    );
+    assert!(
+        notes
+            .resource_templates
+            .iter()
+            .all(|template| template.uri_template != "memo://{name}"),
+        "live cancellation domain plus includeTags notes must omit memo://{{name}}: {notes:?}"
+    );
+
+    let already = fastmcp_rust::McpRequestCancellation::new();
+    already.cancel();
+    let pre_send_resources = client
+        .list_resources_with_params_and_cancellation(
+            &cx,
+            &already,
+            stdio_resource_list_params(Some(&["server"]), None),
+        )
+        .expect_err("pre-send cancellation must reject a tagged resources/list locally");
+    assert_eq!(pre_send_resources.code, McpErrorCode::RequestCancelled);
+    let pre_send_prompts = client
+        .list_prompts_with_params_and_cancellation(
+            &cx,
+            &already,
+            stdio_prompt_list_params(Some(&["onboarding"]), None),
+        )
+        .expect_err("pre-send cancellation must reject a tagged prompts/list locally");
+    assert_eq!(pre_send_prompts.code, McpErrorCode::RequestCancelled);
+    let pre_send_templates = client
+        .list_resource_templates_with_params_and_cancellation(
+            &cx,
+            &already,
+            stdio_template_list_params(Some(&["notes"]), None),
+        )
+        .expect_err("pre-send cancellation must reject a tagged resources/templates/list locally");
+    assert_eq!(pre_send_templates.code, McpErrorCode::RequestCancelled);
+
+    client
+        .ping()
+        .expect("modern stdio ping remains usable after tagged catalog cancellation");
+    client
+        .close()
+        .expect("modern-only stdio tagged catalog cancellation client cleanup");
+}
+
+const STDIO_SERVER_INFO_ICON: &str = "https://example.test/echo-server.png";
+const STDIO_GREETING_ICON: &str = "https://example.test/echo-greeting.png";
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_list_resources_and_prompts_retain_icons() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client connects to the icon-bearing echo peer");
+
+    let listed = client
+        .list_resources(None)
+        .expect("modern resources/list must retain shipped icons");
+    let server = listed
+        .resources
+        .iter()
+        .find(|resource| resource.uri.as_str() == "info://server")
+        .expect("info://server must remain on the live catalog");
+    let leak = listed
+        .resources
+        .iter()
+        .find(|resource| resource.uri.as_str() == "info://leak")
+        .expect("info://leak must remain the iconless peer");
+    let icons = server
+        .icons
+        .as_ref()
+        .expect("info://server must advertise its exact-final icon");
+    assert_eq!(icons.len(), 1);
+    assert_eq!(icons[0].src.as_str(), STDIO_SERVER_INFO_ICON);
+    assert_eq!(
+        leak.icons, None,
+        "changing only the missing icon must keep info://leak iconless: {leak:?}"
+    );
+
+    let listed_prompts = client
+        .list_prompts(None)
+        .expect("modern prompts/list must retain shipped icons");
+    let greeting = listed_prompts
+        .prompts
+        .iter()
+        .find(|prompt| prompt.name == "greeting")
+        .expect("greeting must remain on the live catalog");
+    let compose = listed_prompts
+        .prompts
+        .iter()
+        .find(|prompt| prompt.name == "compose_greeting")
+        .expect("compose_greeting must remain the iconless peer");
+    let greeting_icons = greeting
+        .icons
+        .as_ref()
+        .expect("greeting must advertise its exact-final icon");
+    assert_eq!(greeting_icons.len(), 1);
+    assert_eq!(greeting_icons[0].src.as_str(), STDIO_GREETING_ICON);
+    assert_eq!(
+        compose.icons, None,
+        "changing only the missing icon must keep compose_greeting iconless: {compose:?}"
+    );
+
+    client
+        .close()
+        .expect("modern-only stdio catalog-icon client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_list_resources_and_prompts_retain_icons() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects to the icon-bearing echo peer");
+
+    let listed = client
+        .list_resources()
+        .expect("exact-2024 resources/list must retain shipped icons");
+    let server = listed
+        .iter()
+        .find(|resource| resource.uri == "info://server")
+        .expect("info://server must remain on the live catalog");
+    let leak = listed
+        .iter()
+        .find(|resource| resource.uri == "info://leak")
+        .expect("info://leak must remain the iconless peer");
+    assert_eq!(
+        server.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some(STDIO_SERVER_INFO_ICON),
+        "exact-2024 info://server must retain its icon src: {server:?}"
+    );
+    assert_eq!(
+        leak.icon, None,
+        "changing only the missing icon must keep info://leak iconless: {leak:?}"
+    );
+
+    let listed_prompts = client
+        .list_prompts()
+        .expect("exact-2024 prompts/list must retain shipped icons");
+    let greeting = listed_prompts
+        .iter()
+        .find(|prompt| prompt.name == "greeting")
+        .expect("greeting must remain on the live catalog");
+    let compose = listed_prompts
+        .iter()
+        .find(|prompt| prompt.name == "compose_greeting")
+        .expect("compose_greeting must remain the iconless peer");
+    assert_eq!(
+        greeting.icon.as_ref().and_then(|icon| icon.src.as_deref()),
+        Some(STDIO_GREETING_ICON),
+        "exact-2024 greeting must retain its icon src: {greeting:?}"
+    );
+    assert_eq!(
+        compose.icon, None,
+        "changing only the missing icon must keep compose_greeting iconless: {compose:?}"
+    );
+
+    client
+        .close()
+        .expect("legacy-only stdio catalog-icon client cleanup");
 }
 
 #[cfg(unix)]
