@@ -10201,6 +10201,86 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
     gateway.shutdown();
 }
 
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_creates_official_task_through_the_gateway() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let prefixed = format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}");
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-tasks-create", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live as_proxy Tasks gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live as_proxy gateway must advertise the prefixed Tasks tool");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "as_proxy_typed must prefix the live Tasks tool: {listed:?}"
+    );
+    assert!(
+        !listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == PUBLIC_HTTP_TASK_TOOL_NAME),
+        "a nonempty as_proxy prefix must not keep the unprefixed Tasks tool: {listed:?}"
+    );
+
+    let unprefixed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect_err("changing only the tool name must not create a Task on the unprefixed path");
+    let _ = unprefixed;
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(&cx, RequestId::Number(3), &prefixed, json!({}), 1 << 20),
+    )
+    .expect("the live as_proxy gateway must create one official Task through the prefixed tool");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the prefixed task-capable live tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/get must return the gateway-created Task");
+    assert_eq!(
+        observed.task.base().task_id,
+        task_id,
+        "as_proxy_typed must keep the same id it created: {observed:?}"
+    );
+
+    let missing = FinalTaskId::parse("missing-gateway-created-task")
+        .expect("the planted-missing task id is a valid official TaskId");
+    let missing_get = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(5), missing, 1 << 20),
+    )
+    .expect_err("changing only the task id must not invent a Task on the as_proxy gateway");
+    let _ = missing_get;
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
 const PUBLIC_HTTP_LEAK_RESOURCE_URI: &str = "test://public-http-e2e/leak";
 const PUBLIC_HTTP_LEAK_SECRET: &str = "secret-db-dsn";
 
