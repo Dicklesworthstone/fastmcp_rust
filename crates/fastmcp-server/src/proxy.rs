@@ -6,6 +6,10 @@
 #[cfg(feature = "tasks")]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "tasks")]
+use std::future::Future;
+#[cfg(feature = "tasks")]
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 #[cfg(feature = "tasks")]
@@ -379,6 +383,20 @@ pub trait ProxyFinalTaskListener: Send {
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<ProxyFinalTaskListenerEvent>;
+
+    /// Awaits the next upstream Tasks listener event on the caller's `Cx`.
+    ///
+    /// HTTP relay listen must use this from a live SSE dispatch so it does
+    /// not nest `block_on` on a second current-thread runtime. The default
+    /// wraps [`Self::next`] for backends whose ingress is already synchronous.
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyFinalTaskListenerEvent>> + Send + 'a>> {
+        let result = self.next(cx, request_cancellation);
+        Box::pin(async move { result })
+    }
 }
 
 /// One event emitted by a [`ProxyFinalTaskListener`].
@@ -1056,6 +1074,28 @@ pub trait ProxyBackend: Send {
         Err(McpError::invalid_request(
             "Proxy upstream does not own an incremental final Tasks listener",
         ))
+    }
+
+    /// Takes a ready incremental Tasks event, or drives one bounded stdio
+    /// receive turn. `None` means the bound elapsed without an event so the
+    /// caller can drop the route mutex.
+    #[cfg(feature = "tasks")]
+    fn try_next_incremental_final_task_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<ProxyFinalTaskListenerEvent>> {
+        Ok(Some(self.next_incremental_final_task_listener(
+            cx,
+            request_cancellation,
+        )?))
+    }
+
+    /// Retires a live incremental Tasks listener so later route requests can
+    /// use the sole stdio ingress reader again.
+    #[cfg(feature = "tasks")]
+    fn cancel_incremental_final_task_listener(&mut self, _cx: &Cx) -> McpResult<()> {
+        Ok(())
     }
 
     /// Opens one live, route-bound upstream Tasks listener.
@@ -1994,6 +2034,33 @@ impl ProxyBackend for Client {
     }
 
     #[cfg(feature = "tasks")]
+    fn try_next_incremental_final_task_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<ProxyFinalTaskListenerEvent>> {
+        Ok(
+            match Client::try_next_final_task_subscription_event(self, cx, request_cancellation)? {
+                Some(fastmcp_client::StdioTaskSubscriptionEvent::Acknowledged(filter)) => {
+                    Some(ProxyFinalTaskListenerEvent::Acknowledged(filter))
+                }
+                Some(fastmcp_client::StdioTaskSubscriptionEvent::Notification(notification)) => {
+                    Some(ProxyFinalTaskListenerEvent::Notification(notification))
+                }
+                Some(fastmcp_client::StdioTaskSubscriptionEvent::Terminal) => {
+                    Some(ProxyFinalTaskListenerEvent::Terminal)
+                }
+                None => None,
+            },
+        )
+    }
+
+    #[cfg(feature = "tasks")]
+    fn cancel_incremental_final_task_listener(&mut self, cx: &Cx) -> McpResult<()> {
+        Client::cancel_live_final_task_subscription(self, cx)
+    }
+
+    #[cfg(feature = "tasks")]
     fn open_final_task_listener(
         &mut self,
         notifications: SubscriptionFilter,
@@ -2068,6 +2135,40 @@ impl ProxyFinalTaskListener for ProxyIncrementalStdioFinalTaskListener {
         self.client.with_backend(|backend| {
             backend.next_incremental_final_task_listener(cx, request_cancellation)
         })
+    }
+
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyFinalTaskListenerEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                    let _ = self
+                        .client
+                        .with_backend(|backend| backend.cancel_incremental_final_task_listener(cx));
+                    return Err(McpError::request_cancelled());
+                }
+                let event = self.client.with_backend(|backend| {
+                    backend.try_next_incremental_final_task_listener(cx, request_cancellation)
+                })?;
+                if let Some(event) = event {
+                    return Ok(event);
+                }
+                asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
+            }
+        })
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl Drop for ProxyIncrementalStdioFinalTaskListener {
+    fn drop(&mut self) {
+        let cx = Cx::for_request();
+        let _ = self
+            .client
+            .with_backend(|backend| backend.cancel_incremental_final_task_listener(&cx));
     }
 }
 
@@ -2356,22 +2457,11 @@ impl AdmittedProxyFinalTaskListener {
         self.phase = ProxyFinalTaskListenerPhase::Terminated;
         Err(McpError::invalid_request(message))
     }
-}
 
-#[cfg(feature = "tasks")]
-impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
-    fn next(
+    fn admit_event(
         &mut self,
-        cx: &Cx,
-        request_cancellation: &fastmcp_core::McpRequestCancellation,
+        event: ProxyFinalTaskListenerEvent,
     ) -> McpResult<ProxyFinalTaskListenerEvent> {
-        if self.phase == ProxyFinalTaskListenerPhase::Terminated {
-            return Err(McpError::invalid_request(
-                "Proxy final Tasks listener was polled after terminal completion",
-            ));
-        }
-
-        let event = self.inner.next(cx, request_cancellation)?;
         match (self.phase, event) {
             (
                 ProxyFinalTaskListenerPhase::AwaitingAcknowledgement,
@@ -2398,6 +2488,40 @@ impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
                 unreachable!("terminated Tasks listener is rejected before its backend is polled")
             }
         }
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyFinalTaskListener for AdmittedProxyFinalTaskListener {
+    fn next(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyFinalTaskListenerEvent> {
+        if self.phase == ProxyFinalTaskListenerPhase::Terminated {
+            return Err(McpError::invalid_request(
+                "Proxy final Tasks listener was polled after terminal completion",
+            ));
+        }
+
+        let event = self.inner.next(cx, request_cancellation)?;
+        self.admit_event(event)
+    }
+
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyFinalTaskListenerEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            if self.phase == ProxyFinalTaskListenerPhase::Terminated {
+                return Err(McpError::invalid_request(
+                    "Proxy final Tasks listener was polled after terminal completion",
+                ));
+            }
+            let event = self.inner.next_async(cx, request_cancellation).await?;
+            self.admit_event(event)
+        })
     }
 }
 
@@ -2726,6 +2850,14 @@ impl ProxyFinalTaskRelay {
         ctx: &McpContext,
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
+        block_on(self.open_listener_async(ctx, notifications))
+    }
+
+    pub(crate) async fn open_listener_async(
+        &self,
+        ctx: &McpContext,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
         self.ensure_modern_route()?;
         let task_ids = task_subscription_ids(&notifications)
             .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
@@ -2734,7 +2866,8 @@ impl ProxyFinalTaskRelay {
             self.known_task(task_id)?;
         }
         self.client
-            .open_final_task_listener(ctx, notifications)
+            .open_final_task_listener_async(ctx, notifications)
+            .await
             .map(|listener| {
                 Box::new(AdmittedProxyFinalTaskListener::new(listener))
                     as Box<dyn ProxyFinalTaskListener>
@@ -4179,36 +4312,12 @@ struct ProxyHttpFinalTaskListener {
 }
 
 #[cfg(feature = "tasks")]
-impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
-    fn next(
-        &mut self,
-        cx: &Cx,
-        request_cancellation: &fastmcp_core::McpRequestCancellation,
+#[cfg(feature = "tasks")]
+impl ProxyHttpFinalTaskListener {
+    fn map_listen_event(
+        event: Option<ModernHttpSubscriptionListenEvent>,
     ) -> McpResult<ProxyFinalTaskListenerEvent> {
-        let listen = self.listener.next_event(cx);
-        let listen = async move {
-            listen.await.map_err(|error| match error {
-                ModernHttpSubscriptionListenError::CallerCancelled { .. } => {
-                    McpError::request_cancelled()
-                }
-                other => McpError::invalid_request(format!(
-                    "Proxy HTTP final Tasks listener rejected an upstream frame: {other:?}"
-                )),
-            })
-        };
-        match block_on(await_proxy_operation_or_cancellation(
-            cx,
-            request_cancellation,
-            Box::pin(listen),
-        ))
-        .map_err(|error| {
-            if error.code == fastmcp_core::McpErrorCode::RequestCancelled {
-                return error;
-            }
-            McpError::invalid_request(format!(
-                "Proxy HTTP final Tasks listener rejected an upstream frame: {error}"
-            ))
-        })? {
+        match event {
             Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
                 Ok(ProxyFinalTaskListenerEvent::Acknowledged(accepted_filter))
             }
@@ -4222,6 +4331,66 @@ impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
                 McpError::invalid_request("Proxy Tasks listener received a non-Tasks notification"),
             ),
         }
+    }
+
+    fn map_listen_error(error: ModernHttpSubscriptionListenError) -> McpError {
+        match error {
+            ModernHttpSubscriptionListenError::CallerCancelled { .. } => {
+                McpError::request_cancelled()
+            }
+            other => McpError::invalid_request(format!(
+                "Proxy HTTP final Tasks listener rejected an upstream frame: {other:?}"
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyFinalTaskListener for ProxyHttpFinalTaskListener {
+    fn next(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyFinalTaskListenerEvent> {
+        let listen = self.listener.next_event(cx);
+        let listen = async move { listen.await.map_err(Self::map_listen_error) };
+        let event = block_on(await_proxy_operation_or_cancellation(
+            cx,
+            request_cancellation,
+            Box::pin(listen),
+        ))
+        .map_err(|error| {
+            if error.code == fastmcp_core::McpErrorCode::RequestCancelled {
+                return error;
+            }
+            McpError::invalid_request(format!(
+                "Proxy HTTP final Tasks listener rejected an upstream frame: {error}"
+            ))
+        })?;
+        Self::map_listen_event(event)
+    }
+
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyFinalTaskListenerEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            let listen = self.listener.next_event(cx);
+            let listen = async move { listen.await.map_err(Self::map_listen_error) };
+            let event =
+                await_proxy_operation_or_cancellation(cx, request_cancellation, Box::pin(listen))
+                    .await
+                    .map_err(|error| {
+                        if error.code == fastmcp_core::McpErrorCode::RequestCancelled {
+                            return error;
+                        }
+                        McpError::invalid_request(format!(
+                            "Proxy HTTP final Tasks listener rejected an upstream frame: {error}"
+                        ))
+                    })?;
+            Self::map_listen_event(event)
+        })
     }
 }
 
@@ -4460,7 +4629,7 @@ fn receive_modern_response(
 /// control on the pinned message endpoint.
 async fn await_proxy_request_or_cancellation<T>(
     ctx: &McpContext,
-    operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + '_>>,
+    operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + Send + '_>>,
 ) -> McpResult<T> {
     ctx.checkpoint()?;
     let cancellation = ctx.request_cancellation();
@@ -4474,7 +4643,7 @@ async fn await_proxy_request_or_cancellation<T>(
 async fn await_proxy_operation_or_cancellation<T>(
     cx: &Cx,
     request_cancellation: &fastmcp_core::McpRequestCancellation,
-    operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + '_>>,
+    operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + Send + '_>>,
 ) -> McpResult<T> {
     await_proxy_operation_with_cancellation_priority(cx, request_cancellation, operation).await
 }
@@ -4492,7 +4661,11 @@ async fn await_proxy_operation_or_cancellation<T>(
 async fn await_proxy_final_task_listener_event_or_cancellation(
     ctx: &McpContext,
     mut operation: std::pin::Pin<
-        Box<dyn std::future::Future<Output = McpResult<Option<ModernHttpFinalCoreEvent>>> + '_>,
+        Box<
+            dyn std::future::Future<Output = McpResult<Option<ModernHttpFinalCoreEvent>>>
+                + Send
+                + '_,
+        >,
     >,
 ) -> McpResult<Option<ModernHttpFinalCoreEvent>> {
     ctx.checkpoint()?;
@@ -4531,24 +4704,51 @@ async fn await_proxy_final_task_listener_event_or_cancellation(
 /// pending.  When an upstream frame and cancellation are both ready in one
 /// poll turn, the two cancellation checks make the request-owned terminal
 /// state authoritative and drop the upstream frame instead of relaying it.
+/// Upstream HTTP body parks are not cancel-preemptible. Re-arm this timer so
+/// a cancelled request Cx or request token is observed without waiting for
+/// the next upstream SSE frame.
+const PROXY_OPERATION_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 async fn await_proxy_operation_with_cancellation_priority<T>(
     cx: &Cx,
     request_cancellation: &fastmcp_core::McpRequestCancellation,
-    mut operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + '_>>,
+    mut operation: std::pin::Pin<Box<dyn std::future::Future<Output = McpResult<T>> + Send + '_>>,
 ) -> McpResult<T> {
-    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+    if cx.checkpoint().is_err() || request_cancellation.is_cancel_requested() {
+        return Err(McpError::request_cancelled());
+    }
     let cancellation = request_cancellation.clone();
     let mut cancellation_wait = Box::pin(async move {
         cancellation.cancelled().await;
     });
+    let mut cancel_poll = Box::pin(asupersync::time::sleep(
+        cx.now(),
+        PROXY_OPERATION_CANCEL_POLL,
+    ));
     std::future::poll_fn(move |task_cx| {
+        if cx.checkpoint().is_err() || request_cancellation.is_cancel_requested() {
+            return Poll::Ready(Err(McpError::request_cancelled()));
+        }
         if cancellation_wait.as_mut().poll(task_cx).is_ready() {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
         let Poll::Ready(result) = operation.as_mut().poll(task_cx) else {
+            if cancel_poll.as_mut().poll(task_cx).is_ready() {
+                cancel_poll = Box::pin(asupersync::time::sleep(
+                    cx.now(),
+                    PROXY_OPERATION_CANCEL_POLL,
+                ));
+                let _ = cancel_poll.as_mut().poll(task_cx);
+                if cx.checkpoint().is_err() || request_cancellation.is_cancel_requested() {
+                    return Poll::Ready(Err(McpError::request_cancelled()));
+                }
+            }
             return Poll::Pending;
         };
-        if cancellation_wait.as_mut().poll(task_cx).is_ready() {
+        if cancellation_wait.as_mut().poll(task_cx).is_ready()
+            || cx.checkpoint().is_err()
+            || request_cancellation.is_cancel_requested()
+        {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
         Poll::Ready(result)
@@ -5819,13 +6019,21 @@ impl ProxyClient {
         ctx: &McpContext,
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
+        block_on(self.open_final_task_listener_async(ctx, notifications))
+    }
+
+    async fn open_final_task_listener_async(
+        &self,
+        ctx: &McpContext,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Box<dyn ProxyFinalTaskListener>> {
         // Prefer an independent HTTP SSE request so the route mutex stays free
         // while the gateway listen loop waits. Incremental listen is for
         // backends that own a sequential ingress loop (stdio).
         match self
             .with_backend(|backend| backend.start_final_task_listener(notifications.clone()))?
         {
-            Some(request) => return block_on(request.open(ctx)),
+            Some(request) => return request.open(ctx).await,
             None => {}
         }
         if self.with_backend(|backend| {
