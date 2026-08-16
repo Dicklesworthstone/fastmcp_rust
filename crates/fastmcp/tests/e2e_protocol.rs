@@ -1636,6 +1636,198 @@ fn e2e_public_stdio_modern_discovery_retains_instructions_peer_stays_bare() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_modern_discovery_retains_implementation_identity() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client completes live modern discovery");
+    let discovery = client
+        .server_discovery()
+        .expect("modern discovery exposes handshake identity");
+    let identified = discovery
+        .implementation()
+        .expect("configured modern discovery must retain Implementation identity");
+    assert_eq!(identified.name, "echo-server");
+    assert_eq!(identified.version, "1.0.0");
+    assert_eq!(identified.title.as_deref(), Some("FastMCP Echo"));
+    assert_eq!(
+        identified.description.as_deref(),
+        Some("A simple echo server for testing FastMCP.")
+    );
+    assert_eq!(
+        identified.website_url.as_ref().map(|uri| uri.as_str()),
+        Some("https://example.test/fastmcp")
+    );
+    assert_eq!(
+        identified.icons.first().map(|icon| icon.src.as_str()),
+        Some("https://example.test/echo-icon.png"),
+        "live stdio discovery must retain the shipped echo icon: {identified:?}"
+    );
+    client
+        .close()
+        .expect("identified modern stdio client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_discovery_retains_implementation_identity_peer_stays_bare() {
+    let mut bare = connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
+        "modern-only",
+        &[("FASTMCP_NO_IDENTITY", "1")],
+    )
+    .expect("a ModernOnly facade client connects to the bare-identity echo peer");
+    let discovery = bare
+        .server_discovery()
+        .expect("modern discovery exposes the missing-identity observable");
+    assert!(
+        discovery.implementation().is_none(),
+        "changing only the missing identity extras must keep discovery name/version-only: {:?}",
+        discovery.implementation()
+    );
+    assert_eq!(
+        discovery
+            .server_info()
+            .map(|info| (info.name.as_str(), info.version.as_str())),
+        Some(("echo-server", "1.0.0")),
+        "the bare peer must still advertise name and version"
+    );
+    bare.close()
+        .expect("bare-identity modern stdio client cleanup");
+}
+
+#[cfg(unix)]
+fn connect_bounded_modern_stdio_with_client_title(
+    server_policy: &str,
+    client_name: &str,
+    title: Option<&str>,
+) -> McpResult<modern::Client> {
+    let command = shipped_echo_server_executable();
+    let mut builder = modern::client_builder()
+        .client_info(client_name, "1.0.0")
+        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+        .request_timeout_policy(
+            RequestTimeoutPolicy::new(
+                STDIO_COMPLETION_IDLE_TIMEOUT,
+                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+            )
+            .expect("the public completion timeout policy is valid"),
+        );
+    if let Some(title) = title {
+        builder = builder.title(title);
+    }
+    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_client_implementation_is_visible_to_handler() {
+    let mut client = connect_bounded_modern_stdio_with_client_title(
+        "modern-only",
+        "e2e-stdio-client-identity",
+        Some("Client Title"),
+    )
+    .expect("a titled ModernOnly facade client completes live modern discovery");
+    let reported = client
+        .call_tool("client_identity", json!({}))
+        .expect("live modern stdio client_identity must reach the shipped handler");
+    assert!(
+        reported.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "name=e2e-stdio-client-identity|title=Client Title"
+            }
+            _ => false,
+        }),
+        "live stdio must attach ClientBuilder title onto McpContext: {reported:?}"
+    );
+    client
+        .close()
+        .expect("identified modern stdio client-identity cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_modern_client_implementation_peer_stays_bare() {
+    let mut bare = connect_bounded_modern_stdio_with_client_title(
+        "modern-only",
+        "e2e-stdio-client-identity-bare",
+        None,
+    )
+    .expect("a name/version-only ModernOnly facade client connects to the echo peer");
+    let reported = bare
+        .call_tool("client_identity", json!({}))
+        .expect("bare modern stdio client_identity must still reach the shipped handler");
+    assert!(
+        reported.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "name=e2e-stdio-client-identity-bare|title=none"
+            }
+            _ => false,
+        }),
+        "changing only the missing client title must keep handler-visible extras bare: {reported:?}"
+    );
+    bare.close()
+        .expect("bare modern stdio client-identity cleanup");
+}
+
+#[cfg(unix)]
+fn connect_legacy_stdio_with_client_name(
+    server_policy: &str,
+    client_name: &str,
+) -> McpResult<legacy_2024::Client> {
+    let command = shipped_echo_server_executable();
+    legacy_2024::client_builder()
+        .client_info(client_name, "1.0.0")
+        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+        .request_timeout_policy(
+            RequestTimeoutPolicy::new(
+                STDIO_COMPLETION_IDLE_TIMEOUT,
+                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+            )
+            .expect("the public completion timeout policy is valid"),
+        )
+        .connect_stdio_with_cx(command, &[], &Cx::for_request())
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_client_info_is_visible_to_handler() {
+    let mut client =
+        connect_legacy_stdio_with_client_name("legacy-only", "e2e-stdio-legacy-client-identity")
+            .expect("a named LegacyOnly facade client completes live exact-2024 initialize");
+    let reported = client
+        .call_tool("client_identity", json!({}))
+        .expect("live exact-2024 stdio client_identity must reach the shipped handler");
+    assert_eq!(
+        stdio_legacy_tool_text(&reported),
+        Some("name=e2e-stdio-legacy-client-identity|title=none"),
+        "live exact-2024 stdio must attach initialize clientInfo onto McpContext: {reported:?}"
+    );
+    client
+        .close()
+        .expect("named exact-2024 stdio client-identity cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_client_info_peer_changes_only_the_name() {
+    let mut other = connect_legacy_stdio_with_client_name(
+        "legacy-only",
+        "e2e-stdio-legacy-client-identity-other",
+    )
+    .expect("a differently named LegacyOnly facade client connects to the echo peer");
+    let reported = other
+        .call_tool("client_identity", json!({}))
+        .expect("the other exact-2024 stdio client_identity must still reach the shipped handler");
+    assert_eq!(
+        stdio_legacy_tool_text(&reported),
+        Some("name=e2e-stdio-legacy-client-identity-other|title=none"),
+        "changing only the initialize client name must change the handler-visible identity: {reported:?}"
+    );
+    other
+        .close()
+        .expect("other exact-2024 stdio client-identity cleanup");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_modern_composes_nested_tool_and_resource() {
     let mut client = connect_modern_stdio_to_shipped_echo_server("modern-only")
         .expect("a ModernOnly facade client completes live modern discovery");
@@ -3066,6 +3258,94 @@ fn e2e_public_stdio_typed_verbs_honor_pre_send_cancellation() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_public_stdio_legacy_typed_verbs_honor_pre_send_cancellation() {
+    let mut client = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a LegacyOnly facade client connects before pre-send cancellation");
+    let cx = Cx::for_request();
+    let cancellation = fastmcp_rust::McpRequestCancellation::new();
+    cancellation.cancel();
+    let list = client
+        .list_tools_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_tools cancellation must reject locally");
+    assert_eq!(list.code, McpErrorCode::RequestCancelled);
+    let tagged = client
+        .list_tools_with_params_and_cancellation(
+            &cx,
+            &cancellation,
+            ListToolsParams {
+                include_tags: Some(vec!["demo".to_owned()]),
+                ..ListToolsParams::default()
+            },
+        )
+        .expect_err("pre-send tagged list_tools cancellation must reject locally");
+    assert_eq!(tagged.code, McpErrorCode::RequestCancelled);
+    let resources = client
+        .list_resources_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_resources cancellation must reject locally");
+    assert_eq!(resources.code, McpErrorCode::RequestCancelled);
+    let templates = client
+        .list_resource_templates_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_resource_templates cancellation must reject locally");
+    assert_eq!(templates.code, McpErrorCode::RequestCancelled);
+    let prompts = client
+        .list_prompts_with_cancellation(&cx, &cancellation, None)
+        .expect_err("pre-send list_prompts cancellation must reject locally");
+    assert_eq!(prompts.code, McpErrorCode::RequestCancelled);
+    let call = client
+        .call_tool_with_cancellation(&cx, &cancellation, "echo", json!({"message": "hi"}))
+        .expect_err("pre-send call_tool cancellation must reject locally");
+    assert_eq!(call.code, McpErrorCode::RequestCancelled);
+    let resource = client
+        .read_resource_with_cancellation(&cx, &cancellation, "info://server")
+        .expect_err("pre-send read_resource cancellation must reject locally");
+    assert_eq!(resource.code, McpErrorCode::RequestCancelled);
+    let prompt = client
+        .get_prompt_with_cancellation(&cx, &cancellation, "greeting", HashMap::new())
+        .expect_err("pre-send get_prompt cancellation must reject locally");
+    assert_eq!(prompt.code, McpErrorCode::RequestCancelled);
+    let completion = client
+        .complete_with_cancellation(
+            &cx,
+            &cancellation,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: "greeting".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "co".to_owned(),
+                },
+                meta: None,
+            },
+        )
+        .expect_err("pre-send complete cancellation must reject locally");
+    assert_eq!(completion.code, McpErrorCode::RequestCancelled);
+    let ping = client
+        .ping_with_cancellation(&cx, &cancellation)
+        .expect_err("pre-send ping cancellation must reject locally");
+    assert_eq!(ping.code, McpErrorCode::RequestCancelled);
+
+    let admitted = fastmcp_rust::McpRequestCancellation::new();
+    let echoed = client
+        .call_tool_with_cancellation(&cx, &admitted, "echo", json!({"message": "hi"}))
+        .expect("an uncancelled exact-2024 tools/call still reaches the handler");
+    assert!(matches!(
+        echoed.content.first(),
+        Some(LegacyContent::Text { text, .. }) if text == "hi"
+    ));
+    client
+        .ping()
+        .expect("exact-2024 stdio ping remains usable after local cancellation");
+    client
+        .list_tools()
+        .expect("the same exact-2024 stdio session remains usable after local cancellation");
+    client
+        .close()
+        .expect("exact-2024 stdio pre-send cancellation client cleanup reaps the live subprocess");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_public_stdio_executor_execute_stamps_modern_meta() {
     let mut client = connect_auto_stdio_to_shipped_echo_server("modern-only");
     assert_eq!(
@@ -3447,6 +3727,108 @@ fn e2e_public_stdio_modern_tasks_create_resume_cancel_and_reject_missing_capabil
         legacy_cleanup_started.elapsed() <= STDIO_COMPLETION_CLEANUP_BOUND,
         "the exact-2024 subprocess also performs bounded cleanup without a Task service"
     );
+}
+
+#[cfg(unix)]
+#[cfg(feature = "tasks")]
+#[test]
+fn e2e_public_stdio_modern_tasks_listen_retains_status_and_catalog_listen_refuses_task_ids() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client starts the shipped caller-owned Task service");
+
+    let created = client
+        .call_tool_outcome("durable_task", json!({}))
+        .expect("the typed ModernOnly facade client creates one durable Task");
+    let modern::FinalToolCallOutcome::Task(created) = created else {
+        panic!("the task-capable tool returns the exact final Task result branch");
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let mut catalog_with_tasks = modern::SubscriptionFilter {
+        tools_list_changed: Some(true),
+        ..modern::SubscriptionFilter::default()
+    };
+    modern::set_task_subscription_ids(&mut catalog_with_tasks, vec![task_id.clone()])
+        .expect("the public Tasks filter composes beside a catalog filter");
+    let catalog_refusal = client
+        .open_subscriptions_listener(catalog_with_tasks)
+        .expect_err("catalog listen must refuse taskIds");
+    assert!(
+        catalog_refusal
+            .to_string()
+            .contains("open_final_task_subscription_listener")
+            || catalog_refusal.to_string().contains("taskIds"),
+        "changing only the added taskIds must keep catalog listen refused: {catalog_refusal:?}"
+    );
+
+    let mut filter = modern::SubscriptionFilter::default();
+    modern::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+        .expect("the public Tasks filter is valid");
+    client
+        .open_final_task_subscription_listener(filter)
+        .expect("live stdio must admit an incremental official Tasks listener");
+
+    let cx = Cx::for_request();
+    let cancellation = modern::McpRequestCancellation::new();
+    let acknowledgement = client
+        .next_final_task_subscription_event(&cx, &cancellation)
+        .expect("official Tasks listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            acknowledgement,
+            modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                if modern::task_subscription_ids(accepted)
+                    .expect("acknowledged Tasks filter stays valid")
+                    .as_deref()
+                    == Some([task_id.clone()].as_slice())
+        ),
+        "the first incremental Tasks listen record must be the accepted taskIds: {acknowledgement:?}"
+    );
+
+    client
+        .cancel_task(task_id.clone())
+        .expect("typed tasks/cancel acknowledges the durable cancellation request");
+
+    let notification_deadline = Instant::now() + STDIO_COMPLETION_ABSOLUTE_TIMEOUT;
+    loop {
+        let event = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect("official Tasks listen must retain later status updates");
+        match event {
+            modern::StdioTaskSubscriptionEvent::Notification(notification)
+                if matches!(notification.params.task, modern::FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the Tasks notification must keep the created id"
+                );
+                break;
+            }
+            modern::StdioTaskSubscriptionEvent::Notification(_)
+            | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the caller-owned supervisor publishes cancellation within the public bound"
+                );
+            }
+            modern::StdioTaskSubscriptionEvent::Terminal => {
+                panic!("the live Tasks listener must retain cancellation before terminal")
+            }
+        }
+    }
+
+    let observed = client
+        .get_task(task_id)
+        .expect("typed tasks/get remains usable after the listener observed cancellation");
+    assert!(
+        matches!(observed.task, modern::FinalTask::Cancelled(_)),
+        "the same session must still admit tasks/get after listen: {observed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern Tasks listen stdio client cleanup");
 }
 
 #[cfg(unix)]
@@ -4200,6 +4582,52 @@ fn e2e_public_stdio_legacy_progress_marker_is_retained_from_live_echo() {
                     && params.message.as_deref() == Some("greeted")
         )),
         "live exact-2024 stdio must retain prompt notifications/progress after a progressToken: {prompt_progress:?}"
+    );
+
+    let completion_params = legacy_2024::LegacyCompletionParams {
+        reference: legacy_2024::LegacyCompletionReference::Prompt {
+            name: "greeting".to_owned(),
+        },
+        argument: legacy_2024::LegacyCompletionArgument {
+            name: "name".to_owned(),
+            value: "co".to_owned(),
+        },
+        meta: None,
+    };
+    client
+        .complete(completion_params.clone())
+        .expect("a completion/complete without a progress token still completes");
+    let silent_completion = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        !silent_completion.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "without a progressToken the shipped greeting completion must not emit request-scoped progress: {silent_completion:?}"
+    );
+
+    let completion_marker = legacy_2024::ProgressMarker::from("stdio-legacy-completion-progress");
+    let completed = client
+        .complete_with_progress_marker(completion_params, completion_marker.clone())
+        .expect("a progressToken must not prevent the shipped greeting completion from completing");
+    assert_eq!(
+        completed.completion.values,
+        vec!["stdio-completion-legacy".to_owned()],
+        "the exact-2024 completion provider must retain its values: {completed:?}"
+    );
+    let completion_progress = client
+        .take_server_notifications()
+        .expect("exact-2024 stdio notifications must decode");
+    assert!(
+        completion_progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == completion_marker
+                    && params.message.as_deref() == Some("stdio-completion-legacy-halfway")
+        )),
+        "live exact-2024 stdio must retain completion notifications/progress after a progressToken: {completion_progress:?}"
     );
 
     client
@@ -5957,6 +6385,7 @@ fn e2e_public_stdio_legacy_completion_panic_is_sanitized_and_admits_fast_peer() 
                 name: "name".to_owned(),
                 value: "co".to_owned(),
             },
+            meta: None,
         })
         .expect_err("a panicking exact-2024 completion/complete must stay a protocol error");
     let panicked = format!("{panicked:?}");
@@ -7346,6 +7775,7 @@ fn e2e_public_stdio_legacy_complete_is_retained_and_unknown_prompt_is_refused() 
                 name: "name".to_owned(),
                 value: "co".to_owned(),
             },
+            meta: None,
         })
         .expect("live exact-2024 stdio must complete the shipped greeting provider");
     assert_eq!(
@@ -7375,6 +7805,7 @@ fn e2e_public_stdio_legacy_resource_template_completion_is_retained_and_unregist
                 name: "name".to_owned(),
                 value: "al".to_owned(),
             },
+            meta: None,
         })
         .expect("live exact-2024 stdio must complete the shipped note template provider");
     assert_eq!(
@@ -7392,6 +7823,7 @@ fn e2e_public_stdio_legacy_resource_template_completion_is_retained_and_unregist
                 name: "name".to_owned(),
                 value: "al".to_owned(),
             },
+            meta: None,
         })
         .expect_err("changing only the template URI must refuse the greeting catch-all");
     assert_eq!(missing_provider.code, McpErrorCode::InvalidParams);
@@ -7405,6 +7837,7 @@ fn e2e_public_stdio_legacy_resource_template_completion_is_retained_and_unregist
                 name: "name".to_owned(),
                 value: "co".to_owned(),
             },
+            meta: None,
         })
         .expect("the note provider must leave the greeting prompt provider usable");
     assert_eq!(
@@ -7441,6 +7874,7 @@ fn e2e_public_stdio_legacy_complete_peer_without_handler_is_refused() {
                 name: "name".to_owned(),
                 value: "co".to_owned(),
             },
+            meta: None,
         })
         .expect_err("changing only the missing completion handler must refuse complete");
 
