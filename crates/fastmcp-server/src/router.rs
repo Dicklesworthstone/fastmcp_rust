@@ -35,8 +35,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fastmcp_core::logging::{debug, targets, trace};
 use fastmcp_core::{
-    McpContext, McpError, McpErrorCode, McpOutcome, McpResult, SessionState, block_on,
-    sha256_bounded,
+    McpContext, McpError, McpErrorCode, McpOutcome, McpResult, PromptCaller, PromptGetResult,
+    PromptMessageItem, PromptMessageRole, SessionState, block_on, sha256_bounded,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::MissingRequiredClientCapabilityError;
@@ -62,8 +62,8 @@ use fastmcp_protocol::{
     ListPromptsResult, ListResourceTemplatesParams, ListResourceTemplatesResult,
     ListResourcesParams, ListResourcesResult, ListToolsParams, ListToolsResult, PROTOCOL_VERSION,
     ProgressMarker, Prompt, PromptMessage, ReadResourceParams, ReadResourceResult, Resource,
-    ResourceContent, ResourceTemplate, ServerBehavior, ServerBehaviorRegistry, TemplateValue, Tool,
-    admit_final_schema, exact_json_to_serde, validate, validate_strict,
+    ResourceContent, ResourceTemplate, Role, ServerBehavior, ServerBehaviorRegistry, TemplateValue,
+    Tool, admit_final_schema, exact_json_to_serde, validate, validate_strict,
 };
 
 /// Type alias for a notification sender callback.
@@ -7303,21 +7303,14 @@ impl ResourceReader for RouterResourceReader {
 
             // Derive the child from the parent request authority, preserving
             // auth, mask state, budget accounting, and request identity.
-            let nested_router = router_access.clone();
-            let nested_state = session_state.clone();
-            let child_ctx = parent_ctx
-                .clone()
-                .with_operation_deadline(effective_budget.deadline)
-                .with_resource_read_depth(depth)
-                .with_tool_call_depth(depth)
-                .with_tool_caller(Arc::new(RouterToolCaller::from_access(
-                    nested_router.clone(),
-                    nested_state.clone(),
-                )))
-                .with_resource_reader(Arc::new(RouterResourceReader::from_access(
-                    nested_router,
-                    nested_state,
-                )));
+            let child_ctx = with_nested_component_access(
+                parent_ctx
+                    .clone()
+                    .with_operation_deadline(effective_budget.deadline),
+                router_access.clone(),
+                session_state.clone(),
+                depth,
+            );
 
             // Read the resource on the request-owned future. Nested
             // `block_on` would replace the ambient Cx and can stall the
@@ -7493,21 +7486,14 @@ impl ToolCaller for RouterToolCaller {
 
             // Derive the child from the parent request authority, preserving
             // auth, mask state, budget accounting, and request identity.
-            let nested_router = router_access.clone();
-            let nested_state = session_state.clone();
-            let child_ctx = parent_ctx
-                .clone()
-                .with_operation_deadline(effective_budget.deadline)
-                .with_tool_call_depth(depth)
-                .with_resource_read_depth(depth)
-                .with_tool_caller(Arc::new(RouterToolCaller::from_access(
-                    nested_router.clone(),
-                    nested_state.clone(),
-                )))
-                .with_resource_reader(Arc::new(RouterResourceReader::from_access(
-                    nested_router,
-                    nested_state,
-                )));
+            let child_ctx = with_nested_component_access(
+                parent_ctx
+                    .clone()
+                    .with_operation_deadline(effective_budget.deadline),
+                router_access.clone(),
+                session_state.clone(),
+                depth,
+            );
 
             // Call the tool on the request-owned future. Nested `block_on`
             // would replace the ambient Cx and can stall the already-running
@@ -7559,6 +7545,168 @@ impl ToolCaller for RouterToolCaller {
                     Err(sanitized_handler_panic(parent_ctx.cx(), "tool"))
                 }
             }
+        })
+    }
+}
+
+fn with_nested_component_access(
+    ctx: McpContext,
+    router: RouterAccess,
+    state: SessionState,
+    depth: u32,
+) -> McpContext {
+    ctx.with_resource_read_depth(depth)
+        .with_tool_call_depth(depth)
+        .with_prompt_get_depth(depth)
+        .with_tool_caller(Arc::new(RouterToolCaller::from_access(
+            router.clone(),
+            state.clone(),
+        )))
+        .with_resource_reader(Arc::new(RouterResourceReader::from_access(
+            router.clone(),
+            state.clone(),
+        )))
+        .with_prompt_caller(Arc::new(RouterPromptCaller::from_access(router, state)))
+}
+
+// ============================================================================
+// Prompt Caller Implementation
+// ============================================================================
+
+pub(crate) struct RouterPromptCaller {
+    router: RouterAccess,
+    session_state: SessionState,
+}
+
+impl RouterPromptCaller {
+    #[must_use]
+    pub(crate) fn new(router: Arc<Router>, session_state: SessionState) -> Self {
+        Self {
+            router: RouterAccess::Shared(router),
+            session_state,
+        }
+    }
+
+    fn from_access(router: RouterAccess, session_state: SessionState) -> Self {
+        Self {
+            router,
+            session_state,
+        }
+    }
+}
+
+impl PromptCaller for RouterPromptCaller {
+    fn get_prompt<'a>(
+        &'a self,
+        parent_ctx: &'a McpContext,
+        name: &'a str,
+        arguments: HashMap<String, String>,
+        depth: u32,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = fastmcp_core::McpResult<PromptGetResult>> + Send + 'a>,
+    > {
+        if depth > fastmcp_core::MAX_PROMPT_GET_DEPTH {
+            return Box::pin(async move {
+                Err(McpError::new(
+                    McpErrorCode::InternalError,
+                    format!(
+                        "Maximum prompt get depth ({}) exceeded",
+                        fastmcp_core::MAX_PROMPT_GET_DEPTH
+                    ),
+                ))
+            });
+        }
+
+        let parent_ctx = parent_ctx.clone();
+        let name = name.to_string();
+        let router_access = self.router.clone();
+        let session_state = self.session_state.clone();
+
+        Box::pin(async move {
+            debug!(
+                target: targets::HANDLER,
+                "cross-component prompt get; prompt_key={}; depth={}; request={}",
+                safe_log_label(&name),
+                depth,
+                parent_ctx.request_id()
+            );
+            let router = router_access.upgrade()?;
+            let operation_started_at = parent_ctx.cx().now();
+            if let Some(error) = budget_error(&parent_ctx) {
+                return Err(error);
+            }
+            if !session_state.is_prompt_enabled(&name) {
+                return Err(McpError::new(
+                    McpErrorCode::PromptNotFound,
+                    format!("Prompt '{name}' is disabled for this session"),
+                ));
+            }
+            let handler = router.prompts.get(&name).ok_or_else(|| {
+                McpError::new(
+                    McpErrorCode::PromptNotFound,
+                    format!("Prompt not found: {name}"),
+                )
+            })?;
+            if router.final_only_prompts.contains(&name) {
+                return Err(McpError::new(
+                    McpErrorCode::PromptNotFound,
+                    format!("Prompt not found: {name}"),
+                ));
+            }
+            let description = crate::catch_extension_unwind(|| handler.definition().description)
+                .map_err(|_payload| {
+                    sanitized_handler_panic(parent_ctx.cx(), "prompt_definition")
+                })?;
+            let handler_timeout =
+                read_handler_timeout(parent_ctx.cx(), "prompt_timeout", || handler.timeout())?;
+            let effective_budget = compose_handler_budget(
+                parent_ctx.cx().budget(),
+                parent_ctx.budget(),
+                handler_timeout,
+                operation_started_at,
+            );
+            let child_ctx = with_nested_component_access(
+                parent_ctx
+                    .clone()
+                    .with_operation_deadline(effective_budget.deadline),
+                router_access,
+                session_state,
+                depth,
+            );
+            let outcome = run_handler_in_request(
+                &child_ctx,
+                parent_ctx.cx(),
+                effective_budget,
+                "prompt",
+                |request_cx| handler.get_async_in_request(&child_ctx, request_cx, arguments),
+            )
+            .await?;
+            let messages = match outcome {
+                Outcome::Ok(messages) => messages,
+                Outcome::Err(error) => {
+                    return Err(sanitize_handler_error(parent_ctx.cx(), "prompt", error));
+                }
+                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+                Outcome::Panicked(_payload) => {
+                    return Err(sanitized_handler_panic(parent_ctx.cx(), "prompt"));
+                }
+            };
+            Ok(PromptGetResult {
+                description,
+                messages: messages
+                    .into_iter()
+                    .map(|message| PromptMessageItem {
+                        role: match message.role {
+                            Role::User => PromptMessageRole::User,
+                            Role::Assistant => PromptMessageRole::Assistant,
+                        },
+                        text: match message.content {
+                            Content::Text { text } => Some(text),
+                            _ => None,
+                        },
+                    })
+                    .collect(),
+            })
         })
     }
 }
@@ -14414,6 +14562,26 @@ mod router_tests {
     // ── handle_prompts_get: success path ─────────────────────────────────
 
     #[test]
+    fn nested_get_prompt_returns_handler_text_and_refuses_missing() {
+        let mut router = Router::new();
+        router.add_prompt(NamedPrompt::new("greet"));
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_prompt_caller(
+            Arc::new(RouterPromptCaller::new(Arc::clone(&router), state)),
+        );
+
+        let missing = block_on(request_ctx.get_prompt("missing", HashMap::new()))
+            .expect_err("an unknown nested prompt must stay refused");
+        assert_eq!(missing.code, McpErrorCode::PromptNotFound);
+
+        let result = block_on(request_ctx.get_prompt("greet", HashMap::new()))
+            .expect("a registered nested prompt must complete");
+        assert_eq!(result.description.as_deref(), Some("Prompt greet"));
+        assert!(result.messages.is_empty());
+    }
+
     fn handle_prompts_get_success() {
         let mut r = Router::new();
         r.add_prompt(NamedPrompt::new("greet"));

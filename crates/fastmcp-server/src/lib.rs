@@ -136,7 +136,10 @@ pub use router::{
     InboundRequestContext, InboundRequestTransport, MountResult, NotificationSender, Router,
     TagFilters,
 };
-use router::{ModernConnection, RouterResourceReader, RouterToolCaller, TransportAuthorization};
+use router::{
+    ModernConnection, RouterPromptCaller, RouterResourceReader, RouterToolCaller,
+    TransportAuthorization,
+};
 pub use session::Session;
 use session::{
     InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SessionPrincipalBinding,
@@ -16845,6 +16848,10 @@ impl Server {
             state.clone(),
         )))
         .with_resource_reader(Arc::new(RouterResourceReader::new(
+            Arc::clone(&self.router),
+            state.clone(),
+        )))
+        .with_prompt_caller(Arc::new(RouterPromptCaller::new(
             Arc::clone(&self.router),
             state,
         )))
