@@ -32128,6 +32128,144 @@ mod live_websocket_bind {
         });
     }
 
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_forwards_resource_template_completion() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy template-completion runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_template_completion_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-template-complete-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-template-complete-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket template-completion gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-template-complete-upstream",
+                    "native-h1:e2e-legacy-ws-template-complete-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-template-complete".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live exact-2024 HTTP template-completion proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP template-completion proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-template-complete-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed template-completion install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy template-completion must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy template-completion publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy template-completion serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy template-completion handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket template-completion must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy template-completion initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-template-complete", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy template-completion over bind_websocket",
+            );
+
+            let completed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy template complete",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Resource {
+                            uri: format!("child/{PUBLIC_HTTP_CURSOR_TEMPLATE}"),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "id".to_owned(),
+                            value: "al".to_owned(),
+                        },
+                        meta: None,
+                    },
+                ),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket must rewrite the prefixed template URI");
+            assert_eq!(
+                completed.completion.values,
+                vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE.to_owned()],
+                "exact-2024 as_proxy WebSocket must retain the upstream template completion: {completed:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy unprefixed template complete",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Resource {
+                            uri: PUBLIC_HTTP_CURSOR_TEMPLATE.to_owned(),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "id".to_owned(),
+                            value: "al".to_owned(),
+                        },
+                        meta: None,
+                    },
+                ),
+            )
+            .await
+            .expect_err("changing only the prefix must not reach the exact-2024 upstream provider");
+            let _ = missing;
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy template-completion close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the exact-2024 as_proxy WebSocket template-completion client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
     #[test]
     fn e2e_public_websocket_legacy_bind_transformed_tool_renames_argument_and_keeps_parent_unknown()
     {
