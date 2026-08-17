@@ -7123,12 +7123,6 @@ where
                 "A final WebSocket catalog subscription is already active on this client",
             ));
         }
-        #[cfg(feature = "tasks")]
-        if self.live_task_subscription.is_some() {
-            return Err(McpError::invalid_request(
-                "A final Tasks WebSocket subscription is already active on this client",
-            ));
-        }
         self.require_modern("subscriptions/listen")?;
         #[cfg(feature = "tasks")]
         if task_subscription_ids(&notifications)
@@ -7228,39 +7222,23 @@ where
                     if self.discard_retired_websocket_response(response) {
                         continue;
                     }
-                    let listen_id = self
-                        .live_catalog_subscription
-                        .as_ref()
-                        .map(|subscription| subscription.request_id.clone());
-                    if !response.id.as_ref().is_some_and(|response_id| {
-                        listen_id
-                            .as_ref()
-                            .is_some_and(|listen_id| response_id.correlates_with(listen_id))
-                    }) {
-                        return Err(self
-                            .close_after_protocol_error(
-                                cx,
-                                "WebSocket catalog listener received a response for another request",
-                            )
-                            .await);
-                    }
                     let response = response.clone();
                     let raw_result =
                         raw_result_from_admitted_response(&response, frame, "WebSocket")?;
-                    let Some(subscription) = self.live_catalog_subscription.as_mut() else {
-                        return Err(McpError::invalid_request(
-                            "No live final catalog WebSocket subscription is active",
-                        ));
-                    };
-                    if subscription.terminal_response.is_some() {
-                        return Err(self
-                            .close_after_protocol_error(
-                                cx,
-                                "WebSocket catalog listener received a duplicate terminal response",
-                            )
-                            .await);
+                    match self.park_websocket_listen_terminal(response, raw_result) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(self
+                                .close_after_protocol_error(
+                                    cx,
+                                    "WebSocket catalog listener received a response for another request",
+                                )
+                                .await);
+                        }
+                        Err(error) => {
+                            return Err(self.close_after_protocol_error(cx, &error.message).await);
+                        }
                     }
-                    subscription.terminal_response = Some((response, raw_result));
                 }
                 JsonRpcMessage::Request(_) => {
                     if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame).await
@@ -7270,6 +7248,55 @@ where
                 }
             }
         }
+    }
+
+    fn park_websocket_listen_terminal(
+        &mut self,
+        response: JsonRpcResponse,
+        raw_result: Option<String>,
+    ) -> McpResult<bool> {
+        if self
+            .live_catalog_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                response.id.as_ref().is_some_and(|response_id| {
+                    response_id.correlates_with(&subscription.request_id)
+                })
+            })
+        {
+            let subscription = self.live_catalog_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final catalog WebSocket subscription is active")
+            })?;
+            if subscription.terminal_response.is_some() {
+                return Err(McpError::invalid_request(
+                    "WebSocket catalog listener received a duplicate terminal response",
+                ));
+            }
+            subscription.terminal_response = Some((response, raw_result));
+            return Ok(true);
+        }
+        #[cfg(feature = "tasks")]
+        if self
+            .live_task_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
+                response.id.as_ref().is_some_and(|response_id| {
+                    response_id.correlates_with(&subscription.request_id)
+                })
+            })
+        {
+            let subscription = self.live_task_subscription.as_mut().ok_or_else(|| {
+                McpError::invalid_request("No live final Tasks WebSocket subscription is active")
+            })?;
+            if subscription.terminal_response.is_some() {
+                return Err(McpError::invalid_request(
+                    "WebSocket Tasks listener received a duplicate terminal response",
+                ));
+            }
+            subscription.terminal_response = Some((response, raw_result));
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn harvest_live_catalog_subscription_notifications(&mut self) -> McpResult<()> {
@@ -7515,11 +7542,6 @@ where
                 "A final Tasks WebSocket subscription is already active on this client",
             ));
         }
-        if self.live_catalog_subscription.is_some() {
-            return Err(McpError::invalid_request(
-                "A final WebSocket catalog subscription is already active on this client",
-            ));
-        }
         self.require_modern("subscriptions/listen")?;
         if task_subscription_ids(&notifications)
             .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
@@ -7618,39 +7640,23 @@ where
                     if self.discard_retired_websocket_response(response) {
                         continue;
                     }
-                    let listen_id = self
-                        .live_task_subscription
-                        .as_ref()
-                        .map(|subscription| subscription.request_id.clone());
-                    if !response.id.as_ref().is_some_and(|response_id| {
-                        listen_id
-                            .as_ref()
-                            .is_some_and(|listen_id| response_id.correlates_with(listen_id))
-                    }) {
-                        return Err(self
-                            .close_after_protocol_error(
-                                cx,
-                                "WebSocket Tasks listener received a response for another request",
-                            )
-                            .await);
-                    }
                     let response = response.clone();
                     let raw_result =
                         raw_result_from_admitted_response(&response, frame, "WebSocket")?;
-                    let Some(subscription) = self.live_task_subscription.as_mut() else {
-                        return Err(McpError::invalid_request(
-                            "No live final Tasks WebSocket subscription is active",
-                        ));
-                    };
-                    if subscription.terminal_response.is_some() {
-                        return Err(self
-                            .close_after_protocol_error(
-                                cx,
-                                "WebSocket Tasks listener received a duplicate terminal response",
-                            )
-                            .await);
+                    match self.park_websocket_listen_terminal(response, raw_result) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(self
+                                .close_after_protocol_error(
+                                    cx,
+                                    "WebSocket Tasks listener received a response for another request",
+                                )
+                                .await);
+                        }
+                        Err(error) => {
+                            return Err(self.close_after_protocol_error(cx, &error.message).await);
+                        }
                     }
-                    subscription.terminal_response = Some((response, raw_result));
                 }
                 JsonRpcMessage::Request(_) => {
                     if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame).await
@@ -15603,6 +15609,53 @@ impl Client {
         })
     }
 
+    /// Sends one request through the shared stdio executor while a live
+    /// catalog or Tasks listener already owns that executor.
+    ///
+    /// Sequential response-registry waits must not mix with an executor-owned
+    /// listen: the listen is the selected ingress owner, and a second reader
+    /// can terminate the connection. I/O stays on the connection `Cx`; the
+    /// caller `Cx` only checkpoints cancellation.
+    fn send_prepared_request_through_stdio_executor(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        params_value: serde_json::Value,
+    ) -> McpResult<ReceivedPreparedResult> {
+        let executor = self.multiplexed_stdio_executor()?;
+        let connection_cx = self.cx.clone();
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        executor.service(&connection_cx)?;
+        let mut execution = executor.execute(&connection_cx, method, Some(params_value))?;
+        loop {
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                executor.cancel(&connection_cx, &mut execution)?;
+                return Err(McpError::request_cancelled());
+            }
+            if let Some((mut response, raw_result)) =
+                executor.try_take_response_with_raw_result(&mut execution)?
+            {
+                let receipt = Instant::now();
+                if let Some(error) = response.error.take() {
+                    return Err(json_rpc_error_to_mcp(error));
+                }
+                let result = response
+                    .result
+                    .take()
+                    .ok_or_else(|| McpError::internal_error("No result in response"))?;
+                return Ok(ReceivedPreparedResult {
+                    result,
+                    raw_result,
+                    receipt,
+                });
+            }
+            self.drive_multiplexed_stdio(&connection_cx)?;
+        }
+    }
+
     /// Sends one prepared request under an optional operation-wide deadline.
     ///
     /// Ordinary public requests retain their existing per-request deadline
@@ -17956,16 +18009,26 @@ impl Client {
             .map_err(|_| {
                 McpError::invalid_params("Modern Tasks tools/call parameters are invalid")
             })?;
-        let received = self.send_prepared_request_with_request_cancellation(
-            cx,
-            cancellation,
-            "tools/call",
-            parameters,
-            RequestCancellationTerminalElection::FinalToolsCallTask {
-                request: Box::new(request.clone()),
-            },
-            |_| {},
-        )?;
+        let received =
+            if self.live_catalog_subscription.is_some() || self.multiplexed_executor.is_some() {
+                self.send_prepared_request_through_stdio_executor(
+                    cx,
+                    cancellation,
+                    "tools/call",
+                    parameters,
+                )?
+            } else {
+                self.send_prepared_request_with_request_cancellation(
+                    cx,
+                    cancellation,
+                    "tools/call",
+                    parameters,
+                    RequestCancellationTerminalElection::FinalToolsCallTask {
+                        request: Box::new(request.clone()),
+                    },
+                    |_| {},
+                )?
+            };
         let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
             &request,
             &received.result,
@@ -19492,12 +19555,6 @@ impl Client {
                 "A final catalog stdio subscription is already active on this client",
             ));
         }
-        #[cfg(feature = "tasks")]
-        if self.live_task_subscription.is_some() {
-            return Err(McpError::invalid_request(
-                "A final Tasks stdio subscription is already active on this client",
-            ));
-        }
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
             return Err(McpError::invalid_params(
                 "subscriptions/listen is available only for MCP 2026-07-28",
@@ -19565,11 +19622,13 @@ impl Client {
 
     /// Commits upstream cancellation before retiring the live catalog listener.
     ///
-    /// The listener remains installed when the cancellation control cannot be
-    /// committed. This preserves its request ownership and retains the
-    /// original transport failure instead of silently converting it into a
-    /// successful local cancellation.
-    fn cancel_live_catalog_subscription(&mut self, cx: &Cx) -> McpResult<()> {
+    /// A missing listener is a no-op so Drop / next-async cancel paths can
+    /// retire a route that never installed one. The listener remains installed
+    /// when the cancellation control cannot be committed.
+    pub fn cancel_live_catalog_subscription(&mut self, cx: &Cx) -> McpResult<()> {
+        if self.live_catalog_subscription.is_none() {
+            return Ok(());
+        }
         let cancellation = {
             let subscription = self.live_catalog_subscription.as_mut().ok_or_else(|| {
                 McpError::invalid_request("No live final catalog stdio subscription is active")
@@ -19807,6 +19866,66 @@ impl Client {
         }
     }
 
+    /// Takes a ready catalog listener event, or drives one bounded stdio
+    /// receive turn. `None` means the bound elapsed without an event so a
+    /// proxy route can drop its mutex.
+    pub fn try_next_subscription_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<StdioSubscriptionEvent>> {
+        const STDIO_CATALOG_LISTEN_RECEIVE_BOUND: Duration = Duration::from_millis(20);
+        if let Some(error) = self
+            .live_catalog_subscription
+            .as_ref()
+            .and_then(|subscription| subscription.cancellation_failure.clone())
+        {
+            return Err(error);
+        }
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.cancel_live_catalog_subscription(cx)?;
+            return Err(McpError::request_cancelled());
+        }
+        self.harvest_live_catalog_subscription_notifications()?;
+        if let Some(event) = self.take_ready_catalog_subscription_event()? {
+            return Ok(Some(event));
+        }
+        self.drive_multiplexed_stdio_until(
+            cx,
+            Some(Instant::now() + STDIO_CATALOG_LISTEN_RECEIVE_BOUND),
+        )?;
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.cancel_live_catalog_subscription(cx)?;
+            return Err(McpError::request_cancelled());
+        }
+        self.harvest_live_catalog_subscription_notifications()?;
+        self.take_ready_catalog_subscription_event()
+    }
+
+    /// Moves already-queued connection notifications into the live catalog
+    /// listener and returns resource URIs whose updates are ready.
+    pub fn take_ready_catalog_resource_updated_uris(&mut self) -> McpResult<Vec<String>> {
+        if self.live_catalog_subscription.is_none() {
+            return Ok(Vec::new());
+        }
+        self.harvest_live_catalog_subscription_notifications()?;
+        let Some(subscription) = self.live_catalog_subscription.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let mut uris = Vec::new();
+        let mut kept = VecDeque::new();
+        while let Some(notification) = subscription.pending_notifications.pop_front() {
+            match notification {
+                ServerNotification::ResourceUpdated(params) => {
+                    uris.push(params.uri.as_str().to_owned());
+                }
+                other => kept.push_back(other),
+            }
+        }
+        subscription.pending_notifications = kept;
+        Ok(uris)
+    }
+
     /// Starts a real, incrementally driven final Tasks subscription on this
     /// stdio connection.
     ///
@@ -19824,11 +19943,6 @@ impl Client {
         if self.live_task_subscription.is_some() {
             return Err(McpError::invalid_request(
                 "A final Tasks stdio subscription is already active on this client",
-            ));
-        }
-        if self.live_catalog_subscription.is_some() {
-            return Err(McpError::invalid_request(
-                "A final catalog stdio subscription is already active on this client",
             ));
         }
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
