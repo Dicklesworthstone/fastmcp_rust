@@ -22712,6 +22712,24 @@ fn spawn_legacy_upstream_http_server() -> HttpServerFixture {
     })
 }
 
+fn spawn_legacy_as_proxy_template_completion_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy as_proxy template-completion upstream", || {
+        ServerBuilder::new("facade-http-legacy-proxy-template-complete", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpValue)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .resource(PublicHttpCursorTemplateResource)
+            .resource(PublicHttpOtherTemplateResource)
+            .legacy_resource_template_completion_handler(
+                PUBLIC_HTTP_CURSOR_TEMPLATE,
+                PublicHttpTemplateCompletion,
+            )
+            .build()
+    })
+}
+
 #[cfg(feature = "proxy")]
 fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
@@ -23020,6 +23038,88 @@ fn e2e_public_http_legacy_as_proxy_prefixes_tool_prompt_and_resource() {
             || original.contains("MethodNotFound"),
         "calling the unprefixed upstream name must stay unknown: {original}"
     );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_forwards_resource_template_completion() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_template_completion_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-template-complete",
+    );
+
+    let prefixed = format!("child/{PUBLIC_HTTP_CURSOR_TEMPLATE}");
+    let completed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy template completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource { uri: prefixed },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "id".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "exact-2024 as_proxy must rewrite the prefixed template URI onto the upstream provider",
+    );
+    assert_eq!(
+        completed.completion.values,
+        vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE.to_owned()],
+        "exact-2024 as_proxy must retain the upstream template completion: {completed:?}"
+    );
+
+    let unprefixed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy unprefixed template completion",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: PUBLIC_HTTP_CURSOR_TEMPLATE.to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "id".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the prefix must not reach the exact-2024 upstream provider");
+    let _ = unprefixed;
+
+    let other = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy other template completion",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: format!("child/{PUBLIC_HTTP_OTHER_TEMPLATE}"),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "id".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the template URI must not invent an exact-2024 completion provider");
+    let _ = other;
 
     drop(client);
     gateway.shutdown();
