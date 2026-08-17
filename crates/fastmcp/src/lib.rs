@@ -8989,6 +8989,18 @@ pub mod legacy_2024 {
         {
             self.inner.unsubscribe_resource(cx, uri).await
         }
+
+        /// Sends `notifications/roots/list_changed` on this exact-2024 socket.
+        ///
+        /// This requires the client to have advertised `roots.listChanged`
+        /// during initialization. The sealed facade intentionally offers no
+        /// modern equivalent.
+        pub async fn roots_list_changed(&mut self, cx: &Cx) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner.roots_list_changed(cx).await
+        }
     }
 
     /// A ready HTTP client produced only by a sealed exact-2024 plan.
