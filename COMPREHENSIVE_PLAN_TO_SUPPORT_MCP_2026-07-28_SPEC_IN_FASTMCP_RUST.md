@@ -79,6 +79,23 @@
   run and close fail together. Generic synchronous HTTP `Read` cannot be
   preempted once blocked in the kernel; regular files/devices, inherited
   descriptor aliases, and non-Unix stdio retain documented limits.
+- Reality-check product delta (unverified shared-worktree state,
+  2026-08-17): the public client is no longer subprocess-stdio-only.
+  Live public `bind_http`, live public `bind_websocket`
+  (`websocket-experimental`), and live shipped-echo stdio now carry the
+  dual-era core: typed catalog verbs, compose, progress, logging,
+  official Tasks create/get/update/cancel/listen, incremental
+  `subscriptions/listen`, and prefixed `as_proxy` identity / logLevel /
+  capability / progress / catalog `resources/updated` relay. Dual
+  catalog+Tasks listen is live on direct HTTP/stdio/WebSocket and on
+  as_proxy HTTP+WebSocket+stdio. Inbound as_proxy official Tasks
+  tools/call now merge sampling/elicitation/roots onto `_meta` client
+  capabilities without replacing already-stamped official Tasks. These source/live-e2e increments do not close
+  FND-04 (owned child region from ambient `&Cx` is still absent in
+  asupersync), do not authorize EventStore Last-Event-ID on modern
+  `bind_http`, do not promote JWT/Redis/Docket/Apps/EMA/OAuth CC, and
+  are not aggregate MCP 2026-07-28 evidence. The public
+  `PROTOCOL_VERSION` constant remains `2024-11-05`.
 - Frozen dependency evidence is not current for the live dependency
   graph: the renamed-facade macro work introduces
   `proc-macro-crate = 3.5.0`, which is absent from the sealed FND-01
