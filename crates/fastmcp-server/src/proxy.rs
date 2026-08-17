@@ -36,7 +36,7 @@ use fastmcp_core::{
     CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome, McpResult,
     Outcome, SamplingRequest, SamplingRequestMessage, SamplingRole, block_on,
 };
-use fastmcp_protocol::common_types::{AbsoluteUri, LoggingLevel, RawIcon};
+use fastmcp_protocol::common_types::{AbsoluteUri, Implementation, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
@@ -1108,6 +1108,12 @@ pub trait ProxyBackend: Send {
         Ok(None)
     }
 
+    /// Returns the upstream modern Implementation extras when the peer
+    /// advertised title, description, website, or icons.
+    fn upstream_implementation(&self) -> McpResult<Option<Implementation>> {
+        Ok(None)
+    }
+
     /// Binds the inbound request context so exact-2024 reverse
     /// `sampling/createMessage` / `roots/list` can be forwarded.
     fn bind_inbound_legacy_reverse(&mut self, _ctx: &McpContext) -> McpResult<()> {
@@ -1837,6 +1843,13 @@ fn progress_from_legacy_notification(notification: &JsonRpcRequest) -> Option<Pr
         return None;
     }
     serde_json::from_value(notification.params.clone()?).ok()
+}
+
+fn implementation_has_extras(implementation: &Implementation) -> bool {
+    implementation.title.is_some()
+        || implementation.description.is_some()
+        || implementation.website_url.is_some()
+        || !implementation.icons.is_empty()
 }
 
 fn overlay_legacy_progress_token(
@@ -2605,6 +2618,13 @@ impl ProxyBackend for Client {
             .instructions()
             .map(str::to_owned)
             .filter(|value| !value.is_empty()))
+    }
+
+    fn upstream_implementation(&self) -> McpResult<Option<Implementation>> {
+        Ok(self
+            .server_discovery()
+            .and_then(|discovery| discovery.implementation().cloned())
+            .filter(implementation_has_extras))
     }
 
     fn complete_result_with_context(
@@ -4141,6 +4161,7 @@ pub struct ProxyHttpClient {
     next_request_id: i64,
     legacy_initialized: bool,
     instructions: Option<String>,
+    implementation: Option<Implementation>,
     inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
     live_catalog_listener: Option<ModernHttpSubscriptionListener>,
     #[cfg(feature = "tasks")]
@@ -4175,16 +4196,24 @@ impl ProxyHttpClient {
             ProtocolEra::Modern2026 => 2,
             ProtocolEra::Legacy2024 => 1,
         };
-        let instructions = match connection.selected_protocol_era() {
-            ProtocolEra::Modern2026 => connection
-                .server_discovery()
-                .and_then(|discovery| {
+        let (instructions, implementation) = match connection.selected_protocol_era() {
+            ProtocolEra::Modern2026 => {
+                let discovery = connection.server_discovery();
+                (
                     discovery
-                        .instructions()
-                        .map(|value| value.as_str().to_owned())
-                })
-                .filter(|value| !value.is_empty()),
-            ProtocolEra::Legacy2024 => None,
+                        .as_ref()
+                        .and_then(|discovery| {
+                            discovery
+                                .instructions()
+                                .map(|value| value.as_str().to_owned())
+                        })
+                        .filter(|value| !value.is_empty()),
+                    discovery
+                        .and_then(|discovery| discovery.implementation().cloned())
+                        .filter(implementation_has_extras),
+                )
+            }
+            ProtocolEra::Legacy2024 => (None, None),
         };
         Self {
             binding,
@@ -4195,6 +4224,7 @@ impl ProxyHttpClient {
             next_request_id,
             legacy_initialized: false,
             instructions,
+            implementation,
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
             live_catalog_listener: None,
             #[cfg(feature = "tasks")]
@@ -4654,6 +4684,10 @@ impl ProxyHttpClient {
 impl ProxyBackend for ProxyHttpClient {
     fn upstream_instructions(&self) -> McpResult<Option<String>> {
         Ok(self.instructions.clone())
+    }
+
+    fn upstream_implementation(&self) -> McpResult<Option<Implementation>> {
+        Ok(self.implementation.clone())
     }
 
     fn bind_inbound_legacy_reverse(&mut self, ctx: &McpContext) -> McpResult<()> {
@@ -6983,6 +7017,14 @@ impl ProxyClient {
     /// advertised a nonempty string.
     pub fn upstream_instructions(&self) -> McpResult<Option<String>> {
         self.with_backend(|backend| backend.upstream_instructions())
+    }
+
+    /// Returns the upstream modern Implementation extras when the peer
+    /// advertised title, description, website, or icons.
+    pub fn upstream_implementation(
+        &self,
+    ) -> McpResult<Option<fastmcp_protocol::common_types::Implementation>> {
+        self.with_backend(|backend| backend.upstream_implementation())
     }
 
     /// Admits a caller-provided typed catalog only when this route already

@@ -1476,6 +1476,48 @@ impl ServerBuilder {
         Ok(())
     }
 
+    /// Copies upstream modern Implementation extras onto this gateway when the
+    /// builder has not already set title, description, website, or icons.
+    ///
+    /// The gateway keeps its own `name`/`version`. Exact-2024 initialize stays
+    /// name/version-only.
+    #[cfg(feature = "proxy")]
+    fn adopt_upstream_proxy_implementation(
+        &mut self,
+        proxy_client: &ProxyClient,
+    ) -> Result<(), fastmcp_core::McpError> {
+        let gateway_has_extras = self.title.as_ref().is_some_and(|title| !title.is_empty())
+            || self
+                .description
+                .as_ref()
+                .is_some_and(|description| !description.is_empty())
+            || self
+                .website_url
+                .as_ref()
+                .is_some_and(|website| !website.is_empty())
+            || !self.icons.is_empty();
+        if gateway_has_extras {
+            return Ok(());
+        }
+        let Some(implementation) = proxy_client.upstream_implementation()? else {
+            return Ok(());
+        };
+        if implementation.title.is_none()
+            && implementation.description.is_none()
+            && implementation.website_url.is_none()
+            && implementation.icons.is_empty()
+        {
+            return Ok(());
+        }
+        self.title = implementation.title;
+        self.description = implementation.description;
+        self.website_url = implementation
+            .website_url
+            .map(|uri| uri.as_str().to_owned());
+        self.icons = implementation.icons;
+        Ok(())
+    }
+
     #[cfg(feature = "proxy")]
     fn register_prefixed_typed_proxy_catalog(
         mut self,
@@ -1485,6 +1527,7 @@ impl ServerBuilder {
     ) -> Result<Self, fastmcp_core::McpError> {
         proxy_client.admit_typed_catalog(&catalog)?;
         self.adopt_upstream_proxy_instructions(&proxy_client)?;
+        self.adopt_upstream_proxy_implementation(&proxy_client)?;
         let completion_supported = proxy_client.supports_completion()?;
         #[cfg(feature = "tasks")]
         let catalog_era = catalog.era()?;
@@ -1756,6 +1799,7 @@ impl ServerBuilder {
         // not establish an era for an unbound proxy route.
         proxy_client.admit_typed_catalog(&catalog)?;
         self.adopt_upstream_proxy_instructions(&proxy_client)?;
+        self.adopt_upstream_proxy_implementation(&proxy_client)?;
         let catalog_era = catalog.era()?;
         let completion_supported = proxy_client.supports_completion()?;
         #[cfg(feature = "tasks")]
