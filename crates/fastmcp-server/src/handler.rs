@@ -187,7 +187,10 @@ where
     where
         Self: 'static,
     {
-        ProgressReporter::new(self)
+        ProgressReporter::with_marker(
+            serde_json::to_value(&self.marker).unwrap_or(serde_json::Value::Null),
+            self,
+        )
     }
 
     /// Emits the newest pending progress notification, if the request remains
@@ -2586,8 +2589,20 @@ impl ResourceHandler for FinalProxyResourceHandler {
         self.client.read_resource(ctx, &self.external_uri)
     }
 
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
     fn read_final(&self, ctx: &McpContext) -> McpResult<CompleteResult<FinalReadResourceResult>> {
         self.client.read_resource_final(ctx, &self.external_uri)
+    }
+
+    fn read_final_outcome(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.client
+            .read_resource_final_outcome(ctx, &self.external_uri)
     }
 }
 
@@ -2674,6 +2689,27 @@ impl ResourceHandler for FinalProxyResourceTemplateHandler {
     ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
         self.client.read_resource_final(ctx, uri)
     }
+
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
+    fn read_final_outcome(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.client
+            .read_resource_final_outcome(ctx, &self.external_uri_template)
+    }
+
+    fn read_final_outcome_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        _params: &UriParams,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.client.read_resource_final_outcome(ctx, uri)
+    }
 }
 
 /// Proxy adapter for an upstream exact-final prompt catalog entry.
@@ -2752,6 +2788,10 @@ impl PromptHandler for FinalProxyPromptHandler {
         self.client.get_prompt(ctx, &self.external_name, arguments)
     }
 
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
     fn get_final(
         &self,
         ctx: &McpContext,
@@ -2759,6 +2799,15 @@ impl PromptHandler for FinalProxyPromptHandler {
     ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
         self.client
             .get_prompt_final(ctx, &self.external_name, arguments)
+    }
+
+    fn get_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        self.client
+            .get_prompt_final_outcome(ctx, &self.external_name, arguments)
     }
 }
 
@@ -4081,6 +4130,20 @@ mod tests {
     fn progress_sender_into_reporter() {
         let sender = ProgressNotificationSender::new(ProgressMarker::from("tok-rpt"), |_| {});
         let _reporter = sender.into_reporter();
+    }
+
+    #[test]
+    fn final_progress_runtime_into_reporter_retains_the_request_marker() {
+        let runtime = Arc::new(FinalProgressRuntime::new(
+            ProgressMarker::from("final-runtime-marker"),
+            |_| {},
+        ));
+        let reporter = runtime.into_reporter();
+        assert_eq!(
+            reporter.marker(),
+            Some(&serde_json::json!("final-runtime-marker")),
+            "as_proxy correlates inbound progressToken from the request-owned final reporter"
+        );
     }
 
     // ── BidirectionalSenders ─────────────────────────────────────────
