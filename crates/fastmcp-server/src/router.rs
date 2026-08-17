@@ -3308,6 +3308,26 @@ impl Router {
         self.resolve_resource(uri).is_some()
     }
 
+    /// Forwards a session `resources/subscribe` onto the resolved handler.
+    pub(crate) fn notify_resource_subscribed(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
+        if let Some(resolved) = self.resolve_resource(uri) {
+            resolved.handler.on_subscribe(ctx, uri)?;
+        }
+        Ok(())
+    }
+
+    /// Forwards a session `resources/unsubscribe` onto the resolved handler.
+    pub(crate) fn notify_resource_unsubscribed(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<()> {
+        if let Some(resolved) = self.resolve_resource(uri) {
+            resolved.handler.on_unsubscribe(ctx, uri)?;
+        }
+        Ok(())
+    }
+
     fn resolve_resource(&self, uri: &str) -> Option<ResolvedResource<'_>> {
         self.resolve_resource_for_era(uri, None)
     }

@@ -1064,8 +1064,21 @@ where
     ) -> Result<Value, Legacy2024AdapterError> {
         match method {
             PING => Ok(json!({})),
-            RESOURCES_SUBSCRIBE => self.subscribe(params),
-            RESOURCES_UNSUBSCRIBE => self.unsubscribe(params),
+            RESOURCES_SUBSCRIBE => {
+                // Live dispatch must resolve the URI and run on_subscribe
+                // before the adapter records the subscription. Adapter-only
+                // admission would keep as_proxy upstreams silent.
+                self.require_resource_subscribe_capability()?;
+                self.dispatch_operating_handler(request_id, method, params)
+                    .await?;
+                self.subscribe(params)
+            }
+            RESOURCES_UNSUBSCRIBE => {
+                self.require_resource_subscribe_capability()?;
+                self.dispatch_operating_handler(request_id, method, params)
+                    .await?;
+                self.unsubscribe(params)
+            }
             LOGGING_SET_LEVEL => self.set_logging_level(params),
             TOOLS_LIST
             | TOOLS_CALL
@@ -1104,6 +1117,21 @@ where
         }
     }
 
+    async fn dispatch_operating_handler(
+        &mut self,
+        request_id: &Value,
+        method: &'static str,
+        params: Option<&Value>,
+    ) -> Result<Value, Legacy2024AdapterError> {
+        self.handler
+            .handle_legacy_2024_with_request_id_async(request_id, method, params)
+            .await
+            .map_err(|error| Legacy2024AdapterError {
+                code: error.code().clone(),
+                message: error.message().to_owned(),
+            })
+    }
+
     fn require_server_capability(&self, method: &str) -> Result<(), Legacy2024AdapterError> {
         let admitted = match method {
             TOOLS_LIST | TOOLS_CALL => self.config.capabilities.tools.is_some(),
@@ -1123,18 +1151,24 @@ where
         }
     }
 
-    fn subscribe(&mut self, params: Option<&Value>) -> Result<Value, Legacy2024AdapterError> {
-        if !self
+    fn require_resource_subscribe_capability(&self) -> Result<(), Legacy2024AdapterError> {
+        if self
             .config
             .capabilities
             .resources
             .as_ref()
             .is_some_and(|resources| resources.subscribe)
         {
-            return Err(Legacy2024AdapterError::invalid_request(
+            Ok(())
+        } else {
+            Err(Legacy2024AdapterError::invalid_request(
                 "server resources.subscribe capability is required",
-            ));
+            ))
         }
+    }
+
+    fn subscribe(&mut self, params: Option<&Value>) -> Result<Value, Legacy2024AdapterError> {
+        self.require_resource_subscribe_capability()?;
         let uri = uri_param(params)?;
         if !self.subscriptions.contains(uri) {
             self.reserve_state()?;
@@ -1144,17 +1178,7 @@ where
     }
 
     fn unsubscribe(&mut self, params: Option<&Value>) -> Result<Value, Legacy2024AdapterError> {
-        if !self
-            .config
-            .capabilities
-            .resources
-            .as_ref()
-            .is_some_and(|resources| resources.subscribe)
-        {
-            return Err(Legacy2024AdapterError::invalid_request(
-                "server resources.subscribe capability is required",
-            ));
-        }
+        self.require_resource_subscribe_capability()?;
         let uri = uri_param(params)?;
         if self.subscriptions.remove(uri) {
             self.release_state()?;

@@ -1869,6 +1869,19 @@ pub trait ResourceHandler: Send + Sync {
         None
     }
 
+    /// Called after a session admits `resources/subscribe` for this URI.
+    ///
+    /// Prefixed as_proxy handlers rewrite the inbound URI and subscribe the
+    /// upstream so later `notify_resource_updated` is not silent.
+    fn on_subscribe(&self, _ctx: &McpContext, _uri: &str) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Called after a session removes `resources/subscribe` for this URI.
+    fn on_unsubscribe(&self, _ctx: &McpContext, _uri: &str) -> McpResult<()> {
+        Ok(())
+    }
+
     /// Returns an exact final resource catalog definition, when this handler
     /// owns one. This bypasses lossy projection through [`Resource`], retaining
     /// final-only fields such as `size`, full icons, annotations, and `_meta`.
