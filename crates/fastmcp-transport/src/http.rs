@@ -3043,35 +3043,59 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
             )));
         }
 
-        let http_request = match self.read_request_with_context(Some(cx)) {
-            Ok(request) => request,
-            Err(error) => {
-                // The incremental HTTP parser may already have consumed a
-                // request-line, headers, chunk metadata, or body prefix. It is
-                // never safe to treat the remaining suffix as a new request.
-                self.closed = true;
-                self.response_pending = false;
-                self.response_origin = None;
-                return Err(match error {
-                    HttpError::Closed => TransportError::Closed,
-                    HttpError::Timeout => TransportError::Timeout,
-                    HttpError::Transport(error) => error,
-                    _ => TransportError::Io(std::io::Error::other(error.to_string())),
-                });
+        let json_rpc = loop {
+            let http_request = match self.read_request_with_context(Some(cx)) {
+                Ok(request) => request,
+                Err(error) => {
+                    // The incremental HTTP parser may already have consumed a
+                    // request-line, headers, chunk metadata, or body prefix. It is
+                    // never safe to treat the remaining suffix as a new request.
+                    self.closed = true;
+                    self.response_pending = false;
+                    self.response_origin = None;
+                    return Err(match error {
+                        HttpError::Closed => TransportError::Closed,
+                        HttpError::Timeout => TransportError::Timeout,
+                        HttpError::Transport(error) => error,
+                        _ => TransportError::Io(std::io::Error::other(error.to_string())),
+                    });
+                }
+            };
+            validate_mcp_request_policy(&http_request, &self.config).map_err(|error| {
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ))
+            })?;
+            self.response_origin = http_request.header("origin").map(ToOwned::to_owned);
+            self.response_pending = true;
+
+            // Parse JSON-RPC from the complete HTTP body through the same bounded
+            // admission policy used by every other transport.
+            match self.codec.decode_complete_request(&http_request.body) {
+                Ok(json_rpc) => break json_rpc,
+                Err(_) => {
+                    // The HTTP framing consumed exactly this request's bytes,
+                    // so the stream is still in sync. A body that is not a
+                    // valid JSON-RPC request is a request-scoped failure:
+                    // streamable HTTP answers it with 400 Bad Request and the
+                    // connection keeps serving subsequent exchanges (JSON-RPC
+                    // parse errors never poison the transport).
+                    let mut rejection = HttpResponse::new(HttpStatus::BAD_REQUEST);
+                    if let Some(origin) = self.response_origin.as_deref() {
+                        rejection = rejection.with_cors(origin);
+                    }
+                    if self.write_response(&rejection).is_err() {
+                        self.closed = true;
+                        self.response_pending = false;
+                        self.response_origin = None;
+                        return Err(TransportError::Io(std::io::Error::other("write error")));
+                    }
+                    self.response_pending = false;
+                    self.response_origin = None;
+                }
             }
         };
-        validate_mcp_request_policy(&http_request, &self.config).map_err(|error| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                error.to_string(),
-            ))
-        })?;
-        self.response_origin = http_request.header("origin").map(ToOwned::to_owned);
-        self.response_pending = true;
-
-        // Parse JSON-RPC from the complete HTTP body through the same bounded
-        // admission policy used by every other transport.
-        let json_rpc = self.codec.decode_complete_request(&http_request.body)?;
 
         if let Err(error) = http_checkpoint(cx) {
             // The complete HTTP exchange has already left the byte stream. A

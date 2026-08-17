@@ -724,12 +724,19 @@ where
             Ok(envelope) => envelope,
             Err(error) => {
                 // A valid envelope whose method-owned params content is
-                // malformed is an Invalid Params rejection, not an invalid
-                // request; envelope-structure failures keep -32600.
+                // malformed is an Invalid Params rejection; a valid envelope
+                // naming a method outside exact 2024-11-05 is Method Not
+                // Found (-32601) per JSON-RPC 2.0; envelope-structure
+                // failures keep -32600.
                 let error = match error {
                     Legacy2024EnvelopeError::MethodParams(_) => {
                         Legacy2024AdapterError::invalid_params(
                             "invalid exact MCP 2024-11-05 parameters",
+                        )
+                    }
+                    Legacy2024EnvelopeError::Method(_) => {
+                        Legacy2024AdapterError::method_not_found(
+                            "method is not part of exact MCP 2024-11-05",
                         )
                     }
                     Legacy2024EnvelopeError::Envelope(_) => {

@@ -1423,22 +1423,27 @@ pub fn decode_legacy_2024_11_05_envelope(
     value: Value,
 ) -> Result<Legacy2024Envelope, Legacy2024WireError> {
     decode_legacy_2024_11_05_envelope_classified(value).map_err(|error| match error {
-        Legacy2024EnvelopeError::Envelope(error) | Legacy2024EnvelopeError::MethodParams(error) => {
-            error
-        }
+        Legacy2024EnvelopeError::Envelope(error)
+        | Legacy2024EnvelopeError::Method(error)
+        | Legacy2024EnvelopeError::MethodParams(error) => error,
     })
 }
 
 /// One exact-2024 admission failure, split by JSON-RPC error taxonomy.
 ///
-/// Envelope-structure failures map to Invalid Request (-32600); a valid
-/// envelope whose method-owned params content is malformed maps to Invalid
-/// Params (-32602). Envelope admission runs first, so a doubly-invalid frame
+/// Envelope-structure failures map to Invalid Request (-32600); a
+/// structurally valid JSON-RPC envelope naming a method outside the exact
+/// 2024-11-05 inventory maps to Method Not Found (-32601); a valid envelope
+/// whose method-owned params content is malformed maps to Invalid Params
+/// (-32602). Envelope admission runs first, so a doubly-invalid frame
 /// reports its envelope failure.
 #[derive(Debug)]
 pub enum Legacy2024EnvelopeError {
     /// The JSON-RPC envelope itself is not an exact MCP 2024-11-05 frame.
     Envelope(Legacy2024WireError),
+    /// The envelope is a valid JSON-RPC frame, but its method name is not
+    /// part of exact MCP 2024-11-05 (JSON-RPC 2.0 Method Not Found).
+    Method(Legacy2024WireError),
     /// The envelope is valid but the method's params content is malformed.
     MethodParams(Legacy2024WireError),
 }
@@ -1483,10 +1488,15 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
             .ok_or(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
                 "JSON-RPC method must be a string",
             )))?;
-        let method =
-            legacy_2024_11_05_method(method_name).ok_or(Legacy2024EnvelopeError::Envelope(
-                Legacy2024WireError("method is not part of exact MCP 2024-11-05"),
-            ))?;
+        // An unrecognized method on an otherwise valid JSON-RPC frame is
+        // JSON-RPC 2.0 Method Not Found (-32601), not Invalid Request: the
+        // envelope structure is sound, the method simply is not available
+        // in exact MCP 2024-11-05.
+        let method = legacy_2024_11_05_method(method_name).ok_or(
+            Legacy2024EnvelopeError::Method(Legacy2024WireError(
+                "method is not part of exact MCP 2024-11-05",
+            )),
+        )?;
         let params = object.get("params").cloned();
         if params.as_ref().is_some_and(|params| !params.is_object()) {
             return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(
