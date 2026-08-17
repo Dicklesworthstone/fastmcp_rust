@@ -1303,6 +1303,41 @@ fn insert_negotiated_tasks_client_extension(
     Ok(())
 }
 
+/// Overlays inbound sampling/elicitation/roots without replacing extension
+/// advertisements already stamped on `_meta` client capabilities.
+fn overlay_inbound_core_client_capabilities_on_metadata(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    inbound: &ClientCapabilities,
+) -> McpResult<()> {
+    let inbound = serde_json::to_value(inbound).map_err(|_| {
+        McpError::internal_error("Inbound client capabilities could not be encoded")
+    })?;
+    let Some(inbound) = inbound.as_object() else {
+        return Err(McpError::internal_error(
+            "Inbound client capabilities must serialize as an object",
+        ));
+    };
+    let capabilities = metadata
+        .entry(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(capabilities) = capabilities.as_object_mut() else {
+        return Err(McpError::internal_error(
+            "Modern Tasks client capabilities must be an object",
+        ));
+    };
+    for key in ["sampling", "elicitation", "roots"] {
+        match inbound.get(key) {
+            Some(value) => {
+                capabilities.insert(key.to_owned(), value.clone());
+            }
+            None => {
+                capabilities.remove(key);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn insert_final_request_log_level(
     metadata: &mut serde_json::Map<String, serde_json::Value>,
     level: Option<LoggingLevel>,
@@ -17997,12 +18032,7 @@ impl Client {
                 );
             }
             if let Some(capabilities) = inbound_capabilities {
-                metadata.insert(
-                    FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
-                    serde_json::to_value(capabilities).map_err(|_| {
-                        McpError::internal_error("Inbound client capabilities could not be encoded")
-                    })?,
-                );
+                overlay_inbound_core_client_capabilities_on_metadata(metadata, &capabilities)?;
             }
         }
         let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&parameters))
@@ -20431,6 +20461,61 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     #[cfg(feature = "websocket-experimental")]
     use std::io;
+
+    #[test]
+    fn inbound_capability_overlay_preserves_official_tasks_extension() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+            serde_json::json!({
+                "extensions": { fastmcp_protocol::TASKS_EXTENSION: {} }
+            }),
+        );
+        overlay_inbound_core_client_capabilities_on_metadata(
+            &mut metadata,
+            &ClientCapabilities::default(),
+        )
+        .expect("an empty inbound overlay must keep already-stamped Tasks");
+        assert_eq!(
+            metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                [fastmcp_protocol::TASKS_EXTENSION],
+            serde_json::json!({})
+        );
+        assert!(
+            metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]
+                .get("sampling")
+                .is_none(),
+            "empty inbound capabilities must not invent sampling: {metadata:?}"
+        );
+    }
+
+    #[test]
+    fn inbound_capability_overlay_applies_sampling_without_dropping_tasks() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+            serde_json::json!({
+                "extensions": { fastmcp_protocol::TASKS_EXTENSION: {} }
+            }),
+        );
+        overlay_inbound_core_client_capabilities_on_metadata(
+            &mut metadata,
+            &ClientCapabilities {
+                sampling: Some(SamplingCapability::default()),
+                ..ClientCapabilities::default()
+            },
+        )
+        .expect("sampling overlay must keep already-stamped Tasks");
+        assert_eq!(
+            metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                [fastmcp_protocol::TASKS_EXTENSION],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["sampling"],
+            serde_json::json!({})
+        );
+    }
     #[cfg(feature = "websocket-experimental")]
     use std::net::SocketAddr;
     #[cfg(feature = "websocket-experimental")]
