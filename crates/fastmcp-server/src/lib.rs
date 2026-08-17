@@ -121,8 +121,6 @@ use oauth::{
     AuthorizationRequest, CodeChallengeMethod, OAuthError, OAuthHttpRoutes,
     OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName, TokenRequest,
 };
-#[cfg(all(feature = "proxy", feature = "tasks"))]
-use proxy::ProxyFinalTaskRelay;
 #[cfg(feature = "proxy")]
 pub use proxy::{
     FinalProgressCallback, ProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
@@ -130,6 +128,8 @@ pub use proxy::{
     ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
     ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyFinalTaskRelay};
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 pub use proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
 pub use router::{
@@ -5035,6 +5035,14 @@ fn subscription_cancellation_notification(
     })
 }
 
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn catalog_filter_requests_resource_updates(filter: &SubscriptionFilter) -> bool {
+    filter
+        .resource_subscriptions
+        .as_ref()
+        .is_some_and(|uris| !uris.is_empty())
+}
+
 fn is_final_subscription_event(notification: &ServerNotification) -> bool {
     matches!(
         notification,
@@ -9615,6 +9623,10 @@ fn spawn_modern_sse_dispatch(
                     terminal_commit_failed = true;
                 }
             } else {
+                // Peer cancel after Stream admission drops the JSON-RPC
+                // result. Settle the HTTP receipt here so listener drain
+                // does not wait for a complete that this path never sends.
+                terminal_delivery.mark_failed();
                 terminal_commit_failed = true;
             }
         }
@@ -9734,13 +9746,13 @@ async fn send_modern_sse_stream(
                 Ok(None) if response.is_finished() => break,
                 Ok(None)
                     if request_cancellation.is_cancel_requested()
-                        && !terminal_delivery.is_committed()
-                        && !terminal_delivery.control_is_satisfied() =>
+                        && !terminal_delivery.is_committed() =>
                 {
                     // Peer/session cancel with no graceful complete in flight.
-                    // Fail the receipt now so listener shutdown does not burn
-                    // the full drain budget waiting for a frame that will
-                    // never be enqueued.
+                    // Stream election marks control not-required, so do not
+                    // wait for a control frame that modern HTTP never writes.
+                    // Fail the receipt now so two live as_proxy catalog+Tasks
+                    // SSE POSTs do not burn the full drain budget.
                     terminal_delivery.mark_failed();
                     break;
                 }
@@ -9749,9 +9761,10 @@ async fn send_modern_sse_stream(
                     // live catalog+Tasks writers would busy-loop or hang and
                     // starve the dispatch that still owes the elected complete.
                     if cx.checkpoint().is_err() {
-                        if terminal_delivery.completion_is_open() {
+                        if !terminal_delivery.is_settled() {
                             // The connection region is already cancelled, so
-                            // dispatch cannot flush an unelected complete.
+                            // dispatch cannot flush an unelected complete or
+                            // a RequestCancelled that already left the body.
                             // Fail now instead of burning the drain budget.
                             terminal_delivery.mark_failed();
                             break;
@@ -12105,13 +12118,44 @@ impl Server {
             relay_listener = Some(listener);
         }
 
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        let mut catalog_relay_listener: Option<Box<dyn ProxyCatalogListener>> = None;
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        if !tasks_requested
+            && catalog_filter_requests_resource_updates(&params.notifications)
+            && let Some(relay) = self.final_task_relay.as_ref()
+        {
+            let mut listener = relay
+                .open_catalog_listener_async(request_ctx, params.notifications.clone())
+                .await?;
+            match listener
+                .next_async(request_ctx.cx(), &request_cancellation)
+                .await?
+            {
+                ProxyCatalogListenerEvent::Acknowledged(accepted) => {
+                    if !subscription_filter_admission_matches(&params.notifications, &accepted)? {
+                        return Err(McpError::invalid_params(
+                            "Proxy upstream narrowed the catalog subscription filter",
+                        ));
+                    }
+                }
+                ProxyCatalogListenerEvent::Notification(_)
+                | ProxyCatalogListenerEvent::Terminal => {
+                    return Err(McpError::invalid_request(
+                        "Proxy upstream catalog listener did not acknowledge before events",
+                    ));
+                }
+            }
+            catalog_relay_listener = Some(listener);
+        }
+
         let lease = self.final_subscriptions.open(
             subscription_id.clone(),
             params.notifications,
             tasks_requested,
             modern_http_owner,
             request_cancellation.clone(),
-            terminal_delivery,
+            terminal_delivery.clone(),
             notification_sender,
         )?;
 
@@ -12119,6 +12163,9 @@ impl Server {
             if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
                 if lease.has_graceful_completion() {
                     return self.final_subscription_complete_result(&subscription_id);
+                }
+                if let Some(delivery) = &terminal_delivery {
+                    delivery.mark_failed();
                 }
                 return Err(McpError::request_cancelled());
             }
@@ -12151,6 +12198,41 @@ impl Server {
                         if lease.has_graceful_completion() {
                             return self.final_subscription_complete_result(&subscription_id);
                         }
+                        if let Some(delivery) = &terminal_delivery {
+                            delivery.mark_failed();
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
+            if let Some(listener) = catalog_relay_listener.as_mut() {
+                match listener
+                    .next_async(request_ctx.cx(), &request_cancellation)
+                    .await
+                {
+                    Ok(ProxyCatalogListenerEvent::Notification(
+                        notification @ ServerNotification::ResourceUpdated(_),
+                    )) => {
+                        self.final_subscriptions.publish(notification)?;
+                    }
+                    Ok(ProxyCatalogListenerEvent::Notification(_)) => {}
+                    Ok(ProxyCatalogListenerEvent::Terminal) => {
+                        return self.final_subscription_complete_result(&subscription_id);
+                    }
+                    Ok(ProxyCatalogListenerEvent::Acknowledged(_)) => {
+                        return Err(McpError::invalid_request(
+                            "Proxy upstream catalog listener acknowledged more than once",
+                        ));
+                    }
+                    Err(error) if error.code == McpErrorCode::RequestCancelled => {
+                        if lease.has_graceful_completion() {
+                            return self.final_subscription_complete_result(&subscription_id);
+                        }
+                        if let Some(delivery) = &terminal_delivery {
+                            delivery.mark_failed();
+                        }
                         return Err(error);
                     }
                     Err(error) => return Err(error),
@@ -12162,6 +12244,9 @@ impl Server {
                 // cancellation error a peer-initiated cancel produces.
                 if lease.has_graceful_completion() {
                     return self.final_subscription_complete_result(&subscription_id);
+                }
+                if let Some(delivery) = &terminal_delivery {
+                    delivery.mark_failed();
                 }
                 return Err(McpError::request_cancelled());
             }
@@ -45075,6 +45160,25 @@ mod lib_unit_tests {
         assert!(
             delivery.is_settled(),
             "a cancelled connection region must settle instead of burning the drain bound"
+        );
+    }
+
+    #[test]
+    fn cancelled_http_writer_fails_after_stream_election_without_a_control_frame() {
+        let delivery = FinalSubscriptionTerminalDelivery::default();
+        delivery.mark_control_not_required();
+        assert!(
+            delivery.control_is_satisfied(),
+            "Stream election marks modern HTTP control not-required"
+        );
+        assert!(
+            !delivery.is_committed(),
+            "peer cancel after acknowledgement still has no complete enqueued"
+        );
+        delivery.mark_failed();
+        assert!(
+            delivery.is_settled(),
+            "as_proxy dual listen drain must settle when the peer drops after Stream"
         );
     }
 
