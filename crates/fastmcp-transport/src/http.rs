@@ -2521,6 +2521,12 @@ pub struct HttpTransport<R, W> {
     response_origin: Option<String>,
     /// Whether one admitted HTTP request is still awaiting its sole response.
     response_pending: bool,
+    /// Whether the pending exchange's body failed JSON-RPC decoding. The
+    /// server may still answer it with a correlated JSON-RPC error response;
+    /// if it declines and receives again instead, the next receive completes
+    /// the abandoned exchange with 400 Bad Request so the connection keeps
+    /// serving (the HTTP framing consumed exactly that request's bytes).
+    pending_body_rejected: bool,
 }
 
 fn read_retry_interrupted<R: Read>(
@@ -2593,6 +2599,7 @@ impl<R: Read, W: Write> HttpTransport<R, W> {
             closed: false,
             response_origin: None,
             response_pending: false,
+            pending_body_rejected: false,
         }
     }
 
@@ -3027,6 +3034,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         }
         self.response_pending = false;
         self.response_origin = None;
+        self.pending_body_rejected = false;
 
         Ok(())
     }
@@ -3037,10 +3045,34 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         }
         http_checkpoint(cx)?;
         if self.response_pending {
-            return Err(TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "previous HTTP request is still awaiting a response",
-            )));
+            if self.pending_body_rejected {
+                // The previous exchange's body failed JSON-RPC decoding and
+                // the server declined to answer it with a JSON-RPC error
+                // response (era admission skips malformed opening frames).
+                // The HTTP framing consumed exactly that request's bytes, so
+                // the stream is still in sync: complete the abandoned
+                // exchange with 400 Bad Request and keep the connection
+                // serving subsequent exchanges.
+                let mut rejection = HttpResponse::new(HttpStatus::BAD_REQUEST);
+                if let Some(origin) = self.response_origin.as_deref() {
+                    rejection = rejection.with_cors(origin);
+                }
+                if self.write_response(&rejection).is_err() {
+                    self.closed = true;
+                    self.response_pending = false;
+                    self.response_origin = None;
+                    self.pending_body_rejected = false;
+                    return Err(TransportError::Io(std::io::Error::other("write error")));
+                }
+                self.response_pending = false;
+                self.response_origin = None;
+                self.pending_body_rejected = false;
+            } else {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "previous HTTP request is still awaiting a response",
+                )));
+            }
         }
 
         let http_request = match self.read_request_with_context(Some(cx)) {
@@ -3070,8 +3102,18 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         self.response_pending = true;
 
         // Parse JSON-RPC from the complete HTTP body through the same bounded
-        // admission policy used by every other transport.
-        let json_rpc = self.codec.decode_complete_request(&http_request.body)?;
+        // admission policy used by every other transport. A decode failure
+        // keeps the response slot open: the server may answer this exchange
+        // with a correlated JSON-RPC error (for example -32700 Parse error).
+        // If it declines and receives again, the guard above completes the
+        // exchange with 400 Bad Request instead of failing the connection.
+        let json_rpc = match self.codec.decode_complete_request(&http_request.body) {
+            Ok(json_rpc) => json_rpc,
+            Err(error) => {
+                self.pending_body_rejected = true;
+                return Err(error.into());
+            }
+        };
 
         if let Err(error) = http_checkpoint(cx) {
             // The complete HTTP exchange has already left the byte stream. A
@@ -3107,6 +3149,7 @@ impl<R: Read, W: Write> Transport for HttpTransport<R, W> {
         self.closed = true;
         self.response_pending = false;
         self.response_origin = None;
+        self.pending_body_rejected = false;
         Ok(())
     }
 }
@@ -8819,6 +8862,59 @@ Content-Length: {}\r\n\
         assert!(!transport.closed);
         assert!(!transport.response_pending);
         assert!(transport.writer.starts_with(b"HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn declined_codec_error_exchange_flushes_400_and_admits_the_next_request() {
+        // First exchange: well-framed POST with a malformed JSON body.
+        let bad_body = b"{not-json";
+        let mut input = format!(
+            "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            bad_body.len()
+        )
+        .into_bytes();
+        input.extend_from_slice(bad_body);
+        // Second exchange: a valid ping request.
+        let good_body = br#"{"jsonrpc":"2.0","method":"ping","id":7}"#;
+        input.extend_from_slice(
+            format!(
+                "POST /mcp/v1 HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                good_body.len()
+            )
+            .as_bytes(),
+        );
+        input.extend_from_slice(good_body);
+
+        let mut transport = HttpTransport::new(Cursor::new(input), Vec::new());
+        let cx = Cx::for_testing();
+
+        // The codec failure keeps the response slot so the server may still
+        // answer with a correlated JSON-RPC error if it chooses to.
+        assert!(matches!(
+            transport.recv(&cx),
+            Err(TransportError::Codec(CodecError::Json(_)))
+        ));
+        assert!(!transport.closed);
+        assert!(transport.response_pending);
+
+        // The server declines (era admission skips malformed opening frames)
+        // and receives again: the abandoned exchange completes with 400 Bad
+        // Request and the next request is admitted on the same connection.
+        let message = transport
+            .recv(&cx)
+            .expect("the connection must keep serving after a declined malformed body");
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("second exchange must decode as a request");
+        };
+        assert_eq!(request.method, "ping");
+        assert!(transport.response_pending);
+        assert!(!transport.pending_body_rejected);
+        assert!(
+            transport
+                .writer
+                .starts_with(b"HTTP/1.1 400 Bad Request\r\n"),
+            "declined malformed exchange must be answered with 400"
+        );
     }
 
     #[test]

@@ -724,14 +724,19 @@ where
             Ok(envelope) => envelope,
             Err(error) => {
                 // A valid envelope whose method-owned params content is
-                // malformed is an Invalid Params rejection, not an invalid
-                // request; envelope-structure failures keep -32600.
+                // malformed is an Invalid Params rejection; a valid envelope
+                // naming a method outside exact 2024-11-05 is Method Not
+                // Found (-32601) per JSON-RPC 2.0; envelope-structure
+                // failures keep -32600.
                 let error = match error {
                     Legacy2024EnvelopeError::MethodParams(_) => {
                         Legacy2024AdapterError::invalid_params(
                             "invalid exact MCP 2024-11-05 parameters",
                         )
                     }
+                    Legacy2024EnvelopeError::Method(_) => Legacy2024AdapterError::method_not_found(
+                        "method is not part of exact MCP 2024-11-05",
+                    ),
                     Legacy2024EnvelopeError::Envelope(_) => {
                         Legacy2024AdapterError::invalid_request(
                             "invalid exact MCP 2024-11-05 envelope",
@@ -1803,6 +1808,41 @@ mod tests {
                 COMPLETION_COMPLETE
             ]
         );
+    }
+
+    #[test]
+    fn unknown_request_method_is_method_not_found() {
+        let binding = binding();
+        let mut adapter = adapter();
+        initialize_operating(&mut adapter);
+        let before = adapter.snapshot();
+
+        let response = adapter
+            .receive(
+                binding,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 41,
+                    "method": "totally/unknown/method"
+                }),
+            )
+            .expect("an id-bearing unknown method must receive a JSON-RPC error response");
+        let Legacy2024Outbound::Response(response) = response else {
+            panic!("unknown request method must produce a response");
+        };
+        // JSON-RPC 2.0: a structurally valid request naming an unavailable
+        // method is Method Not Found (-32601), not Invalid Request (-32600).
+        assert_eq!(response["error"]["code"], -32601);
+        assert_eq!(response["id"], 41);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("method"),
+            "refusal must name the method taxonomy: {response}"
+        );
+        assert_eq!(adapter.snapshot(), before);
+        assert!(adapter.handler.methods.is_empty());
     }
 
     #[test]
