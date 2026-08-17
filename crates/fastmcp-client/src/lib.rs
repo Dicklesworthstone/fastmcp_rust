@@ -6022,6 +6022,45 @@ where
         .await
     }
 
+    /// Sends exact-2024 `notifications/roots/list_changed` on this socket.
+    ///
+    /// Modern sessions reject it: the legacy reverse-notification vocabulary
+    /// is not a final transport escape hatch. The client must have advertised
+    /// `roots.listChanged` during initialization.
+    pub async fn roots_list_changed(&mut self, cx: &Cx) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        if self.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Err(McpError::method_not_found(NOTIFICATIONS_ROOTS_LIST_CHANGED));
+        }
+        if !self
+            .session
+            .client_capabilities()
+            .roots
+            .as_ref()
+            .is_some_and(|roots| roots.list_changed)
+        {
+            return Err(McpError::invalid_request(
+                "MCP 2024-11-05 roots/list_changed requires advertised roots.listChanged",
+            ));
+        }
+        let notification = JsonRpcMessage::Request(JsonRpcRequest::notification(
+            NOTIFICATIONS_ROOTS_LIST_CHANGED,
+            None,
+        ));
+        if let Err(error) = self.send_message(cx, &notification).await {
+            return Err(self.terminal_transport_error(cx, error).await);
+        }
+        Ok(())
+    }
+
     async fn request_legacy_empty(
         &mut self,
         cx: &Cx,
