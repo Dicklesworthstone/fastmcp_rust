@@ -47,10 +47,10 @@ use fastmcp_protocol::tasks_extension::{
 use fastmcp_protocol::{
     CancellationSender, CancellationWireMessage, ClientCapabilities, ClientInfo, CompleteResult,
     CoreDispatchError, CoreRequest, CoreResult, CorrelationKey, ElicitRequestParams, ElicitResult,
-    FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY, FINAL_SUBSCRIPTION_ID_META_KEY,
-    FinalCoreResult, FinalCreateMessageParams, FinalCreateMessageResult,
-    FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult, FinalNotificationError,
-    FinalProgressNotificationParams, FinalRequestMeta,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalCreateMessageParams,
+    FinalCreateMessageResult, FinalEmbeddedRootsListParams, FinalEmbeddedRootsListResult,
+    FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
@@ -5049,6 +5049,17 @@ impl ModernHttpClient {
         self.final_log_level = Some(level);
     }
 
+    /// Overlays inbound sampling/roots/elicitation onto this request handle.
+    ///
+    /// Official Tasks and other extension settings stay on the handle. Only
+    /// the inbound client's advertised core capabilities are replaced so an
+    /// as_proxy gateway cannot invent or drop sampling/roots/elicitation.
+    pub fn overlay_client_capabilities(&mut self, inbound: ClientCapabilities) {
+        self.client_capabilities.sampling = inbound.sampling;
+        self.client_capabilities.elicitation = inbound.elicitation;
+        self.client_capabilities.roots = inbound.roots;
+    }
+
     fn stamped_client_identity(&self) -> fastmcp_protocol::common_types::Implementation {
         self.client_implementation
             .clone()
@@ -8037,6 +8048,35 @@ fn build_modern_tasks_request(
     )
 }
 
+fn retain_inbound_core_client_capabilities(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+    inbound_capabilities: Option<serde_json::Value>,
+) {
+    let Some(inbound) = inbound_capabilities.and_then(|value| value.as_object().cloned()) else {
+        return;
+    };
+    let Some(capabilities) = metadata
+        .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        metadata.insert(
+            FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+            serde_json::Value::Object(inbound),
+        );
+        return;
+    };
+    for key in ["sampling", "elicitation", "roots"] {
+        match inbound.get(key) {
+            Some(value) => {
+                capabilities.insert(key.to_owned(), value.clone());
+            }
+            None => {
+                capabilities.remove(key);
+            }
+        }
+    }
+}
+
 /// Adds final HTTP metadata after the caller has validated that the method is
 /// reachable through its own core or extension-specific admission path.
 fn build_modern_request_after_method_validation(
@@ -8086,6 +8126,7 @@ fn build_modern_request_after_method_validation(
         .cloned()
         .or_else(|| metadata.get("clientInfo").cloned());
     let inbound_log_level = metadata.get(FINAL_LOG_LEVEL_META_KEY).cloned();
+    let inbound_capabilities = metadata.get(FINAL_CLIENT_CAPABILITIES_META_KEY).cloned();
     metadata.extend(final_metadata.clone());
     if let Some(inbound_client_info) = inbound_client_info {
         metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), inbound_client_info);
@@ -8093,6 +8134,7 @@ fn build_modern_request_after_method_validation(
     if let Some(inbound_log_level) = inbound_log_level {
         metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), inbound_log_level);
     }
+    retain_inbound_core_client_capabilities(&mut metadata, inbound_capabilities);
     parameters.insert("_meta".to_owned(), serde_json::Value::Object(metadata));
 
     let request = match request_id {

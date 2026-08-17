@@ -8175,6 +8175,10 @@ where
             meta.as_object()
                 .and_then(|meta| meta.get(FINAL_LOG_LEVEL_META_KEY).cloned())
         });
+        let inbound_capabilities = object.get("_meta").and_then(|meta| {
+            meta.as_object()
+                .and_then(|meta| meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY).cloned())
+        });
         if let Some(existing) = object.remove("_meta") {
             let existing = existing.as_object().ok_or_else(|| {
                 McpError::invalid_params("Modern WebSocket request metadata must be an object")
@@ -8188,6 +8192,23 @@ where
         insert_final_request_log_level(generated, self.final_log_level)?;
         if let Some(inbound_log_level) = inbound_log_level {
             generated.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), inbound_log_level);
+        }
+        if let Some(inbound) = inbound_capabilities.and_then(|value| value.as_object().cloned()) {
+            if let Some(capabilities) = generated
+                .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for key in ["sampling", "elicitation", "roots"] {
+                    match inbound.get(key) {
+                        Some(value) => {
+                            capabilities.insert(key.to_owned(), value.clone());
+                        }
+                        None => {
+                            capabilities.remove(key);
+                        }
+                    }
+                }
+            }
         }
         object.insert("_meta".to_owned(), metadata);
         Ok(params)
@@ -15026,6 +15047,7 @@ impl Client {
             .cloned()
             .or_else(|| metadata.get("clientInfo").cloned());
         let inbound_log_level = metadata.get(FINAL_LOG_LEVEL_META_KEY).cloned();
+        let inbound_capabilities = metadata.get(FINAL_CLIENT_CAPABILITIES_META_KEY).cloned();
         metadata.extend(final_metadata);
         if let Some(inbound_client_info) = inbound_client_info {
             metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), inbound_client_info);
@@ -15033,6 +15055,23 @@ impl Client {
         insert_final_request_log_level(metadata, self.final_log_level)?;
         if let Some(inbound_log_level) = inbound_log_level {
             metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), inbound_log_level);
+        }
+        if let Some(inbound) = inbound_capabilities.and_then(|value| value.as_object().cloned()) {
+            if let Some(capabilities) = metadata
+                .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for key in ["sampling", "elicitation", "roots"] {
+                    match inbound.get(key) {
+                        Some(value) => {
+                            capabilities.insert(key.to_owned(), value.clone());
+                        }
+                        None => {
+                            capabilities.remove(key);
+                        }
+                    }
+                }
+            }
         }
         Ok(params)
     }
@@ -17857,6 +17896,7 @@ impl Client {
         progress_marker: Option<&fastmcp_protocol::ProgressMarker>,
         inbound_identity: Option<&fastmcp_protocol::common_types::Implementation>,
         inbound_log_level: Option<LoggingLevel>,
+        inbound_capabilities: Option<ClientCapabilities>,
     ) -> McpResult<FinalToolCallOutcome> {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
@@ -17877,7 +17917,10 @@ impl Client {
                 McpError::internal_error("Modern Tasks progress token could not be encoded")
             })?;
         }
-        if inbound_identity.is_some() || inbound_log_level.is_some() {
+        if inbound_identity.is_some()
+            || inbound_log_level.is_some()
+            || inbound_capabilities.is_some()
+        {
             let metadata = parameters
                 .get_mut("_meta")
                 .and_then(serde_json::Value::as_object_mut)
@@ -17897,6 +17940,14 @@ impl Client {
                     FINAL_LOG_LEVEL_META_KEY.to_owned(),
                     serde_json::to_value(level).map_err(|_| {
                         McpError::internal_error("Inbound logLevel could not be encoded")
+                    })?,
+                );
+            }
+            if let Some(capabilities) = inbound_capabilities {
+                metadata.insert(
+                    FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(),
+                    serde_json::to_value(capabilities).map_err(|_| {
+                        McpError::internal_error("Inbound client capabilities could not be encoded")
                     })?,
                 );
             }
