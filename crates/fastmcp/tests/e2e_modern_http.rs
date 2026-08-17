@@ -18819,6 +18819,77 @@ fn connect_legacy_http_client(cx: &Cx, address: SocketAddr, name: &str) -> legac
 }
 
 #[test]
+fn e2e_public_http_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_is_refused() {
+    let cx = Cx::for_request();
+    let advertised = spawn_legacy_instructions_http_server(false);
+    let omitted = spawn_legacy_instructions_http_server(false);
+    let mut admitted = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP roots-change connect",
+        legacy_2024::http_client_builder(
+            public_http_target(advertised.address(), "/sse"),
+            public_http_target(advertised.address(), "/messages"),
+        )
+        .expect("the exact-2024 HTTP endpoints form one public facade plan")
+        .client_info("e2e-public-http-legacy-roots-changed", "1.0.0")
+        .capabilities(ClientCapabilities {
+            roots: Some(legacy_2024::RootsCapability { list_changed: true }),
+            ..ClientCapabilities::default()
+        })
+        .reverse_request_handlers(
+            legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
+                |_cx, _cancel, _params| {
+                    Box::pin(async { Ok(legacy_2024::ListRootsResult::new(Vec::new())) })
+                },
+            ),
+        )
+        .connect_http_client_with_cx(&cx),
+    )
+    .expect("an advertised roots.listChanged client connects");
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP roots/list_changed",
+        admitted.roots_list_changed(&cx),
+    )
+    .expect("live exact-2024 HTTP must admit notifications/roots/list_changed when advertised");
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP ping after roots/list_changed",
+        admitted.ping(&cx),
+    )
+    .expect("the same session must still admit ping after roots/list_changed");
+
+    let mut refused = connect_legacy_http_client(
+        &cx,
+        omitted.address(),
+        "e2e-public-http-legacy-roots-changed-bare",
+    );
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP unadvertised roots/list_changed",
+        refused.roots_list_changed(&cx),
+    )
+    .expect_err("changing only the missing roots.listChanged advertisement must refuse");
+    let missing = format!("{missing:?}");
+    assert!(
+        missing.contains("roots.listChanged") || missing.contains("InvalidRequest"),
+        "the unadvertised refusal must keep the capability gate: {missing}"
+    );
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP ping after unadvertised roots/list_changed",
+        refused.ping(&cx),
+    )
+    .expect("changing only the missing advertisement must leave ping admitted");
+
+    drop(admitted);
+    drop(refused);
+    advertised.shutdown();
+    omitted.shutdown();
+}
+
+#[test]
 fn e2e_public_http_legacy_ping_is_admitted_and_missing_tool_stays_refused() {
     let cx = Cx::for_request();
     let server = spawn_legacy_instructions_http_server(false);
@@ -22730,6 +22801,150 @@ fn spawn_legacy_as_proxy_template_completion_upstream() -> HttpServerFixture {
     })
 }
 
+/// Live exact-2024 stdio `as_proxy("ext")` HTTP gateway against the shipped
+/// echo process launched as LegacyOnly. Prefixed resource-template completion
+/// proofs use this so `ext/note://{name}` rewrites onto the echo note provider.
+#[cfg(all(unix, feature = "proxy"))]
+fn spawn_legacy_http_stdio_as_proxy_gateway() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("legacy stdio as_proxy gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("legacy stdio as_proxy gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "legacy stdio as_proxy gateway HTTP server control receiver went away"
+                        .to_owned(),
+                );
+            }
+            let mut last_connect_error = None;
+            let mut stdio = None;
+            for attempt in 1_u32..=4 {
+                match legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-http-legacy-stdio-as-proxy-upstream", "1.0.0")
+                    .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
+                    .max_retries(2)
+                    .retry_delay_ms(150)
+                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                {
+                    Ok(client) => {
+                        stdio = Some(client);
+                        break;
+                    }
+                    Err(error) => {
+                        last_connect_error = Some(error);
+                        if attempt < 4 {
+                            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                        }
+                    }
+                }
+            }
+            let mut stdio = stdio.ok_or_else(|| {
+                format!(
+                    "live exact-2024 stdio as_proxy upstream connect failed: {}",
+                    last_connect_error
+                        .expect("a failed stdio connect records its last transport error")
+                )
+            })?;
+            // as_proxy catalog listing is the first stdio request on this
+            // path. A live tools/list first proves the echo process is
+            // answering before install consumes the idle deadline.
+            let _ = stdio.list_tools().map_err(|error| {
+                format!(
+                    "live exact-2024 stdio as_proxy upstream must answer tools/list before install: {error}"
+                )
+            })?;
+            let server = legacy_2024::ServerBuilder::new("e2e-legacy-http-stdio-as-proxy", "1.0.0")
+                .as_proxy("ext", stdio)
+                .map_err(|error| format!("legacy as_proxy stdio install failed: {error}"))?
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("legacy stdio as_proxy gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message =
+                        format!("legacy stdio as_proxy gateway HTTP server address failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "legacy stdio as_proxy gateway HTTP server startup receiver went away"
+                        .to_owned(),
+                );
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("legacy stdio as_proxy gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy stdio as_proxy gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(ready)) => break ready,
+            Ok(Err(error)) => {
+                panic!("legacy stdio as_proxy gateway HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("legacy stdio as_proxy gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
 #[cfg(feature = "proxy")]
 fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
@@ -23124,6 +23339,111 @@ fn e2e_public_http_legacy_as_proxy_forwards_resource_template_completion() {
     drop(client);
     gateway.shutdown();
     upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_forwards_resource_template_completion() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-template-complete",
+    );
+
+    let completed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy template completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: "ext/note://{name}".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "exact-2024 stdio as_proxy must rewrite the prefixed note template onto the echo provider",
+    );
+    assert_eq!(
+        completed.completion.values,
+        vec!["stdio-note-completion-legacy".to_owned()],
+        "exact-2024 stdio as_proxy must retain the echo note-template completion: {completed:?}"
+    );
+
+    let unprefixed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy unprefixed template completion",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: "note://{name}".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the prefix must not reach the exact-2024 echo note provider");
+    let _ = unprefixed;
+
+    let other = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy other template completion",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: "ext/memo://{name}".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the template URI must not invent an exact-2024 completion provider");
+    let _ = other;
+
+    let greeting = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy greeting complete after template",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: "ext/greeting".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "co".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect("prefixed greeting complete must stay admitted after template complete");
+    assert_eq!(
+        greeting.completion.values,
+        vec!["stdio-completion-legacy".to_owned()],
+        "exact-2024 stdio as_proxy must still complete ext/greeting: {greeting:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
 }
 
 #[test]
@@ -30387,6 +30707,131 @@ mod live_websocket_bind {
                 .await
                 .expect("the bare exact-2024 roots WebSocket client closes after the planted refusal");
             drop(bare);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn e2e_public_websocket_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_is_refused()
+    {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket roots-change runtime installs an ambient context",
+            );
+            let server = legacy_2024::ServerBuilder::new("facade-ws-legacy-roots-changed", "1.0.0")
+                .tool(PublicHttpValue)
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect(
+                    "public LegacyOnly bind_websocket roots-change must bind a localhost listener",
+                );
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket roots-change publishes its bound address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket roots-change serve must be admitted");
+
+            let advertised_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots-change handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public LegacyOnly bind_websocket roots-change must complete RFC 6455 upgrade");
+            let mut admitted = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots-change initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-roots-changed", "1.0.0")
+                    .capabilities(ClientCapabilities {
+                        roots: Some(legacy_2024::RootsCapability { list_changed: true }),
+                        ..ClientCapabilities::default()
+                    })
+                    .reverse_request_handlers(
+                        legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
+                            |_cx, _cancel, _params| {
+                                Box::pin(async {
+                                    Ok(legacy_2024::ListRootsResult::new(Vec::new()))
+                                })
+                            },
+                        ),
+                    )
+                    .connect_websocket_with_cx(&cx, advertised_transport),
+            )
+            .await
+            .expect("an advertised roots.listChanged WebSocket client connects");
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 WebSocket roots/list_changed",
+                admitted.roots_list_changed(&cx),
+            )
+            .await
+            .expect(
+                "live exact-2024 WebSocket must admit notifications/roots/list_changed when advertised",
+            );
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 WebSocket ping after roots/list_changed",
+                admitted.ping(&cx),
+            )
+            .await
+            .expect("the same socket must still admit ping after roots/list_changed");
+
+            let omitted_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots-change bare handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("a bare exact-2024 WebSocket client must complete RFC 6455 upgrade");
+            let mut refused = websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots-change bare initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-roots-changed-bare", "1.0.0")
+                    .connect_websocket_with_cx(&cx, omitted_transport),
+            )
+            .await
+            .expect("a bare exact-2024 WebSocket peer must still initialize");
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 unadvertised roots/list_changed",
+                refused.roots_list_changed(&cx),
+            )
+            .await
+            .expect_err("changing only the missing roots.listChanged advertisement must refuse");
+            let missing = format!("{missing:?}");
+            assert!(
+                missing.contains("roots.listChanged") || missing.contains("InvalidRequest"),
+                "the unadvertised refusal must keep the capability gate: {missing}"
+            );
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 WebSocket ping after unadvertised roots/list_changed",
+                refused.ping(&cx),
+            )
+            .await
+            .expect("changing only the missing advertisement must leave ping admitted");
+
+            websocket_client_bounded(&cx, "live exact-2024 roots-change close", admitted.close(&cx))
+                .await
+                .expect("the advertised exact-2024 roots-change WebSocket client closes");
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 roots-change bare close",
+                refused.close(&cx),
+            )
+            .await
+            .expect("the bare exact-2024 roots-change WebSocket client closes");
+            drop(admitted);
+            drop(refused);
             cx.set_cancel_requested(true);
             listener.abort();
         });
