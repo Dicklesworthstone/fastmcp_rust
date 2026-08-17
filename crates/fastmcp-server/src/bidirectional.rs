@@ -780,12 +780,16 @@ impl std::fmt::Debug for RequestSender {
 #[derive(Clone)]
 pub struct TransportSamplingSender {
     sender: RequestSender,
+    request_context: McpContext,
 }
 
 impl TransportSamplingSender {
-    /// Creates a new transport-backed sampling sender.
-    pub fn new(sender: RequestSender) -> Self {
-        Self { sender }
+    /// Creates a sampling sender bound to the originating handler request.
+    pub fn new(sender: RequestSender, request_context: McpContext) -> Self {
+        Self {
+            sender,
+            request_context,
+        }
     }
 }
 
@@ -833,13 +837,16 @@ impl SamplingSender for TransportSamplingSender {
             let params_value = serde_json::to_value(&params)
                 .map_err(|_| McpError::internal_error(REQUEST_PAYLOAD_ERROR))?;
 
-            let cx = Cx::current().ok_or_else(|| {
-                McpError::internal_error("No current asupersync Cx for sampling request")
-            })?;
-
+            self.request_context
+                .checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             let result: fastmcp_protocol::CreateMessageResult = self
                 .sender
-                .send_request(&cx, "sampling/createMessage", params_value)
+                .send_request(
+                    self.request_context.cx(),
+                    "sampling/createMessage",
+                    params_value,
+                )
                 .await?;
 
             if result.role != fastmcp_protocol::Role::Assistant {
@@ -868,12 +875,16 @@ impl SamplingSender for TransportSamplingSender {
 #[derive(Clone)]
 pub struct TransportElicitationSender {
     sender: RequestSender,
+    request_context: McpContext,
 }
 
 impl TransportElicitationSender {
-    /// Creates a new transport-backed elicitation sender.
-    pub fn new(sender: RequestSender) -> Self {
-        Self { sender }
+    /// Creates an elicitation sender bound to the originating handler request.
+    pub fn new(sender: RequestSender, request_context: McpContext) -> Self {
+        Self {
+            sender,
+            request_context,
+        }
     }
 }
 
@@ -923,13 +934,16 @@ impl ElicitationSender for TransportElicitationSender {
                 }
             };
 
-            let cx = Cx::current().ok_or_else(|| {
-                McpError::internal_error("No current asupersync Cx for elicitation request")
-            })?;
-
+            self.request_context
+                .checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
             let result: fastmcp_protocol::ElicitResult = self
                 .sender
-                .send_request(&cx, "elicitation/create", params_value)
+                .send_request(
+                    self.request_context.cx(),
+                    "elicitation/create",
+                    params_value,
+                )
                 .await?;
 
             let action = match result.action {
@@ -4367,7 +4381,7 @@ mod tests {
         let pending = Arc::new(PendingRequests::new());
         let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
         let sender = RequestSender::new(pending, send_fn);
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
         let _cloned = sampling.clone();
     }
 
@@ -4376,7 +4390,8 @@ mod tests {
         let pending = Arc::new(PendingRequests::new());
         let send_fn: TransportSendFn = Arc::new(|_| Ok(()));
         let sender = RequestSender::new(pending, send_fn);
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
         let _cloned = elicitation.clone();
     }
 
@@ -4448,7 +4463,7 @@ mod tests {
                 "stopReason": "endTurn"
             })
         });
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = SamplingRequest {
             messages: vec![fastmcp_core::SamplingRequestMessage {
@@ -4482,7 +4497,7 @@ mod tests {
             assert_eq!(request.method, "sampling/createMessage");
             reply.clone()
         });
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let callback_response = fastmcp_core::block_on(SamplingSender::create_message(
             &sampling,
@@ -4522,7 +4537,7 @@ mod tests {
                 "stopReason": "maxTokens"
             })
         });
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = SamplingRequest {
             messages: vec![fastmcp_core::SamplingRequestMessage {
@@ -4559,7 +4574,7 @@ mod tests {
                 "stopReason": "stopSequence"
             })
         });
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = SamplingRequest {
             messages: vec![fastmcp_core::SamplingRequestMessage {
@@ -4594,7 +4609,7 @@ mod tests {
                 "stopReason": "endTurn"
             })
         });
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = SamplingRequest {
             messages: vec![fastmcp_core::SamplingRequestMessage {
@@ -4623,7 +4638,7 @@ mod tests {
                 "stopReason": "endTurn"
             })
         });
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
         let request = SamplingRequest::prompt("Hi", 10);
 
         let error = fastmcp_core::block_on(SamplingSender::create_message(&sampling, request))
@@ -4652,7 +4667,8 @@ mod tests {
                 }
             })
         });
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = ElicitationRequest {
             message: "Fill the form".to_string(),
@@ -4681,7 +4697,8 @@ mod tests {
                 "action": "decline"
             })
         });
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = ElicitationRequest {
             message: "Confirm?".to_string(),
@@ -4708,7 +4725,8 @@ mod tests {
                 "action": "cancel"
             })
         });
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = ElicitationRequest {
             message: "Please authenticate".to_string(),
@@ -4854,7 +4872,8 @@ mod tests {
         let sender = make_sender_with_responder(|_| {
             panic!("an invalid URL elicitation must not reach the transport")
         });
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = ElicitationRequest {
             message: "Auth".to_string(),
@@ -4874,7 +4893,8 @@ mod tests {
     #[test]
     fn transport_elicitation_sender_rejects_accepted_form_without_content() {
         let sender = make_sender_with_responder(|_| serde_json::json!({ "action": "accept" }));
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
         let request = ElicitationRequest::form(
             "Fill the form",
             serde_json::json!({
@@ -4895,7 +4915,8 @@ mod tests {
                 "content": {"credential": "must-not-be-exposed"}
             })
         });
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
         let request = ElicitationRequest::url("Authenticate", "https://example.com", "eid-1");
 
         let error = fastmcp_core::block_on(ElicitationSender::elicit(&elicitation, request))
@@ -4912,7 +4933,8 @@ mod tests {
                 "content": {"credential": "must-not-be-exposed"}
             })
         });
-        let elicitation = TransportElicitationSender::new(sender);
+        let elicitation =
+            TransportElicitationSender::new(sender, McpContext::new(Cx::for_testing(), 0));
         let request = ElicitationRequest::form(
             "Fill the form",
             serde_json::json!({
@@ -4959,7 +4981,7 @@ mod tests {
         let pending = Arc::new(PendingRequests::new());
         let send_fn: TransportSendFn = Arc::new(|_| Err("connection reset".to_string()));
         let sender = RequestSender::new(pending, send_fn);
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = SamplingRequest {
             messages: vec![fastmcp_core::SamplingRequestMessage {
@@ -4997,7 +5019,7 @@ mod tests {
                 "stopReason": "endTurn"
             })
         });
-        let sampling = TransportSamplingSender::new(sender);
+        let sampling = TransportSamplingSender::new(sender, McpContext::new(Cx::for_testing(), 0));
 
         let request = SamplingRequest {
             messages: vec![

@@ -20,18 +20,21 @@ use asupersync::Cx;
 use fastmcp_client::FinalToolCallOutcome;
 #[cfg(feature = "tasks")]
 use fastmcp_client::StdioTaskSubscriptionEvent;
-use fastmcp_client::http_executor::{LegacyHttpRequest, ModernHttpClient, ModernHttpResponseKind};
+use fastmcp_client::http_executor::{
+    LegacyHttpRequest, LegacySsePersistentReceiver, ModernHttpClient, ModernHttpResponseKind,
+};
 #[cfg(feature = "tasks")]
 use fastmcp_client::http_executor::{ModernHttpFinalCoreEvent, ModernHttpSubscriptionListenError};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
     Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
     ClientProtocolPlan, CompletionParams, CompletionReference, ModernHttpSubscriptionListenEvent,
-    ModernHttpSubscriptionListener, ReverseRequestHandlers, StdioSubscriptionEvent,
+    ModernHttpSubscriptionListener, ReverseRequestHandlers, StdioRequestExecution,
+    StdioSubscriptionEvent,
 };
 use fastmcp_core::{
     CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome, McpResult,
-    Outcome, block_on,
+    Outcome, SamplingRequest, SamplingRequestMessage, SamplingRole, block_on,
 };
 use fastmcp_protocol::common_types::{AbsoluteUri, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
@@ -47,18 +50,18 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
-    CompletionValues, Content, CoreRequest, CoreResult, ElicitationCapability,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
-    FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
-    FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
+    CompletionValues, Content, CoreRequest, CoreResult, CreateMessageParams, CreateMessageResult,
+    ElicitationCapability, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
+    FINAL_LOG_LEVEL_META_KEY, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
+    FinalCoreResult, FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
     InitializeParams, InitializeResult, InputRequiredResult, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, LegacyCompletionParams, LegacyCompletionReference, LegacyContent,
     LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsResult, ProgressParams,
     Prompt, PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent,
-    ResourceTemplate, RootsCapability, SamplingCapability, ServerDiscoverResult,
-    ServerNotification, SubscriptionFilter, Tool, ToolAnnotations, UrlElicitationCapability,
-    decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
+    ResourceTemplate, Root, RootsCapability, SamplingCapability, SamplingContent,
+    ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool, ToolAnnotations,
+    UrlElicitationCapability, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{
@@ -477,6 +480,22 @@ impl ProxyCatalogListener for ProxyHttpCatalogListener {
 pub struct ProxyLegacyHttpRequest {
     request: CoreRequest,
     handle: LegacyHttpRequest,
+}
+
+/// Prepared exact-2024 HTTP start that can POST after the route mutex drops.
+pub struct PreparedLegacyHttpStart {
+    request: CoreRequest,
+    method: String,
+    parameters: serde_json::Value,
+    request_id: RequestId,
+    receiver: Arc<LegacySsePersistentReceiver>,
+    cx: Cx,
+}
+
+/// Prepared exact-2024 stdio start that can yield after the route mutex drops.
+pub struct PreparedLegacyStdioStart {
+    request: CoreRequest,
+    execution: StdioRequestExecution,
 }
 
 impl ProxyLegacyHttpRequest {
@@ -1062,6 +1081,97 @@ pub trait ProxyBackend: Send {
         Ok(None)
     }
 
+    /// Subscribes the upstream to one exact-2024 resource URI.
+    fn subscribe_resource(&mut self, _uri: &str) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Ends one exact-2024 upstream resource subscription.
+    fn unsubscribe_resource(&mut self, _uri: &str) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Forwards exact-2024 `logging/setLevel` onto the upstream session.
+    fn set_log_level(&mut self, _level: LoggingLevel) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Drains exact-2024 `resources/updated` URIs and `notifications/message`
+    /// frames retained by the last upstream request or shared SSE stream.
+    fn take_legacy_peer_notifications(&mut self) -> McpResult<ProxyLegacyPeerNotifications> {
+        Ok(ProxyLegacyPeerNotifications::default())
+    }
+
+    /// Returns the upstream initialize/discover instructions, if the peer
+    /// advertised a nonempty string.
+    fn upstream_instructions(&self) -> McpResult<Option<String>> {
+        Ok(None)
+    }
+
+    /// Binds the inbound request context so exact-2024 reverse
+    /// `sampling/createMessage` / `roots/list` can be forwarded.
+    fn bind_inbound_legacy_reverse(&mut self, _ctx: &McpContext) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Clears the inbound reverse-forwarding context after one request.
+    fn unbind_inbound_legacy_reverse(&mut self) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Starts the exact-2024 HTTP SSE pump on the current ambient runtime.
+    ///
+    /// Call this from an awaited inbound handler so `Cx::current()` is the
+    /// gateway serve runtime. Starting the pump inside `block_on` orphans it
+    /// on the process-wide runtime, which is idle while the inbound loop
+    /// waits for reverse sampling/roots.
+    fn start_legacy_receive_pump(&mut self) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Prepares one exact-2024 HTTP start so the POST can be awaited after
+    /// the route mutex is released.
+    fn prepare_legacy_http_start(
+        &mut self,
+        _ctx: &McpContext,
+        _method: &str,
+        _parameters: serde_json::Value,
+    ) -> McpResult<Option<PreparedLegacyHttpStart>> {
+        Ok(None)
+    }
+
+    /// Starts one exact-2024 stdio request on the multiplexed executor so the
+    /// inbound serve loop can yield while reverse sampling/roots complete.
+    fn start_legacy_stdio_yielding(
+        &mut self,
+        _ctx: &McpContext,
+        _method: &str,
+        _parameters: serde_json::Value,
+    ) -> McpResult<Option<PreparedLegacyStdioStart>> {
+        Ok(None)
+    }
+
+    /// Takes one already-routed exact-2024 stdio result without reading.
+    fn try_take_legacy_stdio_yielding(
+        &mut self,
+        _start: &mut PreparedLegacyStdioStart,
+    ) -> McpResult<Option<CoreResult>> {
+        Ok(None)
+    }
+
+    /// Drives one bounded stdio ingress turn, then returns so the caller can yield.
+    fn drive_legacy_stdio_yielding(&mut self) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Cancels one yielding exact-2024 stdio request.
+    fn cancel_legacy_stdio_yielding(
+        &mut self,
+        _start: &mut PreparedLegacyStdioStart,
+    ) -> McpResult<()> {
+        Ok(())
+    }
+
     /// Runs one resource read under the downstream request's cancellation domain.
     fn read_resource_result_with_context(
         &mut self,
@@ -1395,6 +1505,72 @@ fn ctx_progress_marker(ctx: &McpContext) -> Option<fastmcp_protocol::ProgressMar
         .and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
+struct ProxyHttpInboundReverseGuard {
+    slot: Arc<Mutex<Option<McpContext>>>,
+}
+
+impl Drop for ProxyHttpInboundReverseGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = None;
+        }
+    }
+}
+
+struct ProxyInboundLegacyReverseGuard<'a> {
+    client: &'a ProxyClient,
+}
+
+impl Drop for ProxyInboundLegacyReverseGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.client.unbind_inbound_legacy_reverse();
+    }
+}
+
+fn sampling_request_from_create_message_params(
+    params: CreateMessageParams,
+) -> McpResult<SamplingRequest> {
+    let max_tokens = params
+        .max_tokens
+        .as_i32()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            McpError::invalid_params("Proxy inbound sampling maxTokens must fit a u32 token budget")
+        })?;
+    let messages = params
+        .messages
+        .into_iter()
+        .map(|message| {
+            let text = match message.content {
+                SamplingContent::Text { text } => text,
+                SamplingContent::Image { .. } => {
+                    return Err(McpError::invalid_params(
+                        "Proxy inbound sampling cannot forward an image sampling message",
+                    ));
+                }
+            };
+            Ok(SamplingRequestMessage {
+                role: match message.role {
+                    fastmcp_protocol::Role::User => SamplingRole::User,
+                    fastmcp_protocol::Role::Assistant => SamplingRole::Assistant,
+                },
+                text,
+            })
+        })
+        .collect::<McpResult<Vec<_>>>()?;
+    let mut request = SamplingRequest::new(messages, max_tokens);
+    if let Some(system_prompt) = params.system_prompt {
+        request = request.with_system_prompt(system_prompt);
+    }
+    if let Some(temperature) = params.temperature {
+        request = request.with_temperature(temperature);
+    }
+    if !params.stop_sequences.is_empty() {
+        request = request.with_stop_sequences(params.stop_sequences);
+    }
+    Ok(request)
+}
+
 /// Projects a handler-visible inbound identity back onto the official
 /// Implementation object stamped on an upstream request.
 fn implementation_from_request_identity(
@@ -1541,11 +1717,19 @@ fn mcp_log_level_from_logging(level: LoggingLevel) -> McpLogLevel {
 }
 
 fn stdio_parameters_with_inbound_identity(
+    era: Option<ProtocolEra>,
     mut parameters: serde_json::Value,
     identity: Option<&fastmcp_core::ClientImplementationInfo>,
     log_level: Option<LoggingLevel>,
     capabilities: Option<ClientCapabilities>,
 ) -> serde_json::Value {
+    // Exact-2024 decode rejects reserved final `_meta` members. Identity,
+    // logLevel, and clientCapabilities overlays are modern-only; a legacy
+    // stdio session keeps progressToken (stamped by the caller) and nothing
+    // else.
+    if era != Some(ProtocolEra::Modern2026) {
+        return parameters;
+    }
     let client_info = identity.and_then(inbound_client_info_value);
     if client_info.is_none() && log_level.is_none() && capabilities.is_none() {
         return parameters;
@@ -1609,6 +1793,89 @@ fn relay_upstream_catalog_resource_updates(ctx: &McpContext, client: &mut Client
         let _ = ctx.notify_resource_updated(uri);
     }
     Ok(())
+}
+
+fn resource_updated_uri_from_legacy_notification(notification: &JsonRpcRequest) -> Option<String> {
+    if notification.method != fastmcp_protocol::methods::NOTIFICATIONS_RESOURCES_UPDATED {
+        return None;
+    }
+    notification
+        .params
+        .as_ref()
+        .and_then(|parameters| parameters.get("uri"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+fn log_message_from_legacy_notification(
+    notification: &JsonRpcRequest,
+) -> Option<(LoggingLevel, serde_json::Value)> {
+    if notification.method != fastmcp_protocol::methods::NOTIFICATIONS_MESSAGE {
+        return None;
+    }
+    let parameters = notification.params.as_ref()?.as_object()?;
+    let level = parameters
+        .get("level")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())?;
+    let data = parameters.get("data").cloned()?;
+    Some((level, data))
+}
+
+/// Exact-2024 notifications harvested from one upstream request or SSE drain.
+#[derive(Debug, Default)]
+pub struct ProxyLegacyPeerNotifications {
+    /// Prefixed or unprefixed `resources/updated` URIs.
+    pub updated_uris: Vec<String>,
+    /// `notifications/message` frames admitted by the inbound log floor.
+    pub log_messages: Vec<(LoggingLevel, serde_json::Value)>,
+    /// `notifications/progress` frames correlated to an inbound progress token.
+    pub progress: Vec<ProgressParams>,
+}
+
+fn progress_from_legacy_notification(notification: &JsonRpcRequest) -> Option<ProgressParams> {
+    if notification.method != fastmcp_protocol::methods::NOTIFICATIONS_PROGRESS {
+        return None;
+    }
+    serde_json::from_value(notification.params.clone()?).ok()
+}
+
+fn overlay_legacy_progress_token(
+    parameters: &mut serde_json::Value,
+    marker: &serde_json::Value,
+) -> McpResult<()> {
+    let object = parameters.as_object_mut().ok_or_else(|| {
+        McpError::invalid_params("Proxy legacy request parameters must be an object")
+    })?;
+    if let Some(meta) = object
+        .get_mut("_meta")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        meta.insert("progressToken".to_owned(), marker.clone());
+    } else {
+        object.insert(
+            "_meta".to_owned(),
+            serde_json::json!({"progressToken": marker}),
+        );
+    }
+    Ok(())
+}
+
+fn collect_legacy_peer_notifications(
+    notifications: impl IntoIterator<Item = JsonRpcRequest>,
+) -> ProxyLegacyPeerNotifications {
+    let mut drained = ProxyLegacyPeerNotifications::default();
+    for notification in notifications {
+        if let Some(uri) = resource_updated_uri_from_legacy_notification(&notification) {
+            drained.updated_uris.push(uri);
+        }
+        if let Some(message) = log_message_from_legacy_notification(&notification) {
+            drained.log_messages.push(message);
+        }
+        if let Some(progress) = progress_from_legacy_notification(&notification) {
+            drained.progress.push(progress);
+        }
+    }
+    drained
 }
 
 fn reject_lossy_proxy_projection(
@@ -1928,6 +2195,81 @@ fn collect_modern_proxy_catalog_pages<T>(
 }
 
 impl ProxyBackend for Client {
+    fn bind_inbound_legacy_reverse(&mut self, ctx: &McpContext) -> McpResult<()> {
+        Client::bind_inbound_legacy_reverse(self, ctx)
+    }
+
+    fn unbind_inbound_legacy_reverse(&mut self) -> McpResult<()> {
+        Client::unbind_inbound_legacy_reverse(self)
+    }
+
+    fn start_legacy_stdio_yielding(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<Option<PreparedLegacyStdioStart>> {
+        if self.selected_protocol_era() != Some(ProtocolEra::Legacy2024) {
+            return Ok(None);
+        }
+        ctx.checkpoint()?;
+        self.ensure_initialized()?;
+        let mut parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        );
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
+        }
+        let request = CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&parameters))
+            .map_err(|error| {
+                McpError::invalid_params(format!(
+                    "Proxy stdio request is invalid for the selected upstream era: {error}"
+                ))
+            })?;
+        let execution = self.start_yielding_stdio_request(method, Some(parameters))?;
+        Ok(Some(PreparedLegacyStdioStart { request, execution }))
+    }
+
+    fn try_take_legacy_stdio_yielding(
+        &mut self,
+        start: &mut PreparedLegacyStdioStart,
+    ) -> McpResult<Option<CoreResult>> {
+        let Some((response, raw_result)) =
+            self.try_take_yielding_stdio_response(&mut start.execution)?
+        else {
+            return Ok(None);
+        };
+        let raw_result = raw_result.as_deref().ok_or_else(|| {
+            McpError::invalid_request("Exact-2024 typed response lost its admitted result source")
+        })?;
+        match start
+            .request
+            .decode_response_result(&response, raw_result)
+            .map_err(|error| {
+                McpError::invalid_request(format!("Invalid exact-2024 core response: {error}"))
+            })? {
+            CoreResult::Legacy(result) => Ok(Some(CoreResult::Legacy(result))),
+            CoreResult::Final(_) => Err(McpError::internal_error(
+                "Exact-2024 typed request received a final result",
+            )),
+        }
+    }
+
+    fn drive_legacy_stdio_yielding(&mut self) -> McpResult<()> {
+        self.drive_yielding_stdio_slice()
+    }
+
+    fn cancel_legacy_stdio_yielding(
+        &mut self,
+        start: &mut PreparedLegacyStdioStart,
+    ) -> McpResult<()> {
+        self.cancel_yielding_stdio_request(&mut start.execution)
+    }
+
     fn list_tools(&mut self) -> McpResult<Vec<Tool>> {
         self.ensure_initialized()?;
         if self.server_capabilities().tools.is_none() {
@@ -2238,6 +2580,33 @@ impl ProxyBackend for Client {
         }
     }
 
+    fn subscribe_resource(&mut self, uri: &str) -> McpResult<()> {
+        Client::subscribe_resource_legacy(self, uri)
+    }
+
+    fn unsubscribe_resource(&mut self, uri: &str) -> McpResult<()> {
+        Client::unsubscribe_resource_legacy(self, uri)
+    }
+
+    fn set_log_level(&mut self, level: LoggingLevel) -> McpResult<()> {
+        Client::set_log_level_typed(self, level)
+    }
+
+    fn take_legacy_peer_notifications(&mut self) -> McpResult<ProxyLegacyPeerNotifications> {
+        let mut drained = collect_legacy_peer_notifications(self.take_legacy_notifications());
+        drained
+            .updated_uris
+            .extend(self.take_ready_catalog_resource_updated_uris()?);
+        Ok(drained)
+    }
+
+    fn upstream_instructions(&self) -> McpResult<Option<String>> {
+        Ok(self
+            .instructions()
+            .map(str::to_owned)
+            .filter(|value| !value.is_empty()))
+    }
+
     fn complete_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -2268,6 +2637,7 @@ impl ProxyBackend for Client {
             parameters["_meta"] = serde_json::json!({"progressToken": marker});
         }
         parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
             parameters,
             ctx.client_implementation(),
             inbound_logging_level(ctx),
@@ -2300,6 +2670,7 @@ impl ProxyBackend for Client {
             &ctx.request_cancellation(),
             method,
             stdio_parameters_with_inbound_identity(
+                self.selected_protocol_era(),
                 parameters,
                 ctx.client_implementation(),
                 inbound_logging_level(ctx),
@@ -2322,6 +2693,7 @@ impl ProxyBackend for Client {
             &ctx.request_cancellation(),
             fastmcp_protocol::methods::TOOLS_CALL,
             stdio_parameters_with_inbound_identity(
+                self.selected_protocol_era(),
                 serde_json::json!({"name": name, "arguments": arguments}),
                 ctx.client_implementation(),
                 inbound_logging_level(ctx),
@@ -2347,6 +2719,7 @@ impl ProxyBackend for Client {
             parameters["_meta"] = serde_json::json!({"progressToken": marker});
         }
         parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
             parameters,
             ctx.client_implementation(),
             inbound_logging_level(ctx),
@@ -2394,6 +2767,7 @@ impl ProxyBackend for Client {
             parameters["_meta"] = serde_json::json!({"progressToken": marker});
         }
         parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
             parameters,
             ctx.client_implementation(),
             inbound_logging_level(ctx),
@@ -2443,6 +2817,7 @@ impl ProxyBackend for Client {
             parameters["_meta"] = serde_json::json!({"progressToken": marker});
         }
         parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
             parameters,
             ctx.client_implementation(),
             inbound_logging_level(ctx),
@@ -3059,6 +3434,10 @@ pub struct ProxyClient {
     /// Last upstream `input_required` per operation, used to resume that
     /// exact requestState when the downstream MRTR exchange completes.
     pending_mrtr: Arc<Mutex<HashMap<String, InputRequiredResult>>>,
+    /// Maps an upstream resource URI onto the inbound prefixed URI that
+    /// subscribed through this route, so relayed `resources/updated` frames
+    /// match the gateway session subscription.
+    subscription_rewrites: Arc<Mutex<HashMap<String, String>>>,
     /// Era observed from an admitted typed catalog or upstream result.
     ///
     /// Custom backends can have no transport-level binding. Their first
@@ -3761,6 +4140,8 @@ pub struct ProxyHttpClient {
     client_capabilities: ClientCapabilities,
     next_request_id: i64,
     legacy_initialized: bool,
+    instructions: Option<String>,
+    inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
     live_catalog_listener: Option<ModernHttpSubscriptionListener>,
     #[cfg(feature = "tasks")]
     live_task_listener: Option<ModernHttpSubscriptionListener>,
@@ -3794,6 +4175,17 @@ impl ProxyHttpClient {
             ProtocolEra::Modern2026 => 2,
             ProtocolEra::Legacy2024 => 1,
         };
+        let instructions = match connection.selected_protocol_era() {
+            ProtocolEra::Modern2026 => connection
+                .server_discovery()
+                .and_then(|discovery| {
+                    discovery
+                        .instructions()
+                        .map(|value| value.as_str().to_owned())
+                })
+                .filter(|value| !value.is_empty()),
+            ProtocolEra::Legacy2024 => None,
+        };
         Self {
             binding,
             connection,
@@ -3802,6 +4194,8 @@ impl ProxyHttpClient {
             client_capabilities,
             next_request_id,
             legacy_initialized: false,
+            instructions,
+            inbound_legacy_reverse: Arc::new(Mutex::new(None)),
             live_catalog_listener: None,
             #[cfg(feature = "tasks")]
             live_task_listener: None,
@@ -3966,6 +4360,7 @@ impl ProxyHttpClient {
                 "Legacy initialize response selected a protocol version other than 2024-11-05",
             ));
         }
+        self.instructions = initialized.instructions.filter(|value| !value.is_empty());
 
         block_on(self.connection.notify(
             &self.cx,
@@ -3986,17 +4381,60 @@ impl ProxyHttpClient {
 
         let mut handlers = ReverseRequestHandlers::new();
         if self.client_capabilities.sampling.is_some() {
-            handlers = handlers.with_sampling_create_message(|_cx, _cancellation, _params| {
+            let inbound = Arc::clone(&self.inbound_legacy_reverse);
+            handlers = handlers.with_sampling_create_message(move |_cx, _cancellation, params| {
+                let inbound = Arc::clone(&inbound);
                 Box::pin(async move {
-                    Err(McpError::internal_error(
-                        "Proxy HTTP legacy sampling callback is unavailable",
-                    ))
+                    let inbound = inbound
+                        .lock()
+                        .map_err(|_| {
+                            McpError::internal_error("Proxy inbound reverse lock poisoned")
+                        })?
+                        .clone()
+                        .ok_or_else(|| {
+                            McpError::invalid_request(
+                                "Proxy HTTP legacy sampling callback is unavailable",
+                            )
+                        })?;
+                    if !inbound.can_sample() {
+                        return Err(McpError::invalid_request(
+                            "Sampling not available: client does not support sampling capability",
+                        ));
+                    }
+                    let response = inbound
+                        .sample_with_request(sampling_request_from_create_message_params(params)?)
+                        .await?;
+                    Ok(CreateMessageResult::text(response.text, response.model))
                 })
             });
         }
         if self.client_capabilities.roots.is_some() {
-            handlers = handlers.with_roots_list(|_cx, _cancellation, _params| {
-                Box::pin(async move { Ok(ListRootsResult::empty()) })
+            let inbound = Arc::clone(&self.inbound_legacy_reverse);
+            handlers = handlers.with_roots_list(move |_cx, _cancellation, _params| {
+                let inbound = Arc::clone(&inbound);
+                Box::pin(async move {
+                    let inbound = inbound
+                        .lock()
+                        .map_err(|_| {
+                            McpError::internal_error("Proxy inbound reverse lock poisoned")
+                        })?
+                        .clone()
+                        .ok_or_else(|| {
+                            McpError::invalid_request(
+                                "Proxy HTTP legacy roots callback is unavailable",
+                            )
+                        })?;
+                    let roots = inbound.list_roots().await?;
+                    Ok(ListRootsResult::new(
+                        roots
+                            .into_iter()
+                            .map(|root| match root.name {
+                                Some(name) => Root::with_name(root.uri, name),
+                                None => Root::new(root.uri),
+                            })
+                            .collect(),
+                    ))
+                })
             });
         }
         self.connection
@@ -4064,7 +4502,11 @@ impl ProxyHttpClient {
     ) -> McpResult<CoreResult> {
         if let Some(ctx) = ctx {
             ctx.checkpoint()?;
+            self.bind_inbound_legacy_reverse(ctx)?;
         }
+        let _inbound_reverse = ctx.map(|_| ProxyHttpInboundReverseGuard {
+            slot: Arc::clone(&self.inbound_legacy_reverse),
+        });
         if self.binding.era() == ProtocolEra::Legacy2024 {
             self.ensure_legacy_initialized()?;
         }
@@ -4210,6 +4652,76 @@ impl ProxyHttpClient {
 }
 
 impl ProxyBackend for ProxyHttpClient {
+    fn upstream_instructions(&self) -> McpResult<Option<String>> {
+        Ok(self.instructions.clone())
+    }
+
+    fn bind_inbound_legacy_reverse(&mut self, ctx: &McpContext) -> McpResult<()> {
+        *self
+            .inbound_legacy_reverse
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy inbound reverse lock poisoned"))? =
+            Some(ctx.clone());
+        Ok(())
+    }
+
+    fn unbind_inbound_legacy_reverse(&mut self) -> McpResult<()> {
+        *self
+            .inbound_legacy_reverse
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy inbound reverse lock poisoned"))? = None;
+        Ok(())
+    }
+
+    fn start_legacy_receive_pump(&mut self) -> McpResult<()> {
+        self.connection
+            .start_legacy_receive_pump(&self.cx)
+            .map_err(proxy_http_connection_error)
+    }
+
+    fn prepare_legacy_http_start(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<Option<PreparedLegacyHttpStart>> {
+        if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
+            return Ok(None);
+        }
+        ctx.checkpoint()?;
+        self.ensure_legacy_initialized()?;
+        self.connection
+            .start_legacy_receive_pump(&self.cx)
+            .map_err(proxy_http_connection_error)?;
+        let Some(receiver) = self.connection.legacy_persistent_receiver() else {
+            return Ok(None);
+        };
+        let mut parameters = self.request_parameters(
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        )?;
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
+        }
+        let request = CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&parameters))
+            .map_err(|error| {
+                McpError::invalid_params(format!(
+                    "Proxy HTTP request is invalid for the selected upstream era: {error}"
+                ))
+            })?;
+        let request_id = self.next_request_id()?;
+        Ok(Some(PreparedLegacyHttpStart {
+            request,
+            method: method.to_owned(),
+            parameters,
+            request_id,
+            receiver,
+            cx: self.cx.clone(),
+        }))
+    }
+
     fn start_legacy_request_with_context(
         &mut self,
         ctx: &McpContext,
@@ -4221,12 +4733,15 @@ impl ProxyBackend for ProxyHttpClient {
         }
         ctx.checkpoint()?;
         self.ensure_legacy_initialized()?;
-        let parameters = self.request_parameters(
+        let mut parameters = self.request_parameters(
             parameters,
             ctx.client_implementation(),
             inbound_logging_level(ctx),
             inbound_client_capabilities(ctx),
         )?;
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
+        }
         let request = CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&parameters))
             .map_err(|error| {
                 McpError::invalid_params(format!(
@@ -4234,12 +4749,10 @@ impl ProxyBackend for ProxyHttpClient {
                 ))
             })?;
         let request_id = self.next_request_id()?;
-        let handle = block_on(self.connection.start_legacy_request(
-            ctx.cx(),
-            method,
-            parameters,
-            request_id,
-        ))
+        let handle = block_on(
+            self.connection
+                .start_legacy_request(&self.cx, method, parameters, request_id),
+        )
         .map_err(proxy_http_connection_error)?;
         Ok(Some(ProxyLegacyHttpRequest::new(request, handle)))
     }
@@ -4490,6 +5003,44 @@ impl ProxyBackend for ProxyHttpClient {
                 .transpose()?
                 .unwrap_or(false)),
         }
+    }
+
+    fn subscribe_resource(&mut self, uri: &str) -> McpResult<()> {
+        match self.request_result(
+            fastmcp_protocol::methods::RESOURCES_SUBSCRIBE,
+            serde_json::json!({"uri": uri}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::ResourcesSubscribe(_)) => Ok(()),
+            _ => Err(unexpected_proxy_result("resources/subscribe")),
+        }
+    }
+
+    fn unsubscribe_resource(&mut self, uri: &str) -> McpResult<()> {
+        match self.request_result(
+            fastmcp_protocol::methods::RESOURCES_UNSUBSCRIBE,
+            serde_json::json!({"uri": uri}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::ResourcesUnsubscribe(_)) => Ok(()),
+            _ => Err(unexpected_proxy_result("resources/unsubscribe")),
+        }
+    }
+
+    fn set_log_level(&mut self, level: LoggingLevel) -> McpResult<()> {
+        match self.request_result(
+            fastmcp_protocol::methods::LOGGING_SET_LEVEL,
+            serde_json::json!({"level": level}),
+        )? {
+            CoreResult::Legacy(LegacyCoreResult::SetLogLevel(_)) => Ok(()),
+            _ => Err(unexpected_proxy_result("logging/setLevel")),
+        }
+    }
+
+    fn take_legacy_peer_notifications(&mut self) -> McpResult<ProxyLegacyPeerNotifications> {
+        let mut notifications = Vec::new();
+        while let Some(notification) = self.connection.take_legacy_notification() {
+            notifications.push(notification);
+        }
+        Ok(collect_legacy_peer_notifications(notifications))
     }
 
     fn complete_result(&mut self, params: CompletionParams) -> McpResult<CoreResult> {
@@ -6312,6 +6863,7 @@ impl ProxyClient {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: None,
             pending_mrtr: Arc::new(Mutex::new(HashMap::new())),
+            subscription_rewrites: Arc::new(Mutex::new(HashMap::new())),
             observed_era: Arc::new(Mutex::new(None)),
             #[cfg(feature = "tasks")]
             final_task_registry: Arc::new(Mutex::new(ProxyFinalTaskRegistry::default())),
@@ -6333,6 +6885,7 @@ impl ProxyClient {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: Some(binding),
             pending_mrtr: Arc::new(Mutex::new(HashMap::new())),
+            subscription_rewrites: Arc::new(Mutex::new(HashMap::new())),
             observed_era: Arc::new(Mutex::new(None)),
             #[cfg(feature = "tasks")]
             final_task_registry: Arc::new(Mutex::new(ProxyFinalTaskRegistry::default())),
@@ -6426,6 +6979,12 @@ impl ProxyClient {
         Ok(catalog)
     }
 
+    /// Returns the upstream initialize/discover instructions when the peer
+    /// advertised a nonempty string.
+    pub fn upstream_instructions(&self) -> McpResult<Option<String>> {
+        self.with_backend(|backend| backend.upstream_instructions())
+    }
+
     /// Admits a caller-provided typed catalog only when this route already
     /// has transport or backend-observed era evidence.
     ///
@@ -6476,6 +7035,26 @@ impl ProxyClient {
         f(&mut *guard)
     }
 
+    fn bind_inbound_legacy_reverse(&self, ctx: &McpContext) -> McpResult<()> {
+        self.with_backend(|backend| backend.bind_inbound_legacy_reverse(ctx))
+    }
+
+    fn unbind_inbound_legacy_reverse(&self) -> McpResult<()> {
+        self.with_backend(|backend| backend.unbind_inbound_legacy_reverse())
+    }
+
+    fn inbound_legacy_reverse_guard(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<ProxyInboundLegacyReverseGuard<'_>> {
+        self.bind_inbound_legacy_reverse(ctx)?;
+        Ok(ProxyInboundLegacyReverseGuard { client: self })
+    }
+
+    fn start_legacy_receive_pump(&self) -> McpResult<()> {
+        self.with_backend(|backend| backend.start_legacy_receive_pump())
+    }
+
     /// Starts an exact-2024 request while the mutable route is exclusively
     /// held, then returns its independent client handle.  Waiting and any
     /// cancellation control deliberately happen after this function returns,
@@ -6510,17 +7089,32 @@ impl ProxyClient {
     fn await_legacy_request_with_context(
         &self,
         ctx: &McpContext,
+        request: ProxyLegacyHttpRequest,
+        method: &str,
+    ) -> McpResult<CoreResult> {
+        block_on(self.await_legacy_request_with_context_async(ctx, request, method))
+    }
+
+    /// Yielding counterpart of [`Self::await_legacy_request_with_context`].
+    ///
+    /// Reverse `sampling/createMessage` / `roots/list` POSTs land on the same
+    /// inbound HTTP serve loop as the originating tools/call. Parking that
+    /// loop inside `block_on` leaves the sampling-response POST unaccepted.
+    async fn await_legacy_request_with_context_async(
+        &self,
+        ctx: &McpContext,
         mut request: ProxyLegacyHttpRequest,
         method: &str,
     ) -> McpResult<CoreResult> {
-        let response = block_on(await_proxy_request_or_cancellation(
+        let response = await_proxy_request_or_cancellation(
             ctx,
             Box::pin(async { request.wait(ctx.cx()).await }),
-        ));
+        )
+        .await;
         match response {
             Ok(response) => request.decode_response(response, method),
             Err(error) if ctx.request_cancellation().is_cancel_requested() => {
-                block_on(request.cancel(ctx.cx()))?;
+                request.cancel(ctx.cx()).await?;
                 Err(error)
             }
             Err(error) => Err(error),
@@ -6533,6 +7127,90 @@ impl ProxyClient {
         self.with_backend(|backend| backend.supports_completion())
     }
 
+    /// Subscribes the upstream to one resource and remembers the inbound URI
+    /// so later `resources/updated` can be republished onto the gateway session.
+    pub fn subscribe_resource(&self, ctx: &McpContext, inbound_uri: &str) -> McpResult<()> {
+        ctx.checkpoint()?;
+        if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
+            return Ok(());
+        }
+        let upstream_uri = inbound_uri
+            .split_once('/')
+            .filter(|(prefix, rest)| !prefix.is_empty() && rest.contains("://"))
+            .map(|(_, rest)| rest)
+            .unwrap_or(inbound_uri);
+        self.with_backend(|backend| backend.subscribe_resource(upstream_uri))?;
+        self.subscription_rewrites
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?
+            .insert(upstream_uri.to_owned(), inbound_uri.to_owned());
+        Ok(())
+    }
+
+    /// Ends the matching upstream resource subscription.
+    pub fn unsubscribe_resource(&self, ctx: &McpContext, inbound_uri: &str) -> McpResult<()> {
+        ctx.checkpoint()?;
+        if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
+            return Ok(());
+        }
+        let upstream_uri = inbound_uri
+            .split_once('/')
+            .filter(|(prefix, rest)| !prefix.is_empty() && rest.contains("://"))
+            .map(|(_, rest)| rest)
+            .unwrap_or(inbound_uri);
+        self.with_backend(|backend| backend.unsubscribe_resource(upstream_uri))?;
+        self.subscription_rewrites
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?
+            .remove(upstream_uri);
+        Ok(())
+    }
+
+    fn forward_inbound_log_level(&self, ctx: &McpContext) -> McpResult<()> {
+        ctx.checkpoint()?;
+        if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
+            return Ok(());
+        }
+        let Some(level) = inbound_logging_level(ctx) else {
+            return Ok(());
+        };
+        self.with_backend(|backend| backend.set_log_level(level))
+    }
+
+    fn relay_resource_updated_notifications(&self, ctx: &McpContext) -> McpResult<()> {
+        let drained = self.with_backend(|backend| backend.take_legacy_peer_notifications())?;
+        let rewrites = self
+            .subscription_rewrites
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?;
+        for uri in drained.updated_uris {
+            let _ = ctx.notify_resource_updated(&uri);
+            if let Some(downstream) = rewrites.get(&uri) {
+                let _ = ctx.notify_resource_updated(downstream);
+            }
+        }
+        drop(rewrites);
+        for (level, data) in drained.log_messages {
+            ctx.log_data(mcp_log_level_from_logging(level), data);
+        }
+        let expected_progress = ctx_progress_marker(ctx);
+        for progress in drained.progress {
+            if !legacy_progress_matches_marker(expected_progress.as_ref(), &progress) {
+                continue;
+            }
+            if let Some(total) = progress.total {
+                ctx.report_progress_with_total(
+                    progress.progress,
+                    total,
+                    progress.message.as_deref(),
+                );
+            } else {
+                ctx.report_progress(progress.progress, progress.message.as_deref());
+            }
+        }
+        Ok(())
+    }
+
     /// Completes one argument without erasing the exact selected-era result.
     pub fn complete_typed(
         &self,
@@ -6540,6 +7218,8 @@ impl ProxyClient {
         params: CompletionParams,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
         if let Some(request) = self.start_legacy_completion_with_context(ctx, params.clone())? {
             let result = self.await_legacy_request_with_context(
                 ctx,
@@ -6547,6 +7227,7 @@ impl ProxyClient {
                 fastmcp_protocol::methods::COMPLETION_COMPLETE,
             )?;
             ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("completion/complete", result);
         }
         let mut progress_error = None;
@@ -6566,6 +7247,7 @@ impl ProxyClient {
             return Err(error);
         }
         ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
         self.admit_upstream_result("completion/complete", result)
     }
 
@@ -6653,6 +7335,28 @@ impl ProxyClient {
         }
     }
 
+    /// Yielding counterpart of [`Self::call_tool`].
+    ///
+    /// Exact-2024 HTTP as_proxy reverse sampling/roots must park the inbound
+    /// tools/call instead of `block_on`, so the inbound session can accept the
+    /// client's reverse-RPC POST.
+    async fn call_tool_async(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<Vec<Content>> {
+        match self.call_tool_typed_async(ctx, name, arguments).await? {
+            CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => {
+                legacy_tool_result_to_handler(result)
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCall { .. }) => Err(McpError::invalid_request(
+                "Proxy cannot project a final tools/call result to the legacy handler surface",
+            )),
+            _ => Err(unexpected_proxy_result("tools/call")),
+        }
+    }
+
     pub fn read_resource(&self, ctx: &McpContext, uri: &str) -> McpResult<Vec<ResourceContent>> {
         match self.read_resource_typed(ctx, uri)? {
             CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
@@ -6712,6 +7416,8 @@ impl ProxyClient {
         on_progress: FinalProgressCallback<'_>,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
         let parameters = serde_json::json!({"name": name, "arguments": arguments.clone()});
         if let Some(request) = self.start_legacy_request_with_context(
             ctx,
@@ -6724,6 +7430,7 @@ impl ProxyClient {
                 fastmcp_protocol::methods::TOOLS_CALL,
             )?;
             ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("tools/call", result);
         }
         let result = self.with_backend(|backend| {
@@ -6735,6 +7442,91 @@ impl ProxyClient {
             )
         })?;
         ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
+        self.admit_upstream_result("tools/call", result)
+    }
+
+    /// Yielding counterpart of [`Self::call_tool_typed`].
+    ///
+    /// When the HTTP backend returns a detached [`ProxyLegacyHttpRequest`],
+    /// wait on the inbound request Cx instead of a nested `block_on` runtime.
+    async fn call_tool_typed_async(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        self.start_legacy_receive_pump()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        let parameters = serde_json::json!({"name": name, "arguments": arguments.clone()});
+        if let Some(prepared) = self.with_backend(|backend| {
+            backend.prepare_legacy_http_start(
+                ctx,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                parameters.clone(),
+            )
+        })? {
+            let handle = prepared
+                .receiver
+                .start_request(
+                    &prepared.cx,
+                    &prepared.method,
+                    prepared.parameters,
+                    prepared.request_id,
+                )
+                .await
+                .map_err(proxy_http_connection_error)?;
+            let request = ProxyLegacyHttpRequest::new(prepared.request, handle);
+            let result = self
+                .await_legacy_request_with_context_async(
+                    ctx,
+                    request,
+                    fastmcp_protocol::methods::TOOLS_CALL,
+                )
+                .await?;
+            ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
+            return self.admit_upstream_result("tools/call", result);
+        }
+        if let Some(mut prepared) = self.with_backend(|backend| {
+            backend.start_legacy_stdio_yielding(
+                ctx,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                parameters.clone(),
+            )
+        })? {
+            let result = loop {
+                if ctx.checkpoint().is_err() {
+                    let _ = self.with_backend(|backend| {
+                        backend.cancel_legacy_stdio_yielding(&mut prepared)
+                    });
+                    return Err(McpError::request_cancelled());
+                }
+                if let Some(result) = self
+                    .with_backend(|backend| backend.try_take_legacy_stdio_yielding(&mut prepared))?
+                {
+                    break result;
+                }
+                self.with_backend(|backend| backend.drive_legacy_stdio_yielding())?;
+                asupersync::runtime::yield_now().await;
+            };
+            ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
+            return self.admit_upstream_result("tools/call", result);
+        }
+        let mut ignore_final_progress = |_| {};
+        let result = self.with_backend(|backend| {
+            backend.call_tool_result_with_context_and_final_progress(
+                ctx,
+                name,
+                arguments,
+                &mut ignore_final_progress,
+            )
+        })?;
+        ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
         self.admit_upstream_result("tools/call", result)
     }
 
@@ -7046,6 +7838,8 @@ impl ProxyClient {
     /// Reads a resource without erasing exact legacy fields or final result state.
     pub fn read_resource_typed(&self, ctx: &McpContext, uri: &str) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
         if let Some(request) = self.start_legacy_request_with_context(
             ctx,
             fastmcp_protocol::methods::RESOURCES_READ,
@@ -7057,6 +7851,7 @@ impl ProxyClient {
                 fastmcp_protocol::methods::RESOURCES_READ,
             )?;
             ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("resources/read", result);
         }
         let mut progress_error = None;
@@ -7076,6 +7871,7 @@ impl ProxyClient {
             return Err(error);
         }
         ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
         self.admit_upstream_result("resources/read", result)
     }
 
@@ -7087,6 +7883,8 @@ impl ProxyClient {
         arguments: HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
         if let Some(request) = self.start_legacy_request_with_context(
             ctx,
             fastmcp_protocol::methods::PROMPTS_GET,
@@ -7098,6 +7896,7 @@ impl ProxyClient {
                 fastmcp_protocol::methods::PROMPTS_GET,
             )?;
             ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("prompts/get", result);
         }
         let mut progress_error = None;
@@ -7118,6 +7917,7 @@ impl ProxyClient {
             return Err(error);
         }
         ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
         self.admit_upstream_result("prompts/get", result)
     }
 
@@ -7615,6 +8415,23 @@ impl ToolHandler for ProxyToolHandler {
         self.client.call_tool(ctx, &self.external_name, arguments)
     }
 
+    fn call_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        Box::pin(async move {
+            match self
+                .client
+                .call_tool_async(ctx, &self.external_name, arguments)
+                .await
+            {
+                Ok(content) => Outcome::Ok(content),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     fn call_final(
         &self,
         ctx: &McpContext,
@@ -7803,6 +8620,14 @@ impl ResourceHandler for ProxyResourceHandler {
 
     fn template(&self) -> Option<ResourceTemplate> {
         self.template.clone()
+    }
+
+    fn on_subscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
+        self.client.subscribe_resource(ctx, uri)
+    }
+
+    fn on_unsubscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
+        self.client.unsubscribe_resource(ctx, uri)
     }
 
     fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
@@ -8063,6 +8888,7 @@ mod tests {
     #[test]
     fn stdio_inbound_capability_overlay_preserves_official_tasks_extension() {
         let parameters = stdio_parameters_with_inbound_identity(
+            Some(ProtocolEra::Modern2026),
             serde_json::json!({
                 "_meta": {
                     fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY: {
@@ -8085,6 +8911,25 @@ mod tests {
                 .get("sampling")
                 .is_none(),
             "empty inbound capabilities must not invent sampling: {parameters:?}"
+        );
+    }
+
+    #[test]
+    fn stdio_inbound_identity_overlay_is_skipped_on_exact_2024() {
+        let parameters = stdio_parameters_with_inbound_identity(
+            Some(ProtocolEra::Legacy2024),
+            serde_json::json!({"uri": "file:///e2e/note.txt"}),
+            None,
+            None,
+            Some(ClientCapabilities::default()),
+        );
+        assert!(
+            parameters.get("_meta").is_none(),
+            "exact-2024 stdio as_proxy must not stamp reserved final _meta: {parameters:?}"
+        );
+        assert_eq!(
+            parameters["uri"], "file:///e2e/note.txt",
+            "exact-2024 stdio as_proxy must keep the rewritten file URI: {parameters:?}"
         );
     }
 
@@ -11730,9 +12575,9 @@ exec sleep 2
             serde_json::json!({})
         );
         assert_eq!(messages[3]["id"], serde_json::json!(80));
-        assert_eq!(messages[3]["error"]["code"], serde_json::json!(-32603));
+        assert_eq!(messages[3]["error"]["code"], serde_json::json!(-32600));
         assert_eq!(messages[4]["id"], serde_json::json!(81));
-        assert_eq!(messages[4]["result"], serde_json::json!({"roots": []}));
+        assert_eq!(messages[4]["error"]["code"], serde_json::json!(-32600));
         assert_eq!(messages[5]["id"], serde_json::json!(82));
         assert_eq!(messages[5]["error"]["code"], serde_json::json!(-32601));
         assert_eq!(messages[6]["id"], serde_json::json!(3));
@@ -11825,7 +12670,7 @@ exec sleep 2
         assert_eq!(messages[3]["id"], serde_json::json!(80));
         assert_eq!(messages[3]["error"]["code"], serde_json::json!(-32601));
         assert_eq!(messages[4]["id"], serde_json::json!(81));
-        assert_eq!(messages[4]["result"], serde_json::json!({"roots": []}));
+        assert_eq!(messages[4]["error"]["code"], serde_json::json!(-32600));
         assert_eq!(messages[5]["id"], serde_json::json!(82));
         assert_eq!(messages[5]["error"]["code"], serde_json::json!(-32601));
         assert_eq!(messages[6]["id"], serde_json::json!(3));

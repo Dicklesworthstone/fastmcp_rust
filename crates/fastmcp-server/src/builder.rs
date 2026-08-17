@@ -1454,6 +1454,28 @@ impl ServerBuilder {
         self.register_prefixed_typed_proxy_catalog(prefix, proxy_client, catalog)
     }
 
+    /// Copies nonempty upstream initialize/discover instructions onto this
+    /// gateway when the builder has not already set its own string.
+    #[cfg(feature = "proxy")]
+    fn adopt_upstream_proxy_instructions(
+        &mut self,
+        proxy_client: &ProxyClient,
+    ) -> Result<(), fastmcp_core::McpError> {
+        if self
+            .instructions
+            .as_ref()
+            .is_some_and(|instructions| !instructions.is_empty())
+        {
+            return Ok(());
+        }
+        if let Some(instructions) = proxy_client.upstream_instructions()?
+            && !instructions.is_empty()
+        {
+            self.instructions = Some(instructions);
+        }
+        Ok(())
+    }
+
     #[cfg(feature = "proxy")]
     fn register_prefixed_typed_proxy_catalog(
         mut self,
@@ -1462,6 +1484,7 @@ impl ServerBuilder {
         catalog: ProxyTypedCatalog,
     ) -> Result<Self, fastmcp_core::McpError> {
         proxy_client.admit_typed_catalog(&catalog)?;
+        self.adopt_upstream_proxy_instructions(&proxy_client)?;
         let completion_supported = proxy_client.supports_completion()?;
         #[cfg(feature = "tasks")]
         let catalog_era = catalog.era()?;
@@ -1732,6 +1755,7 @@ impl ServerBuilder {
         // already-selected transport or an earlier observed catalog; it may
         // not establish an era for an unbound proxy route.
         proxy_client.admit_typed_catalog(&catalog)?;
+        self.adopt_upstream_proxy_instructions(&proxy_client)?;
         let catalog_era = catalog.era()?;
         let completion_supported = proxy_client.supports_completion()?;
         #[cfg(feature = "tasks")]

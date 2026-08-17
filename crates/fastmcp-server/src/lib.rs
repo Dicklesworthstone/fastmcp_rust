@@ -124,9 +124,9 @@ use oauth::{
 #[cfg(feature = "proxy")]
 pub use proxy::{
     FinalProgressCallback, ProgressCallback, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog,
-    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
-    ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+    ProxyClient, ProxyFinalCatalog, ProxyLegacyPeerNotifications, ProxyPromptCatalog,
+    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+    ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyFinalTaskRelay};
@@ -12707,6 +12707,24 @@ impl Server {
                         )
                         .map_err(McpError::from)
                     }
+                    "resources/subscribe" => {
+                        let params: SubscribeResourceParams = parse_params(params)?;
+                        let uri = params.uri;
+                        if uri.len() > MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION {
+                            return Err(resource_subscription_capacity_error());
+                        }
+                        if !self.router.resource_exists(&uri) {
+                            return Err(McpError::resource_not_found(&uri));
+                        }
+                        self.router.notify_resource_subscribed(&request_ctx, &uri)?;
+                        Ok(serde_json::json!({}))
+                    }
+                    "resources/unsubscribe" => {
+                        let params: UnsubscribeResourceParams = parse_params(params)?;
+                        self.router
+                            .notify_resource_unsubscribed(&request_ctx, &params.uri)?;
+                        Ok(serde_json::json!({}))
+                    }
                     _ => Err(McpError::method_not_found(&request.method)),
                 }
             }
@@ -17557,11 +17575,20 @@ impl Server {
                     }
                     match session.subscribe_resource(&mw_ctx, uri.clone()) {
                         Ok(SubscriptionAdmission::Accepted) => {
+                            if let Err(error) =
+                                self.router.notify_resource_subscribed(&mw_ctx, &uri)
+                            {
+                                let _ = session.unsubscribe_resource(&mw_ctx, &uri);
+                                return Err(error);
+                            }
                             *session_mutation_rollback =
                                 Some(SessionMutationRollback::RemoveResourceSubscription(uri));
                             Ok(serde_json::json!({}))
                         }
-                        Ok(SubscriptionAdmission::Duplicate) => Ok(serde_json::json!({})),
+                        Ok(SubscriptionAdmission::Duplicate) => {
+                            self.router.notify_resource_subscribed(&mw_ctx, &uri)?;
+                            Ok(serde_json::json!({}))
+                        }
                         Err(SubscriptionAdmissionError::CapacityExceeded) => {
                             Err(resource_subscription_capacity_error())
                         }
@@ -17575,6 +17602,7 @@ impl Server {
                     let uri = params.uri;
                     match session.unsubscribe_resource(&mw_ctx, &uri) {
                         Ok(SubscriptionRemoval::Removed) => {
+                            self.router.notify_resource_unsubscribed(&mw_ctx, &uri)?;
                             *session_mutation_rollback =
                                 Some(SessionMutationRollback::RestoreResourceSubscription(uri));
                             Ok(serde_json::json!({}))
@@ -18105,16 +18133,20 @@ impl Server {
         let request_sender = request_sender.for_request(request_cancellation.clone());
 
         if supports_sampling {
-            let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> = Arc::new(
-                bidirectional::TransportSamplingSender::new(request_sender.clone()),
-            );
+            let sampling_sender: Arc<dyn fastmcp_core::SamplingSender> =
+                Arc::new(bidirectional::TransportSamplingSender::new(
+                    request_sender.clone(),
+                    request_context.clone(),
+                ));
             senders = senders.with_sampling(sampling_sender);
         }
 
         if supports_elicitation {
-            let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> = Arc::new(
-                bidirectional::TransportElicitationSender::new(request_sender.clone()),
-            );
+            let elicitation_sender: Arc<dyn fastmcp_core::ElicitationSender> =
+                Arc::new(bidirectional::TransportElicitationSender::new(
+                    request_sender.clone(),
+                    request_context.clone(),
+                ));
             senders = senders.with_elicitation(elicitation_sender);
         }
 

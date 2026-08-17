@@ -8049,6 +8049,13 @@ pub mod legacy_2024 {
             Self::from_inner(self.inner.reverse_request_handlers(handlers))
         }
 
+        /// Advertises exact-2024 sampling+roots and forwards reverse RPCs onto
+        /// the inbound as_proxy request context.
+        #[must_use]
+        pub fn forward_inbound_legacy_reverse(self) -> Self {
+            Self::from_inner(self.inner.forward_inbound_legacy_reverse())
+        }
+
         /// Defers exact legacy initialization until the first request.
         #[must_use]
         pub fn auto_initialize(self, enabled: bool) -> Self {
