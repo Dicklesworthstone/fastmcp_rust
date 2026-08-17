@@ -3832,6 +3832,136 @@ fn e2e_public_stdio_modern_tasks_listen_retains_status_and_catalog_listen_refuse
 }
 
 #[cfg(unix)]
+#[cfg(feature = "tasks")]
+#[test]
+fn e2e_public_stdio_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
+        .expect("a ModernOnly facade client starts the shipped caller-owned Task service");
+
+    let created = client
+        .call_tool_outcome("durable_task", json!({}))
+        .expect("the typed ModernOnly facade client creates one durable Task");
+    let modern::FinalToolCallOutcome::Task(created) = created else {
+        panic!("the task-capable tool returns the exact final Task result branch");
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    client
+        .open_subscriptions_listener(modern::SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..modern::SubscriptionFilter::default()
+        })
+        .expect("live stdio must admit a catalog listener while official Tasks remain unused");
+
+    let cx = Cx::for_request();
+    let cancellation = modern::McpRequestCancellation::new();
+    let catalog_ack = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("catalog listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            catalog_ack,
+            modern::StdioSubscriptionEvent::Acknowledged(ref filter)
+                if filter.tools_list_changed == Some(true)
+        ),
+        "the first catalog listen record must be the accepted filter: {catalog_ack:?}"
+    );
+
+    let mut task_filter = modern::SubscriptionFilter::default();
+    modern::set_task_subscription_ids(&mut task_filter, vec![task_id.clone()])
+        .expect("the public Tasks filter is valid");
+    client
+        .open_final_task_subscription_listener(task_filter)
+        .expect(
+            "the same stdio Client must admit official Tasks listen while catalog listen is live",
+        );
+
+    let task_ack = client
+        .next_final_task_subscription_event(&cx, &cancellation)
+        .expect("official Tasks listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            task_ack,
+            modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                if modern::task_subscription_ids(accepted)
+                    .expect("acknowledged Tasks filter stays valid")
+                    .as_deref()
+                    == Some([task_id.clone()].as_slice())
+        ),
+        "the first incremental Tasks listen record must be the accepted taskIds: {task_ack:?}"
+    );
+
+    let hidden = client
+        .call_tool("hide_echo", json!({}))
+        .expect("disabling a peer tool must complete while both listeners are live");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "the same stdio Client must still admit tools/call while both listeners are live: {hidden:?}"
+    );
+
+    let changed = client
+        .next_subscription_event(&cx, &cancellation)
+        .expect("catalog listen must retain tools/list_changed while Tasks listen is live");
+    assert!(
+        matches!(
+            changed,
+            modern::StdioSubscriptionEvent::Notification(
+                modern::ServerNotification::ToolsListChanged(_)
+            )
+        ),
+        "live stdio must retain catalog list_changed on the same client as Tasks listen: {changed:?}"
+    );
+
+    client
+        .cancel_task(task_id.clone())
+        .expect("typed tasks/cancel remains usable while both listeners are live");
+
+    let notification_deadline = Instant::now() + STDIO_COMPLETION_ABSOLUTE_TIMEOUT;
+    loop {
+        let event = client
+            .next_final_task_subscription_event(&cx, &cancellation)
+            .expect("official Tasks listen must retain later status updates while catalog listen is live");
+        match event {
+            modern::StdioTaskSubscriptionEvent::Notification(notification)
+                if matches!(notification.params.task, modern::FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the Tasks notification must keep the created id"
+                );
+                break;
+            }
+            modern::StdioTaskSubscriptionEvent::Notification(_)
+            | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the caller-owned supervisor publishes cancellation within the public bound"
+                );
+            }
+            modern::StdioTaskSubscriptionEvent::Terminal => {
+                panic!("the live Tasks listener must retain cancellation before terminal")
+            }
+        }
+    }
+
+    let observed = client
+        .get_task(task_id)
+        .expect("typed tasks/get remains usable after both listeners observed their events");
+    assert!(
+        matches!(observed.task, modern::FinalTask::Cancelled(_)),
+        "the same stdio client must still admit tasks/get after dual listen: {observed:?}"
+    );
+
+    client
+        .close()
+        .expect("modern dual-listen stdio client cleanup");
+}
+
+#[cfg(unix)]
 #[test]
 fn e2e_public_stdio_modern_only_rejects_the_exact_legacy_shipped_server() {
     // This differs from the matched ModernOnly positive only in the child
