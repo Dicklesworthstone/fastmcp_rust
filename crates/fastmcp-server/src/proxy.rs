@@ -365,6 +365,107 @@ impl ProxyFinalTaskListenerRequest {
     }
 }
 
+/// One independent HTTP catalog `subscriptions/listen` opening.
+#[cfg(feature = "tasks")]
+pub struct ProxyCatalogListenerRequest {
+    client: ModernHttpClient,
+    request_id: RequestId,
+    notifications: SubscriptionFilter,
+    limits: SseLimits,
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyCatalogListenerRequest {
+    async fn open(self, ctx: &McpContext) -> McpResult<Box<dyn ProxyCatalogListener>> {
+        let listener = await_proxy_request_or_cancellation(
+            ctx,
+            Box::pin(async move {
+                self.client
+                    .open_subscriptions_listener(
+                        ctx.cx(),
+                        self.request_id,
+                        self.notifications,
+                        self.limits,
+                    )
+                    .await
+                    .map_err(|error| {
+                        McpError::invalid_request(format!(
+                            "Proxy HTTP catalog subscriptions/listen failed: {error}"
+                        ))
+                    })
+            }),
+        )
+        .await?;
+        Ok(Box::new(ProxyHttpCatalogListener { listener }))
+    }
+}
+
+/// One live HTTP catalog listener detached from the proxy route mutex.
+#[cfg(feature = "tasks")]
+struct ProxyHttpCatalogListener {
+    listener: ModernHttpSubscriptionListener,
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyHttpCatalogListener {
+    fn map_listen_event(
+        event: Option<ModernHttpSubscriptionListenEvent>,
+    ) -> McpResult<ProxyCatalogListenerEvent> {
+        match event {
+            Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
+                Ok(ProxyCatalogListenerEvent::Acknowledged(accepted_filter))
+            }
+            Some(ModernHttpSubscriptionListenEvent::Notification(notification)) => {
+                Ok(ProxyCatalogListenerEvent::Notification(notification))
+            }
+            #[cfg(feature = "tasks")]
+            Some(ModernHttpSubscriptionListenEvent::TaskNotification(_)) => Err(
+                McpError::invalid_request("Proxy catalog listener received a Tasks event"),
+            ),
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) | None => {
+                Ok(ProxyCatalogListenerEvent::Terminal)
+            }
+        }
+    }
+
+    fn map_listen_error(error: ModernHttpSubscriptionListenError) -> McpError {
+        match error {
+            ModernHttpSubscriptionListenError::CallerCancelled { .. } => {
+                McpError::request_cancelled()
+            }
+            other => McpError::invalid_request(format!(
+                "Proxy HTTP catalog listener rejected an upstream frame: {other:?}"
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyCatalogListener for ProxyHttpCatalogListener {
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            let listen = self.listener.next_event(cx);
+            let listen = async move { listen.await.map_err(Self::map_listen_error) };
+            let event =
+                await_proxy_operation_or_cancellation(cx, request_cancellation, Box::pin(listen))
+                    .await
+                    .map_err(|error| {
+                        if error.code == fastmcp_core::McpErrorCode::RequestCancelled {
+                            return error;
+                        }
+                        McpError::invalid_request(format!(
+                            "Proxy HTTP catalog listener rejected an upstream frame: {error}"
+                        ))
+                    })?;
+            Self::map_listen_event(event)
+        })
+    }
+}
+
 /// One committed exact-2024 upstream request detached from its proxy route.
 ///
 /// A [`ProxyClient`] starts this handle while it exclusively owns the mutable
@@ -445,6 +546,31 @@ pub trait ProxyFinalTaskListener: Send {
         let result = self.next(cx, request_cancellation);
         Box::pin(async move { result })
     }
+}
+
+/// One live upstream catalog `subscriptions/listen` owned by a downstream
+/// request. HTTP uses an independent SSE POST so the route mutex stays free;
+/// stdio drives the incremental listener under a brief lock.
+#[cfg(feature = "tasks")]
+pub trait ProxyCatalogListener: Send {
+    /// Awaits the next upstream catalog listener event on the caller's `Cx`.
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>>;
+}
+
+/// One event emitted by a [`ProxyCatalogListener`].
+#[derive(Debug)]
+#[cfg(feature = "tasks")]
+pub enum ProxyCatalogListenerEvent {
+    /// Upstream accepted the requested catalog filter.
+    Acknowledged(SubscriptionFilter),
+    /// One typed catalog or resource-update notification.
+    Notification(ServerNotification),
+    /// The upstream stream completed normally.
+    Terminal,
 }
 
 /// One event emitted by a [`ProxyFinalTaskListener`].
@@ -1131,6 +1257,17 @@ pub trait ProxyBackend: Send {
         Ok(None)
     }
 
+    /// Reserves an independent HTTP catalog listener opening without beginning
+    /// upstream I/O. Incremental stdio backends return `None`.
+    #[cfg(feature = "tasks")]
+    #[doc(hidden)]
+    fn start_catalog_listener_request(
+        &mut self,
+        _notifications: SubscriptionFilter,
+    ) -> McpResult<Option<ProxyCatalogListenerRequest>> {
+        Ok(None)
+    }
+
     /// Starts an incrementally driven final Tasks listener when the backend
     /// itself owns a sequential ingress loop (currently stdio).
     ///
@@ -1168,6 +1305,27 @@ pub trait ProxyBackend: Send {
         Err(McpError::invalid_request(
             "Proxy upstream does not own an incremental catalog listener",
         ))
+    }
+
+    /// Takes a ready incremental catalog event, or drives one bounded stdio
+    /// receive turn. `None` means the bound elapsed without an event.
+    #[cfg(feature = "tasks")]
+    fn try_next_incremental_catalog_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<fastmcp_client::StdioSubscriptionEvent>> {
+        Ok(Some(self.next_incremental_catalog_listener(
+            cx,
+            request_cancellation,
+        )?))
+    }
+
+    /// Retires a live incremental catalog listener so later route requests can
+    /// use the sole stdio ingress reader again.
+    #[cfg(feature = "tasks")]
+    fn cancel_incremental_catalog_listener(&mut self, _cx: &Cx) -> McpResult<()> {
+        Ok(())
     }
 
     /// Takes one event from a listener started through
@@ -1429,6 +1587,13 @@ fn relay_upstream_log_notifications(ctx: &McpContext, notifications: Vec<ServerN
             relay_upstream_log_message(ctx, &params);
         }
     }
+}
+
+fn relay_upstream_catalog_resource_updates(ctx: &McpContext, client: &mut Client) -> McpResult<()> {
+    for uri in client.take_ready_catalog_resource_updated_uris()? {
+        let _ = ctx.notify_resource_updated(uri);
+    }
+    Ok(())
 }
 
 fn reject_lossy_proxy_projection(
@@ -2149,6 +2314,7 @@ impl ProxyBackend for Client {
             ),
             |_| {},
         )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         Ok(result)
     }
@@ -2336,6 +2502,7 @@ impl ProxyBackend for Client {
             inbound_logging_level(ctx),
             inbound_client_capabilities(ctx),
         )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
             if progress_marker.as_ref() == Some(&progress.progress_token) {
@@ -2466,6 +2633,20 @@ impl ProxyBackend for Client {
         request_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<fastmcp_client::StdioSubscriptionEvent> {
         Client::next_subscription_event(self, cx, request_cancellation)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn try_next_incremental_catalog_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<fastmcp_client::StdioSubscriptionEvent>> {
+        Client::try_next_subscription_event(self, cx, request_cancellation)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn cancel_incremental_catalog_listener(&mut self, cx: &Cx) -> McpResult<()> {
+        Client::cancel_live_catalog_subscription(self, cx)
     }
 
     #[cfg(feature = "tasks")]
@@ -2623,6 +2804,58 @@ impl Drop for ProxyIncrementalStdioFinalTaskListener {
         let _ = self
             .client
             .with_backend(|backend| backend.cancel_incremental_final_task_listener(&cx));
+    }
+}
+
+/// A route-owned bridge to a stdio catalog listener. Each `next_async` call
+/// briefly obtains the route mutex only to drive one bounded receive turn.
+#[cfg(feature = "tasks")]
+struct ProxyIncrementalStdioCatalogListener {
+    client: ProxyClient,
+}
+
+#[cfg(feature = "tasks")]
+impl ProxyCatalogListener for ProxyIncrementalStdioCatalogListener {
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            loop {
+                if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                    let _ = self
+                        .client
+                        .with_backend(|backend| backend.cancel_incremental_catalog_listener(cx));
+                    return Err(McpError::request_cancelled());
+                }
+                let event = self.client.with_backend(|backend| {
+                    backend.try_next_incremental_catalog_listener(cx, request_cancellation)
+                })?;
+                if let Some(event) = event {
+                    return Ok(match event {
+                        StdioSubscriptionEvent::Acknowledged(filter) => {
+                            ProxyCatalogListenerEvent::Acknowledged(filter)
+                        }
+                        StdioSubscriptionEvent::Notification(notification) => {
+                            ProxyCatalogListenerEvent::Notification(notification)
+                        }
+                        StdioSubscriptionEvent::Terminal => ProxyCatalogListenerEvent::Terminal,
+                    });
+                }
+                asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
+            }
+        })
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl Drop for ProxyIncrementalStdioCatalogListener {
+    fn drop(&mut self) {
+        let cx = Cx::for_request();
+        let _ = self
+            .client
+            .with_backend(|backend| backend.cancel_incremental_catalog_listener(&cx));
     }
 }
 
@@ -3329,6 +3562,17 @@ impl ProxyFinalTaskRelay {
                 Box::new(AdmittedProxyFinalTaskListener::new(listener))
                     as Box<dyn ProxyFinalTaskListener>
             })
+    }
+
+    pub(crate) async fn open_catalog_listener_async(
+        &self,
+        ctx: &McpContext,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Box<dyn ProxyCatalogListener>> {
+        self.ensure_modern_route()?;
+        self.client
+            .open_catalog_listener_async(ctx, notifications)
+            .await
     }
 
     pub(crate) fn record_notification(
@@ -4638,6 +4882,22 @@ impl ProxyBackend for ProxyHttpClient {
             return Ok(None);
         };
         Ok(Some(ProxyFinalTaskListenerRequest {
+            client: client.clone(),
+            request_id: self.next_request_id()?,
+            notifications,
+            limits: Self::sse_limits(),
+        }))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn start_catalog_listener_request(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Option<ProxyCatalogListenerRequest>> {
+        let ClientHttpConnection::Modern(client) = &self.connection else {
+            return Ok(None);
+        };
+        Ok(Some(ProxyCatalogListenerRequest {
             client: client.clone(),
             request_id: self.next_request_id()?,
             notifications,
@@ -6688,6 +6948,30 @@ impl ProxyClient {
             }));
         }
         self.with_backend(|backend| backend.open_final_task_listener(notifications))
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn open_catalog_listener_async(
+        &self,
+        ctx: &McpContext,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Box<dyn ProxyCatalogListener>> {
+        match self
+            .with_backend(|backend| backend.start_catalog_listener_request(notifications.clone()))?
+        {
+            Some(request) => return request.open(ctx).await,
+            None => {}
+        }
+        if self.with_backend(|backend| {
+            backend.start_incremental_catalog_listener(notifications.clone())
+        })? {
+            return Ok(Box::new(ProxyIncrementalStdioCatalogListener {
+                client: self.clone(),
+            }));
+        }
+        Err(McpError::invalid_request(
+            "Proxy upstream does not provide a live catalog subscription relay",
+        ))
     }
 
     /// Starts an incremental catalog listener on a stdio or HTTP upstream.
