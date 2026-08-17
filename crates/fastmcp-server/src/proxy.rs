@@ -44,15 +44,17 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
-    CompletionValues, Content, CoreRequest, CoreResult, FINAL_CLIENT_INFO_META_KEY,
-    FINAL_LOG_LEVEL_META_KEY, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
-    FinalCoreResult, FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
-    FinalReadResourceResult, FinalRequestMeta, GetPromptResult, InitializeParams, InitializeResult,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
-    LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
-    LegacyResourceContent, ListRootsResult, ProgressParams, Prompt, PromptMessage,
-    ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
-    ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool, ToolAnnotations,
+    CompletionValues, Content, CoreRequest, CoreResult, ElicitationCapability,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
+    FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
+    FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
+    FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
+    InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    LegacyCompletionParams, LegacyCompletionReference, LegacyContent, LegacyCoreResult,
+    LegacyPromptMessage, LegacyResourceContent, ListRootsResult, ProgressParams, Prompt,
+    PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
+    RootsCapability, SamplingCapability, ServerDiscoverResult, ServerNotification,
+    SubscriptionFilter, Tool, ToolAnnotations, UrlElicitationCapability,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
@@ -69,8 +71,9 @@ use serde_json::value::RawValue;
 #[cfg(feature = "tasks")]
 use crate::handler::FinalToolOutcome;
 use crate::handler::{
-    CompletionHandler, FinalResourceReadCacheHintProvenance, FinalToolSchemaAuthority,
-    PromptHandler, ResourceHandler, ToolHandler, UpstreamFinalToolSchemaRegistration, UriParams,
+    CompletionHandler, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
+    FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
+    UpstreamFinalToolSchemaRegistration, UriParams,
 };
 
 /// Progress callback signature used by proxy backends.
@@ -150,6 +153,9 @@ impl ProxyFinalTaskRequest {
         }
         if let Some(level) = inbound_logging_level(ctx) {
             client.set_log_level(level);
+        }
+        if let Some(capabilities) = inbound_client_capabilities(ctx) {
+            client.overlay_client_capabilities(capabilities);
         }
         match operation {
             ProxyFinalTaskOperation::CallTool { name, arguments } => {
@@ -847,6 +853,20 @@ pub trait ProxyBackend: Send {
         self.complete_result(params)
     }
 
+    /// Completes one argument while forwarding exact-final progress.
+    ///
+    /// Backends that cannot expose incremental final progress retain the
+    /// existing result-only behavior. Native HTTP and stdio implementations
+    /// override this when their selected ingress can admit the progress stream.
+    fn complete_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        params: CompletionParams,
+        _on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.complete_result_with_context(ctx, params)
+    }
+
     /// Runs one tool request under the downstream request's cancellation domain.
     fn call_tool_result_with_context(
         &mut self,
@@ -925,6 +945,20 @@ pub trait ProxyBackend: Send {
         self.read_resource_result(uri)
     }
 
+    /// Reads one resource while forwarding exact-final progress.
+    ///
+    /// Backends that cannot expose incremental final progress retain the
+    /// existing result-only behavior. Native HTTP and stdio implementations
+    /// override this when their selected ingress can admit the progress stream.
+    fn read_resource_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        uri: &str,
+        _on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.read_resource_result_with_context(ctx, uri)
+    }
+
     /// Runs one prompt lookup under the downstream request's cancellation domain.
     fn get_prompt_result_with_context(
         &mut self,
@@ -934,6 +968,21 @@ pub trait ProxyBackend: Send {
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
         self.get_prompt_result(name, arguments)
+    }
+
+    /// Fetches one prompt while forwarding exact-final progress.
+    ///
+    /// Backends that cannot expose incremental final progress retain the
+    /// existing result-only behavior. Native HTTP and stdio implementations
+    /// override this when their selected ingress can admit the progress stream.
+    fn get_prompt_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+        _on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.get_prompt_result_with_context(ctx, name, arguments)
     }
 
     /// Returns whether this exact selected upstream admits the complete final
@@ -1204,6 +1253,43 @@ fn inbound_logging_level(ctx: &McpContext) -> Option<LoggingLevel> {
     ctx.min_log_level().map(logging_level_from_mcp)
 }
 
+fn inbound_client_capabilities(ctx: &McpContext) -> Option<ClientCapabilities> {
+    let inbound = ctx.client_capabilities()?;
+    let mut capabilities = ClientCapabilities::default();
+    if inbound.sampling {
+        capabilities.sampling = Some(SamplingCapability::default());
+    }
+    if inbound.elicitation {
+        capabilities.elicitation = Some(ElicitationCapability {
+            form: inbound
+                .elicitation_form
+                .then(FormElicitationCapability::default),
+            url: inbound
+                .elicitation_url
+                .then(UrlElicitationCapability::default),
+        });
+    }
+    if inbound.roots {
+        capabilities.roots = Some(RootsCapability {
+            list_changed: inbound.roots_list_changed,
+        });
+    }
+    Some(capabilities)
+}
+
+fn overlay_inbound_client_capabilities(
+    mut base: ClientCapabilities,
+    inbound: Option<ClientCapabilities>,
+) -> ClientCapabilities {
+    let Some(inbound) = inbound else {
+        return base;
+    };
+    base.sampling = inbound.sampling;
+    base.elicitation = inbound.elicitation;
+    base.roots = inbound.roots;
+    base
+}
+
 fn logging_level_from_mcp(level: McpLogLevel) -> LoggingLevel {
     match level {
         McpLogLevel::Debug => LoggingLevel::Debug,
@@ -1234,9 +1320,10 @@ fn stdio_parameters_with_inbound_identity(
     mut parameters: serde_json::Value,
     identity: Option<&fastmcp_core::ClientImplementationInfo>,
     log_level: Option<LoggingLevel>,
+    capabilities: Option<ClientCapabilities>,
 ) -> serde_json::Value {
     let client_info = identity.and_then(inbound_client_info_value);
-    if client_info.is_none() && log_level.is_none() {
+    if client_info.is_none() && log_level.is_none() && capabilities.is_none() {
         return parameters;
     }
     let Some(object) = parameters.as_object_mut() else {
@@ -1253,6 +1340,11 @@ fn stdio_parameters_with_inbound_identity(
             && let Ok(value) = serde_json::to_value(log_level)
         {
             metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), value);
+        }
+        if let Some(capabilities) = capabilities
+            && let Ok(value) = serde_json::to_value(capabilities)
+        {
+            metadata.insert(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(), value);
         }
     }
     parameters
@@ -1908,6 +2000,49 @@ impl ProxyBackend for Client {
         self.complete_with_cancellation(ctx.cx(), &ctx.request_cancellation(), params, |_| {})
     }
 
+    fn complete_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        params: CompletionParams,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.ensure_initialized()?;
+        let expected_marker = ctx_progress_marker(ctx);
+        if expected_marker.is_none()
+            || self.selected_protocol_era() != Some(ProtocolEra::Modern2026)
+        {
+            return self.complete_result_with_context(ctx, params);
+        }
+        let mut parameters = serde_json::to_value(params).map_err(|error| {
+            McpError::invalid_params(format!(
+                "Proxy stdio modern completion parameters could not serialize: {error}"
+            ))
+        })?;
+        if let Some(marker) = expected_marker.as_ref() {
+            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        }
+        parameters = stdio_parameters_with_inbound_identity(
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        );
+        let result = self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::COMPLETION_COMPLETE,
+            parameters,
+            |_| {},
+        )?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        for progress in self.take_final_progress_notifications() {
+            if expected_marker.as_ref() == Some(&progress.progress_token) {
+                on_progress(progress);
+            }
+        }
+        Ok(result)
+    }
+
     fn call_tool_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -1922,6 +2057,7 @@ impl ProxyBackend for Client {
                 serde_json::json!({"name": name, "arguments": arguments}),
                 ctx.client_implementation(),
                 inbound_logging_level(ctx),
+                inbound_client_capabilities(ctx),
             ),
             |_| {},
         )?;
@@ -1945,6 +2081,7 @@ impl ProxyBackend for Client {
             parameters,
             ctx.client_implementation(),
             inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
         );
         let result = self.request_core_with_cancellation(
             ctx.cx(),
@@ -1976,6 +2113,39 @@ impl ProxyBackend for Client {
         )
     }
 
+    fn read_resource_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        uri: &str,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let mut parameters = serde_json::json!({"uri": uri});
+        let expected_marker = ctx_progress_marker(ctx);
+        if let Some(marker) = expected_marker.as_ref() {
+            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        }
+        parameters = stdio_parameters_with_inbound_identity(
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        );
+        let result = self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::RESOURCES_READ,
+            parameters,
+            |_| {},
+        )?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        for progress in self.take_final_progress_notifications() {
+            if expected_marker.as_ref() == Some(&progress.progress_token) {
+                on_progress(progress);
+            }
+        }
+        Ok(result)
+    }
+
     fn get_prompt_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -1989,6 +2159,40 @@ impl ProxyBackend for Client {
             serde_json::json!({"name": name, "arguments": arguments}),
             |_| {},
         )
+    }
+
+    fn get_prompt_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
+        let expected_marker = ctx_progress_marker(ctx);
+        if let Some(marker) = expected_marker.as_ref() {
+            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        }
+        parameters = stdio_parameters_with_inbound_identity(
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        );
+        let result = self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::PROMPTS_GET,
+            parameters,
+            |_| {},
+        )?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        for progress in self.take_final_progress_notifications() {
+            if expected_marker.as_ref() == Some(&progress.progress_token) {
+                on_progress(progress);
+            }
+        }
+        Ok(result)
     }
 
     #[cfg(feature = "tasks")]
@@ -2042,6 +2246,7 @@ impl ProxyBackend for Client {
             progress_marker.as_ref(),
             inbound_identity.as_ref(),
             inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
         )?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
@@ -3273,6 +3478,7 @@ impl ProxyHttpClient {
         mut parameters: serde_json::Value,
         inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
         inbound_log_level: Option<LoggingLevel>,
+        inbound_capabilities: Option<ClientCapabilities>,
     ) -> McpResult<serde_json::Value> {
         if self.binding.era() == ProtocolEra::Legacy2024 {
             return Ok(parameters);
@@ -3291,7 +3497,10 @@ impl ProxyHttpClient {
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
             })
         });
-        let mut metadata = FinalRequestMeta::new(self.client_capabilities.clone());
+        let mut metadata = FinalRequestMeta::new(overlay_inbound_client_capabilities(
+            self.client_capabilities.clone(),
+            inbound_capabilities,
+        ));
         metadata.client_info = inbound_identity
             .and_then(implementation_from_request_identity)
             .or_else(|| Some(self.client_info.to_implementation()));
@@ -3513,6 +3722,7 @@ impl ProxyHttpClient {
             parameters,
             ctx.and_then(McpContext::client_implementation),
             ctx.and_then(inbound_logging_level),
+            ctx.and_then(inbound_client_capabilities),
         )?;
         let request = CoreRequest::decode(self.binding.era(), method, Some(&parameters)).map_err(
             |error| {
@@ -3668,6 +3878,7 @@ impl ProxyBackend for ProxyHttpClient {
             parameters,
             ctx.client_implementation(),
             inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
         )?;
         let request = CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&parameters))
             .map_err(|error| {
@@ -4048,6 +4259,24 @@ impl ProxyBackend for ProxyHttpClient {
         )
     }
 
+    fn complete_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        params: CompletionParams,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let mut parameters = self.completion_parameters(params)?;
+        if let Some(marker) = ctx.progress_marker() {
+            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        }
+        self.request_result_with_context_and_final_progress(
+            Some(ctx),
+            fastmcp_protocol::methods::COMPLETION_COMPLETE,
+            parameters,
+            on_progress,
+        )
+    }
+
     fn call_tool_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -4130,6 +4359,24 @@ impl ProxyBackend for ProxyHttpClient {
         )
     }
 
+    fn read_resource_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        uri: &str,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let mut parameters = serde_json::json!({"uri": uri});
+        if let Some(marker) = ctx.progress_marker() {
+            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        }
+        self.request_result_with_context_and_final_progress(
+            Some(ctx),
+            fastmcp_protocol::methods::RESOURCES_READ,
+            parameters,
+            on_progress,
+        )
+    }
+
     fn get_prompt_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -4140,6 +4387,25 @@ impl ProxyBackend for ProxyHttpClient {
             ctx,
             fastmcp_protocol::methods::PROMPTS_GET,
             serde_json::json!({"name": name, "arguments": arguments}),
+        )
+    }
+
+    fn get_prompt_result_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
+        if let Some(marker) = ctx.progress_marker() {
+            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        }
+        self.request_result_with_context_and_final_progress(
+            Some(ctx),
+            fastmcp_protocol::methods::PROMPTS_GET,
+            parameters,
+            on_progress,
         )
     }
 
@@ -5890,8 +6156,22 @@ impl ProxyClient {
             ctx.checkpoint()?;
             return self.admit_upstream_result("completion/complete", result);
         }
-        let result =
-            self.with_backend(|backend| backend.complete_result_with_context(ctx, params))?;
+        let mut progress_error = None;
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = self.with_backend(|backend| {
+            backend.complete_result_with_context_and_final_progress(
+                ctx,
+                params,
+                &mut forward_progress,
+            )
+        })?;
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
         ctx.checkpoint()?;
         self.admit_upstream_result("completion/complete", result)
     }
@@ -6316,8 +6596,22 @@ impl ProxyClient {
             ctx.checkpoint()?;
             return self.admit_upstream_result("resources/read", result);
         }
-        let result =
-            self.with_backend(|backend| backend.read_resource_result_with_context(ctx, uri))?;
+        let mut progress_error = None;
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = self.with_backend(|backend| {
+            backend.read_resource_result_with_context_and_final_progress(
+                ctx,
+                uri,
+                &mut forward_progress,
+            )
+        })?;
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
         ctx.checkpoint()?;
         self.admit_upstream_result("resources/read", result)
     }
@@ -6343,8 +6637,23 @@ impl ProxyClient {
             ctx.checkpoint()?;
             return self.admit_upstream_result("prompts/get", result);
         }
-        let result = self
-            .with_backend(|backend| backend.get_prompt_result_with_context(ctx, name, arguments))?;
+        let mut progress_error = None;
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = self.with_backend(|backend| {
+            backend.get_prompt_result_with_context_and_final_progress(
+                ctx,
+                name,
+                arguments,
+                &mut forward_progress,
+            )
+        })?;
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
         ctx.checkpoint()?;
         self.admit_upstream_result("prompts/get", result)
     }
@@ -6380,8 +6689,24 @@ impl ProxyClient {
         ctx: &McpContext,
         uri: &str,
     ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        match self.read_resource_final_outcome(ctx, uri)? {
+            FinalMethodOutcome::Complete(result) => Ok(result),
+            FinalMethodOutcome::InputRequired(_) => Err(unexpected_proxy_result("resources/read")),
+        }
+    }
+
+    pub(crate) fn read_resource_final_outcome(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         match self.read_resource_typed(ctx, uri)? {
-            CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => Ok(result),
+            CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => {
+                Ok(FinalMethodOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }) => {
+                Ok(FinalMethodOutcome::InputRequired(result))
+            }
             CoreResult::Legacy(LegacyCoreResult::ResourcesRead(_)) => {
                 Err(McpError::invalid_request(
                     "Proxy cannot use an exact legacy resources/read result for a final handler path",
@@ -6397,8 +6722,25 @@ impl ProxyClient {
         name: &str,
         arguments: HashMap<String, String>,
     ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
+        match self.get_prompt_final_outcome(ctx, name, arguments)? {
+            FinalMethodOutcome::Complete(result) => Ok(result),
+            FinalMethodOutcome::InputRequired(_) => Err(unexpected_proxy_result("prompts/get")),
+        }
+    }
+
+    pub(crate) fn get_prompt_final_outcome(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         match self.get_prompt_typed(ctx, name, arguments)? {
-            CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => Ok(result),
+            CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => {
+                Ok(FinalMethodOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) => {
+                Ok(FinalMethodOutcome::InputRequired(result))
+            }
             CoreResult::Legacy(LegacyCoreResult::PromptsGet(_)) => Err(McpError::invalid_request(
                 "Proxy cannot use an exact legacy prompts/get result for a final handler path",
             )),
@@ -6909,6 +7251,10 @@ impl ResourceHandler for ProxyResourceHandler {
         self.client.read_resource(ctx, external_uri)
     }
 
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
     fn read_final(&self, ctx: &McpContext) -> McpResult<CompleteResult<FinalReadResourceResult>> {
         self.client.read_resource_final(ctx, &self.external_uri)
     }
@@ -6925,6 +7271,28 @@ impl ResourceHandler for ProxyResourceHandler {
             .and_then(|prefix| uri.strip_prefix(prefix))
             .unwrap_or(uri);
         self.client.read_resource_final(ctx, external_uri)
+    }
+
+    fn read_final_outcome(
+        &self,
+        ctx: &McpContext,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        self.client
+            .read_resource_final_outcome(ctx, &self.external_uri)
+    }
+
+    fn read_final_outcome_with_uri(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+        _params: &UriParams,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        let external_uri = self
+            .uri_prefix
+            .as_deref()
+            .and_then(|prefix| uri.strip_prefix(prefix))
+            .unwrap_or(uri);
+        self.client.read_resource_final_outcome(ctx, external_uri)
     }
 }
 
@@ -6972,6 +7340,10 @@ impl PromptHandler for ProxyPromptHandler {
         self.client.get_prompt(ctx, &self.external_name, arguments)
     }
 
+    fn declares_final_mrtr(&self) -> bool {
+        true
+    }
+
     fn get_final(
         &self,
         ctx: &McpContext,
@@ -6979,6 +7351,15 @@ impl PromptHandler for ProxyPromptHandler {
     ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
         self.client
             .get_prompt_final(ctx, &self.external_name, arguments)
+    }
+
+    fn get_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        self.client
+            .get_prompt_final_outcome(ctx, &self.external_name, arguments)
     }
 }
 
