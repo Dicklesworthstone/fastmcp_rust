@@ -30,7 +30,8 @@ use fastmcp_client::{
     ModernHttpSubscriptionListener, ReverseRequestHandlers, StdioSubscriptionEvent,
 };
 use fastmcp_core::{
-    CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpResult, block_on,
+    CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome, McpResult,
+    Outcome, block_on,
 };
 use fastmcp_protocol::common_types::{AbsoluteUri, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
@@ -51,12 +52,12 @@ use fastmcp_protocol::{
     FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
     FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
-    InitializeParams, InitializeResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    LegacyCompletionParams, LegacyCompletionReference, LegacyContent, LegacyCoreResult,
-    LegacyPromptMessage, LegacyResourceContent, ListRootsResult, ProgressParams, Prompt,
-    PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent, ResourceTemplate,
-    RootsCapability, SamplingCapability, ServerDiscoverResult, ServerNotification,
-    SubscriptionFilter, Tool, ToolAnnotations, UrlElicitationCapability,
+    InitializeParams, InitializeResult, InputRequiredResult, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, LegacyCompletionParams, LegacyCompletionReference, LegacyContent,
+    LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsResult, ProgressParams,
+    Prompt, PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent,
+    ResourceTemplate, RootsCapability, SamplingCapability, ServerDiscoverResult,
+    ServerNotification, SubscriptionFilter, Tool, ToolAnnotations, UrlElicitationCapability,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
@@ -70,10 +71,11 @@ use fastmcp_protocol::{
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::bidirectional::{MrtrCompletedInputs, MrtrInputKind};
 #[cfg(feature = "tasks")]
 use crate::handler::FinalToolOutcome;
 use crate::handler::{
-    CompletionHandler, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
+    BoxFuture, CompletionHandler, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
     FinalToolSchemaAuthority, PromptHandler, ResourceHandler, ToolHandler,
     UpstreamFinalToolSchemaRegistration, UriParams,
 };
@@ -958,6 +960,22 @@ pub trait ProxyBackend: Send {
         self.read_resource_result_with_context(ctx, uri)
     }
 
+    /// Sends one modern request with caller-built parameters.
+    ///
+    /// Used to resume an upstream `input_required` with the original
+    /// `requestState` plus the downstream-admitted input responses.
+    fn request_final_core_with_parameters(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let _ = (ctx, method, parameters);
+        Err(McpError::invalid_request(
+            "Proxy backend cannot resume an official MRTR continuation",
+        ))
+    }
+
     /// Runs one prompt lookup under the downstream request's cancellation domain.
     fn get_prompt_result_with_context(
         &mut self,
@@ -1287,6 +1305,55 @@ fn overlay_inbound_client_capabilities(
     base.elicitation = inbound.elicitation;
     base.roots = inbound.roots;
     base
+}
+
+fn mrtr_operation_key(method: &str, target: &str) -> String {
+    format!("{method}:{target}")
+}
+
+fn mrtr_input_responses_from_completed(
+    resume: &MrtrCompletedInputs,
+) -> McpResult<BTreeMap<String, serde_json::Value>> {
+    let mut responses = BTreeMap::new();
+    for (key, response) in resume.responses().iter() {
+        let value = match response.kind() {
+            MrtrInputKind::Elicitation => {
+                serde_json::to_value(response.elicitation_result()?).map_err(McpError::from)?
+            }
+            MrtrInputKind::Sampling => {
+                serde_json::to_value(response.sampling_result()?).map_err(McpError::from)?
+            }
+            MrtrInputKind::Roots => {
+                serde_json::to_value(response.roots_result()?).map_err(McpError::from)?
+            }
+        };
+        responses.insert(key.to_owned(), value);
+    }
+    Ok(responses)
+}
+
+fn overlay_upstream_mrtr_resume(
+    mut parameters: serde_json::Value,
+    pending: &InputRequiredResult,
+    resume: &MrtrCompletedInputs,
+) -> McpResult<serde_json::Value> {
+    let object = parameters.as_object_mut().ok_or_else(|| {
+        McpError::internal_error("Proxy MRTR resume parameters must remain an object")
+    })?;
+    if let Some(request_state) = pending.request_state() {
+        object.insert(
+            "requestState".to_owned(),
+            serde_json::Value::String(request_state.to_owned()),
+        );
+    }
+    let responses = mrtr_input_responses_from_completed(resume)?;
+    if !responses.is_empty() {
+        object.insert(
+            "inputResponses".to_owned(),
+            serde_json::to_value(responses).map_err(McpError::from)?,
+        );
+    }
+    Ok(parameters)
 }
 
 fn logging_level_from_mcp(level: McpLogLevel) -> LoggingLevel {
@@ -2042,6 +2109,28 @@ impl ProxyBackend for Client {
         Ok(result)
     }
 
+    fn request_final_core_with_parameters(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let result = self.request_core_with_cancellation(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            method,
+            stdio_parameters_with_inbound_identity(
+                parameters,
+                ctx.client_implementation(),
+                inbound_logging_level(ctx),
+                inbound_client_capabilities(ctx),
+            ),
+            |_| {},
+        )?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        Ok(result)
+    }
+
     fn call_tool_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -2719,6 +2808,9 @@ impl ProxyCatalog {
 pub struct ProxyClient {
     inner: Arc<Mutex<dyn ProxyBackend>>,
     upstream_binding: Option<ProxyUpstreamBinding>,
+    /// Last upstream `input_required` per operation, used to resume that
+    /// exact requestState when the downstream MRTR exchange completes.
+    pending_mrtr: Arc<Mutex<HashMap<String, InputRequiredResult>>>,
     /// Era observed from an admitted typed catalog or upstream result.
     ///
     /// Custom backends can have no transport-level binding. Their first
@@ -4343,6 +4435,15 @@ impl ProxyBackend for ProxyHttpClient {
         Ok(result)
     }
 
+    fn request_final_core_with_parameters(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.request_result_with_context(ctx, method, parameters)
+    }
+
     fn read_resource_result_with_context(
         &mut self,
         ctx: &McpContext,
@@ -5935,6 +6036,7 @@ impl ProxyClient {
         Self {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: None,
+            pending_mrtr: Arc::new(Mutex::new(HashMap::new())),
             observed_era: Arc::new(Mutex::new(None)),
             #[cfg(feature = "tasks")]
             final_task_registry: Arc::new(Mutex::new(ProxyFinalTaskRegistry::default())),
@@ -5955,6 +6057,7 @@ impl ProxyClient {
         Ok(Self {
             inner: Arc::new(Mutex::new(backend)),
             upstream_binding: Some(binding),
+            pending_mrtr: Arc::new(Mutex::new(HashMap::new())),
             observed_era: Arc::new(Mutex::new(None)),
             #[cfg(feature = "tasks")]
             final_task_registry: Arc::new(Mutex::new(ProxyFinalTaskRegistry::default())),
@@ -6424,7 +6527,53 @@ impl ProxyClient {
         if !matches!(outcome, FinalToolCallOutcome::Task(_)) {
             ctx.checkpoint()?;
         }
+        if let FinalToolCallOutcome::InputRequired(result) = &outcome {
+            self.store_pending_mrtr(
+                mrtr_operation_key(fastmcp_protocol::methods::TOOLS_CALL, name),
+                result.clone(),
+            )?;
+        }
         Ok(outcome)
+    }
+
+    /// Forwards a tools/call, optionally resuming a stored upstream
+    /// `input_required` with the downstream-admitted MRTR inputs.
+    #[cfg(feature = "tasks")]
+    fn call_tool_final_outcome_with_resume(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        resume_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalToolCallOutcome> {
+        if let Some(resume) = resume_inputs {
+            let key = mrtr_operation_key(fastmcp_protocol::methods::TOOLS_CALL, name);
+            let pending = self.take_pending_mrtr(&key)?;
+            let parameters = overlay_upstream_mrtr_resume(
+                serde_json::json!({"name": name, "arguments": arguments}),
+                &pending,
+                resume,
+            )?;
+            match self.request_upstream_final_core(
+                ctx,
+                fastmcp_protocol::methods::TOOLS_CALL,
+                parameters,
+            )? {
+                CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                    Ok(FinalToolCallOutcome::Complete(result))
+                }
+                CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                    self.store_pending_mrtr(key, result.clone())?;
+                    Ok(FinalToolCallOutcome::InputRequired(result))
+                }
+                CoreResult::Final(FinalCoreResult::ToolsCallTask { result, .. }) => {
+                    Ok(FinalToolCallOutcome::Task(result))
+                }
+                _ => Err(unexpected_proxy_result("tools/call")),
+            }
+        } else {
+            self.call_tool_final_outcome(ctx, name, arguments)
+        }
     }
 
     #[cfg(feature = "tasks")]
@@ -6704,7 +6853,7 @@ impl ProxyClient {
         ctx: &McpContext,
         uri: &str,
     ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
-        match self.read_resource_final_outcome(ctx, uri)? {
+        match self.read_resource_final_outcome(ctx, uri, None)? {
             FinalMethodOutcome::Complete(result) => Ok(result),
             FinalMethodOutcome::InputRequired(_) => Err(unexpected_proxy_result("resources/read")),
         }
@@ -6714,12 +6863,27 @@ impl ProxyClient {
         &self,
         ctx: &McpContext,
         uri: &str,
+        resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
-        match self.read_resource_typed(ctx, uri)? {
+        let key = mrtr_operation_key(fastmcp_protocol::methods::RESOURCES_READ, uri);
+        let result = if let Some(resume) = resume_inputs {
+            let pending = self.take_pending_mrtr(&key)?;
+            let parameters =
+                overlay_upstream_mrtr_resume(serde_json::json!({"uri": uri}), &pending, resume)?;
+            self.request_upstream_final_core(
+                ctx,
+                fastmcp_protocol::methods::RESOURCES_READ,
+                parameters,
+            )?
+        } else {
+            self.read_resource_typed(ctx, uri)?
+        };
+        match result {
             CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) => {
                 Ok(FinalMethodOutcome::Complete(result))
             }
             CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. }) => {
+                self.store_pending_mrtr(key, result.clone())?;
                 Ok(FinalMethodOutcome::InputRequired(result))
             }
             CoreResult::Legacy(LegacyCoreResult::ResourcesRead(_)) => {
@@ -6737,7 +6901,7 @@ impl ProxyClient {
         name: &str,
         arguments: HashMap<String, String>,
     ) -> McpResult<CompleteResult<FinalGetPromptResult>> {
-        match self.get_prompt_final_outcome(ctx, name, arguments)? {
+        match self.get_prompt_final_outcome(ctx, name, arguments, None)? {
             FinalMethodOutcome::Complete(result) => Ok(result),
             FinalMethodOutcome::InputRequired(_) => Err(unexpected_proxy_result("prompts/get")),
         }
@@ -6748,12 +6912,30 @@ impl ProxyClient {
         ctx: &McpContext,
         name: &str,
         arguments: HashMap<String, String>,
+        resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
-        match self.get_prompt_typed(ctx, name, arguments)? {
+        let key = mrtr_operation_key(fastmcp_protocol::methods::PROMPTS_GET, name);
+        let result = if let Some(resume) = resume_inputs {
+            let pending = self.take_pending_mrtr(&key)?;
+            let parameters = overlay_upstream_mrtr_resume(
+                serde_json::json!({"name": name, "arguments": arguments}),
+                &pending,
+                resume,
+            )?;
+            self.request_upstream_final_core(
+                ctx,
+                fastmcp_protocol::methods::PROMPTS_GET,
+                parameters,
+            )?
+        } else {
+            self.get_prompt_typed(ctx, name, arguments)?
+        };
+        match result {
             CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) => {
                 Ok(FinalMethodOutcome::Complete(result))
             }
             CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) => {
+                self.store_pending_mrtr(key, result.clone())?;
                 Ok(FinalMethodOutcome::InputRequired(result))
             }
             CoreResult::Legacy(LegacyCoreResult::PromptsGet(_)) => Err(McpError::invalid_request(
@@ -6761,6 +6943,38 @@ impl ProxyClient {
             )),
             _ => Err(unexpected_proxy_result("prompts/get")),
         }
+    }
+
+    fn store_pending_mrtr(&self, key: String, result: InputRequiredResult) -> McpResult<()> {
+        self.pending_mrtr
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy MRTR resume lock poisoned"))?
+            .insert(key, result);
+        Ok(())
+    }
+
+    fn take_pending_mrtr(&self, key: &str) -> McpResult<InputRequiredResult> {
+        self.pending_mrtr
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy MRTR resume lock poisoned"))?
+            .remove(key)
+            .ok_or_else(|| {
+                McpError::invalid_request(
+                    "Proxy has no upstream input_required to resume for this operation",
+                )
+            })
+    }
+
+    fn request_upstream_final_core(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let result = self.with_backend(|backend| {
+            backend.request_final_core_with_parameters(ctx, method, parameters)
+        })?;
+        self.admit_upstream_result(method, result)
     }
 
     fn admit_upstream_result(&self, method: &str, result: CoreResult) -> McpResult<CoreResult> {
@@ -7143,6 +7357,58 @@ impl ToolHandler for ProxyToolHandler {
         }
     }
 
+    fn declares_final_mrtr(&self) -> bool {
+        self.final_tool.is_some()
+    }
+
+    #[cfg(feature = "tasks")]
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            let outcome = match self.client.call_tool_final_outcome_with_resume(
+                ctx,
+                &self.external_name,
+                arguments,
+                resume_inputs,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => return Outcome::Err(error),
+            };
+            match outcome {
+                FinalToolCallOutcome::Complete(result) => {
+                    Outcome::Ok(FinalToolOutcome::Complete(result))
+                }
+                FinalToolCallOutcome::InputRequired(result) => {
+                    Outcome::Ok(FinalToolOutcome::InputRequired(result))
+                }
+                FinalToolCallOutcome::Task(result) => {
+                    let Some(task_relay) = self.task_relay.as_ref() else {
+                        return Outcome::Err(McpError::internal_error(
+                            "Proxy official Task result has no route-bound relay",
+                        ));
+                    };
+                    match task_relay.reserve_task_creation() {
+                        Ok(reservation) => {
+                            match task_relay.encode_task_carrier(reservation, result) {
+                                Ok(work_descriptor) => Outcome::Ok(FinalToolOutcome::CreateTask {
+                                    work_descriptor,
+                                    status_message: None,
+                                }),
+                                Err(error) => Outcome::Err(error),
+                            }
+                        }
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
+            }
+        })
+    }
+
     fn final_tool_error_structured_content(
         &self,
         _kind: crate::handler::ToolErrorKind,
@@ -7293,7 +7559,7 @@ impl ResourceHandler for ProxyResourceHandler {
         ctx: &McpContext,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         self.client
-            .read_resource_final_outcome(ctx, &self.external_uri)
+            .read_resource_final_outcome(ctx, &self.external_uri, None)
     }
 
     fn read_final_outcome_with_uri(
@@ -7307,7 +7573,32 @@ impl ResourceHandler for ProxyResourceHandler {
             .as_deref()
             .and_then(|prefix| uri.strip_prefix(prefix))
             .unwrap_or(uri);
-        self.client.read_resource_final_outcome(ctx, external_uri)
+        self.client
+            .read_resource_final_outcome(ctx, external_uri, None)
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a UriParams,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            let external_uri = self
+                .uri_prefix
+                .as_deref()
+                .and_then(|prefix| uri.strip_prefix(prefix))
+                .unwrap_or(uri);
+            match self
+                .client
+                .read_resource_final_outcome(ctx, external_uri, resume_inputs)
+            {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Err(error),
+            }
+        })
     }
 }
 
@@ -7374,7 +7665,27 @@ impl PromptHandler for ProxyPromptHandler {
         arguments: HashMap<String, String>,
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         self.client
-            .get_prompt_final_outcome(ctx, &self.external_name, arguments)
+            .get_prompt_final_outcome(ctx, &self.external_name, arguments, None)
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            match self.client.get_prompt_final_outcome(
+                ctx,
+                &self.external_name,
+                arguments,
+                resume_inputs,
+            ) {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Err(error),
+            }
+        })
     }
 }
 

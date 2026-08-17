@@ -2602,7 +2602,26 @@ impl ResourceHandler for FinalProxyResourceHandler {
         ctx: &McpContext,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         self.client
-            .read_resource_final_outcome(ctx, &self.external_uri)
+            .read_resource_final_outcome(ctx, &self.external_uri, None)
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        _uri: &'a str,
+        _params: &'a UriParams,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            match self
+                .client
+                .read_resource_final_outcome(ctx, &self.external_uri, resume_inputs)
+            {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Err(error),
+            }
+        })
     }
 }
 
@@ -2699,7 +2718,7 @@ impl ResourceHandler for FinalProxyResourceTemplateHandler {
         ctx: &McpContext,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
         self.client
-            .read_resource_final_outcome(ctx, &self.external_uri_template)
+            .read_resource_final_outcome(ctx, &self.external_uri_template, None)
     }
 
     fn read_final_outcome_with_uri(
@@ -2708,7 +2727,26 @@ impl ResourceHandler for FinalProxyResourceTemplateHandler {
         uri: &str,
         _params: &UriParams,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
-        self.client.read_resource_final_outcome(ctx, uri)
+        self.client.read_resource_final_outcome(ctx, uri, None)
+    }
+
+    fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a UriParams,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        Box::pin(async move {
+            match self
+                .client
+                .read_resource_final_outcome(ctx, uri, resume_inputs)
+            {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Err(error),
+            }
+        })
     }
 }
 
@@ -2807,7 +2845,27 @@ impl PromptHandler for FinalProxyPromptHandler {
         arguments: HashMap<String, String>,
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
         self.client
-            .get_prompt_final_outcome(ctx, &self.external_name, arguments)
+            .get_prompt_final_outcome(ctx, &self.external_name, arguments, None)
+    }
+
+    fn get_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalGetPromptResult>>> {
+        Box::pin(async move {
+            match self.client.get_prompt_final_outcome(
+                ctx,
+                &self.external_name,
+                arguments,
+                resume_inputs,
+            ) {
+                Ok(result) => Outcome::Ok(result),
+                Err(error) => Outcome::Err(error),
+            }
+        })
     }
 }
 
