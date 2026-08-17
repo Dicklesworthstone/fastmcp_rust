@@ -29,7 +29,9 @@ use fastmcp_client::{
     ClientProtocolPlan, CompletionParams, CompletionReference, ModernHttpSubscriptionListenEvent,
     ModernHttpSubscriptionListener, ReverseRequestHandlers, StdioSubscriptionEvent,
 };
-use fastmcp_core::{CanonicalHttpUrl, McpContext, McpError, McpLogLevel, McpResult, block_on};
+use fastmcp_core::{
+    CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpResult, block_on,
+};
 use fastmcp_protocol::common_types::{AbsoluteUri, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
@@ -402,10 +404,7 @@ impl ProxyLegacyHttpRequest {
 
     fn decode_response(self, response: JsonRpcResponse, method: &str) -> McpResult<CoreResult> {
         if let Some(error) = response.error.as_ref() {
-            return Err(McpError::internal_error(format!(
-                "Proxy HTTP upstream rejected {method}: {} ({})",
-                error.message, error.code
-            )));
+            return Err(proxy_http_upstream_rpc_error(method, error));
         }
         self.request.decode_response(&response).map_err(|error| {
             McpError::invalid_request(format!(
@@ -3785,10 +3784,7 @@ impl ProxyHttpClient {
             Err(error) => return Err(error),
         };
         if let Some(error) = response.error.as_ref() {
-            return Err(McpError::internal_error(format!(
-                "Proxy HTTP upstream rejected {method}: {} ({})",
-                error.message, error.code
-            )));
+            return Err(proxy_http_upstream_rpc_error(method, error));
         }
         let decoded = match self.connection.selected_protocol_era() {
             ProtocolEra::Modern2026 => {
@@ -5400,6 +5396,25 @@ fn unexpected_proxy_result(method: &str) -> McpError {
     McpError::invalid_request(format!(
         "Proxy HTTP upstream returned a result for another method instead of {method}"
     ))
+}
+
+/// Forwards an upstream JSON-RPC error without remapping it to InternalError.
+///
+/// Capability fail-closed (`InvalidRequest` / `InvalidParams`) must stay
+/// distinguishable from a sanitized handler crash after as_proxy.
+fn proxy_http_upstream_rpc_error(method: &str, error: &fastmcp_protocol::JsonRpcError) -> McpError {
+    let code = error
+        .code
+        .as_i32()
+        .map(McpErrorCode::from)
+        .unwrap_or(McpErrorCode::InternalError);
+    match code {
+        McpErrorCode::InternalError | McpErrorCode::Custom(_) => McpError::internal_error(format!(
+            "Proxy HTTP upstream rejected {method}: {} ({})",
+            error.message, error.code
+        )),
+        code => McpError::new(code, error.message.clone()),
+    }
 }
 
 fn legacy_icon(icons: Option<Vec<RawIcon>>) -> Option<fastmcp_protocol::Icon> {
