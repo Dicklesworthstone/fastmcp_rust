@@ -3964,6 +3964,8 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
                 .map_err(|error| format!("task HTTP server service install failed: {error}"))?;
             let server = modern::ServerBuilder::new("facade-http-task", "1.0.0")
                 .tool(PublicHttpTaskTool)
+                .tool(PublicHttpTouchTool)
+                .tool(PublicHttpHideTool)
                 .final_tasks(task_runtime)
                 .map_err(|error| format!("task HTTP server final_tasks install failed: {error}"))?
                 .build();
@@ -10142,6 +10144,157 @@ fn e2e_public_http_tasks_listen_retains_status_and_catalog_listen_refuses_task_i
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
+fn e2e_public_http_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_task_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-public-http-dual-listen", "1.0.0")
+            .connect_http_with_cx(public_http_target(server.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live official Tasks HTTP server");
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            PUBLIC_HTTP_TASK_TOOL_NAME,
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("live bind_http must create one official Task");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the task-capable live tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
+        .expect("subscription SSE limits must be nonzero");
+    let catalog_filter = modern::SubscriptionFilter {
+        tools_list_changed: Some(true),
+        ..modern::SubscriptionFilter::default()
+    };
+    runtime_block_on_bounded(
+        &cx,
+        client.start_subscriptions_listener(&cx, catalog_filter, limits),
+    )
+    .expect("live bind_http must admit a catalog listener while official Tasks remain unused");
+
+    let catalog_ack = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("catalog listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            catalog_ack,
+            Some(modern::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+        ),
+        "the first catalog listen record must be the accepted filter: {catalog_ack:?}"
+    );
+
+    let mut task_filter = modern::SubscriptionFilter::default();
+    modern::set_task_subscription_ids(&mut task_filter, vec![task_id.clone()])
+        .expect("the public Tasks filter is valid");
+    runtime_block_on_bounded(
+        &cx,
+        client.open_final_task_subscription_listener(&cx, task_filter, limits),
+    )
+    .expect(
+        "the same HttpClient must admit an official Tasks listener while catalog listen is live",
+    );
+
+    let task_ack = runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+        .expect("official Tasks listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            task_ack,
+            modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                if modern::task_subscription_ids(accepted)
+                    .expect("acknowledged Tasks filter stays valid")
+                    .as_deref()
+                    == Some([task_id.clone()].as_slice())
+        ),
+        "the first incremental Tasks listen record must be the accepted taskIds: {task_ack:?}"
+    );
+
+    let hidden = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_HIDE_TOOL_NAME, json!({})),
+    )
+    .expect("disabling a peer tool must complete while both listeners are live");
+    assert!(
+        hidden.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "hidden",
+            _ => false,
+        }),
+        "the same HttpClient must still admit tools/call while both listeners are live: {hidden:?}"
+    );
+
+    let changed = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("catalog listen must retain tools/list_changed while Tasks listen is live");
+    assert!(
+        matches!(
+            changed,
+            Some(modern::ModernHttpSubscriptionListenEvent::Notification(
+                modern::ServerNotification::ToolsListChanged(_)
+            ))
+        ),
+        "live bind_http must retain catalog list_changed on the same client as Tasks listen: {changed:?}"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(3), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/cancel remains usable while both listeners are live");
+
+    let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let event = runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+            .expect("official Tasks listen must retain later status updates while catalog listen is live");
+        match event {
+            modern::StdioTaskSubscriptionEvent::Notification(notification)
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the Tasks notification must keep the created id: {notification:?}"
+                );
+                break;
+            }
+            modern::StdioTaskSubscriptionEvent::Notification(_)
+            | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the caller-owned supervisor publishes cancellation within the public bound"
+                );
+            }
+            modern::StdioTaskSubscriptionEvent::Terminal => {
+                panic!("the live Tasks listener must retain cancellation before terminal")
+            }
+        }
+    }
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(4), task_id, 1 << 20),
+    )
+    .expect("typed tasks/get remains usable after both listeners observed their events");
+    assert!(
+        matches!(observed.task, FinalTask::Cancelled(_)),
+        "the same HTTP client must still admit tasks/get after dual listen: {observed:?}"
+    );
+
+    drop(client);
+    server.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
 fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
     let upstream = spawn_modern_task_http_server();
     let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
@@ -11098,6 +11251,765 @@ fn e2e_public_http_as_proxy_stdio_forwards_inbound_log_level() {
                     && message.data == json!("echo-handler-info")
         )),
         "raising only the inbound logLevel floor must suppress stdio as_proxy ctx.info: {emergency_notifications:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_forwards_inbound_sampling_capability() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_sampling_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let prefixed_sample = format!("ext/{PUBLIC_HTTP_SAMPLING_TOOL_NAME}");
+    let prefixed_roots = format!("ext/{PUBLIC_HTTP_ROOTS_TOOL_NAME}");
+
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.sampling = Some(Default::default());
+    capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+    capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+        .expect("form and url elicitation capabilities are valid");
+    let mut admitted = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-sampling", "1.0.0")
+            .capabilities(capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the sampling public facade connects to the live HTTP as_proxy gateway");
+
+    let listed = runtime_block_on_bounded(&cx, admitted.list_tools(&cx, None))
+        .expect("the live HTTP as_proxy gateway must advertise the prefixed sampling tool");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed_sample),
+        "as_proxy_typed must prefix the live sampling tool: {listed:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, PUBLIC_HTTP_SAMPLING_TOOL_NAME, json!({})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed sampling handler");
+    let _ = missing;
+
+    let sampled = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, &prefixed_sample, json!({})),
+    )
+    .expect("as_proxy must forward inbound sampling so upstream ctx.final_sampling is admitted");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = sampled else {
+        panic!("as_proxy must retain upstream sampling input_required: {sampled:?}");
+    };
+    assert_live_input_required(&result, "sample", "as_proxy tools/call");
+
+    let rooted = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, &prefixed_roots, json!({})),
+    )
+    .expect("as_proxy must forward inbound roots so upstream ctx.final_roots is admitted");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = rooted else {
+        panic!("as_proxy must retain upstream roots input_required: {rooted:?}");
+    };
+    assert_live_input_required(&result, "roots", "as_proxy tools/call");
+
+    let prefixed_url = format!("ext/{PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME}");
+    let elicited = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, &prefixed_url, json!({})),
+    )
+    .expect(
+        "as_proxy must forward inbound elicitation.url so upstream ctx.final_elicitation_url is admitted",
+    );
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = elicited else {
+        panic!("as_proxy must retain upstream URL elicitation input_required: {elicited:?}");
+    };
+    assert_live_input_required(&result, "approval", "as_proxy tools/call");
+
+    let form_resource = runtime_block_on_bounded(
+        &cx,
+        admitted.read_resource_result(&cx, PUBLIC_HTTP_ELICITATION_RESOURCE_URI),
+    )
+    .expect(
+        "as_proxy must forward inbound elicitation.form so upstream ctx.final_elicitation_form is admitted",
+    );
+    let FinalCoreResult::ResourcesReadInputRequired { result, .. } = form_resource else {
+        panic!("as_proxy must retain upstream form elicitation input_required: {form_resource:?}");
+    };
+    assert_live_input_required(&result, "approval", "as_proxy resources/read");
+
+    let prefixed_form_prompt = format!("ext/{PUBLIC_HTTP_ELICITATION_PROMPT_NAME}");
+    let form_prompt = runtime_block_on_bounded(
+        &cx,
+        admitted.get_prompt_result(&cx, &prefixed_form_prompt, HashMap::new()),
+    )
+    .expect("as_proxy must forward inbound elicitation.form on prefixed prompts/get");
+    let FinalCoreResult::PromptsGetInputRequired { result, .. } = form_prompt else {
+        panic!(
+            "as_proxy must retain upstream prompt form elicitation input_required: {form_prompt:?}"
+        );
+    };
+    assert_live_input_required(&result, "approval", "as_proxy prompts/get");
+    let _ = runtime_block_on_bounded(
+        &cx,
+        admitted.get_prompt_result(&cx, PUBLIC_HTTP_ELICITATION_PROMPT_NAME, HashMap::new()),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed elicitation prompt");
+
+    let mut no_form_capabilities = ClientCapabilities::default();
+    no_form_capabilities.elicitation =
+        serde_json::from_value(json!({"url": {}})).expect("url elicitation capability is valid");
+    let mut no_form = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-sampling-no-form", "1.0.0")
+            .capabilities(no_form_capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the url-only public facade connects to the live HTTP as_proxy gateway");
+    let missing_form = runtime_block_on_bounded(
+        &cx,
+        no_form.read_resource_result(&cx, PUBLIC_HTTP_ELICITATION_RESOURCE_URI),
+    );
+    match missing_form {
+        Err(error) => assert!(
+            error.to_string().contains("not advertised by the client"),
+            "as_proxy must not invent inbound elicitation.form: {error:?}"
+        ),
+        Ok(result) => panic!("omitting only inbound elicitation.form must fail closed: {result:?}"),
+    }
+
+    let mut no_url_capabilities = ClientCapabilities::default();
+    no_url_capabilities.sampling = Some(Default::default());
+    no_url_capabilities.roots =
+        serde_json::from_value(json!({})).expect("roots capability is valid");
+    no_url_capabilities.elicitation =
+        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    let mut no_url = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-sampling-no-url", "1.0.0")
+            .capabilities(no_url_capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the form-only public facade connects to the live HTTP as_proxy gateway");
+    let missing_url = runtime_block_on_bounded(
+        &cx,
+        no_url.call_tool_result(&cx, &prefixed_url, json!({})),
+    )
+    .expect("omitting only inbound elicitation.url must still complete tools/call as a tool error");
+    let FinalCoreResult::ToolsCall { result, .. } = missing_url else {
+        panic!(
+            "omitting only inbound elicitation.url must fail closed as a tool error: {missing_url:?}"
+        );
+    };
+    assert!(
+        result.payload.is_error,
+        "as_proxy must not invent inbound elicitation.url for the upstream handler: {result:?}"
+    );
+
+    let mut bare_capabilities = ClientCapabilities::default();
+    bare_capabilities.elicitation =
+        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    let mut bare = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-sampling-bare", "1.0.0")
+            .capabilities(bare_capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the bare public facade connects to the live HTTP as_proxy gateway");
+    let refused =
+        runtime_block_on_bounded(&cx, bare.call_tool_result(&cx, &prefixed_sample, json!({})))
+            .expect(
+                "omitting only inbound sampling must still complete tools/call as a tool error",
+            );
+    let FinalCoreResult::ToolsCall { result, .. } = refused else {
+        panic!("omitting only inbound sampling must fail closed as a tool error: {refused:?}");
+    };
+    assert!(
+        result.payload.is_error,
+        "as_proxy must not invent inbound sampling for the upstream handler: {result:?}"
+    );
+
+    drop(admitted);
+    drop(no_form);
+    drop(no_url);
+    drop(bare);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_inbound_sampling_capability() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+
+    let mut capabilities = ClientCapabilities::default();
+    capabilities.sampling = Some(Default::default());
+    capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+    capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+        .expect("form and url elicitation capabilities are valid");
+    let mut admitted = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-sampling", "1.0.0")
+            .capabilities(capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the sampling public facade connects to the live stdio as_proxy gateway");
+
+    let listed = runtime_block_on_bounded(&cx, admitted.list_tools(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the prefixed sampling tool");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ext/sample_echo"),
+        "as_proxy must prefix the shipped echo sampling tool: {listed:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, "sample_echo", json!({})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed stdio sampling handler");
+    let _ = missing;
+
+    let sampled = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, "ext/sample_echo", json!({})),
+    )
+    .expect("stdio as_proxy must forward inbound sampling so echo ctx.final_sampling is admitted");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = sampled else {
+        panic!("stdio as_proxy must retain echo sampling input_required: {sampled:?}");
+    };
+    assert_live_input_required(&result, "sample", "stdio as_proxy tools/call");
+
+    let rooted = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, "ext/roots_echo", json!({})),
+    )
+    .expect("stdio as_proxy must forward inbound roots so echo ctx.final_roots is admitted");
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = rooted else {
+        panic!("stdio as_proxy must retain echo roots input_required: {rooted:?}");
+    };
+    assert_live_input_required(&result, "roots", "stdio as_proxy tools/call");
+
+    let elicited = runtime_block_on_bounded(
+        &cx,
+        admitted.call_tool_result(&cx, "ext/url_elicit_echo", json!({})),
+    )
+    .expect(
+        "stdio as_proxy must forward inbound elicitation.url so echo ctx.final_elicitation_url is admitted",
+    );
+    let FinalCoreResult::ToolsCallInputRequired { result, .. } = elicited else {
+        panic!("stdio as_proxy must retain echo URL elicitation input_required: {elicited:?}");
+    };
+    assert_live_input_required(&result, "approval", "stdio as_proxy tools/call");
+
+    let form_resource = runtime_block_on_bounded(
+        &cx,
+        admitted.read_resource_result(&cx, "info://elicit-form"),
+    )
+    .expect(
+        "stdio as_proxy must forward inbound elicitation.form so echo ctx.final_elicitation_form is admitted",
+    );
+    let FinalCoreResult::ResourcesReadInputRequired { result, .. } = form_resource else {
+        panic!(
+            "stdio as_proxy must retain echo form elicitation input_required: {form_resource:?}"
+        );
+    };
+    assert_live_input_required(&result, "approval", "stdio as_proxy resources/read");
+
+    let form_prompt = runtime_block_on_bounded(
+        &cx,
+        admitted.get_prompt_result(&cx, "ext/elicit_form_greeting", HashMap::new()),
+    )
+    .expect("stdio as_proxy must forward inbound elicitation.form on prefixed prompts/get");
+    let FinalCoreResult::PromptsGetInputRequired { result, .. } = form_prompt else {
+        panic!(
+            "stdio as_proxy must retain echo prompt form elicitation input_required: {form_prompt:?}"
+        );
+    };
+    assert_live_input_required(&result, "approval", "stdio as_proxy prompts/get");
+    let _ = runtime_block_on_bounded(
+        &cx,
+        admitted.get_prompt_result(&cx, "elicit_form_greeting", HashMap::new()),
+    )
+    .expect_err(
+        "changing only the prompt name must not reach the unprefixed echo elicitation prompt",
+    );
+
+    let mut no_form_capabilities = ClientCapabilities::default();
+    no_form_capabilities.elicitation =
+        serde_json::from_value(json!({"url": {}})).expect("url elicitation capability is valid");
+    let mut no_form = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-sampling-no-form", "1.0.0")
+            .capabilities(no_form_capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the url-only public facade connects to the live stdio as_proxy gateway");
+    let missing_form =
+        runtime_block_on_bounded(&cx, no_form.read_resource_result(&cx, "info://elicit-form"));
+    match missing_form {
+        Err(error) => assert!(
+            error.to_string().contains("not advertised by the client"),
+            "stdio as_proxy must not invent inbound elicitation.form: {error:?}"
+        ),
+        Ok(result) => panic!("omitting only inbound elicitation.form must fail closed: {result:?}"),
+    }
+
+    let mut no_url_capabilities = ClientCapabilities::default();
+    no_url_capabilities.sampling = Some(Default::default());
+    no_url_capabilities.roots =
+        serde_json::from_value(json!({})).expect("roots capability is valid");
+    no_url_capabilities.elicitation =
+        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    let mut no_url = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-sampling-no-url", "1.0.0")
+            .capabilities(no_url_capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the form-only public facade connects to the live stdio as_proxy gateway");
+    let missing_url = runtime_block_on_bounded(
+        &cx,
+        no_url.call_tool_result(&cx, "ext/url_elicit_echo", json!({})),
+    )
+    .expect(
+        "omitting only inbound elicitation.url must still complete stdio as_proxy tools/call as a tool error",
+    );
+    let FinalCoreResult::ToolsCall { result, .. } = missing_url else {
+        panic!(
+            "omitting only inbound elicitation.url must fail closed as a stdio as_proxy tool error: {missing_url:?}"
+        );
+    };
+    assert!(
+        result.payload.is_error,
+        "stdio as_proxy must not invent inbound elicitation.url for the echo handler: {result:?}"
+    );
+
+    let mut bare_capabilities = ClientCapabilities::default();
+    bare_capabilities.elicitation =
+        serde_json::from_value(json!({"form": {}})).expect("form elicitation capability is valid");
+    let mut bare = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-sampling-bare", "1.0.0")
+            .capabilities(bare_capabilities)
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the bare public facade connects to the live stdio as_proxy gateway");
+    let refused = runtime_block_on_bounded(
+        &cx,
+        bare.call_tool_result(&cx, "ext/sample_echo", json!({})),
+    )
+    .expect("omitting only inbound sampling must still complete stdio as_proxy tools/call as a tool error");
+    let FinalCoreResult::ToolsCall { result, .. } = refused else {
+        panic!(
+            "omitting only inbound sampling must fail closed as a stdio as_proxy tool error: {refused:?}"
+        );
+    };
+    assert!(
+        result.payload.is_error,
+        "stdio as_proxy must not invent inbound sampling for the echo handler: {result:?}"
+    );
+
+    drop(admitted);
+    drop(no_form);
+    drop(no_url);
+    drop(bare);
+    gateway.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_forwards_inbound_progress_marker() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_progress_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let prefixed_tool = format!("ext/{PUBLIC_HTTP_PROGRESS_TOOL_NAME}");
+    let prefixed_prompt = format!("ext/{PUBLIC_HTTP_PROGRESS_PROMPT_NAME}");
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-progress", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy progress gateway");
+
+    runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed_tool, json!({})))
+        .expect("as_proxy tools/call still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "as_proxy must not invent request-scoped progress without a progressToken: {:?}",
+        client.take_progress_notifications()
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_progress_marker(
+            &cx,
+            PUBLIC_HTTP_PROGRESS_TOOL_NAME,
+            json!({}),
+            modern::ProgressMarker::from("as-proxy-http-progress-unprefixed"),
+        ),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed progress handler");
+    let _ = missing;
+
+    let marker = modern::ProgressMarker::from("as-proxy-http-progress");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_progress_marker(&cx, &prefixed_tool, json!({}), marker.clone()),
+    )
+    .expect("as_proxy must forward an inbound progressToken onto the upstream tools/call");
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("halfway")
+        }),
+        "as_proxy must retain upstream tools/call notifications/progress: {progress:?}"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_PROGRESS_RESOURCE_URI),
+    )
+    .expect("as_proxy resources/read still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "as_proxy must not invent resource progress without a progressToken"
+    );
+
+    let resource_marker = modern::ProgressMarker::from("as-proxy-http-resource-progress");
+    runtime_block_on_bounded(
+        &cx,
+        client.read_resource_with_progress_marker(
+            &cx,
+            PUBLIC_HTTP_PROGRESS_RESOURCE_URI,
+            resource_marker.clone(),
+        ),
+    )
+    .expect("as_proxy must forward an inbound progressToken onto the unprefixed resource URI");
+    let resource_progress = client.take_progress_notifications();
+    assert!(
+        resource_progress.iter().any(|notification| {
+            notification.progress_token == resource_marker
+                && notification.message.as_deref() == Some("resource-halfway")
+        }),
+        "as_proxy must retain upstream resources/read notifications/progress: {resource_progress:?}"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, &prefixed_prompt, HashMap::new()),
+    )
+    .expect("as_proxy prompts/get still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "as_proxy must not invent prompt progress without a progressToken"
+    );
+
+    let prompt_marker = modern::ProgressMarker::from("as-proxy-http-prompt-progress");
+    runtime_block_on_bounded(
+        &cx,
+        client.get_prompt_with_progress_marker(
+            &cx,
+            &prefixed_prompt,
+            HashMap::new(),
+            prompt_marker.clone(),
+        ),
+    )
+    .expect("as_proxy must forward an inbound progressToken onto the prefixed prompt");
+    let prompt_progress = client.take_progress_notifications();
+    assert!(
+        prompt_progress.iter().any(|notification| {
+            notification.progress_token == prompt_marker
+                && notification.message.as_deref() == Some("prompt-halfway")
+        }),
+        "as_proxy must retain upstream prompts/get notifications/progress: {prompt_progress:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_inbound_progress_marker() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-progress", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy progress gateway");
+
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "no-token"})),
+    )
+    .expect("stdio as_proxy echo still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "stdio as_proxy must not invent request-scoped progress without a progressToken"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_progress_marker(
+            &cx,
+            "echo",
+            json!({"message": "unprefixed"}),
+            modern::ProgressMarker::from("as-proxy-stdio-progress-unprefixed"),
+        ),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed stdio echo handler");
+    let _ = missing;
+
+    let marker = modern::ProgressMarker::from("as-proxy-stdio-progress");
+    runtime_block_on_bounded(
+        &cx,
+        client.call_tool_with_progress_marker(
+            &cx,
+            "ext/echo",
+            json!({"message": "token"}),
+            marker.clone(),
+        ),
+    )
+    .expect("stdio as_proxy must forward an inbound progressToken onto ext/echo");
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("echoed")
+        }),
+        "stdio as_proxy must retain echo notifications/progress: {progress:?}"
+    );
+
+    runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://server"))
+        .expect("stdio as_proxy resources/read still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "stdio as_proxy must not invent resource progress without a progressToken"
+    );
+
+    let resource_marker = modern::ProgressMarker::from("as-proxy-stdio-resource-progress");
+    runtime_block_on_bounded(
+        &cx,
+        client.read_resource_with_progress_marker(&cx, "info://server", resource_marker.clone()),
+    )
+    .expect("stdio as_proxy must forward an inbound progressToken onto info://server");
+    let resource_progress = client.take_progress_notifications();
+    assert!(
+        resource_progress.iter().any(|notification| {
+            notification.progress_token == resource_marker
+                && notification.message.as_deref() == Some("info")
+        }),
+        "stdio as_proxy must retain info://server notifications/progress: {resource_progress:?}"
+    );
+
+    let mut greeting = HashMap::new();
+    greeting.insert("name".to_owned(), "no-token".to_owned());
+    runtime_block_on_bounded(&cx, client.get_prompt(&cx, "ext/greeting", greeting))
+        .expect("stdio as_proxy prompts/get still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "stdio as_proxy must not invent prompt progress without a progressToken"
+    );
+
+    let prompt_marker = modern::ProgressMarker::from("as-proxy-stdio-prompt-progress");
+    let mut greeting_with_token = HashMap::new();
+    greeting_with_token.insert("name".to_owned(), "token".to_owned());
+    runtime_block_on_bounded(
+        &cx,
+        client.get_prompt_with_progress_marker(
+            &cx,
+            "ext/greeting",
+            greeting_with_token,
+            prompt_marker.clone(),
+        ),
+    )
+    .expect("stdio as_proxy must forward an inbound progressToken onto ext/greeting");
+    let prompt_progress = client.take_progress_notifications();
+    assert!(
+        prompt_progress.iter().any(|notification| {
+            notification.progress_token == prompt_marker
+                && notification.message.as_deref() == Some("greeted")
+        }),
+        "stdio as_proxy must retain greeting notifications/progress: {prompt_progress:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_forwards_inbound_completion_progress_marker() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_facade_http_server(false, None, false);
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let prefixed = format!("ext/{PUBLIC_HTTP_PROMPT_NAME}");
+    let params = modern::CompletionParams {
+        reference: modern::CompletionReference::PromptWithTitle {
+            name: prefixed,
+            title: "Public HTTP E2E Prompt".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "subject".to_owned(),
+            value: "cross-era".to_owned(),
+        },
+        context: Some(modern::FinalCompletionContext {
+            arguments: Some(std::collections::BTreeMap::from([(
+                "region".to_owned(),
+                "us-east-1".to_owned(),
+            )])),
+        }),
+    };
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-complete-progress", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy completion gateway");
+
+    runtime_block_on_bounded(&cx, client.complete(&cx, params.clone()))
+        .expect("as_proxy completion/complete still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "as_proxy must not invent completion progress without a progressToken"
+    );
+
+    let mut unprefixed = params.clone();
+    unprefixed.reference = modern::CompletionReference::PromptWithTitle {
+        name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+        title: "Public HTTP E2E Prompt".to_owned(),
+    };
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.complete_with_progress_marker(
+            &cx,
+            unprefixed,
+            modern::ProgressMarker::from("as-proxy-http-complete-unprefixed"),
+        ),
+    )
+    .expect_err("changing only the completion prompt name must not reach the unprefixed provider");
+    let _ = missing;
+
+    let marker = modern::ProgressMarker::from("as-proxy-http-complete-progress");
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.complete_with_progress_marker(&cx, params, marker.clone()),
+    )
+    .expect("as_proxy must forward an inbound progressToken onto completion/complete");
+    assert_eq!(
+        result.completion.values,
+        vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+        "as_proxy must still retain the upstream completion values: {result:?}"
+    );
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("completion-halfway")
+        }),
+        "as_proxy must retain upstream completion notifications/progress: {progress:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_inbound_completion_progress_marker() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    let params = modern::CompletionParams {
+        reference: modern::CompletionReference::PromptWithTitle {
+            name: "ext/greeting".to_owned(),
+            title: "Greeting".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "name".to_owned(),
+            value: "co".to_owned(),
+        },
+        context: Some(modern::FinalCompletionContext {
+            arguments: Some(std::collections::BTreeMap::from([(
+                "locale".to_owned(),
+                "en-US".to_owned(),
+            )])),
+        }),
+    };
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-complete-progress", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy completion gateway");
+
+    runtime_block_on_bounded(&cx, client.complete(&cx, params.clone()))
+        .expect("stdio as_proxy completion/complete still completes without a progress token");
+    assert!(
+        client.take_progress_notifications().is_empty(),
+        "stdio as_proxy must not invent completion progress without a progressToken"
+    );
+
+    let mut unprefixed = params.clone();
+    unprefixed.reference = modern::CompletionReference::PromptWithTitle {
+        name: "greeting".to_owned(),
+        title: "Greeting".to_owned(),
+    };
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.complete_with_progress_marker(
+            &cx,
+            unprefixed,
+            modern::ProgressMarker::from("as-proxy-stdio-complete-unprefixed"),
+        ),
+    )
+    .expect_err(
+        "changing only the completion prompt name must not reach the unprefixed stdio provider",
+    );
+    let _ = missing;
+
+    let marker = modern::ProgressMarker::from("as-proxy-stdio-complete-progress");
+    let result = runtime_block_on_bounded(
+        &cx,
+        client.complete_with_progress_marker(&cx, params, marker.clone()),
+    )
+    .expect("stdio as_proxy must forward an inbound progressToken onto ext/greeting completion");
+    assert_eq!(
+        result.completion.values,
+        vec!["stdio-completion-2".to_owned()],
+        "stdio as_proxy must still retain the echo completion value after the silent call: {result:?}"
+    );
+    let progress = client.take_progress_notifications();
+    assert!(
+        progress.iter().any(|notification| {
+            notification.progress_token == marker
+                && notification.message.as_deref() == Some("stdio-completion-halfway")
+        }),
+        "stdio as_proxy must retain greeting completion notifications/progress: {progress:?}"
     );
 
     drop(client);
@@ -25095,6 +26007,646 @@ mod live_websocket_bind {
             )
             .await
             .expect("the as_proxy WebSocket log client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_forwards_inbound_sampling_capability() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy sampling runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_sampling_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-sampling-gateway".to_owned(),
+                "e2e-ws-as-proxy-sampling-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket sampling gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-sampling-upstream",
+                    "native-h1:e2e-ws-as-proxy-sampling-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-sampling".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP sampling proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP sampling proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-sampling-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed sampling install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy sampling must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy sampling publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy sampling serve must be admitted");
+
+            let mut capabilities = ClientCapabilities::default();
+            capabilities.sampling = Some(Default::default());
+            capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+            capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+                .expect("form and url elicitation capabilities are valid");
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket sampling must complete RFC 6455 upgrade");
+            let mut admitted = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-sampling", "1.0.0")
+                    .capabilities(capabilities)
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the sampling ModernOnly public facade negotiates as_proxy over bind_websocket");
+
+            let prefixed_sample = format!("ext/{PUBLIC_HTTP_SAMPLING_TOOL_NAME}");
+            let prefixed_roots = format!("ext/{PUBLIC_HTTP_ROOTS_TOOL_NAME}");
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling list_tools",
+                admitted.list_tools(&cx, None),
+            )
+            .await
+            .expect("the live as_proxy WebSocket gateway must advertise the prefixed sampling tool");
+            assert!(
+                listed.tools.iter().any(|tool| tool.name == prefixed_sample),
+                "as_proxy_typed must prefix the live sampling tool over WebSocket: {listed:?}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling unprefixed",
+                admitted.call_tool_result(&cx, PUBLIC_HTTP_SAMPLING_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed sampling handler");
+            let _ = missing;
+
+            let sampled = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling tools/call",
+                admitted.call_tool_result(&cx, &prefixed_sample, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward inbound sampling so upstream ctx.final_sampling is admitted");
+            let FinalCoreResult::ToolsCallInputRequired { result, .. } = sampled else {
+                panic!("as_proxy WebSocket must retain upstream sampling input_required: {sampled:?}");
+            };
+            assert_live_input_required(&result, "sample", "as_proxy WebSocket tools/call");
+
+            let rooted = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy roots tools/call",
+                admitted.call_tool_result(&cx, &prefixed_roots, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward inbound roots so upstream ctx.final_roots is admitted");
+            let FinalCoreResult::ToolsCallInputRequired { result, .. } = rooted else {
+                panic!("as_proxy WebSocket must retain upstream roots input_required: {rooted:?}");
+            };
+            assert_live_input_required(&result, "roots", "as_proxy WebSocket tools/call");
+
+            let prefixed_url = format!("ext/{PUBLIC_HTTP_URL_ELICITATION_TOOL_NAME}");
+            let elicited = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy URL elicitation tools/call",
+                admitted.call_tool_result(&cx, &prefixed_url, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward inbound elicitation.url so upstream ctx.final_elicitation_url is admitted");
+            let FinalCoreResult::ToolsCallInputRequired { result, .. } = elicited else {
+                panic!("as_proxy WebSocket must retain upstream URL elicitation input_required: {elicited:?}");
+            };
+            assert_live_input_required(&result, "approval", "as_proxy WebSocket tools/call");
+
+            let form_resource = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy form elicitation resources/read",
+                admitted.read_resource_result(&cx, PUBLIC_HTTP_ELICITATION_RESOURCE_URI),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward inbound elicitation.form so upstream ctx.final_elicitation_form is admitted");
+            let FinalCoreResult::ResourcesReadInputRequired { result, .. } = form_resource else {
+                panic!("as_proxy WebSocket must retain upstream form elicitation input_required: {form_resource:?}");
+            };
+            assert_live_input_required(&result, "approval", "as_proxy WebSocket resources/read");
+
+            let prefixed_form_prompt = format!("ext/{PUBLIC_HTTP_ELICITATION_PROMPT_NAME}");
+            let form_prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy form elicitation prompts/get",
+                admitted.get_prompt_result(&cx, &prefixed_form_prompt, HashMap::new()),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward inbound elicitation.form on prefixed prompts/get");
+            let FinalCoreResult::PromptsGetInputRequired { result, .. } = form_prompt else {
+                panic!("as_proxy WebSocket must retain upstream prompt form elicitation input_required: {form_prompt:?}");
+            };
+            assert_live_input_required(&result, "approval", "as_proxy WebSocket prompts/get");
+            let _ = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy unprefixed form elicitation prompt",
+                admitted.get_prompt_result(&cx, PUBLIC_HTTP_ELICITATION_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect_err("changing only the prompt name must not reach the unprefixed elicitation prompt");
+
+            let mut no_form_capabilities = ClientCapabilities::default();
+            no_form_capabilities.elicitation =
+                serde_json::from_value(json!({"url": {}})).expect("url elicitation capability is valid");
+            let no_form_transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy url-only handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("url-only as_proxy WebSocket must complete RFC 6455 upgrade");
+            let mut no_form = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy url-only initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-sampling-no-form", "1.0.0")
+                    .capabilities(no_form_capabilities)
+                    .connect_websocket_with_cx(&cx, no_form_transport),
+            )
+            .await
+            .expect("the url-only ModernOnly public facade negotiates as_proxy over bind_websocket");
+            let missing_form = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy url-only form resources/read",
+                no_form.read_resource_result(&cx, PUBLIC_HTTP_ELICITATION_RESOURCE_URI),
+            )
+            .await;
+            match missing_form {
+                Err(error) => assert!(
+                    error.to_string().contains("not advertised by the client"),
+                    "as_proxy WebSocket must not invent inbound elicitation.form: {error:?}"
+                ),
+                Ok(result) => panic!(
+                    "omitting only inbound elicitation.form must fail closed: {result:?}"
+                ),
+            }
+
+            let mut bare_capabilities = ClientCapabilities::default();
+            bare_capabilities.elicitation = serde_json::from_value(json!({"form": {}}))
+                .expect("form elicitation capability is valid");
+            let bare_transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling bare handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("bare as_proxy WebSocket sampling must complete RFC 6455 upgrade");
+            let mut bare = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling bare initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-sampling-bare", "1.0.0")
+                    .capabilities(bare_capabilities)
+                    .connect_websocket_with_cx(&cx, bare_transport),
+            )
+            .await
+            .expect("the bare ModernOnly public facade negotiates as_proxy sampling over bind_websocket");
+            let refused = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling bare tools/call",
+                bare.call_tool_result(&cx, &prefixed_sample, json!({})),
+            )
+            .await
+            .expect("omitting only inbound sampling must still complete WebSocket tools/call as a tool error");
+            let FinalCoreResult::ToolsCall { result, .. } = refused else {
+                panic!("omitting only inbound sampling must fail closed as a WebSocket tool error: {refused:?}");
+            };
+            assert!(
+                result.payload.is_error,
+                "as_proxy WebSocket must not invent inbound sampling for the upstream handler: {result:?}"
+            );
+            let missing_url = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy form-only URL elicitation",
+                bare.call_tool_result(&cx, &prefixed_url, json!({})),
+            )
+            .await
+            .expect("omitting only inbound elicitation.url must still complete WebSocket tools/call as a tool error");
+            let FinalCoreResult::ToolsCall { result, .. } = missing_url else {
+                panic!("omitting only inbound elicitation.url must fail closed as a WebSocket tool error: {missing_url:?}");
+            };
+            assert!(
+                result.payload.is_error,
+                "as_proxy WebSocket must not invent inbound elicitation.url for the upstream handler: {result:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling close",
+                admitted.close(&cx),
+            )
+            .await
+            .expect("the admitted as_proxy WebSocket sampling client closes after the live proof");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy url-only close",
+                no_form.close(&cx),
+            )
+            .await
+            .expect("the url-only as_proxy WebSocket sampling client closes after the live proof");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sampling bare close",
+                bare.close(&cx),
+            )
+            .await
+            .expect("the bare as_proxy WebSocket sampling client closes after the live proof");
+            drop(admitted);
+            drop(bare);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_forwards_inbound_progress_marker() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy progress runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_progress_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-progress-gateway".to_owned(),
+                "e2e-ws-as-proxy-progress-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket progress gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-progress-upstream",
+                    "native-h1:e2e-ws-as-proxy-progress-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-progress".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP progress proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP progress proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-progress-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed progress install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy progress must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy progress publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy progress serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket progress must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-progress", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy progress over bind_websocket");
+
+            let prefixed_tool = format!("ext/{PUBLIC_HTTP_PROGRESS_TOOL_NAME}");
+            let prefixed_prompt = format!("ext/{PUBLIC_HTTP_PROGRESS_PROMPT_NAME}");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress tools/call silent",
+                client.call_tool(&cx, &prefixed_tool, json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket tools/call still completes without a progress token");
+            assert!(
+                client.take_progress_notifications().is_empty(),
+                "as_proxy WebSocket must not invent request-scoped progress without a progressToken"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress unprefixed",
+                client.call_tool_with_progress_marker(
+                    &cx,
+                    PUBLIC_HTTP_PROGRESS_TOOL_NAME,
+                    json!({}),
+                    modern::ProgressMarker::from("as-proxy-ws-progress-unprefixed"),
+                ),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed progress handler");
+            let _ = missing;
+
+            let marker = modern::ProgressMarker::from("as-proxy-ws-progress");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress tools/call",
+                client.call_tool_with_progress_marker(&cx, &prefixed_tool, json!({}), marker.clone()),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward an inbound progressToken onto the upstream tools/call");
+            let progress = client.take_progress_notifications();
+            assert!(
+                progress.iter().any(|notification| {
+                    notification.progress_token == marker
+                        && notification.message.as_deref() == Some("halfway")
+                }),
+                "as_proxy WebSocket must retain upstream tools/call notifications/progress: {progress:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress resources/read silent",
+                client.read_resource(&cx, PUBLIC_HTTP_PROGRESS_RESOURCE_URI),
+            )
+            .await
+            .expect("as_proxy WebSocket resources/read still completes without a progress token");
+            assert!(
+                client.take_progress_notifications().is_empty(),
+                "as_proxy WebSocket must not invent resource progress without a progressToken"
+            );
+
+            let resource_marker = modern::ProgressMarker::from("as-proxy-ws-resource-progress");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress resources/read",
+                client.read_resource_with_progress_marker(
+                    &cx,
+                    PUBLIC_HTTP_PROGRESS_RESOURCE_URI,
+                    resource_marker.clone(),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward an inbound progressToken onto the unprefixed resource URI");
+            let resource_progress = client.take_progress_notifications();
+            assert!(
+                resource_progress.iter().any(|notification| {
+                    notification.progress_token == resource_marker
+                        && notification.message.as_deref() == Some("resource-halfway")
+                }),
+                "as_proxy WebSocket must retain upstream resources/read notifications/progress: {resource_progress:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress prompts/get silent",
+                client.get_prompt(&cx, &prefixed_prompt, HashMap::new()),
+            )
+            .await
+            .expect("as_proxy WebSocket prompts/get still completes without a progress token");
+            assert!(
+                client.take_progress_notifications().is_empty(),
+                "as_proxy WebSocket must not invent prompt progress without a progressToken"
+            );
+
+            let prompt_marker = modern::ProgressMarker::from("as-proxy-ws-prompt-progress");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress prompts/get",
+                client.get_prompt_with_progress_marker(
+                    &cx,
+                    &prefixed_prompt,
+                    HashMap::new(),
+                    prompt_marker.clone(),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward an inbound progressToken onto the prefixed prompt");
+            let prompt_progress = client.take_progress_notifications();
+            assert!(
+                prompt_progress.iter().any(|notification| {
+                    notification.progress_token == prompt_marker
+                        && notification.message.as_deref() == Some("prompt-halfway")
+                }),
+                "as_proxy WebSocket must retain upstream prompts/get notifications/progress: {prompt_progress:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy progress close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the as_proxy WebSocket progress client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_forwards_inbound_completion_progress_marker() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy completion-progress runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_facade_http_server(false, None, false);
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-complete-progress-gateway".to_owned(),
+                "e2e-ws-as-proxy-complete-progress-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket completion-progress gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-complete-progress-upstream",
+                    "native-h1:e2e-ws-as-proxy-complete-progress-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-complete-progress".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP completion proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP completion proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-complete-progress-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed completion-progress install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy completion-progress must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy completion-progress publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy completion-progress serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-progress handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket completion-progress must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-progress initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-complete-progress", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy completion-progress over bind_websocket");
+
+            let prefixed = format!("ext/{PUBLIC_HTTP_PROMPT_NAME}");
+            let params = modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: prefixed,
+                    title: "Public HTTP E2E Prompt".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                context: Some(modern::FinalCompletionContext {
+                    arguments: Some(std::collections::BTreeMap::from([(
+                        "region".to_owned(),
+                        "us-east-1".to_owned(),
+                    )])),
+                }),
+            };
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion silent",
+                client.complete(&cx, params.clone()),
+            )
+            .await
+            .expect("as_proxy WebSocket completion/complete still completes without a progress token");
+            assert!(
+                client.take_progress_notifications().is_empty(),
+                "as_proxy WebSocket must not invent completion progress without a progressToken"
+            );
+
+            let mut unprefixed = params.clone();
+            unprefixed.reference = modern::CompletionReference::PromptWithTitle {
+                name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+                title: "Public HTTP E2E Prompt".to_owned(),
+            };
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion unprefixed",
+                client.complete_with_progress_marker(
+                    &cx,
+                    unprefixed,
+                    modern::ProgressMarker::from("as-proxy-ws-complete-unprefixed"),
+                ),
+            )
+            .await
+            .expect_err("changing only the completion prompt name must not reach the unprefixed provider");
+            let _ = missing;
+
+            let marker = modern::ProgressMarker::from("as-proxy-ws-complete-progress");
+            let result = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion progress",
+                client.complete_with_progress_marker(&cx, params, marker.clone()),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward an inbound progressToken onto completion/complete");
+            assert_eq!(
+                result.completion.values,
+                vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+                "as_proxy WebSocket must still retain the upstream completion values: {result:?}"
+            );
+            let progress = client.take_progress_notifications();
+            assert!(
+                progress.iter().any(|notification| {
+                    notification.progress_token == marker
+                        && notification.message.as_deref() == Some("completion-halfway")
+                }),
+                "as_proxy WebSocket must retain upstream completion notifications/progress: {progress:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-progress close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the as_proxy WebSocket completion-progress client closes after the live proof");
             drop(client);
             cx.set_cancel_requested(true);
             listener.abort();
