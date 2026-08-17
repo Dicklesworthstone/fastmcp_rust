@@ -1492,11 +1492,10 @@ pub fn decode_legacy_2024_11_05_envelope_classified(
         // JSON-RPC 2.0 Method Not Found (-32601), not Invalid Request: the
         // envelope structure is sound, the method simply is not available
         // in exact MCP 2024-11-05.
-        let method = legacy_2024_11_05_method(method_name).ok_or(
-            Legacy2024EnvelopeError::Method(Legacy2024WireError(
-                "method is not part of exact MCP 2024-11-05",
-            )),
-        )?;
+        let method =
+            legacy_2024_11_05_method(method_name).ok_or(Legacy2024EnvelopeError::Method(
+                Legacy2024WireError("method is not part of exact MCP 2024-11-05"),
+            ))?;
         let params = object.get("params").cloned();
         if params.as_ref().is_some_and(|params| !params.is_object()) {
             return Err(Legacy2024EnvelopeError::Envelope(Legacy2024WireError(

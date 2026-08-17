@@ -673,8 +673,7 @@ impl StdioEraClassifier {
             }
             (
                 ProtocolEra::Legacy2024,
-                StdioOpeningFrame::RequestWithoutModernMetadata
-                | StdioOpeningFrame::Notification,
+                StdioOpeningFrame::RequestWithoutModernMetadata | StdioOpeningFrame::Notification,
             ) => StdioEraDecision::Selected {
                 era,
                 modern_version: None,
