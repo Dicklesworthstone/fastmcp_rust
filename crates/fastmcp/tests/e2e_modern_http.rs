@@ -26299,6 +26299,361 @@ mod live_websocket_bind {
         });
     }
 
+    #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_stdio_follows_form_elicitation() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy stdio elicitation runtime installs an ambient context",
+            );
+            let mut last_connect_error = None;
+            let mut stdio = None;
+            for attempt in 1_u32..=4 {
+                match modern::ClientBuilder::new()
+                    .client_info("e2e-ws-as-proxy-stdio-elicit-upstream", "1.0.0")
+                    .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+                    .max_retries(2)
+                    .retry_delay_ms(150)
+                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                {
+                    Ok(client) => {
+                        stdio = Some(client);
+                        break;
+                    }
+                    Err(error) => {
+                        last_connect_error = Some(error);
+                        if attempt < 4 {
+                            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                        }
+                    }
+                }
+            }
+            let mut stdio = stdio.unwrap_or_else(|| {
+                panic!(
+                    "live stdio as_proxy elicitation upstream connect failed: {:?}",
+                    last_connect_error
+                )
+            });
+            let _ = stdio
+                .list_tools(None)
+                .expect("live stdio as_proxy elicitation upstream must answer tools/list before install");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-stdio-elicit", "1.0.0")
+                .as_proxy("ext", stdio)
+                .expect("as_proxy stdio elicitation install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy stdio elicitation must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy stdio elicitation publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy stdio elicitation serve must be admitted");
+
+            let mut capabilities = ClientCapabilities::default();
+            capabilities.elicitation = serde_json::from_value(json!({"form": {}, "url": {}}))
+                .expect("form and url elicitation capabilities are valid");
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio elicitation handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket stdio elicitation must complete RFC 6455 upgrade");
+            let mut admitted = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio elicitation initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-stdio-elicit", "1.0.0")
+                    .capabilities(capabilities.clone())
+                    .modern_reverse_request_handlers(public_modern_elicitation_follow_handlers())
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the elicitation-follow ModernOnly facade negotiates as_proxy over bind_websocket");
+
+            let resource = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio form resource follow",
+                admitted.read_resource(&cx, "info://elicit-form"),
+            )
+            .await
+            .expect("as_proxy WebSocket read_resource follows form elicitation through stdio echo");
+            assert!(
+                resource.contents.iter().any(|content| match content {
+                    EmbeddedResourceContents::Text { text, .. } => text == "form-elicit:true",
+                    _ => false,
+                }),
+                "as_proxy must resume stdio form elicitation on resources/read: {resource:?}"
+            );
+
+            let prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio form prompt follow",
+                admitted.get_prompt(&cx, "ext/elicit_form_greeting", HashMap::new()),
+            )
+            .await
+            .expect("as_proxy WebSocket get_prompt follows form elicitation through stdio echo");
+            assert!(
+                prompt.messages.iter().any(|message| match &message.content {
+                    ContentBlock::Text { text, .. } => text == "form-elicit:true",
+                    _ => false,
+                }),
+                "as_proxy must resume stdio form elicitation on prompts/get: {prompt:?}"
+            );
+
+            let url = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio URL tool follow",
+                admitted.call_tool(&cx, "ext/url_elicit_echo", json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket call_tool follows URL elicitation through stdio echo");
+            assert!(
+                url.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "url-elicit:accept",
+                    _ => false,
+                }),
+                "as_proxy must resume stdio URL elicitation on tools/call: {url:?}"
+            );
+
+            let result_transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio elicitation result handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("result-only as_proxy WebSocket elicitation must complete RFC 6455 upgrade");
+            let mut result_only = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio elicitation result initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-stdio-elicit-result", "1.0.0")
+                    .capabilities(capabilities)
+                    .connect_websocket_with_cx(&cx, result_transport),
+            )
+            .await
+            .expect("the result-only ModernOnly facade negotiates as_proxy over bind_websocket");
+            let pending = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio elicitation result resource",
+                result_only.read_resource_result(&cx, "info://elicit-form"),
+            )
+            .await
+            .expect("omitting only the elicitation handler must keep the input_required branch");
+            let FinalCoreResult::ResourcesReadInputRequired { result, .. } = pending else {
+                panic!(
+                    "changing only the installed elicitation handler must keep form input_required: {pending:?}"
+                );
+            };
+            assert_live_input_required(&result, "approval", "as_proxy WebSocket stdio resources/read");
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio elicitation close",
+                admitted.close(&cx),
+            )
+            .await
+            .expect("the elicitation-follow as_proxy WebSocket client closes after the live proof");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio elicitation result close",
+                result_only.close(&cx),
+            )
+            .await
+            .expect("the result-only as_proxy WebSocket client closes after the live proof");
+            drop(admitted);
+            drop(result_only);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_stdio_follows_sampling_and_roots() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy stdio sampling runtime installs an ambient context",
+            );
+            let mut last_connect_error = None;
+            let mut stdio = None;
+            for attempt in 1_u32..=4 {
+                match modern::ClientBuilder::new()
+                    .client_info("e2e-ws-as-proxy-stdio-sample-upstream", "1.0.0")
+                    .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+                    .max_retries(2)
+                    .retry_delay_ms(150)
+                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                {
+                    Ok(client) => {
+                        stdio = Some(client);
+                        break;
+                    }
+                    Err(error) => {
+                        last_connect_error = Some(error);
+                        if attempt < 4 {
+                            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+                        }
+                    }
+                }
+            }
+            let mut stdio = stdio.unwrap_or_else(|| {
+                panic!(
+                    "live stdio as_proxy sampling upstream connect failed: {:?}",
+                    last_connect_error
+                )
+            });
+            let _ = stdio
+                .list_tools(None)
+                .expect("live stdio as_proxy sampling upstream must answer tools/list before install");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-stdio-sample", "1.0.0")
+                .as_proxy("ext", stdio)
+                .expect("as_proxy stdio sampling install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy stdio sampling must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy stdio sampling publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy stdio sampling serve must be admitted");
+
+            let mut capabilities = ClientCapabilities::default();
+            capabilities.sampling = Some(Default::default());
+            capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
+            let handlers = modern::ReverseRequestHandlers::new()
+                .with_modern_sampling_create_message(|_cx, _cancellation, _params| {
+                    Box::pin(async {
+                        Ok(modern::FinalCreateMessageResult {
+                            content: modern::FinalSamplingMessageContent::Block(
+                                modern::FinalSamplingMessageContentBlock::Text {
+                                    text: "sampled".to_owned(),
+                                    annotations: None,
+                                    meta: None,
+                                    additional: std::collections::BTreeMap::new(),
+                                },
+                            ),
+                            model: "as-proxy-ws-sample-model".to_owned(),
+                            role: Role::Assistant,
+                            stop_reason: None,
+                            meta: None,
+                        })
+                    })
+                })
+                .with_modern_roots_list(|_cx, _cancellation, _params| {
+                    Box::pin(async { Ok(modern::FinalEmbeddedRootsListResult { roots: vec![] }) })
+                });
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket stdio sampling must complete RFC 6455 upgrade");
+            let mut admitted = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-stdio-sample", "1.0.0")
+                    .capabilities(capabilities.clone())
+                    .modern_reverse_request_handlers(handlers)
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the sampling-follow ModernOnly facade negotiates as_proxy over bind_websocket");
+
+            let sampled = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling follow",
+                admitted.call_tool(&cx, "ext/sample_echo", json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket call_tool follows sampling through stdio echo");
+            assert!(
+                sampled.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "sampled:as-proxy-ws-sample-model",
+                    _ => false,
+                }),
+                "as_proxy must resume stdio sampling on tools/call: {sampled:?}"
+            );
+
+            let roots = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio roots follow",
+                admitted.call_tool(&cx, "ext/roots_echo", json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket call_tool follows roots through stdio echo");
+            assert!(
+                roots.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "roots:0",
+                    _ => false,
+                }),
+                "as_proxy must resume stdio roots on tools/call: {roots:?}"
+            );
+
+            let result_transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling result handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("result-only as_proxy WebSocket sampling must complete RFC 6455 upgrade");
+            let mut result_only = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling result initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-stdio-sample-result", "1.0.0")
+                    .capabilities(capabilities)
+                    .connect_websocket_with_cx(&cx, result_transport),
+            )
+            .await
+            .expect("the result-only ModernOnly facade negotiates as_proxy over bind_websocket");
+            let pending = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling result tool",
+                result_only.call_tool_result(&cx, "ext/sample_echo", json!({})),
+            )
+            .await
+            .expect("omitting only the sampling handler must keep the input_required branch");
+            let FinalCoreResult::ToolsCallInputRequired { result, .. } = pending else {
+                panic!(
+                    "changing only the installed sampling handler must keep input_required: {pending:?}"
+                );
+            };
+            assert_live_input_required(&result, "sample", "as_proxy WebSocket stdio tools/call");
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling close",
+                admitted.close(&cx),
+            )
+            .await
+            .expect("the sampling-follow as_proxy WebSocket client closes after the live proof");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy stdio sampling result close",
+                result_only.close(&cx),
+            )
+            .await
+            .expect("the result-only as_proxy WebSocket client closes after the live proof");
+            drop(admitted);
+            drop(result_only);
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
     fn e2e_public_websocket_as_proxy_forwards_inbound_progress_marker() {
