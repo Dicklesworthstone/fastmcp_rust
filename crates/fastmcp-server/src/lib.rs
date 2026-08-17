@@ -3937,6 +3937,18 @@ impl FinalSubscriptionTerminalDelivery {
             || terminal_state == FINAL_TERMINAL_DRAINED
                 && completion_state == FINAL_TERMINAL_DRAINED
     }
+
+    /// True once graceful election marked the control half done or the body failed.
+    ///
+    /// A server-owned modern HTTP listen sets this before the dispatch can
+    /// enqueue the complete result. The H1 writer must keep polling that
+    /// result instead of treating request cancellation as a clean close.
+    fn control_is_satisfied(&self) -> bool {
+        matches!(
+            self.state.load(Ordering::Acquire),
+            FINAL_TERMINAL_DRAINED | FINAL_TERMINAL_FAILED
+        )
+    }
 }
 
 /// Cancellation view shared by one public HTTP response body and its MCP
@@ -9699,12 +9711,25 @@ async fn send_modern_sse_stream(
                 Ok(None) if response.is_finished() => break,
                 Ok(None)
                     if request_cancellation.is_cancel_requested()
-                        && !terminal_delivery.is_committed() =>
+                        && !terminal_delivery.is_committed()
+                        && !terminal_delivery.control_is_satisfied() =>
                 {
+                    // Peer/session cancel with no graceful complete in flight.
+                    // Fail the receipt now so listener shutdown does not burn
+                    // the full drain budget waiting for a frame that will
+                    // never be enqueued.
+                    terminal_delivery.mark_failed();
                     break;
                 }
                 Ok(None) => {
-                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    // A cancelled listener Cx must not park on its timer: two
+                    // live catalog+Tasks writers would busy-loop or hang and
+                    // starve the dispatch that still owes the elected complete.
+                    if cx.checkpoint().is_err() {
+                        asupersync::runtime::yield_now().await;
+                    } else {
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
                 }
                 Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
                     if response.is_finished() =>
@@ -9723,6 +9748,12 @@ async fn send_modern_sse_stream(
         terminal_delivery.mark_failed();
         modern_sessions
             .retain_retired_dispatches(live_session.cancel_modern_dispatch(http_stream_generation));
+    } else if !terminal_delivery.is_settled() {
+        // Writing the chunked trailer can succeed after the peer already
+        // dropped. That must not leave a graceful-election receipt open for
+        // the full HTTP_TERMINAL_DRAIN_TIMEOUT — two live SSE POSTs would
+        // then blow the fixture teardown bound.
+        terminal_delivery.mark_failed();
     }
     live_session.reap_modern_dispatches();
     result
@@ -12127,7 +12158,36 @@ impl Server {
             // The registry is intentionally transport-neutral. Polling uses
             // the caller-owned clock and never creates a detached wake task;
             // a request cancellation wakes its transport-owned dispatch task.
-            asupersync::time::sleep(request_ctx.cx().now(), Duration::from_millis(1)).await;
+            // Race the poll against `cancelled()` so two live HTTP listens
+            // wake as soon as `terminate_with_receipt` elects completion,
+            // instead of remaining parked on a cancelled-Cx timer.
+            if request_ctx.ensure_live().is_err() {
+                asupersync::runtime::yield_now().await;
+            } else {
+                let mut sleep = std::pin::pin!(asupersync::time::sleep(
+                    request_ctx.cx().now(),
+                    Duration::from_millis(1),
+                ));
+                let cancellation = request_cancellation.clone();
+                let mut cancelled = std::pin::pin!(async move {
+                    cancellation.cancelled().await;
+                });
+                std::future::poll_fn(|task_cx| {
+                    if self.final_subscriptions.is_terminating()
+                        || request_cancellation.is_cancel_requested()
+                    {
+                        return std::task::Poll::Ready(());
+                    }
+                    if cancelled.as_mut().poll(task_cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                    if sleep.as_mut().poll(task_cx).is_ready() {
+                        return std::task::Poll::Ready(());
+                    }
+                    std::task::Poll::Pending
+                })
+                .await;
+            }
         }
 
         if lease.has_graceful_completion() {
@@ -44999,6 +45059,29 @@ mod lib_unit_tests {
             "bounded shutdown must turn an unconsumed terminal into an explicit failure"
         );
         assert!(!terminal_delivery.is_drained());
+    }
+
+    #[test]
+    fn modern_http_writer_exit_without_complete_fails_a_graceful_election_receipt() {
+        let delivery = FinalSubscriptionTerminalDelivery::default();
+        delivery.mark_control_not_required();
+        assert!(
+            delivery.control_is_satisfied(),
+            "graceful modern HTTP election satisfies the control half before complete is queued"
+        );
+        assert!(
+            delivery.is_committed(),
+            "control-not-required is the committed control half; the H1 writer must keep waiting for complete"
+        );
+        assert!(
+            !delivery.is_settled(),
+            "an elected complete that was never flushed must not settle the receipt"
+        );
+        delivery.mark_failed();
+        assert!(
+            delivery.is_settled(),
+            "an H1 writer that closes without flushing complete must fail the receipt immediately"
+        );
     }
 
     #[test]
