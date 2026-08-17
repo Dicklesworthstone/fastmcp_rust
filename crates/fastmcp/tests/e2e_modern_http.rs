@@ -10413,6 +10413,437 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway() {
     upstream.shutdown();
 }
 
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_forwards_resource_updated_on_catalog_listen() {
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let cx = Cx::for_request();
+
+    let mut silent = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-resource-updated-silent", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects a silent as_proxy catalog client");
+    let silent_touch = runtime_block_on_bounded(
+        &cx,
+        silent.call_tool(
+            &cx,
+            &format!("ext/{PUBLIC_HTTP_TOUCH_TOOL_NAME}"),
+            json!({}),
+        ),
+    )
+    .expect("as_proxy touch still completes without a catalog listener");
+    assert!(
+        silent_touch.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "silent",
+            _ => false,
+        }),
+        "omitting only catalog listen must keep upstream notify_resource_updated silent: {silent_touch:?}"
+    );
+    let refused = runtime_block_on_bounded(
+        &cx,
+        silent.call_tool(&cx, PUBLIC_HTTP_TOUCH_TOOL_NAME, json!({})),
+    );
+    assert!(
+        refused.is_err(),
+        "changing only the unprefixed touch name must stay refused: {refused:?}"
+    );
+    drop(silent);
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-resource-updated", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects the as_proxy catalog listener");
+    let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
+        .expect("subscription SSE limits must be nonzero");
+    let filter = modern::SubscriptionFilter {
+        resource_subscriptions: Some(vec![PUBLIC_HTTP_WATCH_RESOURCE_URI.to_owned()]),
+        ..modern::SubscriptionFilter::default()
+    };
+    runtime_block_on_bounded(
+        &cx,
+        client.start_subscriptions_listener(&cx, filter, limits),
+    )
+    .expect("as_proxy must admit a catalog listener for the unprefixed resource URI");
+    let acknowledgement = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("as_proxy catalog listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            acknowledgement,
+            Some(modern::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+        ),
+        "the first as_proxy catalog listen record must be the accepted filter: {acknowledgement:?}"
+    );
+
+    let touched = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            &format!("ext/{PUBLIC_HTTP_TOUCH_TOOL_NAME}"),
+            json!({}),
+        ),
+    )
+    .expect("as_proxy must forward the prefixed touch tool");
+    assert!(
+        touched.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "notified",
+            _ => false,
+        }),
+        "an inbound catalog listen must count as upstream notify_resource_updated delivery: {touched:?}"
+    );
+
+    let updated = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("as_proxy catalog listen must retain the relayed resources/updated");
+    assert!(
+        matches!(
+            updated,
+            Some(modern::ModernHttpSubscriptionListenEvent::Notification(
+                modern::ServerNotification::ResourceUpdated(ref params)
+            )) if params.uri.as_str() == PUBLIC_HTTP_WATCH_RESOURCE_URI
+        ),
+        "as_proxy must relay notifications/resources/updated onto the inbound catalog listen: {updated:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+    let upstream = spawn_modern_task_http_server();
+    let gateway = spawn_modern_http_task_proxy_gateway(upstream.address());
+    let cx = Cx::for_request();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-dual-listen", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live as_proxy dual-listen gateway");
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            &format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}"),
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("as_proxy must create one official Task through the gateway");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the prefixed task-capable tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
+        .expect("subscription SSE limits must be nonzero");
+    let catalog_filter = modern::SubscriptionFilter {
+        resource_subscriptions: Some(vec![PUBLIC_HTTP_WATCH_RESOURCE_URI.to_owned()]),
+        ..modern::SubscriptionFilter::default()
+    };
+    runtime_block_on_bounded(
+        &cx,
+        client.start_subscriptions_listener(&cx, catalog_filter, limits),
+    )
+    .expect("as_proxy must admit a catalog listener while official Tasks remain unused");
+    let catalog_ack = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("as_proxy catalog listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            catalog_ack,
+            Some(modern::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+        ),
+        "the first as_proxy catalog listen record must be the accepted filter: {catalog_ack:?}"
+    );
+
+    let mut task_filter = modern::SubscriptionFilter::default();
+    modern::set_task_subscription_ids(&mut task_filter, vec![task_id.clone()])
+        .expect("the public Tasks filter is valid");
+    runtime_block_on_bounded(
+        &cx,
+        client.open_final_task_subscription_listener(&cx, task_filter, limits),
+    )
+    .expect("the same as_proxy HttpClient must admit official Tasks listen while catalog listen is live");
+    let task_ack = runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+        .expect("as_proxy official Tasks listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            task_ack,
+            modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                if modern::task_subscription_ids(accepted)
+                    .expect("acknowledged Tasks filter stays valid")
+                    .as_deref()
+                    == Some([task_id.clone()].as_slice())
+        ),
+        "the first as_proxy Tasks listen record must be the accepted taskIds: {task_ack:?}"
+    );
+
+    let touched = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            &format!("ext/{PUBLIC_HTTP_TOUCH_TOOL_NAME}"),
+            json!({}),
+        ),
+    )
+    .expect("as_proxy touch must complete while both listeners are live");
+    assert!(
+        touched.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "notified",
+            _ => false,
+        }),
+        "an inbound catalog listen must count as upstream notify_resource_updated delivery: {touched:?}"
+    );
+    let updated = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("as_proxy catalog listen must retain resources/updated while Tasks listen is live");
+    assert!(
+        matches!(
+            updated,
+            Some(modern::ModernHttpSubscriptionListenEvent::Notification(
+                modern::ServerNotification::ResourceUpdated(ref params)
+            )) if params.uri.as_str() == PUBLIC_HTTP_WATCH_RESOURCE_URI
+        ),
+        "as_proxy dual listen must retain resources/updated on the catalog listener: {updated:?}"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(3), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/cancel remains usable while both as_proxy listeners are live");
+    let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let event = runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+            .expect("as_proxy Tasks listen must retain later status updates while catalog listen is live");
+        match event {
+            modern::StdioTaskSubscriptionEvent::Notification(notification)
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the as_proxy Tasks notification must keep the created id: {notification:?}"
+                );
+                break;
+            }
+            modern::StdioTaskSubscriptionEvent::Notification(_)
+            | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the as_proxy relay publishes cancellation within the public bound"
+                );
+            }
+            modern::StdioTaskSubscriptionEvent::Terminal => {
+                panic!("the live as_proxy Tasks listener must retain cancellation before terminal")
+            }
+        }
+    }
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(4), task_id, 1 << 20),
+    )
+    .expect("typed tasks/get remains usable after both as_proxy listeners observed their events");
+    assert!(
+        matches!(observed.task, FinalTask::Cancelled(_)),
+        "the same as_proxy HTTP client must still admit tasks/get after dual listen: {observed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+    // Create through the gateway so the route-bound relay records the handle.
+    // The precreate spawn occupies echo's in-memory store (capacity 1).
+    let gateway = spawn_modern_http_stdio_as_proxy_gateway_without_precreated_task();
+    let cx = Cx::for_request();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-dual-listen", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy dual-listen gateway");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the live stdio as_proxy gateway must advertise the prefixed durable task");
+    assert!(
+        listed
+            .tools
+            .iter()
+            .any(|tool| tool.name == "ext/durable_task"),
+        "as_proxy must prefix the live stdio durable_task tool: {listed:?}"
+    );
+    let unprefixed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(2),
+            "durable_task",
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect_err("changing only the tool name must not create a Task on the unprefixed path");
+    let _ = unprefixed;
+
+    let created = runtime_block_on_bounded(
+        &cx,
+        client.call_tool_outcome(
+            &cx,
+            RequestId::Number(3),
+            "ext/durable_task",
+            json!({}),
+            1 << 20,
+        ),
+    )
+    .expect("stdio as_proxy must create one official Task through the gateway");
+    let FinalToolCallOutcome::Task(created) = created else {
+        panic!(
+            "the prefixed durable_task tool must return the official Task result branch: {created:?}"
+        );
+    };
+    let task_id = created.task.base().task_id.clone();
+
+    let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
+        .expect("subscription SSE limits must be nonzero");
+    let catalog_filter = modern::SubscriptionFilter {
+        resource_subscriptions: Some(vec!["info://server".to_owned()]),
+        ..modern::SubscriptionFilter::default()
+    };
+    runtime_block_on_bounded(
+        &cx,
+        client.start_subscriptions_listener(&cx, catalog_filter, limits),
+    )
+    .expect("stdio as_proxy must admit a catalog listener while official Tasks remain unused");
+    let catalog_ack = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("stdio as_proxy catalog listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            catalog_ack,
+            Some(modern::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+        ),
+        "the first stdio as_proxy catalog listen record must be the accepted filter: {catalog_ack:?}"
+    );
+
+    let mut task_filter = modern::SubscriptionFilter::default();
+    modern::set_task_subscription_ids(&mut task_filter, vec![task_id.clone()])
+        .expect("the public Tasks filter is valid");
+    runtime_block_on_bounded(
+        &cx,
+        client.open_final_task_subscription_listener(&cx, task_filter, limits),
+    )
+    .expect(
+        "the same stdio as_proxy HttpClient must admit official Tasks listen while catalog listen is live",
+    );
+    let task_ack = runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+        .expect("stdio as_proxy official Tasks listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            task_ack,
+            modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                if modern::task_subscription_ids(accepted)
+                    .expect("acknowledged Tasks filter stays valid")
+                    .as_deref()
+                    == Some([task_id.clone()].as_slice())
+        ),
+        "the first stdio as_proxy Tasks listen record must be the accepted taskIds: {task_ack:?}"
+    );
+
+    let touched = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/touch_server_info", json!({})),
+    )
+    .expect("stdio as_proxy touch must complete while both listeners are live");
+    assert!(
+        touched.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "notified",
+            _ => false,
+        }),
+        "an inbound catalog listen must count as echo notify_resource_updated delivery: {touched:?}"
+    );
+    let updated = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx)).expect(
+        "stdio as_proxy catalog listen must retain resources/updated while Tasks listen is live",
+    );
+    assert!(
+        matches!(
+            updated,
+            Some(modern::ModernHttpSubscriptionListenEvent::Notification(
+                modern::ServerNotification::ResourceUpdated(ref params)
+            )) if params.uri.as_str() == "info://server"
+        ),
+        "stdio as_proxy dual listen must retain resources/updated on the catalog listener: {updated:?}"
+    );
+
+    runtime_block_on_bounded(
+        &cx,
+        client.cancel_task(&cx, RequestId::Number(4), task_id.clone(), 1 << 20),
+    )
+    .expect("typed tasks/cancel remains usable while both stdio as_proxy listeners are live");
+    let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+    loop {
+        let event = runtime_block_on_bounded(&cx, client.next_final_task_subscription_event(&cx))
+            .expect(
+                "stdio as_proxy Tasks listen must retain later status updates while catalog listen is live",
+            );
+        match event {
+            modern::StdioTaskSubscriptionEvent::Notification(notification)
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+            {
+                assert_eq!(
+                    notification.params.task.base().task_id,
+                    task_id,
+                    "the stdio as_proxy Tasks notification must keep the created id: {notification:?}"
+                );
+                break;
+            }
+            modern::StdioTaskSubscriptionEvent::Notification(_)
+            | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the stdio as_proxy relay publishes cancellation within the public bound"
+                );
+            }
+            modern::StdioTaskSubscriptionEvent::Terminal => {
+                panic!(
+                    "the live stdio as_proxy Tasks listener must retain cancellation before terminal"
+                )
+            }
+        }
+    }
+
+    let observed = runtime_block_on_bounded(
+        &cx,
+        client.get_task(&cx, RequestId::Number(5), task_id, 1 << 20),
+    )
+    .expect(
+        "typed tasks/get remains usable after both stdio as_proxy listeners observed their events",
+    );
+    assert!(
+        matches!(observed.task, FinalTask::Cancelled(_)),
+        "the same stdio as_proxy HTTP client must still admit tasks/get after dual listen: {observed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gateway() {
@@ -10505,6 +10936,96 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
     drop(watch);
     drop(watcher);
     drop(controller);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_resource_updated_on_catalog_listen() {
+    let (gateway, _precreated) = spawn_modern_http_stdio_as_proxy_gateway();
+    let cx = Cx::for_request();
+
+    let mut silent = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-resource-updated-silent", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects a silent stdio as_proxy catalog client");
+    let silent_touch = runtime_block_on_bounded(
+        &cx,
+        silent.call_tool(&cx, "ext/touch_server_info", json!({})),
+    )
+    .expect("stdio as_proxy touch still completes without a catalog listener");
+    assert!(
+        silent_touch.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "silent",
+            _ => false,
+        }),
+        "omitting only catalog listen must keep echo notify_resource_updated silent: {silent_touch:?}"
+    );
+    let refused =
+        runtime_block_on_bounded(&cx, silent.call_tool(&cx, "touch_server_info", json!({})));
+    assert!(
+        refused.is_err(),
+        "changing only the unprefixed touch name must stay refused: {refused:?}"
+    );
+    drop(silent);
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-resource-updated", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects the stdio as_proxy catalog listener");
+    let limits = modern::SseLimits::new(64 * 1024, 2 * 1024 * 1024, 256)
+        .expect("subscription SSE limits must be nonzero");
+    let filter = modern::SubscriptionFilter {
+        resource_subscriptions: Some(vec!["info://server".to_owned()]),
+        ..modern::SubscriptionFilter::default()
+    };
+    runtime_block_on_bounded(
+        &cx,
+        client.start_subscriptions_listener(&cx, filter, limits),
+    )
+    .expect("stdio as_proxy must admit a catalog listener for info://server");
+    let acknowledgement = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("stdio as_proxy catalog listen must emit its acknowledgement");
+    assert!(
+        matches!(
+            acknowledgement,
+            Some(modern::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+        ),
+        "the first stdio as_proxy catalog listen record must be the accepted filter: {acknowledgement:?}"
+    );
+
+    let touched = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/touch_server_info", json!({})),
+    )
+    .expect("stdio as_proxy must forward the prefixed touch tool");
+    assert!(
+        touched.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "notified",
+            _ => false,
+        }),
+        "an inbound catalog listen must count as echo notify_resource_updated delivery: {touched:?}"
+    );
+
+    let updated = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .expect("stdio as_proxy catalog listen must retain the relayed resources/updated");
+    assert!(
+        matches!(
+            updated,
+            Some(modern::ModernHttpSubscriptionListenEvent::Notification(
+                modern::ServerNotification::ResourceUpdated(ref params)
+            )) if params.uri.as_str() == "info://server"
+        ),
+        "stdio as_proxy must relay notifications/resources/updated onto the inbound catalog listen: {updated:?}"
+    );
+
+    drop(client);
     gateway.shutdown();
 }
 
@@ -23529,6 +24050,36 @@ mod live_websocket_bind {
             .expect("live bind_websocket installs an owned runtime")
     }
 
+    #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+    fn connect_warmed_stdio_as_proxy_upstream(cx: &Cx, client_name: &str) -> modern::Client {
+        let mut last_error = None;
+        for attempt in 1_u32..=4 {
+            match modern::ClientBuilder::new()
+                .client_info(client_name, "1.0.0")
+                .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+                .max_retries(2)
+                .retry_delay_ms(150)
+                .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], cx)
+            {
+                Ok(mut client) => match client.list_tools(None) {
+                    Ok(_) => return client,
+                    Err(error) => {
+                        last_error = Some(error);
+                        drop(client);
+                    }
+                },
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 4 {
+                thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
+            }
+        }
+        panic!(
+            "live stdio as_proxy upstream connect/list_tools failed: {:?}",
+            last_error
+        );
+    }
+
     const PUBLIC_WS_WATCH_RESOURCE_URI: &str = "test://public-ws-e2e/watched";
     const PUBLIC_WS_NOTIFY_TOOL_NAME: &str = "public-ws-e2e-notify";
     const PUBLIC_WS_MISS_TOOL_NAME: &str = "public-ws-e2e-miss";
@@ -25305,6 +25856,236 @@ mod live_websocket_bind {
 
     #[cfg(all(feature = "tasks", feature = "proxy"))]
     #[test]
+    fn e2e_public_websocket_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket dual-listen runtime installs an ambient context",
+            );
+            let task_runtime = FinalTaskRuntime::in_memory(
+                FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                    .expect("modern WebSocket dual-listen timing policy is valid"),
+                Arc::new(|_| {}),
+            );
+            let task_runner = task_runtime
+                .install_task_service(1, Arc::new(PublicHttpHoldingTaskSupervisor))
+                .expect("modern WebSocket dual-listen service install must succeed");
+            let server = modern::ServerBuilder::new("facade-ws-dual-listen", "1.0.0")
+                .tool(PublicHttpTaskTool)
+                .tool(PublicHttpHideTool)
+                .final_tasks(task_runtime)
+                .expect("modern WebSocket final_tasks dual-listen install must succeed")
+                .build();
+            let service_scope = cx.scope();
+            let service = cx
+                .spawn_in(&service_scope, move |service_cx| async move {
+                    task_runner.run(&service_cx).await
+                })
+                .expect("modern WebSocket dual-listen service must be admitted");
+            asupersync::runtime::yield_now().await;
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket dual listen must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket dual listen publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket dual listen serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public ModernOnly bind_websocket dual listen must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-dual-listen", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates dual listen over bind_websocket");
+
+            let created = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen tools/call",
+                client.call_tool_outcome(&cx, PUBLIC_HTTP_TASK_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("live bind_websocket must create one official Task before dual listen");
+            let FinalToolCallOutcome::Task(created) = created else {
+                panic!(
+                    "the task-capable live tool must return the official Task result branch: {created:?}"
+                );
+            };
+            let task_id = created.task.base().task_id.clone();
+
+            let catalog_filter = modern::SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..modern::SubscriptionFilter::default()
+            };
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen catalog open",
+                client.open_subscriptions_listener(&cx, catalog_filter),
+            )
+            .await
+            .expect("live bind_websocket must admit a catalog listener while official Tasks remain unused");
+
+            let cancellation = McpRequestCancellation::new();
+            let catalog_ack = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen catalog acknowledgement",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("catalog listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    catalog_ack,
+                    modern::StdioSubscriptionEvent::Acknowledged(ref filter)
+                        if filter.tools_list_changed == Some(true)
+                ),
+                "the first catalog listen record must be the accepted filter: {catalog_ack:?}"
+            );
+
+            let mut task_filter = modern::SubscriptionFilter::default();
+            modern::set_task_subscription_ids(&mut task_filter, vec![task_id.clone()])
+                .expect("the public Tasks filter is valid");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen Tasks open",
+                client.open_final_task_subscription_listener(&cx, task_filter),
+            )
+            .await
+            .expect("the same WebSocketClient must admit official Tasks listen while catalog listen is live");
+
+            let task_ack = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen Tasks acknowledgement",
+                client.next_final_task_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("official Tasks listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    task_ack,
+                    modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                        if modern::task_subscription_ids(accepted)
+                            .expect("acknowledged Tasks filter stays valid")
+                            .as_deref()
+                            == Some([task_id.clone()].as_slice())
+                ),
+                "the first incremental Tasks listen record must be the accepted taskIds: {task_ack:?}"
+            );
+
+            let hidden = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen hide",
+                client.call_tool(&cx, PUBLIC_HTTP_HIDE_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect("disabling a peer tool must complete while both listeners are live");
+            assert!(
+                hidden.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "hidden",
+                    _ => false,
+                }),
+                "the same WebSocketClient must still admit tools/call while both listeners are live: {hidden:?}"
+            );
+
+            let changed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen catalog list_changed",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("catalog listen must retain tools/list_changed while Tasks listen is live");
+            assert!(
+                matches!(
+                    changed,
+                    modern::StdioSubscriptionEvent::Notification(
+                        modern::ServerNotification::ToolsListChanged(_)
+                    )
+                ),
+                "live bind_websocket must retain catalog list_changed on the same client as Tasks listen: {changed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen cancel",
+                client.cancel_task(&cx, task_id.clone()),
+            )
+            .await
+            .expect("typed tasks/cancel remains usable while both listeners are live");
+
+            let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+            loop {
+                let event = websocket_client_bounded(
+                    &cx,
+                    "live modern WebSocket dual listen Tasks status",
+                    client.next_final_task_subscription_event(&cx, &cancellation),
+                )
+                .await
+                .expect("official Tasks listen must retain later status updates while catalog listen is live");
+                match event {
+                    modern::StdioTaskSubscriptionEvent::Notification(notification)
+                        if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+                    {
+                        assert_eq!(
+                            notification.params.task.base().task_id,
+                            task_id,
+                            "the Tasks notification must keep the created id"
+                        );
+                        break;
+                    }
+                    modern::StdioTaskSubscriptionEvent::Notification(_)
+                    | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                        assert!(
+                            Instant::now() < notification_deadline,
+                            "the caller-owned supervisor publishes cancellation within the public bound"
+                        );
+                    }
+                    modern::StdioTaskSubscriptionEvent::Terminal => {
+                        panic!("the live Tasks listener must retain cancellation before terminal")
+                    }
+                }
+            }
+
+            let observed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen get after cancel",
+                client.get_task(&cx, task_id),
+            )
+            .await
+            .expect("typed tasks/get remains usable after both listeners observed their events");
+            assert!(
+                matches!(observed.task, FinalTask::Cancelled(_)),
+                "the same WebSocket client must still admit tasks/get after dual listen: {observed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket dual listen close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern WebSocket dual-listen client closes after the live proof");
+            drop(client);
+            service.abort();
+            cx.set_cancel_requested(true);
+            listener.abort();
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "proxy"))]
+    #[test]
     fn e2e_public_websocket_as_proxy_tasks_listen_retains_status_through_the_gateway() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
@@ -25512,6 +26293,428 @@ mod live_websocket_bind {
             )
             .await
             .expect("the modern WebSocket as_proxy Tasks listen client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "proxy"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_forwards_resource_updated_on_catalog_listen() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy catalog listen runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_task_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-resource-updated-gateway".to_owned(),
+                "e2e-ws-as-proxy-resource-updated-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket catalog listen gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-resource-updated-upstream",
+                    "native-h1:e2e-ws-as-proxy-resource-updated-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-resource-updated".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP catalog proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP catalog proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-resource-updated-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed catalog install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy catalog must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy catalog publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy catalog serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog listen handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public ModernOnly bind_websocket as_proxy catalog must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog listen initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-as-proxy-resource-updated", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy catalog listen over bind_websocket");
+
+            let silent_touch = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog silent touch",
+                client.call_tool(&cx, &format!("ext/{PUBLIC_HTTP_TOUCH_TOOL_NAME}"), json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket touch still completes without a catalog listener");
+            assert!(
+                silent_touch.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "silent",
+                    _ => false,
+                }),
+                "omitting only catalog listen must keep upstream notify_resource_updated silent: {silent_touch:?}"
+            );
+            let refused = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog unprefixed touch",
+                client.call_tool(&cx, PUBLIC_HTTP_TOUCH_TOOL_NAME, json!({})),
+            )
+            .await;
+            assert!(
+                refused.is_err(),
+                "changing only the unprefixed touch name must stay refused: {refused:?}"
+            );
+
+            let filter = modern::SubscriptionFilter {
+                resource_subscriptions: Some(vec![PUBLIC_HTTP_WATCH_RESOURCE_URI.to_owned()]),
+                ..modern::SubscriptionFilter::default()
+            };
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog listen open",
+                client.open_subscriptions_listener(&cx, filter),
+            )
+            .await
+            .expect("as_proxy bind_websocket must admit a catalog listener for the unprefixed resource URI");
+
+            let cancellation = McpRequestCancellation::new();
+            let acknowledgement = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog listen acknowledgement",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("as_proxy catalog listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    acknowledgement,
+                    modern::StdioSubscriptionEvent::Acknowledged(_)
+                ),
+                "the first as_proxy WebSocket catalog listen record must be the accepted filter: {acknowledgement:?}"
+            );
+
+            let touched = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog listen touch",
+                client.call_tool(&cx, &format!("ext/{PUBLIC_HTTP_TOUCH_TOOL_NAME}"), json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward the prefixed touch tool");
+            assert!(
+                touched.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "notified",
+                    _ => false,
+                }),
+                "an inbound catalog listen must count as upstream notify_resource_updated delivery: {touched:?}"
+            );
+
+            let updated = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog listen updated",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("as_proxy catalog listen must retain the relayed resources/updated");
+            assert!(
+                matches!(
+                    updated,
+                    modern::StdioSubscriptionEvent::Notification(
+                        modern::ServerNotification::ResourceUpdated(ref params)
+                    ) if params.uri.as_str() == PUBLIC_HTTP_WATCH_RESOURCE_URI
+                ),
+                "as_proxy WebSocket must relay notifications/resources/updated onto the inbound catalog listen: {updated:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog listen close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern WebSocket as_proxy catalog listen client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "proxy"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_client() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy dual-listen runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_task_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-dual-listen-gateway".to_owned(),
+                "e2e-ws-as-proxy-dual-listen-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket dual-listen gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-dual-listen-upstream",
+                    "native-h1:e2e-ws-as-proxy-dual-listen-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-dual-listen".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect("live modern HTTP dual-listen proxy upstream must connect from the WebSocket runtime");
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP dual-listen proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-dual-listen-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed dual-listen install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy dual listen must bind a localhost listener");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy dual listen publishes its bound address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy dual listen serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("public ModernOnly bind_websocket as_proxy dual listen must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-public-ws-as-proxy-dual-listen", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy dual listen over bind_websocket");
+
+            let created = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen create",
+                client.call_tool_outcome(
+                    &cx,
+                    &format!("ext/{PUBLIC_HTTP_TASK_TOOL_NAME}"),
+                    json!({}),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must create one official Task through the gateway");
+            let FinalToolCallOutcome::Task(created) = created else {
+                panic!(
+                    "the prefixed task-capable tool must return the official Task result branch: {created:?}"
+                );
+            };
+            let task_id = created.task.base().task_id.clone();
+
+            let catalog_filter = modern::SubscriptionFilter {
+                resource_subscriptions: Some(vec![PUBLIC_HTTP_WATCH_RESOURCE_URI.to_owned()]),
+                ..modern::SubscriptionFilter::default()
+            };
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen catalog open",
+                client.open_subscriptions_listener(&cx, catalog_filter),
+            )
+            .await
+            .expect("as_proxy bind_websocket must admit a catalog listener while official Tasks remain unused");
+
+            let cancellation = McpRequestCancellation::new();
+            let catalog_ack = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen catalog acknowledgement",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("as_proxy catalog listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    catalog_ack,
+                    modern::StdioSubscriptionEvent::Acknowledged(_)
+                ),
+                "the first as_proxy WebSocket catalog listen record must be the accepted filter: {catalog_ack:?}"
+            );
+
+            let mut task_filter = modern::SubscriptionFilter::default();
+            modern::set_task_subscription_ids(&mut task_filter, vec![task_id.clone()])
+                .expect("the public Tasks filter is valid");
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen Tasks open",
+                client.open_final_task_subscription_listener(&cx, task_filter),
+            )
+            .await
+            .expect("the same as_proxy WebSocketClient must admit official Tasks listen while catalog listen is live");
+
+            let task_ack = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen Tasks acknowledgement",
+                client.next_final_task_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("as_proxy official Tasks listen must emit its acknowledgement");
+            assert!(
+                matches!(
+                    task_ack,
+                    modern::StdioTaskSubscriptionEvent::Acknowledged(ref accepted)
+                        if modern::task_subscription_ids(accepted)
+                            .expect("acknowledged Tasks filter stays valid")
+                            .as_deref()
+                            == Some([task_id.clone()].as_slice())
+                ),
+                "the first as_proxy WebSocket Tasks listen record must be the accepted taskIds: {task_ack:?}"
+            );
+
+            let touched = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen touch",
+                client.call_tool(&cx, &format!("ext/{PUBLIC_HTTP_TOUCH_TOOL_NAME}"), json!({})),
+            )
+            .await
+            .expect("as_proxy WebSocket touch must complete while both listeners are live");
+            assert!(
+                touched.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "notified",
+                    _ => false,
+                }),
+                "an inbound catalog listen must count as upstream notify_resource_updated delivery: {touched:?}"
+            );
+
+            let updated = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen catalog updated",
+                client.next_subscription_event(&cx, &cancellation),
+            )
+            .await
+            .expect("as_proxy catalog listen must retain resources/updated while Tasks listen is live");
+            assert!(
+                matches!(
+                    updated,
+                    modern::StdioSubscriptionEvent::Notification(
+                        modern::ServerNotification::ResourceUpdated(ref params)
+                    ) if params.uri.as_str() == PUBLIC_HTTP_WATCH_RESOURCE_URI
+                ),
+                "as_proxy WebSocket dual listen must retain resources/updated on the catalog listener: {updated:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen cancel",
+                client.cancel_task(&cx, task_id.clone()),
+            )
+            .await
+            .expect("typed tasks/cancel remains usable while both as_proxy listeners are live");
+
+            let notification_deadline = Instant::now() + HTTP_OPERATION_BOUND;
+            loop {
+                let event = websocket_client_bounded(
+                    &cx,
+                    "live modern WebSocket as_proxy dual listen Tasks status",
+                    client.next_final_task_subscription_event(&cx, &cancellation),
+                )
+                .await
+                .expect("as_proxy Tasks listen must retain later status updates while catalog listen is live");
+                match event {
+                    modern::StdioTaskSubscriptionEvent::Notification(notification)
+                        if matches!(notification.params.task, FinalTask::Cancelled(_)) =>
+                    {
+                        assert_eq!(
+                            notification.params.task.base().task_id,
+                            task_id,
+                            "the as_proxy WebSocket Tasks notification must keep the created id"
+                        );
+                        break;
+                    }
+                    modern::StdioTaskSubscriptionEvent::Notification(_)
+                    | modern::StdioTaskSubscriptionEvent::Acknowledged(_) => {
+                        assert!(
+                            Instant::now() < notification_deadline,
+                            "the as_proxy relay publishes cancellation within the public bound"
+                        );
+                    }
+                    modern::StdioTaskSubscriptionEvent::Terminal => {
+                        panic!(
+                            "the live as_proxy WebSocket Tasks listener must retain cancellation before terminal"
+                        )
+                    }
+                }
+            }
+
+            let observed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen get after cancel",
+                client.get_task(&cx, task_id),
+            )
+            .await
+            .expect("typed tasks/get remains usable after both as_proxy listeners observed their events");
+            assert!(
+                matches!(observed.task, FinalTask::Cancelled(_)),
+                "the same as_proxy WebSocket client must still admit tasks/get after dual listen: {observed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy dual listen close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the modern WebSocket as_proxy dual-listen client closes after the live proof");
             drop(client);
             cx.set_cancel_requested(true);
             listener.abort();
@@ -26307,37 +27510,10 @@ mod live_websocket_bind {
             let cx = Cx::current().expect(
                 "owned modern WebSocket as_proxy stdio elicitation runtime installs an ambient context",
             );
-            let mut last_connect_error = None;
-            let mut stdio = None;
-            for attempt in 1_u32..=4 {
-                match modern::ClientBuilder::new()
-                    .client_info("e2e-ws-as-proxy-stdio-elicit-upstream", "1.0.0")
-                    .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
-                    .max_retries(2)
-                    .retry_delay_ms(150)
-                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
-                {
-                    Ok(client) => {
-                        stdio = Some(client);
-                        break;
-                    }
-                    Err(error) => {
-                        last_connect_error = Some(error);
-                        if attempt < 4 {
-                            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
-                        }
-                    }
-                }
-            }
-            let mut stdio = stdio.unwrap_or_else(|| {
-                panic!(
-                    "live stdio as_proxy elicitation upstream connect failed: {:?}",
-                    last_connect_error
-                )
-            });
-            let _ = stdio
-                .list_tools(None)
-                .expect("live stdio as_proxy elicitation upstream must answer tools/list before install");
+            let stdio = connect_warmed_stdio_as_proxy_upstream(
+                &cx,
+                "e2e-ws-as-proxy-stdio-elicit-upstream",
+            );
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-stdio-elicit", "1.0.0")
                 .as_proxy("ext", stdio)
                 .expect("as_proxy stdio elicitation install must succeed")
@@ -26481,37 +27657,10 @@ mod live_websocket_bind {
             let cx = Cx::current().expect(
                 "owned modern WebSocket as_proxy stdio sampling runtime installs an ambient context",
             );
-            let mut last_connect_error = None;
-            let mut stdio = None;
-            for attempt in 1_u32..=4 {
-                match modern::ClientBuilder::new()
-                    .client_info("e2e-ws-as-proxy-stdio-sample-upstream", "1.0.0")
-                    .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
-                    .max_retries(2)
-                    .retry_delay_ms(150)
-                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
-                {
-                    Ok(client) => {
-                        stdio = Some(client);
-                        break;
-                    }
-                    Err(error) => {
-                        last_connect_error = Some(error);
-                        if attempt < 4 {
-                            thread::sleep(Duration::from_millis(50 * u64::from(attempt)));
-                        }
-                    }
-                }
-            }
-            let mut stdio = stdio.unwrap_or_else(|| {
-                panic!(
-                    "live stdio as_proxy sampling upstream connect failed: {:?}",
-                    last_connect_error
-                )
-            });
-            let _ = stdio
-                .list_tools(None)
-                .expect("live stdio as_proxy sampling upstream must answer tools/list before install");
+            let stdio = connect_warmed_stdio_as_proxy_upstream(
+                &cx,
+                "e2e-ws-as-proxy-stdio-sample-upstream",
+            );
             let server = modern::ServerBuilder::new("e2e-ws-as-proxy-stdio-sample", "1.0.0")
                 .as_proxy("ext", stdio)
                 .expect("as_proxy stdio sampling install must succeed")
