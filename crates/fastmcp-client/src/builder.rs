@@ -31,19 +31,25 @@ use std::future::Future;
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 #[cfg(feature = "websocket-experimental")]
 use asupersync::io::{AsyncRead, AsyncWrite};
-use fastmcp_core::{McpError, McpResult, block_on};
+use fastmcp_core::{
+    McpContext, McpError, McpResult, SamplingRequest, SamplingRequestMessage, SamplingRole,
+    block_on,
+};
 use fastmcp_protocol::extensions::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
     McpAppsClientSettings,
 };
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
-use fastmcp_protocol::{ClientCapabilities, ClientInfo};
+use fastmcp_protocol::{
+    ClientCapabilities, ClientInfo, CreateMessageParams, CreateMessageResult, ListRootsResult,
+    Root, RootsCapability, SamplingContent,
+};
 use fastmcp_transport::StdioTransport;
 #[cfg(feature = "websocket-experimental")]
 use fastmcp_transport::websocket::AsyncWsClientTransport;
@@ -187,6 +193,8 @@ pub struct ClientBuilder {
     capabilities: ClientCapabilities,
     /// Exact-2024 server-to-client callbacks installed before initialization.
     reverse_request_handlers: ReverseRequestHandlers,
+    /// Shared inbound request slot for as_proxy reverse sampling/roots.
+    inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
     /// Optional official MCP Apps client settings for final discovery.
     mcp_apps_settings: Option<McpAppsClientSettings>,
     /// Frozen generic final extension descriptors, local settings, and resolver.
@@ -263,6 +271,7 @@ impl ClientBuilder {
             inherit_env: true,
             capabilities: ClientCapabilities::default(),
             reverse_request_handlers: ReverseRequestHandlers::new(),
+            inbound_legacy_reverse: Arc::new(Mutex::new(None)),
             mcp_apps_settings: None,
             client_extension_runtime: None,
             auto_initialize: false,
@@ -465,6 +474,80 @@ impl ClientBuilder {
     #[must_use]
     pub fn reverse_request_handlers(mut self, handlers: ReverseRequestHandlers) -> Self {
         self.reverse_request_handlers = handlers;
+        self
+    }
+
+    /// Advertises exact-2024 sampling+roots and forwards reverse RPCs onto the
+    /// inbound request context bound by as_proxy.
+    ///
+    /// Handlers are installed before initialize so advertised capabilities
+    /// match the callable surface. `ProxyClient` binds the inbound ctx for
+    /// the duration of each forwarded tools/call.
+    #[must_use]
+    pub fn forward_inbound_legacy_reverse(mut self) -> Self {
+        let inbound = Arc::clone(&self.inbound_legacy_reverse);
+        self.capabilities.sampling = Some(Default::default());
+        self.capabilities.roots = Some(RootsCapability {
+            list_changed: false,
+        });
+        self.reverse_request_handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message({
+                let inbound = Arc::clone(&inbound);
+                move |_cx, _cancel, params| {
+                    let inbound = Arc::clone(&inbound);
+                    Box::pin(async move {
+                        let inbound = inbound
+                            .lock()
+                            .map_err(|_| {
+                                McpError::internal_error("Stdio inbound reverse lock poisoned")
+                            })?
+                            .clone()
+                            .ok_or_else(|| {
+                                McpError::invalid_request(
+                                    "Stdio proxy legacy sampling callback is unavailable",
+                                )
+                            })?;
+                        if !inbound.can_sample() {
+                            return Err(McpError::invalid_request(
+                                "Sampling not available: client does not support sampling capability",
+                            ));
+                        }
+                        let response = inbound
+                            .sample_with_request(stdio_sampling_request_from_params(params)?)
+                            .await?;
+                        Ok(CreateMessageResult::text(response.text, response.model))
+                    })
+                }
+            })
+            .with_roots_list({
+                let inbound = Arc::clone(&inbound);
+                move |_cx, _cancel, _params| {
+                    let inbound = Arc::clone(&inbound);
+                    Box::pin(async move {
+                        let inbound = inbound
+                            .lock()
+                            .map_err(|_| {
+                                McpError::internal_error("Stdio inbound reverse lock poisoned")
+                            })?
+                            .clone()
+                            .ok_or_else(|| {
+                                McpError::invalid_request(
+                                    "Stdio proxy legacy roots callback is unavailable",
+                                )
+                            })?;
+                        let roots = inbound.list_roots().await?;
+                        Ok(ListRootsResult::new(
+                            roots
+                                .into_iter()
+                                .map(|root| match root.name {
+                                    Some(name) => Root::with_name(root.uri, name),
+                                    None => Root::new(root.uri),
+                                })
+                                .collect(),
+                        ))
+                    })
+                }
+            });
         self
     }
 
@@ -1358,6 +1441,7 @@ impl ClientBuilder {
         client.install_reverse_request_handlers_before_initialization(
             self.reverse_request_handlers.clone(),
         );
+        client.attach_inbound_legacy_reverse_slot(Arc::clone(&self.inbound_legacy_reverse));
         client
     }
 
@@ -1442,6 +1526,48 @@ impl ClientBuilder {
             }
         }
     }
+}
+
+fn stdio_sampling_request_from_params(params: CreateMessageParams) -> McpResult<SamplingRequest> {
+    let max_tokens = params
+        .max_tokens
+        .as_i32()
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            McpError::invalid_params("Stdio inbound sampling maxTokens must fit a u32 token budget")
+        })?;
+    let messages = params
+        .messages
+        .into_iter()
+        .map(|message| {
+            let text = match message.content {
+                SamplingContent::Text { text } => text,
+                SamplingContent::Image { .. } => {
+                    return Err(McpError::invalid_params(
+                        "Stdio inbound sampling cannot forward an image sampling message",
+                    ));
+                }
+            };
+            Ok(SamplingRequestMessage {
+                role: match message.role {
+                    fastmcp_protocol::Role::User => SamplingRole::User,
+                    fastmcp_protocol::Role::Assistant => SamplingRole::Assistant,
+                },
+                text,
+            })
+        })
+        .collect::<McpResult<Vec<_>>>()?;
+    let mut request = SamplingRequest::new(messages, max_tokens);
+    if let Some(system_prompt) = params.system_prompt {
+        request = request.with_system_prompt(system_prompt);
+    }
+    if let Some(temperature) = params.temperature {
+        request = request.with_temperature(temperature);
+    }
+    if !params.stop_sequences.is_empty() {
+        request = request.with_stop_sequences(params.stop_sequences);
+    }
+    Ok(request)
 }
 
 impl Default for ClientBuilder {

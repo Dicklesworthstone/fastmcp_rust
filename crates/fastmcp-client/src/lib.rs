@@ -206,7 +206,7 @@ use asupersync::{
 };
 use execution::{MrtrDriver, MrtrDriverLimits};
 use fastmcp_core::{
-    McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, block_on,
+    McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, block_on,
     sha256_bounded,
 };
 use fastmcp_protocol::common_types::{
@@ -13544,6 +13544,10 @@ pub struct Client {
     last_final_cache_page: Option<FinalCachePageState>,
     /// Application handlers for server-initiated requests on this connection.
     reverse_request_handlers: ReverseRequestHandlers,
+    /// Inbound request context for as_proxy reverse `sampling/createMessage`
+    /// / `roots/list` forwarding. The builder installs handlers that close
+    /// over this same slot before initialize.
+    inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
     /// Fixed, owned callback workers for exact-2024 reverse requests.
     reverse_callback_pool: ReverseCallbackPool,
     /// Idle/absolute policy for ordinary stdio responses.
@@ -13885,6 +13889,7 @@ impl Client {
             initialized: AtomicBool::new(false),
             initialization_error: None,
             final_log_level: None,
+            inbound_legacy_reverse: Arc::new(Mutex::new(None)),
         };
 
         // Perform initialization handshake
@@ -14075,6 +14080,7 @@ impl Client {
             initialized: AtomicBool::new(true), // Already initialized by builder
             initialization_error: None,
             final_log_level: None,
+            inbound_legacy_reverse: Arc::new(Mutex::new(None)),
         };
         client.install_multiplexed_stdio_executor();
         client
@@ -14147,6 +14153,7 @@ impl Client {
             initialized: AtomicBool::new(false),
             initialization_error: None,
             final_log_level: None,
+            inbound_legacy_reverse: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -14577,6 +14584,34 @@ impl Client {
         self.reverse_request_handlers = handlers;
     }
 
+    /// Attaches the builder-owned inbound reverse slot so as_proxy can bind
+    /// the current request context into the pre-initialize handlers.
+    pub(crate) fn attach_inbound_legacy_reverse_slot(
+        &mut self,
+        slot: Arc<Mutex<Option<McpContext>>>,
+    ) {
+        self.inbound_legacy_reverse = slot;
+    }
+
+    /// Binds the inbound request context for reverse sampling/roots forward.
+    pub fn bind_inbound_legacy_reverse(&mut self, ctx: &McpContext) -> McpResult<()> {
+        *self
+            .inbound_legacy_reverse
+            .lock()
+            .map_err(|_| McpError::internal_error("Stdio inbound reverse lock poisoned"))? =
+            Some(ctx.clone());
+        Ok(())
+    }
+
+    /// Clears the inbound reverse-forwarding context after one request.
+    pub fn unbind_inbound_legacy_reverse(&mut self) -> McpResult<()> {
+        *self
+            .inbound_legacy_reverse
+            .lock()
+            .map_err(|_| McpError::internal_error("Stdio inbound reverse lock poisoned"))? = None;
+        Ok(())
+    }
+
     fn server_request_response(&mut self, request: &JsonRpcRequest) -> Option<JsonRpcMessage> {
         match live_server_request_dispatch(
             self.session.selected_era(),
@@ -14764,6 +14799,58 @@ impl Client {
             None => None,
         };
         executor.execute(cx, method, params)
+    }
+
+    /// Starts one exact-2024 stdio request without waiting so the caller can
+    /// yield while reverse `sampling/createMessage` / `roots/list` run on the
+    /// inbound serve runtime.
+    ///
+    /// The sequential `request_core_with_cancellation` path parks the current
+    /// thread in `recv`. That freezes both the reverse-callback tasks (spawned
+    /// on this runtime) and any inbound HTTP POST that must deliver their
+    /// results. This start + `drive_yielding_stdio_slice` +
+    /// `try_take_yielding_stdio_response` loop is the yielding counterpart.
+    pub fn start_yielding_stdio_request(
+        &mut self,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<StdioRequestExecution> {
+        self.ensure_initialized()?;
+        self.install_multiplexed_stdio_executor();
+        let connection_cx = self.cx.clone();
+        self.start_multiplexed_request(&connection_cx, method, params)
+    }
+
+    /// Takes one already-routed stdio response without reading the transport.
+    pub fn try_take_yielding_stdio_response(
+        &self,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<Option<(JsonRpcResponse, Option<String>)>> {
+        let executor = self.multiplexed_stdio_executor()?;
+        executor.try_take_response_with_raw_result(execution)
+    }
+
+    /// Drives one bounded stdio ingress turn so reverse callbacks can be
+    /// admitted, then returns so the caller can yield the inbound runtime.
+    pub fn drive_yielding_stdio_slice(&mut self) -> McpResult<()> {
+        let connection_cx = self.cx.clone();
+        let receive_deadline = Instant::now()
+            .checked_add(REVERSE_CALLBACK_POLL_SLICE)
+            .unwrap_or_else(Instant::now);
+        self.drive_multiplexed_stdio_until(&connection_cx, Some(receive_deadline))
+    }
+
+    /// Cancels one yielding stdio request through the connection-owned executor.
+    pub fn cancel_yielding_stdio_request(
+        &mut self,
+        execution: &mut StdioRequestExecution,
+    ) -> McpResult<()> {
+        let executor = self.multiplexed_stdio_executor()?;
+        let connection_cx = self.cx.clone();
+        executor
+            .cancel(&connection_cx, execution)
+            .and_then(|()| executor.service(&connection_cx))
+            .map_err(|error| self.terminate_connection(error))
     }
 
     /// Waits for one multiplexed request through the same sole ingress path

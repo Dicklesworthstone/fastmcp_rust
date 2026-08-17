@@ -2396,7 +2396,7 @@ pub struct LegacySseConnection {
     client_capabilities: ClientCapabilities,
     reverse_request_handlers: ReverseRequestHandlers,
     cancelled_response_ids: VecDeque<RequestId>,
-    persistent_receiver: Option<LegacySsePersistentReceiver>,
+    persistent_receiver: Option<Arc<LegacySsePersistentReceiver>>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
 }
 
@@ -2407,7 +2407,7 @@ struct LegacySseConnection {
     client_capabilities: ClientCapabilities,
     reverse_request_handlers: ReverseRequestHandlers,
     cancelled_response_ids: VecDeque<RequestId>,
-    persistent_receiver: Option<LegacySsePersistentReceiver>,
+    persistent_receiver: Option<Arc<LegacySsePersistentReceiver>>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
 }
 
@@ -3059,7 +3059,7 @@ impl ClientHttpConnection {
                 ..
             }) => persistent_receiver
                 .as_ref()
-                .and_then(LegacySsePersistentReceiver::take_notification)
+                .and_then(|receiver| receiver.take_notification())
                 .or_else(|| client.take_notification()),
         }
     }
@@ -3088,10 +3088,7 @@ impl ClientHttpConnection {
     /// stream, retains bounded notifications, and services eligible reverse
     /// requests even while no ordinary client request is pending.
     #[cfg(feature = "legacy-2024-11-05")]
-    pub(crate) fn start_legacy_receive_pump(
-        &mut self,
-        cx: &Cx,
-    ) -> Result<(), ClientHttpConnectionError> {
+    pub fn start_legacy_receive_pump(&mut self, cx: &Cx) -> Result<(), ClientHttpConnectionError> {
         let Self::LegacySse(LegacySseConnection {
             client,
             client_capabilities,
@@ -3109,14 +3106,30 @@ impl ClientHttpConnection {
             .take_reader()
             .ok_or(ClientHttpConnectionError::LegacyPersistentReceiverUnavailable)?;
         let outbound = client.outbound();
-        *persistent_receiver = Some(LegacySsePersistentReceiver::start(
+        *persistent_receiver = Some(Arc::new(LegacySsePersistentReceiver::start(
             cx,
             reader,
             outbound,
             client_capabilities.clone(),
             reverse_request_handlers.clone(),
-        )?);
+        )?));
         Ok(())
+    }
+
+    /// Returns the live exact-2024 SSE pump so a caller can start a request
+    /// after releasing a route mutex.
+    #[cfg(feature = "legacy-2024-11-05")]
+    pub fn legacy_persistent_receiver(&self) -> Option<Arc<LegacySsePersistentReceiver>> {
+        match self {
+            Self::LegacySse(LegacySseConnection {
+                persistent_receiver,
+                ..
+            }) => persistent_receiver.clone(),
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            _ => None,
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
     }
 
     /// Starts one exact-2024 request-scoped HTTP operation.
@@ -6815,7 +6828,8 @@ impl LegacySsePersistentReceiver {
             .pop_front()
     }
 
-    async fn start_request(
+    /// Starts one correlated exact-2024 request on this connection-owned pump.
+    pub async fn start_request(
         &self,
         cx: &Cx,
         method: &str,
