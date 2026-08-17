@@ -1567,8 +1567,23 @@ fn stdio_parameters_with_inbound_identity(
         }
         if let Some(capabilities) = capabilities
             && let Ok(value) = serde_json::to_value(capabilities)
+            && let Some(inbound) = value.as_object()
         {
-            metadata.insert(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned(), value);
+            let existing = metadata
+                .entry(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(existing) = existing.as_object_mut() {
+                for key in ["sampling", "elicitation", "roots"] {
+                    match inbound.get(key) {
+                        Some(member) => {
+                            existing.insert(key.to_owned(), member.clone());
+                        }
+                        None => {
+                            existing.remove(key);
+                        }
+                    }
+                }
+            }
         }
     }
     parameters
@@ -8032,6 +8047,7 @@ mod tests {
         decode_modern_server_notification, final_tool_legacy_fallback,
         forward_modern_progress_notification, legacy_contents_to_handler,
         legacy_prompt_messages_to_handler, legacy_resource_to_handler,
+        stdio_parameters_with_inbound_identity,
     };
     #[cfg(feature = "tasks")]
     use super::{
@@ -8042,6 +8058,35 @@ mod tests {
     use crate::handler::FinalToolOutcome;
     use crate::handler::{FinalToolSchemaAuthority, PromptHandler, ToolHandler};
     use std::task::Poll;
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn stdio_inbound_capability_overlay_preserves_official_tasks_extension() {
+        let parameters = stdio_parameters_with_inbound_identity(
+            serde_json::json!({
+                "_meta": {
+                    fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY: {
+                        "extensions": { fastmcp_protocol::TASKS_EXTENSION: {} }
+                    }
+                }
+            }),
+            None,
+            None,
+            Some(ClientCapabilities::default()),
+        );
+        assert_eq!(
+            parameters["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                [fastmcp_protocol::TASKS_EXTENSION],
+            serde_json::json!({}),
+            "an empty inbound overlay must keep already-stamped official Tasks: {parameters:?}"
+        );
+        assert!(
+            parameters["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]
+                .get("sampling")
+                .is_none(),
+            "empty inbound capabilities must not invent sampling: {parameters:?}"
+        );
+    }
 
     #[test]
     fn custom_backend_does_not_pretend_to_own_an_incremental_catalog_listener() {
