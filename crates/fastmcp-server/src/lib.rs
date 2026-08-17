@@ -580,6 +580,11 @@ const MODERN_ONLY_INITIALIZE_MESSAGE: &str = "Initialization-based MCP is not en
 const STDIO_OUTPUT_COMMIT_TIMEOUT: Duration = Duration::from_secs(2);
 const DISPATCH_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TERMINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Wake `accept` often enough that a cancelled listener Cx can leave the
+/// loop without waiting for the next inbound connection. Two live SSE
+/// listens otherwise keep their writers parked until fixture teardown
+/// burns `HTTP_TERMINAL_DRAIN_TIMEOUT`.
+const HTTP_ACCEPT_CANCEL_POLL: Duration = Duration::from_millis(20);
 /// Bound the public HTTP lifecycle's cooperative connection drain.  A
 /// synchronous handler which ignores cancellation cannot be preempted, so a
 /// timeout returns a caller-owned handle retaining its still-live child.
@@ -3938,6 +3943,14 @@ impl FinalSubscriptionTerminalDelivery {
                 && completion_state == FINAL_TERMINAL_DRAINED
     }
 
+    /// True while the dispatcher has not yet selected a terminal response.
+    ///
+    /// A cancelled connection region cannot flush that response. The H1
+    /// writer must fail the receipt instead of waiting out the drain bound.
+    fn completion_is_open(&self) -> bool {
+        self.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_OPEN
+    }
+
     /// True once graceful election marked the control half done or the body failed.
     ///
     /// A server-owned modern HTTP listen sets this before the dispatch can
@@ -6071,7 +6084,17 @@ impl BoundHttpServer {
             }
             #[cfg(test)]
             lib_unit_tests::record_live_http_listener_wait();
-            let (stream, _peer_addr) = match self.listener.accept().await {
+            let accepted = match asupersync::time::timeout(
+                cx.now(),
+                HTTP_ACCEPT_CANCEL_POLL,
+                self.listener.accept(),
+            )
+            .await
+            {
+                Ok(accepted) => accepted,
+                Err(_) => continue,
+            };
+            let (stream, _peer_addr) = match accepted {
                 Ok(connection) => connection,
                 Err(_error) if cx.checkpoint().is_err() => break Ok(()),
                 Err(error) => {
@@ -9726,6 +9749,13 @@ async fn send_modern_sse_stream(
                     // live catalog+Tasks writers would busy-loop or hang and
                     // starve the dispatch that still owes the elected complete.
                     if cx.checkpoint().is_err() {
+                        if terminal_delivery.completion_is_open() {
+                            // The connection region is already cancelled, so
+                            // dispatch cannot flush an unelected complete.
+                            // Fail now instead of burning the drain budget.
+                            terminal_delivery.mark_failed();
+                            break;
+                        }
                         asupersync::runtime::yield_now().await;
                     } else {
                         asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
@@ -45027,6 +45057,25 @@ mod lib_unit_tests {
         terminal_delivery.mark_completion_enqueued();
         terminal_delivery.mark_completion_drained();
         assert!(receipt.is_settled());
+    }
+
+    #[test]
+    fn cancelled_http_writer_fails_an_open_completion_so_dual_listen_drain_can_settle() {
+        let delivery = FinalSubscriptionTerminalDelivery::default();
+        delivery.mark_control_not_required();
+        assert!(
+            delivery.completion_is_open(),
+            "graceful election marks control done before dispatch selects a complete"
+        );
+        assert!(
+            !delivery.is_settled(),
+            "an unelected complete must keep the drain receipt open"
+        );
+        delivery.mark_failed();
+        assert!(
+            delivery.is_settled(),
+            "a cancelled connection region must settle instead of burning the drain bound"
+        );
     }
 
     #[test]
