@@ -26,8 +26,9 @@ use fastmcp_rust::{
 };
 #[cfg(unix)]
 use fastmcp_rust::{
-    Client, Cx, ListPromptsParams, ListResourceTemplatesParams, ListResourcesParams,
-    ListToolsParams, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto, legacy_2024, modern,
+    Client, ClientCapabilities, Cx, ListPromptsParams, ListResourceTemplatesParams,
+    ListResourcesParams, ListToolsParams, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto,
+    legacy_2024, modern,
 };
 use serde_json::json;
 
@@ -7917,6 +7918,57 @@ fn e2e_public_stdio_legacy_complete_is_retained_and_unknown_prompt_is_refused() 
     client
         .close()
         .expect("legacy-only stdio complete client cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_public_stdio_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_is_refused() {
+    let command = shipped_echo_server_executable();
+    let mut admitted = legacy_2024::client_builder()
+        .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
+        .capabilities(ClientCapabilities {
+            roots: Some(legacy_2024::RootsCapability { list_changed: true }),
+            ..ClientCapabilities::default()
+        })
+        .reverse_request_handlers(
+            legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
+                |_cx, _cancel, _params| {
+                    Box::pin(async { Ok(legacy_2024::ListRootsResult::new(Vec::new())) })
+                },
+            ),
+        )
+        .connect_stdio_with_cx(command, &[], &Cx::for_request())
+        .expect(
+            "an advertised roots.listChanged stdio client completes the exact legacy lifecycle",
+        );
+
+    admitted.roots_list_changed().expect(
+        "live exact-2024 stdio must admit notifications/roots/list_changed when advertised",
+    );
+    admitted
+        .ping()
+        .expect("the same session must still admit ping after roots/list_changed");
+
+    let mut refused = connect_legacy_stdio_to_shipped_echo_server("legacy-only")
+        .expect("a bare LegacyOnly facade client completes the exact legacy lifecycle");
+    let missing = refused
+        .roots_list_changed()
+        .expect_err("changing only the missing roots.listChanged advertisement must refuse");
+    let missing = format!("{missing:?}");
+    assert!(
+        missing.contains("roots.listChanged") || missing.contains("InvalidRequest"),
+        "the unadvertised refusal must keep the capability gate: {missing}"
+    );
+    refused
+        .ping()
+        .expect("changing only the missing advertisement must leave ping admitted");
+
+    admitted
+        .close()
+        .expect("legacy-only stdio advertised roots-change client cleanup");
+    refused
+        .close()
+        .expect("legacy-only stdio bare roots-change client cleanup");
 }
 
 #[cfg(unix)]
