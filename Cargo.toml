@@ -186,7 +186,3 @@ items_after_statements = "allow"
 # Drop this patch once a rich_rust >0.2.2 with the time ^0.3.54 requirement
 # is published. See mcp_agent_mail_rust bead br-noizk.
 rich_rust = { path = "../rich_rust" }
-# asupersync is pinned to the sibling git rev (8ffba4c) via this patch so the
-# manifest matches the git source recorded in Cargo.lock; `cargo *--locked`
-# fails without it. Drop once the rev is published to crates.io as >0.4.3.
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "fffc0a4c3" }
