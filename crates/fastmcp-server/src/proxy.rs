@@ -2655,10 +2655,20 @@ impl ProxyBackend for Client {
     ) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
         let expected_marker = ctx_progress_marker(ctx);
-        if expected_marker.is_none()
-            || self.selected_protocol_era() != Some(ProtocolEra::Modern2026)
-        {
+        if expected_marker.is_none() {
             return self.complete_result_with_context(ctx, params);
+        }
+        if self.selected_protocol_era() != Some(ProtocolEra::Modern2026) {
+            // Exact-2024 stdio must stamp `_meta.progressToken` and leave the
+            // queued `notifications/progress` frames for
+            // `ProxyClient::relay_resource_updated_notifications`. The modern
+            // final-progress harvest below is era-wrong here and used to drop
+            // the token entirely.
+            return Client::complete_with_progress_marker(
+                self,
+                params,
+                expected_marker.expect("a present completion progress marker was checked"),
+            );
         }
         let mut parameters = serde_json::to_value(params).map_err(|error| {
             McpError::invalid_params(format!(
