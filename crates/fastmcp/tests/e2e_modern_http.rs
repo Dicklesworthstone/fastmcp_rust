@@ -13903,6 +13903,244 @@ fn e2e_public_http_legacy_as_proxy_stdio_prompt_composes_nested_tool_and_resourc
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 #[test]
+fn e2e_public_http_as_proxy_stdio_from_prompt_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-from-prompt", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy from-prompt gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "compose_from_prompt",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed compose_from_prompt");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/compose_from_prompt",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect("as_proxy must forward prefixed compose_from_prompt onto the live stdio echo process");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text == "compose-prompt:Please greet alpha in a friendly way."
+                }
+                _ => false,
+            }),
+        "as_proxy prompts/get must retain the nested greeting prompt text: {composed:?}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/compose_from_prompt",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("prompt".to_owned(), "stdio-e2e-missing".to_owned()),
+            ]),
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => panic!(
+            "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy from-prompt compose must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_from_prompt_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-from-prompt",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy from-prompt unprefixed",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "compose_from_prompt".to_owned(),
+                arguments: Some(HashMap::from([("name".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err(
+        "changing only the missing prefix must not reach the unprefixed compose_from_prompt",
+    );
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy from-prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "ext/compose_from_prompt".to_owned(),
+                arguments: Some(HashMap::from([("name".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "as_proxy must forward prefixed compose_from_prompt onto the live LegacyOnly echo process",
+    );
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 stdio prompt result serializes");
+    assert_eq!(
+        composed["messages"][0]["content"]["text"],
+        json!("compose-prompt:Please greet alpha in a friendly way."),
+        "as_proxy prompts/get must retain the nested greeting prompt text: {composed}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy from-prompt missing nested prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "ext/compose_from_prompt".to_owned(),
+                arguments: Some(HashMap::from([
+                    ("name".to_owned(), "alpha".to_owned()),
+                    ("prompt".to_owned(), "stdio-e2e-missing".to_owned()),
+                ])),
+                meta: None,
+            },
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy from-prompt compose must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_forwards_inbound_completion_progress_marker() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-complete-progress",
+    );
+    let params = legacy_2024::LegacyCompletionParams {
+        reference: legacy_2024::LegacyCompletionReference::Prompt {
+            name: "ext/greeting".to_owned(),
+        },
+        argument: legacy_2024::LegacyCompletionArgument {
+            name: "name".to_owned(),
+            value: "co".to_owned(),
+        },
+        meta: None,
+    };
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy completion/complete before token",
+        client.complete(&cx, params.clone()),
+    )
+    .expect("prefixed greeting complete must complete without a progressToken");
+    let silent = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "omitting only the progressToken must keep stdio as_proxy completion/complete silent: {silent:?}"
+    );
+
+    let mut unprefixed = params.clone();
+    unprefixed.reference = legacy_2024::LegacyCompletionReference::Prompt {
+        name: "greeting".to_owned(),
+    };
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy completion unprefixed",
+        client.complete_with_progress_marker(
+            &cx,
+            unprefixed,
+            legacy_2024::ProgressMarker::from("stdio-legacy-as-proxy-complete-unprefixed"),
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the prompt name must refuse before the unprefixed stdio completion provider: {missing:?}"
+    );
+
+    let marker = legacy_2024::ProgressMarker::from("stdio-legacy-as-proxy-complete-progress");
+    let progressed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy completion/complete with token",
+        client.complete_with_progress_marker(&cx, params, marker.clone()),
+    )
+    .expect("stdio as_proxy must forward an inbound progressToken onto ext/greeting completion");
+    assert_eq!(
+        progressed.completion.values,
+        vec!["stdio-completion-legacy".to_owned()],
+        "stdio as_proxy must still retain the echo completion value after the silent call: {progressed:?}"
+    );
+    let progress =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == marker
+                    && params.message.as_deref() == Some("stdio-completion-legacy-halfway")
+        )),
+        "stdio as_proxy must retain greeting completion notifications/progress: {progress:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
 fn e2e_public_http_as_proxy_stdio_resource_composes_nested_prompt() {
     let cx = Cx::for_request();
     let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
@@ -14589,6 +14827,516 @@ fn e2e_public_http_legacy_as_proxy_prompt_composes_nested_tool_and_resource() {
     drop(client);
     gateway.shutdown();
     upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_from_prompt_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_compose_prompt_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-from-prompt", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy from-prompt gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_FROM_PROMPT_NAME}");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_FROM_PROMPT_NAME,
+            HashMap::from([("subject".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed from-prompt");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            &prefixed,
+            HashMap::from([("subject".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect("as_proxy must forward prefixed from-prompt onto the live HTTP upstream");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => text == "compose-prompt:prompt:alpha",
+                _ => false,
+            }),
+        "as_proxy prompts/get must retain the nested prompt text: {composed:?}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            &prefixed,
+            HashMap::from([
+                ("subject".to_owned(), "alpha".to_owned()),
+                ("prompt".to_owned(), "public-http-e2e-missing".to_owned()),
+            ]),
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => panic!(
+            "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("public-http-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy from-prompt compose must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_from_prompt_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_compose_prompt_http_server();
+    let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-from-prompt",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_FROM_PROMPT_NAME}");
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy from-prompt unprefixed",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_FROM_PROMPT_NAME.to_owned(),
+                arguments: Some(HashMap::from([("subject".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the missing prefix must not reach the unprefixed from-prompt");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy from-prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: prefixed.clone(),
+                arguments: Some(HashMap::from([("subject".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect("as_proxy must forward prefixed from-prompt onto the live exact-2024 HTTP upstream");
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 HTTP prompt result serializes");
+    assert_eq!(
+        composed["messages"][0]["content"]["text"],
+        json!("compose-prompt:prompt:alpha"),
+        "as_proxy prompts/get must retain the nested prompt text: {composed}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy from-prompt missing nested prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: prefixed,
+                arguments: Some(HashMap::from([
+                    ("subject".to_owned(), "alpha".to_owned()),
+                    ("prompt".to_owned(), "public-http-e2e-missing".to_owned()),
+                ])),
+                meta: None,
+            },
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("public-http-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy from-prompt compose must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_forwards_inbound_completion_progress_marker() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_completion_progress_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-complete-progress",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_PROMPT_NAME}");
+    let params = legacy_2024::LegacyCompletionParams {
+        reference: legacy_2024::LegacyCompletionReference::Prompt { name: prefixed },
+        argument: legacy_2024::LegacyCompletionArgument {
+            name: "subject".to_owned(),
+            value: "cross-era".to_owned(),
+        },
+        meta: None,
+    };
+
+    runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy completion/complete before token",
+        client.complete(&cx, params.clone()),
+    )
+    .expect("prefixed prompt complete must complete without a progressToken");
+    let silent = take_legacy_http_notifications_until(
+        &mut client,
+        Instant::now() + Duration::from_millis(150),
+    );
+    assert!(
+        !silent.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(_)
+        )),
+        "omitting only the progressToken must keep as_proxy completion/complete silent: {silent:?}"
+    );
+
+    let mut unprefixed = params.clone();
+    unprefixed.reference = legacy_2024::LegacyCompletionReference::Prompt {
+        name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+    };
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy completion unprefixed",
+        client.complete_with_progress_marker(
+            &cx,
+            unprefixed,
+            legacy_2024::ProgressMarker::from("http-legacy-as-proxy-complete-unprefixed"),
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the prompt name must refuse before the unprefixed completion provider: {missing:?}"
+    );
+
+    let marker = legacy_2024::ProgressMarker::from("http-legacy-as-proxy-complete-progress");
+    let progressed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy completion/complete with token",
+        client.complete_with_progress_marker(&cx, params, marker.clone()),
+    )
+    .expect("as_proxy must forward an inbound progressToken onto prefixed completion/complete");
+    assert_eq!(
+        progressed.completion.values,
+        vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+        "as_proxy must still retain the upstream completion values: {progressed:?}"
+    );
+    let progress =
+        take_legacy_http_notifications_until(&mut client, Instant::now() + Duration::from_secs(1));
+    assert!(
+        progress.iter().any(|notification| matches!(
+            notification,
+            legacy_2024::ServerNotification::Progress(params)
+                if params.progress_marker == marker
+                    && params.message.as_deref() == Some("completion-legacy-halfway")
+        )),
+        "exact-2024 as_proxy must retain upstream completion notifications/progress: {progress:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_sanitizes_prefixed_handler_panic() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_panic_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-panic", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy panic gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_PANIC_TOOL_NAME}");
+    let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_PANIC_TOOL_NAME, json!({})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed panic tool");
+    let _ = missing;
+
+    let panicked = runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed, json!({})));
+    let panicked = match panicked {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => {
+            panic!("a panicking as_proxy tools/call must stay a protocol error: {result:?}")
+        }
+    };
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "as_proxy must sanitize an upstream handler panic: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "as_proxy must not leak the upstream unwind payload: {panicked}"
+    );
+
+    let fast = runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed_fast, json!({})))
+        .expect("changing only the tool must still be admitted after a sanitized as_proxy panic");
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the prefixed fast peer tool must still complete after a sanitized as_proxy panic: {fast:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_sanitizes_prefixed_handler_panic() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_panic_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-panic",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_PANIC_TOOL_NAME}");
+    let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy panic unprefixed",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_PANIC_TOOL_NAME.to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the missing prefix must not reach the unprefixed panic tool: {missing:?}"
+    );
+
+    let panicked = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy panic tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed,
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    );
+    let panicked = match panicked {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "exact-2024 as_proxy must sanitize an upstream handler panic: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 as_proxy must not leak the upstream unwind payload: {panicked}"
+    );
+
+    let fast = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy panic fast peer",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed_fast,
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "changing only the tool must still be admitted after a sanitized exact-2024 as_proxy panic",
+    );
+    assert_eq!(
+        legacy_http_tool_text(&fast).as_deref(),
+        Some("fast"),
+        "the prefixed fast peer tool must still complete after a sanitized as_proxy panic: {fast:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_handler_panic() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
+        false,
+        vec![("FASTMCP_PANIC_TOOL".to_owned(), "1".to_owned())],
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-panic", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy panic gateway");
+
+    let missing = runtime_block_on_bounded(&cx, client.call_tool(&cx, "panic_probe", json!({})))
+        .expect_err("changing only the tool name must not reach the unprefixed stdio panic tool");
+    let _ = missing;
+
+    let panicked =
+        runtime_block_on_bounded(&cx, client.call_tool(&cx, "ext/panic_probe", json!({})));
+    let panicked = match panicked {
+        Ok(result) if result.is_error => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+        Ok(result) => {
+            panic!("a panicking stdio as_proxy tools/call must stay a protocol error: {result:?}")
+        }
+    };
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "stdio as_proxy must sanitize an upstream handler panic: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "stdio as_proxy must not leak the upstream unwind payload: {panicked}"
+    );
+
+    let peer = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "after-panic"})),
+    )
+    .expect("changing only the tool must still be admitted after a sanitized stdio as_proxy panic");
+    assert!(
+        peer.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "after-panic",
+            _ => false,
+        }),
+        "the prefixed stdio echo peer must still complete after a sanitized as_proxy panic: {peer:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_sanitizes_prefixed_handler_panic() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![(
+        "FASTMCP_PANIC_TOOL".to_owned(),
+        "1".to_owned(),
+    )]);
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-panic",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy panic unprefixed",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "panic_probe".to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the missing prefix must not reach the unprefixed stdio panic tool: {missing:?}"
+    );
+
+    let panicked = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy panic tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/panic_probe".to_owned(),
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    );
+    let panicked = match panicked {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked.contains("Internal server error") || panicked.contains("InternalError"),
+        "exact-2024 stdio as_proxy must sanitize an upstream handler panic: {panicked}"
+    );
+    assert!(
+        !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 stdio as_proxy must not leak the upstream unwind payload: {panicked}"
+    );
+
+    let peer = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy panic echo peer",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "after-panic"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the tool must still be admitted after a sanitized exact-2024 stdio as_proxy panic");
+    assert_eq!(
+        legacy_http_tool_text(&peer).as_deref(),
+        Some("after-panic"),
+        "the prefixed stdio echo peer must still complete after a sanitized as_proxy panic: {peer:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
 }
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -26240,6 +26988,55 @@ fn spawn_legacy_as_proxy_template_completion_upstream() -> HttpServerFixture {
     })
 }
 
+/// Live handler-panic plus fast-peer catalog for as_proxy sanitization proofs.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_as_proxy_panic_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("modern as_proxy panic upstream", || {
+        ServerBuilder::new("facade-http-as-proxy-panic", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpPanicTool)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+/// Live exact-2024 handler-panic plus the catalog members required by
+/// `spawn_legacy_as_proxy_http_gateway`.
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_panic_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy as_proxy panic upstream", || {
+        ServerBuilder::new("facade-http-legacy-proxy-panic", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpValue)
+            .tool(PublicHttpPanicTool)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+/// Live exact-2024 completion provider that reports progress, plus the catalog
+/// members required by `spawn_legacy_as_proxy_http_gateway`.
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_completion_progress_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy as_proxy completion-progress upstream", || {
+        let counters = Arc::new(PublicHttpHandlerCallCounters::default());
+        ServerBuilder::new("facade-http-legacy-proxy-complete-progress", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpValue)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .legacy_completion_handler(CountingPublicHttpCompletion { counters })
+            .build()
+    })
+}
+
 /// Live exact-2024 FilesystemProvider plus the catalog members required by
 /// `spawn_legacy_as_proxy_http_gateway`. Prefixed `child/file:///e2e/{+path}`
 /// proofs use this so as_proxy rewrites onto the upstream file URI.
@@ -34332,6 +35129,151 @@ mod live_websocket_bind {
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
+    fn e2e_public_websocket_as_proxy_from_prompt_composes_nested_prompt() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy from-prompt runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_modern_compose_prompt_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(compose_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-from-prompt-gateway".to_owned(),
+                "e2e-ws-as-proxy-from-prompt-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket from-prompt gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-from-prompt-upstream",
+                    "native-h1:e2e-ws-as-proxy-from-prompt-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-from-prompt".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP from-prompt proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP from-prompt proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-from-prompt-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed from-prompt install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy from-prompt must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy from-prompt publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy from-prompt serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy from-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket from-prompt must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy from-prompt initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-from-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy from-prompt over bind_websocket",
+            );
+            let prefixed = format!("ext/{PUBLIC_HTTP_FROM_PROMPT_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy from-prompt unprefixed",
+                client.get_prompt(
+                    &cx,
+                    PUBLIC_HTTP_FROM_PROMPT_NAME,
+                    HashMap::from([("subject".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect_err("changing only the prompt name must not reach the unprefixed from-prompt");
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy from-prompt prompts/get",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([("subject".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed from-prompt onto the live HTTP upstream");
+            assert!(
+                composed
+                    .messages
+                    .iter()
+                    .any(|message| match &message.content {
+                        ContentBlock::Text { text, .. } => text == "compose-prompt:prompt:alpha",
+                        _ => false,
+                    }),
+                "as_proxy WebSocket prompts/get must retain the nested prompt text: {composed:?}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy from-prompt missing nested prompt",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([
+                        ("subject".to_owned(), "alpha".to_owned()),
+                        ("prompt".to_owned(), "public-http-e2e-missing".to_owned()),
+                    ]),
+                ),
+            )
+            .await;
+            let missing_prompt = match missing_prompt {
+                Ok(result) => panic!(
+                    "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+                ),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_prompt.contains("public-http-e2e-missing")
+                    || missing_prompt.contains("compose-nested-prompt"),
+                "as_proxy WebSocket from-prompt compose must keep the nested missing-prompt refusal: {missing_prompt}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
     fn e2e_public_websocket_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
@@ -34709,6 +35651,136 @@ mod live_websocket_bind {
             cx.set_cancel_requested(true);
             listener.abort();
             timeout_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_sanitizes_prefixed_handler_panic() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy panic runtime installs an ambient context",
+            );
+            let panic_upstream = spawn_modern_as_proxy_panic_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(panic_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-panic-gateway".to_owned(),
+                "e2e-ws-as-proxy-panic-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket panic gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-panic-upstream",
+                    "native-h1:e2e-ws-as-proxy-panic-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-panic".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP panic proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP panic proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-panic-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed panic install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy panic must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy panic publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy panic serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy panic initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy panic over bind_websocket");
+            let prefixed = format!("ext/{PUBLIC_HTTP_PANIC_TOOL_NAME}");
+            let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy panic unprefixed",
+                client.call_tool(&cx, PUBLIC_HTTP_PANIC_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed panic tool");
+            let _ = missing;
+
+            let panicked = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy panic tools/call",
+                client.call_tool(&cx, &prefixed, json!({})),
+            )
+            .await;
+            let panicked = match panicked {
+                Ok(result) if result.is_error => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+                Ok(result) => {
+                    panic!("a panicking as_proxy WebSocket tools/call must stay a protocol error: {result:?}")
+                }
+            };
+            assert!(
+                panicked.contains("Internal server error") || panicked.contains("InternalError"),
+                "as_proxy WebSocket must sanitize an upstream handler panic: {panicked}"
+            );
+            assert!(
+                !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "as_proxy WebSocket must not leak the upstream unwind payload: {panicked}"
+            );
+
+            let peer = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy panic fast peer",
+                client.call_tool(&cx, &prefixed_fast, json!({})),
+            )
+            .await
+            .expect("changing only the tool must still be admitted after a sanitized as_proxy panic");
+            assert!(
+                peer.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "the prefixed fast peer tool must still complete after a sanitized as_proxy panic: {peer:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            panic_upstream.shutdown();
         });
     }
 
@@ -42004,6 +43076,315 @@ mod live_websocket_bind {
 
     #[cfg(feature = "proxy")]
     #[test]
+    fn e2e_public_websocket_legacy_as_proxy_from_prompt_composes_nested_prompt() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy from-prompt runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_legacy_compose_prompt_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(compose_upstream.address(), "/sse")),
+                Some(public_http_target(compose_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-from-prompt-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-from-prompt-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket from-prompt gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-from-prompt-upstream",
+                    "native-h1:e2e-legacy-ws-from-prompt-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-from-prompt".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP from-prompt proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP from-prompt proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-from-prompt-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed from-prompt install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy from-prompt must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy from-prompt publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy from-prompt serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy from-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket from-prompt must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy from-prompt initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-from-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy from-prompt over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_FROM_PROMPT_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy from-prompt unprefixed",
+                client.get_prompt(
+                    &cx,
+                    PUBLIC_HTTP_FROM_PROMPT_NAME,
+                    HashMap::from([("subject".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect_err(
+                "changing only the missing prefix must not reach the unprefixed from-prompt",
+            );
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy from-prompt prompts/get",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([("subject".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed from-prompt onto the live exact-2024 HTTP upstream");
+            let composed = serde_json::to_value(composed)
+                .expect("the exact-2024 WebSocket prompt result serializes");
+            assert_eq!(
+                composed["messages"][0]["content"]["text"],
+                json!("compose-prompt:prompt:alpha"),
+                "as_proxy WebSocket prompts/get must retain the nested prompt text: {composed}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy from-prompt missing nested prompt",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([
+                        ("subject".to_owned(), "alpha".to_owned()),
+                        ("prompt".to_owned(), "public-http-e2e-missing".to_owned()),
+                    ]),
+                ),
+            )
+            .await;
+            let missing_prompt = match missing_prompt {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_prompt.contains("public-http-e2e-missing")
+                    || missing_prompt.contains("compose-nested-prompt"),
+                "as_proxy WebSocket from-prompt compose must keep the nested missing-prompt refusal: {missing_prompt}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_forwards_inbound_completion_progress_marker() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy completion-progress runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_completion_progress_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-complete-progress-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-complete-progress-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket completion-progress gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-complete-progress-upstream",
+                    "native-h1:e2e-legacy-ws-complete-progress-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-complete-progress".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP completion-progress proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP completion-progress proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-complete-progress-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed completion-progress install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy completion-progress must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy completion-progress publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy completion-progress serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-progress handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect(
+                "exact-2024 as_proxy WebSocket completion-progress must complete RFC 6455 upgrade",
+            );
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-progress initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-complete-progress", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy completion-progress over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_PROMPT_NAME}");
+            let params = legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt { name: prefixed },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                meta: None,
+            };
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion/complete before token",
+                client.complete(&cx, params.clone()),
+            )
+            .await
+            .expect("prefixed prompt complete must complete without a progressToken");
+            let silent = client
+                .take_server_notifications()
+                .expect("exact-2024 as_proxy WebSocket notifications before token must decode");
+            assert!(
+                !silent.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(_)
+                )),
+                "omitting only the progressToken must keep as_proxy WebSocket completion/complete silent: {silent:?}"
+            );
+
+            let mut unprefixed = params.clone();
+            unprefixed.reference = legacy_2024::LegacyCompletionReference::Prompt {
+                name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+            };
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion unprefixed",
+                client.complete_with_progress_marker(
+                    &cx,
+                    unprefixed,
+                    legacy_2024::ProgressMarker::from("ws-legacy-as-proxy-complete-unprefixed"),
+                ),
+            )
+            .await
+            .expect_err(
+                "changing only the prompt name must refuse before the unprefixed completion provider",
+            );
+
+            let marker = legacy_2024::ProgressMarker::from("ws-legacy-as-proxy-complete-progress");
+            let progressed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion/complete with token",
+                client.complete_with_progress_marker(&cx, params, marker.clone()),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward an inbound progressToken onto prefixed completion/complete");
+            assert_eq!(
+                progressed.completion.values,
+                vec![PUBLIC_HTTP_COMPLETION_VALUE.to_owned()],
+                "as_proxy WebSocket must still retain the upstream completion values: {progressed:?}"
+            );
+            let progress = client
+                .take_server_notifications()
+                .expect("exact-2024 as_proxy WebSocket completion progress notifications must decode");
+            assert!(
+                progress.iter().any(|notification| matches!(
+                    notification,
+                    legacy_2024::ServerNotification::Progress(params)
+                        if params.progress_marker == marker
+                            && params.message.as_deref() == Some("completion-legacy-halfway")
+                )),
+                "exact-2024 as_proxy WebSocket must retain upstream completion notifications/progress: {progress:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
     fn e2e_public_websocket_legacy_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
@@ -42614,6 +43995,133 @@ mod live_websocket_bind {
             cx.set_cancel_requested(true);
             listener.abort();
             timeout_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_sanitizes_prefixed_handler_panic() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy panic runtime installs an ambient context",
+            );
+            let panic_upstream = spawn_legacy_as_proxy_panic_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(panic_upstream.address(), "/sse")),
+                Some(public_http_target(panic_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-panic-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-panic-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket panic gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-panic-upstream",
+                    "native-h1:e2e-legacy-ws-panic-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-panic".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP panic proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP panic proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-panic-gateway", "1.0.0")
+                .as_proxy_typed("child", proxy, catalog)
+                .expect("legacy as_proxy_typed panic install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy panic must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy panic publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket as_proxy panic serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy panic initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy panic over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_PANIC_TOOL_NAME}");
+            let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy panic unprefixed",
+                client.call_tool(&cx, PUBLIC_HTTP_PANIC_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed panic tool");
+            let _ = missing;
+
+            let panicked = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy panic tools/call",
+                client.call_tool(&cx, &prefixed, json!({})),
+            )
+            .await;
+            let panicked = match panicked {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked.contains("Internal server error") || panicked.contains("InternalError"),
+                "exact-2024 as_proxy WebSocket must sanitize an upstream handler panic: {panicked}"
+            );
+            assert!(
+                !panicked.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "exact-2024 as_proxy WebSocket must not leak the upstream unwind payload: {panicked}"
+            );
+
+            let peer = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy panic fast peer",
+                client.call_tool(&cx, &prefixed_fast, json!({})),
+            )
+            .await
+            .expect("changing only the tool must still be admitted after a sanitized exact-2024 as_proxy panic");
+            assert_eq!(
+                legacy_http_tool_text(&peer).as_deref(),
+                Some("fast"),
+                "the prefixed fast peer tool must still complete after a sanitized as_proxy panic: {peer:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            panic_upstream.shutdown();
         });
     }
 
