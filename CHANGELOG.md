@@ -6,9 +6,18 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.3.2)
+## [Unreleased] (after v0.4.0)
 
-Current unreleased work follows the v0.3.2 release on 2026-06-18.
+No unreleased changes yet.
+
+---
+
+## [v0.4.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.4.0) -- 2026-08-17 (GitHub Release)
+
+Breaking release (pre-1.0 minor bump): `Legacy2024EnvelopeError` gains a new
+public `Method` variant, which breaks exhaustive matchers downstream. All
+workspace crates move to 0.4.0. This release covers work landed since the
+v0.3.2 release on 2026-06-18.
 
 ### MCP 2026-07-28 support (in progress)
 
@@ -19,8 +28,9 @@ Aggregate MCP 2026-07-28 support is not claimed by FND-01.
 
 ### Protocol and Runtime Maintenance
 
-- **JSON-RPC error taxonomy correction for unknown legacy methods (breaking)** -- A structurally valid JSON-RPC request naming a method outside the exact MCP 2024-11-05 inventory is now refused with `-32601` Method Not Found instead of `-32600` Invalid Request, matching the JSON-RPC 2.0 taxonomy (`-32600` remains reserved for envelope-structure failures). `Legacy2024EnvelopeError` gains a `Method` class, which is API-breaking for exhaustive matchers; the next published release must account for this in its version bump.
+- **JSON-RPC error taxonomy correction for unknown legacy methods (breaking)** -- A structurally valid JSON-RPC request naming a method outside the exact MCP 2024-11-05 inventory is now refused with `-32601` Method Not Found instead of `-32600` Invalid Request, matching the JSON-RPC 2.0 taxonomy (`-32600` remains reserved for envelope-structure failures). `Legacy2024EnvelopeError` gains a `Method` class, which is API-breaking for exhaustive matchers; this change is what makes v0.4.0 a breaking (pre-1.0 minor) version bump. ([`2a5ee3b`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2a5ee3bf769f94b0b2fca33b0b699874ca8f833f))
 - **Streamable HTTP survives malformed POST bodies** -- A well-framed HTTP POST whose body fails JSON-RPC decoding no longer strands the connection's single response slot: the receive path still surfaces the codec error so a server can answer with a correlated `-32700` response, but if the server declines and receives again (era admission skips malformed opening frames), the transport completes the abandoned exchange with `400 Bad Request` and keeps serving subsequent exchanges instead of terminating on a phantom `WouldBlock`.
+- **Proxy gateways adopt upstream `Implementation` extras** -- `as_proxy` gateways propagate upstream implementation metadata and preserve upstream JSON-RPC error codes through the proxy boundary. ([`b1c4f59`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/b1c4f59c7c9fa134e5a55b0ebdc36afa0b84f0e6))
 - **MCP wire corrections** -- Correct tool-annotation field names and the lifecycle notification method name. ([`f8ec1e0`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/f8ec1e0ab86501439fd437f52ce825da4641ed97))
 - **Runtime upgrades** -- Adapt the workspace to later asupersync 0.3 releases and their context/deadline APIs. ([`a0f6a39`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/a0f6a3948341efc60f969ee196e694c263f6acfb), [`6cebdde`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/6cebdde16664101393d5dc8bcae00171d903f384), [`5c6cd65`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/5c6cd6585c0d5b36801993130fb578d43f351193))
 - **Client dual request deadlines (breaking, in progress)** -- Replace the single client `timeout_ms` setting with `RequestTimeoutPolicy` (30-second idle and 120-second non-resettable absolute response-wait defaults, both starting after send commit). Replace `fastmcp test --timeout` with independent bounded `--idle-timeout` and `--absolute-timeout` options. Historical release entries below retain their original API names.
@@ -41,6 +51,8 @@ MCP 2026-07-28 support remains unverified.
 - **`dispatch_request_concurrent` API name retained without a lock-free guarantee** -- The public entry point exists, but the current implementation serializes through the same shared session mutex as ordinary dispatch. Historical lock-free and sub-microsecond snapshot claims are withdrawn. ([`d2fd587`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d2fd587e158b644b32e3b20a66416d6e155dced3))
 - **Historical turnkey HTTP server (quarantined)** -- `run_http` / `run_http_with_cx` / `run_http_returning` were introduced with a sessionful listener. That listener is private and unreachable because it shared mutable legacy state across clients. Current public native HTTP routing separates modern MCP 2026-07-28 admission from exact MCP 2024-11-05 lifecycle handling; aggregate qualification remains unverified. ([`693bc06`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/693bc06f83ab6e579f1d8ea3167d4a5495b3e430))
 - **OAuth/OIDC limits** -- CSPRNG-backed opaque-token draws and PKCE verification are not evidence of complete OAuth 2.0/2.1 or OIDC conformance. The current OIDC surface advertises no signing algorithms or JWKS endpoint and fails closed for ID-token issuance.
+
+**Exact changes:** [v0.3.2...v0.4.0](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.3.2...v0.4.0)
 
 ---
 
