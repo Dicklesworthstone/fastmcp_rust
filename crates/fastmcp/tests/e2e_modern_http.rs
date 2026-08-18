@@ -537,7 +537,9 @@ impl ToolHandler for LocalPrefixedEcho {
     fn definition(&self) -> Tool {
         Tool {
             name: "ext/echo".to_owned(),
-            description: Some("Local colliding echo used to prove as_proxy on_duplicate".to_owned()),
+            description: Some(
+                "Local colliding echo used to prove as_proxy on_duplicate".to_owned(),
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -18337,6 +18339,211 @@ fn e2e_public_http_as_proxy_stdio_gateway_session_state_uses_shared_upstream_bag
 }
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_stdio_as_proxy_duplicate_gateway(
+    behavior: DuplicateBehavior,
+) -> HttpServerFixture {
+    spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        Some(behavior),
+    )
+    .0
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+fn spawn_legacy_http_stdio_as_proxy_duplicate_gateway(
+    behavior: DuplicateBehavior,
+) -> HttpServerFixture {
+    spawn_legacy_http_stdio_as_proxy_gateway_with_duplicate(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+        Some(behavior),
+    )
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_on_duplicate_error_keeps_local_echo() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_duplicate_gateway(DuplicateBehavior::Error);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-duplicate-error", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the Error-on-duplicate stdio as_proxy gateway");
+
+    let kept = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect("Error must keep the local prefixed echo callable");
+    assert!(
+        kept.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "local:alpha",
+            _ => false,
+        }),
+        "stdio as_proxy on_duplicate Error must keep the local ext/echo handler: {kept:?}"
+    );
+
+    let add = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/add", json!({"a": 2, "b": 3})),
+    )
+    .expect("Error must still install the rest of the prefixed stdio catalog");
+    assert!(
+        add.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "5",
+            _ => false,
+        }),
+        "a non-colliding prefixed tool must still reach the stdio upstream: {add:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "echo", json!({"message": "alpha"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed echo");
+    let _ = missing;
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_on_duplicate_replace_installs_echo() {
+    let cx = Cx::for_request();
+    let gateway = spawn_modern_http_stdio_as_proxy_duplicate_gateway(DuplicateBehavior::Replace);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-duplicate-replace", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the Replace-on-duplicate stdio as_proxy gateway");
+
+    let replaced = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect("Replace must install the proxied echo");
+    assert!(
+        replaced.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha",
+            _ => false,
+        }),
+        "changing only on_duplicate to Replace must reach prefixed ext/echo: {replaced:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_on_duplicate_error_keeps_local_echo() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_duplicate_gateway(DuplicateBehavior::Error);
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-duplicate-error",
+    );
+
+    let kept = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy on_duplicate Error call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("Error must keep the local prefixed echo callable");
+    assert_eq!(
+        legacy_http_tool_text(&kept).as_deref(),
+        Some("local:alpha"),
+        "stdio as_proxy on_duplicate Error must keep the local ext/echo handler: {kept:?}"
+    );
+
+    let add = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy on_duplicate Error peer add",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/add".to_owned(),
+                arguments: Some(json!({"a": 2, "b": 3})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("Error must still install the rest of the prefixed stdio catalog");
+    assert_eq!(
+        legacy_http_tool_text(&add).as_deref(),
+        Some("5"),
+        "a non-colliding prefixed tool must still reach the stdio upstream: {add:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_on_duplicate_replace_installs_echo() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_duplicate_gateway(DuplicateBehavior::Replace);
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-duplicate-replace",
+    );
+
+    let replaced = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy on_duplicate Replace call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("Replace must install the proxied echo");
+    assert_eq!(
+        legacy_http_tool_text(&replaced).as_deref(),
+        Some("alpha"),
+        "changing only on_duplicate to Replace must reach prefixed ext/echo: {replaced:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_stdio_gateway_strict_input_refuses_unknown_property() {
     let cx = Cx::for_request();
@@ -31549,6 +31756,33 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
     strict_input: bool,
     list_page_size: Option<usize>,
 ) -> HttpServerFixture {
+    spawn_legacy_http_stdio_as_proxy_gateway_with_duplicate(
+        extra_env,
+        mask_error_details,
+        request_timeout_secs,
+        cache_tools,
+        rate_limit,
+        sliding_window,
+        static_token,
+        strict_input,
+        list_page_size,
+        None,
+    )
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+fn spawn_legacy_http_stdio_as_proxy_gateway_with_duplicate(
+    extra_env: Vec<(String, String)>,
+    mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+    on_duplicate: Option<DuplicateBehavior>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -31651,6 +31885,9 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
             }
             if let Some(page_size) = list_page_size {
                 builder = builder.list_page_size(page_size);
+            }
+            if let Some(behavior) = on_duplicate {
+                builder = builder.on_duplicate(behavior).tool(LocalPrefixedEcho);
             }
             let server = builder
                 .as_proxy("ext", stdio)
