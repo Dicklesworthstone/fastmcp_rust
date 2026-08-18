@@ -11367,7 +11367,7 @@ fn e2e_public_http_as_proxy_forwards_resource_template_completion() {
     upstream.shutdown();
 }
 
-#[cfg(feature = "proxy")]
+#[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
 fn e2e_public_http_as_proxy_advertises_completions_when_upstream_supports() {
     let upstream = spawn_modern_template_completion_http_server();
