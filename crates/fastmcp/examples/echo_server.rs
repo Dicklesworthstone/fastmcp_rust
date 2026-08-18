@@ -289,6 +289,31 @@ impl ToolHandler for FastEcho {
     }
 }
 
+/// Sleeps longer than a 1s gateway `request_timeout` and has no handler `timeout()`.
+struct HoldEcho;
+
+impl ToolHandler for HoldEcho {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "hold_echo".to_owned(),
+            description: Some(
+                "Proves live stdio request_timeout of a tool without timeout()".to_owned(),
+            ),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        std::thread::sleep(Duration::from_millis(1500));
+        Ok(vec![Content::text("held")])
+    }
+}
+
 /// Advertises an output schema and authors matching structured content.
 struct StructuredEcho;
 
@@ -1209,6 +1234,7 @@ fn main() {
         .tool(ComposePrompt)
         .tool(SlowEcho)
         .tool(FastEcho)
+        .tool(HoldEcho)
         .tool(StructuredEcho)
         .tool(RichEcho)
         .tool(ClientRootUri)
