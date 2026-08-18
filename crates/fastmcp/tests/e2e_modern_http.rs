@@ -507,6 +507,61 @@ impl ToolHandler for ReplacedPublicHttpValue {
     }
 }
 
+/// Local gateway tool registered under a prefixed as_proxy name so
+/// `on_duplicate` can keep or replace the proxied catalog entry.
+struct LocalPrefixedPublicHttpValue {
+    name: String,
+}
+
+impl ToolHandler for LocalPrefixedPublicHttpValue {
+    fn definition(&self) -> Tool {
+        let mut definition = PublicHttpValue.definition();
+        definition.name = self.name.clone();
+        definition
+    }
+
+    fn call(&self, _context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let value = arguments
+            .get("value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        Ok(vec![Content::text(format!("local:{value}"))])
+    }
+}
+
+/// Local gateway tool registered as `ext/echo` so stdio as_proxy
+/// `on_duplicate` can keep or replace the prefixed echo catalog entry.
+struct LocalPrefixedEcho;
+
+impl ToolHandler for LocalPrefixedEcho {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "ext/echo".to_owned(),
+            description: Some("Local colliding echo used to prove as_proxy on_duplicate".to_owned()),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"}
+                },
+                "required": ["message"]
+            }),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _context: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let message = arguments
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing");
+        Ok(vec![Content::text(format!("local:{message}"))])
+    }
+}
+
 /// Returns the committed native-HTTP `AuthContext` subject.
 struct PublicHttpAuthSubject {
     counters: Arc<PublicHttpHandlerCallCounters>,
@@ -4465,7 +4520,18 @@ fn spawn_modern_http_stdio_as_proxy_gateway_configured(
     precreate_task: bool,
     extra_env: Vec<(String, String)>,
 ) -> (HttpServerFixture, Option<FinalTaskId>) {
-    spawn_modern_http_stdio_as_proxy_gateway_with_options(precreate_task, extra_env, false, None)
+    spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        precreate_task,
+        extra_env,
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    )
 }
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
@@ -4474,6 +4540,41 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+) -> (HttpServerFixture, Option<FinalTaskId>) {
+    spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
+        precreate_task,
+        extra_env,
+        mask_error_details,
+        request_timeout_secs,
+        cache_tools,
+        rate_limit,
+        sliding_window,
+        static_token,
+        strict_input,
+        list_page_size,
+        None,
+    )
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
+    precreate_task: bool,
+    extra_env: Vec<(String, String)>,
+    mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+    on_duplicate: Option<DuplicateBehavior>,
 ) -> (HttpServerFixture, Option<FinalTaskId>) {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) =
@@ -4568,6 +4669,40 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
                 .mask_error_details(mask_error_details);
             if let Some(request_timeout_secs) = request_timeout_secs {
                 builder = builder.request_timeout(request_timeout_secs);
+            }
+            if let Some(cache_tools) = cache_tools {
+                builder = builder.middleware(
+                    caching::ResponseCachingMiddleware::new().include_tools(cache_tools),
+                );
+            }
+            if rate_limit {
+                builder = builder.middleware(
+                    rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1),
+                );
+            }
+            if sliding_window {
+                builder = builder.middleware(
+                    rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
+                );
+            }
+            if static_token {
+                let verifier = StaticTokenVerifier::new([(
+                    "alpha",
+                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                )])
+                .expect("the deterministic stdio as_proxy gateway bearer verifier is valid")
+                .with_allowed_schemes(["Bearer"])
+                .expect("the stdio as_proxy gateway bearer scheme allowlist is valid");
+                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            }
+            if strict_input {
+                builder = builder.strict_input_validation(true);
+            }
+            if let Some(page_size) = list_page_size {
+                builder = builder.list_page_size(page_size);
+            }
+            if let Some(behavior) = on_duplicate {
+                builder = builder.on_duplicate(behavior).tool(LocalPrefixedEcho);
             }
             let server = builder
                 .as_proxy("ext", stdio)
@@ -11818,7 +11953,9 @@ fn e2e_public_http_as_proxy_stdio_bare_upstream_omits_instructions() {
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_identity_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
-    spawn_modern_http_identity_proxy_gateway_configured(upstream, None, false, None)
+    spawn_modern_http_identity_proxy_gateway_configured(
+        upstream, None, false, None, None, false, false, false, false, None,
+    )
 }
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -11827,6 +11964,12 @@ fn spawn_modern_http_identity_proxy_gateway_configured(
     gateway_instructions: Option<String>,
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
 ) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -11891,6 +12034,37 @@ fn spawn_modern_http_identity_proxy_gateway_configured(
             }
             if let Some(request_timeout_secs) = request_timeout_secs {
                 builder = builder.request_timeout(request_timeout_secs);
+            }
+            if let Some(cache_tools) = cache_tools {
+                builder = builder.middleware(
+                    caching::ResponseCachingMiddleware::new().include_tools(cache_tools),
+                );
+            }
+            if rate_limit {
+                builder = builder.middleware(
+                    rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1),
+                );
+            }
+            if sliding_window {
+                builder = builder.middleware(
+                    rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
+                );
+            }
+            if static_token {
+                let verifier = StaticTokenVerifier::new([(
+                    "alpha",
+                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                )])
+                .expect("the deterministic as_proxy gateway bearer verifier is valid")
+                .with_allowed_schemes(["Bearer"])
+                .expect("the as_proxy gateway bearer scheme allowlist is valid");
+                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            }
+            if strict_input {
+                builder = builder.strict_input_validation(true);
+            }
+            if let Some(page_size) = list_page_size {
+                builder = builder.list_page_size(page_size);
             }
             let server = builder
                 .as_proxy_typed("ext", proxy, catalog)
@@ -12125,6 +12299,12 @@ fn e2e_public_http_as_proxy_adopts_upstream_instructions() {
     let override_gateway = spawn_modern_http_identity_proxy_gateway_configured(
         instructed_upstream.address(),
         Some("gateway-override-instructions".to_owned()),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
         false,
         None,
     );
@@ -12675,10 +12855,30 @@ fn e2e_public_http_legacy_as_proxy_forwards_hide_catalog_of_prefixed_resource_an
 fn e2e_public_http_as_proxy_mask_error_details_hides_upstream_resource_secret() {
     let cx = Cx::for_request();
     let upstream = spawn_modern_as_proxy_leak_upstream();
-    let masked_gateway =
-        spawn_modern_http_identity_proxy_gateway_configured(upstream.address(), None, true, None);
-    let unmasked_gateway =
-        spawn_modern_http_identity_proxy_gateway_configured(upstream.address(), None, false, None);
+    let masked_gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        true,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    let unmasked_gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
     let mut masked = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -12837,8 +13037,18 @@ fn e2e_public_http_legacy_as_proxy_mask_error_details_hides_upstream_resource_se
 #[test]
 fn e2e_public_http_as_proxy_stdio_mask_error_details_hides_upstream_resource_secret() {
     let cx = Cx::for_request();
-    let (gateway, _) =
-        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), true, None);
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        true,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -12873,8 +13083,18 @@ fn e2e_public_http_as_proxy_stdio_mask_error_details_hides_upstream_resource_sec
 #[test]
 fn e2e_public_http_as_proxy_stdio_unmask_error_details_keeps_upstream_resource_secret() {
     let cx = Cx::for_request();
-    let (gateway, _) =
-        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), false, None);
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -12899,10 +13119,28 @@ fn e2e_public_http_as_proxy_stdio_unmask_error_details_keeps_upstream_resource_s
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_mask_error_details_hides_upstream_resource_secret() {
     let cx = Cx::for_request();
-    let masked_gateway =
-        spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), true, None);
-    let unmasked_gateway =
-        spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), false, None);
+    let masked_gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        true,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    let unmasked_gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
     let mut masked = connect_legacy_http_client(
         &cx,
         masked_gateway.address(),
@@ -15341,6 +15579,4070 @@ fn e2e_public_http_legacy_as_proxy_stdio_sanitizes_prefixed_handler_panic() {
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
+fn e2e_public_http_as_proxy_sanitizes_prefixed_catalog_and_completion_panic() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_panic_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-catalog-panic", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy catalog-panic gateway");
+    let prefixed_prompt = format!("ext/{PUBLIC_HTTP_PANIC_PROMPT_NAME}");
+    let prefixed_peer_prompt = format!("ext/{PUBLIC_HTTP_PROMPT_NAME}");
+    let prefixed_complete = format!("ext/{PUBLIC_HTTP_PROMPT_NAME}");
+    let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let missing_resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, &format!("ext/{PUBLIC_HTTP_PANIC_RESOURCE_URI}")),
+    )
+    .expect_err("modern as_proxy must not invent a prefixed panic resource URI");
+    let _ = missing_resource;
+
+    let panicked_resource = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_PANIC_RESOURCE_URI),
+    );
+    let panicked_resource = match panicked_resource {
+        Ok(result) => {
+            panic!("a panicking as_proxy resources/read must stay a protocol error: {result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "as_proxy must sanitize an upstream resource panic: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "as_proxy must not leak the upstream resource unwind payload: {panicked_resource}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, PUBLIC_HTTP_PANIC_PROMPT_NAME, HashMap::new()),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed panic prompt");
+    let _ = missing_prompt;
+
+    let panicked_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, &prefixed_prompt, HashMap::new()),
+    );
+    let panicked_prompt = match panicked_prompt {
+        Ok(result) => {
+            panic!("a panicking as_proxy prompts/get must stay a protocol error: {result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "as_proxy must sanitize an upstream prompt panic: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "as_proxy must not leak the upstream prompt unwind payload: {panicked_prompt}"
+    );
+
+    let missing_complete = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+                    title: "Public HTTP E2E Prompt".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                context: None,
+            },
+        ),
+    )
+    .expect_err("changing only the completion prompt name must not reach the unprefixed provider");
+    let _ = missing_complete;
+
+    let panicked_complete = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: prefixed_complete,
+                    title: "Public HTTP E2E Prompt".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                context: None,
+            },
+        ),
+    );
+    let panicked_complete = match panicked_complete {
+        Ok(result) => panic!(
+            "a panicking as_proxy completion/complete must stay a protocol error: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_complete.contains("Internal server error")
+            || panicked_complete.contains("InternalError"),
+        "as_proxy must sanitize an upstream completion panic: {panicked_complete}"
+    );
+    assert!(
+        !panicked_complete.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "as_proxy must not leak the upstream completion unwind payload: {panicked_complete}"
+    );
+
+    let peer_resource =
+        runtime_block_on_bounded(&cx, client.read_resource(&cx, PUBLIC_HTTP_RESOURCE_URI)).expect(
+            "changing only the resource must still be admitted after a sanitized as_proxy panic",
+        );
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains(PUBLIC_HTTP_RESOURCE_TEXT),
+        "the unprefixed peer resource must still complete after a sanitized as_proxy panic: {peer_resource}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            &prefixed_peer_prompt,
+            HashMap::from([("subject".to_owned(), PUBLIC_HTTP_TOOL_ARGUMENT.to_owned())]),
+        ),
+    )
+    .expect("changing only the prompt must still be admitted after a sanitized as_proxy panic");
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains(PUBLIC_HTTP_PROMPT_TEXT),
+        "the prefixed peer prompt must still complete after a sanitized as_proxy panic: {peer_prompt}"
+    );
+
+    let fast = runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed_fast, json!({})))
+        .expect(
+            "changing only the method must still admit tools/call after a sanitized as_proxy panic",
+        );
+    assert!(
+        fast.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "the prefixed fast peer tool must still complete after a sanitized as_proxy catalog panic: {fast:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_sanitizes_prefixed_catalog_and_completion_panic() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_panic_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-catalog-panic",
+    );
+    let prefixed_resource = format!("child/{PUBLIC_HTTP_PANIC_RESOURCE_URI}");
+    let prefixed_peer_resource = format!("child/{PUBLIC_HTTP_RESOURCE_URI}");
+    let prefixed_prompt = format!("child/{PUBLIC_HTTP_PANIC_PROMPT_NAME}");
+    let prefixed_peer_prompt = format!("child/{PUBLIC_HTTP_PROMPT_NAME}");
+    let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let missing_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy catalog panic unprefixed resource",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_PANIC_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing_resource.is_err(),
+        "changing only the missing prefix must not reach the unprefixed panic resource: {missing_resource:?}"
+    );
+
+    let panicked_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy catalog panic resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: prefixed_resource,
+                meta: None,
+            },
+        ),
+    );
+    let panicked_resource = match panicked_resource {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "exact-2024 as_proxy must sanitize an upstream resource panic: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 as_proxy must not leak the upstream resource unwind payload: {panicked_resource}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy catalog panic unprefixed prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_PANIC_PROMPT_NAME.to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing_prompt.is_err(),
+        "changing only the missing prefix must not reach the unprefixed panic prompt: {missing_prompt:?}"
+    );
+
+    let panicked_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy catalog panic prompts/get",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: prefixed_prompt,
+                arguments: None,
+                meta: None,
+            },
+        ),
+    );
+    let panicked_prompt = match panicked_prompt {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "exact-2024 as_proxy must sanitize an upstream prompt panic: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 as_proxy must not leak the upstream prompt unwind payload: {panicked_prompt}"
+    );
+
+    let missing_complete = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy completion panic unprefixed",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing_complete.is_err(),
+        "changing only the completion prompt name must refuse before the unprefixed provider: {missing_complete:?}"
+    );
+
+    let panicked_complete = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy completion panic complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: prefixed_peer_prompt.clone(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "cross-era".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    );
+    let panicked_complete = match panicked_complete {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_complete.contains("Internal server error")
+            || panicked_complete.contains("InternalError"),
+        "exact-2024 as_proxy must sanitize an upstream completion panic: {panicked_complete}"
+    );
+    assert!(
+        !panicked_complete.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 as_proxy must not leak the upstream completion unwind payload: {panicked_complete}"
+    );
+
+    let peer_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy catalog panic peer resource",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: prefixed_peer_resource,
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the resource must still be admitted after a sanitized exact-2024 as_proxy panic");
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains(PUBLIC_HTTP_RESOURCE_TEXT),
+        "the prefixed peer resource must still complete after a sanitized as_proxy panic: {peer_resource}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy catalog panic peer prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: prefixed_peer_prompt,
+                arguments: Some(HashMap::from([(
+                    "subject".to_owned(),
+                    PUBLIC_HTTP_TOOL_ARGUMENT.to_owned(),
+                )])),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the prompt must still be admitted after a sanitized exact-2024 as_proxy panic");
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains(PUBLIC_HTTP_PROMPT_TEXT),
+        "the prefixed peer prompt must still complete after a sanitized as_proxy panic: {peer_prompt}"
+    );
+
+    let fast = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy catalog panic fast peer",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed_fast,
+                arguments: Some(json!({})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the method must still admit tools/call after a sanitized exact-2024 as_proxy panic");
+    assert_eq!(
+        legacy_http_tool_text(&fast).as_deref(),
+        Some("fast"),
+        "the prefixed fast peer tool must still complete after a sanitized as_proxy catalog panic: {fast:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_sanitizes_prefixed_catalog_and_completion_panic() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
+        false,
+        vec![
+            ("FASTMCP_PANIC_CATALOG".to_owned(), "1".to_owned()),
+            ("FASTMCP_PANIC_COMPLETE".to_owned(), "1".to_owned()),
+        ],
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-catalog-panic", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy catalog-panic gateway");
+
+    let missing_resource =
+        runtime_block_on_bounded(&cx, client.read_resource(&cx, "ext/info://panic"))
+            .expect_err("modern stdio as_proxy must not invent a prefixed panic resource URI");
+    let _ = missing_resource;
+
+    let panicked_resource =
+        runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://panic"));
+    let panicked_resource = match panicked_resource {
+        Ok(result) => panic!(
+            "a panicking stdio as_proxy resources/read must stay a protocol error: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "stdio as_proxy must sanitize an upstream resource panic: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "stdio as_proxy must not leak the upstream resource unwind payload: {panicked_resource}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, "panic_greeting", HashMap::new()),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed stdio panic prompt");
+    let _ = missing_prompt;
+
+    let panicked_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(&cx, "ext/panic_greeting", HashMap::new()),
+    );
+    let panicked_prompt = match panicked_prompt {
+        Ok(result) => {
+            panic!("a panicking stdio as_proxy prompts/get must stay a protocol error: {result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "stdio as_proxy must sanitize an upstream prompt panic: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "stdio as_proxy must not leak the upstream prompt unwind payload: {panicked_prompt}"
+    );
+
+    let missing_complete = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: "greeting".to_owned(),
+                    title: "Greeting".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "World".to_owned(),
+                },
+                context: None,
+            },
+        ),
+    )
+    .expect_err(
+        "changing only the completion prompt name must not reach the unprefixed stdio provider",
+    );
+    let _ = missing_complete;
+
+    let panicked_complete = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: "ext/greeting".to_owned(),
+                    title: "Greeting".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "World".to_owned(),
+                },
+                context: None,
+            },
+        ),
+    );
+    let panicked_complete = match panicked_complete {
+        Ok(result) => panic!(
+            "a panicking stdio as_proxy completion/complete must stay a protocol error: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_complete.contains("Internal server error")
+            || panicked_complete.contains("InternalError"),
+        "stdio as_proxy must sanitize an upstream completion panic: {panicked_complete}"
+    );
+    assert!(
+        !panicked_complete.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "stdio as_proxy must not leak the upstream completion unwind payload: {panicked_complete}"
+    );
+
+    let peer_resource = runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://server"))
+        .expect("changing only the resource must still be admitted after a sanitized stdio as_proxy panic");
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains("echo-server") || peer_resource.contains("info://server"),
+        "the unprefixed stdio peer resource must still complete after a sanitized as_proxy panic: {peer_resource}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/greeting",
+            HashMap::from([("name".to_owned(), "World".to_owned())]),
+        ),
+    )
+    .expect(
+        "changing only the prompt must still be admitted after a sanitized stdio as_proxy panic",
+    );
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("World") || peer_prompt.contains("greet"),
+        "the prefixed stdio peer prompt must still complete after a sanitized as_proxy panic: {peer_prompt}"
+    );
+
+    let peer = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "after-catalog-panic"})),
+    )
+    .expect("changing only the method must still admit tools/call after a sanitized stdio as_proxy panic");
+    assert!(
+        peer.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "after-catalog-panic",
+            _ => false,
+        }),
+        "the prefixed stdio echo peer must still complete after a sanitized as_proxy catalog panic: {peer:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_sanitizes_prefixed_catalog_and_completion_panic() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![
+        ("FASTMCP_PANIC_CATALOG".to_owned(), "1".to_owned()),
+        ("FASTMCP_PANIC_COMPLETE".to_owned(), "1".to_owned()),
+    ]);
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-catalog-panic",
+    );
+
+    let missing_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy catalog panic unprefixed resource",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "info://panic".to_owned(),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing_resource.is_err(),
+        "changing only the missing prefix must not reach the unprefixed stdio panic resource: {missing_resource:?}"
+    );
+
+    let panicked_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy catalog panic resources/read",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "ext/info://panic".to_owned(),
+                meta: None,
+            },
+        ),
+    );
+    let panicked_resource = match panicked_resource {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_resource.contains("Internal server error")
+            || panicked_resource.contains("InternalError"),
+        "exact-2024 stdio as_proxy must sanitize an upstream resource panic: {panicked_resource}"
+    );
+    assert!(
+        !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 stdio as_proxy must not leak the upstream resource unwind payload: {panicked_resource}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy catalog panic unprefixed prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "panic_greeting".to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing_prompt.is_err(),
+        "changing only the missing prefix must not reach the unprefixed stdio panic prompt: {missing_prompt:?}"
+    );
+
+    let panicked_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy catalog panic prompts/get",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "ext/panic_greeting".to_owned(),
+                arguments: None,
+                meta: None,
+            },
+        ),
+    );
+    let panicked_prompt = match panicked_prompt {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_prompt.contains("Internal server error")
+            || panicked_prompt.contains("InternalError"),
+        "exact-2024 stdio as_proxy must sanitize an upstream prompt panic: {panicked_prompt}"
+    );
+    assert!(
+        !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 stdio as_proxy must not leak the upstream prompt unwind payload: {panicked_prompt}"
+    );
+
+    let missing_complete = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy completion panic unprefixed",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: "greeting".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "World".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing_complete.is_err(),
+        "changing only the completion prompt name must refuse before the unprefixed stdio provider: {missing_complete:?}"
+    );
+
+    let panicked_complete = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy completion panic complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: "ext/greeting".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "World".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    );
+    let panicked_complete = match panicked_complete {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        panicked_complete.contains("Internal server error")
+            || panicked_complete.contains("InternalError"),
+        "exact-2024 stdio as_proxy must sanitize an upstream completion panic: {panicked_complete}"
+    );
+    assert!(
+        !panicked_complete.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+        "exact-2024 stdio as_proxy must not leak the upstream completion unwind payload: {panicked_complete}"
+    );
+
+    let peer_resource = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy catalog panic peer resource",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "ext/info://server".to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the resource must still be admitted after a sanitized exact-2024 stdio as_proxy panic");
+    let peer_resource = format!("{peer_resource:?}");
+    assert!(
+        peer_resource.contains("echo-server") || peer_resource.contains("info://server"),
+        "the prefixed stdio peer resource must still complete after a sanitized as_proxy panic: {peer_resource}"
+    );
+
+    let peer_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy catalog panic peer prompt",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "ext/greeting".to_owned(),
+                arguments: Some(HashMap::from([("name".to_owned(), "World".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the prompt must still be admitted after a sanitized exact-2024 stdio as_proxy panic");
+    let peer_prompt = format!("{peer_prompt:?}");
+    assert!(
+        peer_prompt.contains("World") || peer_prompt.contains("greet"),
+        "the prefixed stdio peer prompt must still complete after a sanitized as_proxy panic: {peer_prompt}"
+    );
+
+    let peer = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy catalog panic echo peer",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "after-catalog-panic"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the method must still admit tools/call after a sanitized exact-2024 stdio as_proxy panic");
+    assert_eq!(
+        legacy_http_tool_text(&peer).as_deref(),
+        Some("after-catalog-panic"),
+        "the prefixed stdio echo peer must still complete after a sanitized as_proxy catalog panic: {peer:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_cache_hits_prefixed_allowlisted_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+    let gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        None,
+        Some(vec![prefixed.clone()]),
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-cache", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy cache gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed counting tool");
+    let _ = missing;
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("the first allowlisted prefixed tools/call must miss and reach the upstream");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the first as_proxy cache miss must return the upstream handler result: {first:?}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "the first allowlisted prefixed tools/call must invoke the upstream counting handler"
+    );
+
+    let cached = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("the second identical prefixed tools/call must be a gateway cache hit");
+    assert!(
+        cached.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the as_proxy cache hit must keep the first complete result: {cached:?}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "a gateway cache hit must not invoke the upstream counting handler again"
+    );
+
+    let missed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "beta"})),
+    )
+    .expect("changing only the arguments must miss the gateway cache");
+    assert!(
+        missed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:beta",
+            _ => false,
+        }),
+        "the as_proxy cache miss must reach the upstream with the new arguments: {missed:?}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        2,
+        "a different-arguments prefixed tools/call must invoke the upstream counting handler"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_cache_hits_prefixed_allowlisted_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+    let gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        Some(vec![prefixed.clone()]),
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-cache",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy cache unprefixed",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TOOL_NAME.to_owned(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the missing prefix must not reach the unprefixed counting tool: {missing:?}"
+    );
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy cache miss",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the first allowlisted prefixed tools/call must miss and reach the upstream");
+    assert_eq!(
+        legacy_http_tool_text(&first).as_deref(),
+        Some("tool:alpha"),
+        "the first exact-2024 as_proxy cache miss must return the upstream handler result: {first:?}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "the first allowlisted prefixed tools/call must invoke the upstream counting handler"
+    );
+
+    let cached = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy cache hit",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the second identical prefixed tools/call must be a gateway cache hit");
+    assert_eq!(
+        legacy_http_tool_text(&cached).as_deref(),
+        Some("tool:alpha"),
+        "the exact-2024 as_proxy cache hit must keep the first complete result: {cached:?}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "a gateway cache hit must not invoke the upstream counting handler again"
+    );
+
+    let missed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy cache arg miss",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed,
+                arguments: Some(json!({"value": "beta"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the arguments must miss the gateway cache");
+    assert_eq!(
+        legacy_http_tool_text(&missed).as_deref(),
+        Some("tool:beta"),
+        "the exact-2024 as_proxy cache miss must reach the upstream with the new arguments: {missed:?}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        2,
+        "a different-arguments prefixed tools/call must invoke the upstream counting handler"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_rate_limit_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        None,
+        None,
+        true,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-rate-limit", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy rate-limit gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("the first prefixed tools/call must be admitted by the gateway rate limiter");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the first as_proxy rate-limited tools/call must reach the upstream: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect_err("a second prefixed tools/call must be refused by the gateway rate limiter");
+    let limited = format!("{limited:?}");
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second as_proxy tools/call must keep the rate-limit error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("changing only the method must still be admitted by the gateway rate limiter");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "tools/list must stay callable after prefixed tools/call is rate-limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_sliding_window_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        None,
+        None,
+        false,
+        true,
+        false,
+        false,
+        None,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-sliding", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy sliding-window gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("the first prefixed tools/call must be admitted by the gateway sliding window");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the first as_proxy sliding-window tools/call must reach the upstream: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect_err("a second prefixed tools/call must be refused by the gateway sliding window");
+    let limited = format!("{limited:?}");
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second as_proxy tools/call must keep the sliding-window error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("changing only the method must still be admitted by the gateway sliding window");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "tools/list must stay callable after prefixed tools/call is sliding-window limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_static_token_refuses_missing_and_wrong() {
+    const MAX_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+
+    fn exchange(address: SocketAddr, authorization: Option<&str>, body: &[u8]) -> Vec<u8> {
+        let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+            .expect("native HTTP client connects to the as_proxy auth gateway");
+        stream
+            .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client read deadline is configured");
+        stream
+            .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client write deadline is configured");
+        let authorization_header =
+            authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
+        let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\n{authorization_header}Accept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: {prefixed}\r\nContent-Length: {}\r\n\r\n",
+            modern::PROTOCOL_VERSION,
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(body))
+            .expect("native HTTP request commits to the as_proxy auth gateway");
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("native HTTP response reads within its configured deadline");
+            if read == 0 {
+                break;
+            }
+            assert!(
+                response
+                    .len()
+                    .checked_add(read)
+                    .is_some_and(|size| size <= MAX_NATIVE_HTTP_RESPONSE_BYTES),
+                "native HTTP response exceeds the test's bounded response budget"
+            );
+            response.extend_from_slice(&buffer[..read]);
+        }
+        response
+    }
+
+    fn response_headers(response: &[u8]) -> &str {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("native HTTP response contains a complete header terminator");
+        std::str::from_utf8(&response[..header_end])
+            .expect("native HTTP response headers are ASCII")
+    }
+
+    fn response_json_body(response: &[u8]) -> serde_json::Value {
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("native HTTP response contains a complete header terminator");
+        let headers = std::str::from_utf8(&response[..header_end])
+            .expect("native HTTP response headers are ASCII");
+        let mut content_length = None;
+        let mut chunked = false;
+        for header in headers.lines().skip(1) {
+            let (name, value) = header
+                .split_once(':')
+                .expect("native HTTP response header has a field delimiter");
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .expect("native HTTP Content-Length is a valid byte count"),
+                );
+            }
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked = true;
+            }
+        }
+        let body = &response[header_end + 4..];
+        let decoded = if chunked {
+            let mut cursor = 0;
+            let mut decoded = Vec::new();
+            loop {
+                let size_end = body[cursor..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                    .map(|offset| cursor + offset)
+                    .expect("chunked response contains a complete chunk-size line");
+                let size_line = std::str::from_utf8(&body[cursor..size_end])
+                    .expect("chunked response chunk size is ASCII");
+                let size =
+                    usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+                        .expect("chunked response chunk size is hexadecimal");
+                cursor = size_end + 2;
+                if size == 0 {
+                    return serde_json::from_slice(&decoded)
+                        .expect("authenticated as_proxy tool response is JSON-RPC");
+                }
+                let chunk_end = cursor
+                    .checked_add(size)
+                    .expect("chunked response chunk length does not overflow");
+                decoded.extend_from_slice(&body[cursor..chunk_end]);
+                cursor = chunk_end + 2;
+            }
+        } else {
+            let content_length = content_length
+                .expect("native HTTP response uses Content-Length or chunked framing");
+            body[..content_length].to_vec()
+        };
+        serde_json::from_slice(&decoded).expect("authenticated as_proxy tool response is JSON-RPC")
+    }
+
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        None,
+        None,
+        false,
+        false,
+        true,
+        false,
+        None,
+    );
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": prefixed,
+            "arguments": {"value": "alpha"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/tasks": {}
+                    }
+                },
+            },
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("as_proxy auth tool request serializes");
+
+    let missing = exchange(gateway.address(), None, &tool_body);
+    assert!(
+        missing.starts_with(b"HTTP/1.1 401"),
+        "missing Authorization must be refused before the as_proxy gateway dispatches: {}",
+        String::from_utf8_lossy(&missing)
+    );
+    assert!(
+        response_headers(&missing).lines().any(|header| header
+            .to_ascii_lowercase()
+            .starts_with("www-authenticate:")
+            && header.to_ascii_lowercase().contains("bearer")),
+        "the missing-token as_proxy challenge must advertise Bearer: {}",
+        String::from_utf8_lossy(&missing)
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "missing Authorization must not reach the as_proxy upstream"
+    );
+
+    let wrong = exchange(gateway.address(), Some("Bearer beta"), &tool_body);
+    assert!(
+        wrong.starts_with(b"HTTP/1.1 401"),
+        "changing only the bearer token must be refused before as_proxy dispatch: {}",
+        String::from_utf8_lossy(&wrong)
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "a wrong bearer token must not reach the as_proxy upstream"
+    );
+
+    let admitted = exchange(gateway.address(), Some("Bearer alpha"), &tool_body);
+    assert!(
+        admitted.starts_with(b"HTTP/1.1 200"),
+        "the matching bearer token must admit prefixed tools/call: {}",
+        String::from_utf8_lossy(&admitted)
+    );
+    let admitted_json = response_json_body(&admitted);
+    let text = admitted_json["result"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|block| block["text"].as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        text, "tool:alpha",
+        "the matching as_proxy bearer token must reach the prefixed upstream: {admitted_json}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "only the matching bearer token may invoke the as_proxy upstream"
+    );
+
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_session_state_is_request_local_across_posts() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_state_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-state", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy session-state gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_STATE_TOOL_NAME}");
+
+    let written = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"action": "write", "value": "alpha"})),
+    )
+    .expect("as_proxy must write request-local session state on the upstream");
+    assert!(
+        written.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "state:alpha",
+            _ => false,
+        }),
+        "set_state then get_state on the same as_proxy POST must retain the value: {written:?}"
+    );
+
+    let later_read = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"action": "read"})),
+    )
+    .expect("a later as_proxy POST must still be admitted");
+    assert!(
+        later_read.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "state:missing",
+            _ => false,
+        }),
+        "changing only the POST must not reuse the previous as_proxy request-local bag: {later_read:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_STATE_TOOL_NAME, json!({"action": "read"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed state tool");
+    let _ = missing;
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_strict_input_refuses_unknown_property() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let strict_gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+        None,
+    );
+    let lenient_gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let mut strict = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-strict-on", "1.0.0")
+            .connect_http_with_cx(public_http_target(strict_gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the strict as_proxy gateway");
+    let admitted = runtime_block_on_bounded(
+        &cx,
+        strict.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("strict as_proxy must still admit declared arguments");
+    assert!(
+        admitted.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "declared arguments must reach the prefixed upstream under gateway strict validation: {admitted:?}"
+    );
+
+    let refused = runtime_block_on_bounded(
+        &cx,
+        strict.call_tool(&cx, &prefixed, json!({"value": "alpha", "extra": 1})),
+    )
+    .expect("strict as_proxy returns a complete tools/call result, not a transport failure");
+    assert!(
+        refused.is_error,
+        "an unknown property must become a tool-level error when gateway strict validation is on: {refused:?}"
+    );
+    assert!(
+        refused.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text.contains("do not match the declared input schema")
+                    || text.contains("additional property")
+            }
+            _ => false,
+        }),
+        "the as_proxy strict refusal must name the input-schema mismatch: {refused:?}"
+    );
+
+    drop(strict);
+    strict_gateway.shutdown();
+
+    let mut lenient = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-strict-off", "1.0.0")
+            .connect_http_with_cx(public_http_target(lenient_gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the lenient as_proxy gateway");
+    let extra = runtime_block_on_bounded(
+        &cx,
+        lenient.call_tool(&cx, &prefixed, json!({"value": "alpha", "extra": 1})),
+    )
+    .expect("lenient as_proxy must admit the same extra property");
+    assert!(
+        extra.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "changing only the gateway strict flag must admit the extra property: {extra:?}"
+    );
+
+    drop(lenient);
+    lenient_gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_static_token_refuses_missing_and_wrong() {
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        true,
+        false,
+        None,
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let (_missing_stream, missing) =
+        write_legacy_native_http(gateway.address(), "GET", "/sse", None, &[], false);
+    assert_legacy_bearer_challenge(&missing, "missing Authorization on as_proxy GET /sse");
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "missing Authorization must not reach the as_proxy upstream"
+    );
+
+    let (_wrong_stream, wrong) = write_legacy_native_http(
+        gateway.address(),
+        "GET",
+        "/sse",
+        Some("Bearer beta"),
+        &[],
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong, "wrong bearer on as_proxy GET /sse");
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "a wrong bearer token must not reach the as_proxy upstream"
+    );
+
+    let (mut sse, opened, messages) = initialize_legacy_native_session(
+        gateway.address(),
+        Some("Bearer alpha"),
+        "e2e-public-http-legacy-as-proxy-auth",
+    );
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": prefixed,
+            "arguments": {"value": "alpha"},
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("exact-2024 as_proxy tools/call serializes");
+
+    let (_missing_post, missing_post) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        None,
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(
+        &missing_post,
+        "missing Authorization on as_proxy POST /messages",
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "missing Authorization on POST /messages must not reach the as_proxy upstream"
+    );
+
+    let (_wrong_post, wrong_post) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        Some("Bearer beta"),
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong_post, "wrong bearer on as_proxy POST /messages");
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "a wrong bearer token on POST /messages must not reach the as_proxy upstream"
+    );
+
+    let (_tool_stream, tool_response) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        Some("Bearer alpha"),
+        &tool_body,
+        false,
+    );
+    assert!(
+        tool_response.starts_with(b"HTTP/1.1 202") || tool_response.starts_with(b"HTTP/1.1 200"),
+        "the matching bearer token must admit prefixed as_proxy tools/call: {}",
+        String::from_utf8_lossy(&tool_response)
+    );
+
+    let mut sse_body = opened;
+    let retained = read_legacy_sse_until(&mut sse, &mut sse_body, "tool:alpha");
+    assert!(
+        retained.contains("tool:alpha"),
+        "the matching exact-2024 as_proxy bearer token must reach the prefixed upstream: {retained}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "only the matching bearer token may invoke the as_proxy upstream"
+    );
+
+    drop(sse);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_session_state_uses_shared_upstream_bag() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_state_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_STATE_TOOL_NAME,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-state",
+    );
+    let mut peer = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-state-peer",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_STATE_TOOL_NAME}");
+
+    let written = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy session state write",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"action": "write", "value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("exact-2024 as_proxy must write session state on the upstream binding");
+    assert_eq!(
+        legacy_http_tool_text(&written).as_deref(),
+        Some("state:alpha"),
+        "set_state then get_state on the same as_proxy write must retain the value: {written:?}"
+    );
+
+    let later_read = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy session state later read",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"action": "read"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a later exact-2024 as_proxy tools/call must still be admitted");
+    assert_eq!(
+        legacy_http_tool_text(&later_read).as_deref(),
+        Some("state:alpha"),
+        "the as_proxy upstream binding must reuse the previous bag: {later_read:?}"
+    );
+
+    let peer_read = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy session state peer read",
+        peer.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed,
+                arguments: Some(json!({"action": "read"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a peer inbound SSE session must still be admitted");
+    assert_eq!(
+        legacy_http_tool_text(&peer_read).as_deref(),
+        Some("state:alpha"),
+        "as_proxy must keep one upstream session bag across inbound clients: {peer_read:?}"
+    );
+
+    drop(client);
+    drop(peer);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_strict_input_refuses_unknown_property() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let strict_gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        false,
+        true,
+        None,
+    );
+    let lenient_gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        false,
+        false,
+        None,
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let mut strict = connect_legacy_http_client(
+        &cx,
+        strict_gateway.address(),
+        "e2e-public-http-legacy-as-proxy-strict-on",
+    );
+    let admitted = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy strict declared",
+        strict.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("strict as_proxy must still admit declared arguments");
+    assert_eq!(
+        legacy_http_tool_text(&admitted).as_deref(),
+        Some("tool:alpha"),
+        "declared arguments must reach the prefixed upstream under gateway strict validation: {admitted:?}"
+    );
+
+    let refused = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy strict extra-property",
+        strict.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha", "extra": 1})),
+                meta: None,
+            },
+        ),
+    );
+    let refused = match refused {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        refused.contains("do not match the declared input schema")
+            || refused.contains("additional property")
+            || refused.contains("unknown"),
+        "the exact-2024 as_proxy strict refusal must name the input-schema mismatch: {refused}"
+    );
+
+    drop(strict);
+    strict_gateway.shutdown();
+
+    let mut lenient = connect_legacy_http_client(
+        &cx,
+        lenient_gateway.address(),
+        "e2e-public-http-legacy-as-proxy-strict-off",
+    );
+    let extra = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy lenient extra-property",
+        lenient.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed,
+                arguments: Some(json!({"value": "alpha", "extra": 1})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("lenient as_proxy must admit the same extra property");
+    assert_eq!(
+        legacy_http_tool_text(&extra).as_deref(),
+        Some("tool:alpha"),
+        "changing only the gateway strict flag must admit the extra property: {extra:?}"
+    );
+
+    drop(lenient);
+    lenient_gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let paged = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        Some(1),
+    );
+    let default_gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+    let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-page-size", "1.0.0")
+            .connect_http_with_cx(public_http_target(paged.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the paged as_proxy gateway");
+    let first = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("gateway list_page_size(1) must page prefixed tools");
+    assert_eq!(
+        first.tools.len(),
+        1,
+        "as_proxy gateway list_page_size(1) must create a real continuation: {first:?}"
+    );
+    let first_name = first.tools[0].name.clone();
+    assert!(
+        first_name == prefixed || first_name == prefixed_fast,
+        "the first as_proxy page must retain a prefixed catalog tool: {first:?}"
+    );
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first as_proxy page must carry an opaque cursor");
+
+    let second = runtime_block_on_bounded(&cx, client.list_tools(&cx, Some(cursor.as_str())))
+        .expect("the as_proxy cursor continuation must reach the second page");
+    assert_eq!(
+        second.tools.len(),
+        1,
+        "the as_proxy continuation must retain one remaining prefixed tool: {second:?}"
+    );
+    assert_ne!(
+        second.tools[0].name, first_name,
+        "the continuation must retain the other prefixed tool: {second:?}"
+    );
+    assert!(
+        second.tools[0].name == prefixed || second.tools[0].name == prefixed_fast,
+        "the continuation must stay on the prefixed as_proxy catalog: {second:?}"
+    );
+
+    drop(client);
+    paged.shutdown();
+
+    let mut unpaged = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-page-size-off", "1.0.0")
+            .connect_http_with_cx(public_http_target(default_gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the default as_proxy gateway");
+    let listed = runtime_block_on_bounded(&cx, unpaged.list_tools(&cx, None))
+        .expect("the default as_proxy catalog must still list prefixed tools");
+    assert!(
+        listed.tools.len() >= 2,
+        "changing only the missing list_page_size must not invent a 1-item page: {listed:?}"
+    );
+
+    drop(unpaged);
+    default_gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let paged = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        false,
+        false,
+        Some(1),
+    );
+    let default_gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+    let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let mut client = connect_legacy_http_client(
+        &cx,
+        paged.address(),
+        "e2e-public-http-legacy-as-proxy-page-size",
+    );
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy list_page_size first",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("gateway list_page_size(1) must page prefixed tools");
+    assert_eq!(
+        first.tools.len(),
+        1,
+        "as_proxy gateway list_page_size(1) must create a real continuation: {first:?}"
+    );
+    let first_name = first.tools[0].name.clone();
+    assert!(
+        first_name == prefixed || first_name == prefixed_fast,
+        "the first as_proxy page must retain a prefixed catalog tool: {first:?}"
+    );
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first as_proxy page must carry an opaque cursor");
+
+    let second = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy list_page_size continuation",
+        client.list_tools(
+            &cx,
+            legacy_2024::ListToolsParams {
+                cursor: Some(cursor),
+                include_tags: None,
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("the as_proxy cursor continuation must reach the second page");
+    assert_eq!(
+        second.tools.len(),
+        1,
+        "the as_proxy continuation must retain one remaining prefixed tool: {second:?}"
+    );
+    assert_ne!(
+        second.tools[0].name, first_name,
+        "the continuation must retain the other prefixed tool: {second:?}"
+    );
+
+    drop(client);
+    paged.shutdown();
+
+    let mut unpaged = connect_legacy_http_client(
+        &cx,
+        default_gateway.address(),
+        "e2e-public-http-legacy-as-proxy-page-size-off",
+    );
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy default list",
+        unpaged.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("the default as_proxy catalog must still list prefixed tools");
+    assert!(
+        listed.tools.len() >= 2,
+        "changing only the missing list_page_size must not invent a 1-item page: {listed:?}"
+    );
+
+    drop(unpaged);
+    default_gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_list_page_size_pages_prefixed_tools() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        Some(1),
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-page-size", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the paged stdio as_proxy gateway");
+
+    let first = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("gateway list_page_size(1) must page prefixed stdio tools");
+    assert_eq!(
+        first.tools.len(),
+        1,
+        "stdio as_proxy list_page_size(1) must create a real continuation: {first:?}"
+    );
+    assert!(
+        first.tools[0].name.starts_with("ext/"),
+        "the first stdio as_proxy page must retain a prefixed catalog tool: {first:?}"
+    );
+    let first_name = first.tools[0].name.clone();
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first stdio as_proxy page must carry an opaque cursor");
+
+    let second = runtime_block_on_bounded(&cx, client.list_tools(&cx, Some(cursor.as_str())))
+        .expect("the stdio as_proxy cursor continuation must reach the second page");
+    assert_eq!(
+        second.tools.len(),
+        1,
+        "the stdio as_proxy continuation must retain one remaining prefixed tool: {second:?}"
+    );
+    assert_ne!(
+        second.tools[0].name, first_name,
+        "the continuation must retain a different prefixed tool: {second:?}"
+    );
+    assert!(
+        second.tools[0].name.starts_with("ext/"),
+        "the continuation must stay on the prefixed stdio as_proxy catalog: {second:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_default_list_is_not_page_size_1() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-page-size-off", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the default stdio as_proxy gateway");
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("the default stdio as_proxy catalog must still list prefixed tools");
+    assert!(
+        listed.tools.len() >= 2,
+        "changing only the missing list_page_size must not invent a 1-item page: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_list_page_size_pages_prefixed_tools() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        Some(1),
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-page-size",
+    );
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy list_page_size first",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("gateway list_page_size(1) must page prefixed stdio tools");
+    assert_eq!(
+        first.tools.len(),
+        1,
+        "stdio as_proxy list_page_size(1) must create a real continuation: {first:?}"
+    );
+    assert!(
+        first.tools[0].name.starts_with("ext/"),
+        "the first stdio as_proxy page must retain a prefixed catalog tool: {first:?}"
+    );
+    let first_name = first.tools[0].name.clone();
+    let cursor = first
+        .next_cursor
+        .clone()
+        .expect("the first stdio as_proxy page must carry an opaque cursor");
+
+    let second = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy list_page_size continuation",
+        client.list_tools(
+            &cx,
+            legacy_2024::ListToolsParams {
+                cursor: Some(cursor),
+                include_tags: None,
+                exclude_tags: None,
+            },
+        ),
+    )
+    .expect("the stdio as_proxy cursor continuation must reach the second page");
+    assert_eq!(
+        second.tools.len(),
+        1,
+        "the stdio as_proxy continuation must retain one remaining prefixed tool: {second:?}"
+    );
+    assert_ne!(
+        second.tools[0].name, first_name,
+        "the continuation must retain a different prefixed tool: {second:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_default_list_is_not_page_size_1() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(Vec::new());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-page-size-off",
+    );
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy default list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("the default stdio as_proxy catalog must still list prefixed tools");
+    assert!(
+        listed.tools.len() >= 2,
+        "changing only the missing list_page_size must not invent a 1-item page: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+/// Gateway that registers a local tool under the prefixed as_proxy name
+/// before installing the upstream catalog, so `on_duplicate` can keep or
+/// replace that collision.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_as_proxy_duplicate_gateway(
+    upstream: SocketAddr,
+    behavior: DuplicateBehavior,
+) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("as_proxy on_duplicate gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("as_proxy on_duplicate gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "as_proxy on_duplicate gateway HTTP server control receiver went away"
+                        .to_owned(),
+                );
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream, "/mcp")),
+                None,
+                None,
+                "e2e-http-as-proxy-duplicate-gateway".to_owned(),
+                "e2e-http-as-proxy-duplicate-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .map_err(|error| format!("as_proxy on_duplicate gateway HTTP plan failed: {error}"))?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-live-duplicate-upstream",
+                    "native-h1:e2e-live-duplicate-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-http-as-proxy-duplicate".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .map_err(|error| {
+                    format!("live HTTP as_proxy on_duplicate upstream connect failed: {error}")
+                })?;
+            let catalog = proxy.catalog_typed().map_err(|error| {
+                format!("live HTTP as_proxy on_duplicate catalog failed: {error}")
+            })?;
+            let server = modern::ServerBuilder::new("e2e-http-as-proxy-duplicate", "1.0.0")
+                .on_duplicate(behavior)
+                .tool(LocalPrefixedPublicHttpValue {
+                    name: format!("ext/{PUBLIC_HTTP_TOOL_NAME}"),
+                })
+                .as_proxy_typed("ext", proxy, catalog)
+                .map_err(|error| format!("as_proxy_typed on_duplicate install failed: {error}"))?
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message =
+                        format!("as_proxy on_duplicate gateway HTTP server bind failed: {error}");
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!(
+                        "as_proxy on_duplicate gateway HTTP server address failed: {error}"
+                    );
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "as_proxy on_duplicate gateway HTTP server startup receiver went away"
+                        .to_owned(),
+                );
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!("as_proxy on_duplicate gateway HTTP server stopped unexpectedly: {error}")
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("as_proxy on_duplicate gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("as_proxy on_duplicate gateway HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!("as_proxy on_duplicate gateway HTTP server readiness channel disconnected")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_on_duplicate_error_keeps_local_prefixed_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let gateway =
+        spawn_modern_http_as_proxy_duplicate_gateway(upstream.address(), DuplicateBehavior::Error);
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-duplicate-error", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the Error-on-duplicate as_proxy gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let kept = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("Error must keep the local prefixed tool callable");
+    assert!(
+        kept.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "local:alpha",
+            _ => false,
+        }),
+        "as_proxy on_duplicate Error must keep the local prefixed handler: {kept:?}"
+    );
+    assert_eq!(
+        upstream.handler_calls.tool.load(Ordering::SeqCst),
+        0,
+        "Error must not forward the colliding prefixed name to the upstream"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed local or upstream tool");
+    let _ = missing;
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_on_duplicate_replace_installs_proxied_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let gateway = spawn_modern_http_as_proxy_duplicate_gateway(
+        upstream.address(),
+        DuplicateBehavior::Replace,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-duplicate-replace", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the Replace-on-duplicate as_proxy gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let replaced = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("Replace must install the proxied catalog entry");
+    assert!(
+        replaced.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "changing only on_duplicate to Replace must reach the prefixed upstream: {replaced:?}"
+    );
+    assert_eq!(
+        upstream.handler_calls.tool.load(Ordering::SeqCst),
+        1,
+        "Replace must forward the colliding prefixed name to the upstream"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed upstream tool");
+    let _ = missing;
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_http_duplicate_gateway(
+    upstream: SocketAddr,
+    behavior: DuplicateBehavior,
+) -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
+    let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
+    let (finished_tx, finished_rx) = mpsc::sync_channel::<Result<HttpServerShutdown, String>>(1);
+    let join = Some(thread::spawn(move || {
+        let ready_for_spawn_failure = ready_tx.clone();
+        let finished_for_spawn_failure = finished_tx.clone();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(
+                asupersync::runtime::reactor::create_reactor()
+                    .expect("legacy as_proxy on_duplicate gateway HTTP server reactor initializes"),
+            )
+            .build()
+            .expect("legacy as_proxy on_duplicate gateway HTTP server installs an owned runtime");
+        let outcome = runtime.block_on(async move {
+            let cx =
+                Cx::current().expect("owned gateway runtime installs an ambient server context");
+            if server_cx_tx.send(cx.clone()).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "legacy as_proxy on_duplicate gateway HTTP server control receiver went away"
+                        .to_owned(),
+                );
+            }
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream, "/sse")),
+                Some(public_http_target(upstream, "/messages")),
+                "e2e-legacy-http-as-proxy-duplicate-gateway".to_owned(),
+                "e2e-legacy-http-as-proxy-duplicate-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .map_err(|error| {
+                format!("legacy as_proxy on_duplicate gateway HTTP plan failed: {error}")
+            })?;
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-duplicate-upstream",
+                    "native-h1:e2e-legacy-duplicate-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-http-as-proxy-duplicate".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities {
+                        sampling: Some(Default::default()),
+                        elicitation: None,
+                        roots: Some(legacy_2024::RootsCapability {
+                            list_changed: false,
+                        }),
+                    },
+                    cx.clone(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "live exact-2024 as_proxy on_duplicate upstream connect failed: {error}"
+                    )
+                })?;
+            let catalog = proxy.catalog_typed().map_err(|error| {
+                format!("live exact-2024 as_proxy on_duplicate catalog failed: {error}")
+            })?;
+            let server = ServerBuilder::new("e2e-legacy-http-as-proxy-duplicate", "1.0.0")
+                .protocol_policy(ProtocolPolicy::LegacyOnly)
+                .expect("LegacyOnly is available")
+                .on_duplicate(behavior)
+                .tool(LocalPrefixedPublicHttpValue {
+                    name: format!("child/{PUBLIC_HTTP_TOOL_NAME}"),
+                })
+                .as_proxy_typed("child", proxy, catalog)
+                .map_err(|error| {
+                    format!("legacy as_proxy_typed on_duplicate install failed: {error}")
+                })?
+                .build();
+            let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    let message = format!(
+                        "legacy as_proxy on_duplicate gateway HTTP server bind failed: {error}"
+                    );
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            let address = match bound.local_addr() {
+                Ok(address) => address,
+                Err(error) => {
+                    let message = format!(
+                        "legacy as_proxy on_duplicate gateway HTTP server address failed: {error}"
+                    );
+                    let _ = ready_tx.send(Err(message.clone()));
+                    return Err(message);
+                }
+            };
+            if ready_tx.send(Ok(address)).is_err() {
+                cx.set_cancel_requested(true);
+                return Err(
+                    "legacy as_proxy on_duplicate gateway HTTP server startup receiver went away"
+                        .to_owned(),
+                );
+            }
+            bound.serve(&cx).await.map_err(|error| {
+                format!(
+                    "legacy as_proxy on_duplicate gateway HTTP server stopped unexpectedly: {error}"
+                )
+            })
+        });
+        if let Err(message) = &outcome {
+            let _ = ready_for_spawn_failure.send(Err(message.clone()));
+        }
+        let _ = finished_for_spawn_failure.send(outcome);
+    }));
+
+    let mut startup = HttpServerStartupGuard {
+        server_cx: None,
+        server_cx_rx: Some(server_cx_rx),
+        finished: Some(finished_rx),
+        join,
+    };
+    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let address = loop {
+        startup.capture_server_cx();
+        let remaining = startup_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("legacy as_proxy on_duplicate gateway HTTP server startup exceeded its bound");
+        }
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(address)) => break address,
+            Ok(Err(error)) => {
+                panic!("legacy as_proxy on_duplicate gateway HTTP server failed to start: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                startup.resume_thread_panic_if_finished();
+                panic!(
+                    "legacy as_proxy on_duplicate gateway HTTP server readiness channel disconnected"
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    startup.capture_server_cx();
+    let (server_cx, finished, join) = startup.into_parts();
+
+    HttpServerFixture {
+        address,
+        server_cx,
+        finished,
+        shutdown_completion: None,
+        join,
+        nonquiescent: None,
+        handler_calls,
+    }
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_on_duplicate_error_keeps_local_prefixed_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let gateway =
+        spawn_legacy_as_proxy_http_duplicate_gateway(upstream.address(), DuplicateBehavior::Error);
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-duplicate-error",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let kept = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy on_duplicate Error call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed,
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("Error must keep the local prefixed tool callable");
+    assert_eq!(
+        legacy_http_tool_text(&kept).as_deref(),
+        Some("local:alpha"),
+        "as_proxy on_duplicate Error must keep the local prefixed handler: {kept:?}"
+    );
+    assert_eq!(
+        upstream.handler_calls.tool.load(Ordering::SeqCst),
+        0,
+        "Error must not forward the colliding prefixed name to the upstream"
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy on_duplicate Error unprefixed",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TOOL_NAME.to_owned(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed local or upstream tool");
+    let _ = missing;
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_on_duplicate_replace_installs_proxied_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let gateway = spawn_legacy_as_proxy_http_duplicate_gateway(
+        upstream.address(),
+        DuplicateBehavior::Replace,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-duplicate-replace",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let replaced = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy on_duplicate Replace call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed,
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("Replace must install the proxied catalog entry");
+    assert_eq!(
+        legacy_http_tool_text(&replaced).as_deref(),
+        Some("tool:alpha"),
+        "changing only on_duplicate to Replace must reach the prefixed upstream: {replaced:?}"
+    );
+    assert_eq!(
+        upstream.handler_calls.tool.load(Ordering::SeqCst),
+        1,
+        "Replace must forward the colliding prefixed name to the upstream"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_session_state_uses_shared_upstream_bag() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(Vec::new());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-state",
+    );
+    let mut peer = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-state-peer",
+    );
+
+    let written = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy session state write",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/state_probe".to_owned(),
+                arguments: Some(json!({"action": "write", "value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("exact-2024 stdio as_proxy must write session state on the upstream binding");
+    assert_eq!(
+        legacy_http_tool_text(&written).as_deref(),
+        Some("state:alpha"),
+        "set_state then get_state on the same as_proxy stdio write must retain the value: {written:?}"
+    );
+
+    let later_read = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy session state later read",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/state_probe".to_owned(),
+                arguments: Some(json!({"action": "read", "value": ""})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a later exact-2024 as_proxy stdio tools/call must still be admitted");
+    assert_eq!(
+        legacy_http_tool_text(&later_read).as_deref(),
+        Some("state:alpha"),
+        "stdio as_proxy must reuse one upstream session bag: {later_read:?}"
+    );
+
+    let peer_read = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy session state peer read",
+        peer.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/state_probe".to_owned(),
+                arguments: Some(json!({"action": "read", "value": ""})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("a peer inbound SSE session must still be admitted");
+    assert_eq!(
+        legacy_http_tool_text(&peer_read).as_deref(),
+        Some("state:alpha"),
+        "as_proxy must keep one upstream stdio session bag across inbound clients: {peer_read:?}"
+    );
+
+    drop(client);
+    drop(peer);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_session_state_uses_shared_upstream_bag() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-state", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the stdio as_proxy session-state gateway");
+
+    let written = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            "ext/state_probe",
+            json!({"action": "write", "value": "alpha"}),
+        ),
+    )
+    .expect("as_proxy stdio must write session state on the upstream binding");
+    assert!(
+        written.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "state:alpha",
+            _ => false,
+        }),
+        "set_state then get_state on the same as_proxy stdio write must retain the value: {written:?}"
+    );
+
+    let later_read = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            "ext/state_probe",
+            json!({"action": "read", "value": ""}),
+        ),
+    )
+    .expect("a later as_proxy stdio POST must still be admitted");
+    assert!(
+        later_read.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "state:alpha",
+            _ => false,
+        }),
+        "stdio as_proxy must reuse one upstream session bag across inbound POSTs: {later_read:?}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "state_probe", json!({"action": "read", "value": ""})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed state tool");
+    let _ = missing;
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_strict_input_refuses_unknown_property() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+        None,
+    );
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-strict-on", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the strict stdio as_proxy gateway");
+    let admitted = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect("strict stdio as_proxy must still admit declared arguments");
+    assert!(
+        admitted.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha",
+            _ => false,
+        }),
+        "declared arguments must reach prefixed ext/echo under gateway strict validation: {admitted:?}"
+    );
+
+    let refused = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha", "extra": 1})),
+    )
+    .expect("strict stdio as_proxy returns a complete tools/call result, not a transport failure");
+    assert!(
+        refused.is_error,
+        "an unknown property must become a tool-level error when gateway strict validation is on: {refused:?}"
+    );
+    assert!(
+        refused.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text.contains("do not match the declared input schema")
+                    || text.contains("additional property")
+            }
+            _ => false,
+        }),
+        "the stdio as_proxy strict refusal must name the input-schema mismatch: {refused:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_lenient_input_admits_unknown_property() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-strict-off", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the lenient stdio as_proxy gateway");
+    let extra = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha", "extra": 1})),
+    )
+    .expect("lenient stdio as_proxy must admit the same extra property");
+    assert!(
+        extra.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha",
+            _ => false,
+        }),
+        "changing only the gateway strict flag must admit the extra property: {extra:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_strict_input_refuses_unknown_property() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        true,
+        None,
+    );
+
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-strict-on",
+    );
+    let admitted = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy strict declared",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("strict stdio as_proxy must still admit declared arguments");
+    assert_eq!(
+        legacy_http_tool_text(&admitted).as_deref(),
+        Some("alpha"),
+        "declared arguments must reach prefixed ext/echo under gateway strict validation: {admitted:?}"
+    );
+
+    let refused = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy strict extra-property",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha", "extra": 1})),
+                meta: None,
+            },
+        ),
+    );
+    let refused = match refused {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        refused.contains("do not match the declared input schema")
+            || refused.contains("additional property")
+            || refused.contains("unknown"),
+        "the exact-2024 stdio as_proxy strict refusal must name the input-schema mismatch: {refused}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_lenient_input_admits_unknown_property() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-strict-off",
+    );
+    let extra = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy lenient extra-property",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha", "extra": 1})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("lenient stdio as_proxy must admit the same extra property");
+    assert_eq!(
+        legacy_http_tool_text(&extra).as_deref(),
+        Some("alpha"),
+        "changing only the gateway strict flag must admit the extra property: {extra:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_sliding_window_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        true,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-sliding",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy sliding first",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the first prefixed tools/call must be admitted by the gateway sliding window");
+    assert_eq!(
+        legacy_http_tool_text(&first).as_deref(),
+        Some("tool:alpha"),
+        "the first exact-2024 as_proxy sliding-window tools/call must reach the upstream: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy sliding second",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    let limited = match limited {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 as_proxy tools/call must keep the sliding-window error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy sliding tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("changing only the method must still be admitted by the gateway sliding window");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "tools/list must stay callable after prefixed tools/call is sliding-window limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_rate_limit_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        true,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-rate-limit",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy rate-limit first",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the first prefixed tools/call must be admitted by the gateway rate limiter");
+    assert_eq!(
+        legacy_http_tool_text(&first).as_deref(),
+        Some("tool:alpha"),
+        "the first exact-2024 as_proxy rate-limited tools/call must reach the upstream: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy rate-limit second",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed.clone(),
+                arguments: Some(json!({"value": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    let limited = match limited {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 as_proxy tools/call must keep the rate-limit error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy rate-limit tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("changing only the method must still be admitted by the gateway rate limiter");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == prefixed),
+        "tools/list must stay callable after prefixed tools/call is rate-limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_forwards_transformed_prefixed_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_transform_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-transform", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy transform gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_TRANSFORMED_TOOL_NAME}");
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("as_proxy must list the prefixed transformed tool");
+    let transformed = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == prefixed)
+        .unwrap_or_else(|| {
+            panic!("the as_proxy catalog must advertise the prefixed transformed name: {listed:?}")
+        });
+    assert!(
+        listed
+            .tools
+            .iter()
+            .all(|tool| tool.name != PUBLIC_HTTP_TRANSFORMED_TOOL_NAME
+                && tool.name != PUBLIC_HTTP_TOOL_NAME
+                && tool.name != format!("ext/{PUBLIC_HTTP_TOOL_NAME}")),
+        "as_proxy must not keep the unprefixed transformed name or the parent tool: {listed:?}"
+    );
+    let schema = serde_json::to_string(&transformed.input_schema)
+        .expect("the prefixed transformed input schema serializes");
+    assert!(
+        schema.contains("query"),
+        "as_proxy must retain the renamed argument on the prefixed catalog: {schema}"
+    );
+    assert!(
+        !schema.contains("\"value\""),
+        "as_proxy must drop the original argument name from the prefixed catalog: {schema}"
+    );
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_TRANSFORMED_TOOL_NAME,
+            json!({"query": "alpha"}),
+        ),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed transformed tool");
+    let _ = missing;
+
+    let looked_up = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"query": "alpha"})),
+    )
+    .expect("as_proxy must forward the renamed argument onto the live transformed upstream");
+    assert!(
+        looked_up.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "tool:alpha",
+            _ => false,
+        }),
+        "the rewritten argument must reach the parent handler through as_proxy: {looked_up:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_forwards_transformed_prefixed_tool() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_transform_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_TRANSFORMED_TOOL_NAME,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-transform",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TRANSFORMED_TOOL_NAME}");
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy transform tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("exact-2024 as_proxy must list the prefixed transformed tool");
+    let transformed = listed
+        .tools
+        .iter()
+        .find(|tool| tool.name == prefixed)
+        .unwrap_or_else(|| {
+            panic!(
+                "the exact-2024 as_proxy catalog must advertise the prefixed transformed name: {listed:?}"
+            )
+        });
+    assert!(
+        listed
+            .tools
+            .iter()
+            .all(|tool| tool.name != PUBLIC_HTTP_TRANSFORMED_TOOL_NAME
+                && tool.name != PUBLIC_HTTP_TOOL_NAME),
+        "exact-2024 as_proxy must not keep the unprefixed transformed name or the parent tool: {listed:?}"
+    );
+    let schema = serde_json::to_string(&transformed.input_schema)
+        .expect("the prefixed transformed input schema serializes");
+    assert!(
+        schema.contains("query"),
+        "exact-2024 as_proxy must retain the renamed argument on the prefixed catalog: {schema}"
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy transform unprefixed",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: PUBLIC_HTTP_TRANSFORMED_TOOL_NAME.to_owned(),
+                arguments: Some(json!({"query": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the missing prefix must not reach the unprefixed transformed tool: {missing:?}"
+    );
+
+    let looked_up = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy transform tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: prefixed,
+                arguments: Some(json!({"query": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "exact-2024 as_proxy must forward the renamed argument onto the live transformed upstream",
+    );
+    assert_eq!(
+        legacy_http_tool_text(&looked_up).as_deref(),
+        Some("tool:alpha"),
+        "the rewritten argument must reach the parent handler through exact-2024 as_proxy: {looked_up:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_cache_hits_prefixed_allowlisted_tool() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        Some(vec!["ext/cache_probe".to_owned()]),
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-cache", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy cache gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "cache_probe", json!({"token": "alpha"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed stdio cache_probe");
+    let _ = missing;
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/cache_probe", json!({"token": "alpha"})),
+    )
+    .expect("the first allowlisted prefixed cache_probe must miss and reach the stdio upstream");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha:0",
+            _ => false,
+        }),
+        "the first stdio as_proxy cache miss must increment the process-local counter: {first:?}"
+    );
+
+    let cached = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/cache_probe", json!({"token": "alpha"})),
+    )
+    .expect("the second identical prefixed cache_probe must be a gateway cache hit");
+    assert!(
+        cached.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha:0",
+            _ => false,
+        }),
+        "the stdio as_proxy cache hit must keep the first complete result: {cached:?}"
+    );
+
+    let missed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/cache_probe", json!({"token": "beta"})),
+    )
+    .expect("changing only the arguments must miss the stdio as_proxy gateway cache");
+    assert!(
+        missed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "beta:1",
+            _ => false,
+        }),
+        "a stdio as_proxy cache miss must increment the process-local counter: {missed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_cache_hits_prefixed_allowlisted_tool() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        Some(vec!["ext/cache_probe".to_owned()]),
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-cache",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy cache unprefixed",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "cache_probe".to_owned(),
+                arguments: Some(json!({"token": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the missing prefix must not reach the unprefixed stdio cache_probe: {missing:?}"
+    );
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy cache miss",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/cache_probe".to_owned(),
+                arguments: Some(json!({"token": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the first allowlisted prefixed cache_probe must miss and reach the stdio upstream");
+    assert_eq!(
+        legacy_http_tool_text(&first).as_deref(),
+        Some("alpha:0"),
+        "the first exact-2024 stdio as_proxy cache miss must increment: {first:?}"
+    );
+
+    let cached = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy cache hit",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/cache_probe".to_owned(),
+                arguments: Some(json!({"token": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the second identical prefixed cache_probe must be a gateway cache hit");
+    assert_eq!(
+        legacy_http_tool_text(&cached).as_deref(),
+        Some("alpha:0"),
+        "the exact-2024 stdio as_proxy cache hit must keep the first complete result: {cached:?}"
+    );
+
+    let missed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy cache arg miss",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/cache_probe".to_owned(),
+                arguments: Some(json!({"token": "beta"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("changing only the arguments must miss the stdio as_proxy gateway cache");
+    assert_eq!(
+        legacy_http_tool_text(&missed).as_deref(),
+        Some("beta:1"),
+        "a exact-2024 stdio as_proxy cache miss must increment: {missed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_rate_limit_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        true,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-rate-limit", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy rate-limit gateway");
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect("the first prefixed stdio tools/call must be admitted by the gateway rate limiter");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha",
+            _ => false,
+        }),
+        "the first stdio as_proxy rate-limited tools/call must reach the echo process: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect_err("a second prefixed stdio tools/call must be refused by the gateway rate limiter");
+    let limited = format!("{limited:?}");
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second stdio as_proxy tools/call must keep the rate-limit error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("changing only the method must still be admitted by the gateway rate limiter");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == "ext/echo"),
+        "tools/list must stay callable after prefixed stdio tools/call is rate-limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_rate_limit_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        true,
+        false,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-rate-limit",
+    );
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy rate-limit first",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the first prefixed stdio tools/call must be admitted by the gateway rate limiter");
+    assert_eq!(
+        legacy_http_tool_text(&first).as_deref(),
+        Some("alpha"),
+        "the first exact-2024 stdio as_proxy rate-limited tools/call must reach the echo process: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy rate-limit second",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    let limited = match limited {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 stdio as_proxy tools/call must keep the rate-limit error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy rate-limit tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("changing only the method must still be admitted by the gateway rate limiter");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == "ext/echo"),
+        "tools/list must stay callable after prefixed stdio tools/call is rate-limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_sliding_window_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        true,
+        false,
+        false,
+        None,
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-sliding", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy sliding-window gateway");
+
+    let first = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect("the first prefixed stdio tools/call must be admitted by the gateway sliding window");
+    assert!(
+        first.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha",
+            _ => false,
+        }),
+        "the first stdio as_proxy sliding-window tools/call must reach the echo process: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect_err("a second prefixed stdio tools/call must be refused by the gateway sliding window");
+    let limited = format!("{limited:?}");
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second stdio as_proxy tools/call must keep the sliding-window error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded(&cx, client.list_tools(&cx, None))
+        .expect("changing only the method must still be admitted by the gateway sliding window");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == "ext/echo"),
+        "tools/list must stay callable after prefixed stdio tools/call is sliding-window limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_sliding_window_refuses_second_prefixed_call() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        true,
+        false,
+        false,
+        None,
+    );
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-sliding",
+    );
+
+    let first = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy sliding first",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the first prefixed stdio tools/call must be admitted by the gateway sliding window");
+    assert_eq!(
+        legacy_http_tool_text(&first).as_deref(),
+        Some("alpha"),
+        "the first exact-2024 stdio as_proxy sliding-window tools/call must reach the echo process: {first:?}"
+    );
+
+    let limited = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy sliding second",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    let limited = match limited {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        limited.contains("Rate limit exceeded"),
+        "the refused second exact-2024 stdio as_proxy tools/call must keep the sliding-window error: {limited}"
+    );
+
+    let listed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy sliding tools/list",
+        client.list_tools(&cx, legacy_2024::ListToolsParams::default()),
+    )
+    .expect("changing only the method must still be admitted by the gateway sliding window");
+    assert!(
+        listed.tools.iter().any(|tool| tool.name == "ext/echo"),
+        "tools/list must stay callable after prefixed stdio tools/call is sliding-window limited: {listed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_static_token_refuses_missing_and_wrong() {
+    const MAX_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+
+    fn exchange(address: SocketAddr, authorization: Option<&str>, body: &[u8]) -> Vec<u8> {
+        let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+            .expect("native HTTP client connects to the stdio as_proxy auth gateway");
+        stream
+            .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client read deadline is configured");
+        stream
+            .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+            .expect("native HTTP client write deadline is configured");
+        let authorization_header =
+            authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {address}\r\n{authorization_header}Accept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: tools/call\r\nMcp-Name: ext/echo\r\nContent-Length: {}\r\n\r\n",
+            modern::PROTOCOL_VERSION,
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(body))
+            .expect("native HTTP request commits to the stdio as_proxy auth gateway");
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .expect("native HTTP response reads within its configured deadline");
+            if read == 0 {
+                break;
+            }
+            assert!(
+                response
+                    .len()
+                    .checked_add(read)
+                    .is_some_and(|size| size <= MAX_NATIVE_HTTP_RESPONSE_BYTES),
+                "native HTTP response exceeds the test's bounded response budget"
+            );
+            response.extend_from_slice(&buffer[..read]);
+        }
+        response
+    }
+
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        true,
+        false,
+        None,
+    );
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": "ext/echo",
+            "arguments": {"message": "alpha"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/tasks": {}
+                    }
+                },
+            },
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool).expect("stdio as_proxy auth tool request serializes");
+
+    let missing = exchange(gateway.address(), None, &tool_body);
+    assert!(
+        missing.starts_with(b"HTTP/1.1 401"),
+        "missing Authorization must be refused before the stdio as_proxy gateway dispatches: {}",
+        String::from_utf8_lossy(&missing)
+    );
+
+    let wrong = exchange(gateway.address(), Some("Bearer beta"), &tool_body);
+    assert!(
+        wrong.starts_with(b"HTTP/1.1 401"),
+        "changing only the bearer token must be refused before stdio as_proxy dispatch: {}",
+        String::from_utf8_lossy(&wrong)
+    );
+
+    let admitted = exchange(gateway.address(), Some("Bearer alpha"), &tool_body);
+    assert!(
+        admitted.starts_with(b"HTTP/1.1 200"),
+        "the matching bearer token must admit prefixed stdio tools/call: {}",
+        String::from_utf8_lossy(&admitted)
+    );
+    let body = String::from_utf8_lossy(&admitted);
+    assert!(
+        body.contains("alpha"),
+        "the matching stdio as_proxy bearer token must reach ext/echo: {body}"
+    );
+
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_static_token_refuses_missing_and_wrong() {
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        true,
+        false,
+        None,
+    );
+
+    let (_missing_stream, missing) =
+        write_legacy_native_http(gateway.address(), "GET", "/sse", None, &[], false);
+    assert_legacy_bearer_challenge(&missing, "missing Authorization on stdio as_proxy GET /sse");
+
+    let (_wrong_stream, wrong) = write_legacy_native_http(
+        gateway.address(),
+        "GET",
+        "/sse",
+        Some("Bearer beta"),
+        &[],
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong, "wrong bearer on stdio as_proxy GET /sse");
+
+    let (mut sse, opened, messages) = initialize_legacy_native_session(
+        gateway.address(),
+        Some("Bearer alpha"),
+        "e2e-public-http-legacy-stdio-as-proxy-auth",
+    );
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": "ext/echo",
+            "arguments": {"message": "alpha"},
+        })),
+        2_i64,
+    );
+    let tool_body =
+        serde_json::to_vec(&tool).expect("exact-2024 stdio as_proxy tools/call serializes");
+
+    let (_missing_post, missing_post) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        None,
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(
+        &missing_post,
+        "missing Authorization on stdio as_proxy POST /messages",
+    );
+
+    let (_wrong_post, wrong_post) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        Some("Bearer beta"),
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(&wrong_post, "wrong bearer on stdio as_proxy POST /messages");
+
+    let (_tool_stream, tool_response) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        Some("Bearer alpha"),
+        &tool_body,
+        false,
+    );
+    assert!(
+        tool_response.starts_with(b"HTTP/1.1 202") || tool_response.starts_with(b"HTTP/1.1 200"),
+        "the matching bearer token must admit prefixed stdio as_proxy tools/call: {}",
+        String::from_utf8_lossy(&tool_response)
+    );
+
+    let mut sse_body = opened;
+    let retained = read_legacy_sse_until(&mut sse, &mut sse_body, "alpha");
+    assert!(
+        retained.contains("alpha"),
+        "the matching exact-2024 stdio as_proxy bearer token must reach ext/echo: {retained}"
+    );
+
+    drop(sse);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_forwards_transformed_prefixed_tool() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
+        false,
+        vec![("FASTMCP_TRANSFORM_ECHO".to_owned(), "1".to_owned())],
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-transform", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy transform gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "echo_text", json!({"text": "alpha"})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed transformed echo");
+    let _ = missing;
+
+    let looked_up = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo_text", json!({"text": "alpha"})),
+    )
+    .expect("as_proxy must forward the renamed argument onto the live stdio transformed echo");
+    assert!(
+        looked_up.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha",
+            _ => false,
+        }),
+        "the rewritten argument must reach the parent echo through as_proxy: {looked_up:?}"
+    );
+
+    let parent = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/echo", json!({"message": "alpha"})),
+    )
+    .expect("the prefixed parent echo must stay registered beside the transform");
+    assert!(
+        parent.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "alpha",
+            _ => false,
+        }),
+        "the prefixed parent echo must keep the original argument name: {parent:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_forwards_transformed_prefixed_tool() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![(
+        "FASTMCP_TRANSFORM_ECHO".to_owned(),
+        "1".to_owned(),
+    )]);
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-transform",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy transform unprefixed",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "echo_text".to_owned(),
+                arguments: Some(json!({"text": "alpha"})),
+                meta: None,
+            },
+        ),
+    );
+    assert!(
+        missing.is_err(),
+        "changing only the missing prefix must not reach the unprefixed transformed echo: {missing:?}"
+    );
+
+    let looked_up = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy transform tools/call",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo_text".to_owned(),
+                arguments: Some(json!({"text": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("exact-2024 as_proxy must forward the renamed argument onto the live stdio transformed echo");
+    assert_eq!(
+        legacy_http_tool_text(&looked_up).as_deref(),
+        Some("alpha"),
+        "the rewritten argument must reach the parent echo through exact-2024 as_proxy: {looked_up:?}"
+    );
+
+    let parent = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy transform parent echo",
+        client.call_tool(
+            &cx,
+            legacy_2024::CallToolParams {
+                name: "ext/echo".to_owned(),
+                arguments: Some(json!({"message": "alpha"})),
+                meta: None,
+            },
+        ),
+    )
+    .expect("the prefixed parent echo must stay registered beside the transform");
+    assert_eq!(
+        legacy_http_tool_text(&parent).as_deref(),
+        Some("alpha"),
+        "the prefixed parent echo must keep the original argument name: {parent:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
 fn e2e_public_http_as_proxy_resource_composes_nested_prompt() {
     let cx = Cx::for_request();
     let upstream = spawn_modern_compose_prompt_http_server();
@@ -15482,6 +19784,12 @@ fn e2e_public_http_as_proxy_request_timeout_of_hold_tool_without_handler_timeout
         None,
         false,
         Some(1),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
     );
     let mut client = runtime_block_on_bounded(
         &cx,
@@ -15613,8 +19921,18 @@ fn e2e_public_http_legacy_as_proxy_request_timeout_of_hold_tool_without_handler_
 #[test]
 fn e2e_public_http_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_timeout() {
     let cx = Cx::for_request();
-    let (gateway, _) =
-        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), false, Some(1));
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_options(
+        false,
+        Vec::new(),
+        false,
+        Some(1),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -15668,7 +19986,17 @@ fn e2e_public_http_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_t
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_timeout() {
     let cx = Cx::for_request();
-    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), false, Some(1));
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        Vec::new(),
+        false,
+        Some(1),
+        None,
+        false,
+        false,
+        false,
+        false,
+        None,
+    );
     let mut client = connect_legacy_http_client(
         &cx,
         gateway.address(),
@@ -26988,6 +31316,121 @@ fn spawn_legacy_as_proxy_template_completion_upstream() -> HttpServerFixture {
     })
 }
 
+/// Live counting tool plus the catalog members required by as_proxy cache proofs.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_as_proxy_counting_upstream() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let mut fixture = spawn_legacy_http_server("modern as_proxy counting upstream", move || {
+        ServerBuilder::new("facade-http-as-proxy-count", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(CountingPublicHttpValue {
+                counters: tool_calls,
+            })
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    });
+    fixture.handler_calls = handler_calls;
+    fixture
+}
+
+/// Live exact-2024 counting tool plus the catalog members required by
+/// `spawn_legacy_as_proxy_http_gateway`.
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_counting_upstream() -> HttpServerFixture {
+    let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
+    let tool_calls = Arc::clone(&handler_calls);
+    let mut fixture = spawn_legacy_http_server("legacy as_proxy counting upstream", move || {
+        ServerBuilder::new("facade-http-legacy-proxy-count", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(CountingPublicHttpValue {
+                counters: tool_calls,
+            })
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    });
+    fixture.handler_calls = handler_calls;
+    fixture
+}
+
+/// Live modern session-state tool plus the catalog members required by as_proxy.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_as_proxy_state_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("modern as_proxy state upstream", || {
+        ServerBuilder::new("facade-http-as-proxy-state", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpStateTool)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+/// Live exact-2024 session-state tool plus the catalog members required by
+/// `spawn_legacy_as_proxy_http_gateway_configured`.
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_state_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy as_proxy state upstream", || {
+        ServerBuilder::new("facade-http-legacy-proxy-state", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpStateTool)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+/// Live transformed tool plus the catalog members required by as_proxy prefix proofs.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_as_proxy_transform_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("modern as_proxy transform upstream", || {
+        ServerBuilder::new("facade-http-as-proxy-transform", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(
+                transform::TransformedTool::from_tool(PublicHttpValue)
+                    .name(PUBLIC_HTTP_TRANSFORMED_TOOL_NAME)
+                    .rename_arg("value", "query")
+                    .build(),
+            )
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+/// Live exact-2024 transformed tool plus the catalog members required by
+/// `spawn_legacy_as_proxy_http_gateway_configured`.
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_transform_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy as_proxy transform upstream", || {
+        ServerBuilder::new("facade-http-legacy-proxy-transform", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(
+                transform::TransformedTool::from_tool(PublicHttpValue)
+                    .name(PUBLIC_HTTP_TRANSFORMED_TOOL_NAME)
+                    .rename_arg("value", "query")
+                    .build(),
+            )
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
 /// Live handler-panic plus fast-peer catalog for as_proxy sanitization proofs.
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 fn spawn_modern_as_proxy_panic_upstream() -> HttpServerFixture {
@@ -26998,7 +31441,10 @@ fn spawn_modern_as_proxy_panic_upstream() -> HttpServerFixture {
             .tool(PublicHttpPanicTool)
             .tool(PublicHttpFastTool)
             .prompt(PublicHttpInstructionPrompt)
+            .prompt(PublicHttpPanicPrompt)
             .resource(PublicHttpSnapshotResource)
+            .resource(PublicHttpPanicResource)
+            .completion_handler(PublicHttpPanicCompletion)
             .build()
     })
 }
@@ -27015,7 +31461,10 @@ fn spawn_legacy_as_proxy_panic_upstream() -> HttpServerFixture {
             .tool(PublicHttpPanicTool)
             .tool(PublicHttpFastTool)
             .prompt(PublicHttpInstructionPrompt)
+            .prompt(PublicHttpPanicPrompt)
             .resource(PublicHttpSnapshotResource)
+            .resource(PublicHttpPanicResource)
+            .legacy_completion_handler(PublicHttpPanicCompletion)
             .build()
     })
 }
@@ -27083,7 +31532,9 @@ fn spawn_legacy_http_stdio_as_proxy_gateway() -> HttpServerFixture {
 fn spawn_legacy_http_stdio_as_proxy_gateway_with_env(
     extra_env: Vec<(String, String)>,
 ) -> HttpServerFixture {
-    spawn_legacy_http_stdio_as_proxy_gateway_with_options(extra_env, false, None)
+    spawn_legacy_http_stdio_as_proxy_gateway_with_options(
+        extra_env, false, None, None, false, false, false, false, None,
+    )
 }
 
 #[cfg(all(unix, feature = "proxy"))]
@@ -27091,6 +31542,12 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
 ) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -27163,6 +31620,37 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
                     .mask_error_details(mask_error_details);
             if let Some(request_timeout_secs) = request_timeout_secs {
                 builder = builder.request_timeout(request_timeout_secs);
+            }
+            if let Some(cache_tools) = cache_tools {
+                builder = builder.middleware(
+                    caching::ResponseCachingMiddleware::new().include_tools(cache_tools),
+                );
+            }
+            if rate_limit {
+                builder = builder.middleware(
+                    rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1),
+                );
+            }
+            if sliding_window {
+                builder = builder.middleware(
+                    rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
+                );
+            }
+            if static_token {
+                let verifier = StaticTokenVerifier::new([(
+                    "alpha",
+                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                )])
+                .expect("the deterministic exact-2024 stdio as_proxy gateway bearer verifier is valid")
+                .with_allowed_schemes(["Bearer"])
+                .expect("the exact-2024 stdio as_proxy gateway bearer scheme allowlist is valid");
+                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            }
+            if strict_input {
+                builder = builder.strict_input_validation(true);
+            }
+            if let Some(page_size) = list_page_size {
+                builder = builder.list_page_size(page_size);
             }
             let server = builder
                 .as_proxy("ext", stdio)
@@ -27244,6 +31732,29 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
 
 #[cfg(feature = "proxy")]
 fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    spawn_legacy_as_proxy_http_gateway_configured(
+        upstream,
+        None,
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        false,
+        false,
+        None,
+    )
+}
+
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_http_gateway_configured(
+    upstream: SocketAddr,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    required_tool_name: &'static str,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -27307,9 +31818,9 @@ fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture
                     "exact-2024 HTTP as_proxy catalog must stay on the 2024 tool model".to_owned(),
                 );
             };
-            if !tools.iter().any(|tool| tool.name == PUBLIC_HTTP_TOOL_NAME) {
+            if !tools.iter().any(|tool| tool.name == required_tool_name) {
                 return Err(format!(
-                    "live exact-2024 HTTP proxy catalog omitted {PUBLIC_HTTP_TOOL_NAME}: {tools:?}"
+                    "live exact-2024 HTTP proxy catalog omitted {required_tool_name}: {tools:?}"
                 ));
             }
             let ProxyPromptCatalog::Legacy(prompts) = &catalog.prompts else {
@@ -27339,9 +31850,41 @@ fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture
                     "live exact-2024 HTTP proxy catalog omitted {PUBLIC_HTTP_RESOURCE_URI}: {resources:?}"
                 ));
             }
-            let server = ServerBuilder::new("e2e-legacy-http-gateway", "1.0.0")
+            let mut builder = ServerBuilder::new("e2e-legacy-http-gateway", "1.0.0")
                 .protocol_policy(ProtocolPolicy::LegacyOnly)
-                .expect("LegacyOnly is available")
+                .expect("LegacyOnly is available");
+            if let Some(cache_tools) = cache_tools {
+                builder = builder.middleware(
+                    caching::ResponseCachingMiddleware::new().include_tools(cache_tools),
+                );
+            }
+            if rate_limit {
+                builder = builder.middleware(
+                    rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1),
+                );
+            }
+            if sliding_window {
+                builder = builder.middleware(
+                    rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
+                );
+            }
+            if static_token {
+                let verifier = StaticTokenVerifier::new([(
+                    "alpha",
+                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                )])
+                .expect("the deterministic exact-2024 as_proxy gateway bearer verifier is valid")
+                .with_allowed_schemes(["Bearer"])
+                .expect("the exact-2024 as_proxy gateway bearer scheme allowlist is valid");
+                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            }
+            if strict_input {
+                builder = builder.strict_input_validation(true);
+            }
+            if let Some(page_size) = list_page_size {
+                builder = builder.list_page_size(page_size);
+            }
+            let server = builder
                 .as_proxy_typed("child", proxy, catalog)
                 .map_err(|error| format!("legacy as_proxy_typed install failed: {error}"))?
                 .build();
@@ -35786,6 +40329,1718 @@ mod live_websocket_bind {
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
+    fn e2e_public_websocket_as_proxy_sanitizes_prefixed_catalog_and_completion_panic() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy catalog-panic runtime installs an ambient context",
+            );
+            let panic_upstream = spawn_modern_as_proxy_panic_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(panic_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-catalog-panic-gateway".to_owned(),
+                "e2e-ws-as-proxy-catalog-panic-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket catalog-panic gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-catalog-panic-upstream",
+                    "native-h1:e2e-ws-as-proxy-catalog-panic-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-catalog-panic".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP catalog-panic proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP catalog-panic proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-catalog-panic-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed catalog-panic install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy catalog-panic must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy catalog-panic publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy catalog-panic serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket catalog-panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-catalog-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy catalog-panic over bind_websocket",
+            );
+            let prefixed_prompt = format!("ext/{PUBLIC_HTTP_PANIC_PROMPT_NAME}");
+            let prefixed_peer_prompt = format!("ext/{PUBLIC_HTTP_PROMPT_NAME}");
+            let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let missing_resource = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic prefixed resource",
+                client.read_resource(&cx, &format!("ext/{PUBLIC_HTTP_PANIC_RESOURCE_URI}")),
+            )
+            .await
+            .expect_err("modern as_proxy must not invent a prefixed panic resource URI");
+            let _ = missing_resource;
+
+            let panicked_resource = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_PANIC_RESOURCE_URI),
+            )
+            .await;
+            let panicked_resource = match panicked_resource {
+                Ok(result) => panic!(
+                    "a panicking as_proxy WebSocket resources/read must stay a protocol error: {result:?}"
+                ),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked_resource.contains("Internal server error")
+                    || panicked_resource.contains("InternalError"),
+                "as_proxy WebSocket must sanitize an upstream resource panic: {panicked_resource}"
+            );
+            assert!(
+                !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "as_proxy WebSocket must not leak the upstream resource unwind payload: {panicked_resource}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic unprefixed prompt",
+                client.get_prompt(&cx, PUBLIC_HTTP_PANIC_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect_err("changing only the prompt name must not reach the unprefixed panic prompt");
+            let _ = missing_prompt;
+
+            let panicked_prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic prompts/get",
+                client.get_prompt(&cx, &prefixed_prompt, HashMap::new()),
+            )
+            .await;
+            let panicked_prompt = match panicked_prompt {
+                Ok(result) => panic!(
+                    "a panicking as_proxy WebSocket prompts/get must stay a protocol error: {result:?}"
+                ),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked_prompt.contains("Internal server error")
+                    || panicked_prompt.contains("InternalError"),
+                "as_proxy WebSocket must sanitize an upstream prompt panic: {panicked_prompt}"
+            );
+            assert!(
+                !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "as_proxy WebSocket must not leak the upstream prompt unwind payload: {panicked_prompt}"
+            );
+
+            let missing_complete = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-panic unprefixed",
+                client.complete(
+                    &cx,
+                    modern::CompletionParams {
+                        reference: modern::CompletionReference::PromptWithTitle {
+                            name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+                            title: "Public HTTP E2E Prompt".to_owned(),
+                        },
+                        argument: modern::FinalCompletionArgument {
+                            name: "subject".to_owned(),
+                            value: "cross-era".to_owned(),
+                        },
+                        context: None,
+                    },
+                ),
+            )
+            .await
+            .expect_err(
+                "changing only the completion prompt name must not reach the unprefixed provider",
+            );
+            let _ = missing_complete;
+
+            let panicked_complete = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-panic complete",
+                client.complete(
+                    &cx,
+                    modern::CompletionParams {
+                        reference: modern::CompletionReference::PromptWithTitle {
+                            name: prefixed_peer_prompt.clone(),
+                            title: "Public HTTP E2E Prompt".to_owned(),
+                        },
+                        argument: modern::FinalCompletionArgument {
+                            name: "subject".to_owned(),
+                            value: "cross-era".to_owned(),
+                        },
+                        context: None,
+                    },
+                ),
+            )
+            .await;
+            let panicked_complete = match panicked_complete {
+                Ok(result) => panic!(
+                    "a panicking as_proxy WebSocket completion/complete must stay a protocol error: {result:?}"
+                ),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked_complete.contains("Internal server error")
+                    || panicked_complete.contains("InternalError"),
+                "as_proxy WebSocket must sanitize an upstream completion panic: {panicked_complete}"
+            );
+            assert!(
+                !panicked_complete.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "as_proxy WebSocket must not leak the upstream completion unwind payload: {panicked_complete}"
+            );
+
+            let peer_resource = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic peer resource",
+                client.read_resource(&cx, PUBLIC_HTTP_RESOURCE_URI),
+            )
+            .await
+            .expect("changing only the resource must still be admitted after a sanitized as_proxy panic");
+            let peer_resource = format!("{peer_resource:?}");
+            assert!(
+                peer_resource.contains(PUBLIC_HTTP_RESOURCE_TEXT),
+                "the unprefixed peer resource must still complete after a sanitized as_proxy panic: {peer_resource}"
+            );
+
+            let peer_prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic peer prompt",
+                client.get_prompt(
+                    &cx,
+                    &prefixed_peer_prompt,
+                    HashMap::from([("subject".to_owned(), PUBLIC_HTTP_TOOL_ARGUMENT.to_owned())]),
+                ),
+            )
+            .await
+            .expect("changing only the prompt must still be admitted after a sanitized as_proxy panic");
+            let peer_prompt = format!("{peer_prompt:?}");
+            assert!(
+                peer_prompt.contains(PUBLIC_HTTP_PROMPT_TEXT),
+                "the prefixed peer prompt must still complete after a sanitized as_proxy panic: {peer_prompt}"
+            );
+
+            let peer = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy catalog-panic fast peer",
+                client.call_tool(&cx, &prefixed_fast, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after a sanitized as_proxy panic");
+            assert!(
+                peer.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "the prefixed fast peer tool must still complete after a sanitized as_proxy catalog panic: {peer:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            panic_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_cache_hits_prefixed_allowlisted_tool() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy cache runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-cache-gateway".to_owned(),
+                "e2e-ws-as-proxy-cache-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket cache gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-cache-upstream",
+                    "native-h1:e2e-ws-as-proxy-cache-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-cache".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-cache-gateway", "1.0.0")
+                .middleware(
+                    caching::ResponseCachingMiddleware::new().include_tools(vec![prefixed.clone()]),
+                )
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed cache install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy cache must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy cache publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy cache serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy cache handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket cache must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy cache initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-cache", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy cache over bind_websocket");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy cache unprefixed",
+                client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed counting tool");
+            let _ = missing;
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy cache miss",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the first allowlisted prefixed tools/call must miss and reach the upstream");
+            assert!(
+                first.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "the first as_proxy WebSocket cache miss must return the upstream handler result: {first:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "the first allowlisted prefixed tools/call must invoke the upstream counting handler"
+            );
+
+            let cached = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy cache hit",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the second identical prefixed tools/call must be a gateway cache hit");
+            assert!(
+                cached.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "the as_proxy WebSocket cache hit must keep the first complete result: {cached:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "a gateway cache hit must not invoke the upstream counting handler again"
+            );
+
+            let missed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy cache arg miss",
+                client.call_tool(&cx, &prefixed, json!({"value": "beta"})),
+            )
+            .await
+            .expect("changing only the arguments must miss the gateway cache");
+            assert!(
+                missed.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:beta",
+                    _ => false,
+                }),
+                "the as_proxy WebSocket cache miss must reach the upstream with the new arguments: {missed:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                2,
+                "a different-arguments prefixed tools/call must invoke the upstream counting handler"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_rate_limit_refuses_second_prefixed_call() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy rate-limit runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-rate-limit-gateway".to_owned(),
+                "e2e-ws-as-proxy-rate-limit-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket rate-limit gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-rate-limit-upstream",
+                    "native-h1:e2e-ws-as-proxy-rate-limit-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-rate-limit".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-rate-limit-gateway", "1.0.0")
+                .middleware(
+                    rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1),
+                )
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed rate-limit install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy rate-limit must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy rate-limit publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy rate-limit serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy rate-limit handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket rate-limit must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy rate-limit initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-rate-limit", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy rate-limit over bind_websocket",
+            );
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy rate-limit first",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the first prefixed tools/call must be admitted by the gateway rate limiter");
+            assert!(
+                first.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "the first as_proxy WebSocket rate-limited tools/call must reach the upstream: {first:?}"
+            );
+
+            let limited = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy rate-limit second",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect_err("a second prefixed tools/call must be refused by the gateway rate limiter");
+            let limited = format!("{limited:?}");
+            assert!(
+                limited.contains("Rate limit exceeded"),
+                "the refused second as_proxy WebSocket tools/call must keep the rate-limit error: {limited}"
+            );
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy rate-limit tools/list",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("changing only the method must still be admitted by the gateway rate limiter");
+            assert!(
+                listed.tools.iter().any(|tool| tool.name == prefixed),
+                "tools/list must stay callable after prefixed tools/call is rate-limited: {listed:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_sliding_window_refuses_second_prefixed_call() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy sliding-window runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-sliding-gateway".to_owned(),
+                "e2e-ws-as-proxy-sliding-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket sliding-window gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-sliding-upstream",
+                    "native-h1:e2e-ws-as-proxy-sliding-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-sliding".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-sliding-gateway", "1.0.0")
+                .middleware(rate_limiting::SlidingWindowRateLimitingMiddleware::new(
+                    1, 60,
+                ))
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed sliding-window install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy sliding-window must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy sliding-window publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy sliding-window serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sliding handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket sliding-window must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sliding initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-sliding", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy sliding-window over bind_websocket",
+            );
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sliding first",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the first prefixed tools/call must be admitted by the gateway sliding window");
+            assert!(
+                first.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "the first as_proxy WebSocket sliding-window tools/call must reach the upstream: {first:?}"
+            );
+
+            let limited = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sliding second",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect_err("a second prefixed tools/call must be refused by the gateway sliding window");
+            let limited = format!("{limited:?}");
+            assert!(
+                limited.contains("Rate limit exceeded"),
+                "the refused second as_proxy WebSocket tools/call must keep the sliding-window error: {limited}"
+            );
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy sliding tools/list",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("changing only the method must still be admitted by the gateway sliding window");
+            assert!(
+                listed.tools.iter().any(|tool| tool.name == prefixed),
+                "tools/list must stay callable after prefixed tools/call is sliding-window limited: {listed:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_static_token_refuses_missing_and_wrong() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy auth runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-auth-gateway".to_owned(),
+                "e2e-ws-as-proxy-auth-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket auth gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-auth-upstream",
+                    "native-h1:e2e-ws-as-proxy-auth-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-auth".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let verifier = StaticTokenVerifier::new([(
+                "alpha",
+                AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+            )])
+            .expect("the deterministic as_proxy WebSocket bearer verifier is valid")
+            .with_allowed_schemes(["Bearer"])
+            .expect("the as_proxy WebSocket bearer scheme allowlist is valid");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-auth-gateway", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(verifier))
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed auth install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy auth must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy auth publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy auth serve must be admitted");
+
+            let (missing, _missing_stream) = websocket_upgrade_status(&cx, address, None).await;
+            assert!(
+                missing.starts_with(b"HTTP/1.1 401"),
+                "omitting Authorization must refuse the as_proxy WebSocket upgrade: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert!(
+                String::from_utf8_lossy(&missing)
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate"),
+                "the missing-token as_proxy WebSocket upgrade must challenge Bearer: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "missing Authorization must not reach the as_proxy upstream"
+            );
+
+            let (wrong, _wrong_stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer beta")).await;
+            assert!(
+                wrong.starts_with(b"HTTP/1.1 401"),
+                "a wrong bearer token must refuse the as_proxy WebSocket upgrade: {}",
+                String::from_utf8_lossy(&wrong)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "a wrong bearer token must not reach the as_proxy upstream"
+            );
+
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the matching bearer token must complete RFC 6455 upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live as_proxy WebSocket auth initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-auth", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("an admitted as_proxy WebSocket upgrade must negotiate ModernOnly");
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live as_proxy WebSocket auth tools/call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the matching bearer token must reach the prefixed as_proxy upstream");
+            assert!(
+                admitted.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "the matching as_proxy WebSocket bearer token must reach the upstream: {admitted:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "only the matching bearer token may invoke the as_proxy upstream"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_session_state_is_request_local_across_calls() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy session-state runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_state_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-state-gateway".to_owned(),
+                "e2e-ws-as-proxy-state-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket session-state gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-state-upstream",
+                    "native-h1:e2e-ws-as-proxy-state-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-state".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP state proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP state proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-state-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed session-state install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy session-state must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy session-state publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy session-state serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy session-state handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket session-state must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy session-state initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-state", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy session-state over bind_websocket",
+            );
+            let prefixed = format!("ext/{PUBLIC_HTTP_STATE_TOOL_NAME}");
+
+            let written = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy session-state write",
+                client.call_tool(
+                    &cx,
+                    &prefixed,
+                    json!({"action": "write", "value": "alpha"}),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must write request-local session state on the upstream");
+            assert!(
+                written.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "state:alpha",
+                    _ => false,
+                }),
+                "set_state then get_state on the same as_proxy WebSocket call must retain: {written:?}"
+            );
+
+            let later_read = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy session-state later read",
+                client.call_tool(&cx, &prefixed, json!({"action": "read"})),
+            )
+            .await
+            .expect("a later as_proxy WebSocket tools/call must still be admitted");
+            assert!(
+                later_read.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "state:missing",
+                    _ => false,
+                }),
+                "changing only the call must not reuse the previous as_proxy upstream bag: {later_read:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_strict_input_refuses_unknown_property() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy strict runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-strict-gateway".to_owned(),
+                "e2e-ws-as-proxy-strict-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket strict gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-strict-upstream",
+                    "native-h1:e2e-ws-as-proxy-strict-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-strict".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let strict_server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-strict-gateway", "1.0.0")
+                    .strict_input_validation(true)
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed strict install must succeed")
+                    .build();
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-lenient-gateway".to_owned(),
+                "e2e-ws-as-proxy-lenient-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket lenient gateway HTTP plan is valid");
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-lenient-upstream",
+                    "native-h1:e2e-ws-as-proxy-lenient-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-lenient".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let lenient_server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-lenient-gateway", "1.0.0")
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed lenient install must succeed")
+                    .build();
+            let strict_bound = strict_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy strict must bind");
+            let strict_address = strict_bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy strict publishes its address",
+            );
+            let lenient_bound = lenient_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy lenient must bind");
+            let lenient_address = lenient_bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy lenient publishes its address",
+            );
+            let scope = cx.scope();
+            let strict_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    strict_bound.serve(&serve_cx).await
+                })
+                .expect("public ModernOnly bind_websocket as_proxy strict serve must be admitted");
+            let lenient_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    lenient_bound.serve(&serve_cx).await
+                })
+                .expect("public ModernOnly bind_websocket as_proxy lenient serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy strict handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{strict_address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket strict must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy strict initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-strict", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy strict over bind_websocket");
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy strict declared",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("strict as_proxy must still admit declared arguments");
+            assert!(
+                admitted.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "declared arguments must reach the prefixed upstream under gateway strict validation: {admitted:?}"
+            );
+
+            let refused = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy strict extra-property",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha", "extra": 1})),
+            )
+            .await
+            .expect("strict as_proxy returns a complete tools/call result, not a transport failure");
+            assert!(
+                refused.is_error,
+                "an unknown property must become a tool-level error when gateway strict validation is on: {refused:?}"
+            );
+            assert!(
+                refused.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => {
+                        text.contains("do not match the declared input schema")
+                            || text.contains("additional property")
+                    }
+                    _ => false,
+                }),
+                "the as_proxy WebSocket strict refusal must name the input-schema mismatch: {refused:?}"
+            );
+
+            drop(client);
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy lenient handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{lenient_address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket lenient must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy lenient initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-lenient", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy lenient over bind_websocket");
+
+            let extra = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy lenient extra-property",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha", "extra": 1})),
+            )
+            .await
+            .expect("lenient as_proxy must admit the same extra property");
+            assert!(
+                extra.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "changing only the gateway strict flag must admit the extra property: {extra:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            strict_listener.abort();
+            lenient_listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy list_page_size runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-page-gateway".to_owned(),
+                "e2e-ws-as-proxy-page-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket list_page_size gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-page-upstream",
+                    "native-h1:e2e-ws-as-proxy-page-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-page".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let paged_server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-page-gateway", "1.0.0")
+                    .list_page_size(1)
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed list_page_size install must succeed")
+                    .build();
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-unpaged-gateway".to_owned(),
+                "e2e-ws-as-proxy-unpaged-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket default-list gateway HTTP plan is valid");
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-unpaged-upstream",
+                    "native-h1:e2e-ws-as-proxy-unpaged-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-unpaged".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let unpaged_server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-unpaged-gateway", "1.0.0")
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed default-list install must succeed")
+                    .build();
+            let paged_bound = paged_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy list_page_size must bind");
+            let paged_address = paged_bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy list_page_size publishes its address",
+            );
+            let unpaged_bound = unpaged_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy default list must bind");
+            let unpaged_address = unpaged_bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy default list publishes its address",
+            );
+            let scope = cx.scope();
+            let paged_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    paged_bound.serve(&serve_cx).await
+                })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy list_page_size serve must be admitted",
+                );
+            let unpaged_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    unpaged_bound.serve(&serve_cx).await
+                })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy default list serve must be admitted",
+                );
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+            let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy list_page_size handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{paged_address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket list_page_size must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy list_page_size initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-page", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy list_page_size over bind_websocket",
+            );
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy list_page_size first",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("gateway list_page_size(1) must page prefixed tools");
+            assert_eq!(
+                first.tools.len(),
+                1,
+                "as_proxy gateway list_page_size(1) must create a real continuation: {first:?}"
+            );
+            let first_name = first.tools[0].name.clone();
+            assert!(
+                first_name == prefixed || first_name == prefixed_fast,
+                "the first as_proxy page must retain a prefixed catalog tool: {first:?}"
+            );
+            let cursor = first
+                .next_cursor
+                .clone()
+                .expect("the first as_proxy page must carry an opaque cursor");
+
+            let second = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy list_page_size continuation",
+                client.list_tools(&cx, Some(cursor.as_str())),
+            )
+            .await
+            .expect("the as_proxy cursor continuation must reach the second page");
+            assert_eq!(
+                second.tools.len(),
+                1,
+                "the as_proxy continuation must retain one remaining prefixed tool: {second:?}"
+            );
+            assert_ne!(
+                second.tools[0].name, first_name,
+                "the continuation must retain the other prefixed tool: {second:?}"
+            );
+
+            drop(client);
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy default-list handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{unpaged_address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket default list must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy default-list initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-unpaged", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy default list over bind_websocket",
+            );
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy default list",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("the default as_proxy catalog must still list prefixed tools");
+            assert!(
+                listed.tools.len() >= 2,
+                "changing only the missing list_page_size must not invent a 1-item page: {listed:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            paged_listener.abort();
+            unpaged_listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_on_duplicate_error_keeps_and_replace_installs() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy on_duplicate runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-duplicate-error-gateway".to_owned(),
+                "e2e-ws-as-proxy-duplicate-error-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket on_duplicate Error gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-duplicate-error-upstream",
+                    "native-h1:e2e-ws-as-proxy-duplicate-error-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-duplicate-error".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let error_server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-duplicate-error", "1.0.0")
+                    .on_duplicate(DuplicateBehavior::Error)
+                    .tool(LocalPrefixedPublicHttpValue {
+                        name: format!("ext/{PUBLIC_HTTP_TOOL_NAME}"),
+                    })
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed on_duplicate Error install must succeed")
+                    .build();
+            let bound = error_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy on_duplicate Error must bind");
+            let error_address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy on_duplicate Error publishes its address",
+            );
+            let scope = cx.scope();
+            let error_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy on_duplicate Error serve must be admitted",
+                );
+
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-duplicate-replace-gateway".to_owned(),
+                "e2e-ws-as-proxy-duplicate-replace-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket on_duplicate Replace gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-duplicate-replace-upstream",
+                    "native-h1:e2e-ws-as-proxy-duplicate-replace-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-duplicate-replace".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect for the Replace gateway",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed for Replace");
+            let replace_server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-duplicate-replace", "1.0.0")
+                    .on_duplicate(DuplicateBehavior::Replace)
+                    .tool(LocalPrefixedPublicHttpValue {
+                        name: format!("ext/{PUBLIC_HTTP_TOOL_NAME}"),
+                    })
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed on_duplicate Replace install must succeed")
+                    .build();
+            let bound = replace_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy on_duplicate Replace must bind");
+            let replace_address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy on_duplicate Replace publishes its address",
+            );
+            let replace_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy on_duplicate Replace serve must be admitted",
+                );
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy on_duplicate Error handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{error_address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket on_duplicate Error must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy on_duplicate Error initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-duplicate-error", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy on_duplicate Error over bind_websocket",
+            );
+            let kept = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy on_duplicate Error call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("Error must keep the local prefixed tool callable");
+            assert!(
+                kept.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "local:alpha",
+                    _ => false,
+                }),
+                "as_proxy on_duplicate Error must keep the local prefixed handler: {kept:?}"
+            );
+            assert_eq!(
+                upstream.handler_calls.tool.load(Ordering::SeqCst),
+                0,
+                "Error must not forward the colliding prefixed name to the upstream"
+            );
+            drop(client);
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy on_duplicate Replace handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{replace_address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket on_duplicate Replace must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy on_duplicate Replace initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-duplicate-replace", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy on_duplicate Replace over bind_websocket",
+            );
+            let replaced = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy on_duplicate Replace call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("Replace must install the proxied catalog entry");
+            assert!(
+                replaced.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "changing only on_duplicate to Replace must reach the prefixed upstream: {replaced:?}"
+            );
+            assert_eq!(
+                upstream.handler_calls.tool.load(Ordering::SeqCst),
+                1,
+                "Replace must forward the colliding prefixed name to the upstream"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            error_listener.abort();
+            replace_listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_forwards_transformed_prefixed_tool() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy transform runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_transform_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-transform-gateway".to_owned(),
+                "e2e-ws-as-proxy-transform-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket transform gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-transform-upstream",
+                    "native-h1:e2e-ws-as-proxy-transform-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-transform".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP transform proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP transform proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-transform-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed transform install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy transform must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy transform publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy transform serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy transform handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket transform must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy transform initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-transform", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy transform over bind_websocket",
+            );
+            let prefixed = format!("ext/{PUBLIC_HTTP_TRANSFORMED_TOOL_NAME}");
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy transform tools/list",
+                client.list_tools(&cx, None),
+            )
+            .await
+            .expect("as_proxy WebSocket must list the prefixed transformed tool");
+            let transformed = listed
+                .tools
+                .iter()
+                .find(|tool| tool.name == prefixed)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the as_proxy WebSocket catalog must advertise the prefixed transformed name: {listed:?}"
+                    )
+                });
+            assert!(
+                listed.tools.iter().all(|tool| tool.name != PUBLIC_HTTP_TRANSFORMED_TOOL_NAME
+                    && tool.name != PUBLIC_HTTP_TOOL_NAME
+                    && tool.name != format!("ext/{PUBLIC_HTTP_TOOL_NAME}")),
+                "as_proxy WebSocket must not keep the unprefixed transformed name or the parent tool: {listed:?}"
+            );
+            let schema = serde_json::to_string(&transformed.input_schema)
+                .expect("the prefixed transformed input schema serializes");
+            assert!(
+                schema.contains("query"),
+                "as_proxy WebSocket must retain the renamed argument on the prefixed catalog: {schema}"
+            );
+            assert!(
+                !schema.contains("\"value\""),
+                "as_proxy WebSocket must drop the original argument name from the prefixed catalog: {schema}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy transform unprefixed",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_TRANSFORMED_TOOL_NAME,
+                    json!({"query": "alpha"}),
+                ),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed transformed tool");
+            let _ = missing;
+
+            let looked_up = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy transform tools/call",
+                client.call_tool(&cx, &prefixed, json!({"query": "alpha"})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward the renamed argument onto the live transformed upstream");
+            assert!(
+                looked_up.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "the rewritten argument must reach the parent handler through as_proxy WebSocket: {looked_up:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
     fn e2e_public_websocket_as_proxy_forwards_inbound_log_level() {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
@@ -44122,6 +50377,1748 @@ mod live_websocket_bind {
             cx.set_cancel_requested(true);
             listener.abort();
             panic_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_sanitizes_prefixed_catalog_and_completion_panic() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy catalog-panic runtime installs an ambient context",
+            );
+            let panic_upstream = spawn_legacy_as_proxy_panic_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(panic_upstream.address(), "/sse")),
+                Some(public_http_target(panic_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-catalog-panic-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-catalog-panic-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket catalog-panic gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-catalog-panic-upstream",
+                    "native-h1:e2e-legacy-ws-catalog-panic-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-catalog-panic".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP catalog-panic proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP catalog-panic proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-catalog-panic-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed catalog-panic install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy catalog-panic must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy catalog-panic publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy catalog-panic serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket catalog-panic must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-catalog-panic", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy catalog-panic over bind_websocket",
+            );
+            let prefixed_resource = format!("child/{PUBLIC_HTTP_PANIC_RESOURCE_URI}");
+            let prefixed_peer_resource = format!("child/{PUBLIC_HTTP_RESOURCE_URI}");
+            let prefixed_prompt = format!("child/{PUBLIC_HTTP_PANIC_PROMPT_NAME}");
+            let prefixed_peer_prompt = format!("child/{PUBLIC_HTTP_PROMPT_NAME}");
+            let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let missing_resource = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic unprefixed resource",
+                client.read_resource(&cx, PUBLIC_HTTP_PANIC_RESOURCE_URI),
+            )
+            .await
+            .expect_err("changing only the missing prefix must not reach the unprefixed panic resource");
+            let _ = missing_resource;
+
+            let panicked_resource = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic resources/read",
+                client.read_resource(&cx, &prefixed_resource),
+            )
+            .await;
+            let panicked_resource = match panicked_resource {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked_resource.contains("Internal server error")
+                    || panicked_resource.contains("InternalError"),
+                "exact-2024 as_proxy WebSocket must sanitize an upstream resource panic: {panicked_resource}"
+            );
+            assert!(
+                !panicked_resource.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "exact-2024 as_proxy WebSocket must not leak the upstream resource unwind payload: {panicked_resource}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic unprefixed prompt",
+                client.get_prompt(&cx, PUBLIC_HTTP_PANIC_PROMPT_NAME, HashMap::new()),
+            )
+            .await
+            .expect_err("changing only the missing prefix must not reach the unprefixed panic prompt");
+            let _ = missing_prompt;
+
+            let panicked_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic prompts/get",
+                client.get_prompt(&cx, &prefixed_prompt, HashMap::new()),
+            )
+            .await;
+            let panicked_prompt = match panicked_prompt {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked_prompt.contains("Internal server error")
+                    || panicked_prompt.contains("InternalError"),
+                "exact-2024 as_proxy WebSocket must sanitize an upstream prompt panic: {panicked_prompt}"
+            );
+            assert!(
+                !panicked_prompt.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "exact-2024 as_proxy WebSocket must not leak the upstream prompt unwind payload: {panicked_prompt}"
+            );
+
+            let missing_complete = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-panic unprefixed",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Prompt {
+                            name: PUBLIC_HTTP_PROMPT_NAME.to_owned(),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "subject".to_owned(),
+                            value: "cross-era".to_owned(),
+                        },
+                        meta: None,
+                    },
+                ),
+            )
+            .await;
+            assert!(
+                missing_complete.is_err(),
+                "changing only the completion prompt name must refuse before the unprefixed provider: {missing_complete:?}"
+            );
+
+            let panicked_complete = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-panic complete",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Prompt {
+                            name: prefixed_peer_prompt.clone(),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "subject".to_owned(),
+                            value: "cross-era".to_owned(),
+                        },
+                        meta: None,
+                    },
+                ),
+            )
+            .await;
+            let panicked_complete = match panicked_complete {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                panicked_complete.contains("Internal server error")
+                    || panicked_complete.contains("InternalError"),
+                "exact-2024 as_proxy WebSocket must sanitize an upstream completion panic: {panicked_complete}"
+            );
+            assert!(
+                !panicked_complete.contains(PUBLIC_HTTP_PANIC_PAYLOAD),
+                "exact-2024 as_proxy WebSocket must not leak the upstream completion unwind payload: {panicked_complete}"
+            );
+
+            let peer_resource = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic peer resource",
+                client.read_resource(&cx, &prefixed_peer_resource),
+            )
+            .await
+            .expect("changing only the resource must still be admitted after a sanitized exact-2024 as_proxy panic");
+            let peer_resource = format!("{peer_resource:?}");
+            assert!(
+                peer_resource.contains(PUBLIC_HTTP_RESOURCE_TEXT),
+                "the prefixed peer resource must still complete after a sanitized as_proxy panic: {peer_resource}"
+            );
+
+            let peer_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic peer prompt",
+                client.get_prompt(
+                    &cx,
+                    &prefixed_peer_prompt,
+                    HashMap::from([(
+                        "subject".to_owned(),
+                        PUBLIC_HTTP_TOOL_ARGUMENT.to_owned(),
+                    )]),
+                ),
+            )
+            .await
+            .expect("changing only the prompt must still be admitted after a sanitized exact-2024 as_proxy panic");
+            let peer_prompt = format!("{peer_prompt:?}");
+            assert!(
+                peer_prompt.contains(PUBLIC_HTTP_PROMPT_TEXT),
+                "the prefixed peer prompt must still complete after a sanitized as_proxy panic: {peer_prompt}"
+            );
+
+            let peer = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy catalog-panic fast peer",
+                client.call_tool(&cx, &prefixed_fast, json!({})),
+            )
+            .await
+            .expect("changing only the method must still admit tools/call after a sanitized exact-2024 as_proxy panic");
+            assert_eq!(
+                legacy_http_tool_text(&peer).as_deref(),
+                Some("fast"),
+                "the prefixed fast peer tool must still complete after a sanitized as_proxy catalog panic: {peer:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            panic_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_cache_hits_prefixed_allowlisted_tool() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy cache runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-cache-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-cache-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket cache gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-cache-upstream",
+                    "native-h1:e2e-legacy-ws-cache-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-cache".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-cache-gateway", "1.0.0")
+                .middleware(
+                    caching::ResponseCachingMiddleware::new().include_tools(vec![prefixed.clone()]),
+                )
+                .as_proxy_typed("child", proxy, catalog)
+                .expect("legacy as_proxy_typed cache install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy cache must bind");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket as_proxy cache publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket as_proxy cache serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy cache handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket cache must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy cache initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-cache", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates as_proxy cache over bind_websocket");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy cache unprefixed",
+                client.call_tool(&cx, PUBLIC_HTTP_TOOL_NAME, json!({"value": "alpha"})),
+            )
+            .await;
+            assert!(
+                missing.is_err(),
+                "changing only the missing prefix must not reach the unprefixed counting tool: {missing:?}"
+            );
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy cache miss",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the first allowlisted prefixed tools/call must miss and reach the upstream");
+            assert_eq!(
+                legacy_http_tool_text(&first).as_deref(),
+                Some("tool:alpha"),
+                "the first exact-2024 as_proxy WebSocket cache miss must return the upstream handler result: {first:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "the first allowlisted prefixed tools/call must invoke the upstream counting handler"
+            );
+
+            let cached = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy cache hit",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the second identical prefixed tools/call must be a gateway cache hit");
+            assert_eq!(
+                legacy_http_tool_text(&cached).as_deref(),
+                Some("tool:alpha"),
+                "the exact-2024 as_proxy WebSocket cache hit must keep the first complete result: {cached:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "a gateway cache hit must not invoke the upstream counting handler again"
+            );
+
+            let missed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy cache arg miss",
+                client.call_tool(&cx, &prefixed, json!({"value": "beta"})),
+            )
+            .await
+            .expect("changing only the arguments must miss the gateway cache");
+            assert_eq!(
+                legacy_http_tool_text(&missed).as_deref(),
+                Some("tool:beta"),
+                "the exact-2024 as_proxy WebSocket cache miss must reach the upstream with the new arguments: {missed:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                2,
+                "a different-arguments prefixed tools/call must invoke the upstream counting handler"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_rate_limit_refuses_second_prefixed_call() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy rate-limit runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-rate-limit-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-rate-limit-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket rate-limit gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-rate-limit-upstream",
+                    "native-h1:e2e-legacy-ws-rate-limit-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-rate-limit".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-rate-limit-gateway", "1.0.0")
+                    .middleware(
+                        rate_limiting::RateLimitingMiddleware::new(1.0e-300).burst_capacity(1),
+                    )
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed rate-limit install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy rate-limit must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy rate-limit publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy rate-limit serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy rate-limit handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket rate-limit must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy rate-limit initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-rate-limit", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy rate-limit over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy rate-limit first",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the first prefixed tools/call must be admitted by the gateway rate limiter");
+            assert_eq!(
+                legacy_http_tool_text(&first).as_deref(),
+                Some("tool:alpha"),
+                "the first exact-2024 as_proxy WebSocket rate-limited tools/call must reach the upstream: {first:?}"
+            );
+
+            let limited = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy rate-limit second",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await;
+            let limited = match limited {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                limited.contains("Rate limit exceeded"),
+                "the refused second exact-2024 as_proxy WebSocket tools/call must keep the rate-limit error: {limited}"
+            );
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy rate-limit tools/list",
+                client.list_tools(&cx),
+            )
+            .await
+            .expect("changing only the method must still be admitted by the gateway rate limiter");
+            assert!(
+                listed.iter().any(|tool| tool.name == prefixed),
+                "tools/list must stay callable after prefixed tools/call is rate-limited: {listed:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_sliding_window_refuses_second_prefixed_call() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy sliding-window runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-sliding-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-sliding-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket sliding-window gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-sliding-upstream",
+                    "native-h1:e2e-legacy-ws-sliding-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-sliding".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-sliding-gateway", "1.0.0")
+                    .middleware(rate_limiting::SlidingWindowRateLimitingMiddleware::new(
+                        1, 60,
+                    ))
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed sliding-window install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy sliding-window must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy sliding-window publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy sliding-window serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy sliding handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket sliding-window must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy sliding initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-sliding", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy sliding-window over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy sliding first",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the first prefixed tools/call must be admitted by the gateway sliding window");
+            assert_eq!(
+                legacy_http_tool_text(&first).as_deref(),
+                Some("tool:alpha"),
+                "the first exact-2024 as_proxy WebSocket sliding-window tools/call must reach the upstream: {first:?}"
+            );
+
+            let limited = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy sliding second",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await;
+            let limited = match limited {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                limited.contains("Rate limit exceeded"),
+                "the refused second exact-2024 as_proxy WebSocket tools/call must keep the sliding-window error: {limited}"
+            );
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy sliding tools/list",
+                client.list_tools(&cx),
+            )
+            .await
+            .expect("changing only the method must still be admitted by the gateway sliding window");
+            assert!(
+                listed.iter().any(|tool| tool.name == prefixed),
+                "tools/list must stay callable after prefixed tools/call is sliding-window limited: {listed:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_static_token_refuses_missing_and_wrong() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy auth runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-auth-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-auth-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket auth gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-auth-upstream",
+                    "native-h1:e2e-legacy-ws-auth-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-auth".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let verifier = StaticTokenVerifier::new([(
+                "alpha",
+                AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+            )])
+            .expect("the deterministic exact-2024 as_proxy WebSocket bearer verifier is valid")
+            .with_allowed_schemes(["Bearer"])
+            .expect("the exact-2024 as_proxy WebSocket bearer scheme allowlist is valid");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-auth-gateway", "1.0.0")
+                    .auth_provider(TokenAuthProvider::new(verifier))
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed auth install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy auth must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy auth publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket as_proxy auth serve must be admitted");
+
+            let (missing, _missing_stream) = websocket_upgrade_status(&cx, address, None).await;
+            assert!(
+                missing.starts_with(b"HTTP/1.1 401"),
+                "omitting Authorization must refuse the exact-2024 as_proxy WebSocket upgrade: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert!(
+                String::from_utf8_lossy(&missing)
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate"),
+                "the missing-token exact-2024 as_proxy WebSocket upgrade must challenge Bearer: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "missing Authorization must not reach the as_proxy upstream"
+            );
+
+            let (wrong, _wrong_stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer beta")).await;
+            assert!(
+                wrong.starts_with(b"HTTP/1.1 401"),
+                "a wrong bearer token must refuse the exact-2024 as_proxy WebSocket upgrade: {}",
+                String::from_utf8_lossy(&wrong)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "a wrong bearer token must not reach the as_proxy upstream"
+            );
+
+            let (accepted, stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the matching bearer token must complete RFC 6455 upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy auth initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-auth", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("an admitted exact-2024 as_proxy WebSocket upgrade must negotiate LegacyOnly");
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy auth tools/call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the matching bearer token must reach the prefixed as_proxy upstream");
+            assert_eq!(
+                legacy_http_tool_text(&admitted).as_deref(),
+                Some("tool:alpha"),
+                "the matching exact-2024 as_proxy WebSocket bearer token must reach the upstream: {admitted:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "only the matching bearer token may invoke the as_proxy upstream"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_session_state_uses_shared_upstream_bag() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy session-state runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_state_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-state-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-state-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket session-state gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-state-upstream",
+                    "native-h1:e2e-legacy-ws-state-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-state".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP state proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP state proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-state-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed session-state install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy session-state must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy session-state publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy session-state serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy session-state handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket session-state must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy session-state initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-state", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy session-state over bind_websocket",
+            );
+            let peer_transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy session-state peer handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy peer WebSocket must complete RFC 6455 upgrade");
+            let mut peer = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy session-state peer initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-state-peer", "1.0.0")
+                    .connect_websocket_with_cx(&cx, peer_transport),
+            )
+            .await
+            .expect("a peer inbound WebSocket must still negotiate LegacyOnly");
+            let prefixed = format!("child/{PUBLIC_HTTP_STATE_TOOL_NAME}");
+
+            let written = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy session-state write",
+                client.call_tool(
+                    &cx,
+                    &prefixed,
+                    json!({"action": "write", "value": "alpha"}),
+                ),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket must write session state on the upstream binding");
+            assert_eq!(
+                legacy_http_tool_text(&written).as_deref(),
+                Some("state:alpha"),
+                "set_state then get_state on the same as_proxy WebSocket write must retain: {written:?}"
+            );
+
+            let later_read = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy session-state later read",
+                client.call_tool(&cx, &prefixed, json!({"action": "read"})),
+            )
+            .await
+            .expect("a later exact-2024 as_proxy WebSocket tools/call must still be admitted");
+            assert_eq!(
+                legacy_http_tool_text(&later_read).as_deref(),
+                Some("state:alpha"),
+                "the as_proxy upstream binding must reuse the previous bag: {later_read:?}"
+            );
+
+            let peer_read = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy session-state peer read",
+                peer.call_tool(&cx, &prefixed, json!({"action": "read"})),
+            )
+            .await
+            .expect("a peer inbound WebSocket must still be admitted");
+            assert_eq!(
+                legacy_http_tool_text(&peer_read).as_deref(),
+                Some("state:alpha"),
+                "as_proxy must keep one upstream session bag across inbound clients: {peer_read:?}"
+            );
+
+            drop(client);
+            drop(peer);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_strict_input_refuses_unknown_property() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy strict runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-strict-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-strict-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket strict gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-strict-upstream",
+                    "native-h1:e2e-legacy-ws-strict-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-strict".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let strict_server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-strict-gateway", "1.0.0")
+                    .strict_input_validation(true)
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed strict install must succeed")
+                    .build();
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-lenient-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-lenient-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket lenient gateway HTTP plan is valid");
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-lenient-upstream",
+                    "native-h1:e2e-legacy-ws-lenient-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-lenient".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let lenient_server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-lenient-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed lenient install must succeed")
+                    .build();
+            let strict_bound = strict_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy strict must bind");
+            let strict_address = strict_bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy strict publishes its address",
+            );
+            let lenient_bound = lenient_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy lenient must bind");
+            let lenient_address = lenient_bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy lenient publishes its address",
+            );
+            let scope = cx.scope();
+            let strict_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    strict_bound.serve(&serve_cx).await
+                })
+                .expect("public LegacyOnly bind_websocket as_proxy strict serve must be admitted");
+            let lenient_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    lenient_bound.serve(&serve_cx).await
+                })
+                .expect("public LegacyOnly bind_websocket as_proxy lenient serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy strict handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{strict_address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket strict must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy strict initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-strict", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy strict over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy strict declared",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("strict as_proxy must still admit declared arguments");
+            assert_eq!(
+                legacy_http_tool_text(&admitted).as_deref(),
+                Some("tool:alpha"),
+                "declared arguments must reach the prefixed upstream under gateway strict validation: {admitted:?}"
+            );
+
+            let refused = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy strict extra-property",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha", "extra": 1})),
+            )
+            .await;
+            let refused = match refused {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                refused.contains("do not match the declared input schema")
+                    || refused.contains("additional property")
+                    || refused.contains("unknown"),
+                "the exact-2024 as_proxy WebSocket strict refusal must name the input-schema mismatch: {refused}"
+            );
+
+            drop(client);
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy lenient handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{lenient_address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket lenient must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy lenient initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-lenient", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy lenient over bind_websocket",
+            );
+
+            let extra = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy lenient extra-property",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha", "extra": 1})),
+            )
+            .await
+            .expect("lenient as_proxy must admit the same extra property");
+            assert_eq!(
+                legacy_http_tool_text(&extra).as_deref(),
+                Some("tool:alpha"),
+                "changing only the gateway strict flag must admit the extra property: {extra:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            strict_listener.abort();
+            lenient_listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_list_page_size_pages_prefixed_tools() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy list_page_size runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-page-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-page-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket list_page_size gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-page-upstream",
+                    "native-h1:e2e-legacy-ws-page-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-page".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let paged_server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-page-gateway", "1.0.0")
+                    .list_page_size(1)
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed list_page_size install must succeed")
+                    .build();
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-unpaged-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-unpaged-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket default-list gateway HTTP plan is valid");
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-unpaged-upstream",
+                    "native-h1:e2e-legacy-ws-unpaged-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-unpaged".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let unpaged_server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-unpaged-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed default-list install must succeed")
+                    .build();
+            let paged_bound = paged_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy list_page_size must bind");
+            let paged_address = paged_bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy list_page_size publishes its address",
+            );
+            let unpaged_bound = unpaged_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy default list must bind");
+            let unpaged_address = unpaged_bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy default list publishes its address",
+            );
+            let scope = cx.scope();
+            let paged_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    paged_bound.serve(&serve_cx).await
+                })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy list_page_size serve must be admitted",
+                );
+            let unpaged_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move {
+                    unpaged_bound.serve(&serve_cx).await
+                })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy default list serve must be admitted",
+                );
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+            let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy list_page_size handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{paged_address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket list_page_size must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy list_page_size initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-page", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy list_page_size over bind_websocket",
+            );
+
+            let first = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy list_page_size first",
+                client.list_tools_page(&cx, legacy_2024::ListToolsParams::default()),
+            )
+            .await
+            .expect("gateway list_page_size(1) must page prefixed tools");
+            assert_eq!(
+                first.tools.len(),
+                1,
+                "as_proxy gateway list_page_size(1) must create a real continuation: {first:?}"
+            );
+            let first_name = first.tools[0].name.clone();
+            assert!(
+                first_name == prefixed || first_name == prefixed_fast,
+                "the first as_proxy page must retain a prefixed catalog tool: {first:?}"
+            );
+            let cursor = first
+                .next_cursor
+                .clone()
+                .expect("the first as_proxy page must carry an opaque cursor");
+
+            let second = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy list_page_size continuation",
+                client.list_tools_page(
+                    &cx,
+                    legacy_2024::ListToolsParams {
+                        cursor: Some(cursor),
+                        include_tags: None,
+                        exclude_tags: None,
+                    },
+                ),
+            )
+            .await
+            .expect("the as_proxy cursor continuation must reach the second page");
+            assert_eq!(
+                second.tools.len(),
+                1,
+                "the as_proxy continuation must retain one remaining prefixed tool: {second:?}"
+            );
+            assert_ne!(
+                second.tools[0].name, first_name,
+                "the continuation must retain the other prefixed tool: {second:?}"
+            );
+
+            drop(client);
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy default-list handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{unpaged_address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket default list must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy default-list initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-unpaged", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy default list over bind_websocket",
+            );
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy default list",
+                client.list_tools_page(&cx, legacy_2024::ListToolsParams::default()),
+            )
+            .await
+            .expect("the default as_proxy catalog must still list prefixed tools");
+            assert!(
+                listed.tools.len() >= 2,
+                "changing only the missing list_page_size must not invent a 1-item page: {listed:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            paged_listener.abort();
+            unpaged_listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_on_duplicate_error_keeps_and_replace_installs()
+    {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy on_duplicate runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-as-proxy-duplicate-error-gateway".to_owned(),
+                "e2e-legacy-ws-as-proxy-duplicate-error-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket on_duplicate Error gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-as-proxy-duplicate-error-upstream",
+                    "native-h1:e2e-legacy-ws-as-proxy-duplicate-error-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-as-proxy-duplicate-error".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities {
+                        sampling: Some(Default::default()),
+                        elicitation: None,
+                        roots: Some(legacy_2024::RootsCapability {
+                            list_changed: false,
+                        }),
+                    },
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let error_server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-as-proxy-duplicate-error", "1.0.0")
+                    .on_duplicate(DuplicateBehavior::Error)
+                    .tool(LocalPrefixedPublicHttpValue {
+                        name: format!("child/{PUBLIC_HTTP_TOOL_NAME}"),
+                    })
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed on_duplicate Error install must succeed")
+                    .build();
+            let bound = error_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy on_duplicate Error must bind");
+            let error_address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy on_duplicate Error publishes its address",
+            );
+            let scope = cx.scope();
+            let error_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy on_duplicate Error serve must be admitted",
+                );
+
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-as-proxy-duplicate-replace-gateway".to_owned(),
+                "e2e-legacy-ws-as-proxy-duplicate-replace-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket on_duplicate Replace gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-as-proxy-duplicate-replace-upstream",
+                    "native-h1:e2e-legacy-ws-as-proxy-duplicate-replace-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-as-proxy-duplicate-replace".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities {
+                        sampling: Some(Default::default()),
+                        elicitation: None,
+                        roots: Some(legacy_2024::RootsCapability {
+                            list_changed: false,
+                        }),
+                    },
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect for the Replace gateway",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed for Replace");
+            let replace_server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-as-proxy-duplicate-replace", "1.0.0")
+                    .on_duplicate(DuplicateBehavior::Replace)
+                    .tool(LocalPrefixedPublicHttpValue {
+                        name: format!("child/{PUBLIC_HTTP_TOOL_NAME}"),
+                    })
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed on_duplicate Replace install must succeed")
+                    .build();
+            let bound = replace_server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy on_duplicate Replace must bind");
+            let replace_address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy on_duplicate Replace publishes its address",
+            );
+            let replace_listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy on_duplicate Replace serve must be admitted",
+                );
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy on_duplicate Error handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{error_address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket on_duplicate Error must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy on_duplicate Error initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-duplicate-error", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy on_duplicate Error over bind_websocket",
+            );
+            let kept = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy on_duplicate Error call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("Error must keep the local prefixed tool callable");
+            assert_eq!(
+                legacy_http_tool_text(&kept).as_deref(),
+                Some("local:alpha"),
+                "as_proxy on_duplicate Error must keep the local prefixed handler: {kept:?}"
+            );
+            assert_eq!(
+                upstream.handler_calls.tool.load(Ordering::SeqCst),
+                0,
+                "Error must not forward the colliding prefixed name to the upstream"
+            );
+            drop(client);
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy on_duplicate Replace handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{replace_address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket on_duplicate Replace must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy on_duplicate Replace initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-duplicate-replace", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy on_duplicate Replace over bind_websocket",
+            );
+            let replaced = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy on_duplicate Replace call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("Replace must install the proxied catalog entry");
+            assert_eq!(
+                legacy_http_tool_text(&replaced).as_deref(),
+                Some("tool:alpha"),
+                "changing only on_duplicate to Replace must reach the prefixed upstream: {replaced:?}"
+            );
+            assert_eq!(
+                upstream.handler_calls.tool.load(Ordering::SeqCst),
+                1,
+                "Replace must forward the colliding prefixed name to the upstream"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            error_listener.abort();
+            replace_listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_forwards_transformed_prefixed_tool() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy transform runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_transform_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-transform-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-transform-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket transform gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-transform-upstream",
+                    "native-h1:e2e-legacy-ws-transform-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-transform".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP transform proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP transform proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-transform-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed transform install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy transform must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy transform publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy transform serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy transform handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket transform must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy transform initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-transform", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy transform over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_TRANSFORMED_TOOL_NAME}");
+
+            let listed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy transform tools/list",
+                client.list_tools(&cx),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket must list the prefixed transformed tool");
+            let transformed = listed
+                .iter()
+                .find(|tool| tool.name == prefixed)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the exact-2024 as_proxy WebSocket catalog must advertise the prefixed transformed name: {listed:?}"
+                    )
+                });
+            assert!(
+                listed.iter().all(|tool| tool.name != PUBLIC_HTTP_TRANSFORMED_TOOL_NAME
+                    && tool.name != PUBLIC_HTTP_TOOL_NAME),
+                "exact-2024 as_proxy WebSocket must not keep the unprefixed transformed name or the parent tool: {listed:?}"
+            );
+            let schema = serde_json::to_string(&transformed.input_schema)
+                .expect("the prefixed transformed input schema serializes");
+            assert!(
+                schema.contains("query"),
+                "exact-2024 as_proxy WebSocket must retain the renamed argument on the prefixed catalog: {schema}"
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy transform unprefixed",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_TRANSFORMED_TOOL_NAME,
+                    json!({"query": "alpha"}),
+                ),
+            )
+            .await;
+            assert!(
+                missing.is_err(),
+                "changing only the missing prefix must not reach the unprefixed transformed tool: {missing:?}"
+            );
+
+            let looked_up = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy transform tools/call",
+                client.call_tool(&cx, &prefixed, json!({"query": "alpha"})),
+            )
+            .await
+            .expect(
+                "exact-2024 as_proxy WebSocket must forward the renamed argument onto the live transformed upstream",
+            );
+            assert_eq!(
+                legacy_http_tool_text(&looked_up).as_deref(),
+                Some("tool:alpha"),
+                "the rewritten argument must reach the parent handler through exact-2024 as_proxy WebSocket: {looked_up:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
         });
     }
 
