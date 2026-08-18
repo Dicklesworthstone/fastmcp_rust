@@ -1019,7 +1019,7 @@ impl ServerBuilder {
     #[must_use]
     pub fn completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
         self.router.add_completion_handler(handler);
-        self.capabilities.completions = Some(fastmcp_protocol::CompletionsCapability::default());
+        self.advertise_completions();
         self
     }
 
@@ -1031,7 +1031,7 @@ impl ServerBuilder {
     #[must_use]
     pub fn legacy_completion_handler<H: CompletionHandler + 'static>(mut self, handler: H) -> Self {
         self.router.add_legacy_completion_handler(handler);
-        self.capabilities.completions = Some(fastmcp_protocol::CompletionsCapability::default());
+        self.advertise_completions();
         self
     }
 
@@ -1082,7 +1082,7 @@ impl ServerBuilder {
     ) -> Self {
         self.router
             .add_legacy_resource_template_completion_handler(uri_template, handler);
-        self.capabilities.completions = Some(fastmcp_protocol::CompletionsCapability::default());
+        self.advertise_completions();
         self
     }
 
@@ -1594,7 +1594,7 @@ impl ServerBuilder {
                     let downstream_uri = format!("{prefix}/{upstream_uri}");
                     let completion_target_admitted =
                         self.proxy_resource_template_wins_admission(&downstream_uri);
-                    if let Err(error) = self.router.add_legacy_resource_with_behavior(
+                    match self.router.add_legacy_resource_with_behavior(
                         ProxyResourceHandler::from_template_with_prefix(
                             template,
                             prefix,
@@ -1602,22 +1602,25 @@ impl ServerBuilder {
                         ),
                         self.on_duplicate,
                     ) {
-                        log::error!(
-                            target: "fastmcp_rust::builder",
-                            "Failed to register prefixed proxied resource template; code={:?}",
-                            error.code
-                        );
-                    }
-                    if completion_target_admitted && completion_supported {
-                        self.router.add_legacy_resource_template_completion_handler(
-                            downstream_uri.clone(),
-                            ProxyCompletionHandler::for_resource_template(
-                                proxy_client.clone(),
-                                downstream_uri,
-                                upstream_uri,
-                            ),
-                        );
-                        self.advertise_completions();
+                        Ok(()) if completion_target_admitted && completion_supported => {
+                            self.router.add_legacy_resource_template_completion_handler(
+                                downstream_uri.clone(),
+                                ProxyCompletionHandler::for_resource_template(
+                                    proxy_client.clone(),
+                                    downstream_uri,
+                                    upstream_uri,
+                                ),
+                            );
+                            self.advertise_completions();
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            log::error!(
+                                target: "fastmcp_rust::builder",
+                                "Failed to register prefixed proxied resource template; code={:?}",
+                                error.code
+                            );
+                        }
                     }
                 }
                 for prompt in prompts {
@@ -1625,26 +1628,29 @@ impl ServerBuilder {
                     let downstream_name = format!("{prefix}/{upstream_name}");
                     let completion_target_admitted =
                         self.proxy_prompt_wins_admission(&downstream_name);
-                    if let Err(error) = self.router.add_legacy_prompt_with_behavior(
+                    match self.router.add_legacy_prompt_with_behavior(
                         ProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
                         self.on_duplicate,
                     ) {
-                        log::error!(
-                            target: "fastmcp_rust::builder",
-                            "Failed to register prefixed proxied prompt; code={:?}",
-                            error.code
-                        );
-                    }
-                    if completion_target_admitted && completion_supported {
-                        self.router.add_legacy_prompt_completion_handler(
-                            downstream_name.clone(),
-                            ProxyCompletionHandler::for_prompt(
-                                proxy_client.clone(),
-                                downstream_name,
-                                upstream_name,
-                            ),
-                        );
-                        self.advertise_completions();
+                        Ok(()) if completion_target_admitted && completion_supported => {
+                            self.router.add_legacy_prompt_completion_handler(
+                                downstream_name.clone(),
+                                ProxyCompletionHandler::for_prompt(
+                                    proxy_client.clone(),
+                                    downstream_name,
+                                    upstream_name,
+                                ),
+                            );
+                            self.advertise_completions();
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            log::error!(
+                                target: "fastmcp_rust::builder",
+                                "Failed to register prefixed proxied prompt; code={:?}",
+                                error.code
+                            );
+                        }
                     }
                 }
                 counts
@@ -1707,26 +1713,29 @@ impl ServerBuilder {
                     let downstream_uri = template.uri_template.clone();
                     let completion_target_admitted =
                         self.proxy_resource_template_wins_admission(&downstream_uri);
-                    if let Err(error) = self.router.add_final_resource_with_behavior(
+                    match self.router.add_final_resource_with_behavior(
                         FinalProxyResourceTemplateHandler::new(template, proxy_client.clone()),
                         self.on_duplicate,
                     ) {
-                        log::error!(
-                            target: "fastmcp_rust::builder",
-                            "Failed to register prefixed exact-final proxied resource template; code={:?}",
-                            error.code
-                        );
-                    }
-                    if completion_target_admitted && completion_supported {
-                        self.router.add_resource_template_completion_handler(
-                            downstream_uri.clone(),
-                            ProxyCompletionHandler::for_resource_template(
-                                proxy_client.clone(),
+                        Ok(()) if completion_target_admitted && completion_supported => {
+                            self.router.add_resource_template_completion_handler(
                                 downstream_uri.clone(),
-                                downstream_uri,
-                            ),
-                        );
-                        self.advertise_completions();
+                                ProxyCompletionHandler::for_resource_template(
+                                    proxy_client.clone(),
+                                    downstream_uri.clone(),
+                                    downstream_uri,
+                                ),
+                            );
+                            self.advertise_completions();
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            log::error!(
+                                target: "fastmcp_rust::builder",
+                                "Failed to register prefixed exact-final proxied resource template; code={:?}",
+                                error.code
+                            );
+                        }
                     }
                 }
                 for prompt in prompts {
@@ -1734,26 +1743,29 @@ impl ServerBuilder {
                     let downstream_name = format!("{prefix}/{upstream_name}");
                     let completion_target_admitted =
                         self.proxy_prompt_wins_admission(&downstream_name);
-                    if let Err(error) = self.router.add_final_prompt_with_behavior(
+                    match self.router.add_final_prompt_with_behavior(
                         FinalProxyPromptHandler::with_prefix(prompt, prefix, proxy_client.clone()),
                         self.on_duplicate,
                     ) {
-                        log::error!(
-                            target: "fastmcp_rust::builder",
-                            "Failed to register prefixed exact-final proxied prompt; code={:?}",
-                            error.code
-                        );
-                    }
-                    if completion_target_admitted && completion_supported {
-                        self.router.add_prompt_completion_handler(
-                            downstream_name.clone(),
-                            ProxyCompletionHandler::for_prompt(
-                                proxy_client.clone(),
-                                downstream_name,
-                                upstream_name,
-                            ),
-                        );
-                        self.advertise_completions();
+                        Ok(()) if completion_target_admitted && completion_supported => {
+                            self.router.add_prompt_completion_handler(
+                                downstream_name.clone(),
+                                ProxyCompletionHandler::for_prompt(
+                                    proxy_client.clone(),
+                                    downstream_name,
+                                    upstream_name,
+                                ),
+                            );
+                            self.advertise_completions();
+                        }
+                        Ok(()) => {}
+                        Err(error) => {
+                            log::error!(
+                                target: "fastmcp_rust::builder",
+                                "Failed to register prefixed exact-final proxied prompt; code={:?}",
+                                error.code
+                            );
+                        }
                     }
                 }
                 counts

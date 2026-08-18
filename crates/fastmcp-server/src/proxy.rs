@@ -905,7 +905,7 @@ pub trait ProxyBackend: Send {
 
     /// Returns whether the selected upstream exposes `completion/complete`.
     ///
-    /// Exact 2024 routes report their negotiated core method surface; final
+    /// Exact 2024 routes report the initialize `completions` member. Final
     /// routes report support only when their retained discovery capabilities
     /// contain `completions`. Custom backends default to unavailable so a
     /// downstream proxy never advertises a route it cannot execute.
@@ -4182,6 +4182,7 @@ pub struct ProxyHttpClient {
     client_capabilities: ClientCapabilities,
     next_request_id: i64,
     legacy_initialized: bool,
+    /// Upstream initialize advertised `capabilities.completions`.
     legacy_completion_supported: bool,
     instructions: Option<String>,
     implementation: Option<Implementation>,
