@@ -2030,6 +2030,17 @@ fn legacy_prompt_messages_to_handler(
         .collect()
 }
 
+fn legacy_tool_error_message(result: &CallToolResult) -> String {
+    result
+        .content
+        .first()
+        .and_then(|content| match content {
+            LegacyContent::Text { text, .. } if !text.is_empty() => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "Tool execution failed".to_owned())
+}
+
 fn legacy_tool_result_to_handler(result: CallToolResult) -> McpResult<Vec<Content>> {
     reject_lossy_proxy_projection(
         "legacy tools/call result",
@@ -2038,9 +2049,10 @@ fn legacy_tool_result_to_handler(result: CallToolResult) -> McpResult<Vec<Conten
         &result.additional,
     )?;
     if result.is_error {
-        return Err(McpError::tool_error(
-            "Proxy cannot project a legacy tools/call error result as successful handler content",
-        ));
+        // Match Client::call_tool: an isError result is a handler-visible
+        // refusal. Keep the upstream text so nested compose InvalidRequest
+        // messages survive the gateway instead of a generic projection remap.
+        return Err(McpError::tool_error(legacy_tool_error_message(&result)));
     }
     legacy_contents_to_handler(result.content)
 }
@@ -8914,7 +8926,7 @@ mod tests {
         decode_modern_server_notification, final_tool_legacy_fallback,
         forward_modern_progress_notification, legacy_contents_to_handler,
         legacy_prompt_messages_to_handler, legacy_resource_to_handler,
-        stdio_parameters_with_inbound_identity,
+        legacy_tool_result_to_handler, stdio_parameters_with_inbound_identity,
     };
     #[cfg(feature = "tasks")]
     use super::{
@@ -9243,6 +9255,58 @@ mod tests {
                 "content": {"type": "text", "text": "summarized"}
             }])
         );
+    }
+
+    #[test]
+    fn proxy_projects_legacy_tools_call_is_error_text_instead_of_generic_remap() {
+        let success = legacy_tool_result_to_handler(CallToolResult {
+            content: vec![LegacyContent::Text {
+                text: "compose:alpha|echo-server".to_owned(),
+                annotations: None,
+                additional: BTreeMap::new(),
+            }],
+            is_error: false,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
+        .expect("a successful legacy tools/call must stay handler content");
+        assert_eq!(
+            serde_json::to_value(success).expect("handler content serializes"),
+            serde_json::json!([{"type": "text", "text": "compose:alpha|echo-server"}])
+        );
+
+        let error = legacy_tool_result_to_handler(CallToolResult {
+            content: vec![LegacyContent::Text {
+                text: "compose-nested-tool:stdio-e2e-missing:Unknown tool".to_owned(),
+                annotations: None,
+                additional: BTreeMap::new(),
+            }],
+            is_error: true,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
+        .expect_err("an isError tools/call must stay a handler-visible refusal");
+        assert_eq!(error.code, McpErrorCode::ToolExecutionError);
+        assert!(
+            error.message.contains("stdio-e2e-missing")
+                && error.message.contains("compose-nested-tool"),
+            "as_proxy must keep the nested handler message: {error:?}"
+        );
+        assert!(
+            !error
+                .message
+                .contains("cannot project a legacy tools/call error result"),
+            "changing only isError must not replace the handler text with a projection remap: {error:?}"
+        );
+
+        let empty = legacy_tool_result_to_handler(CallToolResult {
+            content: Vec::new(),
+            is_error: true,
+            meta: None,
+            additional: BTreeMap::new(),
+        })
+        .expect_err("an empty isError tools/call must stay a handler-visible refusal");
+        assert_eq!(empty.message, "Tool execution failed");
     }
 
     #[test]
