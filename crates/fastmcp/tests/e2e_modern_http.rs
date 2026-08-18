@@ -11137,6 +11137,96 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_template_completion() {
     gateway.shutdown();
 }
 
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_advertises_completions_when_echo_supports() {
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let cx = Cx::for_request();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-complete-advertise", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy completion-advertise gateway");
+
+    let discovery = serde_json::to_value(client.server_discovery().capabilities())
+        .expect("stdio as_proxy discovery capabilities serialize");
+    assert_eq!(
+        discovery.get("completions"),
+        Some(&json!({})),
+        "stdio as_proxy must advertise completions when echo installed a provider: {discovery}"
+    );
+
+    let note = modern::CompletionParams {
+        reference: modern::CompletionReference::Resource {
+            uri: "note://{name}".to_owned(),
+        },
+        argument: modern::FinalCompletionArgument {
+            name: "name".to_owned(),
+            value: "al".to_owned(),
+        },
+        context: None,
+    };
+    let retained = runtime_block_on_bounded(&cx, client.complete(&cx, note))
+        .expect("advertised stdio as_proxy completions must still forward note://{name}");
+    assert_eq!(
+        retained.completion.values,
+        vec!["alice".to_owned()],
+        "stdio as_proxy must retain the echo note-template completion after advertising: {retained:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_omits_completions_when_echo_has_none() {
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(
+        false,
+        vec![("FASTMCP_NO_COMPLETIONS".to_owned(), "1".to_owned())],
+    );
+    let cx = Cx::for_request();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-stdio-complete-omit", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy completion-omit gateway");
+
+    let discovery = serde_json::to_value(client.server_discovery().capabilities())
+        .expect("stdio as_proxy discovery capabilities serialize");
+    assert!(
+        discovery.get("completions").is_none(),
+        "changing only FASTMCP_NO_COMPLETIONS must omit stdio as_proxy completions: {discovery}"
+    );
+
+    let refused = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: "ext/greeting".to_owned(),
+                    title: "Greeting".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "co".to_owned(),
+                },
+                context: None,
+            },
+        ),
+    )
+    .expect_err("stdio as_proxy without an echo completion provider must refuse complete");
+    let _ = refused;
+
+    drop(client);
+    gateway.shutdown();
+}
+
 /// Live modern stdio `as_proxy("ext")` HTTP gateway against shipped echo with
 /// `FASTMCP_FS_ROOT` so unprefixed `file:///e2e/{+path}` stays exact-final.
 #[cfg(all(
@@ -11271,6 +11361,91 @@ fn e2e_public_http_as_proxy_forwards_resource_template_completion() {
     let missing = runtime_block_on_bounded(&cx, client.complete(&cx, other))
         .expect_err("changing only the template URI must not invent a completion provider");
     let _ = missing;
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_as_proxy_advertises_completions_when_upstream_supports() {
+    let upstream = spawn_modern_template_completion_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let cx = Cx::for_request();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-complete-advertise", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy completion-advertise gateway");
+
+    let discovery = serde_json::to_value(client.server_discovery().capabilities())
+        .expect("as_proxy discovery capabilities serialize");
+    assert_eq!(
+        discovery.get("completions"),
+        Some(&json!({})),
+        "as_proxy must advertise completions when the upstream installed a provider: {discovery}"
+    );
+
+    let retained = runtime_block_on_bounded(
+        &cx,
+        client.complete(&cx, public_http_template_completion_params()),
+    )
+    .expect("advertised as_proxy completions must still forward the unprefixed template");
+    assert_eq!(
+        retained.completion.values,
+        vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_VALUE.to_owned()],
+        "as_proxy must retain the upstream template completion after advertising: {retained:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_omits_completions_when_upstream_has_none() {
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let cx = Cx::for_request();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-http-as-proxy-complete-omit", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy completion-omit gateway");
+
+    let discovery = serde_json::to_value(client.server_discovery().capabilities())
+        .expect("as_proxy discovery capabilities serialize");
+    assert!(
+        discovery.get("completions").is_none(),
+        "changing only the missing upstream completion provider must omit completions: {discovery}"
+    );
+
+    let prefixed = format!("ext/{PUBLIC_HTTP_PROMPT_NAME}");
+    let refused = runtime_block_on_bounded(
+        &cx,
+        client.complete(
+            &cx,
+            modern::CompletionParams {
+                reference: modern::CompletionReference::PromptWithTitle {
+                    name: prefixed,
+                    title: "Public HTTP E2E Prompt".to_owned(),
+                },
+                argument: modern::FinalCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "al".to_owned(),
+                },
+                context: None,
+            },
+        ),
+    )
+    .expect_err("an as_proxy gateway without a completion provider must refuse complete");
+    let _ = refused;
 
     drop(client);
     gateway.shutdown();
@@ -32424,6 +32599,97 @@ fn e2e_public_http_legacy_as_proxy_forwards_resource_template_completion() {
     upstream.shutdown();
 }
 
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_advertises_completions_when_upstream_supports() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_template_completion_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-complete-advertise",
+    );
+
+    assert!(
+        client.server_capabilities().completions.is_some(),
+        "exact-2024 as_proxy must advertise initialize completions when the upstream installed a provider: {:?}",
+        client.server_capabilities()
+    );
+
+    let prefixed = format!("child/{PUBLIC_HTTP_CURSOR_TEMPLATE}");
+    let completed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy advertised completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource { uri: prefixed },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "id".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect("advertised exact-2024 as_proxy completions must still forward the prefixed template");
+    assert_eq!(
+        completed.completion.values,
+        vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE.to_owned()],
+        "exact-2024 as_proxy must retain the upstream template completion after advertising: {completed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_omits_completions_when_upstream_has_none() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-complete-omit",
+    );
+
+    assert!(
+        client.server_capabilities().completions.is_none(),
+        "changing only the missing upstream completion provider must omit exact-2024 as_proxy completions: {:?}",
+        client.server_capabilities()
+    );
+
+    let refused = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 as_proxy omitted completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: format!("child/{PUBLIC_HTTP_PROMPT_NAME}"),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "subject".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect_err(
+        "an exact-2024 as_proxy gateway without a completion provider must refuse complete",
+    );
+    let _ = refused;
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
 #[cfg(all(feature = "proxy", any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn e2e_public_http_legacy_as_proxy_forwards_filesystem_template() {
@@ -34505,6 +34771,97 @@ fn e2e_public_http_legacy_as_proxy_stdio_forwards_resource_template_completion()
         vec!["stdio-completion-legacy".to_owned()],
         "exact-2024 stdio as_proxy must still complete ext/greeting: {greeting:?}"
     );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_advertises_completions_when_echo_supports() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-complete-advertise",
+    );
+
+    assert!(
+        client.server_capabilities().completions.is_some(),
+        "exact-2024 stdio as_proxy must advertise initialize completions when echo installed a provider: {:?}",
+        client.server_capabilities()
+    );
+
+    let completed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy advertised completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Resource {
+                    uri: "ext/note://{name}".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "al".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect("advertised exact-2024 stdio as_proxy completions must still forward prefixed note://{name}");
+    assert_eq!(
+        completed.completion.values,
+        vec!["stdio-note-completion-legacy".to_owned()],
+        "exact-2024 stdio as_proxy must retain the echo note-template completion after advertising: {completed:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_omits_completions_when_echo_has_none() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_env(vec![(
+        "FASTMCP_NO_COMPLETIONS".to_owned(),
+        "1".to_owned(),
+    )]);
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-complete-omit",
+    );
+
+    assert!(
+        client.server_capabilities().completions.is_none(),
+        "changing only FASTMCP_NO_COMPLETIONS must omit exact-2024 stdio as_proxy completions: {:?}",
+        client.server_capabilities()
+    );
+
+    let refused = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy omitted completion/complete",
+        client.complete(
+            &cx,
+            legacy_2024::LegacyCompletionParams {
+                reference: legacy_2024::LegacyCompletionReference::Prompt {
+                    name: "ext/greeting".to_owned(),
+                },
+                argument: legacy_2024::LegacyCompletionArgument {
+                    name: "name".to_owned(),
+                    value: "co".to_owned(),
+                },
+                meta: None,
+            },
+        ),
+    )
+    .expect_err(
+        "exact-2024 stdio as_proxy without an echo completion provider must refuse complete",
+    );
+    let _ = refused;
 
     drop(client);
     gateway.shutdown();
