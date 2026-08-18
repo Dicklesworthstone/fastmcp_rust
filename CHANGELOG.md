@@ -6,9 +6,46 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.4.0)
+## [Unreleased] (after v0.5.0)
 
 No unreleased changes yet.
+
+---
+
+## [v0.5.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.5.0) -- 2026-08-18 (GitHub Release)
+
+Feature release (pre-1.0 minor bump) of the dual-era `as_proxy` gateway.
+Workspace crates move to 0.5.0. This does **not** claim aggregate MCP
+2026-07-28 conformance, FND-01 freeze, or GATE-ALL-MCP-READY.
+
+### Proxy gateway
+
+- **Completions advertise/omit** -- `as_proxy` advertises `completions` only
+  when the proxied upstream's initialize payload includes that member (exact
+  2024) or discovery reports a final completion handler (modern). Public
+  `completion_handler` / `legacy_completion_handler` /
+  `legacy_resource_template_completion_handler` builders now set the same
+  capability. Prefixed catalog install binds completion handlers only after
+  the target actually registers. ([`23190f9`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/23190f9), [`8feeedf`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/8feeedf))
+- **on_duplicate / strict input / list page / session state** -- colliding
+  catalog members skip one component and keep the rest; gateway
+  `strict` input is honored on proxied FinalTools; list page size and
+  session-state bags are proven over HTTP, WebSocket, and stdio. ([`252090e`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/252090e), [`c07d870`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c07d870), [`7f138fc`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/7f138fc))
+- **Compose, request timeout, includeTags** -- `as_proxy` compose-from-prompt,
+  gateway `request_timeout` via `hold_echo`, and includeTags filtering are
+  live. Nested `isError` tool text is preserved through the proxy. ([`3e9fb00`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3e9fb00), [`369a5d0`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/369a5d0))
+- **Exact-2024 completion progressToken** -- stdio completion forwards stamp
+  the request `progressToken`. Panic sanitization on the gateway is covered
+  by e2e. ([`2511b76`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2511b76), [`1613bfa`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1613bfa))
+
+### Release packaging
+
+- First GitHub Release to include a Windows `x86_64-pc-windows-msvc` CLI
+  archive (`fastmcp-windows-amd64.zip`) alongside the existing Linux and
+  macOS `tar.xz` assets. Native Windows build hosts were offline; the
+  Windows binary is produced with `cargo-xwin` on the Linux builder.
+
+**Exact changes:** [v0.4.0...v0.5.0](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.4.0...v0.5.0)
 
 ---
 
