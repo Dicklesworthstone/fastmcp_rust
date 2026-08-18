@@ -161,6 +161,42 @@ fn cache_probe(_ctx: &McpContext, token: String) -> String {
     format!("{token}:{n}")
 }
 
+const ECHO_STATE_KEY: &str = "e2e-echo-session-state";
+
+/// Reads and writes session state so as_proxy stdio can prove the
+/// upstream-binding bag (one shared stdio session).
+#[tool]
+fn state_probe(ctx: &McpContext, action: String, value: String) -> String {
+    if !ctx.has_session_state() {
+        return "state:none".to_owned();
+    }
+    match action.as_str() {
+        "write" => {
+            if !ctx.set_state(ECHO_STATE_KEY, value.clone()) {
+                return "state:set-failed".to_owned();
+            }
+            format!(
+                "state:{}",
+                ctx.get_state::<String>(ECHO_STATE_KEY)
+                    .unwrap_or_else(|| "missing".to_owned())
+            )
+        }
+        "remove" => {
+            let _ = ctx.remove_state(ECHO_STATE_KEY);
+            format!(
+                "state:{}",
+                ctx.get_state::<String>(ECHO_STATE_KEY)
+                    .unwrap_or_else(|| "missing".to_owned())
+            )
+        }
+        _ => format!(
+            "state:{}",
+            ctx.get_state::<String>(ECHO_STATE_KEY)
+                .unwrap_or_else(|| "missing".to_owned())
+        ),
+    }
+}
+
 /// Env-gated panic so live stdio can prove the handler unwind boundary.
 ///
 /// Registered only when `FASTMCP_PANIC_TOOL=1`. The distinctive payload must
@@ -1230,6 +1266,7 @@ fn main() {
         .tool(Reverse)
         .tool(CountWords)
         .tool(CacheProbe)
+        .tool(StateProbe)
         .tool(ComposeEcho)
         .tool(ComposePrompt)
         .tool(SlowEcho)
