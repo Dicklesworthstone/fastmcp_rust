@@ -908,6 +908,10 @@ impl ServerBuilder {
             .list_changed = true;
     }
 
+    fn advertise_completions(&mut self) {
+        self.capabilities.completions = Some(fastmcp_protocol::CompletionsCapability::default());
+    }
+
     /// Registers an intentionally exact MCP 2024-11-05-only resource.
     #[must_use]
     pub fn legacy_resource<H: ResourceHandler + 'static>(mut self, handler: H) -> Self {
@@ -1256,6 +1260,7 @@ impl ServerBuilder {
                                 downstream_uri,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 Ok(()) => {}
@@ -1286,6 +1291,7 @@ impl ServerBuilder {
                                 downstream_name,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 Ok(()) => {}
@@ -1333,6 +1339,7 @@ impl ServerBuilder {
                             downstream_uri,
                         ),
                     );
+                    self.advertise_completions();
                 }
                 Ok(()) => {}
                 Err(error) => {
@@ -1365,6 +1372,7 @@ impl ServerBuilder {
                             downstream_name,
                         ),
                     );
+                    self.advertise_completions();
                 }
                 Ok(()) => {}
                 Err(error) => {
@@ -1609,6 +1617,7 @@ impl ServerBuilder {
                                 upstream_uri,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 for prompt in prompts {
@@ -1635,6 +1644,7 @@ impl ServerBuilder {
                                 upstream_name,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 counts
@@ -1716,6 +1726,7 @@ impl ServerBuilder {
                                 downstream_uri,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 for prompt in prompts {
@@ -1742,6 +1753,7 @@ impl ServerBuilder {
                                 upstream_name,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 counts
@@ -1909,6 +1921,7 @@ impl ServerBuilder {
                                 downstream_uri,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 for prompt in prompts {
@@ -1928,6 +1941,7 @@ impl ServerBuilder {
                                 downstream_name,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 if has_tools {
@@ -1981,6 +1995,7 @@ impl ServerBuilder {
                                 downstream_uri,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 for prompt in prompts {
@@ -2000,6 +2015,7 @@ impl ServerBuilder {
                                 downstream_name,
                             ),
                         );
+                        self.advertise_completions();
                     }
                 }
                 if has_tools {
@@ -5772,6 +5788,10 @@ mod tests {
                 )
                 .expect("the exact final completion proxy installs")
                 .build();
+            assert!(
+                server.capabilities().completions.is_some(),
+                "installing a proxied completion provider must advertise initialize completions"
+            );
 
             let mut legacy_session = initialized_legacy_proxy_session(&server);
             let notification_sender: crate::NotificationSender = Arc::new(|_| {});
@@ -5871,6 +5891,10 @@ mod tests {
                 )
                 .expect("changing only upstream completion support preserves catalog registration")
                 .build();
+            assert!(
+                server.capabilities().completions.is_none(),
+                "an unsupported upstream must not advertise initialize completions"
+            );
             let discovery = serde_json::to_value(
                 server
                     .server_discovery()

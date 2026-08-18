@@ -2520,7 +2520,7 @@ impl ProxyBackend for Client {
     fn supports_completion(&mut self) -> McpResult<bool> {
         self.ensure_initialized()?;
         match self.selected_protocol_era() {
-            Some(ProtocolEra::Legacy2024) => Ok(true),
+            Some(ProtocolEra::Legacy2024) => Ok(self.server_capabilities().completions.is_some()),
             Some(ProtocolEra::Modern2026) => Ok(self
                 .server_discovery()
                 .map(discovery_supports_final_completion)
@@ -4182,6 +4182,7 @@ pub struct ProxyHttpClient {
     client_capabilities: ClientCapabilities,
     next_request_id: i64,
     legacy_initialized: bool,
+    legacy_completion_supported: bool,
     instructions: Option<String>,
     implementation: Option<Implementation>,
     inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
@@ -4245,6 +4246,7 @@ impl ProxyHttpClient {
             client_capabilities,
             next_request_id,
             legacy_initialized: false,
+            legacy_completion_supported: false,
             instructions,
             implementation,
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
@@ -4413,6 +4415,7 @@ impl ProxyHttpClient {
             ));
         }
         self.instructions = initialized.instructions.filter(|value| !value.is_empty());
+        self.legacy_completion_supported = initialized.capabilities.completions.is_some();
 
         block_on(self.connection.notify(
             &self.cx,
@@ -5051,7 +5054,10 @@ impl ProxyBackend for ProxyHttpClient {
 
     fn supports_completion(&mut self) -> McpResult<bool> {
         match self.binding.era() {
-            ProtocolEra::Legacy2024 => Ok(true),
+            ProtocolEra::Legacy2024 => {
+                self.ensure_legacy_initialized()?;
+                Ok(self.legacy_completion_supported)
+            }
             ProtocolEra::Modern2026 => Ok(self
                 .connection
                 .server_discovery()
