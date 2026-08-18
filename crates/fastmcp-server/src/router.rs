@@ -4901,14 +4901,29 @@ impl Router {
             .arguments
             .into_value()
             .unwrap_or_else(|| serde_json::json!({}));
-        if input_schema.is_some_and(|schema| {
-            let validation = if self.strict_input_validation {
-                validate_strict(schema.schema(), &arguments)
-            } else {
-                schema.validate(&arguments)
-            };
-            validation.is_err()
-        }) {
+        let input_validation_failed = match input_schema {
+            Some(schema) => {
+                let validation = if self.strict_input_validation {
+                    validate_strict(schema.schema(), &arguments)
+                } else {
+                    schema.validate(&arguments)
+                };
+                validation.is_err()
+            }
+            None if self.strict_input_validation => {
+                // Upstream/proxy tools skip local schema admission so a valid
+                // non-object catalog schema can be retained without inventing
+                // an error payload. Gateway strict mode still refuses
+                // additionalProperties against that catalog input schema.
+                validate_strict(
+                    &final_registration.final_definition.input_schema,
+                    &arguments,
+                )
+                .is_err()
+            }
+            None => false,
+        };
+        if input_validation_failed {
             let mut result = crate::handler::promote_legacy_tool_content(vec![Content::text(
                 "Tool arguments do not match the declared input schema.",
             )])?;
@@ -17619,6 +17634,68 @@ mod router_tests {
             forged_router
                 .get_tool("upstream-scalar-schema-tool")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn tokenized_upstream_schema_still_honors_strict_input_validation() {
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1602, Budget::INFINITE, &state);
+        let mut router = Router::new();
+        router
+            .add_tool(UpstreamScalarSchemaTool {
+                registered_proxy: true,
+            })
+            .expect("an upstream-owned object schema is retained without local admission");
+        router.set_strict_input_validation(true);
+
+        let refused = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "upstream-scalar-schema-tool",
+                    serde_json::json!({"extra": 1}),
+                    1602_i64,
+                ),
+            )
+            .expect("gateway strict mode returns a complete tools/call result");
+        assert_eq!(refused["resultType"], "complete");
+        assert_eq!(refused["isError"], true);
+        assert_eq!(
+            refused["content"][0]["text"],
+            "Tool arguments do not match the declared input schema."
+        );
+
+        let admitted = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "upstream-scalar-schema-tool",
+                    serde_json::json!({}),
+                    1603_i64,
+                ),
+            )
+            .expect("declared empty object arguments still reach the proxy handler");
+        assert_eq!(
+            admitted["structuredContent"],
+            serde_json::json!({"upstream": true})
+        );
+
+        router.set_strict_input_validation(false);
+        let extra = router
+            .dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request(
+                    "upstream-scalar-schema-tool",
+                    serde_json::json!({"extra": 1}),
+                    1604_i64,
+                ),
+            )
+            .expect("changing only the strict flag must admit the extra property");
+        assert_eq!(
+            extra["structuredContent"],
+            serde_json::json!({"upstream": true})
         );
     }
 
