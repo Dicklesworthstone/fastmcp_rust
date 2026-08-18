@@ -4465,7 +4465,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_configured(
     precreate_task: bool,
     extra_env: Vec<(String, String)>,
 ) -> (HttpServerFixture, Option<FinalTaskId>) {
-    spawn_modern_http_stdio_as_proxy_gateway_with_options(precreate_task, extra_env, false)
+    spawn_modern_http_stdio_as_proxy_gateway_with_options(precreate_task, extra_env, false, None)
 }
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
@@ -4473,6 +4473,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
     precreate_task: bool,
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
 ) -> (HttpServerFixture, Option<FinalTaskId>) {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) =
@@ -4563,8 +4564,12 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
             } else {
                 None
             };
-            let server = modern::ServerBuilder::new("e2e-http-stdio-as-proxy", "1.0.0")
-                .mask_error_details(mask_error_details)
+            let mut builder = modern::ServerBuilder::new("e2e-http-stdio-as-proxy", "1.0.0")
+                .mask_error_details(mask_error_details);
+            if let Some(request_timeout_secs) = request_timeout_secs {
+                builder = builder.request_timeout(request_timeout_secs);
+            }
+            let server = builder
                 .as_proxy("ext", stdio)
                 .map_err(|error| format!("as_proxy stdio install failed: {error}"))?
                 .build();
@@ -11813,7 +11818,7 @@ fn e2e_public_http_as_proxy_stdio_bare_upstream_omits_instructions() {
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_identity_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
-    spawn_modern_http_identity_proxy_gateway_configured(upstream, None, false)
+    spawn_modern_http_identity_proxy_gateway_configured(upstream, None, false, None)
 }
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -11821,6 +11826,7 @@ fn spawn_modern_http_identity_proxy_gateway_configured(
     upstream: SocketAddr,
     gateway_instructions: Option<String>,
     mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
 ) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -11882,6 +11888,9 @@ fn spawn_modern_http_identity_proxy_gateway_configured(
                 .mask_error_details(mask_error_details);
             if let Some(instructions) = gateway_instructions {
                 builder = builder.instructions(instructions);
+            }
+            if let Some(request_timeout_secs) = request_timeout_secs {
+                builder = builder.request_timeout(request_timeout_secs);
             }
             let server = builder
                 .as_proxy_typed("ext", proxy, catalog)
@@ -12117,6 +12126,7 @@ fn e2e_public_http_as_proxy_adopts_upstream_instructions() {
         instructed_upstream.address(),
         Some("gateway-override-instructions".to_owned()),
         false,
+        None,
     );
     let instructed = runtime_block_on_bounded(
         &cx,
@@ -12666,9 +12676,9 @@ fn e2e_public_http_as_proxy_mask_error_details_hides_upstream_resource_secret() 
     let cx = Cx::for_request();
     let upstream = spawn_modern_as_proxy_leak_upstream();
     let masked_gateway =
-        spawn_modern_http_identity_proxy_gateway_configured(upstream.address(), None, true);
+        spawn_modern_http_identity_proxy_gateway_configured(upstream.address(), None, true, None);
     let unmasked_gateway =
-        spawn_modern_http_identity_proxy_gateway_configured(upstream.address(), None, false);
+        spawn_modern_http_identity_proxy_gateway_configured(upstream.address(), None, false, None);
     let mut masked = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -12743,9 +12753,9 @@ fn e2e_public_http_legacy_as_proxy_mask_error_details_hides_upstream_resource_se
     let cx = Cx::for_request();
     let upstream = spawn_legacy_as_proxy_leak_upstream();
     let masked_gateway =
-        spawn_legacy_as_proxy_instructions_gateway_named(upstream.address(), None, true);
+        spawn_legacy_as_proxy_instructions_gateway_named(upstream.address(), None, true, None);
     let unmasked_gateway =
-        spawn_legacy_as_proxy_instructions_gateway_named(upstream.address(), None, false);
+        spawn_legacy_as_proxy_instructions_gateway_named(upstream.address(), None, false, None);
     let mut masked = connect_legacy_http_client(
         &cx,
         masked_gateway.address(),
@@ -12828,7 +12838,7 @@ fn e2e_public_http_legacy_as_proxy_mask_error_details_hides_upstream_resource_se
 fn e2e_public_http_as_proxy_stdio_mask_error_details_hides_upstream_resource_secret() {
     let cx = Cx::for_request();
     let (gateway, _) =
-        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), true);
+        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), true, None);
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -12864,7 +12874,7 @@ fn e2e_public_http_as_proxy_stdio_mask_error_details_hides_upstream_resource_sec
 fn e2e_public_http_as_proxy_stdio_unmask_error_details_keeps_upstream_resource_secret() {
     let cx = Cx::for_request();
     let (gateway, _) =
-        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), false);
+        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), false, None);
     let mut client = runtime_block_on_bounded(
         &cx,
         modern::ClientBuilder::new()
@@ -12889,8 +12899,10 @@ fn e2e_public_http_as_proxy_stdio_unmask_error_details_keeps_upstream_resource_s
 #[test]
 fn e2e_public_http_legacy_as_proxy_stdio_mask_error_details_hides_upstream_resource_secret() {
     let cx = Cx::for_request();
-    let masked_gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), true);
-    let unmasked_gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), false);
+    let masked_gateway =
+        spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), true, None);
+    let unmasked_gateway =
+        spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), false, None);
     let mut masked = connect_legacy_http_client(
         &cx,
         masked_gateway.address(),
@@ -13484,6 +13496,1487 @@ fn e2e_public_http_legacy_as_proxy_stdio_composes_nested_tool_and_resource() {
     assert!(
         missing_tool.contains("stdio-e2e-missing") || missing_tool.contains("compose-nested-tool"),
         "as_proxy compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-compose-prompt", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy compose-prompt gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "compose_prompt", json!({ "name": "alpha" })),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed compose_prompt handler");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, "ext/compose_prompt", json!({ "name": "alpha" })),
+    )
+    .expect("as_proxy must forward prefixed compose_prompt onto the live stdio echo process");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "compose-prompt:Please greet alpha in a friendly way."
+            }
+            _ => false,
+        }),
+        "as_proxy must retain the nested greeting prompt text: {composed:?}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            "ext/compose_prompt",
+            json!({
+                "name": "alpha",
+                "prompt": "stdio-e2e-missing",
+            }),
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy compose_prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-compose-prompt",
+    );
+
+    let missing = legacy_http_call(
+        &cx,
+        &mut client,
+        "compose_prompt",
+        json!({ "name": "alpha" }),
+        "exact-2024 stdio as_proxy compose_prompt unprefixed",
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed compose_prompt handler");
+    let _ = missing;
+
+    let composed = legacy_http_call(
+        &cx,
+        &mut client,
+        "ext/compose_prompt",
+        json!({ "name": "alpha" }),
+        "exact-2024 stdio as_proxy compose_prompt",
+    )
+    .expect("as_proxy must forward prefixed compose_prompt onto the live LegacyOnly echo process");
+    assert_eq!(
+        legacy_http_tool_text(&composed).as_deref(),
+        Some("compose-prompt:Please greet alpha in a friendly way."),
+        "as_proxy must retain the nested greeting prompt text: {composed:?}"
+    );
+
+    let missing_prompt = legacy_http_call(
+        &cx,
+        &mut client,
+        "ext/compose_prompt",
+        json!({
+            "name": "alpha",
+            "prompt": "stdio-e2e-missing",
+        }),
+        "exact-2024 stdio as_proxy compose_prompt missing nested prompt",
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy compose_prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-resource-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy resource-compose gateway");
+
+    let missing = runtime_block_on_bounded(&cx, client.read_resource(&cx, "ext/info://compose"))
+        .expect_err("modern as_proxy must keep the compose resource URI unprefixed");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(&cx, client.read_resource(&cx, "info://compose"))
+        .expect("as_proxy must forward unprefixed info://compose onto the live stdio echo process");
+    assert!(
+        composed.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => {
+                text.starts_with("compose:alpha|") && text.contains("echo-server")
+            }
+            _ => false,
+        }),
+        "as_proxy resources/read must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "info://compose-missing-tool"),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("stdio-e2e-missing") || missing_tool.contains("compose-nested-tool"),
+        "as_proxy resource compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-resource-compose",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy resource compose unprefixed",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "info://compose".to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the missing prefix must not reach the unprefixed compose resource");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy resource compose",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "ext/info://compose".to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("as_proxy must forward prefixed info://compose onto the live LegacyOnly echo process");
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 stdio resource result serializes");
+    let text = composed["contents"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("compose:alpha|") && text.contains("echo-server"),
+        "as_proxy resources/read must retain the nested echo text and server-info resource: {composed}"
+    );
+
+    let missing_tool = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy resource compose missing nested tool",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "ext/info://compose-missing-tool".to_owned(),
+                meta: None,
+            },
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("stdio-e2e-missing") || missing_tool.contains("compose-nested-tool"),
+        "as_proxy resource compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-prompt-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy prompt-compose gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "compose_greeting",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed compose_greeting");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/compose_greeting",
+            HashMap::from([("name".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect("as_proxy must forward prefixed compose_greeting onto the live stdio echo process");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text.starts_with("compose:alpha|") && text.contains("echo-server")
+                }
+                _ => false,
+            }),
+        "as_proxy prompts/get must retain the nested echo text and server-info resource: {composed:?}"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            "ext/compose_greeting",
+            HashMap::from([
+                ("name".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "stdio-e2e-missing".to_owned()),
+            ]),
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("stdio-e2e-missing") || missing_tool.contains("compose-nested-tool"),
+        "as_proxy prompt compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-prompt-compose",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy prompt compose unprefixed",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "compose_greeting".to_owned(),
+                arguments: Some(HashMap::from([("name".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the missing prefix must not reach the unprefixed compose_greeting");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy prompt compose",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "ext/compose_greeting".to_owned(),
+                arguments: Some(HashMap::from([("name".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "as_proxy must forward prefixed compose_greeting onto the live LegacyOnly echo process",
+    );
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 stdio prompt result serializes");
+    let text = composed["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.starts_with("compose:alpha|") && text.contains("echo-server"),
+        "as_proxy prompts/get must retain the nested echo text and server-info resource: {composed}"
+    );
+
+    let missing_tool = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy prompt compose missing nested tool",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: "ext/compose_greeting".to_owned(),
+                arguments: Some(HashMap::from([
+                    ("name".to_owned(), "alpha".to_owned()),
+                    ("tool".to_owned(), "stdio-e2e-missing".to_owned()),
+                ])),
+                meta: None,
+            },
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("stdio-e2e-missing") || missing_tool.contains("compose-nested-tool"),
+        "as_proxy prompt compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_resource_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_configured(false, Vec::new());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-resource-compose-prompt", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect(
+        "the public facade connects to the live stdio as_proxy resource-compose-prompt gateway",
+    );
+
+    let missing =
+        runtime_block_on_bounded(&cx, client.read_resource(&cx, "ext/info://compose-prompt"))
+            .expect_err("modern as_proxy must keep the compose-prompt resource URI unprefixed");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "info://compose-prompt"),
+    )
+    .expect(
+        "as_proxy must forward unprefixed info://compose-prompt onto the live stdio echo process",
+    );
+    assert!(
+        composed.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => {
+                text == "compose-prompt:Please greet alpha in a friendly way."
+            }
+            _ => false,
+        }),
+        "as_proxy resources/read must retain the nested greeting prompt text: {composed:?}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, "info://compose-prompt-missing"),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => panic!(
+            "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy resource compose-prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_resource_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway();
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-resource-compose-prompt",
+    );
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy resource compose-prompt unprefixed",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "info://compose-prompt".to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err(
+        "changing only the missing prefix must not reach the unprefixed compose-prompt resource",
+    );
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy resource compose-prompt",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "ext/info://compose-prompt".to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect("as_proxy must forward prefixed info://compose-prompt onto the live LegacyOnly echo process");
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 stdio resource result serializes");
+    assert_eq!(
+        composed["contents"][0]["text"],
+        json!("compose-prompt:Please greet alpha in a friendly way."),
+        "as_proxy resources/read must retain the nested greeting prompt text: {composed}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 stdio as_proxy resource compose-prompt missing nested prompt",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: "ext/info://compose-prompt-missing".to_owned(),
+                meta: None,
+            },
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("stdio-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy resource compose-prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_compose_and_state_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy compose gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_COMPOSE_TOOL_NAME}");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+            json!({"value": "alpha"}),
+        ),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed compose handler");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+    )
+    .expect("as_proxy must forward prefixed compose onto the live HTTP upstream");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => {
+                text == "compose:tool:alpha|resource:deterministic"
+            }
+            _ => false,
+        }),
+        "as_proxy must retain the nested tool text and resource: {composed:?}"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            &prefixed,
+            json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("compose-nested-tool"),
+        "as_proxy compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_compose_http_server();
+    let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-compose",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_COMPOSE_TOOL_NAME}");
+
+    let missing = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+        json!({"value": "alpha"}),
+        "exact-2024 HTTP as_proxy compose unprefixed",
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed compose handler");
+    let _ = missing;
+
+    let composed = legacy_http_call(
+        &cx,
+        &mut client,
+        &prefixed,
+        json!({"value": "alpha"}),
+        "exact-2024 HTTP as_proxy compose",
+    )
+    .expect("as_proxy must forward prefixed compose onto the live exact-2024 HTTP upstream");
+    assert_eq!(
+        legacy_http_tool_text(&composed).as_deref(),
+        Some("compose:tool:alpha|resource:deterministic"),
+        "as_proxy must retain the nested tool text and resource: {composed:?}"
+    );
+
+    let missing_tool = legacy_http_call(
+        &cx,
+        &mut client,
+        &prefixed,
+        json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+        "exact-2024 HTTP as_proxy compose missing nested tool",
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("compose-nested-tool"),
+        "as_proxy compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_compose_prompt_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-compose-prompt", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy compose-prompt gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME}");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+            json!({"subject": "alpha"}),
+        ),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed compose_prompt handler");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, &prefixed, json!({"subject": "alpha"})),
+    )
+    .expect("as_proxy must forward prefixed compose_prompt onto the live HTTP upstream");
+    assert!(
+        composed.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "compose-prompt:prompt:alpha",
+            _ => false,
+        }),
+        "as_proxy must retain the nested prompt text: {composed:?}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(
+            &cx,
+            &prefixed,
+            json!({
+                "subject": "alpha",
+                "prompt": "public-http-e2e-missing",
+            }),
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("public-http-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy compose_prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_compose_prompt_http_server();
+    let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-compose-prompt",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME}");
+
+    let missing = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+        json!({"subject": "alpha"}),
+        "exact-2024 HTTP as_proxy compose_prompt unprefixed",
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed compose_prompt handler");
+    let _ = missing;
+
+    let composed = legacy_http_call(
+        &cx,
+        &mut client,
+        &prefixed,
+        json!({"subject": "alpha"}),
+        "exact-2024 HTTP as_proxy compose_prompt",
+    )
+    .expect("as_proxy must forward prefixed compose_prompt onto the live exact-2024 HTTP upstream");
+    assert_eq!(
+        legacy_http_tool_text(&composed).as_deref(),
+        Some("compose-prompt:prompt:alpha"),
+        "as_proxy must retain the nested prompt text: {composed:?}"
+    );
+
+    let missing_prompt = legacy_http_call(
+        &cx,
+        &mut client,
+        &prefixed,
+        json!({
+            "subject": "alpha",
+            "prompt": "public-http-e2e-missing",
+        }),
+        "exact-2024 HTTP as_proxy compose_prompt missing nested prompt",
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("public-http-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy compose_prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_compose_and_state_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-resource-compose", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy resource-compose gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, &format!("ext/{PUBLIC_HTTP_COMPOSE_RESOURCE_URI}")),
+    )
+    .expect_err("modern as_proxy must keep the compose resource URI unprefixed");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_RESOURCE_URI),
+    )
+    .expect("as_proxy must forward unprefixed compose resources/read onto the live HTTP upstream");
+    assert!(
+        composed.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => {
+                text == "compose:tool:alpha|resource:deterministic"
+            }
+            _ => false,
+        }),
+        "as_proxy resources/read must retain the nested tool text and resource: {composed:?}"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("compose-nested-tool"),
+        "as_proxy resource compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_resource_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_compose_http_server();
+    let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-resource-compose",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_COMPOSE_RESOURCE_URI}");
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resource compose unprefixed",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_COMPOSE_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the missing prefix must not reach the unprefixed compose resource");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resource compose",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: prefixed,
+                meta: None,
+            },
+        ),
+    )
+    .expect("as_proxy must forward prefixed compose resources/read onto the live exact-2024 HTTP upstream");
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 HTTP resource result serializes");
+    assert_eq!(
+        composed["contents"][0]["text"],
+        json!("compose:tool:alpha|resource:deterministic"),
+        "as_proxy resources/read must retain the nested tool text and resource: {composed}"
+    );
+
+    let missing_tool = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resource compose missing nested tool",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: format!("child/{PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI}"),
+                meta: None,
+            },
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("compose-nested-tool"),
+        "as_proxy resource compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_compose_and_state_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-prompt-compose-handler", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy prompt-compose gateway");
+    let prefixed = format!("ext/{PUBLIC_HTTP_COMPOSE_PROMPT_NAME}");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+            HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect_err("changing only the prompt name must not reach the unprefixed compose prompt");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            &prefixed,
+            HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+        ),
+    )
+    .expect("as_proxy must forward prefixed compose prompts/get onto the live HTTP upstream");
+    assert!(
+        composed
+            .messages
+            .iter()
+            .any(|message| match &message.content {
+                ContentBlock::Text { text, .. } => {
+                    text == "compose:tool:alpha|resource:deterministic"
+                }
+                _ => false,
+            }),
+        "as_proxy prompts/get must retain the nested tool text and resource: {composed:?}"
+    );
+
+    let missing_tool = runtime_block_on_bounded(
+        &cx,
+        client.get_prompt(
+            &cx,
+            &prefixed,
+            HashMap::from([
+                ("value".to_owned(), "alpha".to_owned()),
+                ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+            ]),
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => panic!(
+            "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("compose-nested-tool"),
+        "as_proxy prompt compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_prompt_composes_nested_tool_and_resource() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_compose_http_server();
+    let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-prompt-compose-handler",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_COMPOSE_PROMPT_NAME}");
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy prompt compose unprefixed",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: PUBLIC_HTTP_COMPOSE_PROMPT_NAME.to_owned(),
+                arguments: Some(HashMap::from([("value".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err("changing only the missing prefix must not reach the unprefixed compose prompt");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy prompt compose",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: prefixed.clone(),
+                arguments: Some(HashMap::from([("value".to_owned(), "alpha".to_owned())])),
+                meta: None,
+            },
+        ),
+    )
+    .expect(
+        "as_proxy must forward prefixed compose prompts/get onto the live exact-2024 HTTP upstream",
+    );
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 HTTP prompt result serializes");
+    assert_eq!(
+        composed["messages"][0]["content"]["text"],
+        json!("compose:tool:alpha|resource:deterministic"),
+        "as_proxy prompts/get must retain the nested tool text and resource: {composed}"
+    );
+
+    let missing_tool = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy prompt compose missing nested tool",
+        client.get_prompt(
+            &cx,
+            legacy_2024::GetPromptParams {
+                name: prefixed,
+                arguments: Some(HashMap::from([
+                    ("value".to_owned(), "alpha".to_owned()),
+                    ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+                ])),
+                meta: None,
+            },
+        ),
+    );
+    let missing_tool = match missing_tool {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_tool.contains("public-http-e2e-missing")
+            || missing_tool.contains("compose-nested-tool"),
+        "as_proxy prompt compose must keep the nested missing-tool refusal: {missing_tool}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_resource_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_compose_prompt_http_server();
+    let gateway = spawn_modern_http_identity_proxy_gateway(upstream.address());
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-resource-compose-prompt", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy resource-compose-prompt gateway");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(
+            &cx,
+            &format!("ext/{PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI}"),
+        ),
+    )
+    .expect_err("modern as_proxy must keep the compose-prompt resource URI unprefixed");
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI),
+    )
+    .expect("as_proxy must forward unprefixed compose-prompt resources/read onto the live HTTP upstream");
+    assert!(
+        composed.contents.iter().any(|content| match content {
+            EmbeddedResourceContents::Text { text, .. } => text == "compose-prompt:prompt:alpha",
+            _ => false,
+        }),
+        "as_proxy resources/read must retain the nested prompt text: {composed:?}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded(
+        &cx,
+        client.read_resource(&cx, PUBLIC_HTTP_PROMPT_COMPOSE_MISSING_RESOURCE_URI),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => panic!(
+            "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("public-http-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy resource compose-prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_resource_composes_nested_prompt() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_compose_prompt_http_server();
+    let gateway = spawn_legacy_as_proxy_instructions_gateway(upstream.address());
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-resource-compose-prompt",
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI}");
+
+    let missing = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resource compose-prompt unprefixed",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI.to_owned(),
+                meta: None,
+            },
+        ),
+    )
+    .expect_err(
+        "changing only the missing prefix must not reach the unprefixed compose-prompt resource",
+    );
+    let _ = missing;
+
+    let composed = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resource compose-prompt",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: prefixed,
+                meta: None,
+            },
+        ),
+    )
+    .expect("as_proxy must forward prefixed compose-prompt resources/read onto the live exact-2024 HTTP upstream");
+    let composed =
+        serde_json::to_value(composed).expect("the exact-2024 HTTP resource result serializes");
+    assert_eq!(
+        composed["contents"][0]["text"],
+        json!("compose-prompt:prompt:alpha"),
+        "as_proxy resources/read must retain the nested prompt text: {composed}"
+    );
+
+    let missing_prompt = runtime_block_on_bounded_named(
+        &cx,
+        "exact-2024 HTTP as_proxy resource compose-prompt missing nested prompt",
+        client.read_resource(
+            &cx,
+            legacy_2024::ReadResourceParams {
+                uri: format!("child/{PUBLIC_HTTP_PROMPT_COMPOSE_MISSING_RESOURCE_URI}"),
+                meta: None,
+            },
+        ),
+    );
+    let missing_prompt = match missing_prompt {
+        Ok(result) => format!("{result:?}"),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        missing_prompt.contains("public-http-e2e-missing")
+            || missing_prompt.contains("compose-nested-prompt"),
+        "as_proxy resource compose-prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
+    let cx = Cx::for_request();
+    let upstream = spawn_modern_as_proxy_hold_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway_configured(
+        upstream.address(),
+        None,
+        false,
+        Some(1),
+    );
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-http-request-timeout", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live HTTP as_proxy request_timeout gateway");
+    let prefixed_hold = format!("ext/{PUBLIC_HTTP_HOLD_TOOL_NAME}");
+    let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let missing = runtime_block_on_bounded(
+        &cx,
+        client.call_tool(&cx, PUBLIC_HTTP_HOLD_TOOL_NAME, json!({})),
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed hold handler");
+    let _ = missing;
+
+    let timed_out = runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed_hold, json!({})));
+    let timed_out = match timed_out {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a hold tool without timeout() must stay an error under gateway request_timeout: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        timed_out.contains("Request timeout exceeded")
+            || timed_out.contains("RequestCancelled")
+            || timed_out.contains("Request cancelled"),
+        "gateway request_timeout(1) must refuse prefixed hold before it returns held: {timed_out}"
+    );
+    assert!(
+        !timed_out.contains("held"),
+        "changing only the missing handler timeout must not let hold complete: {timed_out}"
+    );
+
+    let peer = runtime_block_on_bounded(&cx, client.call_tool(&cx, &prefixed_fast, json!({})))
+        .expect("changing only the tool name must still reach the undisabled fast handler");
+    assert!(
+        peer.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "as_proxy must keep the prefixed fast peer callable after a request_timeout: {peer:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_as_proxy_hold_upstream();
+    let gateway =
+        spawn_legacy_as_proxy_instructions_gateway_named(upstream.address(), None, false, Some(1));
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-as-proxy-request-timeout",
+    );
+    let prefixed_hold = format!("child/{PUBLIC_HTTP_HOLD_TOOL_NAME}");
+    let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+    let missing = legacy_http_call(
+        &cx,
+        &mut client,
+        PUBLIC_HTTP_HOLD_TOOL_NAME,
+        json!({}),
+        "exact-2024 HTTP as_proxy request_timeout unprefixed",
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed hold handler");
+    let _ = missing;
+
+    let timed_out = legacy_http_call(
+        &cx,
+        &mut client,
+        &prefixed_hold,
+        json!({}),
+        "exact-2024 HTTP as_proxy request_timeout hold",
+    );
+    let timed_out = match timed_out {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a hold tool without timeout() must stay an error under gateway request_timeout: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        timed_out.contains("Request timeout exceeded")
+            || timed_out.contains("RequestCancelled")
+            || timed_out.contains("Request cancelled"),
+        "gateway request_timeout(1) must refuse prefixed hold before it returns held: {timed_out}"
+    );
+    assert!(
+        !timed_out.contains("held"),
+        "changing only the missing handler timeout must not let hold complete: {timed_out}"
+    );
+
+    let peer = legacy_http_call(
+        &cx,
+        &mut client,
+        &prefixed_fast,
+        json!({}),
+        "exact-2024 HTTP as_proxy request_timeout peer",
+    )
+    .expect("changing only the tool name must still reach the undisabled fast handler");
+    assert_eq!(
+        legacy_http_tool_text(&peer).as_deref(),
+        Some("fast"),
+        "as_proxy must keep the prefixed fast peer callable after a request_timeout: {peer:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_timeout() {
+    let cx = Cx::for_request();
+    let (gateway, _) =
+        spawn_modern_http_stdio_as_proxy_gateway_with_options(false, Vec::new(), false, Some(1));
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("e2e-as-proxy-stdio-request-timeout", "1.0.0")
+            .connect_http_with_cx(public_http_target(gateway.address(), "/mcp"), &cx),
+    )
+    .expect("the public facade connects to the live stdio as_proxy request_timeout gateway");
+
+    let missing = runtime_block_on_bounded(&cx, client.call_tool(&cx, "hold_echo", json!({})))
+        .expect_err("changing only the tool name must not reach the unprefixed stdio hold handler");
+    let _ = missing;
+
+    let timed_out =
+        runtime_block_on_bounded(&cx, client.call_tool(&cx, "ext/hold_echo", json!({})));
+    let timed_out = match timed_out {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a hold tool without timeout() must stay an error under gateway request_timeout: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        timed_out.contains("Request timeout exceeded")
+            || timed_out.contains("RequestCancelled")
+            || timed_out.contains("Request cancelled"),
+        "gateway request_timeout(1) must refuse prefixed hold_echo before it returns held: {timed_out}"
+    );
+    assert!(
+        !timed_out.contains("held"),
+        "changing only the missing handler timeout must not let hold_echo complete: {timed_out}"
+    );
+
+    let peer = runtime_block_on_bounded(&cx, client.call_tool(&cx, "ext/fast_echo", json!({})))
+        .expect("changing only the tool name must still reach the undisabled stdio fast handler");
+    assert!(
+        peer.content.iter().any(|content| match content {
+            ContentBlock::Text { text, .. } => text == "fast",
+            _ => false,
+        }),
+        "as_proxy must keep prefixed fast_echo callable after a request_timeout: {peer:?}"
+    );
+
+    drop(client);
+    gateway.shutdown();
+}
+
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_request_timeout_of_hold_tool_without_handler_timeout() {
+    let cx = Cx::for_request();
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_options(Vec::new(), false, Some(1));
+    let mut client = connect_legacy_http_client(
+        &cx,
+        gateway.address(),
+        "e2e-public-http-legacy-stdio-as-proxy-request-timeout",
+    );
+
+    let missing = legacy_http_call(
+        &cx,
+        &mut client,
+        "hold_echo",
+        json!({}),
+        "exact-2024 stdio as_proxy request_timeout unprefixed",
+    )
+    .expect_err("changing only the tool name must not reach the unprefixed stdio hold handler");
+    let _ = missing;
+
+    let timed_out = legacy_http_call(
+        &cx,
+        &mut client,
+        "ext/hold_echo",
+        json!({}),
+        "exact-2024 stdio as_proxy request_timeout hold",
+    );
+    let timed_out = match timed_out {
+        Ok(result) => {
+            assert!(
+                result.is_error,
+                "a hold tool without timeout() must stay an error under gateway request_timeout: {result:?}"
+            );
+            format!("{result:?}")
+        }
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        timed_out.contains("Request timeout exceeded")
+            || timed_out.contains("RequestCancelled")
+            || timed_out.contains("Request cancelled"),
+        "gateway request_timeout(1) must refuse prefixed hold_echo before it returns held: {timed_out}"
+    );
+    assert!(
+        !timed_out.contains("held"),
+        "changing only the missing handler timeout must not let hold_echo complete: {timed_out}"
+    );
+
+    let peer = legacy_http_call(
+        &cx,
+        &mut client,
+        "ext/fast_echo",
+        json!({}),
+        "exact-2024 stdio as_proxy request_timeout peer",
+    )
+    .expect("changing only the tool name must still reach the undisabled stdio fast handler");
+    assert_eq!(
+        legacy_http_tool_text(&peer).as_deref(),
+        Some("fast"),
+        "as_proxy must keep prefixed fast_echo callable after a request_timeout: {peer:?}"
     );
 
     drop(client);
@@ -15855,6 +17348,33 @@ impl ToolHandler for PublicHttpFastTool {
 
     fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         Ok(vec![Content::text("fast")])
+    }
+}
+
+const PUBLIC_HTTP_HOLD_TOOL_NAME: &str = "public-http-e2e-hold";
+
+/// Sleeps longer than a 1s gateway `request_timeout` and has no handler `timeout()`.
+struct PublicHttpHoldTool;
+
+impl ToolHandler for PublicHttpHoldTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: PUBLIC_HTTP_HOLD_TOOL_NAME.to_owned(),
+            description: Some(
+                "Proves live facade HTTP request_timeout of a tool without timeout()".to_owned(),
+            ),
+            input_schema: json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        thread::sleep(Duration::from_millis(1500));
+        Ok(vec![Content::text("held")])
     }
 }
 
@@ -18789,6 +20309,34 @@ fn spawn_legacy_as_proxy_timeout_upstream() -> HttpServerFixture {
             .expect("LegacyOnly is available")
             .tool(PublicHttpValue)
             .tool(PublicHttpSlowTool)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+fn spawn_modern_as_proxy_hold_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("modern as_proxy hold upstream", || {
+        ServerBuilder::new("facade-http-modern-as-proxy-hold-upstream", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpValue)
+            .tool(PublicHttpHoldTool)
+            .tool(PublicHttpFastTool)
+            .prompt(PublicHttpInstructionPrompt)
+            .resource(PublicHttpSnapshotResource)
+            .build()
+    })
+}
+
+fn spawn_legacy_as_proxy_hold_upstream() -> HttpServerFixture {
+    spawn_legacy_http_server("legacy as_proxy hold upstream", || {
+        ServerBuilder::new("facade-http-legacy-as-proxy-hold-upstream", "1.0.0")
+            .protocol_policy(ProtocolPolicy::LegacyOnly)
+            .expect("LegacyOnly is available")
+            .tool(PublicHttpValue)
+            .tool(PublicHttpHoldTool)
             .tool(PublicHttpFastTool)
             .prompt(PublicHttpInstructionPrompt)
             .resource(PublicHttpSnapshotResource)
@@ -24738,13 +26286,14 @@ fn spawn_legacy_http_stdio_as_proxy_gateway() -> HttpServerFixture {
 fn spawn_legacy_http_stdio_as_proxy_gateway_with_env(
     extra_env: Vec<(String, String)>,
 ) -> HttpServerFixture {
-    spawn_legacy_http_stdio_as_proxy_gateway_with_options(extra_env, false)
+    spawn_legacy_http_stdio_as_proxy_gateway_with_options(extra_env, false, None)
 }
 
 #[cfg(all(unix, feature = "proxy"))]
 fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
 ) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -24812,8 +26361,13 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
                     "live exact-2024 stdio as_proxy upstream must answer tools/list before install: {error}"
                 )
             })?;
-            let server = legacy_2024::ServerBuilder::new("e2e-legacy-http-stdio-as-proxy", "1.0.0")
-                .mask_error_details(mask_error_details)
+            let mut builder =
+                legacy_2024::ServerBuilder::new("e2e-legacy-http-stdio-as-proxy", "1.0.0")
+                    .mask_error_details(mask_error_details);
+            if let Some(request_timeout_secs) = request_timeout_secs {
+                builder = builder.request_timeout(request_timeout_secs);
+            }
+            let server = builder
                 .as_proxy("ext", stdio)
                 .map_err(|error| format!("legacy as_proxy stdio install failed: {error}"))?
                 .build();
@@ -26201,7 +27755,7 @@ fn e2e_public_http_legacy_as_proxy_stdio_bare_upstream_omits_instructions() {
 
 #[cfg(feature = "proxy")]
 fn spawn_legacy_as_proxy_instructions_gateway(upstream: SocketAddr) -> HttpServerFixture {
-    spawn_legacy_as_proxy_instructions_gateway_named(upstream, None, false)
+    spawn_legacy_as_proxy_instructions_gateway_named(upstream, None, false, None)
 }
 
 #[cfg(feature = "proxy")]
@@ -26209,6 +27763,7 @@ fn spawn_legacy_as_proxy_instructions_gateway_named(
     upstream: SocketAddr,
     override_instructions: Option<&'static str>,
     mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
 ) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
@@ -26272,6 +27827,9 @@ fn spawn_legacy_as_proxy_instructions_gateway_named(
                 .mask_error_details(mask_error_details);
             if let Some(override_instructions) = override_instructions {
                 builder = builder.instructions(override_instructions);
+            }
+            if let Some(request_timeout_secs) = request_timeout_secs {
+                builder = builder.request_timeout(request_timeout_secs);
             }
             let server = builder
                 .as_proxy_typed("child", proxy, catalog)
@@ -26360,6 +27918,7 @@ fn e2e_public_http_legacy_as_proxy_retains_upstream_instructions() {
         instructed_upstream.address(),
         Some("gateway-override-instructions"),
         false,
+        None,
     );
     let instructed = connect_legacy_http_client(
         &cx,
@@ -32065,6 +33624,852 @@ mod live_websocket_bind {
             cx.set_cancel_requested(true);
             listener.abort();
             hide_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_composes_nested_tool_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy compose runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_modern_compose_and_state_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(compose_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-compose-gateway".to_owned(),
+                "e2e-ws-as-proxy-compose-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket compose gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-compose-upstream",
+                    "native-h1:e2e-ws-as-proxy-compose-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-compose".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP compose proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP compose proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-compose-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed compose install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy compose must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy compose publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy compose serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-compose", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the ModernOnly public facade negotiates as_proxy compose over bind_websocket");
+            let prefixed = format!("ext/{PUBLIC_HTTP_COMPOSE_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose unprefixed",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+                    json!({"value": "alpha"}),
+                ),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed compose handler");
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose tools/call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose onto the live HTTP upstream");
+            assert!(
+                composed.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => {
+                        text == "compose:tool:alpha|resource:deterministic"
+                    }
+                    _ => false,
+                }),
+                "as_proxy WebSocket must retain the nested tool text and resource: {composed:?}"
+            );
+
+            let missing_tool = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose missing nested tool",
+                client.call_tool(
+                    &cx,
+                    &prefixed,
+                    json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+                ),
+            )
+            .await;
+            let missing_tool = match missing_tool {
+                Ok(result) => {
+                    assert!(
+                        result.is_error,
+                        "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+                    );
+                    format!("{result:?}")
+                }
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_tool.contains("public-http-e2e-missing")
+                    || missing_tool.contains("compose-nested-tool"),
+                "as_proxy WebSocket compose must keep the nested missing-tool refusal: {missing_tool}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_composes_nested_prompt() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy compose-prompt runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_modern_compose_prompt_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(compose_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-compose-prompt-gateway".to_owned(),
+                "e2e-ws-as-proxy-compose-prompt-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket compose-prompt gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-compose-prompt-upstream",
+                    "native-h1:e2e-ws-as-proxy-compose-prompt-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-compose-prompt".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP compose-prompt proxy catalog is typed");
+            let server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-compose-prompt-gateway", "1.0.0")
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed compose-prompt install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy compose-prompt must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy compose-prompt publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy compose-prompt serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket compose-prompt must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose-prompt initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-compose-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy compose-prompt over bind_websocket",
+            );
+            let prefixed = format!("ext/{PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose-prompt unprefixed",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+                    json!({"subject": "alpha"}),
+                ),
+            )
+            .await
+            .expect_err(
+                "changing only the tool name must not reach the unprefixed compose_prompt handler",
+            );
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose-prompt tools/call",
+                client.call_tool(&cx, &prefixed, json!({"subject": "alpha"})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose_prompt onto the live HTTP upstream");
+            assert!(
+                composed.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "compose-prompt:prompt:alpha",
+                    _ => false,
+                }),
+                "as_proxy WebSocket must retain the nested prompt text: {composed:?}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy compose-prompt missing nested prompt",
+                client.call_tool(
+                    &cx,
+                    &prefixed,
+                    json!({
+                        "subject": "alpha",
+                        "prompt": "public-http-e2e-missing",
+                    }),
+                ),
+            )
+            .await;
+            let missing_prompt = match missing_prompt {
+                Ok(result) => {
+                    assert!(
+                        result.is_error,
+                        "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+                    );
+                    format!("{result:?}")
+                }
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_prompt.contains("public-http-e2e-missing")
+                    || missing_prompt.contains("compose-nested-prompt"),
+                "as_proxy WebSocket compose_prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_resource_composes_nested_tool_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy resource-compose runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_modern_compose_and_state_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(compose_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-resource-compose-gateway".to_owned(),
+                "e2e-ws-as-proxy-resource-compose-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket resource-compose gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-resource-compose-upstream",
+                    "native-h1:e2e-ws-as-proxy-resource-compose-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-resource-compose".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP compose proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP compose proxy catalog is typed");
+            let server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-resource-compose-gateway", "1.0.0")
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed resource-compose install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy resource-compose must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy resource-compose publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy resource-compose serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket resource-compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-resource-compose", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy resource-compose over bind_websocket",
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose prefixed",
+                client.read_resource(&cx, &format!("ext/{PUBLIC_HTTP_COMPOSE_RESOURCE_URI}")),
+            )
+            .await
+            .expect_err("modern as_proxy must keep the compose resource URI unprefixed");
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_RESOURCE_URI),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward unprefixed compose resources/read onto the live HTTP upstream");
+            assert!(
+                composed.contents.iter().any(|content| match content {
+                    EmbeddedResourceContents::Text { text, .. } => {
+                        text == "compose:tool:alpha|resource:deterministic"
+                    }
+                    _ => false,
+                }),
+                "as_proxy WebSocket resources/read must retain the nested tool text and resource: {composed:?}"
+            );
+
+            let missing_tool = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose missing nested tool",
+                client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI),
+            )
+            .await;
+            let missing_tool = match missing_tool {
+                Ok(result) => panic!(
+                    "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+                ),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_tool.contains("public-http-e2e-missing")
+                    || missing_tool.contains("compose-nested-tool"),
+                "as_proxy WebSocket resource compose must keep the nested missing-tool refusal: {missing_tool}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_prompt_composes_nested_tool_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy prompt-compose runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_modern_compose_and_state_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(compose_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-prompt-compose-gateway".to_owned(),
+                "e2e-ws-as-proxy-prompt-compose-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket prompt-compose gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-prompt-compose-upstream",
+                    "native-h1:e2e-ws-as-proxy-prompt-compose-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-prompt-compose".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP compose proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP compose proxy catalog is typed");
+            let server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-prompt-compose-gateway", "1.0.0")
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed prompt-compose install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy prompt-compose must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy prompt-compose publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy prompt-compose serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy prompt-compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket prompt-compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy prompt-compose initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-prompt-compose-handler", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy prompt-compose over bind_websocket",
+            );
+            let prefixed = format!("ext/{PUBLIC_HTTP_COMPOSE_PROMPT_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy prompt-compose unprefixed",
+                client.get_prompt(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+                    HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect_err("changing only the prompt name must not reach the unprefixed compose prompt");
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy prompt-compose prompts/get",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose prompts/get onto the live HTTP upstream");
+            assert!(
+                composed
+                    .messages
+                    .iter()
+                    .any(|message| match &message.content {
+                        ContentBlock::Text { text, .. } => {
+                            text == "compose:tool:alpha|resource:deterministic"
+                        }
+                        _ => false,
+                    }),
+                "as_proxy WebSocket prompts/get must retain the nested tool text and resource: {composed:?}"
+            );
+
+            let missing_tool = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy prompt-compose missing nested tool",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([
+                        ("value".to_owned(), "alpha".to_owned()),
+                        ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+                    ]),
+                ),
+            )
+            .await;
+            let missing_tool = match missing_tool {
+                Ok(result) => panic!(
+                    "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+                ),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_tool.contains("public-http-e2e-missing")
+                    || missing_tool.contains("compose-nested-tool"),
+                "as_proxy WebSocket prompt compose must keep the nested missing-tool refusal: {missing_tool}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_resource_composes_nested_prompt() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy resource-compose-prompt runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_modern_compose_prompt_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(compose_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-resource-compose-prompt-gateway".to_owned(),
+                "e2e-ws-as-proxy-resource-compose-prompt-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket resource-compose-prompt gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-resource-compose-prompt-upstream",
+                    "native-h1:e2e-ws-as-proxy-resource-compose-prompt-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-resource-compose-prompt".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP compose-prompt proxy catalog is typed");
+            let server = modern::ServerBuilder::new(
+                "e2e-ws-as-proxy-resource-compose-prompt-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("ext", proxy, catalog)
+            .expect("modern as_proxy_typed resource-compose-prompt install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy resource-compose-prompt must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy resource-compose-prompt publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy resource-compose-prompt serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket resource-compose-prompt must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose-prompt initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-resource-compose-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy resource-compose-prompt over bind_websocket",
+            );
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose-prompt prefixed",
+                client.read_resource(
+                    &cx,
+                    &format!("ext/{PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI}"),
+                ),
+            )
+            .await
+            .expect_err("modern as_proxy must keep the compose-prompt resource URI unprefixed");
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose-prompt resources/read",
+                client.read_resource(&cx, PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward unprefixed compose-prompt resources/read onto the live HTTP upstream");
+            assert!(
+                composed.contents.iter().any(|content| match content {
+                    EmbeddedResourceContents::Text { text, .. } => {
+                        text == "compose-prompt:prompt:alpha"
+                    }
+                    _ => false,
+                }),
+                "as_proxy WebSocket resources/read must retain the nested prompt text: {composed:?}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy resource-compose-prompt missing nested prompt",
+                client.read_resource(&cx, PUBLIC_HTTP_PROMPT_COMPOSE_MISSING_RESOURCE_URI),
+            )
+            .await;
+            let missing_prompt = match missing_prompt {
+                Ok(result) => panic!(
+                    "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+                ),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_prompt.contains("public-http-e2e-missing")
+                    || missing_prompt.contains("compose-nested-prompt"),
+                "as_proxy WebSocket resource compose-prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy request_timeout runtime installs an ambient context",
+            );
+            let hold_upstream = spawn_modern_as_proxy_hold_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(hold_upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-request-timeout-gateway".to_owned(),
+                "e2e-ws-as-proxy-request-timeout-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket request_timeout gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-request-timeout-upstream",
+                    "native-h1:e2e-ws-as-proxy-request-timeout-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-request-timeout".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP hold proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP hold proxy catalog is typed");
+            let server = modern::ServerBuilder::new(
+                "e2e-ws-as-proxy-request-timeout-gateway",
+                "1.0.0",
+            )
+            .request_timeout(1)
+            .as_proxy_typed("ext", proxy, catalog)
+            .expect("modern as_proxy_typed request_timeout install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy request_timeout must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy request_timeout publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy request_timeout serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy request_timeout handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket request_timeout must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy request_timeout initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-request-timeout", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy request_timeout over bind_websocket",
+            );
+            let prefixed_hold = format!("ext/{PUBLIC_HTTP_HOLD_TOOL_NAME}");
+            let prefixed_fast = format!("ext/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy request_timeout unprefixed",
+                client.call_tool(&cx, PUBLIC_HTTP_HOLD_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed hold handler");
+            let _ = missing;
+
+            let timed_out = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy request_timeout hold",
+                client.call_tool(&cx, &prefixed_hold, json!({})),
+            )
+            .await;
+            let timed_out = match timed_out {
+                Ok(result) => {
+                    assert!(
+                        result.is_error,
+                        "a hold tool without timeout() must stay an error under gateway request_timeout: {result:?}"
+                    );
+                    format!("{result:?}")
+                }
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                timed_out.contains("Request timeout exceeded")
+                    || timed_out.contains("RequestCancelled")
+                    || timed_out.contains("Request cancelled"),
+                "gateway request_timeout(1) must refuse prefixed hold before it returns held: {timed_out}"
+            );
+            assert!(
+                !timed_out.contains("held"),
+                "changing only the missing handler timeout must not let hold complete: {timed_out}"
+            );
+
+            let peer = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy request_timeout peer",
+                client.call_tool(&cx, &prefixed_fast, json!({})),
+            )
+            .await
+            .expect("changing only the tool name must still reach the undisabled fast handler");
+            assert!(
+                peer.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "fast",
+                    _ => false,
+                }),
+                "as_proxy WebSocket must keep the prefixed fast peer callable after a request_timeout: {peer:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            hold_upstream.shutdown();
         });
     }
 
@@ -38892,6 +41297,849 @@ mod live_websocket_bind {
             cx.set_cancel_requested(true);
             listener.abort();
             hide_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_composes_nested_tool_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy compose runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_legacy_compose_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(compose_upstream.address(), "/sse")),
+                Some(public_http_target(compose_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-compose-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-compose-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket compose gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-compose-upstream",
+                    "native-h1:e2e-legacy-ws-compose-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-compose".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP compose proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP compose proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-compose-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed compose install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy compose must bind");
+            let address = bound
+                .local_addr()
+                .expect("public LegacyOnly bind_websocket as_proxy compose publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket as_proxy compose serve must be admitted");
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-compose", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("the LegacyOnly public facade negotiates as_proxy compose over bind_websocket");
+            let prefixed = format!("child/{PUBLIC_HTTP_COMPOSE_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose unprefixed",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_TOOL_NAME,
+                    json!({"value": "alpha"}),
+                ),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed compose handler");
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose tools/call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose onto the live exact-2024 HTTP upstream");
+            assert_eq!(
+                legacy_http_tool_text(&composed).as_deref(),
+                Some("compose:tool:alpha|resource:deterministic"),
+                "as_proxy WebSocket must retain the nested tool text and resource: {composed:?}"
+            );
+
+            let missing_tool = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose missing nested tool",
+                client.call_tool(
+                    &cx,
+                    &prefixed,
+                    json!({"value": "alpha", "tool": "public-http-e2e-missing"}),
+                ),
+            )
+            .await;
+            let missing_tool = match missing_tool {
+                Ok(result) => {
+                    assert!(
+                        result.is_error,
+                        "changing only the nested tool name must stay a handler-visible refusal: {result:?}"
+                    );
+                    format!("{result:?}")
+                }
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_tool.contains("public-http-e2e-missing")
+                    || missing_tool.contains("compose-nested-tool"),
+                "as_proxy WebSocket compose must keep the nested missing-tool refusal: {missing_tool}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_composes_nested_prompt() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy compose-prompt runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_legacy_compose_prompt_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(compose_upstream.address(), "/sse")),
+                Some(public_http_target(compose_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-compose-prompt-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-compose-prompt-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket compose-prompt gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-compose-prompt-upstream",
+                    "native-h1:e2e-legacy-ws-compose-prompt-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-compose-prompt".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP compose-prompt proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-compose-prompt-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed compose-prompt install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy compose-prompt must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy compose-prompt publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy compose-prompt serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket compose-prompt must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose-prompt initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-compose-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy compose-prompt over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose-prompt unprefixed",
+                client.call_tool(
+                    &cx,
+                    PUBLIC_HTTP_PROMPT_COMPOSE_TOOL_NAME,
+                    json!({"subject": "alpha"}),
+                ),
+            )
+            .await
+            .expect_err(
+                "changing only the tool name must not reach the unprefixed compose_prompt handler",
+            );
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose-prompt tools/call",
+                client.call_tool(&cx, &prefixed, json!({"subject": "alpha"})),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose_prompt onto the live exact-2024 HTTP upstream");
+            assert_eq!(
+                legacy_http_tool_text(&composed).as_deref(),
+                Some("compose-prompt:prompt:alpha"),
+                "as_proxy WebSocket must retain the nested prompt text: {composed:?}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy compose-prompt missing nested prompt",
+                client.call_tool(
+                    &cx,
+                    &prefixed,
+                    json!({
+                        "subject": "alpha",
+                        "prompt": "public-http-e2e-missing",
+                    }),
+                ),
+            )
+            .await;
+            let missing_prompt = match missing_prompt {
+                Ok(result) => {
+                    assert!(
+                        result.is_error,
+                        "changing only the nested prompt name must stay a handler-visible refusal: {result:?}"
+                    );
+                    format!("{result:?}")
+                }
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_prompt.contains("public-http-e2e-missing")
+                    || missing_prompt.contains("compose-nested-prompt"),
+                "as_proxy WebSocket compose_prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_resource_composes_nested_tool_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy resource-compose runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_legacy_compose_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(compose_upstream.address(), "/sse")),
+                Some(public_http_target(compose_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-resource-compose-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-resource-compose-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket resource-compose gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-resource-compose-upstream",
+                    "native-h1:e2e-legacy-ws-resource-compose-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-resource-compose".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP compose proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP compose proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-resource-compose-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed resource-compose install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy resource-compose must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy resource-compose publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy resource-compose serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket resource-compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-resource-compose", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy resource-compose over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_COMPOSE_RESOURCE_URI}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose unprefixed",
+                client.read_resource(&cx, PUBLIC_HTTP_COMPOSE_RESOURCE_URI),
+            )
+            .await
+            .expect_err(
+                "changing only the missing prefix must not reach the unprefixed compose resource",
+            );
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose resources/read",
+                client.read_resource(&cx, &prefixed),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose resources/read onto the live exact-2024 HTTP upstream");
+            let composed = serde_json::to_value(composed)
+                .expect("the exact-2024 WebSocket resource result serializes");
+            assert_eq!(
+                composed["contents"][0]["text"],
+                json!("compose:tool:alpha|resource:deterministic"),
+                "as_proxy WebSocket resources/read must retain the nested tool text and resource: {composed}"
+            );
+
+            let missing_tool = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose missing nested tool",
+                client.read_resource(
+                    &cx,
+                    &format!("child/{PUBLIC_HTTP_COMPOSE_MISSING_TOOL_RESOURCE_URI}"),
+                ),
+            )
+            .await;
+            let missing_tool = match missing_tool {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_tool.contains("public-http-e2e-missing")
+                    || missing_tool.contains("compose-nested-tool"),
+                "as_proxy WebSocket resource compose must keep the nested missing-tool refusal: {missing_tool}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_prompt_composes_nested_tool_and_resource() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy prompt-compose runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_legacy_compose_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(compose_upstream.address(), "/sse")),
+                Some(public_http_target(compose_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-prompt-compose-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-prompt-compose-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket prompt-compose gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-prompt-compose-upstream",
+                    "native-h1:e2e-legacy-ws-prompt-compose-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-prompt-compose".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP compose proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP compose proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-prompt-compose-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed prompt-compose install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy prompt-compose must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy prompt-compose publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy prompt-compose serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy prompt-compose handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket prompt-compose must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy prompt-compose initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-prompt-compose-handler", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy prompt-compose over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_COMPOSE_PROMPT_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy prompt-compose unprefixed",
+                client.get_prompt(
+                    &cx,
+                    PUBLIC_HTTP_COMPOSE_PROMPT_NAME,
+                    HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect_err(
+                "changing only the missing prefix must not reach the unprefixed compose prompt",
+            );
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy prompt-compose prompts/get",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([("value".to_owned(), "alpha".to_owned())]),
+                ),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose prompts/get onto the live exact-2024 HTTP upstream");
+            let composed = serde_json::to_value(composed)
+                .expect("the exact-2024 WebSocket prompt result serializes");
+            assert_eq!(
+                composed["messages"][0]["content"]["text"],
+                json!("compose:tool:alpha|resource:deterministic"),
+                "as_proxy WebSocket prompts/get must retain the nested tool text and resource: {composed}"
+            );
+
+            let missing_tool = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy prompt-compose missing nested tool",
+                client.get_prompt(
+                    &cx,
+                    &prefixed,
+                    HashMap::from([
+                        ("value".to_owned(), "alpha".to_owned()),
+                        ("tool".to_owned(), "public-http-e2e-missing".to_owned()),
+                    ]),
+                ),
+            )
+            .await;
+            let missing_tool = match missing_tool {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_tool.contains("public-http-e2e-missing")
+                    || missing_tool.contains("compose-nested-tool"),
+                "as_proxy WebSocket prompt compose must keep the nested missing-tool refusal: {missing_tool}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_resource_composes_nested_prompt() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy resource-compose-prompt runtime installs an ambient context",
+            );
+            let compose_upstream = spawn_legacy_compose_prompt_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(compose_upstream.address(), "/sse")),
+                Some(public_http_target(compose_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-resource-compose-prompt-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-resource-compose-prompt-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket resource-compose-prompt gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-resource-compose-prompt-upstream",
+                    "native-h1:e2e-legacy-ws-resource-compose-prompt-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-resource-compose-prompt".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP compose-prompt proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP compose-prompt proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-resource-compose-prompt-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed resource-compose-prompt install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy resource-compose-prompt must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy resource-compose-prompt publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy resource-compose-prompt serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose-prompt handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect(
+                "exact-2024 as_proxy WebSocket resource-compose-prompt must complete RFC 6455 upgrade",
+            );
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose-prompt initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-resource-compose-prompt", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy resource-compose-prompt over bind_websocket",
+            );
+            let prefixed = format!("child/{PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose-prompt unprefixed",
+                client.read_resource(&cx, PUBLIC_HTTP_PROMPT_COMPOSE_RESOURCE_URI),
+            )
+            .await
+            .expect_err(
+                "changing only the missing prefix must not reach the unprefixed compose-prompt resource",
+            );
+            let _ = missing;
+
+            let composed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose-prompt resources/read",
+                client.read_resource(&cx, &prefixed),
+            )
+            .await
+            .expect("as_proxy WebSocket must forward prefixed compose-prompt resources/read onto the live exact-2024 HTTP upstream");
+            let composed = serde_json::to_value(composed)
+                .expect("the exact-2024 WebSocket resource result serializes");
+            assert_eq!(
+                composed["contents"][0]["text"],
+                json!("compose-prompt:prompt:alpha"),
+                "as_proxy WebSocket resources/read must retain the nested prompt text: {composed}"
+            );
+
+            let missing_prompt = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy resource-compose-prompt missing nested prompt",
+                client.read_resource(
+                    &cx,
+                    &format!("child/{PUBLIC_HTTP_PROMPT_COMPOSE_MISSING_RESOURCE_URI}"),
+                ),
+            )
+            .await;
+            let missing_prompt = match missing_prompt {
+                Ok(result) => format!("{result:?}"),
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                missing_prompt.contains("public-http-e2e-missing")
+                    || missing_prompt.contains("compose-nested-prompt"),
+                "as_proxy WebSocket resource compose-prompt must keep the nested missing-prompt refusal: {missing_prompt}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            compose_upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_request_timeout_of_hold_tool_without_handler_timeout() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy request_timeout runtime installs an ambient context",
+            );
+            let hold_upstream = spawn_legacy_as_proxy_hold_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(hold_upstream.address(), "/sse")),
+                Some(public_http_target(hold_upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-request-timeout-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-request-timeout-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket request_timeout gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-request-timeout-upstream",
+                    "native-h1:e2e-legacy-ws-request-timeout-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-request-timeout".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP hold proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP hold proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-request-timeout-gateway",
+                "1.0.0",
+            )
+            .request_timeout(1)
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed request_timeout install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy request_timeout must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy request_timeout publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy request_timeout serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy request_timeout handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket request_timeout must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy request_timeout initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-request-timeout", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy request_timeout over bind_websocket",
+            );
+            let prefixed_hold = format!("child/{PUBLIC_HTTP_HOLD_TOOL_NAME}");
+            let prefixed_fast = format!("child/{PUBLIC_HTTP_FAST_TOOL_NAME}");
+
+            let missing = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy request_timeout unprefixed",
+                client.call_tool(&cx, PUBLIC_HTTP_HOLD_TOOL_NAME, json!({})),
+            )
+            .await
+            .expect_err("changing only the tool name must not reach the unprefixed hold handler");
+            let _ = missing;
+
+            let timed_out = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy request_timeout hold",
+                client.call_tool(&cx, &prefixed_hold, json!({})),
+            )
+            .await;
+            let timed_out = match timed_out {
+                Ok(result) => {
+                    assert!(
+                        result.is_error,
+                        "a hold tool without timeout() must stay an error under gateway request_timeout: {result:?}"
+                    );
+                    format!("{result:?}")
+                }
+                Err(error) => format!("{error:?}"),
+            };
+            assert!(
+                timed_out.contains("Request timeout exceeded")
+                    || timed_out.contains("RequestCancelled")
+                    || timed_out.contains("Request cancelled"),
+                "gateway request_timeout(1) must refuse prefixed hold before it returns held: {timed_out}"
+            );
+            assert!(
+                !timed_out.contains("held"),
+                "changing only the missing handler timeout must not let hold complete: {timed_out}"
+            );
+
+            let peer = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy request_timeout peer",
+                client.call_tool(&cx, &prefixed_fast, json!({})),
+            )
+            .await
+            .expect("changing only the tool name must still reach the undisabled fast handler");
+            assert_eq!(
+                legacy_http_tool_text(&peer).as_deref(),
+                Some("fast"),
+                "as_proxy WebSocket must keep the prefixed fast peer callable after a request_timeout: {peer:?}"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            hold_upstream.shutdown();
         });
     }
 
