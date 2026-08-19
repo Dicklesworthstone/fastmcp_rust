@@ -349,6 +349,20 @@ cd fastmcp_rust
 cargo build --release
 ```
 
+### CLI binaries (GitHub Releases)
+
+Current `fastmcp` binaries are published on GitHub Releases, not crates.io.
+Archives use `fastmcp-<os>-<arch>` names (`.tar.xz` on Unix, `.zip` on
+Windows). Linux and macOS ship amd64/x86_64 and arm64/aarch64 aliases;
+Windows ships amd64 MSVC.
+
+```bash
+# Example: macOS Apple Silicon
+curl -fsSL -O https://github.com/Dicklesworthstone/fastmcp_rust/releases/latest/download/fastmcp-darwin-arm64.tar.xz
+tar -xJf fastmcp-darwin-arm64.tar.xz
+./fastmcp --version
+```
+
 ### CLI (optional; historical 0.3.2 package)
 
 ```bash
