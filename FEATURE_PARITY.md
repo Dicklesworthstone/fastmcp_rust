@@ -11,7 +11,7 @@
 **MCP 2026-07-28 support is under implementation and remains unverified.**  
 **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
 
-Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly (`rust-version = "1.99"`).  
+Toolchain: pinned `nightly-2026-08-19` / rustc 1.100.0-nightly (`rust-version = "1.100"`).  
 The current public `PROTOCOL_VERSION` remains `2024-11-05`. Newer protocol types and method handlers present in the tree do not, by themselves, establish negotiated MCP 2026-07-28 support. Production JWT (`jsonwebtoken`), Docket/Redis, Apps media rendering, and aggregate release-gate claims are **not** FND-01 deliverables.
 
 Release publication remains quarantined. This document supplies neither publication authority nor provider-side evidence that historical workflows, queued runs, and credentials are inert.

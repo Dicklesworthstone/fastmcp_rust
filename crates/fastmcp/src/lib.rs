@@ -19,8 +19,8 @@
 //! `legacy_2024`. The root-level `PROTOCOL_VERSION` remains available for
 //! existing exact-2024 consumers while they move to that module; it is not the
 //! default selected by `auto::client_builder`.
-//! Toolchain: pinned `nightly-2026-07-11` / rustc 1.99.0-nightly
-//! (`rust-version = "1.99"`). Do not assume JWT/OIDC production readiness,
+//! Toolchain: pinned `nightly-2026-08-19` / rustc 1.100.0-nightly
+//! (`rust-version = "1.100"`). Do not assume JWT/OIDC production readiness,
 //! Redis Tasks, Apps media rendering, or aggregate release-gate evidence from
 //! this façade alone.
 //! Release publication remains quarantined; these crate docs do not supply

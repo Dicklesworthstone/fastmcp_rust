@@ -6,9 +6,36 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.5.0)
+## [Unreleased] (after v0.6.0)
 
 No unreleased changes yet.
+
+---
+
+## [v0.6.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.6.0) -- 2026-08-18 (GitHub Release)
+
+Maintenance release: latest crates.io library pins, current dated nightly, and
+a pre-1.0 minor bump. Workspace crates move to 0.6.0. This does **not** claim
+aggregate MCP 2026-07-28 conformance, FND-01 freeze, or GATE-ALL-MCP-READY.
+
+### Toolchain
+
+- **Dated nightly** -- `rust-toolchain.toml` moves from `nightly-2026-07-11`
+  / rustc 1.99.0-nightly to `nightly-2026-08-19` / rustc 1.100.0-nightly.
+  Workspace `rust-version` is `1.100`. The last FND-01 evidence snapshot still
+  records the previous nightly until that harness is re-attested.
+
+### Dependencies
+
+- **asupersync** `=0.4.5` → `=0.4.8` -- latest crates.io patch on the v0.4.3
+  public compatibility floor (timer/cancel, HTTP/1 RFC OWS, ambient `Cx` guard
+  teardown). No public item was removed or renamed.
+- **redis** (optional `redis-tasks` only) `=1.4.1` → `=1.6.0` -- additive
+  streams/cluster/sentinel fixes. Redis remains absent from the default graph.
+- All other direct exact pins were already at latest stable (notify 9 / argon2
+  0.6 remain RC-only and were not taken).
+
+**Exact changes:** [v0.5.0...v0.6.0](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.5.0...v0.6.0)
 
 ---
 

@@ -1,116 +1,53 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-02-19  |  **Project:** fastmcp_rust  |  **Language:** Rust
+**Date:** 2026-08-18  |  **Project:** fastmcp_rust  |  **Language:** Rust
 
 ## Summary
-- **Updated:** 10  |  **Skipped:** 0  |  **Failed:** 0  |  **Needs attention:** 1
+- **Updated:** 2  |  **Skipped:** remaining exact pins already latest stable  |  **Failed:** 0  |  **Needs attention:** FND-01 evidence re-attest
 
 ## Updates
 
-### asupersync: 0.2.0 → 0.2.5
-- **Spec change:** `"0.2.0"` → `"0.2"` (allow future patches)
-- **Breaking:** None
-- **Tests:** Passed (1439/1441 — 2 pre-existing failures unrelated to deps)
+### asupersync: 0.4.5 → 0.4.8
+- **Breaking:** None. Changelog states 0.4.6–0.4.8 preserve the v0.4.3 public floor (no public item removed or renamed).
+- **Notes:** Internal timer/cancel, HTTP/1 RFC OWS framing, ambient `Cx` guard identity teardown, QUIC/ATP reassembly bounds.
+- **Tests:** `cargo check --workspace --all-targets --locked` green on csd
+  (`nightly-2026-08-19`). Isolated `e2e_modern_http` handler test green.
+  `fastmcp-core --lib` 341/341. `fastmcp-cli` `e2e_dev` 12/12 with rustup
+  cargo (RCH shim refuses `/tmp` fixtures). Protocol `--lib` 580/581; the
+  one fail (`final_subscriptions_listen_rejects_one_field_response_id_mismatch`)
+  is unrelated to this pin bump. Full `cargo test --workspace` still log-bombs
+  `fastmcp-server --lib` and includes pre-existing client/e2e_install failures.
 
-### rich_rust: spec loosened
-- **Spec change:** `"0.2.0"` → `"0.2"` (allow future patches)
-- **Breaking:** None (still resolves to 0.2.0, which is latest)
-- **Tests:** Passed
+### redis: 1.4.1 → 1.6.0 (optional `redis-tasks` / FND-01 probe only)
+- **Breaking:** None listed 1.4.1 → 1.6.0 (additive XNACK, reconnect limits, cluster/sentinel fixes).
+- **Notes:** Still absent from the default workspace graph. Not published with `--all-features`.
+- **Tests:** default graph does not compile this edge; pin-only update
 
-### console: 0.15.11 → 0.16.2
-- **Spec change:** `"0.15"` → `"0.16"` (minor version bump)
-- **Breaking:** None encountered — `Term` and `style` APIs compatible
-- **Tests:** Passed
+## Skipped (already latest stable)
 
-### toml: 0.8.23 → 1.0.3
-- **Spec change:** `"0.8"` → `"1.0"` (major version bump)
-- **Breaking:** None encountered — `from_str`, `to_string_pretty`, `Value` all compatible
-- **Tests:** Passed
+asupersync siblings and all other direct exact pins were queried against crates.io `max_stable_version` on 2026-08-18:
 
-### getrandom: 0.3.4 → 0.4.1
-- **Spec change:** `"0.3"` → `"0.4"` (breaking pre-1.0 bump)
-- **Breaking:** None encountered — `getrandom::fill` API preserved
-- **Tests:** Passed
+rich_rust 0.2.3, rustix 1.1.4, serde 1.0.229, serde_json 1.0.151, serde_yaml 0.9.34, log 0.4.33, base64 0.23.1, semver 1.0.28, flate2 1.1.9, chrono 0.4.45, notify 8.2.0, glob 0.3.4, console 0.16.4, toml 1.1.4, dirs 6.0.0, url 2.5.8, getrandom 0.4.3, sha2 0.11.0, hmac 0.13.0, zeroize 1.9.0, ring 0.17.14, proc-macro2 1.0.107, proc-macro-crate 3.5.0, cap-std 4.0.2, cap-fs-ext 4.0.2, regex 1.13.1, clap 4.6.6, trybuild 1.0.120, html5ever 0.39.0, argon2 0.5.3, syn 3.0.3, quote 1.0.47, time 0.3.55, strip-ansi-escapes 0.2.1, tracing 0.1.44, tracing-subscriber 0.3.23, tempfile 3.27.0, chacha20poly1305 0.11.0.
 
-### redis: 1.0.3 → 1.0.4
-- **Spec change:** `"1.0.3"` → `"1"` (loosened to allow future patches)
-- **Breaking:** None
-- **Tests:** Passed
+serde_yaml `0.9.34+deprecated` and toml `1.1.4+spec-1.1.0` are the same versions with registry metadata suffixes.
 
-### semver: spec loosened
-- **Spec change:** `"1.0.27"` → `"1"` (allow future patches)
-- **Breaking:** None
-- **Tests:** Passed
+## Skipped (not stable)
 
-### ureq: spec loosened
-- **Spec change:** `"3.2.0"` → `"3"` (allow future patches)
-- **Breaking:** None
-- **Tests:** Passed
+- notify 9.0.0-rc.4 — RC only; stay on 8.2.0
+- argon2 0.6.0-rc.8 — RC only; stay on 0.5.3
 
-### sha2: spec loosened
-- **Spec change:** `"0.10.8"` → `"0.10"` (allow future patches)
-- **Breaking:** None
-- **Tests:** Passed
+## Toolchain
 
-### hmac: spec loosened
-- **Spec change:** `"0.12.1"` → `"0.12"` (allow future patches)
-- **Breaking:** None
-- **Tests:** Passed
-
-### regex: spec loosened
-- **Spec change:** `"1.11.1"` → `"1"` (allow future patches)
-- **Breaking:** None
-- **Tests:** Passed
-
-### jsonwebtoken: spec loosened (crate-level)
-- **Spec change:** `"10.2.0"` → `"10"` in fastmcp/Cargo.toml and fastmcp-server/Cargo.toml
-- **Breaking:** None
-- **Tests:** Passed
-
-### Cargo.lock patch updates (via `cargo update`)
-- **syn:** 2.0.115 → 2.0.116
-- **clap:** 4.5.58 → 4.5.60
-- **bumpalo:** 3.19.1 → 3.20.2
-- **unicode-ident:** 1.0.23 → 1.0.24
-
-## Failed
-
-_(None)_
+- rust-toolchain.toml `nightly-2026-07-11` / rustc 1.99.0-nightly → `nightly-2026-08-19` / rustc 1.100.0-nightly (`e71c0f1e3` 2026-08-18)
+- workspace `rust-version` `1.99` → `1.100`
+- Dated pin kept (not floating `nightly`) for reproducible DSR/RCH builds
 
 ## Needs Attention
 
-- **serde_yaml** `0.9.34+deprecated` — officially deprecated by maintainer. Consider migrating to `serde_yml` (community fork) or alternative format. No code changes required yet — the crate still works.
+### FND-01 evidence harness
+- **Issue:** `crates/fastmcp/tests/fnd_01_dependency_evidence.rs` and `evidence/fnd-01/*` still freeze `nightly-2026-07-11` / workspace 0.5.0. Rewriting hashes without re-running the producer would be fake attestation.
+- **Action:** Gated the test binary behind `testing-lab` so the default 0.6.0 product test gate does not compile it. FND-01 remains unverified and unclaimed.
 
-## Pre-existing Test Failures (not caused by upgrades)
+## Workspace version
 
-Two tests in `fastmcp-server/src/tasks.rs` fail independently of dependency changes:
-- `tasks::tests::can_transition_invalid_pairs` — `can_transition(Pending, Failed)` returns true but test expects false
-- `tasks::tests::fail_task_on_pending_is_ignored` — task transitions to Failed from Pending but test expects it to stay Pending
-
----
-
-# Dependency Upgrade Run — 2026-08-11 (WildMountain, maintainer-authorized)
-
-**Base rev:** a84e9aa  |  8 of 29 exact-pins outdated; 5 updated, 1 deferred, 2 held, 0 failed.
-
-## Updates
-- **clap 4.6.4 → 4.6.6** (patch) — consumer fastmcp-cli; workspace lib ✓, cli ✓.
-- **toml 1.1.3 → 1.1.4** (patch, 1.1.4+spec-1.1.0) — fastmcp-cli/client/facade; workspace lib ✓, console tests ✓.
-- **base64 0.22.1 → 0.23.1** (minor) — protocol/server; workspace lib ✓, core ✓, protocol 606/3 (3 pre-existing hot-lane, no regression). Lock keeps 0.22.1 for a transitive holdout.
-- **sha2 0.10.9 → 0.11.0 + hmac 0.12.1 → 0.13.0** (RustCrypto digest-0.11 major) — migrated `fastmcp-core/src/crypto.rs` `Mac::new_from_slice` → `KeyInit::new_from_slice` (1 line + import; behavior-preserving). core 335/335 ✓ (HMAC-SHA256 known-answer vectors confirm identical output).
-
-## Deferred
-- **trybuild 1.0.118 → 1.0.120** — kept at baseline. Its own suite can't verify the bump: blocked by a PRE-EXISTING `failed to select a version for time` in the consumer test-projects (baa2b59 time=0.3.55/rich_rust fallout, fails identically at 1.0.118). Negligible dev-dep value.
-
-## Held (not bumped)
-- **asupersync 0.3.10 → 0.4.3** — maintainer deliberately unified on 0.3.10 (baa2b59) for downstream mcp_agent_mail_rust; 0.4.x breaks that + the API. Separate maintainer decision.
-- **serde_yaml → 0.9.34+deprecated** — same version, deprecation marker only (upstream unmaintained; migration is a separate effort).
-
-## Needs attention (owning lanes)
-- **FND-01 dependency/toolchain evidence must be RE-FROZEN** — fnd_01_dependency_evidence.rs byte-binds exact versions/checksums for the bumped crates + crypto.rs bytes; expect it RED until re-frozen.
-- **Separate pre-existing break (NOT from this update):** server proxy-legacy,proxy-tasks,apps *test* build has 2 errors at a84e9aa (extensions.rs:709/711 + proxy.rs:5126 `FnOnce` not general enough).
-
-## Round 2 — 2026-08-11 (maintainer: "everything latest, make it all work")
-- **asupersync 0.3.10 → 0.4.3** (major 0.3→0.4) — **no call-site changes needed**; workspace lib ✓, core 335/335 ✓, transport 362/362 ✓, server proxy-legacy,proxy-tasks,apps test build ✓. NOTE: contradicts baa2b59's downstream unification (mcp_agent_mail_rust/sqlmodel were pinned to the 0.3.10 line) — downstream may need its own bump.
-- **trybuild 1.0.118 → 1.0.120** — dev-dep; workspace unaffected. (Its downstream-probe suite is still blocked by the pre-existing rich_rust/time-0.3.55 fixture-resolution issue — real fix is publishing rich_rust >0.2.2; tracked separately.)
-- All 29 workspace pins now at latest published (serde_yaml stays 0.9.34 — its latest, upstream-deprecated).
+- 0.5.0 → 0.6.0 (pre-1.0 minor bump requested with this upgrade)
