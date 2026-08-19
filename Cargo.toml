@@ -33,7 +33,7 @@ readme = "README.md"
 # only breaking change (TrackedSender::try_reserve/&Cx, CommittedProof) is
 # unused in this workspace. See mcp_agent_mail_rust bead br-noizk.
 asupersync = { version = "=0.4.5" }
-rich_rust = { version = "=0.2.2" }
+rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
 # The non-Unix std::process pipe path remains explicitly frame-boundary-only.
@@ -177,12 +177,4 @@ type_complexity = "allow"
 too_many_lines = "allow"
 items_after_statements = "allow"
 
-[patch.crates-io]
-# rich_rust 0.2.2 on crates.io still pins time ">=0.3.47, <0.3.48" (the
-# pre-time-0.3.48-regression-fix pin); the sibling checkout's 0.2.2 already
-# moved to time ^0.3.54. fastmcp-console pins time =0.3.55 (needed so this
-# workspace and downstream path consumers like mcp_agent_mail_rust resolve a
-# single `time`), which is unsatisfiable against the published rich_rust.
-# Drop this patch once a rich_rust >0.2.2 with the time ^0.3.54 requirement
-# is published. See mcp_agent_mail_rust bead br-noizk.
-rich_rust = { path = "../rich_rust" }
+

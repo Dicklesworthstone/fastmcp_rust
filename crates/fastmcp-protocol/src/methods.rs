@@ -37,7 +37,7 @@ pub const LEGACY_2024_11_05_SCHEMA_SHA256: &str =
 /// source input.  This is deliberately not synthesized from newer protocol
 /// types: consumers can inspect the pinned source of truth directly.
 pub const LEGACY_2024_11_05_SCHEMA_JSON: &str =
-    include_str!("../../../evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.json");
+    include_str!("../schema/mcp-schema-2024-11-05-48234828.json");
 
 /// Parses the pinned legacy schema, retaining its exact source bytes in
 /// [`LEGACY_2024_11_05_SCHEMA_JSON`].

@@ -2448,7 +2448,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rich_rust"
-version = "0.2.2"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d49c27580d13ba376b565cbaa1af2de2ee320a93789c66d54c0478c53f11dcfe"
 dependencies = [
  "backtrace",
  "bitflags",
