@@ -43861,6 +43861,252 @@ mod live_websocket_bind {
         });
     }
 
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_as_proxy_advertises_completions_when_upstream_supports() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy completion-advertise runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_template_completion_http_server();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-complete-advertise-gateway".to_owned(),
+                "e2e-ws-as-proxy-complete-advertise-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket completion-advertise gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-complete-advertise-upstream",
+                    "native-h1:e2e-ws-as-proxy-complete-advertise-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-complete-advertise".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP template-completion proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP template-completion proxy catalog is typed");
+            let server =
+                modern::ServerBuilder::new("e2e-ws-as-proxy-complete-advertise-gateway", "1.0.0")
+                    .as_proxy_typed("ext", proxy, catalog)
+                    .expect("modern as_proxy_typed completion-advertise install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy completion-advertise must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy completion-advertise publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy completion-advertise serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-advertise handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket completion-advertise must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-advertise initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-complete-advertise", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy completion-advertise over bind_websocket",
+            );
+
+            let advertised_discovery = client
+                .session()
+                .server_discovery()
+                .expect("a modern as_proxy WebSocket handshake retains server/discover");
+            let advertised_caps = serde_json::to_value(advertised_discovery.capabilities())
+                .expect("modern as_proxy discovery capabilities serialize");
+            assert_eq!(
+                advertised_caps.get("completions"),
+                Some(&json!({})),
+                "as_proxy WebSocket must advertise completions when the upstream installed a provider: {advertised_caps:?}"
+            );
+
+            let retained = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy advertised complete",
+                client.complete(&cx, public_http_template_completion_params()),
+            )
+            .await
+            .expect("advertised as_proxy WebSocket completions must still forward the unprefixed template");
+            assert_eq!(
+                retained.completion.values,
+                vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_VALUE.to_owned()],
+                "as_proxy WebSocket must retain the upstream template completion after advertising: {retained:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-advertise close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the as_proxy WebSocket completion-advertise client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_omits_completions_when_upstream_has_none() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy completion-omit runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-complete-omit-gateway".to_owned(),
+                "e2e-ws-as-proxy-complete-omit-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket completion-omit gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-complete-omit-upstream",
+                    "native-h1:e2e-ws-as-proxy-complete-omit-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-complete-omit".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-complete-omit-gateway", "1.0.0")
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed completion-omit install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy completion-omit must bind");
+            let address = bound.local_addr().expect(
+                "public ModernOnly bind_websocket as_proxy completion-omit publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public ModernOnly bind_websocket as_proxy completion-omit serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-omit handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("as_proxy WebSocket completion-omit must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-omit initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-complete-omit", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the ModernOnly public facade negotiates as_proxy completion-omit over bind_websocket",
+            );
+
+            let omitted_discovery = client
+                .session()
+                .server_discovery()
+                .expect("a modern as_proxy WebSocket handshake retains server/discover");
+            let omitted_caps = serde_json::to_value(omitted_discovery.capabilities())
+                .expect("modern as_proxy discovery capabilities serialize");
+            assert!(
+                omitted_caps.get("completions").is_none(),
+                "changing only the missing upstream completion provider must omit as_proxy WebSocket completions: {omitted_caps:?}"
+            );
+
+            let prefixed = format!("ext/{PUBLIC_HTTP_PROMPT_NAME}");
+            let refused = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy omitted complete",
+                client.complete(
+                    &cx,
+                    modern::CompletionParams {
+                        reference: modern::CompletionReference::PromptWithTitle {
+                            name: prefixed,
+                            title: "Public HTTP E2E Prompt".to_owned(),
+                        },
+                        argument: modern::FinalCompletionArgument {
+                            name: "subject".to_owned(),
+                            value: "al".to_owned(),
+                        },
+                        context: None,
+                    },
+                ),
+            )
+            .await
+            .expect_err("an as_proxy WebSocket gateway without a completion provider must refuse complete");
+            let _ = refused;
+
+            websocket_client_bounded(
+                &cx,
+                "live modern WebSocket as_proxy completion-omit close",
+                client.close(&cx),
+            )
+            .await
+            .expect("the as_proxy WebSocket completion-omit client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
     #[cfg(all(feature = "proxy", any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn e2e_public_websocket_as_proxy_forwards_filesystem_template() {
@@ -47910,6 +48156,266 @@ mod live_websocket_bind {
             )
             .await
             .expect("the exact-2024 as_proxy WebSocket template-completion client closes after the live proof");
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_advertises_completions_when_upstream_supports() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy completion-advertise runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_template_completion_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-complete-advertise-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-complete-advertise-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket completion-advertise gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-complete-advertise-upstream",
+                    "native-h1:e2e-legacy-ws-complete-advertise-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-complete-advertise".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP template-completion proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP template-completion proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new(
+                "e2e-legacy-ws-complete-advertise-gateway",
+                "1.0.0",
+            )
+            .as_proxy_typed("child", proxy, catalog)
+            .expect("legacy as_proxy_typed completion-advertise install must succeed")
+            .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy completion-advertise must bind",
+                );
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy completion-advertise publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy completion-advertise serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-advertise handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect(
+                "exact-2024 as_proxy WebSocket completion-advertise must complete RFC 6455 upgrade",
+            );
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-advertise initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-complete-advertise", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy completion-advertise over bind_websocket",
+            );
+
+            assert!(
+                client.server_capabilities().completions.is_some(),
+                "exact-2024 as_proxy WebSocket must advertise initialize completions when the upstream installed a provider: {:?}",
+                client.server_capabilities()
+            );
+
+            let completed = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy advertised complete",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Resource {
+                            uri: format!("child/{PUBLIC_HTTP_CURSOR_TEMPLATE}"),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "id".to_owned(),
+                            value: "al".to_owned(),
+                        },
+                        meta: None,
+                    },
+                ),
+            )
+            .await
+            .expect(
+                "advertised exact-2024 as_proxy WebSocket completions must still forward the prefixed template",
+            );
+            assert_eq!(
+                completed.completion.values,
+                vec![PUBLIC_HTTP_TEMPLATE_COMPLETION_LEGACY_VALUE.to_owned()],
+                "exact-2024 as_proxy WebSocket must retain the upstream template completion after advertising: {completed:?}"
+            );
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-advertise close",
+                client.close(&cx),
+            )
+            .await
+            .expect(
+                "the exact-2024 as_proxy WebSocket completion-advertise client closes after the live proof",
+            );
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_omits_completions_when_upstream_has_none() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy completion-omit runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-proxy-complete-omit-gateway".to_owned(),
+                "e2e-legacy-ws-proxy-complete-omit-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket completion-omit gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-complete-omit-upstream",
+                    "native-h1:e2e-legacy-ws-complete-omit-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-proxy-complete-omit".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect from the WebSocket runtime",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let server =
+                legacy_2024::ServerBuilder::new("e2e-legacy-ws-complete-omit-gateway", "1.0.0")
+                    .as_proxy_typed("child", proxy, catalog)
+                    .expect("legacy as_proxy_typed completion-omit install must succeed")
+                    .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy completion-omit must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy completion-omit publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect(
+                    "public LegacyOnly bind_websocket as_proxy completion-omit serve must be admitted",
+                );
+
+            let transport = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-omit handshake",
+                AsyncWsClientTransport::connect(&cx, &format!("ws://{address}/mcp")),
+            )
+            .await
+            .expect("exact-2024 as_proxy WebSocket completion-omit must complete RFC 6455 upgrade");
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-omit initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-complete-omit", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect(
+                "the LegacyOnly public facade negotiates as_proxy completion-omit over bind_websocket",
+            );
+
+            assert!(
+                client.server_capabilities().completions.is_none(),
+                "changing only the missing upstream completion provider must omit exact-2024 as_proxy WebSocket completions: {:?}",
+                client.server_capabilities()
+            );
+
+            let refused = websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy omitted complete",
+                client.complete(
+                    &cx,
+                    legacy_2024::LegacyCompletionParams {
+                        reference: legacy_2024::LegacyCompletionReference::Prompt {
+                            name: format!("child/{PUBLIC_HTTP_PROMPT_NAME}"),
+                        },
+                        argument: legacy_2024::LegacyCompletionArgument {
+                            name: "subject".to_owned(),
+                            value: "al".to_owned(),
+                        },
+                        meta: None,
+                    },
+                ),
+            )
+            .await
+            .expect_err(
+                "an exact-2024 as_proxy WebSocket gateway without a completion provider must refuse complete",
+            );
+            let _ = refused;
+
+            websocket_client_bounded(
+                &cx,
+                "live exact-2024 as_proxy completion-omit close",
+                client.close(&cx),
+            )
+            .await
+            .expect(
+                "the exact-2024 as_proxy WebSocket completion-omit client closes after the live proof",
+            );
             drop(client);
             cx.set_cancel_requested(true);
             listener.abort();

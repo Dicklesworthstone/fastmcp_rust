@@ -8,7 +8,11 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## [Unreleased] (after v0.6.0)
 
-No unreleased changes yet.
+- **as_proxy WebSocket completions advertise/omit** -- live `bind_websocket`
+  as_proxy_typed now has the same initialize advertise/omit split as HTTP and
+  stdio for both modern and exact-2024. A proxied completion provider advertises
+  `completions` and still completes the template; a counting upstream omits the
+  capability and refuses complete. (`bd-campaign-product-remainder-2t3gf.10`)
 
 ---
 
