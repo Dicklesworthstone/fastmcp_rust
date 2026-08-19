@@ -45,15 +45,15 @@ const PROVISIONAL_PUBLIC_STATUS_STANZA: &str = concat!(
 /// Independently authored normalized frame for the public binary. It freezes
 /// every non-whitespace byte; wrapping is the only renderer variance allowed.
 const PROVISIONAL_PUBLIC_ROOT_HELP_PREFIX: &str = concat!(
-    "CLI tooling for FastMCP - run, inspect, and install MCP servers. ",
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
     "Usage: fastmcp <COMMAND> ",
     "Commands: ",
-    "run Run an MCP server binary. ",
-    "inspect Inspect an MCP server's capabilities. ",
-    "install Install server configuration into Claude Desktop or other clients. ",
-    "list List configured MCP servers. ",
-    "test Test MCP server connectivity. ",
-    "dev Run server in development mode with hot reloading. ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
     "help Print this message or the help of the given subcommand(s) ",
     "Options: -h, --help Print help -V, --version Print version "
 );

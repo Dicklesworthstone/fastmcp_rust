@@ -101,15 +101,15 @@ const EXPECTED_CLI_PROTOCOL_STATUS_STANZA: &str = CLI_PROTOCOL_STATUS_HELP;
 /// non-whitespace byte from the Clap construction below; normalization permits
 /// line wrapping only, not punctuation or wording variance.
 const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
-    "CLI tooling for FastMCP - run, inspect, and install MCP servers. ",
+    "CLI tooling for FastMCP - run, inspect, and install MCP servers ",
     "Usage: fastmcp <COMMAND> ",
     "Commands: ",
-    "run Run an MCP server binary. ",
-    "inspect Inspect an MCP server's capabilities. ",
-    "install Install server configuration into Claude Desktop or other clients. ",
-    "list List configured MCP servers. ",
-    "test Test MCP server connectivity. ",
-    "dev Run server in development mode with hot reloading. ",
+    "run Run an MCP server binary ",
+    "inspect Inspect an MCP server's capabilities ",
+    "install Install server configuration into Claude Desktop or other clients ",
+    "list List configured MCP servers ",
+    "test Test MCP server connectivity ",
+    "dev Run server in development mode with hot reloading ",
     "help Print this message or the help of the given subcommand(s) ",
     "Options: -h, --help Print help -V, --version Print version "
 );
