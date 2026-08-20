@@ -1446,6 +1446,11 @@ pub struct McpContext {
     request_cancellation: McpRequestCancellation,
     /// Unique request identifier for tracing (from JSON-RPC id).
     request_id: u64,
+    /// Whether this request was admitted on the MCP 2026-07-28 surface.
+    ///
+    /// Nested component access follows this surface so a modern parent cannot
+    /// bypass final argument admission by calling [`Self::get_prompt`].
+    final_request_surface: bool,
     /// Optional progress reporter for long-running operations.
     progress_reporter: Option<ProgressReporter>,
     /// Session state for per-session key-value storage.
@@ -1519,6 +1524,7 @@ impl std::fmt::Debug for McpContext {
                 &self.request_cancellation.is_cancel_requested(),
             )
             .field("request_id", &self.request_id)
+            .field("final_request_surface", &self.final_request_surface)
             .field("progress_reporter", &self.progress_reporter)
             .field("state", &self.state.is_some())
             .field(
@@ -1667,6 +1673,7 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            final_request_surface: false,
             progress_reporter: None,
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1708,6 +1715,7 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            final_request_surface: false,
             progress_reporter: None,
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1750,6 +1758,7 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            final_request_surface: false,
             progress_reporter: Some(reporter),
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1796,6 +1805,7 @@ impl McpContext {
             request_lease: Arc::new(AtomicU8::new(REQUEST_LEASE_UNMANAGED)),
             request_cancellation: McpRequestCancellation::new(),
             request_id,
+            final_request_surface: false,
             progress_reporter: Some(reporter),
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -2040,6 +2050,22 @@ impl McpContext {
     pub fn with_prompt_caller(mut self, caller: Arc<dyn PromptCaller>) -> Self {
         self.prompt_caller = Some(caller);
         self
+    }
+
+    /// Marks this context as admitted on the MCP 2026-07-28 request surface.
+    ///
+    /// Nested [`Self::get_prompt`] follows this flag so a modern parent keeps
+    /// final argument admission and the final handler hook.
+    #[must_use]
+    pub fn with_final_request_surface(mut self, final_surface: bool) -> Self {
+        self.final_request_surface = final_surface;
+        self
+    }
+
+    /// Returns whether this request was admitted on the MCP 2026-07-28 surface.
+    #[must_use]
+    pub fn is_final_request_surface(&self) -> bool {
+        self.final_request_surface
     }
 
     /// Sets the prompt get depth for this context.
