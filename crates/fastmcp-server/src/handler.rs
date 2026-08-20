@@ -27,12 +27,13 @@ use fastmcp_protocol::common_types::{
 use fastmcp_protocol::{
     AdmittedFinalFormSchema, CacheScope, CacheTtl, CompleteResult, CompletionValues, Content,
     CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue, FinalCallToolResult,
-    FinalCompletionParams, FinalCompletionValues, FinalEmbeddedCreateMessageParams,
-    FinalEmbeddedElicitationParams, FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest,
-    FinalEmbeddedRootsListParams, FinalEmbeddedUrlElicitationParams, FinalGetPromptResult,
-    FinalProgressNotificationParams, FinalPrompt, FinalPromptMessage, FinalReadResourceResult,
-    FinalResource, FinalResourceTemplate, FinalTool, Icon, InputRequiredResult, JsonRpcRequest,
-    LegacyCompletionParams, LogLevel, LogMessageParams, ProgressMarker, ProgressParams, Prompt,
+    FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
+    FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
+    FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest, FinalEmbeddedRootsListParams,
+    FinalEmbeddedUrlElicitationParams, FinalGetPromptResult, FinalProgressNotificationParams,
+    FinalPrompt, FinalPromptMessage, FinalReadResourceResult, FinalResource, FinalResourceTemplate,
+    FinalTool, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams,
+    LegacyCompletionReference, LogLevel, LogMessageParams, ProgressMarker, ProgressParams, Prompt,
     PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool,
     ToolAnnotations, decode_peer_result, encode_result, exact_json_from_serde,
 };
@@ -3710,6 +3711,235 @@ impl PromptHandler for MountedPromptHandler {
             arguments,
             resume_inputs,
         )
+    }
+}
+
+/// Rewrites a mounted completion request back to the child's original names.
+///
+/// `Router::mount` prefixes prompt names and template URIs. Per-name completion
+/// providers (including proxy handlers) still look up the original child key.
+pub(crate) struct MountedCompletionHandler {
+    inner: BoxedCompletionHandler,
+    prompt_names: HashMap<String, String>,
+    resource_templates: HashMap<String, String>,
+}
+
+impl MountedCompletionHandler {
+    pub(crate) fn for_prompt(
+        inner: BoxedCompletionHandler,
+        mounted_name: String,
+        original_name: String,
+    ) -> Self {
+        let mut prompt_names = HashMap::new();
+        prompt_names.insert(mounted_name, original_name);
+        Self {
+            inner,
+            prompt_names,
+            resource_templates: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn for_resource_template(
+        inner: BoxedCompletionHandler,
+        mounted_uri: String,
+        original_uri: String,
+    ) -> Self {
+        let mut resource_templates = HashMap::new();
+        resource_templates.insert(mounted_uri, original_uri);
+        Self {
+            inner,
+            prompt_names: HashMap::new(),
+            resource_templates,
+        }
+    }
+
+    fn rewrite_legacy(&self, mut params: LegacyCompletionParams) -> LegacyCompletionParams {
+        match &mut params.reference {
+            LegacyCompletionReference::Prompt { name } => {
+                if let Some(original) = self.prompt_names.get(name) {
+                    name.clone_from(original);
+                }
+            }
+            LegacyCompletionReference::Resource { uri } => {
+                if let Some(original) = self.resource_templates.get(uri) {
+                    uri.clone_from(original);
+                }
+            }
+        }
+        params
+    }
+
+    fn rewrite_final(&self, mut params: FinalCompletionParams) -> FinalCompletionParams {
+        match &mut params.reference {
+            FinalCompletionReference::Prompt { name }
+            | FinalCompletionReference::PromptWithTitle { name, .. } => {
+                if let Some(original) = self.prompt_names.get(name) {
+                    name.clone_from(original);
+                }
+            }
+            FinalCompletionReference::Resource { uri } => {
+                if let Some(original) = self.resource_templates.get(uri) {
+                    uri.clone_from(original);
+                }
+            }
+        }
+        params
+    }
+}
+
+impl CompletionHandler for MountedCompletionHandler {
+    fn timeout(&self) -> Option<Duration> {
+        self.inner.timeout()
+    }
+
+    fn complete_legacy(
+        &self,
+        ctx: &McpContext,
+        params: LegacyCompletionParams,
+    ) -> McpResult<CompletionValues> {
+        self.inner.complete_legacy(ctx, self.rewrite_legacy(params))
+    }
+
+    fn complete_final(
+        &self,
+        ctx: &McpContext,
+        params: FinalCompletionParams,
+    ) -> McpResult<FinalCompletionValues> {
+        self.inner.complete_final(ctx, self.rewrite_final(params))
+    }
+
+    fn complete_legacy_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+        self.inner
+            .complete_legacy_async_in_request(ctx, request_cx, self.rewrite_legacy(params))
+    }
+
+    fn complete_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
+        self.inner
+            .complete_final_async_in_request(ctx, request_cx, self.rewrite_final(params))
+    }
+}
+
+/// Strips a mount prefix from fallback `completion/complete` references.
+///
+/// Per-name providers are remapped by exact key. The server-wide fallback
+/// still sees whatever reference the client sent, so a nonempty mount prefix
+/// must be inverted before the child's handler runs.
+pub(crate) struct PrefixedFallbackCompletionHandler {
+    inner: BoxedCompletionHandler,
+    prompt_prefix: Option<String>,
+    template_prefix: Option<String>,
+}
+
+impl PrefixedFallbackCompletionHandler {
+    pub(crate) fn new(
+        inner: BoxedCompletionHandler,
+        prompt_prefix: Option<&str>,
+        template_prefix: Option<&str>,
+    ) -> Self {
+        Self {
+            inner,
+            prompt_prefix: nonempty_mount_prefix(prompt_prefix),
+            template_prefix: nonempty_mount_prefix(template_prefix),
+        }
+    }
+
+    fn rewrite_legacy(&self, mut params: LegacyCompletionParams) -> LegacyCompletionParams {
+        match &mut params.reference {
+            LegacyCompletionReference::Prompt { name } => {
+                if let Some(original) = strip_mount_prefix(name, self.prompt_prefix.as_deref()) {
+                    *name = original;
+                }
+            }
+            LegacyCompletionReference::Resource { uri } => {
+                if let Some(original) = strip_mount_prefix(uri, self.template_prefix.as_deref()) {
+                    *uri = original;
+                }
+            }
+        }
+        params
+    }
+
+    fn rewrite_final(&self, mut params: FinalCompletionParams) -> FinalCompletionParams {
+        match &mut params.reference {
+            FinalCompletionReference::Prompt { name }
+            | FinalCompletionReference::PromptWithTitle { name, .. } => {
+                if let Some(original) = strip_mount_prefix(name, self.prompt_prefix.as_deref()) {
+                    *name = original;
+                }
+            }
+            FinalCompletionReference::Resource { uri } => {
+                if let Some(original) = strip_mount_prefix(uri, self.template_prefix.as_deref()) {
+                    *uri = original;
+                }
+            }
+        }
+        params
+    }
+}
+
+fn nonempty_mount_prefix(prefix: Option<&str>) -> Option<String> {
+    prefix
+        .filter(|prefix| !prefix.is_empty())
+        .map(str::to_owned)
+}
+
+fn strip_mount_prefix(value: &str, prefix: Option<&str>) -> Option<String> {
+    let prefix = prefix?;
+    value
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_owned)
+}
+
+impl CompletionHandler for PrefixedFallbackCompletionHandler {
+    fn timeout(&self) -> Option<Duration> {
+        self.inner.timeout()
+    }
+
+    fn complete_legacy(
+        &self,
+        ctx: &McpContext,
+        params: LegacyCompletionParams,
+    ) -> McpResult<CompletionValues> {
+        self.inner.complete_legacy(ctx, self.rewrite_legacy(params))
+    }
+
+    fn complete_final(
+        &self,
+        ctx: &McpContext,
+        params: FinalCompletionParams,
+    ) -> McpResult<FinalCompletionValues> {
+        self.inner.complete_final(ctx, self.rewrite_final(params))
+    }
+
+    fn complete_legacy_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: LegacyCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<CompletionValues>> {
+        self.inner
+            .complete_legacy_async_in_request(ctx, request_cx, self.rewrite_legacy(params))
+    }
+
+    fn complete_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        params: FinalCompletionParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalCompletionValues>> {
+        self.inner
+            .complete_final_async_in_request(ctx, request_cx, self.rewrite_final(params))
     }
 }
 

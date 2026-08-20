@@ -2445,6 +2445,8 @@ impl Router {
     #[must_use]
     pub fn has_completion_handler(&self) -> bool {
         self.completion_handler.is_some()
+            || !self.legacy_prompt_completion_handlers.is_empty()
+            || !self.legacy_resource_template_completion_handlers.is_empty()
             || !self.final_prompt_completion_handlers.is_empty()
             || !self.final_resource_template_completion_handlers.is_empty()
     }
@@ -6111,6 +6113,140 @@ impl Router {
         }
     }
 
+    fn completion_prompt_keys(&self) -> HashSet<String> {
+        self.prompts
+            .keys()
+            .chain(self.final_prompts.keys())
+            .cloned()
+            .collect()
+    }
+
+    fn remap_mounted_completion_handler(
+        handler: crate::handler::BoxedCompletionHandler,
+        original: String,
+        mounted: String,
+        for_prompt: bool,
+    ) -> crate::handler::BoxedCompletionHandler {
+        if original == mounted {
+            return handler;
+        }
+        if for_prompt {
+            Box::new(crate::handler::MountedCompletionHandler::for_prompt(
+                handler, mounted, original,
+            ))
+        } else {
+            Box::new(
+                crate::handler::MountedCompletionHandler::for_resource_template(
+                    handler, mounted, original,
+                ),
+            )
+        }
+    }
+
+    fn remap_mounted_fallback_completion_handler(
+        handler: crate::handler::BoxedCompletionHandler,
+        prompt_prefix: Option<&str>,
+        template_prefix: Option<&str>,
+    ) -> crate::handler::BoxedCompletionHandler {
+        if Self::prefix_preserves_keys(prompt_prefix)
+            && Self::prefix_preserves_keys(template_prefix)
+        {
+            return handler;
+        }
+        Box::new(crate::handler::PrefixedFallbackCompletionHandler::new(
+            handler,
+            prompt_prefix,
+            template_prefix,
+        ))
+    }
+
+    fn mount_completion_providers_from(
+        &mut self,
+        prompt_prefix: Option<&str>,
+        template_prefix: Option<&str>,
+        legacy_prompt_completion_handlers: HashMap<String, crate::handler::BoxedCompletionHandler>,
+        legacy_resource_template_completion_handlers: HashMap<
+            String,
+            crate::handler::BoxedCompletionHandler,
+        >,
+        final_prompt_completion_handlers: HashMap<String, crate::handler::BoxedCompletionHandler>,
+        final_resource_template_completion_handlers: HashMap<
+            String,
+            crate::handler::BoxedCompletionHandler,
+        >,
+        completion_handler: Option<crate::handler::BoxedCompletionHandler>,
+        default_final_completion_enabled: bool,
+        preexisting_prompts: &HashSet<String>,
+        preexisting_templates: &HashSet<String>,
+        behavior: crate::DuplicateBehavior,
+    ) {
+        let replace = behavior == crate::DuplicateBehavior::Replace;
+        for (name, handler) in legacy_prompt_completion_handlers {
+            let mounted = Self::apply_prefix(&name, prompt_prefix);
+            if !self.prompts.contains_key(&mounted) {
+                continue;
+            }
+            if preexisting_prompts.contains(&mounted) && !replace {
+                continue;
+            }
+            self.legacy_prompt_completion_handlers.insert(
+                mounted.clone(),
+                Self::remap_mounted_completion_handler(handler, name, mounted, true),
+            );
+        }
+        for (name, handler) in final_prompt_completion_handlers {
+            let mounted = Self::apply_prefix(&name, prompt_prefix);
+            if !self.prompts.contains_key(&mounted) && !self.final_prompts.contains_key(&mounted) {
+                continue;
+            }
+            if preexisting_prompts.contains(&mounted) && !replace {
+                continue;
+            }
+            self.final_prompt_completion_handlers.insert(
+                mounted.clone(),
+                Self::remap_mounted_completion_handler(handler, name, mounted, true),
+            );
+        }
+        for (uri, handler) in legacy_resource_template_completion_handlers {
+            let mounted = Self::apply_prefix(&uri, template_prefix);
+            if !self.resource_templates.contains_key(&mounted) {
+                continue;
+            }
+            if preexisting_templates.contains(&mounted) && !replace {
+                continue;
+            }
+            self.legacy_resource_template_completion_handlers.insert(
+                mounted.clone(),
+                Self::remap_mounted_completion_handler(handler, uri, mounted, false),
+            );
+        }
+        for (uri, handler) in final_resource_template_completion_handlers {
+            let mounted = Self::apply_prefix(&uri, template_prefix);
+            if !self.resource_templates.contains_key(&mounted) {
+                continue;
+            }
+            if preexisting_templates.contains(&mounted) && !replace {
+                continue;
+            }
+            self.final_resource_template_completion_handlers.insert(
+                mounted.clone(),
+                Self::remap_mounted_completion_handler(handler, uri, mounted, false),
+            );
+        }
+        if let Some(handler) = completion_handler {
+            if self.completion_handler.is_none() || replace {
+                self.completion_handler = Some(Self::remap_mounted_fallback_completion_handler(
+                    handler,
+                    prompt_prefix,
+                    template_prefix,
+                ));
+                self.default_final_completion_enabled = default_final_completion_enabled;
+            }
+        } else if self.completion_handler.is_none() {
+            self.default_final_completion_enabled |= default_final_completion_enabled;
+        }
+    }
+
     /// Mounts all handlers from another router with an optional prefix.
     ///
     /// This consumes the source router and moves its handlers into this router.
@@ -6147,6 +6283,12 @@ impl Router {
         }
 
         let mut result = preflight;
+        let preexisting_prompts = self.completion_prompt_keys();
+        let preexisting_templates = self
+            .resource_templates
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
 
         let Router {
             tools,
@@ -6161,6 +6303,12 @@ impl Router {
             prompt_order,
             resource_templates,
             resource_template_order,
+            completion_handler,
+            default_final_completion_enabled,
+            legacy_prompt_completion_handlers,
+            legacy_resource_template_completion_handlers,
+            final_prompt_completion_handlers,
+            final_resource_template_completion_handlers,
             ..
         } = other;
 
@@ -6194,6 +6342,19 @@ impl Router {
             prefix,
             behavior,
         ));
+        self.mount_completion_providers_from(
+            prefix,
+            prefix,
+            legacy_prompt_completion_handlers,
+            legacy_resource_template_completion_handlers,
+            final_prompt_completion_handlers,
+            final_resource_template_completion_handlers,
+            completion_handler,
+            default_final_completion_enabled,
+            &preexisting_prompts,
+            &preexisting_templates,
+            behavior,
+        );
 
         // Log mount result
         if result.has_components() {
@@ -6233,6 +6394,12 @@ impl Router {
         }
 
         let mut result = preflight;
+        let preexisting_prompts = self.completion_prompt_keys();
+        let preexisting_templates = self
+            .resource_templates
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let Router {
             tools,
             tool_order,
@@ -6246,6 +6413,12 @@ impl Router {
             prompt_order,
             resource_templates,
             resource_template_order,
+            completion_handler,
+            default_final_completion_enabled,
+            legacy_prompt_completion_handlers,
+            legacy_resource_template_completion_handlers,
+            final_prompt_completion_handlers,
+            final_resource_template_completion_handlers,
             ..
         } = other;
 
@@ -6272,6 +6445,19 @@ impl Router {
             prefix,
             behavior,
         ));
+        self.mount_completion_providers_from(
+            prefix,
+            None,
+            legacy_prompt_completion_handlers,
+            legacy_resource_template_completion_handlers,
+            final_prompt_completion_handlers,
+            final_resource_template_completion_handlers,
+            completion_handler,
+            default_final_completion_enabled,
+            &preexisting_prompts,
+            &preexisting_templates,
+            behavior,
+        );
 
         if result.has_components() {
             debug!(
@@ -6401,6 +6587,11 @@ impl Router {
             return preflight;
         }
 
+        let preexisting_templates = self
+            .resource_templates
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
         let Router {
             resources,
             final_only_resources,
@@ -6408,6 +6599,8 @@ impl Router {
             resource_order,
             resource_templates,
             resource_template_order,
+            legacy_resource_template_completion_handlers,
+            final_resource_template_completion_handlers,
             ..
         } = other;
         let mut result = preflight;
@@ -6426,6 +6619,19 @@ impl Router {
             behavior,
         );
         result.merge(template_result);
+        self.mount_completion_providers_from(
+            None,
+            prefix,
+            HashMap::new(),
+            legacy_resource_template_completion_handlers,
+            HashMap::new(),
+            final_resource_template_completion_handlers,
+            None,
+            false,
+            &HashSet::new(),
+            &preexisting_templates,
+            behavior,
+        );
         if result.has_components() {
             self.advance_final_catalog_revision();
         }
@@ -6800,12 +7006,36 @@ impl Router {
         if !preflight.is_success() {
             return preflight;
         }
-        let result = self.mount_prompts_from(
-            other.prompts,
-            other.final_only_prompts,
-            other.final_prompts,
-            other.prompt_order,
+        let preexisting_prompts = self.completion_prompt_keys();
+        let Router {
+            prompts,
+            final_only_prompts,
+            final_prompts,
+            prompt_order,
+            legacy_prompt_completion_handlers,
+            final_prompt_completion_handlers,
+            ..
+        } = other;
+        let mut result = preflight;
+        result.merge(self.mount_prompts_from(
+            prompts,
+            final_only_prompts,
+            final_prompts,
+            prompt_order,
             prefix,
+            behavior,
+        ));
+        self.mount_completion_providers_from(
+            prefix,
+            None,
+            legacy_prompt_completion_handlers,
+            HashMap::new(),
+            final_prompt_completion_handlers,
+            HashMap::new(),
+            None,
+            false,
+            &preexisting_prompts,
+            &HashSet::new(),
             behavior,
         );
         if result.has_components() {
@@ -11076,7 +11306,12 @@ mod router_tests {
             "duplicate://resource",
             vec![marker.to_string()],
         ));
-        router.add_resource_template(marked_template("duplicate://{item}", marker));
+        router
+            .add_resource_template_with_behavior(
+                marked_template("mcp://duplicate-item/{item}", marker),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("marked resource template is disjoint from the marked exact resource");
         router.add_prompt(NamedPrompt::with_tags(
             "duplicate_prompt",
             vec![marker.to_string()],
@@ -11103,7 +11338,7 @@ mod router_tests {
         );
         assert_eq!(
             router
-                .get_resource_template("duplicate://{item}")
+                .get_resource_template("mcp://duplicate-item/{item}")
                 .expect("resource template exists")
                 .tags,
             vec![marker.to_string()]
@@ -12446,6 +12681,316 @@ mod router_tests {
         assert!(main.get_tool("query").is_some());
     }
 
+    struct RecordingNameCompletion {
+        names: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CompletionHandler for RecordingNameCompletion {
+        fn complete_legacy(
+            &self,
+            _ctx: &McpContext,
+            params: LegacyCompletionParams,
+        ) -> McpResult<CompletionValues> {
+            let name = match params.reference {
+                fastmcp_protocol::LegacyCompletionReference::Prompt { name } => name,
+                fastmcp_protocol::LegacyCompletionReference::Resource { uri } => uri,
+            };
+            self.names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(name);
+            Ok(CompletionValues {
+                values: vec![format!("{}ging", params.argument.value)],
+                total: Some(1),
+                has_more: Some(false),
+            })
+        }
+
+        fn complete_final(
+            &self,
+            _ctx: &McpContext,
+            params: FinalCompletionParams,
+        ) -> McpResult<fastmcp_protocol::FinalCompletionValues> {
+            let name = match params.reference {
+                fastmcp_protocol::FinalCompletionReference::Prompt { name }
+                | fastmcp_protocol::FinalCompletionReference::PromptWithTitle { name, .. } => name,
+                fastmcp_protocol::FinalCompletionReference::Resource { uri } => uri,
+            };
+            self.names
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(name);
+            Ok(fastmcp_protocol::FinalCompletionValues {
+                values: vec![format!("{}ging", params.argument.value)],
+                total: Some(fastmcp_protocol::JsonInteger::from(1_i64)),
+                has_more: Some(false),
+            })
+        }
+    }
+
+    #[test]
+    fn mount_transfers_prompt_completion_providers_and_rewrites_prefixed_names() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut child = Router::new();
+        child.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        child.add_legacy_prompt_completion_handler(
+            "prompt-argument-boundary",
+            RecordingNameCompletion {
+                names: Arc::clone(&seen),
+            },
+        );
+        child.add_prompt_completion_handler(
+            "prompt-argument-boundary",
+            RecordingNameCompletion {
+                names: Arc::clone(&seen),
+            },
+        );
+
+        let mut main = Router::new();
+        let result = main.mount(child, Some("ns"));
+        assert!(result.is_success());
+        assert_eq!(result.prompts, 1);
+        assert!(main.has_completion_handler());
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 401, Budget::INFINITE, &state);
+        let legacy = main
+            .dispatch_legacy_completion(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "ns/prompt-argument-boundary"},
+                        "argument": {"name": "topic", "value": "sta"},
+                    })),
+                    401_i64,
+                ),
+            )
+            .expect("prefixed legacy completion must reach the mounted provider");
+        assert_eq!(
+            legacy["completion"]["values"],
+            serde_json::json!(["staging"])
+        );
+
+        let unprefixed = main.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                    "argument": {"name": "topic", "value": "sta"},
+                })),
+                402_i64,
+            ),
+        );
+        assert!(
+            unprefixed.is_err(),
+            "the child's original completion name must not remain after a prefixed mount"
+        );
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            seen.as_slice(),
+            ["prompt-argument-boundary"],
+            "the mounted provider must observe the child's original prompt name"
+        );
+    }
+
+    #[test]
+    fn mount_without_prefix_keeps_completion_provider_keys() {
+        let mut child = Router::new();
+        child.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        child.add_legacy_prompt_completion_handler("prompt-argument-boundary", EchoCompletion);
+        let mut main = Router::new();
+        assert!(main.mount(child, None).is_success());
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 403, Budget::INFINITE, &state);
+        let legacy = main
+            .dispatch_legacy_completion(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "prompt-argument-boundary"},
+                        "argument": {"name": "topic", "value": "sta"},
+                    })),
+                    403_i64,
+                ),
+            )
+            .expect("unprefixed mount keeps the original completion key");
+        assert_eq!(
+            legacy["completion"]["values"],
+            serde_json::json!(["staging"])
+        );
+    }
+
+    #[test]
+    fn mount_transfers_resource_template_completion_providers_and_rewrites_prefixed_uris() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut child = Router::new();
+        child
+            .add_resource_template_with_behavior(
+                marked_template("mcp://books/{id}", "books"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("child resource template is admitted");
+        child.add_legacy_resource_template_completion_handler(
+            "mcp://books/{id}",
+            RecordingNameCompletion {
+                names: Arc::clone(&seen),
+            },
+        );
+        child.add_resource_template_completion_handler(
+            "mcp://books/{id}",
+            RecordingNameCompletion {
+                names: Arc::clone(&seen),
+            },
+        );
+
+        let mut main = Router::new();
+        let result = main.mount(child, Some("ns"));
+        assert!(result.is_success());
+        assert_eq!(result.resource_templates, 1);
+        assert!(main.has_completion_handler());
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 411, Budget::INFINITE, &state);
+        let legacy = main
+            .dispatch_legacy_completion(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/resource", "uri": "ns/mcp://books/{id}"},
+                        "argument": {"name": "id", "value": "sta"},
+                    })),
+                    411_i64,
+                ),
+            )
+            .expect("prefixed legacy template completion must reach the mounted provider");
+        assert_eq!(
+            legacy["completion"]["values"],
+            serde_json::json!(["staging"])
+        );
+
+        let unprefixed = main.dispatch_legacy_completion(
+            &request_ctx,
+            &JsonRpcRequest::new(
+                COMPLETION_COMPLETE,
+                Some(serde_json::json!({
+                    "ref": {"type": "ref/resource", "uri": "mcp://books/{id}"},
+                    "argument": {"name": "id", "value": "sta"},
+                })),
+                412_i64,
+            ),
+        );
+        assert!(
+            unprefixed.is_err(),
+            "the child's original template completion URI must not remain after a prefixed mount"
+        );
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            seen.as_slice(),
+            ["mcp://books/{id}"],
+            "the mounted provider must observe the child's original template URI"
+        );
+    }
+
+    #[test]
+    fn prefixed_mount_strips_prefix_for_server_wide_completion_fallback() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut child = Router::new();
+        child.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        child.add_completion_handler(RecordingNameCompletion {
+            names: Arc::clone(&seen),
+        });
+
+        let mut main = Router::new();
+        assert!(main.mount(child, Some("ns")).is_success());
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 414, Budget::INFINITE, &state);
+        let legacy = main
+            .dispatch_legacy_completion(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "ns/prompt-argument-boundary"},
+                        "argument": {"name": "topic", "value": "sta"},
+                    })),
+                    414_i64,
+                ),
+            )
+            .expect("prefixed fallback completion must reach the child's server-wide handler");
+        assert_eq!(
+            legacy["completion"]["values"],
+            serde_json::json!(["staging"])
+        );
+
+        let seen = seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            seen.as_slice(),
+            ["prompt-argument-boundary"],
+            "the child's server-wide handler must observe the original prompt name"
+        );
+    }
+
+    #[test]
+    fn mount_prompts_does_not_replace_destination_fallback_completion_handler() {
+        let mut dest = Router::new();
+        dest.add_prompt(NamedPrompt::new("kept"));
+        dest.add_completion_handler(CountingCompletion {
+            final_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut child = Router::new();
+        child.add_prompt(NamedPrompt::new("incoming"));
+        child.add_completion_handler(EchoCompletion);
+
+        assert!(
+            dest.mount_prompts_with_behavior(child, None, crate::DuplicateBehavior::Replace)
+                .is_success()
+        );
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 413, Budget::INFINITE, &state);
+        let kept = dest
+            .dispatch_legacy_completion(
+                &request_ctx,
+                &JsonRpcRequest::new(
+                    COMPLETION_COMPLETE,
+                    Some(serde_json::json!({
+                        "ref": {"type": "ref/prompt", "name": "kept"},
+                        "argument": {"name": "topic", "value": "sta"},
+                    })),
+                    413_i64,
+                ),
+            )
+            .expect("prompts-only mount must keep the destination fallback completion handler");
+        assert_eq!(kept["completion"]["values"], serde_json::json!(["legacy"]));
+    }
+
     #[test]
     fn mount_resources_with_prefix() {
         let mut main = Router::new();
@@ -13003,7 +13548,7 @@ mod router_tests {
             for message in result.warnings.iter().chain(&result.errors) {
                 assert!(!message.contains("duplicate_tool"));
                 assert!(!message.contains("duplicate://resource"));
-                assert!(!message.contains("duplicate://{item}"));
+                assert!(!message.contains("mcp://duplicate-item/{item}"));
                 assert!(!message.contains("duplicate_prompt"));
             }
         }

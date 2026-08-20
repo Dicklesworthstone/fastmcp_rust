@@ -2154,6 +2154,9 @@ impl ServerBuilder {
         if has_prompts && result.prompts > 0 {
             self.advertise_legacy_prompts_list_changed();
         }
+        if self.router.has_completion_handler() {
+            self.advertise_completions();
+        }
 
         self
     }
@@ -2202,6 +2205,9 @@ impl ServerBuilder {
         }
         if has_prompts && result.prompts > 0 {
             self.advertise_legacy_prompts_list_changed();
+        }
+        if self.router.has_completion_handler() {
+            self.advertise_completions();
         }
 
         self
@@ -2308,6 +2314,9 @@ impl ServerBuilder {
         if result.resources > 0 || result.resource_templates > 0 {
             self.advertise_legacy_resource_subscriptions();
         }
+        if self.router.has_completion_handler() {
+            self.advertise_completions();
+        }
 
         self
     }
@@ -2350,6 +2359,9 @@ impl ServerBuilder {
         // Update capabilities if prompts were mounted
         if result.prompts > 0 {
             self.advertise_legacy_prompts_list_changed();
+        }
+        if self.router.has_completion_handler() {
+            self.advertise_completions();
         }
 
         self
@@ -3075,7 +3087,7 @@ mod tests {
 
     fn marked_resource_template(marker: &str) -> ResourceTemplate {
         ResourceTemplate {
-            uri_template: "duplicate://{item}".to_string(),
+            uri_template: "mcp://duplicate-item/{item}".to_string(),
             name: marker.to_string(),
             description: Some(marker.to_string()),
             mime_type: None,
