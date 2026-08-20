@@ -1184,6 +1184,29 @@ fn admit_final_prompt_content(
     }
 }
 
+fn admit_declared_final_prompt_arguments<S: AsRef<str>>(
+    declared: &[FinalPromptArgument],
+    supplied: impl IntoIterator<Item = S>,
+) -> McpResult<()> {
+    let supplied: HashSet<String> = supplied
+        .into_iter()
+        .map(|name| name.as_ref().to_owned())
+        .collect();
+    if declared
+        .iter()
+        .any(|argument| argument.required == Some(true) && !supplied.contains(&argument.name))
+    {
+        return Err(McpError::invalid_params("Missing required prompt argument"));
+    }
+    if supplied
+        .iter()
+        .any(|name| !declared.iter().any(|argument| &argument.name == name))
+    {
+        return Err(McpError::invalid_params("Unknown prompt argument"));
+    }
+    Ok(())
+}
+
 fn admit_final_prompt_outcome(
     policy: ResourceUriUsePolicy,
     outcome: &FinalMethodOutcome<FinalGetPromptResult>,
@@ -1797,7 +1820,9 @@ fn derive_handler_context(
         "Deriving handler context for request {}",
         request_ctx.request_id()
     );
-    let mut handler_ctx = request_ctx.clone();
+    let mut handler_ctx = request_ctx
+        .clone()
+        .with_final_request_surface(matches!(protocol_era, ProtocolEra::Modern2026));
 
     // The owned modern dispatch path may already have installed a
     // request-scoped final-progress runtime. Preserve that reporter so its
@@ -5606,29 +5631,14 @@ impl Router {
         // FinalArguments deserialization rejects an explicit null before this
         // point, so `arguments` is here always Absent or a typed value.
         let arguments = params.arguments.into_value().unwrap_or_default();
-        if final_registration
-            .definition
-            .arguments
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .any(|argument| {
-                argument.required == Some(true) && !arguments.contains_key(&argument.name)
-            })
-        {
-            return Err(McpError::invalid_params("Missing required prompt argument"));
-        }
-        if arguments.keys().any(|name| {
-            !final_registration
+        admit_declared_final_prompt_arguments(
+            final_registration
                 .definition
                 .arguments
                 .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|argument| &argument.name == name)
-        }) {
-            return Err(McpError::invalid_params("Unknown prompt argument"));
-        }
+                .unwrap_or_default(),
+            arguments.keys(),
+        )?;
         let ctx = derive_handler_context(
             request_ctx,
             progress_marker,
@@ -7897,92 +7907,231 @@ impl PromptCaller for RouterPromptCaller {
         let name = name.to_string();
         let router_access = self.router.clone();
         let session_state = self.session_state.clone();
+        let final_surface = parent_ctx.is_final_request_surface();
 
         Box::pin(async move {
             debug!(
                 target: targets::HANDLER,
-                "cross-component prompt get; prompt_key={}; depth={}; request={}",
+                "cross-component prompt get; prompt_key={}; depth={}; request={}; final_surface={}",
                 safe_log_label(&name),
                 depth,
-                parent_ctx.request_id()
+                parent_ctx.request_id(),
+                final_surface
             );
             let router = router_access.upgrade()?;
-            let operation_started_at = parent_ctx.cx().now();
-            if let Some(error) = budget_error(&parent_ctx) {
-                return Err(error);
-            }
-            if !session_state.is_prompt_enabled(&name) {
-                return Err(McpError::new(
-                    McpErrorCode::PromptNotFound,
-                    format!("Prompt '{name}' is disabled for this session"),
-                ));
-            }
-            let handler = router.prompts.get(&name).ok_or_else(|| {
-                McpError::new(
-                    McpErrorCode::PromptNotFound,
-                    format!("Prompt not found: {name}"),
+            if final_surface {
+                Self::get_prompt_final(
+                    &router,
+                    &parent_ctx,
+                    router_access,
+                    session_state,
+                    name,
+                    arguments,
+                    depth,
                 )
-            })?;
-            if router.final_only_prompts.contains(&name) {
-                return Err(McpError::new(
-                    McpErrorCode::PromptNotFound,
-                    format!("Prompt not found: {name}"),
-                ));
+                .await
+            } else {
+                Self::get_prompt_legacy(
+                    &router,
+                    &parent_ctx,
+                    router_access,
+                    session_state,
+                    name,
+                    arguments,
+                    depth,
+                )
+                .await
             }
-            let description = crate::catch_extension_unwind(|| handler.definition().description)
-                .map_err(|_payload| {
-                    sanitized_handler_panic(parent_ctx.cx(), "prompt_definition")
-                })?;
-            let handler_timeout =
-                read_handler_timeout(parent_ctx.cx(), "prompt_timeout", || handler.timeout())?;
-            let effective_budget = compose_handler_budget(
-                parent_ctx.cx().budget(),
-                parent_ctx.budget(),
-                handler_timeout,
-                operation_started_at,
-            );
-            let child_ctx = with_nested_component_access(
-                parent_ctx
-                    .clone()
-                    .with_operation_deadline(effective_budget.deadline),
-                router_access,
-                session_state,
-                depth,
-            );
-            let outcome = run_handler_in_request(
-                &child_ctx,
-                parent_ctx.cx(),
-                effective_budget,
-                "prompt",
-                |request_cx| handler.get_async_in_request(&child_ctx, request_cx, arguments),
+        })
+    }
+}
+
+impl RouterPromptCaller {
+    async fn get_prompt_legacy(
+        router: &Router,
+        parent_ctx: &McpContext,
+        router_access: RouterAccess,
+        session_state: SessionState,
+        name: String,
+        arguments: HashMap<String, String>,
+        depth: u32,
+    ) -> McpResult<PromptGetResult> {
+        let operation_started_at = parent_ctx.cx().now();
+        if let Some(error) = budget_error(parent_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_prompt_enabled(&name) {
+            return Err(McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt '{name}' is disabled for this session"),
+            ));
+        }
+        let handler = router.prompts.get(&name).ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt not found: {name}"),
             )
-            .await?;
-            let messages = match outcome {
-                Outcome::Ok(messages) => messages,
-                Outcome::Err(error) => {
-                    return Err(sanitize_handler_error(parent_ctx.cx(), "prompt", error));
-                }
-                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-                Outcome::Panicked(_payload) => {
-                    return Err(sanitized_handler_panic(parent_ctx.cx(), "prompt"));
-                }
-            };
-            Ok(PromptGetResult {
-                description,
-                messages: messages
-                    .into_iter()
-                    .map(|message| PromptMessageItem {
-                        role: match message.role {
-                            Role::User => PromptMessageRole::User,
-                            Role::Assistant => PromptMessageRole::Assistant,
-                        },
-                        text: match message.content {
-                            Content::Text { text } => Some(text),
-                            _ => None,
-                        },
-                    })
-                    .collect(),
-            })
+        })?;
+        if router.final_only_prompts.contains(&name) {
+            return Err(McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt not found: {name}"),
+            ));
+        }
+        let description = crate::catch_extension_unwind(|| handler.definition().description)
+            .map_err(|_payload| sanitized_handler_panic(parent_ctx.cx(), "prompt_definition"))?;
+        let handler_timeout =
+            read_handler_timeout(parent_ctx.cx(), "prompt_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            parent_ctx.cx().budget(),
+            parent_ctx.budget(),
+            handler_timeout,
+            operation_started_at,
+        );
+        let child_ctx = with_nested_component_access(
+            parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline),
+            router_access,
+            session_state,
+            depth,
+        );
+        let outcome = run_handler_in_request(
+            &child_ctx,
+            parent_ctx.cx(),
+            effective_budget,
+            "prompt",
+            |request_cx| handler.get_async_in_request(&child_ctx, request_cx, arguments),
+        )
+        .await?;
+        let messages = match outcome {
+            Outcome::Ok(messages) => messages,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(parent_ctx.cx(), "prompt", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(parent_ctx.cx(), "prompt"));
+            }
+        };
+        Ok(PromptGetResult {
+            description,
+            messages: messages
+                .into_iter()
+                .map(|message| PromptMessageItem {
+                    role: match message.role {
+                        Role::User => PromptMessageRole::User,
+                        Role::Assistant => PromptMessageRole::Assistant,
+                    },
+                    text: match message.content {
+                        Content::Text { text } => Some(text),
+                        _ => None,
+                    },
+                })
+                .collect(),
+        })
+    }
+
+    async fn get_prompt_final(
+        router: &Router,
+        parent_ctx: &McpContext,
+        router_access: RouterAccess,
+        session_state: SessionState,
+        name: String,
+        arguments: HashMap<String, String>,
+        depth: u32,
+    ) -> McpResult<PromptGetResult> {
+        let operation_started_at = parent_ctx.cx().now();
+        if let Some(error) = budget_error(parent_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_prompt_enabled(&name) || !parent_ctx.is_prompt_enabled(&name) {
+            return Err(McpError::new(
+                McpErrorCode::PromptNotFound,
+                format!("Prompt '{name}' is disabled for this session"),
+            ));
+        }
+        let handler = router
+            .prompts
+            .get(&name)
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown prompt: {name}")))?;
+        let final_registration = router.final_prompts.get(&name).ok_or_else(|| {
+            McpError::invalid_params("prompt is registered only for exact MCP 2024-11-05 dispatch")
+        })?;
+        if handler.declares_final_mrtr() && parent_ctx.session_cache_partition().is_none() {
+            return Err(McpError::invalid_params(
+                MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
+            ));
+        }
+        admit_declared_final_prompt_arguments(
+            final_registration
+                .definition
+                .arguments
+                .as_deref()
+                .unwrap_or_default(),
+            arguments.keys(),
+        )?;
+        let handler_timeout =
+            read_handler_timeout(parent_ctx.cx(), "prompt_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            parent_ctx.cx().budget(),
+            parent_ctx.budget(),
+            handler_timeout,
+            operation_started_at,
+        );
+        let child_ctx = with_nested_component_access(
+            parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline),
+            router_access,
+            session_state,
+            depth,
+        );
+        let outcome = run_handler_in_request(
+            &child_ctx,
+            parent_ctx.cx(),
+            effective_budget,
+            "prompt",
+            |request_cx| {
+                handler.get_final_outcome_async_in_request(&child_ctx, request_cx, arguments)
+            },
+        )
+        .await?;
+        let result = match outcome {
+            Outcome::Ok(result) => result,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(parent_ctx.cx(), "prompt", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(parent_ctx.cx(), "prompt"));
+            }
+        };
+        admit_final_prompt_outcome(final_registration.uri_use_policy, &result)?;
+        let FinalMethodOutcome::Complete(complete) = result else {
+            return Err(McpError::internal_error(
+                "nested prompt get cannot complete an input_required outcome",
+            ));
+        };
+        Ok(PromptGetResult {
+            description: complete.payload.description,
+            messages: complete
+                .payload
+                .messages
+                .into_iter()
+                .map(|message| PromptMessageItem {
+                    role: match message.role {
+                        Role::User => PromptMessageRole::User,
+                        Role::Assistant => PromptMessageRole::Assistant,
+                    },
+                    text: match message.content {
+                        fastmcp_protocol::common_types::ContentBlock::Text { text, .. } => {
+                            Some(text)
+                        }
+                        _ => None,
+                    },
+                })
+                .collect(),
         })
     }
 }
@@ -15188,6 +15337,80 @@ mod router_tests {
             .expect("a registered nested prompt must complete");
         assert_eq!(result.description.as_deref(), Some("Prompt greet"));
         assert!(result.messages.is_empty());
+    }
+
+    #[test]
+    fn nested_get_prompt_from_legacy_surface_skips_required_argument_admission() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::clone(&final_calls),
+            legacy_calls: Arc::clone(&legacy_calls),
+        });
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_prompt_caller(
+            Arc::new(RouterPromptCaller::new(Arc::clone(&router), state)),
+        );
+
+        let result = block_on(request_ctx.get_prompt("prompt-argument-boundary", HashMap::new()))
+            .expect("legacy nested get_prompt retains unvalidated argument behavior");
+        assert_eq!(
+            result.messages[0].text.as_deref(),
+            Some("legacy prompt-argument-boundary result")
+        );
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nested_get_prompt_from_final_surface_admits_arguments_before_handler() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_prompt(PromptArgumentBoundary {
+            final_calls: Arc::clone(&final_calls),
+            legacy_calls: Arc::clone(&legacy_calls),
+        });
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone())
+            .with_final_request_surface(true)
+            .with_prompt_caller(Arc::new(RouterPromptCaller::new(
+                Arc::clone(&router),
+                state,
+            )));
+
+        let missing = block_on(request_ctx.get_prompt("prompt-argument-boundary", HashMap::new()))
+            .expect_err("removing only the required nested argument is rejected");
+        assert_eq!(missing.code, McpErrorCode::InvalidParams);
+        assert_eq!(missing.message, "Missing required prompt argument");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let mut unknown = HashMap::new();
+        unknown.insert("topic".to_owned(), "release".to_owned());
+        unknown.insert("extra".to_owned(), "nope".to_owned());
+        let unknown_error = block_on(request_ctx.get_prompt("prompt-argument-boundary", unknown))
+            .expect_err("an undeclared nested argument is rejected before the handler");
+        assert_eq!(unknown_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(unknown_error.message, "Unknown prompt argument");
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let mut required = HashMap::new();
+        required.insert("topic".to_owned(), "release".to_owned());
+        let accepted = block_on(request_ctx.get_prompt("prompt-argument-boundary", required))
+            .expect("the complete required nested argument is accepted");
+        assert_eq!(
+            accepted.messages[0].text.as_deref(),
+            Some("final prompt-argument-boundary result")
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
     }
 
     fn handle_prompts_get_success() {
