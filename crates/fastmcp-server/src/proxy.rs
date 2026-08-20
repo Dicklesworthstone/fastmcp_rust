@@ -8939,6 +8939,13 @@ impl ProxyResourceHandler {
             client,
         }
     }
+
+    fn upstream_uri<'a>(&'a self, uri: &'a str) -> &'a str {
+        self.uri_prefix
+            .as_deref()
+            .and_then(|prefix| uri.strip_prefix(prefix))
+            .unwrap_or(uri)
+    }
 }
 
 impl ResourceHandler for ProxyResourceHandler {
@@ -8951,11 +8958,12 @@ impl ResourceHandler for ProxyResourceHandler {
     }
 
     fn on_subscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
-        self.client.subscribe_resource(ctx, uri)
+        self.client.subscribe_resource(ctx, self.upstream_uri(uri))
     }
 
     fn on_unsubscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
-        self.client.unsubscribe_resource(ctx, uri)
+        self.client
+            .unsubscribe_resource(ctx, self.upstream_uri(uri))
     }
 
     fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
@@ -8976,12 +8984,7 @@ impl ResourceHandler for ProxyResourceHandler {
         // Strip only a prefix that this handler explicitly installed. Deriving
         // it from the exposed URI would misclassify `db://` and other schemes,
         // and splitting once would corrupt configured prefixes containing `/`.
-        let external_uri = self
-            .uri_prefix
-            .as_deref()
-            .and_then(|prefix| uri.strip_prefix(prefix))
-            .unwrap_or(uri);
-        self.client.read_resource(ctx, external_uri)
+        self.client.read_resource(ctx, self.upstream_uri(uri))
     }
 
     fn declares_final_mrtr(&self) -> bool {
@@ -8998,12 +9001,7 @@ impl ResourceHandler for ProxyResourceHandler {
         uri: &str,
         _params: &UriParams,
     ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
-        let external_uri = self
-            .uri_prefix
-            .as_deref()
-            .and_then(|prefix| uri.strip_prefix(prefix))
-            .unwrap_or(uri);
-        self.client.read_resource_final(ctx, external_uri)
+        self.client.read_resource_final(ctx, self.upstream_uri(uri))
     }
 
     fn read_final_outcome(
@@ -9020,13 +9018,8 @@ impl ResourceHandler for ProxyResourceHandler {
         uri: &str,
         _params: &UriParams,
     ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
-        let external_uri = self
-            .uri_prefix
-            .as_deref()
-            .and_then(|prefix| uri.strip_prefix(prefix))
-            .unwrap_or(uri);
         self.client
-            .read_resource_final_outcome(ctx, external_uri, None)
+            .read_resource_final_outcome(ctx, self.upstream_uri(uri), None)
     }
 
     fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
@@ -9038,15 +9031,11 @@ impl ResourceHandler for ProxyResourceHandler {
         resume_inputs: Option<&'a MrtrCompletedInputs>,
     ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
         Box::pin(async move {
-            let external_uri = self
-                .uri_prefix
-                .as_deref()
-                .and_then(|prefix| uri.strip_prefix(prefix))
-                .unwrap_or(uri);
-            match self
-                .client
-                .read_resource_final_outcome(ctx, external_uri, resume_inputs)
-            {
+            match self.client.read_resource_final_outcome(
+                ctx,
+                self.upstream_uri(uri),
+                resume_inputs,
+            ) {
                 Ok(result) => Outcome::Ok(result),
                 Err(error) => Outcome::Err(error),
             }
@@ -10981,6 +10970,8 @@ mod tests {
     struct TestState {
         last_tool: Option<(String, serde_json::Value)>,
         last_resource: Option<String>,
+        last_subscribe: Option<String>,
+        last_unsubscribe: Option<String>,
         last_prompt: Option<(String, HashMap<String, String>)>,
     }
 
@@ -11068,6 +11059,24 @@ mod tests {
                 mime_type: None,
                 blob: None,
             }])
+        }
+
+        fn subscribe_resource(&mut self, uri: &str) -> fastmcp_core::McpResult<()> {
+            self.state
+                .lock()
+                .expect("state lock poisoned")
+                .last_subscribe
+                .replace(uri.to_string());
+            Ok(())
+        }
+
+        fn unsubscribe_resource(&mut self, uri: &str) -> fastmcp_core::McpResult<()> {
+            self.state
+                .lock()
+                .expect("state lock poisoned")
+                .last_unsubscribe
+                .replace(uri.to_string());
+            Ok(())
         }
 
         fn get_prompt(
@@ -16312,6 +16321,53 @@ exec sleep 2
         assert_eq!(
             state.lock().expect("state lock poisoned").last_resource,
             Some("db://orders".to_string())
+        );
+    }
+
+    #[test]
+    fn proxy_resource_handler_subscribe_strips_nested_prefix() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+        use fastmcp_protocol::ResourceTemplate;
+
+        let backend = TestBackend::default();
+        let state = Arc::clone(&backend.state);
+        let proxy = ProxyClient::from_backend(backend);
+        let template = ResourceTemplate {
+            uri_template: "db://{table}".to_string(),
+            name: "DB".to_string(),
+            description: None,
+            mime_type: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+        };
+        let handler =
+            ProxyResourceHandler::from_template_with_prefix(template, "tenant/remote", proxy);
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        handler
+            .on_subscribe(&ctx, "tenant/remote/db://orders")
+            .expect("prefixed subscribe must reach the upstream URI");
+        handler
+            .on_unsubscribe(&ctx, "tenant/remote/db://orders")
+            .expect("prefixed unsubscribe must reach the upstream URI");
+
+        let recorded = state.lock().expect("state lock poisoned");
+        assert_eq!(
+            recorded.last_subscribe.as_deref(),
+            Some("db://orders"),
+            "subscribe must strip the configured prefix, not only the first path segment"
+        );
+        assert_eq!(
+            recorded.last_unsubscribe.as_deref(),
+            Some("db://orders"),
+            "unsubscribe must strip the same configured prefix"
+        );
+        assert_ne!(
+            recorded.last_subscribe.as_deref(),
+            Some("remote/db://orders"),
+            "split_once('/') would leave the rest of a nested prefix on the upstream URI"
         );
     }
 

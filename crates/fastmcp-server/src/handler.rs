@@ -3319,6 +3319,16 @@ impl ResourceHandler for MountedResourceHandler {
         self.inner.timeout()
     }
 
+    fn on_subscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
+        let source_uri = self.translate_incoming_uri(uri)?;
+        self.inner.on_subscribe(ctx, &source_uri)
+    }
+
+    fn on_unsubscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
+        let source_uri = self.translate_incoming_uri(uri)?;
+        self.inner.on_unsubscribe(ctx, &source_uri)
+    }
+
     fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
         self.inner.final_resource_read_cache_hint_provenance()
     }
@@ -5781,6 +5791,104 @@ mod tests {
             "file:///m".to_string(),
         );
         assert_eq!(mounted.timeout(), Some(Duration::from_secs(30)));
+    }
+
+    struct SubscribeProbe {
+        subscribed: std::sync::Arc<Mutex<Vec<String>>>,
+        unsubscribed: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SubscribeProbe {
+        fn new() -> Self {
+            Self {
+                subscribed: std::sync::Arc::new(Mutex::new(Vec::new())),
+                unsubscribed: std::sync::Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl ResourceHandler for SubscribeProbe {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "file:///orig".to_string(),
+                name: "probe".to_string(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn on_subscribe(&self, _ctx: &McpContext, uri: &str) -> McpResult<()> {
+            self.subscribed
+                .lock()
+                .expect("subscribe probe is not poisoned")
+                .push(uri.to_owned());
+            Ok(())
+        }
+
+        fn on_unsubscribe(&self, _ctx: &McpContext, uri: &str) -> McpResult<()> {
+            self.unsubscribed
+                .lock()
+                .expect("unsubscribe probe is not poisoned")
+                .push(uri.to_owned());
+            Ok(())
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn mounted_resource_handler_rewrites_subscribe_uri_to_source() {
+        let inner = SubscribeProbe::new();
+        let subscribed = std::sync::Arc::clone(&inner.subscribed);
+        let unsubscribed = std::sync::Arc::clone(&inner.unsubscribed);
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mounted = MountedResourceHandler::new(
+            Box::new(inner),
+            "file:///orig".to_string(),
+            "ns/file:///orig".to_string(),
+        );
+        mounted
+            .on_subscribe(&ctx, "ns/file:///orig")
+            .expect("mounted subscribe must reach the inner handler");
+        mounted
+            .on_unsubscribe(&ctx, "ns/file:///orig")
+            .expect("mounted unsubscribe must reach the inner handler");
+        assert_eq!(
+            subscribed
+                .lock()
+                .expect("subscribe probe is not poisoned")
+                .as_slice(),
+            ["file:///orig"]
+        );
+        assert_eq!(
+            unsubscribed
+                .lock()
+                .expect("unsubscribe probe is not poisoned")
+                .as_slice(),
+            ["file:///orig"]
+        );
+    }
+
+    #[test]
+    fn mounted_resource_handler_subscribe_rejects_foreign_namespace() {
+        let inner = SubscribeProbe::new();
+        let cx = Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let mounted = MountedResourceHandler::new(
+            Box::new(inner),
+            "file:///orig".to_string(),
+            "ns/file:///orig".to_string(),
+        );
+        let error = mounted
+            .on_subscribe(&ctx, "other/file:///orig")
+            .expect_err("a foreign mount prefix must not bind the inner resource");
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidParams);
     }
 
     // ── MountedPromptHandler delegates ───────────────────────────────
