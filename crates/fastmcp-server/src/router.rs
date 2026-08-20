@@ -400,9 +400,10 @@ fn decode_cursor_offset(cursor: Option<&str>) -> McpResult<usize> {
 /// The catalog a continuation cursor was minted for.
 ///
 /// Paged list cursors bind the offset to this catalog discriminator, the
-/// router catalog revision, and the normalized query filters so a
-/// continuation cannot cross list methods, observe a changed catalog, or
-/// replay under different tag filters.
+/// router catalog revision, the normalized query filters, and—for exact-2024
+/// lists that filter session-disabled members—the visible-member digest so a
+/// continuation cannot cross list methods, observe a changed catalog, replay
+/// under different tag filters, or silently skip after a session disable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FinalCatalogKind {
@@ -461,6 +462,13 @@ struct FinalCatalogCursor {
     revision: u64,
     query: FinalCatalogQuery,
     offset: u64,
+    /// Digest of the exact-2024 visible member keys after session filtering.
+    ///
+    /// Final catalogs are connection-independent and omit this member. A
+    /// session-filtered list binds it so a later disable cannot reuse an
+    /// offset into a shorter snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    visibility_digest: Option<String>,
 }
 
 fn decode_final_catalog_cursor_offset(
@@ -468,6 +476,7 @@ fn decode_final_catalog_cursor_offset(
     expected_catalog: FinalCatalogKind,
     expected_revision: u64,
     expected_query: &FinalCatalogQuery,
+    expected_visibility_digest: Option<&str>,
     catalog_length: usize,
 ) -> McpResult<usize> {
     let Some(cursor) = cursor else {
@@ -493,6 +502,11 @@ fn decode_final_catalog_cursor_offset(
     if &cursor.query != expected_query {
         return Err(McpError::invalid_params(
             "final catalog cursor does not match the requested query filters",
+        ));
+    }
+    if cursor.visibility_digest.as_deref() != expected_visibility_digest {
+        return Err(McpError::invalid_params(
+            "final catalog cursor does not match the requested session visibility",
         ));
     }
     let offset = usize::try_from(cursor.offset)
@@ -1531,6 +1545,7 @@ fn encode_final_catalog_cursor(
     revision: u64,
     query: &FinalCatalogQuery,
     offset: usize,
+    visibility_digest: Option<&str>,
 ) -> String {
     let offset = u64::try_from(offset).expect("usize cursor offsets always fit u64");
     let payload = FinalCatalogCursor {
@@ -1538,15 +1553,39 @@ fn encode_final_catalog_cursor(
         revision,
         query: query.clone(),
         offset,
+        visibility_digest: visibility_digest.map(str::to_owned),
     };
     let bytes = serde_json::to_vec(&payload).expect("final catalog cursor must serialize");
     BASE64_STANDARD.encode(bytes)
 }
 
-/// Pages an already-filtered final catalog snapshot.
+const MAX_CATALOG_VISIBILITY_DIGEST_BYTES: usize = 256 * 1024;
+
+fn catalog_visibility_digest<'a, I>(keys: I) -> McpResult<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut material = Vec::new();
+    for key in keys {
+        let bytes = key.as_bytes();
+        let len = u64::try_from(bytes.len()).map_err(|_| {
+            McpError::internal_error("catalog visibility key exceeds digest length encoding")
+        })?;
+        material.extend_from_slice(&len.to_le_bytes());
+        material.extend_from_slice(bytes);
+    }
+    let digest = sha256_bounded(&material, MAX_CATALOG_VISIBILITY_DIGEST_BYTES)
+        .map_err(|_| McpError::internal_error("catalog visibility digest input too large"))?;
+    Ok(BASE64_STANDARD.encode(digest.as_bytes()))
+}
+
+/// Pages an already-filtered catalog snapshot.
 ///
 /// Filtering must precede cursor arithmetic so a legacy-only or tag-filtered
 /// entry cannot create an empty modern page or shift a final peer's cursor.
+/// Exact-2024 session-disabled filtering additionally binds
+/// `visibility_digest` so a later disable cannot reuse an offset into a
+/// shorter snapshot.
 fn page_final_catalog<T: Clone>(
     items: Vec<T>,
     cursor: Option<&str>,
@@ -1554,16 +1593,49 @@ fn page_final_catalog<T: Clone>(
     catalog: FinalCatalogKind,
     revision: u64,
     query: &FinalCatalogQuery,
+    visibility_digest: Option<&str>,
 ) -> McpResult<(Vec<T>, Option<String>)> {
-    let offset = decode_final_catalog_cursor_offset(cursor, catalog, revision, query, items.len())?;
+    let offset = decode_final_catalog_cursor_offset(
+        cursor,
+        catalog,
+        revision,
+        query,
+        visibility_digest,
+        items.len(),
+    )?;
     let Some(page_size) = page_size else {
         return Ok((items, None));
     };
     let end = offset.saturating_add(page_size).min(items.len());
     Ok((
         items.get(offset..end).unwrap_or_default().to_vec(),
-        (end < items.len()).then(|| encode_final_catalog_cursor(catalog, revision, query, end)),
+        (end < items.len())
+            .then(|| encode_final_catalog_cursor(catalog, revision, query, end, visibility_digest)),
     ))
+}
+
+fn page_session_filtered_catalog<T: Clone>(
+    items: Vec<T>,
+    cursor: Option<&str>,
+    page_size: Option<usize>,
+    catalog: FinalCatalogKind,
+    revision: u64,
+    query: &FinalCatalogQuery,
+    bind_session_visibility: bool,
+    key: impl Fn(&T) -> &str,
+) -> McpResult<(Vec<T>, Option<String>)> {
+    let visibility_digest = bind_session_visibility
+        .then(|| catalog_visibility_digest(items.iter().map(key)))
+        .transpose()?;
+    page_final_catalog(
+        items,
+        cursor,
+        page_size,
+        catalog,
+        revision,
+        query,
+        visibility_digest.as_deref(),
+    )
 }
 
 const SANITIZED_HANDLER_PANIC_MESSAGE: &str = "Internal server error";
@@ -4522,13 +4594,15 @@ impl Router {
             params.include_tags.as_deref(),
             params.exclude_tags.as_deref(),
         );
-        let (tools, next_cursor) = page_final_catalog(
+        let (tools, next_cursor) = page_session_filtered_catalog(
             tools,
             params.cursor.as_deref(),
             Some(page_size),
             FinalCatalogKind::Tools,
             self.final_catalog_revision,
             &query,
+            session_state.is_some(),
+            |tool| tool.name.as_str(),
         )?;
         Ok(ListToolsResult { tools, next_cursor })
     }
@@ -4571,6 +4645,7 @@ impl Router {
             FinalCatalogKind::Tools,
             self.final_catalog_revision,
             &query,
+            None,
         )?;
         let result = ListToolsResult { tools, next_cursor };
         self.project_final_tools_list(request_ctx, result, self.final_cache_hints.clone())
@@ -4643,6 +4718,7 @@ impl Router {
             FinalCatalogKind::Resources,
             self.final_catalog_revision,
             &query,
+            None,
         )?;
         Ok(FinalListResourcesResult {
             resources,
@@ -4687,6 +4763,7 @@ impl Router {
             FinalCatalogKind::ResourceTemplates,
             self.final_catalog_revision,
             &query,
+            None,
         )?;
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
@@ -4726,6 +4803,7 @@ impl Router {
             FinalCatalogKind::Prompts,
             self.final_catalog_revision,
             &query,
+            None,
         )?;
         Ok(FinalListPromptsResult {
             prompts,
@@ -5105,13 +5183,15 @@ impl Router {
             params.include_tags.as_deref(),
             params.exclude_tags.as_deref(),
         );
-        let (resources, next_cursor) = page_final_catalog(
+        let (resources, next_cursor) = page_session_filtered_catalog(
             resources,
             params.cursor.as_deref(),
             Some(page_size),
             FinalCatalogKind::Resources,
             self.final_catalog_revision,
             &query,
+            session_state.is_some(),
+            |resource| resource.uri.as_str(),
         )?;
         Ok(ListResourcesResult {
             resources,
@@ -5151,13 +5231,15 @@ impl Router {
             params.include_tags.as_deref(),
             params.exclude_tags.as_deref(),
         );
-        let (resource_templates, next_cursor) = page_final_catalog(
+        let (resource_templates, next_cursor) = page_session_filtered_catalog(
             templates,
             params.cursor.as_deref(),
             Some(page_size),
             FinalCatalogKind::ResourceTemplates,
             self.final_catalog_revision,
             &query,
+            session_state.is_some(),
+            |template| template.uri_template.as_str(),
         )?;
         Ok(ListResourceTemplatesResult {
             resource_templates,
@@ -5446,13 +5528,15 @@ impl Router {
             params.include_tags.as_deref(),
             params.exclude_tags.as_deref(),
         );
-        let (prompts, next_cursor) = page_final_catalog(
+        let (prompts, next_cursor) = page_session_filtered_catalog(
             prompts,
             params.cursor.as_deref(),
             Some(page_size),
             FinalCatalogKind::Prompts,
             self.final_catalog_revision,
             &query,
+            session_state.is_some(),
+            |prompt| prompt.name.as_str(),
         )?;
         Ok(ListPromptsResult {
             prompts,
@@ -8564,7 +8648,7 @@ mod cursor_tests {
         let include_tags = vec!["Visible".to_owned(), "visible".to_owned()];
         let exclude_tags = vec!["excluded".to_owned()];
         let query = FinalCatalogQuery::from_tag_filters(Some(&include_tags), Some(&exclude_tags));
-        let cursor = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 7);
+        let cursor = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 7, None);
         let equivalent_include_tags = vec!["visible".to_owned()];
         let equivalent_query = FinalCatalogQuery::from_tag_filters(
             Some(&equivalent_include_tags),
@@ -8576,6 +8660,7 @@ mod cursor_tests {
                 FinalCatalogKind::Resources,
                 41,
                 &equivalent_query,
+                None,
                 8,
             )
             .expect("a final cursor accepts a semantically equivalent canonical query"),
@@ -8586,6 +8671,7 @@ mod cursor_tests {
             FinalCatalogKind::Resources,
             42,
             &query,
+            None,
             8,
         )
         .expect_err("changing only the catalog revision rejects a stale continuation");
@@ -8596,6 +8682,7 @@ mod cursor_tests {
             FinalCatalogKind::Prompts,
             41,
             &query,
+            None,
             8,
         )
         .expect_err("changing only the list method rejects a cross-catalog continuation");
@@ -8609,17 +8696,20 @@ mod cursor_tests {
             FinalCatalogKind::Resources,
             41,
             &other_query,
+            None,
             8,
         )
         .expect_err("changing only the request filters rejects the continuation");
         assert!(wrong_query.message.contains("query filters"));
 
-        let out_of_range = encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 8);
+        let out_of_range =
+            encode_final_catalog_cursor(FinalCatalogKind::Resources, 41, &query, 8, None);
         let range_error = decode_final_catalog_cursor_offset(
             Some(&out_of_range),
             FinalCatalogKind::Resources,
             41,
             &query,
+            None,
             8,
         )
         .expect_err("an offset at the end of a catalog is never a router-minted continuation");
@@ -8627,6 +8717,31 @@ mod cursor_tests {
             range_error
                 .message
                 .contains("outside the requested catalog page")
+        );
+
+        let visible =
+            encode_final_catalog_cursor(FinalCatalogKind::Tools, 41, &query, 0, Some("digest-a"));
+        let visibility_error = decode_final_catalog_cursor_offset(
+            Some(&visible),
+            FinalCatalogKind::Tools,
+            41,
+            &query,
+            Some("digest-b"),
+            2,
+        )
+        .expect_err("changing only session visibility rejects the continuation");
+        assert!(visibility_error.message.contains("session visibility"));
+        assert_eq!(
+            decode_final_catalog_cursor_offset(
+                Some(&visible),
+                FinalCatalogKind::Tools,
+                41,
+                &query,
+                Some("digest-a"),
+                2,
+            )
+            .expect("matching session visibility admits the continuation"),
+            0
         );
     }
 }
@@ -14678,6 +14793,66 @@ mod router_tests {
         assert_eq!(result.tools[0].name, "b");
     }
 
+    #[test]
+    fn handle_tools_list_cursor_rejects_changed_session_visibility() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router
+            .add_tool(NamedTool::new("a"))
+            .expect("tool registration succeeds");
+        router
+            .add_tool(NamedTool::new("b"))
+            .expect("tool registration succeeds");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = request_context(&cx, 1, Budget::INFINITE, &state);
+        let first = router
+            .handle_tools_list(
+                &request_ctx,
+                ListToolsParams {
+                    cursor: None,
+                    include_tags: None,
+                    exclude_tags: None,
+                },
+                Some(&state),
+            )
+            .expect("the first session-filtered page is admitted");
+        assert_eq!(first.tools[0].name, "a");
+        let cursor = first
+            .next_cursor
+            .expect("the first page has a continuation");
+
+        let continued = router
+            .handle_tools_list(
+                &request_ctx,
+                ListToolsParams {
+                    cursor: Some(cursor.clone()),
+                    include_tags: None,
+                    exclude_tags: None,
+                },
+                Some(&state),
+            )
+            .expect("unchanged session visibility continues the exact-2024 catalog");
+        assert_eq!(continued.tools[0].name, "b");
+        assert!(continued.next_cursor.is_none());
+
+        let disabled: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+        state.set("fastmcp.disabled_tools", &disabled);
+        let stale = router
+            .handle_tools_list(
+                &request_ctx,
+                ListToolsParams {
+                    cursor: Some(cursor),
+                    include_tags: None,
+                    exclude_tags: None,
+                },
+                Some(&state),
+            )
+            .expect_err("changing only session visibility rejects the continuation");
+        assert_eq!(stale.code, McpErrorCode::InvalidParams);
+        assert!(stale.message.contains("session visibility"));
+    }
+
     // ── handle_resources_list with tag filter ────────────────────────────
 
     #[test]
@@ -15059,6 +15234,7 @@ mod router_tests {
                 FinalCatalogKind::Tools,
                 router.final_catalog_revision,
                 &query,
+                None,
                 2,
             )
             .expect("cursor is router-generated for this exact final catalog revision"),
@@ -15131,6 +15307,7 @@ mod router_tests {
             router.final_catalog_revision,
             &query,
             0,
+            None,
         );
         let validated_full = router
             .dispatch_stateless(
@@ -15148,7 +15325,7 @@ mod router_tests {
             .checked_sub(1)
             .expect("registered tools advance the final catalog revision");
         let stale_cursor =
-            encode_final_catalog_cursor(FinalCatalogKind::Tools, stale_revision, &query, 0);
+            encode_final_catalog_cursor(FinalCatalogKind::Tools, stale_revision, &query, 0, None);
         let stale = router
             .dispatch_stateless(
                 &request_ctx,
@@ -15163,6 +15340,7 @@ mod router_tests {
             router.final_catalog_revision,
             &query,
             0,
+            None,
         );
         let wrong_kind = router
             .dispatch_stateless(
@@ -15180,6 +15358,7 @@ mod router_tests {
             router.final_catalog_revision,
             &other_query,
             0,
+            None,
         );
         let wrong_query = router
             .dispatch_stateless(
@@ -15195,6 +15374,7 @@ mod router_tests {
             router.final_catalog_revision,
             &query,
             2,
+            None,
         );
         let out_of_range = router
             .dispatch_stateless(
