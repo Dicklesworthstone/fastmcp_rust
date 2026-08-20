@@ -193,21 +193,27 @@ impl TransformedTool {
         for (original_name, transform) in &self.arg_transforms {
             let new_name = transform.name.as_ref().unwrap_or(original_name);
 
-            // Check if we have a value for this argument (using new name)
-            if let Some(value) = args.remove(new_name) {
-                // Use the provided value with original name
-                result.insert(original_name.clone(), value);
-            } else if let Some(default) = &transform.default {
-                // Use the default value
-                result.insert(original_name.clone(), default.clone());
-            } else if transform.hide {
-                // Hidden argument without default - error
+            if transform.hide {
+                // Hidden arguments are server-owned. A caller-supplied value
+                // under the published name or the original name must not
+                // override the configured default, and cannot substitute for
+                // a missing one.
+                args.remove(new_name);
+                args.remove(original_name);
+                if let Some(default) = &transform.default {
+                    result.insert(original_name.clone(), default.clone());
+                    continue;
+                }
                 return Err(fastmcp_core::McpError::invalid_params(format!(
-                    "Hidden argument '{}' requires a default value",
-                    original_name
+                    "Hidden argument '{original_name}' requires a default value"
                 )));
             }
-            // Otherwise, don't include (let the parent tool handle missing args)
+
+            if let Some(value) = args.remove(new_name) {
+                result.insert(original_name.clone(), value);
+            } else if let Some(default) = &transform.default {
+                result.insert(original_name.clone(), default.clone());
+            }
         }
 
         // Pass through any remaining arguments that weren't transformed
@@ -375,13 +381,17 @@ impl TransformedToolBuilder {
             return schema;
         };
 
-        // Ensure properties and required exist
-        // Note: Using String::from() with static str is optimized by the compiler
-        // but explicit owned strings are required for serde_json::Map keys
-        if !obj.contains_key("properties") {
+        // Ensure properties and required exist as the shapes later mutation
+        // expects. A parent tool may publish a non-object `properties` or
+        // non-array `required`; replacing those malformed members keeps
+        // `build()` from panicking on a definition the caller already owns.
+        if !obj
+            .get("properties")
+            .is_some_and(serde_json::Value::is_object)
+        {
             obj.insert(String::from("properties"), serde_json::json!({}));
         }
-        if !obj.contains_key("required") {
+        if !obj.get("required").is_some_and(serde_json::Value::is_array) {
             obj.insert(String::from("required"), serde_json::json!([]));
         }
 
@@ -395,7 +405,9 @@ impl TransformedToolBuilder {
 
         // First pass: collect property transformations
         {
-            let props = obj["properties"].as_object().unwrap();
+            let Some(props) = obj.get("properties").and_then(serde_json::Value::as_object) else {
+                return schema;
+            };
 
             for (original_name, transform) in &self.arg_transforms {
                 if transform.hide {
@@ -749,6 +761,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transform_arguments_hidden_default_ignores_caller_supplied_value() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool).hide_arg("n", 10).build();
+
+        let result = transformed
+            .transform_arguments(serde_json::json!({"q": "hello", "n": 999}))
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("q").unwrap(), "hello");
+        assert_eq!(
+            obj.get("n").unwrap(),
+            10,
+            "a hidden argument must keep its server default"
+        );
+    }
+
+    #[test]
+    fn transform_arguments_hidden_renamed_strips_both_published_and_original_names() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg(
+                "n",
+                ArgTransform::new().name("limit").default_int(10).hide(),
+            )
+            .build();
+
+        let result = transformed
+            .transform_arguments(serde_json::json!({
+                "q": "hello",
+                "n": 1,
+                "limit": 2
+            }))
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("q").unwrap(), "hello");
+        assert_eq!(obj.get("n").unwrap(), 10);
+        assert!(
+            obj.get("limit").is_none(),
+            "the unpublished hidden name must not leak into parent arguments"
+        );
+    }
+
+    #[test]
+    fn transform_arguments_hidden_without_default_rejects_caller_value() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("q", ArgTransform::new().hide())
+            .build();
+
+        let result = transformed.transform_arguments(serde_json::json!({"q": "injected"}));
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .contains("Hidden argument 'q' requires a default value")
+        );
+    }
+
     // ── ToolHandler impl ─────────────────────────────────────────────
 
     #[test]
@@ -853,6 +925,44 @@ mod tests {
     }
 
     // ── Schema transform: type override ──────────────────────────────
+
+    #[test]
+    fn transform_schema_replaces_malformed_properties_without_panicking() {
+        struct MalformedSchemaTool;
+        impl ToolHandler for MalformedSchemaTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "malformed".to_string(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": true,
+                        "required": "q"
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: vec![],
+                    annotations: None,
+                }
+            }
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![])
+            }
+        }
+
+        let transformed = TransformedTool::from_tool(MalformedSchemaTool)
+            .hide_arg("secret", "server-owned")
+            .build();
+        assert_eq!(
+            transformed.definition().input_schema["properties"],
+            serde_json::json!({})
+        );
+        assert_eq!(
+            transformed.definition().input_schema["required"],
+            serde_json::json!([])
+        );
+    }
 
     #[test]
     fn transform_schema_applies_type_override() {

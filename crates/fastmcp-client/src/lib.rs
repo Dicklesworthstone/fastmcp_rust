@@ -1108,6 +1108,31 @@ fn validate_subscription_acknowledgement(
     validate_subscription_acknowledgement_filter(requested, &acknowledgement.notifications)
 }
 
+/// Returns the acknowledgement's subscription ID when it is a well-formed
+/// JSON-RPC request identity.
+fn subscription_acknowledgement_request_id(
+    acknowledgement: &FinalSubscriptionsAcknowledgedNotificationParams,
+) -> Option<RequestId> {
+    acknowledgement
+        .meta
+        .as_ref()
+        .and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+/// True when this acknowledgement carries a different listen-request identity.
+///
+/// Incremental catalog and Tasks listeners share one notification queue. A
+/// well-formed ack for the other listener must stay on the queue; treating it
+/// as a protocol failure (or dropping it) steals the other listener's ack.
+fn subscription_acknowledgement_is_foreign(
+    expected_id: &RequestId,
+    acknowledgement: &FinalSubscriptionsAcknowledgedNotificationParams,
+) -> bool {
+    subscription_acknowledgement_request_id(acknowledgement)
+        .is_some_and(|subscription_id| !subscription_id.correlates_with(expected_id))
+}
+
 fn catalog_subscription_requested(filter: &SubscriptionFilter) -> bool {
     filter.tools_list_changed == Some(true)
         || filter.resources_list_changed == Some(true)
@@ -7391,6 +7416,15 @@ where
             };
             match notification {
                 ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                    if subscription_acknowledgement_is_foreign(
+                        &subscription.request_id,
+                        &acknowledgement,
+                    ) {
+                        remainder.push_back(ServerNotification::SubscriptionsAcknowledged(
+                            acknowledgement,
+                        ));
+                        continue;
+                    }
                     if subscription.accepted_filter.is_some() {
                         harvest_error = Some(subscription_listener_protocol_error(
                             "Subscription listener received a duplicate acknowledgement",
@@ -7831,6 +7865,15 @@ where
             };
             match notification {
                 ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                    if subscription_acknowledgement_is_foreign(
+                        &subscription.request_id,
+                        &acknowledgement,
+                    ) {
+                        remainder.push_back(ServerNotification::SubscriptionsAcknowledged(
+                            acknowledgement,
+                        ));
+                        continue;
+                    }
                     if subscription.accepted_filter.is_some() {
                         harvest_error = Some(subscription_listener_protocol_error(
                             "Subscription listener received a duplicate acknowledgement",
@@ -19828,6 +19871,15 @@ impl Client {
             };
             match notification {
                 ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
+                    if subscription_acknowledgement_is_foreign(
+                        subscription.execution.request_id(),
+                        &acknowledgement,
+                    ) {
+                        remainder.push_back(ServerNotification::SubscriptionsAcknowledged(
+                            acknowledgement,
+                        ));
+                        continue;
+                    }
                     if subscription.accepted_filter.is_some() {
                         harvest_error = Some(subscription_listener_protocol_error(
                             "Subscription listener received a duplicate acknowledgement",
@@ -20577,6 +20629,45 @@ mod tests {
     use super::*;
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
+
+    fn acknowledgement_with_subscription_id(
+        id: RequestId,
+    ) -> FinalSubscriptionsAcknowledgedNotificationParams {
+        let meta = OpenMetadata::try_from_notification_entries([(
+            FINAL_SUBSCRIPTION_ID_META_KEY.to_owned(),
+            serde_json::to_value(id).expect("request id serializes"),
+        )])
+        .expect("subscription acknowledgement metadata is valid");
+        FinalSubscriptionsAcknowledgedNotificationParams {
+            notifications: SubscriptionFilter::default(),
+            meta: Some(meta),
+            additional: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn foreign_subscription_acknowledgement_is_left_on_the_shared_queue() {
+        let catalog_id = RequestId::Number(1);
+        let tasks_id = RequestId::Number(2);
+        let tasks_ack = acknowledgement_with_subscription_id(tasks_id.clone());
+        assert!(
+            subscription_acknowledgement_is_foreign(&catalog_id, &tasks_ack),
+            "a Tasks acknowledgement must not be consumed by the catalog harvester"
+        );
+        assert!(
+            !subscription_acknowledgement_is_foreign(&tasks_id, &tasks_ack),
+            "the owning Tasks harvester must still admit its own acknowledgement"
+        );
+        let missing_id = FinalSubscriptionsAcknowledgedNotificationParams {
+            notifications: SubscriptionFilter::default(),
+            meta: None,
+            additional: BTreeMap::new(),
+        };
+        assert!(
+            !subscription_acknowledgement_is_foreign(&catalog_id, &missing_id),
+            "a missing subscription ID remains a protocol error for the active harvester"
+        );
+    }
     #[cfg(feature = "websocket-experimental")]
     use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
     #[cfg(feature = "websocket-experimental")]
@@ -30279,7 +30370,6 @@ mod tests {
         assert!(formatted.contains("data_extent=small"));
     }
 
-    #[test]
     #[test]
     fn insert_final_request_log_level_stamps_only_when_configured() {
         let mut metadata = serde_json::Map::new();

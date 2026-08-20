@@ -1109,10 +1109,9 @@ impl ServerBuilder {
             || self.on_duplicate == DuplicateBehavior::Replace
     }
 
-    /// Skips one colliding prefixed catalog member under
-    /// [`DuplicateBehavior::Error`]. Other admission failures still fail the
-    /// `as_proxy_typed` install so a schema or metadata defect is not logged
-    /// away as a duplicate skip.
+    /// Skips one colliding catalog member under [`DuplicateBehavior::Error`].
+    /// Other admission failures still fail `proxy` / `as_proxy_typed` so a
+    /// schema or metadata defect is not logged away as a duplicate skip.
     #[cfg(feature = "proxy")]
     fn absorb_prefixed_proxy_duplicate(
         error: fastmcp_core::McpError,
@@ -1225,6 +1224,7 @@ impl ServerBuilder {
                     "Failed to register proxied tool; code={:?}",
                     error.code
                 );
+                Self::absorb_prefixed_proxy_duplicate(error)?;
             }
         }
 
@@ -1240,6 +1240,7 @@ impl ServerBuilder {
                         "Failed to register exact-final proxied tool; code={:?}",
                         error.code
                     );
+                    Self::absorb_prefixed_proxy_duplicate(error)?;
                 }
             }
         }
@@ -1254,6 +1255,7 @@ impl ServerBuilder {
                     "Failed to register proxied resource; code={:?}",
                     error.code
                 );
+                Self::absorb_prefixed_proxy_duplicate(error)?;
             }
         }
 
@@ -1285,6 +1287,7 @@ impl ServerBuilder {
                         "Failed to register proxied resource template; code={:?}",
                         error.code
                     );
+                    Self::absorb_prefixed_proxy_duplicate(error)?;
                 }
             }
         }
@@ -1316,6 +1319,7 @@ impl ServerBuilder {
                         "Failed to register proxied prompt; code={:?}",
                         error.code
                     );
+                    Self::absorb_prefixed_proxy_duplicate(error)?;
                 }
             }
         }
@@ -1330,6 +1334,7 @@ impl ServerBuilder {
                     "Failed to register exact-final proxied resource; code={:?}",
                     error.code
                 );
+                Self::absorb_prefixed_proxy_duplicate(error)?;
             }
         }
 
@@ -1363,6 +1368,7 @@ impl ServerBuilder {
                         "Failed to register exact-final proxied resource template; code={:?}",
                         error.code
                     );
+                    Self::absorb_prefixed_proxy_duplicate(error)?;
                 }
             }
         }
@@ -1396,6 +1402,7 @@ impl ServerBuilder {
                         "Failed to register exact-final proxied prompt; code={:?}",
                         error.code
                     );
+                    Self::absorb_prefixed_proxy_duplicate(error)?;
                 }
             }
         }
@@ -7116,13 +7123,13 @@ mod tests {
             fastmcp_core::McpError::invalid_request("Tool already exists; component_key=tool_key");
         assert!(
             ServerBuilder::absorb_prefixed_proxy_duplicate(duplicate).is_ok(),
-            "a colliding prefixed catalog member may skip under DuplicateBehavior::Error"
+            "a colliding catalog member may skip under DuplicateBehavior::Error"
         );
         let panicked =
             fastmcp_core::McpError::internal_error("tool metadata hook panicked during admission");
         assert!(
             ServerBuilder::absorb_prefixed_proxy_duplicate(panicked).is_err(),
-            "a non-duplicate admission failure must fail the as_proxy_typed install"
+            "a non-duplicate admission failure must fail the proxy / as_proxy_typed install"
         );
         let apps = fastmcp_core::McpError::invalid_request(
             "MCP Apps tool metadata requires ServerBuilder::mcp_apps_tool",

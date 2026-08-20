@@ -2757,8 +2757,8 @@ impl ProxyBackend for Client {
     ) -> McpResult<CoreResult> {
         let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
         let expected_marker = ctx_progress_marker(ctx);
-        if let Some(marker) = expected_marker.as_ref() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         parameters = stdio_parameters_with_inbound_identity(
             self.selected_protocol_era(),
@@ -2805,8 +2805,8 @@ impl ProxyBackend for Client {
     ) -> McpResult<CoreResult> {
         let mut parameters = serde_json::json!({"uri": uri});
         let expected_marker = ctx_progress_marker(ctx);
-        if let Some(marker) = expected_marker.as_ref() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         parameters = stdio_parameters_with_inbound_identity(
             self.selected_protocol_era(),
@@ -2855,8 +2855,8 @@ impl ProxyBackend for Client {
     ) -> McpResult<CoreResult> {
         let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
         let expected_marker = ctx_progress_marker(ctx);
-        if let Some(marker) = expected_marker.as_ref() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         parameters = stdio_parameters_with_inbound_identity(
             self.selected_protocol_era(),
@@ -5260,7 +5260,7 @@ impl ProxyBackend for ProxyHttpClient {
     ) -> McpResult<CoreResult> {
         let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
         if let Some(marker) = ctx.progress_marker() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         self.request_result_with_context_and_final_progress(
             Some(ctx),
@@ -5279,8 +5279,8 @@ impl ProxyBackend for ProxyHttpClient {
     ) -> McpResult<CoreResult> {
         let progress_marker = ctx_progress_marker(ctx);
         let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
-        if let Some(marker) = progress_marker.as_ref() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         let result = self.request_result_with_context(
             ctx,
@@ -5337,7 +5337,7 @@ impl ProxyBackend for ProxyHttpClient {
     ) -> McpResult<CoreResult> {
         let mut parameters = serde_json::json!({"uri": uri});
         if let Some(marker) = ctx.progress_marker() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         self.request_result_with_context_and_final_progress(
             Some(ctx),
@@ -5369,7 +5369,7 @@ impl ProxyBackend for ProxyHttpClient {
     ) -> McpResult<CoreResult> {
         let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
         if let Some(marker) = ctx.progress_marker() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         self.request_result_with_context_and_final_progress(
             Some(ctx),
