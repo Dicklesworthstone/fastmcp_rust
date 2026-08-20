@@ -1925,6 +1925,21 @@ fn implementation_has_extras(implementation: &Implementation) -> bool {
         || !implementation.icons.is_empty()
 }
 
+/// Maps a gateway resource URI onto the upstream URI for exact-2024 subscribe.
+///
+/// Prefixed proxy catalogs expose `{prefix}/{upstream}` where `upstream`
+/// contains `://`. A nested prefix such as `tenant/remote` must not be
+/// peeled with `split_once('/')`, which would leave `remote/db://orders`.
+fn proxy_upstream_resource_uri(inbound_uri: &str) -> &str {
+    let Some(scheme_sep) = inbound_uri.find("://") else {
+        return inbound_uri;
+    };
+    match inbound_uri[..scheme_sep].rfind('/') {
+        Some(slash) => &inbound_uri[slash + 1..],
+        None => inbound_uri,
+    }
+}
+
 fn overlay_legacy_progress_token(
     parameters: &mut serde_json::Value,
     marker: &serde_json::Value,
@@ -7133,6 +7148,14 @@ impl ProxyClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn subscription_rewrites_for_test(&self) -> HashMap<String, String> {
+        self.subscription_rewrites
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     /// Creates a proxy client for one already-selected upstream route.
     ///
     /// The exact upstream version is admitted before the backend can enter an
@@ -7405,11 +7428,7 @@ impl ProxyClient {
         if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
             return Ok(());
         }
-        let upstream_uri = inbound_uri
-            .split_once('/')
-            .filter(|(prefix, rest)| !prefix.is_empty() && rest.contains("://"))
-            .map(|(_, rest)| rest)
-            .unwrap_or(inbound_uri);
+        let upstream_uri = proxy_upstream_resource_uri(inbound_uri);
         self.with_backend(|backend| backend.subscribe_resource(upstream_uri))?;
         self.subscription_rewrites
             .lock()
@@ -7424,11 +7443,7 @@ impl ProxyClient {
         if self.upstream_binding.map(|binding| binding.era()) == Some(ProtocolEra::Modern2026) {
             return Ok(());
         }
-        let upstream_uri = inbound_uri
-            .split_once('/')
-            .filter(|(prefix, rest)| !prefix.is_empty() && rest.contains("://"))
-            .map(|(_, rest)| rest)
-            .unwrap_or(inbound_uri);
+        let upstream_uri = proxy_upstream_resource_uri(inbound_uri);
         self.with_backend(|backend| backend.unsubscribe_resource(upstream_uri))?;
         self.subscription_rewrites
             .lock()
@@ -8958,12 +8973,13 @@ impl ResourceHandler for ProxyResourceHandler {
     }
 
     fn on_subscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
-        self.client.subscribe_resource(ctx, self.upstream_uri(uri))
+        // Keep the inbound gateway URI so `resources/updated` can be
+        // republished under the prefixed catalog name.
+        self.client.subscribe_resource(ctx, uri)
     }
 
     fn on_unsubscribe(&self, ctx: &McpContext, uri: &str) -> McpResult<()> {
-        self.client
-            .unsubscribe_resource(ctx, self.upstream_uri(uri))
+        self.client.unsubscribe_resource(ctx, uri)
     }
 
     fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
@@ -16325,6 +16341,31 @@ exec sleep 2
     }
 
     #[test]
+    fn proxy_upstream_resource_uri_strips_nested_prefix_before_scheme() {
+        assert_eq!(
+            super::proxy_upstream_resource_uri("tenant/remote/db://orders"),
+            "db://orders"
+        );
+        assert_eq!(
+            super::proxy_upstream_resource_uri("ext/file://docs/readme"),
+            "file://docs/readme"
+        );
+        assert_eq!(
+            super::proxy_upstream_resource_uri("file://docs/readme"),
+            "file://docs/readme"
+        );
+        assert_eq!(
+            super::proxy_upstream_resource_uri("no-scheme/path"),
+            "no-scheme/path"
+        );
+        assert_ne!(
+            super::proxy_upstream_resource_uri("tenant/remote/db://orders"),
+            "remote/db://orders",
+            "split_once('/') would leave the rest of a nested prefix on the upstream URI"
+        );
+    }
+
+    #[test]
     fn proxy_resource_handler_subscribe_strips_nested_prefix() {
         use super::ProxyResourceHandler;
         use crate::handler::ResourceHandler;
@@ -16342,13 +16383,24 @@ exec sleep 2
             version: None,
             tags: vec![],
         };
-        let handler =
-            ProxyResourceHandler::from_template_with_prefix(template, "tenant/remote", proxy);
+        let handler = ProxyResourceHandler::from_template_with_prefix(
+            template,
+            "tenant/remote",
+            proxy.clone(),
+        );
 
         let ctx = McpContext::new(Cx::for_testing(), 1);
         handler
             .on_subscribe(&ctx, "tenant/remote/db://orders")
             .expect("prefixed subscribe must reach the upstream URI");
+        assert_eq!(
+            proxy
+                .subscription_rewrites_for_test()
+                .get("db://orders")
+                .map(String::as_str),
+            Some("tenant/remote/db://orders"),
+            "resources/updated must republish the inbound prefixed URI"
+        );
         handler
             .on_unsubscribe(&ctx, "tenant/remote/db://orders")
             .expect("prefixed unsubscribe must reach the upstream URI");
@@ -16368,6 +16420,13 @@ exec sleep 2
             recorded.last_subscribe.as_deref(),
             Some("remote/db://orders"),
             "split_once('/') would leave the rest of a nested prefix on the upstream URI"
+        );
+        assert!(
+            proxy
+                .subscription_rewrites_for_test()
+                .get("db://orders")
+                .is_none(),
+            "unsubscribe must drop the inbound rewrite"
         );
     }
 
