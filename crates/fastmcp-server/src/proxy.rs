@@ -7471,7 +7471,9 @@ impl ProxyClient {
             .map_err(|_| McpError::internal_error("Proxy subscription rewrite lock poisoned"))?;
         for uri in drained.updated_uris {
             let _ = ctx.notify_resource_updated(&uri);
-            if let Some(downstream) = rewrites.get(&uri) {
+            if let Some(downstream) = rewrites.get(&uri)
+                && downstream != &uri
+            {
                 let _ = ctx.notify_resource_updated(downstream);
             }
         }
@@ -10999,6 +11001,7 @@ mod tests {
         state: Arc<Mutex<TestState>>,
         cancel_after_tool: Option<McpRequestCancellation>,
         legacy_progress: Option<(f64, Option<f64>, Option<String>)>,
+        pending_updated_uris: Vec<String>,
     }
 
     impl ProxyBackend for TestBackend {
@@ -11093,6 +11096,15 @@ mod tests {
                 .last_unsubscribe
                 .replace(uri.to_string());
             Ok(())
+        }
+
+        fn take_legacy_peer_notifications(
+            &mut self,
+        ) -> fastmcp_core::McpResult<super::ProxyLegacyPeerNotifications> {
+            Ok(super::ProxyLegacyPeerNotifications {
+                updated_uris: std::mem::take(&mut self.pending_updated_uris),
+                ..super::ProxyLegacyPeerNotifications::default()
+            })
         }
 
         fn get_prompt(
@@ -16427,6 +16439,106 @@ exec sleep 2
                 .get("db://orders")
                 .is_none(),
             "unsubscribe must drop the inbound rewrite"
+        );
+    }
+
+    struct ResourceUpdateCapture(Mutex<Vec<String>>);
+
+    impl fastmcp_core::NotificationSender for ResourceUpdateCapture {
+        fn send_progress(&self, _progress: f64, _total: Option<f64>, _message: Option<&str>) {}
+
+        fn send_resource_updated(&self, uri: &str) {
+            self.0
+                .lock()
+                .expect("update capture is not poisoned")
+                .push(uri.to_owned());
+        }
+    }
+
+    #[test]
+    fn unprefixed_resource_updated_is_not_delivered_twice() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+
+        let backend = TestBackend {
+            pending_updated_uris: vec!["file://watched".to_owned()],
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyResourceHandler::new(
+            Resource {
+                uri: "file://watched".to_owned(),
+                name: "watched".to_owned(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            proxy.clone(),
+        );
+        let captured = Arc::new(ResourceUpdateCapture(Mutex::new(Vec::new())));
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_log_sender(Arc::clone(&captured) as Arc<dyn fastmcp_core::NotificationSender>)
+            .with_resource_subscriptions(["file://watched"]);
+        handler
+            .on_subscribe(&ctx, "file://watched")
+            .expect("unprefixed subscribe is admitted");
+        proxy
+            .relay_resource_updated_notifications(&ctx)
+            .expect("relayed updates are delivered");
+        assert_eq!(
+            captured
+                .0
+                .lock()
+                .expect("update capture is not poisoned")
+                .as_slice(),
+            ["file://watched"],
+            "an identity rewrite must not emit a second resources/updated"
+        );
+    }
+
+    #[test]
+    fn prefixed_resource_updated_republishes_inbound_uri() {
+        use super::ProxyResourceHandler;
+        use crate::handler::ResourceHandler;
+
+        let backend = TestBackend {
+            pending_updated_uris: vec!["file://watched".to_owned()],
+            ..TestBackend::default()
+        };
+        let proxy = ProxyClient::from_backend(backend);
+        let handler = ProxyResourceHandler::with_prefix(
+            Resource {
+                uri: "file://watched".to_owned(),
+                name: "watched".to_owned(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            },
+            "ext",
+            proxy.clone(),
+        );
+        let captured = Arc::new(ResourceUpdateCapture(Mutex::new(Vec::new())));
+        let ctx = McpContext::new(Cx::for_testing(), 1)
+            .with_log_sender(Arc::clone(&captured) as Arc<dyn fastmcp_core::NotificationSender>)
+            .with_resource_subscriptions(["ext/file://watched"]);
+        handler
+            .on_subscribe(&ctx, "ext/file://watched")
+            .expect("prefixed subscribe is admitted");
+        proxy
+            .relay_resource_updated_notifications(&ctx)
+            .expect("relayed updates are delivered");
+        assert_eq!(
+            captured
+                .0
+                .lock()
+                .expect("update capture is not poisoned")
+                .as_slice(),
+            ["ext/file://watched"],
+            "a distinct inbound rewrite must republish the gateway URI once"
         );
     }
 
