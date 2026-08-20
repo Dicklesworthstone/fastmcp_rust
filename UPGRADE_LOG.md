@@ -1,5 +1,58 @@
 # Dependency Upgrade Log
 
+**Date:** 2026-08-20  |  **Project:** fastmcp_rust  |  **Language:** Rust
+
+## Summary
+- **Updated:** 3  |  **Skipped:** remaining exact pins already latest stable; frankensqlite / frankensearch / franken_networkx are not direct deps  |  **Failed:** 0  |  **Needs attention:** FND-01 evidence re-attest
+
+## Updates
+
+### asupersync: 0.4.8 → 0.4.9
+- **Breaking:** None. Changelog states 0.4.9 preserves the v0.4.3 public floor (additive APIs only).
+- **Notes:** `RuntimeHandle::request_cx_with_budget`, `Cx::with_blocking_pool_handle`, SQLite cancel/row-metadata correctness, owned-OTLP mapping. Transitive `franken-kernel` / `franken-evidence` / `franken-decision` / `asupersync-macros` 0.4.9.
+- **Tests:** `cargo check --workspace --all-targets --locked` green on
+  `nightly-2026-08-20` / rustc 1.100.0-nightly.
+
+### cap-std / cap-fs-ext: 4.0.2 → 4.0.3
+- **Breaking:** None expected (patch).
+- **Notes:** Filesystem resource provider capability-fs handles.
+- **Tests:** included in the same locked workspace `cargo check`.
+
+## Skipped (already latest stable)
+
+Queried crates.io `max_stable_version` on 2026-08-20:
+
+rich_rust 0.2.3, rustix 1.1.4, serde 1.0.229, serde_json 1.0.151, serde_yaml 0.9.34, log 0.4.33, base64 0.23.1, semver 1.0.28, flate2 1.1.9, chrono 0.4.45, notify 8.2.0, glob 0.3.4, console 0.16.4, toml 1.1.4, dirs 6.0.0, url 2.5.8, getrandom 0.4.3, sha2 0.11.0, hmac 0.13.0, zeroize 1.9.0, ring 0.17.14, proc-macro2 1.0.107, proc-macro-crate 3.5.0, regex 1.13.1, clap 4.6.6, trybuild 1.0.120, html5ever 0.39.0, argon2 0.5.3, redis 1.6.0, time 0.3.55, syn 3.0.3.
+
+serde_yaml `0.9.34+deprecated` and toml `1.1.4+spec-1.1.0` are the same versions with registry metadata suffixes.
+
+frankensqlite (`fsqlite` 0.3.7), frankensearch (crates.io 0.3.2 / git v1.6.0), and franken_networkx are **not** direct FastMCP dependencies; they are not added to the graph.
+
+## Skipped (not stable)
+
+- notify 9.0.0-rc.4 — RC only; stay on 8.2.0
+- argon2 0.6.0-rc.8 — RC only; stay on 0.5.3
+
+## Toolchain
+
+- rust-toolchain.toml `nightly-2026-08-19` → `nightly-2026-08-20` / rustc 1.100.0-nightly
+- workspace `rust-version` stays `1.100`
+- Dated pin kept (not floating `nightly`) for reproducible DSR/RCH builds
+
+## Needs Attention
+
+### FND-01 evidence harness
+- **Issue:** `crates/fastmcp/tests/fnd_01_dependency_evidence.rs` and `evidence/fnd-01/*` still freeze `nightly-2026-07-11` / earlier workspace versions. Rewriting hashes without re-running the producer would be fake attestation.
+- **Action:** Test binary remains behind `testing-lab`. FND-01 remains unverified and unclaimed.
+
+## Workspace version
+
+- 0.6.0 → 0.7.0 (pre-1.0 minor bump: product remainder fixes + franken pin bump)
+
+---
+
+# Prior log (2026-08-18)
+
 **Date:** 2026-08-18  |  **Project:** fastmcp_rust  |  **Language:** Rust
 
 ## Summary

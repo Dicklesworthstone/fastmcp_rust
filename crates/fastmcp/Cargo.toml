@@ -116,7 +116,7 @@ name = "fnd_01_dependency_evidence"
 path = "tests/fnd_01_dependency_evidence.rs"
 # Frozen FND-01 attestation still records nightly-2026-07-11 / workspace 0.5.0.
 # Re-run the producer after a dedicated FND-01 re-attest. This binary is not
-# part of the default 0.6.0 product test gate.
+# part of the default 0.7.0 product test gate.
 required-features = ["testing-lab"]
 
 [[test]]

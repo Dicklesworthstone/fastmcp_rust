@@ -13,11 +13,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 license = "MIT"
 # Cargo lower-bound check only; the supported compiler is the dated nightly
-# pinned in rust-toolchain.toml (nightly-2026-08-19 / rustc 1.100.0-nightly).
+# pinned in rust-toolchain.toml (nightly-2026-08-20 / rustc 1.100.0-nightly).
 rust-version = "1.100"
 repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
 homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"
@@ -27,10 +27,10 @@ readme = "README.md"
 # Runtime (our own).  Production surfaces use runtime-installed ambient
 # contexts; test-only constructors remain opt-in at the test or facade-lab
 # boundary and must not leak into the workspace production graph.
-# =0.4.8 (was =0.4.5): latest crates.io patch on the v0.4.3 public floor.
-# 0.4.6–0.4.8 are internal correctness/HTTP OWS/timer/cancel fixes; no public
-# item was removed or renamed.
-asupersync = { version = "=0.4.8" }
+# =0.4.9 (was =0.4.8): latest crates.io patch on the v0.4.3 public floor.
+# Additive RuntimeHandle request-Cx / blocking-pool APIs, SQLite cancel
+# correctness, and owned-OTLP mapping. No public item was removed or renamed.
+asupersync = { version = "=0.4.9" }
 rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
@@ -83,8 +83,8 @@ proc-macro-crate = { version = "=3.5.0" }
 # Capability-relative filesystem access.  Keep this surface exact: built-in
 # filesystem resources must traverse and open beneath retained directory
 # handles instead of validating a pathname and reopening it later.
-cap-std = { version = "=4.0.2", default-features = false }
-cap-fs-ext = { version = "=4.0.2", default-features = false, features = ["std"] }
+cap-std = { version = "=4.0.3", default-features = false }
+cap-fs-ext = { version = "=4.0.3", default-features = false, features = ["std"] }
 
 # Regex (JSON Schema `pattern` validation)
 regex = { version = "=1.13.1" }
@@ -96,15 +96,15 @@ clap = { version = "=4.6.6", features = ["derive", "env", "wrap_help"] }
 trybuild = { version = "=1.0.120", default-features = false }
 
 # Internal crates
-fastmcp-rust = { version = "0.6.0", path = "crates/fastmcp" }
-fastmcp-core = { version = "0.6.0", path = "crates/fastmcp-core" }
-fastmcp-transport = { version = "0.6.0", path = "crates/fastmcp-transport" }
-fastmcp-protocol = { version = "0.6.0", path = "crates/fastmcp-protocol" }
-fastmcp-server = { version = "0.6.0", path = "crates/fastmcp-server", default-features = false }
-fastmcp-client = { version = "0.6.0", path = "crates/fastmcp-client", default-features = false }
-fastmcp-derive = { version = "0.6.0", path = "crates/fastmcp-macros" }
-fastmcp-console = { version = "0.6.0", path = "crates/fastmcp-console" }
-fastmcp-cli = { version = "0.6.0", path = "crates/fastmcp-cli" }
+fastmcp-rust = { version = "0.7.0", path = "crates/fastmcp" }
+fastmcp-core = { version = "0.7.0", path = "crates/fastmcp-core" }
+fastmcp-transport = { version = "0.7.0", path = "crates/fastmcp-transport" }
+fastmcp-protocol = { version = "0.7.0", path = "crates/fastmcp-protocol" }
+fastmcp-server = { version = "0.7.0", path = "crates/fastmcp-server", default-features = false }
+fastmcp-client = { version = "0.7.0", path = "crates/fastmcp-client", default-features = false }
+fastmcp-derive = { version = "0.7.0", path = "crates/fastmcp-macros" }
+fastmcp-console = { version = "0.7.0", path = "crates/fastmcp-console" }
+fastmcp-cli = { version = "0.7.0", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

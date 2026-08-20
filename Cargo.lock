@@ -198,9 +198,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync"
-version = "0.4.8"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09c1e1074282fa940bdf764abce64e27df4ca174dd75394cb5057dbecb12bc7e"
+checksum = "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd"
 dependencies = [
  "aes-gcm",
  "asupersync-macros",
@@ -260,9 +260,9 @@ dependencies = [
 
 [[package]]
 name = "asupersync-macros"
-version = "0.4.8"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f4f29305f8315ffcf3c1b8eb10b5b63a4df452a319987857a31a93dccec4979"
+checksum = "1a14f9f162d8418e4e347f4965f42f41ca970f8e81be496e04ab4f79c94818c8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -402,9 +402,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cap-fs-ext"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b"
+checksum = "56ff379b70af8e08307a8f65e7040c7301cb4a572538ade16b4984f0da77847f"
 dependencies = [
  "cap-primitives",
  "cap-std",
@@ -414,9 +414,9 @@ dependencies = [
 
 [[package]]
 name = "cap-primitives"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdadbd7c002d3a484b35243669abdae85a0ebaded5a61117169dc3400f9a7ff0"
+checksum = "8b5f74729fd2f44701d1a8eb47e906cdb3ccd9ec0f02baad85a744b791940b18"
 dependencies = [
  "ambient-authority",
  "fs-set-times",
@@ -432,9 +432,9 @@ dependencies = [
 
 [[package]]
 name = "cap-std"
-version = "4.0.2"
+version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7281235d6e96d3544ca18bba9049be92f4190f8d923e3caef1b5f66cfa752608"
+checksum = "c1ec78e242cfa2cfe276807ac2ecc00315a6c97786977414bcd1c3963b6c91b8"
 dependencies = [
  "cap-primitives",
  "io-extras",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-cli"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "asupersync",
  "chrono",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-client"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "asupersync",
  "dirs",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-console"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "fastmcp-core",
  "fastmcp-protocol",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "asupersync",
  "getrandom 0.4.3",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-derive"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "fastmcp-protocol",
  "proc-macro-crate",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-protocol"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "base64 0.23.1",
  "fastmcp-core",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-rust"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "asupersync",
  "fastmcp-client",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "argon2",
  "asupersync",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "fastmcp-transport"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "asupersync",
  "fastmcp-core",
@@ -1166,9 +1166,9 @@ dependencies = [
 
 [[package]]
 name = "franken-decision"
-version = "0.4.8"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05393f3315f8f591e2c21dfb588c7b4e498dca6f468fd92d30e4d571894a5d4"
+checksum = "e3645a3f60a4e63b19feac3121871cd5599fe46a10c4e90cabaee9fd6d27a030"
 dependencies = [
  "franken-evidence",
  "franken-kernel",
@@ -1177,9 +1177,9 @@ dependencies = [
 
 [[package]]
 name = "franken-evidence"
-version = "0.4.8"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "688b703269d0bd5b2199dc0c298643e2023a5500e5086f83c5628a13711c0e5e"
+checksum = "ad9d4f7ad2461e03e792809d98c9f02dc816ab3b3766493a0b0bf6a07d7effc0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1187,9 +1187,9 @@ dependencies = [
 
 [[package]]
 name = "franken-kernel"
-version = "0.4.8"
+version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1195d41283c0cf04931700acd080f9c7c938c51335a262c6acdff380abd6f0af"
+checksum = "92263c58ff55e6f171441ce40efb70ed26a2588d38a793435f2aeef456246696"
 dependencies = [
  "serde",
 ]

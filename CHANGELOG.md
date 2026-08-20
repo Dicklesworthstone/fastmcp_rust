@@ -6,13 +6,58 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.6.0)
+## [Unreleased] (after v0.7.0)
+
+_No unreleased changes._
+
+---
+
+## [v0.7.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.7.0) -- 2026-08-20 (GitHub Release)
+
+Product + maintenance release (pre-1.0 minor bump). Workspace crates move to
+0.7.0. This does **not** claim aggregate MCP 2026-07-28 conformance, FND-01
+freeze, or GATE-ALL-MCP-READY.
+
+### Toolchain
+
+- **Dated nightly** -- `rust-toolchain.toml` moves from `nightly-2026-08-19`
+  to `nightly-2026-08-20` / rustc 1.100.0-nightly. Workspace `rust-version`
+  stays `1.100`. The last FND-01 evidence snapshot still records
+  `nightly-2026-07-11` until that harness is re-attested.
+
+### Dependencies
+
+- **asupersync** `=0.4.8` → `=0.4.9` -- latest crates.io patch on the v0.4.3
+  public compatibility floor (additive `RuntimeHandle` request-Cx / blocking-pool
+  APIs, SQLite cancel correctness, owned-OTLP mapping). No public item was
+  removed or renamed. Transitive FrankenSuite crates (`franken-kernel`,
+  `franken-evidence`, `franken-decision`, `asupersync-macros`) move with it.
+- **cap-std / cap-fs-ext** `=4.0.2` → `=4.0.3` -- latest capability-fs patch
+  used by the filesystem resource provider.
+- **rich_rust** stays `=0.2.3` (already latest stable). FastMCP does not
+  directly depend on frankensqlite, frankensearch, or franken_networkx.
+- All other direct exact pins remain latest stable (notify 9 / argon2 0.6
+  remain RC-only and were not taken).
+
+### Server / proxy product fixes
 
 - **as_proxy WebSocket completions advertise/omit** -- live `bind_websocket`
-  as_proxy_typed now has the same initialize advertise/omit split as HTTP and
-  stdio for both modern and exact-2024. A proxied completion provider advertises
-  `completions` and still completes the template; a counting upstream omits the
-  capability and refuses complete. (`bd-campaign-product-remainder-2t3gf.10`)
+  as_proxy_typed has the same initialize advertise/omit split as HTTP and
+  stdio. (`bd-campaign-product-remainder-2t3gf.10`, [`0f0a5bf`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/0f0a5bf))
+- **Prefixed subscribe / resource updates** -- mounted and as_proxy subscribe
+  rewrite inbound URIs; nested prefixes strip at `://` rather than
+  `split_once('/')`; identity rewrites no longer double-deliver
+  `resources/updated`. ([`41cbf0e`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/41cbf0e), [`af9c0b0`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/af9c0b0), [`c99f71e`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c99f71e))
+- **TransformedTool final hooks** -- rename/hide wrappers forward timeout,
+  exact final catalog, MRTR resume, and `call_final` instead of promoting
+  legacy `call()`. ([`29c4fb9`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/29c4fb9))
+- **HTTP proxy listen** -- handshake and SSE wait no longer hold the route
+  mutex. ([`619d621`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/619d621), [`360c225`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/360c225))
+- **Nested era dispatch / exact-2024 list cursors / SSE opener bind /
+  hidden-arg defaults / completion mount transfer** -- remaining dual-era
+  product holes closed after v0.6.0. ([`9208fb5`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/9208fb5), [`bc7cdf3`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/bc7cdf3), [`879eead`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/879eead), [`f4a21c3`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/f4a21c3), [`d5e184b`](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d5e184b))
+
+**Exact changes:** [v0.6.0...v0.7.0](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.6.0...v0.7.0)
 
 ---
 

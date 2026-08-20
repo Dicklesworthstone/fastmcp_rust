@@ -149,7 +149,7 @@ This project includes an [`AGENTS.md`](AGENTS.md) file with guidelines for AI co
 - **Porting methodology:** Extract spec from legacy → implement from spec → never translate line-by-line
 - **Runtime:** Uses [asupersync](https://github.com/Dicklesworthstone/asupersync) exclusively; Tokio and Tokio-based adapters are unsupported
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
-- **Toolchain:** Rust 2024 edition; pinned `nightly-2026-08-19` / rustc 1.100.0-nightly (`rust-version = "1.100"`)
+- **Toolchain:** Rust 2024 edition; pinned `nightly-2026-08-20` / rustc 1.100.0-nightly (`rust-version = "1.100"`)
 - **MCP 2026-07-28 support is under implementation and remains unverified.**
 - **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**
 - **The root compatibility `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. Neither is proof of negotiated 2026-07-28 support.**
@@ -427,7 +427,7 @@ live and closes an owner-death channel when the host exits, but this is not
 portable process-tree containment or a substitute for Windows Job Objects.
 
 **Requirements:**
-- Rust nightly-2026-08-19 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
+- Rust nightly-2026-08-20 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
 
 ---
 
@@ -653,7 +653,7 @@ fn commit_revision(
 
 | Limitation | Details |
 |------------|---------|
-| **Pinned Nightly Required** | The project contract pins `nightly-2026-08-19`; do not substitute a different toolchain merely because it supports Edition 2024 |
+| **Pinned Nightly Required** | The project contract pins `nightly-2026-08-20`; do not substitute a different toolchain merely because it supports Edition 2024 |
 | **Protocol Modernization** | The root compatibility `PROTOCOL_VERSION` remains `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. MCP 2026-07-28 implementation and verification are incomplete |
 | **Runtime-context migration** | Production entry points obtain an ambient `Cx` from the runtime; `test-internals` is confined to test-only dependencies and the facade's opt-in `testing-lab` feature |
 | **Network Transports** | The turnkey `run_http*` entry points provide a caller-owned dual-era HTTP listener and dispatch lifecycle. The experimental `websocket-experimental` facade profile also provides native async `bind_websocket` and `serve_websocket` listener lifecycles, plus caller-driven client connection. These surfaces do not establish aggregate conformance or complete lifecycle qualification |
