@@ -41,7 +41,7 @@ use fastmcp_core::{
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::MissingRequiredClientCapabilityError;
 use fastmcp_protocol::common_types::{
-    AbsoluteUri, Annotations, EmbeddedResourceContents, OpenMetadata, RawIcon,
+    AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, OpenMetadata, RawIcon,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID;
@@ -7458,8 +7458,78 @@ fn reversible_template_leading_literal_prefix(
 
 use fastmcp_core::{
     MAX_RESOURCE_READ_DEPTH, ResourceContentItem, ResourceReadResult, ResourceReader,
+    ToolCallResult, ToolContentItem,
 };
 use std::pin::Pin;
+
+fn nested_resource_content_from_final(contents: EmbeddedResourceContents) -> ResourceContentItem {
+    match contents {
+        EmbeddedResourceContents::Text {
+            uri,
+            text,
+            mime_type,
+            ..
+        } => ResourceContentItem {
+            uri: uri.as_str().to_owned(),
+            mime_type,
+            text: Some(text),
+            blob: None,
+        },
+        EmbeddedResourceContents::Blob {
+            uri,
+            blob,
+            mime_type,
+            ..
+        } => ResourceContentItem {
+            uri: uri.as_str().to_owned(),
+            mime_type,
+            text: None,
+            blob: Some(blob),
+        },
+    }
+}
+
+fn nested_tool_content_from_final(block: ContentBlock) -> ToolContentItem {
+    match block {
+        ContentBlock::Text { text, .. } => ToolContentItem::Text { text },
+        ContentBlock::Image {
+            data, mime_type, ..
+        } => ToolContentItem::Image { data, mime_type },
+        ContentBlock::Audio {
+            data, mime_type, ..
+        } => ToolContentItem::Audio { data, mime_type },
+        ContentBlock::Resource { resource, .. } => match resource {
+            EmbeddedResourceContents::Text {
+                uri,
+                text,
+                mime_type,
+                ..
+            } => ToolContentItem::Resource {
+                uri: uri.as_str().to_owned(),
+                mime_type,
+                text: Some(text),
+                blob: None,
+            },
+            EmbeddedResourceContents::Blob {
+                uri,
+                blob,
+                mime_type,
+                ..
+            } => ToolContentItem::Resource {
+                uri: uri.as_str().to_owned(),
+                mime_type,
+                text: None,
+                blob: Some(blob),
+            },
+        },
+        ContentBlock::ResourceLink { uri, mime_type, .. } => ToolContentItem::Resource {
+            uri: uri.as_str().to_owned(),
+            mime_type,
+            text: None,
+            blob: None,
+        },
+    }
+}
 
 /// A wrapper that implements `ResourceReader` for a shared `Router`.
 ///
@@ -7515,6 +7585,196 @@ impl RouterResourceReader {
             session_state,
         }
     }
+
+    async fn read_resource_legacy(
+        router: &Router,
+        parent_ctx: &McpContext,
+        router_access: RouterAccess,
+        session_state: SessionState,
+        uri: String,
+        depth: u32,
+    ) -> McpResult<ResourceReadResult> {
+        let operation_started_at = parent_ctx.cx().now();
+        if let Some(error) = budget_error(parent_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_resource_enabled(&uri) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceNotFound,
+                format!("Resource '{uri}' is disabled for this session"),
+            ));
+        }
+
+        let resolved = router.resolve_resource(&uri).ok_or_else(|| {
+            McpError::new(
+                McpErrorCode::ResourceNotFound,
+                format!("Resource not found: {uri}"),
+            )
+        })?;
+        let handler_timeout = read_handler_timeout(parent_ctx.cx(), "resource_timeout", || {
+            resolved.handler.timeout()
+        })?;
+        let effective_budget = compose_handler_budget(
+            parent_ctx.cx().budget(),
+            parent_ctx.budget(),
+            handler_timeout,
+            operation_started_at,
+        );
+        let child_ctx = with_nested_component_access(
+            parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline),
+            router_access.clone(),
+            session_state.clone(),
+            depth,
+        );
+        let outcome = run_handler_in_request(
+            &child_ctx,
+            parent_ctx.cx(),
+            effective_budget,
+            "resource",
+            |request_cx| {
+                resolved.handler.read_async_with_uri_in_request(
+                    &child_ctx,
+                    request_cx,
+                    &uri,
+                    &resolved.params,
+                )
+            },
+        )
+        .await?;
+        let contents = match outcome {
+            Outcome::Ok(contents) => contents,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(parent_ctx.cx(), "resource", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(parent_ctx.cx(), "resource"));
+            }
+        };
+        Ok(ResourceReadResult::new(
+            contents
+                .into_iter()
+                .map(|content| ResourceContentItem {
+                    uri: content.uri,
+                    mime_type: content.mime_type,
+                    text: content.text,
+                    blob: content.blob,
+                })
+                .collect(),
+        ))
+    }
+
+    async fn read_resource_final(
+        router: &Router,
+        parent_ctx: &McpContext,
+        router_access: RouterAccess,
+        session_state: SessionState,
+        uri: String,
+        depth: u32,
+    ) -> McpResult<ResourceReadResult> {
+        let operation_started_at = parent_ctx.cx().now();
+        if let Some(error) = budget_error(parent_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_resource_enabled(&uri) || !parent_ctx.is_resource_enabled(&uri) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceNotFound,
+                format!("Resource '{uri}' is disabled for this session"),
+            ));
+        }
+        let absolute = AbsoluteUri::parse(uri.clone()).map_err(|_| {
+            McpError::with_data(
+                McpErrorCode::InvalidParams,
+                "Resource not found",
+                serde_json::json!({ "uri": uri }),
+            )
+        })?;
+        let resolved = router
+            .resolve_resource_for_era(&uri, Some(ProtocolEra::Modern2026))
+            .ok_or_else(|| {
+                McpError::with_data(
+                    McpErrorCode::InvalidParams,
+                    "Resource not found",
+                    serde_json::json!({ "uri": uri }),
+                )
+            })?;
+        if !resolved.final_enabled {
+            return Err(McpError::invalid_params(
+                "resource is registered only for exact MCP 2024-11-05 dispatch",
+            ));
+        }
+        if resolved.handler.declares_final_mrtr() && parent_ctx.session_cache_partition().is_none()
+        {
+            return Err(McpError::invalid_params(
+                MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
+            ));
+        }
+        admit_final_resource_uri(
+            resolved.uri_use_policy,
+            &absolute,
+            FinalResourceUriUse::ResourceReadTarget,
+        )?;
+        let handler_timeout = read_handler_timeout(parent_ctx.cx(), "resource_timeout", || {
+            resolved.handler.timeout()
+        })?;
+        let effective_budget = compose_handler_budget(
+            parent_ctx.cx().budget(),
+            parent_ctx.budget(),
+            handler_timeout,
+            operation_started_at,
+        );
+        let child_ctx = with_nested_component_access(
+            parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline),
+            router_access,
+            session_state,
+            depth,
+        );
+        let outcome = run_handler_in_request(
+            &child_ctx,
+            parent_ctx.cx(),
+            effective_budget,
+            "resource",
+            |request_cx| {
+                resolved
+                    .handler
+                    .read_final_outcome_async_with_uri_in_request(
+                        &child_ctx,
+                        request_cx,
+                        &uri,
+                        &resolved.params,
+                    )
+            },
+        )
+        .await?;
+        let result = match outcome {
+            Outcome::Ok(result) => result,
+            Outcome::Err(error) => {
+                return Err(sanitize_handler_error(parent_ctx.cx(), "resource", error));
+            }
+            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => {
+                return Err(sanitized_handler_panic(parent_ctx.cx(), "resource"));
+            }
+        };
+        admit_final_resource_read_outcome(resolved.uri_use_policy, &result)?;
+        let FinalMethodOutcome::Complete(complete) = result else {
+            return Err(McpError::internal_error(
+                "nested resource read cannot complete an input_required outcome",
+            ));
+        };
+        Ok(ResourceReadResult::new(
+            complete
+                .payload
+                .contents
+                .into_iter()
+                .map(nested_resource_content_from_final)
+                .collect(),
+        ))
+    }
 }
 
 impl ResourceReader for RouterResourceReader {
@@ -7548,99 +7808,39 @@ impl ResourceReader for RouterResourceReader {
         let uri = uri.to_string();
         let router_access = self.router.clone();
         let session_state = self.session_state.clone();
+        let final_surface = parent_ctx.is_final_request_surface();
 
         Box::pin(async move {
             debug!(
                 target: targets::HANDLER,
-                "cross-component resource read; resource_key={}; depth={}; request={}",
+                "cross-component resource read; resource_key={}; depth={}; request={}; final_surface={}",
                 safe_log_label(&uri),
                 depth,
-                parent_ctx.request_id()
+                parent_ctx.request_id(),
+                final_surface
             );
             let router = router_access.upgrade()?;
-            let operation_started_at = parent_ctx.cx().now();
-            if let Some(error) = budget_error(&parent_ctx) {
-                return Err(error);
-            }
-            if !session_state.is_resource_enabled(&uri) {
-                return Err(McpError::new(
-                    McpErrorCode::ResourceNotFound,
-                    format!("Resource '{}' is disabled for this session", uri),
-                ));
-            }
-
-            // Resolve the resource
-            let resolved = router.resolve_resource(&uri).ok_or_else(|| {
-                McpError::new(
-                    McpErrorCode::ResourceNotFound,
-                    format!("Resource not found: {}", uri),
+            if final_surface {
+                Self::read_resource_final(
+                    &router,
+                    &parent_ctx,
+                    router_access,
+                    session_state,
+                    uri,
+                    depth,
                 )
-            })?;
-            let handler_timeout =
-                read_handler_timeout(parent_ctx.cx(), "resource_timeout", || {
-                    resolved.handler.timeout()
-                })?;
-            let effective_budget = compose_handler_budget(
-                parent_ctx.cx().budget(),
-                parent_ctx.budget(),
-                handler_timeout,
-                operation_started_at,
-            );
-
-            // Derive the child from the parent request authority, preserving
-            // auth, mask state, budget accounting, and request identity.
-            let child_ctx = with_nested_component_access(
-                parent_ctx
-                    .clone()
-                    .with_operation_deadline(effective_budget.deadline),
-                router_access.clone(),
-                session_state.clone(),
-                depth,
-            );
-
-            // Read the resource on the request-owned future. Nested
-            // `block_on` would replace the ambient Cx and can stall the
-            // already-running HTTP/stdio dispatcher.
-            let outcome = run_handler_in_request(
-                &child_ctx,
-                parent_ctx.cx(),
-                effective_budget,
-                "resource",
-                |request_cx| {
-                    resolved.handler.read_async_with_uri_in_request(
-                        &child_ctx,
-                        request_cx,
-                        &uri,
-                        &resolved.params,
-                    )
-                },
-            )
-            .await?;
-
-            // Convert outcome to result
-            let contents = match outcome {
-                Outcome::Ok(contents) => contents,
-                Outcome::Err(error) => {
-                    return Err(sanitize_handler_error(parent_ctx.cx(), "resource", error));
-                }
-                Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-                Outcome::Panicked(_payload) => {
-                    return Err(sanitized_handler_panic(parent_ctx.cx(), "resource"));
-                }
-            };
-
-            // Convert protocol ResourceContent to core ResourceContentItem
-            let items: Vec<ResourceContentItem> = contents
-                .into_iter()
-                .map(|c| ResourceContentItem {
-                    uri: c.uri,
-                    mime_type: c.mime_type,
-                    text: c.text,
-                    blob: c.blob,
-                })
-                .collect();
-
-            Ok(ResourceReadResult::new(items))
+                .await
+            } else {
+                Self::read_resource_legacy(
+                    &router,
+                    &parent_ctx,
+                    router_access,
+                    session_state,
+                    uri,
+                    depth,
+                )
+                .await
+            }
         })
     }
 }
@@ -7649,7 +7849,7 @@ impl ResourceReader for RouterResourceReader {
 // Tool Caller Implementation
 // ============================================================================
 
-use fastmcp_core::{MAX_TOOL_CALL_DEPTH, ToolCallResult, ToolCaller, ToolContentItem};
+use fastmcp_core::{MAX_TOOL_CALL_DEPTH, ToolCaller};
 
 /// A wrapper that implements `ToolCaller` for a shared `Router`.
 ///
@@ -7685,6 +7885,217 @@ impl RouterToolCaller {
             session_state,
         }
     }
+
+    async fn call_tool_legacy(
+        router: &Router,
+        parent_ctx: &McpContext,
+        router_access: RouterAccess,
+        session_state: SessionState,
+        name: String,
+        args: serde_json::Value,
+        depth: u32,
+    ) -> McpResult<ToolCallResult> {
+        let operation_started_at = parent_ctx.cx().now();
+        if let Some(error) = budget_error(parent_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_tool_enabled(&name) {
+            return Err(McpError::new(
+                McpErrorCode::MethodNotFound,
+                format!("Tool '{name}' is disabled for this session"),
+            ));
+        }
+        let entry = router
+            .tools
+            .get(&name)
+            .ok_or_else(|| McpError::method_not_found(&format!("tool: {name}")))?;
+        if !entry.legacy_enabled {
+            return Err(McpError::method_not_found(&format!("tool: {name}")));
+        }
+        let handler = &entry.handler;
+        let validation_result = if router.strict_input_validation {
+            validate_strict(&entry.definition.input_schema, &args)
+        } else {
+            validate(&entry.definition.input_schema, &args)
+        };
+        if let Err(validation_errors) = validation_result {
+            let error_messages: Vec<String> = validation_errors
+                .iter()
+                .map(|error| format!("{}: {}", error.path, error.message))
+                .collect();
+            return Err(McpError::invalid_params(format!(
+                "Input validation failed: {}",
+                error_messages.join("; ")
+            )));
+        }
+        let handler_timeout =
+            read_handler_timeout(parent_ctx.cx(), "tool_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            parent_ctx.cx().budget(),
+            parent_ctx.budget(),
+            handler_timeout,
+            operation_started_at,
+        );
+        let child_ctx = with_nested_component_access(
+            parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline),
+            router_access.clone(),
+            session_state.clone(),
+            depth,
+        );
+        let outcome = run_handler_in_request(
+            &child_ctx,
+            parent_ctx.cx(),
+            effective_budget,
+            "tool",
+            |request_cx| handler.call_async_in_request(&child_ctx, request_cx, args),
+        )
+        .await?;
+        match outcome {
+            Outcome::Ok(content) => Ok(ToolCallResult::success(
+                content
+                    .into_iter()
+                    .map(|content| match content {
+                        Content::Text { text } => ToolContentItem::Text { text },
+                        Content::Image { data, mime_type } => {
+                            ToolContentItem::Image { data, mime_type }
+                        }
+                        Content::Audio { data, mime_type } => {
+                            ToolContentItem::Audio { data, mime_type }
+                        }
+                        Content::Resource { resource } => ToolContentItem::Resource {
+                            uri: resource.uri,
+                            mime_type: resource.mime_type,
+                            text: resource.text,
+                            blob: resource.blob,
+                        },
+                    })
+                    .collect(),
+            )),
+            Outcome::Err(error) => {
+                let error = sanitize_handler_error(parent_ctx.cx(), "tool", error);
+                if is_framework_terminal_tool_error(error.code) {
+                    return Err(error);
+                }
+                Ok(ToolCallResult::error(error.message))
+            }
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(parent_ctx.cx(), "tool")),
+        }
+    }
+
+    async fn call_tool_final(
+        router: &Router,
+        parent_ctx: &McpContext,
+        router_access: RouterAccess,
+        session_state: SessionState,
+        name: String,
+        args: serde_json::Value,
+        depth: u32,
+    ) -> McpResult<ToolCallResult> {
+        let operation_started_at = parent_ctx.cx().now();
+        if let Some(error) = budget_error(parent_ctx) {
+            return Err(error);
+        }
+        if !session_state.is_tool_enabled(&name) || !parent_ctx.is_tool_enabled(&name) {
+            return Err(McpError::new(
+                McpErrorCode::MethodNotFound,
+                format!("Tool '{name}' is disabled for this session"),
+            ));
+        }
+        let entry = router
+            .tools
+            .get(&name)
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {name}")))?;
+        let final_registration = entry
+            .final_registration
+            .as_ref()
+            .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {name}")))?;
+        let handler = &entry.handler;
+        if handler.declares_final_mrtr() && parent_ctx.session_cache_partition().is_none() {
+            return Err(McpError::invalid_params(
+                MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
+            ));
+        }
+        let input_schema = final_registration.schemas.input.as_ref();
+        let input_validation_failed = match input_schema {
+            Some(schema) => {
+                let validation = if router.strict_input_validation {
+                    validate_strict(schema.schema(), &args)
+                } else {
+                    schema.validate(&args)
+                };
+                validation.is_err()
+            }
+            None if router.strict_input_validation => {
+                validate_strict(&final_registration.final_definition.input_schema, &args).is_err()
+            }
+            None => false,
+        };
+        if input_validation_failed {
+            return Ok(ToolCallResult::error(
+                "Tool arguments do not match the declared input schema.",
+            ));
+        }
+        let handler_timeout =
+            read_handler_timeout(parent_ctx.cx(), "tool_timeout", || handler.timeout())?;
+        let effective_budget = compose_handler_budget(
+            parent_ctx.cx().budget(),
+            parent_ctx.budget(),
+            handler_timeout,
+            operation_started_at,
+        );
+        let child_ctx = with_nested_component_access(
+            parent_ctx
+                .clone()
+                .with_operation_deadline(effective_budget.deadline),
+            router_access,
+            session_state,
+            depth,
+        );
+        let outcome = run_handler_in_request(
+            &child_ctx,
+            parent_ctx.cx(),
+            effective_budget,
+            "tool",
+            |request_cx| {
+                handler.call_final_outcome_async_resuming_in_request(
+                    &child_ctx, request_cx, args, None,
+                )
+            },
+        )
+        .await?;
+        match outcome {
+            Outcome::Ok(result) => match result {
+                FinalToolOutcome::Complete(complete) => Ok(ToolCallResult {
+                    content: complete
+                        .payload
+                        .content
+                        .into_iter()
+                        .map(nested_tool_content_from_final)
+                        .collect(),
+                    is_error: complete.payload.is_error,
+                }),
+                FinalToolOutcome::InputRequired(_) => Err(McpError::internal_error(
+                    "nested tool call cannot complete an input_required outcome",
+                )),
+                #[cfg(feature = "tasks")]
+                FinalToolOutcome::CreateTask { .. } => Err(McpError::internal_error(
+                    "nested tool call cannot create a final task",
+                )),
+            },
+            Outcome::Err(error) => {
+                let error = sanitize_handler_error(parent_ctx.cx(), "tool", error);
+                if is_framework_terminal_tool_error(error.code) {
+                    return Err(error);
+                }
+                Ok(ToolCallResult::error(error.message))
+            }
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(parent_ctx.cx(), "tool")),
+        }
+    }
 }
 
 impl ToolCaller for RouterToolCaller {
@@ -7712,124 +8123,40 @@ impl ToolCaller for RouterToolCaller {
         let name = name.to_string();
         let router_access = self.router.clone();
         let session_state = self.session_state.clone();
+        let final_surface = parent_ctx.is_final_request_surface();
 
         Box::pin(async move {
             debug!(
                 target: targets::HANDLER,
-                "cross-component tool call; tool_key={}; depth={}; request={}",
+                "cross-component tool call; tool_key={}; depth={}; request={}; final_surface={}",
                 safe_log_label(&name),
                 depth,
-                parent_ctx.request_id()
+                parent_ctx.request_id(),
+                final_surface
             );
             let router = router_access.upgrade()?;
-            let operation_started_at = parent_ctx.cx().now();
-            if let Some(error) = budget_error(&parent_ctx) {
-                return Err(error);
-            }
-            if !session_state.is_tool_enabled(&name) {
-                return Err(McpError::new(
-                    McpErrorCode::MethodNotFound,
-                    format!("Tool '{}' is disabled for this session", name),
-                ));
-            }
-
-            // Find the tool handler
-            let entry = router
-                .tools
-                .get(&name)
-                .ok_or_else(|| McpError::method_not_found(&format!("tool: {}", name)))?;
-            if !entry.legacy_enabled {
-                return Err(McpError::method_not_found(&format!("tool: {}", name)));
-            }
-            let handler = &entry.handler;
-
-            // Validate arguments against the tool's input schema
-            // Use strict or lenient validation based on router configuration
-            let validation_result = if router.strict_input_validation {
-                validate_strict(&entry.definition.input_schema, &args)
+            if final_surface {
+                Self::call_tool_final(
+                    &router,
+                    &parent_ctx,
+                    router_access,
+                    session_state,
+                    name,
+                    args,
+                    depth,
+                )
+                .await
             } else {
-                validate(&entry.definition.input_schema, &args)
-            };
-
-            if let Err(validation_errors) = validation_result {
-                let error_messages: Vec<String> = validation_errors
-                    .iter()
-                    .map(|e| format!("{}: {}", e.path, e.message))
-                    .collect();
-                return Err(McpError::invalid_params(format!(
-                    "Input validation failed: {}",
-                    error_messages.join("; ")
-                )));
-            }
-            let handler_timeout =
-                read_handler_timeout(parent_ctx.cx(), "tool_timeout", || handler.timeout())?;
-            let effective_budget = compose_handler_budget(
-                parent_ctx.cx().budget(),
-                parent_ctx.budget(),
-                handler_timeout,
-                operation_started_at,
-            );
-
-            // Derive the child from the parent request authority, preserving
-            // auth, mask state, budget accounting, and request identity.
-            let child_ctx = with_nested_component_access(
-                parent_ctx
-                    .clone()
-                    .with_operation_deadline(effective_budget.deadline),
-                router_access.clone(),
-                session_state.clone(),
-                depth,
-            );
-
-            // Call the tool on the request-owned future. Nested `block_on`
-            // would replace the ambient Cx and can stall the already-running
-            // HTTP/stdio dispatcher.
-            let outcome = run_handler_in_request(
-                &child_ctx,
-                parent_ctx.cx(),
-                effective_budget,
-                "tool",
-                |request_cx| handler.call_async_in_request(&child_ctx, request_cx, args),
-            )
-            .await?;
-
-            // Convert outcome to result
-            match outcome {
-                Outcome::Ok(content) => {
-                    // Convert protocol Content to core ToolContentItem
-                    let items: Vec<ToolContentItem> = content
-                        .into_iter()
-                        .map(|c| match c {
-                            Content::Text { text } => ToolContentItem::Text { text },
-                            Content::Image { data, mime_type } => {
-                                ToolContentItem::Image { data, mime_type }
-                            }
-                            Content::Audio { data, mime_type } => {
-                                ToolContentItem::Audio { data, mime_type }
-                            }
-                            Content::Resource { resource } => ToolContentItem::Resource {
-                                uri: resource.uri,
-                                mime_type: resource.mime_type,
-                                text: resource.text,
-                                blob: resource.blob,
-                            },
-                        })
-                        .collect();
-
-                    Ok(ToolCallResult::success(items))
-                }
-                Outcome::Err(e) => {
-                    let e = sanitize_handler_error(parent_ctx.cx(), "tool", e);
-                    if is_framework_terminal_tool_error(e.code) {
-                        return Err(e);
-                    }
-                    // Tool errors become error results, not failures
-                    Ok(ToolCallResult::error(e.message))
-                }
-                Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
-                Outcome::Panicked(_payload) => {
-                    Err(sanitized_handler_panic(parent_ctx.cx(), "tool"))
-                }
+                Self::call_tool_legacy(
+                    &router,
+                    &parent_ctx,
+                    router_access,
+                    session_state,
+                    name,
+                    args,
+                    depth,
+                )
+                .await
             }
         })
     }
@@ -8736,6 +9063,57 @@ mod router_tests {
                     structured_content: None,
                 },
             )))
+        }
+    }
+
+    struct EraBoundaryResource {
+        legacy_calls: Arc<AtomicUsize>,
+        final_calls: Arc<AtomicUsize>,
+    }
+
+    impl ResourceHandler for EraBoundaryResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "mcp://era-boundary".to_owned(),
+                name: "era-boundary".to_owned(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![ResourceContent {
+                uri: "mcp://era-boundary".to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some("legacy resource result".to_owned()),
+                blob: None,
+            }])
+        }
+
+        fn read_final(
+            &self,
+            _ctx: &McpContext,
+        ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+            self.final_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(CompleteResult::new(
+                FinalReadResourceResult {
+                    contents: vec![EmbeddedResourceContents::Text {
+                        uri: AbsoluteUri::parse("mcp://era-boundary")
+                            .expect("era-boundary resource URI is valid"),
+                        text: "final resource result".to_owned(),
+                        mime_type: Some("text/plain".to_owned()),
+                        meta: None,
+                        additional: BTreeMap::new(),
+                    }],
+                    ttl_ms: CacheTtl::milliseconds(DEFAULT_FINAL_RESOURCE_TTL_MS),
+                    cache_scope: CacheScope::Private,
+                },
+                empty_final_result_meta()?,
+            ))
         }
     }
 
@@ -15643,6 +16021,149 @@ mod router_tests {
             block_on(request_ctx.call_tool("nested_tool_failure", serde_json::json!({})))
                 .expect("ordinary tool failures remain protocol-level tool results");
         assert!(tool_failure.is_error);
+    }
+
+    #[test]
+    fn nested_call_tool_from_legacy_surface_uses_legacy_hook() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(DuplicateInvariantTool {
+                label: "nested-legacy",
+                schema_property: "allowed",
+                legacy_calls: Arc::clone(&legacy_calls),
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone())
+            .with_tool_caller(Arc::new(RouterToolCaller::new(Arc::clone(&router), state)));
+
+        let rejected = block_on(request_ctx.call_tool(
+            "duplicate-invariant-tool",
+            serde_json::json!({"allowed": true, "extra": true}),
+        ))
+        .expect_err("legacy nested schema rejection remains an outer invalid-params error");
+        assert_eq!(rejected.code, McpErrorCode::InvalidParams);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+
+        let result = block_on(request_ctx.call_tool(
+            "duplicate-invariant-tool",
+            serde_json::json!({"allowed": true}),
+        ))
+        .expect("legacy nested call_tool reaches the legacy hook");
+        assert!(!result.is_error);
+        assert_eq!(result.first_text(), Some("nested-legacy"));
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nested_call_tool_from_final_surface_validates_before_handler() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(DuplicateInvariantTool {
+                label: "nested-final",
+                schema_property: "allowed",
+                legacy_calls: Arc::clone(&legacy_calls),
+                final_calls: Arc::clone(&final_calls),
+            })
+            .expect("tool registration succeeds");
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone())
+            .with_final_request_surface(true)
+            .with_tool_caller(Arc::new(RouterToolCaller::new(Arc::clone(&router), state)));
+
+        let rejected = block_on(request_ctx.call_tool(
+            "duplicate-invariant-tool",
+            serde_json::json!({"allowed": true, "extra": true}),
+        ))
+        .expect("schema rejection remains a tool-level error result");
+        assert!(rejected.is_error);
+        assert_eq!(
+            rejected.first_text(),
+            Some("Tool arguments do not match the declared input schema.")
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let accepted = block_on(request_ctx.call_tool(
+            "duplicate-invariant-tool",
+            serde_json::json!({"allowed": true}),
+        ))
+        .expect("the complete nested final arguments are accepted");
+        assert!(!accepted.is_error);
+        assert_eq!(accepted.first_text(), Some("nested-final"));
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn nested_read_resource_from_final_surface_uses_final_hook() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_resource(EraBoundaryResource {
+            legacy_calls: Arc::clone(&legacy_calls),
+            final_calls: Arc::clone(&final_calls),
+        });
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone())
+            .with_final_request_surface(true)
+            .with_resource_reader(Arc::new(RouterResourceReader::new(
+                Arc::clone(&router),
+                state,
+            )));
+
+        let accepted = block_on(request_ctx.read_resource("mcp://era-boundary"))
+            .expect("nested final resource read reaches the final hook");
+        assert_eq!(
+            accepted.contents[0].text.as_deref(),
+            Some("final resource result")
+        );
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+
+        let missing = block_on(request_ctx.read_resource("mcp://missing"))
+            .expect_err("an unknown nested final resource is invalid params");
+        assert_eq!(missing.code, McpErrorCode::InvalidParams);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn nested_read_resource_from_legacy_surface_uses_legacy_hook() {
+        let final_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.add_resource(EraBoundaryResource {
+            legacy_calls: Arc::clone(&legacy_calls),
+            final_calls: Arc::clone(&final_calls),
+        });
+        let router = Arc::new(router);
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let request_ctx = McpContext::with_state(cx, 1, state.clone()).with_resource_reader(
+            Arc::new(RouterResourceReader::new(Arc::clone(&router), state)),
+        );
+
+        let accepted = block_on(request_ctx.read_resource("mcp://era-boundary"))
+            .expect("legacy nested resource read reaches the legacy hook");
+        assert_eq!(
+            accepted.contents[0].text.as_deref(),
+            Some("legacy resource result")
+        );
+        assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(final_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
