@@ -12583,16 +12583,29 @@ impl Server {
                 runtime.bidirectional_senders(self, &request_cancellation, &request_ctx)
             });
             Self::enforce_request_context(&request_ctx)?;
+            // Clone so in-band credentials can be stripped after admission.
+            // Exact-2024 stdio has no transport custody; it must still evaluate
+            // AuthProvider the same way modern stdio does, or negotiating
+            // 2024-11-05 would skip every installed verifier.
+            let mut request = request.clone();
             let fingerprint = if let Some(receipt) = auth_receipt {
-                receipt.commit_legacy(&request_ctx, request)?
+                let fingerprint = receipt.commit_legacy(&request_ctx, &request)?;
+                request.params = receipt.sanitized_params.clone();
+                fingerprint
             } else if let Some(connection_auth) = connection_auth {
-                connection_auth.commit_legacy_connection(&request_ctx)?
-            } else if !request_ctx.commit_anonymous_auth() {
-                return Err(McpError::internal_error(
-                    "anonymous request admission could not be committed",
-                ));
+                let fingerprint = connection_auth.commit_legacy_connection(&request_ctx)?;
+                auth::strip_recognized_access_credentials(&mut request.params);
+                fingerprint
             } else {
-                auth::principal_fingerprint(None)?
+                let auth_request = AuthRequest {
+                    method: request.method.as_str(),
+                    params: request.params.as_ref(),
+                    transport_authorization: None,
+                    request_id: request_id_to_u64(request.id.as_ref()),
+                };
+                let fingerprint = self.authenticate_request(&request_ctx, auth_request)?;
+                auth::strip_recognized_access_credentials(&mut request.params);
+                fingerprint
             };
             if !session_principal.bind_or_verify(fingerprint) {
                 return Err(McpError::new(
@@ -12606,7 +12619,7 @@ impl Server {
                 for middleware in self.middleware.iter() {
                     Self::enforce_request_context(&request_ctx)?;
                     entered_middleware.push(middleware.as_ref());
-                    match catch_extension_unwind(|| middleware.on_request(&request_ctx, request)) {
+                    match catch_extension_unwind(|| middleware.on_request(&request_ctx, &request)) {
                         Ok(Ok(MiddlewareDecision::Continue)) => {}
                         Ok(Ok(MiddlewareDecision::Respond(value))) => return Ok(value),
                         Ok(Err(error)) => return Err(error),
@@ -12620,7 +12633,7 @@ impl Server {
                 match request.method.as_str() {
                     "completion/complete" => {
                         self.router
-                            .dispatch_legacy_completion_in_request(&request_ctx, cx, request)
+                            .dispatch_legacy_completion_in_request(&request_ctx, cx, &request)
                             .await
                     }
                     "tools/list" => {
@@ -12734,7 +12747,7 @@ impl Server {
                 &request_cancellation,
                 &entered_middleware,
                 &request_ctx,
-                request,
+                &request,
                 result,
             );
 
@@ -26777,6 +26790,78 @@ mod lib_unit_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exact_2024_dispatch_without_transport_custody_still_evaluates_auth_provider() {
+        let verifier = StaticTokenVerifier::new([(
+            "good-token",
+            AuthContext::with_subject("legacy-stdio-owner"),
+        )])
+        .expect("valid verifier configuration")
+        .with_allowed_schemes(["Bearer"])
+        .expect("valid scheme configuration");
+        let server = Server::new("legacy-stdio-auth", "1.0.0")
+            .auth_provider(TokenAuthProvider::new(verifier))
+            .build();
+        let session_principal = crate::session::SessionPrincipalBinding::default();
+        let missing = JsonRpcRequest::new("tools/list", None, 1_i64);
+        let missing_dispatch = fastmcp_core::block_on(server.dispatch_legacy_2024(
+            &Cx::for_testing(),
+            1,
+            &session_principal,
+            None,
+            None,
+            &missing,
+            None,
+            None,
+        ))
+        .expect("missing-token admission still returns a dispatch record");
+        let missing_error = missing_dispatch
+            .result
+            .expect_err("exact-2024 tools/list without a token must fail closed");
+        assert_eq!(missing_error.code, McpErrorCode::ResourceForbidden);
+
+        let wrong = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({"authorization": "Bearer wrong-token"})),
+            2_i64,
+        );
+        let wrong_dispatch = fastmcp_core::block_on(server.dispatch_legacy_2024(
+            &Cx::for_testing(),
+            1,
+            &session_principal,
+            None,
+            None,
+            &wrong,
+            None,
+            None,
+        ))
+        .expect("wrong-token admission still returns a dispatch record");
+        let wrong_error = wrong_dispatch
+            .result
+            .expect_err("exact-2024 tools/list with the wrong token must fail closed");
+        assert_eq!(wrong_error.code, McpErrorCode::ResourceForbidden);
+
+        let admitted = JsonRpcRequest::new(
+            "tools/list",
+            Some(serde_json::json!({"authorization": "Bearer good-token"})),
+            3_i64,
+        );
+        let dispatch = fastmcp_core::block_on(server.dispatch_legacy_2024(
+            &Cx::for_testing(),
+            1,
+            &session_principal,
+            None,
+            None,
+            &admitted,
+            None,
+            None,
+        ))
+        .expect("exact-2024 tools/list with the admitted token must dispatch");
+        dispatch
+            .result
+            .expect("admitted exact-2024 tools/list must succeed");
     }
 
     #[test]
