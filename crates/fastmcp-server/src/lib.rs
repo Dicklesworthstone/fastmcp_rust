@@ -3737,6 +3737,13 @@ pub struct ServerHttpSession {
     legacy_admissions: Arc<HttpLegacyRequestAdmissions>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_auth_receipt: Arc<Mutex<Option<AuthAdmissionReceipt>>>,
+    /// Principal admitted on the GET `/sse` that opened this generation.
+    ///
+    /// GET has no JSON-RPC body, so its receipt cannot be committed onto a
+    /// later POST. The fingerprint must still bind the session: otherwise the
+    /// first POST wins ownership and can stream results to a different opener.
+    #[cfg(any(feature = "legacy-2024-11-05", test))]
+    legacy_sse_open_fingerprint: Option<Sha256Digest>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
     legacy_pending_requests: Arc<PendingRequests>,
     #[cfg(any(feature = "legacy-2024-11-05", test))]
@@ -7130,6 +7137,8 @@ impl ServerHttpEndpoint {
             #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_auth_receipt: Arc::new(Mutex::new(None)),
             #[cfg(any(feature = "legacy-2024-11-05", test))]
+            legacy_sse_open_fingerprint: None,
+            #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_pending_requests,
             #[cfg(any(feature = "legacy-2024-11-05", test))]
             legacy_runtime,
@@ -7511,6 +7520,16 @@ impl ServerHttpSession {
                 Ok(receipt) => receipt,
                 Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
             };
+            // GET `/sse` has no JSON-RPC body, so the receipt cannot be
+            // committed onto a later POST. Retain the opener fingerprint so
+            // `install_legacy_generation` can bind the session owner. POST
+            // `/messages` (including reverse responses) must not overwrite
+            // or claim that opener identity.
+            if request.method == HttpMethod::Get
+                && request.path == self.server.http_config.legacy_sse_path
+            {
+                self.legacy_sse_open_fingerprint = Some(receipt.fingerprint.clone());
+            }
             let mut stored = self
                 .legacy_auth_receipt
                 .lock()
@@ -8238,6 +8257,16 @@ impl ServerHttpSession {
                 self.legacy_session_id = session_id;
                 self.legacy_lifecycle = lifecycle;
                 self.install_legacy_generation(cx);
+                if let Some(fingerprint) = self.legacy_sse_open_fingerprint.take()
+                    && !self
+                        .legacy_session
+                        .principal_binding()
+                        .bind_or_verify(fingerprint)
+                {
+                    return Ok(ServerHttpEndpointResponse::Immediate(
+                        HttpResponse::new(HttpStatus::UNAUTHORIZED),
+                    ));
+                }
                 return Ok(ServerHttpEndpointResponse::LegacySse(sse));
             }
             DualEraHttpEndpointResponse::Immediate(response) => response,
@@ -8297,7 +8326,20 @@ impl ServerHttpSession {
             .restore_log_level(self.legacy_runtime.log_level());
         let active_request = take_live_legacy_active_request(&self.legacy_active_request);
         if request.method == "notifications/cancelled" && request.id.is_none() {
-            if let Ok(params) = parse_params::<CancelledParams>(request.params.clone()) {
+            let fingerprint = self
+                .legacy_auth_receipt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|receipt| receipt.fingerprint.clone());
+            // Control frames must not cancel unless they prove the already-bound
+            // SSE opener. An unbound session or a different principal is ignored.
+            if fingerprint.is_some_and(|fingerprint| {
+                self.legacy_session
+                    .principal_binding()
+                    .verify_existing(fingerprint)
+            }) && let Ok(params) = parse_params::<CancelledParams>(request.params.clone())
+            {
                 self.server
                     .handle_cancelled_notification(self.legacy_binding.generation(), params);
             }
@@ -40125,6 +40167,167 @@ mod lib_unit_tests {
                 .expect("tool event must remain JSON-RPC"),
             JsonRpcMessage::Response(response)
                 if response.id == Some(212_i64.into())
+                    && response
+                        .result
+                        .as_ref()
+                        .is_some_and(|result| result.get("resultType").is_none())
+        ));
+    }
+
+    #[test]
+    fn public_http_legacy_sse_binds_opener_principal_before_post() {
+        let cx = Cx::for_testing();
+        let verifier = StaticTokenVerifier::new([
+            ("alpha", AuthContext::with_subject("alice")),
+            ("beta", AuthContext::with_subject("bob")),
+        ])
+        .expect("valid verifier configuration")
+        .with_allowed_schemes(["Bearer"])
+        .expect("valid scheme configuration");
+        let alice = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("alice")))
+            .expect("alice fingerprint");
+        let bob = crate::auth::principal_fingerprint(Some(&AuthContext::with_subject("bob")))
+            .expect("bob fingerprint");
+        let endpoint = Server::new("legacy-sse-owner", "1.0.0")
+            .tool(LiveRuntimeListedTool)
+            .auth_provider(TokenAuthProvider::new(verifier))
+            .build_http_endpoint("http://legacy.test")
+            .expect("dual-era endpoint must build");
+        let mut session = endpoint
+            .open_session(&cx)
+            .expect("endpoint must open a bounded live session");
+
+        let denied = session
+            .handle(&cx, HttpRequest::new(HttpMethod::Get, "/sse"))
+            .expect("unauthenticated GET must be answered");
+        assert!(
+            matches!(
+                denied,
+                ServerHttpEndpointResponse::Immediate(response)
+                    if response.status == HttpStatus::UNAUTHORIZED
+            ),
+            "GET /sse without a token must fail closed when a verifier is installed"
+        );
+
+        let stream = session
+            .handle(
+                &cx,
+                HttpRequest::new(HttpMethod::Get, "/sse")
+                    .with_header("Authorization", "Bearer alpha"),
+            )
+            .expect("authenticated GET must open");
+        let ServerHttpEndpointResponse::LegacySse(mut stream) = stream else {
+            panic!("authenticated GET must open an exact SSE stream");
+        };
+        assert!(
+            session
+                .legacy_session
+                .principal_binding()
+                .verify_existing(alice),
+            "GET /sse must bind the opener before any POST"
+        );
+        assert!(
+            !session
+                .legacy_session
+                .principal_binding()
+                .verify_existing(bob),
+            "GET /sse must not bind a different principal"
+        );
+
+        let _ = stream
+            .recv_event(&cx)
+            .expect("legacy stream must advertise its exact POST endpoint");
+        let legacy_session_id = session.legacy_session_id().to_owned();
+        let post = |message: JsonRpcRequest, token: &str| {
+            HttpRequest::new(HttpMethod::Post, "/messages")
+                .with_header("content-type", "application/json")
+                .with_header("Authorization", format!("Bearer {token}"))
+                .with_query("session_id", legacy_session_id.clone())
+                .with_body(serde_json::to_vec(&message).expect("legacy request must serialize"))
+        };
+        let initialize = JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-http-client", "version": "1.0.0"},
+            })),
+            311_i64,
+        );
+        let initialized = JsonRpcRequest::notification("notifications/initialized", None);
+        let foreign_call = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_runtime_listed_tool",
+                "arguments": {},
+            })),
+            312_i64,
+        );
+        let owned_call = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "live_runtime_listed_tool",
+                "arguments": {},
+            })),
+            313_i64,
+        );
+
+        for request in [initialize, initialized] {
+            let response = session
+                .handle(&cx, post(request, "alpha"))
+                .expect("opener POST must be dispatched");
+            let ServerHttpEndpointResponse::Immediate(response) = response else {
+                panic!("legacy POST acknowledgement must be immediate");
+            };
+            assert_eq!(response.status, HttpStatus::ACCEPTED);
+        }
+        let codec = Codec::new();
+        let initialize_event = stream
+            .recv_event(&cx)
+            .expect("opener initialize response must stream");
+        assert!(matches!(
+            codec
+                .decode_complete_message(initialize_event.data.as_bytes())
+                .expect("initialize event must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(311_i64.into()) && response.error.is_none()
+        ));
+
+        let foreign = session
+            .handle(&cx, post(foreign_call, "beta"))
+            .expect("foreign POST must be answered");
+        let ServerHttpEndpointResponse::Immediate(foreign) = foreign else {
+            panic!("foreign legacy POST acknowledgement must be immediate");
+        };
+        assert_eq!(foreign.status, HttpStatus::ACCEPTED);
+        let foreign_event = stream
+            .recv_event(&cx)
+            .expect("foreign tool response must stream");
+        assert!(matches!(
+            codec
+                .decode_complete_message(foreign_event.data.as_bytes())
+                .expect("foreign tool event must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(312_i64.into()) && response.error.is_some()
+        ));
+
+        let owned = session
+            .handle(&cx, post(owned_call, "alpha"))
+            .expect("opener tool call must be dispatched");
+        let ServerHttpEndpointResponse::Immediate(owned) = owned else {
+            panic!("opener tool call acknowledgement must be immediate");
+        };
+        assert_eq!(owned.status, HttpStatus::ACCEPTED);
+        let owned_event = stream
+            .recv_event(&cx)
+            .expect("opener tool response must stream");
+        assert!(matches!(
+            codec
+                .decode_complete_message(owned_event.data.as_bytes())
+                .expect("opener tool event must remain JSON-RPC"),
+            JsonRpcMessage::Response(response)
+                if response.id == Some(313_i64.into())
+                    && response.error.is_none()
                     && response
                         .result
                         .as_ref()
