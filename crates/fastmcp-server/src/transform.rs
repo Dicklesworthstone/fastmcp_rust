@@ -214,6 +214,11 @@ impl TransformedTool {
             } else if let Some(default) = &transform.default {
                 result.insert(original_name.clone(), default.clone());
             }
+            // A caller who still sends the original name after a rename must
+            // not overwrite the mapped value in the leftover-args pass.
+            if new_name != original_name {
+                args.remove(original_name);
+            }
         }
 
         // Pass through any remaining arguments that weren't transformed
@@ -742,6 +747,27 @@ mod tests {
         let obj = result.as_object().unwrap();
         assert_eq!(obj.get("q").unwrap(), "test");
         assert_eq!(obj.get("extra").unwrap(), "value");
+    }
+
+    #[test]
+    fn transform_arguments_rename_ignores_original_name_leftover() {
+        let tool = SearchToolFixture::new("search");
+        let transformed = TransformedTool::from_tool(tool)
+            .rename_arg("q", "query")
+            .build();
+
+        let result = transformed
+            .transform_arguments(serde_json::json!({
+                "query": "mapped",
+                "q": "leftover"
+            }))
+            .unwrap();
+        let obj = result.as_object().unwrap();
+        assert_eq!(obj.get("q").unwrap(), "mapped");
+        assert!(
+            obj.len() == 1,
+            "the unpublished original name must not leak beside the mapped value: {obj:?}"
+        );
     }
 
     #[test]
