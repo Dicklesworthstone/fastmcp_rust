@@ -8263,9 +8263,9 @@ impl ServerHttpSession {
                         .principal_binding()
                         .bind_or_verify(fingerprint)
                 {
-                    return Ok(ServerHttpEndpointResponse::Immediate(
-                        HttpResponse::new(HttpStatus::UNAUTHORIZED),
-                    ));
+                    return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                        HttpStatus::UNAUTHORIZED,
+                    )));
                 }
                 return Ok(ServerHttpEndpointResponse::LegacySse(sse));
             }
