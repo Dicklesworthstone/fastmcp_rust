@@ -498,6 +498,32 @@ pub struct PreparedLegacyStdioStart {
     execution: StdioRequestExecution,
 }
 
+/// Prepared modern HTTP `subscriptions/listen` opening that can handshake
+/// after the route mutex drops.
+pub struct PreparedIncrementalHttpListen {
+    client: ModernHttpClient,
+    request_id: RequestId,
+    notifications: SubscriptionFilter,
+    limits: SseLimits,
+    cx: Cx,
+}
+
+impl PreparedIncrementalHttpListen {
+    fn open(self) -> McpResult<ModernHttpSubscriptionListener> {
+        block_on(self.client.open_subscriptions_listener(
+            &self.cx,
+            self.request_id,
+            self.notifications,
+            self.limits,
+        ))
+        .map_err(|error| {
+            McpError::invalid_request(format!(
+                "Proxy HTTP incremental subscriptions/listen failed: {error}"
+            ))
+        })
+    }
+}
+
 impl ProxyLegacyHttpRequest {
     fn new(request: CoreRequest, handle: LegacyHttpRequest) -> Self {
         Self { request, handle }
@@ -1399,6 +1425,31 @@ pub trait ProxyBackend: Send {
         Ok(false)
     }
 
+    /// Reserves a modern HTTP incremental Tasks listen without beginning the
+    /// SSE handshake. Stdio backends return `None`.
+    #[cfg(feature = "tasks")]
+    fn prepare_incremental_final_task_listener(
+        &mut self,
+        _notifications: SubscriptionFilter,
+    ) -> McpResult<Option<PreparedIncrementalHttpListen>> {
+        Ok(None)
+    }
+
+    /// Drops a Tasks-listen reservation after the handshake fails.
+    #[cfg(feature = "tasks")]
+    fn abort_incremental_final_task_listener_opening(&mut self) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Installs a Tasks listener opened after the route mutex was released.
+    #[cfg(feature = "tasks")]
+    fn install_incremental_final_task_listener(
+        &mut self,
+        _listener: ModernHttpSubscriptionListener,
+    ) -> McpResult<bool> {
+        Ok(false)
+    }
+
     /// Starts an incrementally driven catalog `subscriptions/listen` when the
     /// backend itself owns a sequential ingress loop (currently stdio).
     ///
@@ -1407,6 +1458,28 @@ pub trait ProxyBackend: Send {
     fn start_incremental_catalog_listener(
         &mut self,
         _notifications: SubscriptionFilter,
+    ) -> McpResult<bool> {
+        Ok(false)
+    }
+
+    /// Reserves a modern HTTP incremental catalog listen without beginning
+    /// the SSE handshake. Stdio backends return `None`.
+    fn prepare_incremental_catalog_listener(
+        &mut self,
+        _notifications: SubscriptionFilter,
+    ) -> McpResult<Option<PreparedIncrementalHttpListen>> {
+        Ok(None)
+    }
+
+    /// Drops a catalog-listen reservation after the handshake fails.
+    fn abort_incremental_catalog_listener_opening(&mut self) -> McpResult<()> {
+        Ok(())
+    }
+
+    /// Installs a catalog listener opened after the route mutex was released.
+    fn install_incremental_catalog_listener(
+        &mut self,
+        _listener: ModernHttpSubscriptionListener,
     ) -> McpResult<bool> {
         Ok(false)
     }
@@ -4188,8 +4261,11 @@ pub struct ProxyHttpClient {
     implementation: Option<Implementation>,
     inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
     live_catalog_listener: Option<ModernHttpSubscriptionListener>,
+    catalog_listener_opening: bool,
     #[cfg(feature = "tasks")]
     live_task_listener: Option<ModernHttpSubscriptionListener>,
+    #[cfg(feature = "tasks")]
+    task_listener_opening: bool,
 }
 
 impl std::fmt::Debug for ProxyHttpClient {
@@ -4252,8 +4328,11 @@ impl ProxyHttpClient {
             implementation,
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
             live_catalog_listener: None,
+            catalog_listener_opening: false,
             #[cfg(feature = "tasks")]
             live_task_listener: None,
+            #[cfg(feature = "tasks")]
+            task_listener_opening: false,
         }
     }
 
@@ -5563,7 +5642,18 @@ impl ProxyBackend for ProxyHttpClient {
         &mut self,
         notifications: SubscriptionFilter,
     ) -> McpResult<bool> {
-        if self.live_catalog_listener.is_some() {
+        // HTTP incremental listen is reserved and opened through
+        // [`Self::prepare_incremental_catalog_listener`]. Returning false
+        // keeps this lock-held entry from starting a second SSE handshake.
+        let _ = notifications;
+        Ok(false)
+    }
+
+    fn prepare_incremental_catalog_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Option<PreparedIncrementalHttpListen>> {
+        if self.live_catalog_listener.is_some() || self.catalog_listener_opening {
             return Err(McpError::invalid_request(
                 "A final HTTP catalog subscription is already active on this proxy route",
             ));
@@ -5577,21 +5667,40 @@ impl ProxyBackend for ProxyHttpClient {
                 "A live catalog subscription cannot include taskIds; use start_final_task_listener",
             ));
         }
+        let ClientHttpConnection::Modern(client) = &self.connection else {
+            return Ok(None);
+        };
         if self.connection.selected_protocol_era() != ProtocolEra::Modern2026 {
-            return Ok(false);
+            return Ok(None);
         }
+        let client = client.clone();
         let request_id = self.next_request_id()?;
-        let listener = block_on(self.connection.open_subscriptions_listener(
-            &self.cx,
+        self.catalog_listener_opening = true;
+        Ok(Some(PreparedIncrementalHttpListen {
+            client,
             request_id,
             notifications,
-            Self::sse_limits(),
-        ))
-        .map_err(|error| {
-            McpError::invalid_request(format!(
-                "Proxy HTTP incremental subscriptions/listen failed: {error}"
-            ))
-        })?;
+            limits: Self::sse_limits(),
+            cx: self.cx.clone(),
+        }))
+    }
+
+    fn abort_incremental_catalog_listener_opening(&mut self) -> McpResult<()> {
+        self.catalog_listener_opening = false;
+        Ok(())
+    }
+
+    fn install_incremental_catalog_listener(
+        &mut self,
+        listener: ModernHttpSubscriptionListener,
+    ) -> McpResult<bool> {
+        if self.live_catalog_listener.is_some() {
+            self.catalog_listener_opening = false;
+            return Err(McpError::invalid_request(
+                "A final HTTP catalog subscription is already active on this proxy route",
+            ));
+        }
+        self.catalog_listener_opening = false;
         self.live_catalog_listener = Some(listener);
         Ok(true)
     }
@@ -5666,7 +5775,16 @@ impl ProxyBackend for ProxyHttpClient {
         &mut self,
         notifications: SubscriptionFilter,
     ) -> McpResult<bool> {
-        if self.live_task_listener.is_some() {
+        let _ = notifications;
+        Ok(false)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn prepare_incremental_final_task_listener(
+        &mut self,
+        notifications: SubscriptionFilter,
+    ) -> McpResult<Option<PreparedIncrementalHttpListen>> {
+        if self.live_task_listener.is_some() || self.task_listener_opening {
             return Err(McpError::invalid_request(
                 "A final Tasks HTTP subscription is already active on this proxy route",
             ));
@@ -5684,21 +5802,42 @@ impl ProxyBackend for ProxyHttpClient {
                 "A live final Tasks subscription requires taskIds",
             ));
         }
+        let ClientHttpConnection::Modern(client) = &self.connection else {
+            return Ok(None);
+        };
         if self.connection.selected_protocol_era() != ProtocolEra::Modern2026 {
-            return Ok(false);
+            return Ok(None);
         }
+        let client = client.clone();
         let request_id = self.next_request_id()?;
-        let listener = block_on(self.connection.open_subscriptions_listener(
-            &self.cx,
+        self.task_listener_opening = true;
+        Ok(Some(PreparedIncrementalHttpListen {
+            client,
             request_id,
             notifications,
-            Self::sse_limits(),
-        ))
-        .map_err(|error| {
-            McpError::invalid_request(format!(
-                "Proxy HTTP incremental official Tasks listen failed: {error}"
-            ))
-        })?;
+            limits: Self::sse_limits(),
+            cx: self.cx.clone(),
+        }))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn abort_incremental_final_task_listener_opening(&mut self) -> McpResult<()> {
+        self.task_listener_opening = false;
+        Ok(())
+    }
+
+    #[cfg(feature = "tasks")]
+    fn install_incremental_final_task_listener(
+        &mut self,
+        listener: ModernHttpSubscriptionListener,
+    ) -> McpResult<bool> {
+        if self.live_task_listener.is_some() {
+            self.task_listener_opening = false;
+            return Err(McpError::invalid_request(
+                "A final Tasks HTTP subscription is already active on this proxy route",
+            ));
+        }
+        self.task_listener_opening = false;
         self.live_task_listener = Some(listener);
         Ok(true)
     }
@@ -7921,6 +8060,21 @@ impl ProxyClient {
     /// the stream to terminal. Modern HTTP routes store the listener on this
     /// proxy client so the same route can keep issuing ordinary requests.
     pub fn start_catalog_listener(&self, notifications: SubscriptionFilter) -> McpResult<bool> {
+        if let Some(prepared) = self.with_backend(|backend| {
+            backend.prepare_incremental_catalog_listener(notifications.clone())
+        })? {
+            let listener = match prepared.open() {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = self.with_backend(|backend| {
+                        backend.abort_incremental_catalog_listener_opening()
+                    });
+                    return Err(error);
+                }
+            };
+            return self
+                .with_backend(|backend| backend.install_incremental_catalog_listener(listener));
+        }
         self.with_backend(|backend| backend.start_incremental_catalog_listener(notifications))
     }
 
@@ -7958,6 +8112,21 @@ impl ProxyClient {
     /// [`Self::next_final_task_listener_event`] can poll.
     #[cfg(feature = "tasks")]
     pub fn start_final_task_listener(&self, notifications: SubscriptionFilter) -> McpResult<bool> {
+        if let Some(prepared) = self.with_backend(|backend| {
+            backend.prepare_incremental_final_task_listener(notifications.clone())
+        })? {
+            let listener = match prepared.open() {
+                Ok(listener) => listener,
+                Err(error) => {
+                    let _ = self.with_backend(|backend| {
+                        backend.abort_incremental_final_task_listener_opening()
+                    });
+                    return Err(error);
+                }
+            };
+            return self
+                .with_backend(|backend| backend.install_incremental_final_task_listener(listener));
+        }
         self.with_backend(|backend| backend.start_incremental_final_task_listener(notifications))
     }
 
