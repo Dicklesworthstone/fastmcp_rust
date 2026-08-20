@@ -25,11 +25,20 @@
 //! ```
 
 use std::collections::HashMap;
+use std::time::Duration;
 
+use asupersync::Cx;
 use fastmcp_core::{McpContext, McpOutcome, McpResult, Outcome};
-use fastmcp_protocol::{Content, Tool};
+use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
+use fastmcp_protocol::{
+    CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, Tool, ToolAnnotations,
+};
 
-use crate::handler::{BoxFuture, BoxedToolHandler, ToolHandler};
+use crate::bidirectional::MrtrCompletedInputs;
+use crate::handler::{
+    BoxFuture, BoxedToolHandler, FinalToolOutcome, FinalToolSchemaAuthority, ToolErrorKind,
+    ToolHandler, UpstreamFinalToolSchemaRegistration,
+};
 
 /// Sentinel value for unset optional fields.
 #[derive(Debug, Clone, Copy, Default)]
@@ -249,6 +258,78 @@ impl ToolHandler for TransformedTool {
         self.definition.clone()
     }
 
+    fn icon(&self) -> Option<&Icon> {
+        self.parent.icon()
+    }
+
+    fn version(&self) -> Option<&str> {
+        self.parent.version()
+    }
+
+    fn tags(&self) -> &[String] {
+        self.parent.tags()
+    }
+
+    fn annotations(&self) -> Option<&ToolAnnotations> {
+        self.parent.annotations()
+    }
+
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.parent.output_schema()
+    }
+
+    fn final_title(&self) -> Option<&str> {
+        self.parent.final_title()
+    }
+
+    fn final_icons(&self) -> Option<&[RawIcon]> {
+        self.parent.final_icons()
+    }
+
+    fn final_metadata(&self) -> Option<&OpenMetadata> {
+        self.parent.final_metadata()
+    }
+
+    fn final_definition(&self) -> Option<FinalTool> {
+        let mut definition = self.parent.final_definition()?;
+        definition.name.clone_from(&self.definition.name);
+        definition
+            .description
+            .clone_from(&self.definition.description);
+        definition.input_schema =
+            transform_input_schema(&self.arg_transforms, &definition.input_schema);
+        Some(definition)
+    }
+
+    fn final_tool_schema_authority(&self) -> FinalToolSchemaAuthority {
+        self.parent.final_tool_schema_authority()
+    }
+
+    fn upstream_final_tool_schema_registration(
+        &self,
+    ) -> Option<UpstreamFinalToolSchemaRegistration> {
+        self.parent.upstream_final_tool_schema_registration()
+    }
+
+    fn final_tool_error_structured_content(
+        &self,
+        kind: ToolErrorKind,
+    ) -> Option<serde_json::Value> {
+        self.parent.final_tool_error_structured_content(kind)
+    }
+
+    fn declares_final_tasks(&self) -> bool {
+        self.parent.declares_final_tasks()
+    }
+
+    fn declares_final_mrtr(&self) -> bool {
+        self.parent.declares_final_mrtr()
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        self.parent.timeout()
+    }
+
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let transformed_args = self.transform_arguments(arguments)?;
         self.parent.call(ctx, transformed_args)
@@ -262,9 +343,131 @@ impl ToolHandler for TransformedTool {
         Box::pin(async move {
             let transformed_args = match self.transform_arguments(arguments) {
                 Ok(args) => args,
-                Err(e) => return Outcome::Err(e),
+                Err(error) => return Outcome::Err(error),
             };
             self.parent.call_async(ctx, transformed_args).await
+        })
+    }
+
+    fn call_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+        Box::pin(async move {
+            let transformed_args = match self.transform_arguments(arguments) {
+                Ok(args) => args,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.parent
+                .call_async_in_request(ctx, request_cx, transformed_args)
+                .await
+        })
+    }
+
+    fn call_final(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+        self.parent
+            .call_final(ctx, self.transform_arguments(arguments)?)
+    }
+
+    fn call_final_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        Box::pin(async move {
+            let transformed_args = match self.transform_arguments(arguments) {
+                Ok(args) => args,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.parent.call_final_async(ctx, transformed_args).await
+        })
+    }
+
+    fn call_final_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        Box::pin(async move {
+            let transformed_args = match self.transform_arguments(arguments) {
+                Ok(args) => args,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.parent
+                .call_final_async_in_request(ctx, request_cx, transformed_args)
+                .await
+        })
+    }
+
+    fn call_final_outcome(
+        &self,
+        ctx: &McpContext,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolOutcome> {
+        self.parent
+            .call_final_outcome(ctx, self.transform_arguments(arguments)?)
+    }
+
+    fn call_final_outcome_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            let transformed_args = match self.transform_arguments(arguments) {
+                Ok(args) => args,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.parent
+                .call_final_outcome_async(ctx, transformed_args)
+                .await
+        })
+    }
+
+    fn call_final_outcome_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            let transformed_args = match self.transform_arguments(arguments) {
+                Ok(args) => args,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.parent
+                .call_final_outcome_async_in_request(ctx, request_cx, transformed_args)
+                .await
+        })
+    }
+
+    fn call_final_outcome_async_resuming_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+        resume_inputs: Option<&'a MrtrCompletedInputs>,
+    ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+        Box::pin(async move {
+            let transformed_args = match self.transform_arguments(arguments) {
+                Ok(args) => args,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.parent
+                .call_final_outcome_async_resuming_in_request(
+                    ctx,
+                    request_cx,
+                    transformed_args,
+                    resume_inputs,
+                )
+                .await
         })
     }
 }
@@ -364,7 +567,7 @@ impl TransformedToolBuilder {
             .or_else(|| parent.description.clone());
 
         // Transform the input schema
-        let input_schema = self.transform_schema(&parent.input_schema);
+        let input_schema = transform_input_schema(&self.arg_transforms, &parent.input_schema);
 
         Tool {
             name,
@@ -377,118 +580,123 @@ impl TransformedToolBuilder {
             annotations: parent.annotations.clone(),
         }
     }
+}
 
-    /// Transforms the input schema based on argument transforms.
-    fn transform_schema(&self, original: &serde_json::Value) -> serde_json::Value {
-        let mut schema = original.clone();
+/// Rewrites a JSON Schema object according to argument rename/hide/default rules.
+fn transform_input_schema(
+    arg_transforms: &HashMap<String, ArgTransform>,
+    original: &serde_json::Value,
+) -> serde_json::Value {
+    let mut schema = original.clone();
 
-        let Some(obj) = schema.as_object_mut() else {
+    let Some(obj) = schema.as_object_mut() else {
+        return schema;
+    };
+
+    // Ensure properties and required exist as the shapes later mutation
+    // expects. A parent tool may publish a non-object `properties` or
+    // non-array `required`; replacing those malformed members keeps
+    // `build()` from panicking on a definition the caller already owns.
+    if !obj
+        .get("properties")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        obj.insert(String::from("properties"), serde_json::json!({}));
+    }
+    if !obj.get("required").is_some_and(serde_json::Value::is_array) {
+        obj.insert(String::from("required"), serde_json::json!([]));
+    }
+
+    // Track changes to apply
+    // Pre-allocate based on transform count to avoid reallocations
+    let capacity = arg_transforms.len();
+    let mut props_to_remove: Vec<String> = Vec::with_capacity(capacity);
+    let mut props_to_add: Vec<(String, serde_json::Value)> = Vec::with_capacity(capacity);
+    let mut required_renames: Vec<(String, String)> = Vec::with_capacity(capacity);
+    let mut required_removes: Vec<String> = Vec::with_capacity(capacity);
+
+    // First pass: collect property transformations
+    {
+        let Some(props) = obj.get("properties").and_then(serde_json::Value::as_object) else {
             return schema;
         };
 
-        // Ensure properties and required exist as the shapes later mutation
-        // expects. A parent tool may publish a non-object `properties` or
-        // non-array `required`; replacing those malformed members keeps
-        // `build()` from panicking on a definition the caller already owns.
-        if !obj
-            .get("properties")
-            .is_some_and(serde_json::Value::is_object)
-        {
-            obj.insert(String::from("properties"), serde_json::json!({}));
-        }
-        if !obj.get("required").is_some_and(serde_json::Value::is_array) {
-            obj.insert(String::from("required"), serde_json::json!([]));
-        }
+        for (original_name, transform) in arg_transforms {
+            if transform.hide {
+                props_to_remove.push(original_name.clone());
+                required_removes.push(original_name.clone());
+                continue;
+            }
 
-        // Track changes to apply
-        // Pre-allocate based on transform count to avoid reallocations
-        let capacity = self.arg_transforms.len();
-        let mut props_to_remove: Vec<String> = Vec::with_capacity(capacity);
-        let mut props_to_add: Vec<(String, serde_json::Value)> = Vec::with_capacity(capacity);
-        let mut required_renames: Vec<(String, String)> = Vec::with_capacity(capacity);
-        let mut required_removes: Vec<String> = Vec::with_capacity(capacity);
+            if let Some(prop_schema) = props.get(original_name).cloned() {
+                let new_name = transform.name.as_ref().unwrap_or(original_name);
+                let mut new_schema = prop_schema;
 
-        // First pass: collect property transformations
-        {
-            let Some(props) = obj.get("properties").and_then(serde_json::Value::as_object) else {
-                return schema;
-            };
+                // Apply description override
+                if let (Some(desc), Some(schema_obj)) =
+                    (&transform.description, new_schema.as_object_mut())
+                {
+                    schema_obj.insert(String::from("description"), serde_json::json!(desc));
+                }
 
-            for (original_name, transform) in &self.arg_transforms {
-                if transform.hide {
+                // Apply type override
+                if let Some(type_schema) = &transform.type_schema {
+                    new_schema = type_schema.clone();
+                }
+
+                // Apply default override
+                if let (Some(default), Some(schema_obj)) =
+                    (&transform.default, new_schema.as_object_mut())
+                {
+                    schema_obj.insert(String::from("default"), default.clone());
+                }
+
+                if new_name != original_name {
                     props_to_remove.push(original_name.clone());
-                    required_removes.push(original_name.clone());
-                    continue;
-                }
-
-                if let Some(prop_schema) = props.get(original_name).cloned() {
-                    let new_name = transform.name.as_ref().unwrap_or(original_name);
-                    let mut new_schema = prop_schema;
-
-                    // Apply description override
-                    if let (Some(desc), Some(schema_obj)) =
-                        (&transform.description, new_schema.as_object_mut())
-                    {
-                        schema_obj.insert(String::from("description"), serde_json::json!(desc));
-                    }
-
-                    // Apply type override
-                    if let Some(type_schema) = &transform.type_schema {
-                        new_schema = type_schema.clone();
-                    }
-
-                    // Apply default override
-                    if let (Some(default), Some(schema_obj)) =
-                        (&transform.default, new_schema.as_object_mut())
-                    {
-                        schema_obj.insert(String::from("default"), default.clone());
-                    }
-
-                    if new_name != original_name {
-                        props_to_remove.push(original_name.clone());
-                        props_to_add.push((new_name.clone(), new_schema));
-                        required_renames.push((original_name.clone(), new_name.clone()));
-                    } else {
-                        // Update in place
-                        props_to_add.push((original_name.clone(), new_schema));
-                    }
+                    props_to_add.push((new_name.clone(), new_schema));
+                    required_renames.push((original_name.clone(), new_name.clone()));
+                } else {
+                    // Update in place
+                    props_to_add.push((original_name.clone(), new_schema));
                 }
             }
         }
-
-        // Apply property changes
-        if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
-            for name in &props_to_remove {
-                props.remove(name);
-            }
-            for (name, prop_schema) in props_to_add {
-                props.insert(name, prop_schema);
-            }
-        }
-
-        // Apply required array changes
-        if let Some(required) = obj.get_mut("required").and_then(|r| r.as_array_mut()) {
-            // Handle renames
-            for (old_name, new_name) in required_renames {
-                if let Some(idx) = required.iter().position(|v| v.as_str() == Some(&old_name)) {
-                    required[idx] = serde_json::json!(new_name);
-                }
-            }
-            // Handle removes - compare &str directly to avoid allocation
-            required.retain(|v| {
-                v.as_str()
-                    .is_none_or(|s| !required_removes.iter().any(|r| r == s))
-            });
-        }
-
-        schema
     }
+
+    // Apply property changes
+    if let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut()) {
+        for name in &props_to_remove {
+            props.remove(name);
+        }
+        for (name, prop_schema) in props_to_add {
+            props.insert(name, prop_schema);
+        }
+    }
+
+    // Apply required array changes
+    if let Some(required) = obj.get_mut("required").and_then(|r| r.as_array_mut()) {
+        // Handle renames
+        for (old_name, new_name) in required_renames {
+            if let Some(idx) = required.iter().position(|v| v.as_str() == Some(&old_name)) {
+                required[idx] = serde_json::json!(new_name);
+            }
+        }
+        // Handle removes - compare &str directly to avoid allocation
+        required.retain(|v| {
+            v.as_str()
+                .is_none_or(|s| !required_removes.iter().any(|r| r == s))
+        });
+    }
+
+    schema
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastmcp_core::block_on;
     use fastmcp_protocol::Content;
+    use fastmcp_protocol::common_types::ContentBlock;
 
     struct SearchToolFixture {
         name: String,
@@ -1373,5 +1581,255 @@ mod tests {
         assert!(q_schema["items"].is_object());
         // The old description should NOT be present (type_schema replaces entirely)
         assert!(q_schema.get("description").is_none());
+    }
+
+    struct FinalAwareParent {
+        recorded: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+        resume_hook_invoked: std::sync::Arc<std::sync::Mutex<bool>>,
+    }
+
+    impl FinalAwareParent {
+        fn new() -> Self {
+            Self {
+                recorded: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                resume_hook_invoked: std::sync::Arc::new(std::sync::Mutex::new(false)),
+            }
+        }
+
+        fn search_schema() -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" },
+                    "n": { "type": "integer" }
+                },
+                "required": ["q"]
+            })
+        }
+    }
+
+    impl ToolHandler for FinalAwareParent {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "search".to_string(),
+                description: Some("Search tool".to_string()),
+                input_schema: Self::search_schema(),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+                annotations: None,
+            }
+        }
+
+        fn timeout(&self) -> Option<Duration> {
+            Some(Duration::from_secs(3))
+        }
+
+        fn declares_final_mrtr(&self) -> bool {
+            true
+        }
+
+        fn final_title(&self) -> Option<&str> {
+            Some("Search")
+        }
+
+        fn final_definition(&self) -> Option<FinalTool> {
+            Some(FinalTool {
+                name: "search".to_string(),
+                title: Some("Search".to_string()),
+                description: Some("Search tool".to_string()),
+                icons: None,
+                input_schema: Self::search_schema(),
+                output_schema: None,
+                annotations: None,
+                meta: None,
+            })
+        }
+
+        fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            *self
+                .recorded
+                .lock()
+                .expect("final-aware parent argument log is not poisoned") = Some(arguments);
+            Ok(vec![Content::text("legacy")])
+        }
+
+        fn call_final(
+            &self,
+            _ctx: &McpContext,
+            arguments: serde_json::Value,
+        ) -> McpResult<CompleteResult<FinalCallToolResult>> {
+            *self
+                .recorded
+                .lock()
+                .expect("final-aware parent argument log is not poisoned") = Some(arguments);
+            crate::handler::promote_legacy_tool_content(vec![Content::text("final")])
+        }
+
+        fn call_final_outcome_async_resuming_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: serde_json::Value,
+            _resume_inputs: Option<&'a MrtrCompletedInputs>,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                *self
+                    .resume_hook_invoked
+                    .lock()
+                    .expect("final-aware parent resume log is not poisoned") = true;
+                match self.call_final(ctx, arguments) {
+                    Ok(result) => Outcome::Ok(FinalToolOutcome::Complete(result)),
+                    Err(error) => Outcome::Err(error),
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn transformed_tool_forwards_timeout_and_final_definition() {
+        let transformed = TransformedTool::from_tool(FinalAwareParent::new())
+            .name("semantic_search")
+            .rename_arg("q", "query")
+            .hide_arg("n", 10)
+            .build();
+
+        assert_eq!(transformed.timeout(), Some(Duration::from_secs(3)));
+        assert!(transformed.declares_final_mrtr());
+        assert_eq!(transformed.final_title(), Some("Search"));
+
+        let final_definition = transformed
+            .final_definition()
+            .expect("parent final definition must survive the transform wrapper");
+        assert_eq!(final_definition.name, "semantic_search");
+        assert_eq!(final_definition.title.as_deref(), Some("Search"));
+        let properties = final_definition.input_schema["properties"]
+            .as_object()
+            .expect("final input schema keeps object properties");
+        assert!(
+            properties.contains_key("query"),
+            "final catalog must publish the renamed argument: {properties:?}"
+        );
+        assert!(
+            !properties.contains_key("q"),
+            "final catalog must not keep the unpublished original name: {properties:?}"
+        );
+        assert!(
+            !properties.contains_key("n"),
+            "final catalog must hide the dropped argument: {properties:?}"
+        );
+    }
+
+    #[test]
+    fn transformed_tool_call_final_uses_parent_final_hook_with_mapped_args() {
+        let parent = FinalAwareParent::new();
+        let recorded = std::sync::Arc::clone(&parent.recorded);
+        let transformed = TransformedTool::from_tool(parent)
+            .name("semantic_search")
+            .rename_arg("q", "query")
+            .hide_arg("n", 10)
+            .build();
+
+        let cx = asupersync::Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let result = transformed
+            .call_final(&ctx, serde_json::json!({"query": "test"}))
+            .expect("transformed final call must succeed");
+        match result.payload.content.as_slice() {
+            [ContentBlock::Text { text, .. }] => {
+                assert_eq!(
+                    text, "final",
+                    "TransformedTool must invoke the parent final hook instead of promoting call()"
+                );
+            }
+            other => panic!("expected one final text block, got {other:?}"),
+        }
+        let recorded = recorded
+            .lock()
+            .expect("final-aware parent argument log is not poisoned")
+            .clone()
+            .expect("parent final hook must observe mapped arguments");
+        assert_eq!(recorded["q"], "test");
+        assert_eq!(recorded["n"], 10);
+        assert!(
+            recorded.get("query").is_none(),
+            "parent must see original names, not the published aliases: {recorded}"
+        );
+    }
+
+    #[test]
+    fn transformed_tool_call_final_does_not_promote_legacy_call() {
+        let parent = FinalAwareParent::new();
+        let transformed = TransformedTool::from_tool(parent)
+            .rename_arg("q", "query")
+            .build();
+
+        let cx = asupersync::Cx::for_testing();
+        let ctx = McpContext::new(cx, 1);
+        let legacy = transformed
+            .call(&ctx, serde_json::json!({"query": "legacy-path"}))
+            .expect("legacy call still works");
+        match &legacy[0] {
+            Content::Text { text, .. } => assert_eq!(text, "legacy"),
+            other => panic!("expected legacy text content, got {other:?}"),
+        }
+
+        let final_result = transformed
+            .call_final(&ctx, serde_json::json!({"query": "final-path"}))
+            .expect("final call still works");
+        match final_result.payload.content.as_slice() {
+            [ContentBlock::Text { text, .. }] => {
+                assert_eq!(text, "final");
+                assert_ne!(
+                    text, "legacy",
+                    "the planted dimension is which parent hook ran"
+                );
+            }
+            other => panic!("expected one final text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transformed_tool_forwards_mrtr_resume_hook() {
+        let parent = FinalAwareParent::new();
+        let resume_hook_invoked = std::sync::Arc::clone(&parent.resume_hook_invoked);
+        let transformed = TransformedTool::from_tool(parent)
+            .rename_arg("q", "query")
+            .build();
+
+        let cx = asupersync::Cx::for_testing();
+        let ctx = McpContext::new(cx.clone(), 1);
+        let outcome = block_on(transformed.call_final_outcome_async_resuming_in_request(
+            &ctx,
+            &cx,
+            serde_json::json!({"query": "resume"}),
+            None,
+        ));
+        match outcome {
+            Outcome::Ok(FinalToolOutcome::Complete(result)) => {
+                match result.payload.content.as_slice() {
+                    [ContentBlock::Text { text, .. }] => {
+                        assert_eq!(text, "final");
+                    }
+                    other => panic!("expected one final text block, got {other:?}"),
+                }
+            }
+            other => panic!(
+                "expected a complete final outcome, got {}",
+                match other {
+                    Outcome::Ok(_) => "Ok(non-complete)",
+                    Outcome::Err(_) => "Err",
+                    Outcome::Cancelled(_) => "Cancelled",
+                    Outcome::Panicked(_) => "Panicked",
+                }
+            ),
+        }
+        assert!(
+            *resume_hook_invoked
+                .lock()
+                .expect("final-aware parent resume log is not poisoned"),
+            "TransformedTool must call the parent MRTR resume hook instead of dropping resume inputs"
+        );
     }
 }
