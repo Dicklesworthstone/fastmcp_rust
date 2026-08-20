@@ -45492,8 +45492,16 @@ mod lib_unit_tests {
             "Stream election marks modern HTTP control not-required"
         );
         assert!(
-            !delivery.is_committed(),
+            delivery.is_committed(),
+            "control-not-required is the committed control half so a cancelled request stays live until complete"
+        );
+        assert!(
+            delivery.completion_is_open(),
             "peer cancel after acknowledgement still has no complete enqueued"
+        );
+        assert!(
+            !delivery.is_settled(),
+            "an unelected complete must keep the drain receipt open"
         );
         delivery.mark_failed();
         assert!(
