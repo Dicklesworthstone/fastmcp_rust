@@ -2675,8 +2675,8 @@ impl ProxyBackend for Client {
                 "Proxy stdio modern completion parameters could not serialize: {error}"
             ))
         })?;
-        if let Some(marker) = expected_marker.as_ref() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         parameters = stdio_parameters_with_inbound_identity(
             self.selected_protocol_era(),
@@ -5228,7 +5228,7 @@ impl ProxyBackend for ProxyHttpClient {
     ) -> McpResult<CoreResult> {
         let mut parameters = self.completion_parameters(params)?;
         if let Some(marker) = ctx.progress_marker() {
-            parameters["_meta"] = serde_json::json!({"progressToken": marker});
+            overlay_legacy_progress_token(&mut parameters, marker)?;
         }
         self.request_result_with_context_and_final_progress(
             Some(ctx),
@@ -7007,7 +7007,7 @@ impl ProxyClient {
         let mut tasks = BTreeMap::new();
         for (task_id, retained) in &registry.tasks {
             tasks.insert(
-                task_id.to_string(),
+                task_id.as_str().to_owned(),
                 serde_json::to_value(&retained.task).map_err(|_| {
                     McpError::internal_error(
                         "Proxy relayed final Task snapshot serialization failed",

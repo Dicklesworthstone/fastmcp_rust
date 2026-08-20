@@ -1604,6 +1604,17 @@ fn duplicate_registration_error(component: &'static str, key: &str) -> McpError 
     ))
 }
 
+/// Returns whether `error` is a duplicate-registration refusal from
+/// [`duplicate_registration_error`].
+///
+/// Prefixed `as_proxy_typed` may skip one colliding catalog member under
+/// [`crate::DuplicateBehavior::Error`]. Other admission failures (schema,
+/// metadata, panic-during-definition) must still fail the install.
+pub(crate) fn is_duplicate_registration_error(error: &McpError) -> bool {
+    error.code == McpErrorCode::InvalidRequest
+        && error.message.contains(" already exists; component_key=")
+}
+
 fn compose_handler_budget(
     ambient: Budget,
     server_or_request: Budget,
@@ -12063,7 +12074,23 @@ mod router_tests {
         for error in [tool_error, resource_error, template_error, prompt_error] {
             assert!(error.message.contains("already exists"));
             assert!(!error.message.contains(canary));
+            assert!(
+                is_duplicate_registration_error(&error),
+                "duplicate registration errors must be recognizable without the peer key: {error:?}"
+            );
         }
+        assert!(
+            !is_duplicate_registration_error(&McpError::internal_error(
+                "tool metadata hook panicked during admission"
+            )),
+            "a non-duplicate admission failure must not be treated as a colliding catalog skip"
+        );
+        assert!(
+            !is_duplicate_registration_error(&McpError::invalid_request(
+                "MCP Apps tool metadata requires ServerBuilder::mcp_apps_tool"
+            )),
+            "an InvalidRequest that is not a duplicate must still fail prefixed as_proxy_typed"
+        );
     }
 
     // ── add_resource_template ──────────────────────────────────────────
@@ -12463,7 +12490,8 @@ mod router_tests {
     fn mount_namespaced_prefixes_tools_and_keeps_resource_uris() {
         let mut main = Router::new();
         let mut sub = Router::new();
-        sub.add_tool(NamedTool::new("query"));
+        sub.add_tool(NamedTool::new("query"))
+            .expect("namespaced query tool registers");
         sub.add_resource(NamedResource::new("file:///a"));
         let result =
             main.mount_namespaced_with_behavior(sub, Some("ns"), crate::DuplicateBehavior::Replace);

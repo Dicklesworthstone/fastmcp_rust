@@ -1762,7 +1762,6 @@ mod tests {
         McpContext::new(asupersync::Cx::for_testing(), 1)
     }
 
-    #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn public_build_constructs_a_handler_on_qualified_targets() {

@@ -43861,7 +43861,7 @@ mod live_websocket_bind {
         });
     }
 
-    #[cfg(feature = "proxy")]
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
     fn e2e_public_websocket_as_proxy_advertises_completions_when_upstream_supports() {
         let runtime = websocket_test_runtime();

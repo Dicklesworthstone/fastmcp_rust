@@ -1109,6 +1109,21 @@ impl ServerBuilder {
             || self.on_duplicate == DuplicateBehavior::Replace
     }
 
+    /// Skips one colliding prefixed catalog member under
+    /// [`DuplicateBehavior::Error`]. Other admission failures still fail the
+    /// `as_proxy_typed` install so a schema or metadata defect is not logged
+    /// away as a duplicate skip.
+    #[cfg(feature = "proxy")]
+    fn absorb_prefixed_proxy_duplicate(
+        error: fastmcp_core::McpError,
+    ) -> Result<(), fastmcp_core::McpError> {
+        if crate::router::is_duplicate_registration_error(&error) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
     /// Installs one route-bound modern Tasks relay into every server surface
     /// that owns Tasks discovery and dispatch. Exact-2024 never supplies a
     /// relay, so callers pass `None` for its selected upstream era.
@@ -1575,6 +1590,7 @@ impl ServerBuilder {
                             "Failed to register prefixed proxied tool; code={:?}",
                             error.code
                         );
+                        Self::absorb_prefixed_proxy_duplicate(error)?;
                     }
                 }
                 for resource in resources {
@@ -1587,6 +1603,7 @@ impl ServerBuilder {
                             "Failed to register prefixed proxied resource; code={:?}",
                             error.code
                         );
+                        Self::absorb_prefixed_proxy_duplicate(error)?;
                     }
                 }
                 for template in resource_templates {
@@ -1620,6 +1637,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed proxied resource template; code={:?}",
                                 error.code
                             );
+                            Self::absorb_prefixed_proxy_duplicate(error)?;
                         }
                     }
                 }
@@ -1650,6 +1668,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed proxied prompt; code={:?}",
                                 error.code
                             );
+                            Self::absorb_prefixed_proxy_duplicate(error)?;
                         }
                     }
                 }
@@ -1695,6 +1714,7 @@ impl ServerBuilder {
                             "Failed to register prefixed exact-final proxied tool; code={:?}",
                             error.code
                         );
+                        Self::absorb_prefixed_proxy_duplicate(error)?;
                     }
                 }
                 for resource in resources {
@@ -1707,6 +1727,7 @@ impl ServerBuilder {
                             "Failed to register prefixed exact-final proxied resource; code={:?}",
                             error.code
                         );
+                        Self::absorb_prefixed_proxy_duplicate(error)?;
                     }
                 }
                 for template in resource_templates {
@@ -1735,6 +1756,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed exact-final proxied resource template; code={:?}",
                                 error.code
                             );
+                            Self::absorb_prefixed_proxy_duplicate(error)?;
                         }
                     }
                 }
@@ -1765,6 +1787,7 @@ impl ServerBuilder {
                                 "Failed to register prefixed exact-final proxied prompt; code={:?}",
                                 error.code
                             );
+                            Self::absorb_prefixed_proxy_duplicate(error)?;
                         }
                     }
                 }
@@ -5545,11 +5568,15 @@ mod tests {
                 "the one-field capability rejection must not mutate local subscription delivery state"
             );
             assert_eq!(
-                emitted_notifications
-                    .lock()
-                    .expect("ordinary proxy emitted notification log is not poisoned")
-                    .clone(),
-                emitted_before_rejection,
+                serde_json::to_value(
+                    emitted_notifications
+                        .lock()
+                        .expect("ordinary proxy emitted notification log is not poisoned")
+                        .clone()
+                )
+                .expect("emitted notification log serializes"),
+                serde_json::to_value(emitted_before_rejection)
+                    .expect("baseline notification log serializes"),
                 "the one-field capability rejection must not emit or alter local notification state"
             );
 
@@ -7080,6 +7107,30 @@ mod tests {
             .prompt(DupPrompt("dup"))
             .build();
         assert!(server.has_prompts());
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn prefixed_as_proxy_skips_only_duplicate_registration_errors() {
+        let duplicate =
+            fastmcp_core::McpError::invalid_request("Tool already exists; component_key=tool_key");
+        assert!(
+            ServerBuilder::absorb_prefixed_proxy_duplicate(duplicate).is_ok(),
+            "a colliding prefixed catalog member may skip under DuplicateBehavior::Error"
+        );
+        let panicked =
+            fastmcp_core::McpError::internal_error("tool metadata hook panicked during admission");
+        assert!(
+            ServerBuilder::absorb_prefixed_proxy_duplicate(panicked).is_err(),
+            "a non-duplicate admission failure must fail the as_proxy_typed install"
+        );
+        let apps = fastmcp_core::McpError::invalid_request(
+            "MCP Apps tool metadata requires ServerBuilder::mcp_apps_tool",
+        );
+        assert!(
+            ServerBuilder::absorb_prefixed_proxy_duplicate(apps).is_err(),
+            "InvalidRequest that is not a duplicate must not be skipped"
+        );
     }
 
     // ── Proxy with resources and prompts ─────────────────────────────
