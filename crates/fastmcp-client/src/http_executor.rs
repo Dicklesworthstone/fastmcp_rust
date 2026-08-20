@@ -9,7 +9,7 @@ use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll;
+use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
 use asupersync::Cx;
@@ -683,15 +683,69 @@ impl ModernHttpSubscriptionListener {
         cx: &Cx,
     ) -> Result<Option<ModernHttpSubscriptionListenEvent>, ModernHttpSubscriptionListenError> {
         let result = self.next_event_inner(cx).await;
+        self.close_after_listen_result(&result);
+        result
+    }
+
+    /// Polls for one validated record without waiting on the SSE body.
+    ///
+    /// `Ok(None)` means the stream has no complete record ready.
+    pub fn try_next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpSubscriptionListenEvent>, ModernHttpSubscriptionListenError> {
+        if self.terminal_received {
+            return Err(ModernHttpSubscriptionListenError::EndOfStream {
+                framing: self.stream.end_of_stream(),
+            });
+        }
+        if cx.checkpoint().is_err() {
+            self.stream.close();
+            return Err(ModernHttpSubscriptionListenError::CallerCancelled {
+                request_id: self.request_id.clone(),
+            });
+        }
+        let payload = match self.stream.try_next_event(cx) {
+            Ok(Poll::Pending) => return Ok(None),
+            Ok(Poll::Ready(Some(payload))) => payload,
+            Ok(Poll::Ready(None)) => {
+                let error = ModernHttpSubscriptionListenError::EndOfStream {
+                    framing: self.stream.end_of_stream(),
+                };
+                self.stream.close();
+                return Err(error);
+            }
+            Err(ModernHttpExecutorError::Cancelled) => {
+                self.stream.close();
+                return Err(ModernHttpSubscriptionListenError::CallerCancelled {
+                    request_id: self.request_id.clone(),
+                });
+            }
+            Err(error) => {
+                self.stream.close();
+                return Err(ModernHttpSubscriptionListenError::Executor(error));
+            }
+        };
+        let result = self.admit_listen_payload(payload).map(Some);
+        self.close_after_listen_result(&result);
+        result
+    }
+
+    fn close_after_listen_result(
+        &mut self,
+        result: &Result<
+            Option<ModernHttpSubscriptionListenEvent>,
+            ModernHttpSubscriptionListenError,
+        >,
+    ) {
         if result.is_err()
             || matches!(
-                &result,
+                result,
                 Ok(Some(ModernHttpSubscriptionListenEvent::Terminal { .. }))
             )
         {
             self.stream.close();
         }
-        result
     }
 
     async fn next_event_inner(
@@ -716,6 +770,13 @@ impl ModernHttpSubscriptionListener {
             }
             Err(error) => return Err(ModernHttpSubscriptionListenError::Executor(error)),
         };
+        self.admit_listen_payload(event).map(Some)
+    }
+
+    fn admit_listen_payload(
+        &mut self,
+        event: String,
+    ) -> Result<ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListenError> {
         let message = decode_strict_jsonrpc_message(event.as_bytes(), self.maximum_jsonrpc_bytes)
             .map_err(ModernHttpSubscriptionListenError::JsonRpcAdmission)?;
 
@@ -740,10 +801,10 @@ impl ModernHttpSubscriptionListener {
                     return Err(ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement);
                 }
                 self.terminal_received = true;
-                Ok(Some(ModernHttpSubscriptionListenEvent::Terminal {
+                Ok(ModernHttpSubscriptionListenEvent::Terminal {
                     subscription_id,
                     result,
-                }))
+                })
             }
             JsonRpcMessage::Request(request) => {
                 #[cfg(feature = "tasks")]
@@ -781,9 +842,9 @@ impl ModernHttpSubscriptionListener {
                             ModernHttpSubscriptionListenError::TaskEventOutsideAcceptedFilter,
                         );
                     }
-                    return Ok(Some(ModernHttpSubscriptionListenEvent::TaskNotification(
+                    return Ok(ModernHttpSubscriptionListenEvent::TaskNotification(
                         notification,
-                    )));
+                    ));
                 }
                 #[cfg(not(feature = "tasks"))]
                 if request.id.is_none() && request.method == "notifications/tasks" {
@@ -812,9 +873,7 @@ impl ModernHttpSubscriptionListener {
                         )?;
                         let accepted_filter = acknowledgement.notifications;
                         self.accepted_filter = Some(accepted_filter.clone());
-                        Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged {
-                            accepted_filter,
-                        }))
+                        Ok(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter })
                     }
                     ServerNotification::Cancelled(_) => {
                         Err(ModernHttpSubscriptionListenError::ServerCancellationOnHttp)
@@ -832,9 +891,9 @@ impl ModernHttpSubscriptionListener {
                             &notification,
                             accepted_filter,
                         )?;
-                        Ok(Some(ModernHttpSubscriptionListenEvent::Notification(
+                        Ok(ModernHttpSubscriptionListenEvent::Notification(
                             notification,
-                        )))
+                        ))
                     }
                     ServerNotification::Progress(_) | ServerNotification::Message(_) => {
                         // `subscriptions/listen` admits only the categories
@@ -1417,8 +1476,7 @@ impl ModernHttpSseResponseStream {
             self.close();
             return Err(ModernHttpExecutorError::Cancelled);
         }
-        if let Some(event) = self.pending_events.pop_front() {
-            self.pending_event_bytes = self.pending_event_bytes.saturating_sub(event.len());
+        if let Some(event) = self.take_pending_sse_event() {
             return Ok(Some(event));
         }
         if self.end_of_stream.is_some() {
@@ -1489,11 +1547,75 @@ impl ModernHttpSseResponseStream {
                 self.push_body_frame(chunk)?;
                 data.advance(chunk.len());
             }
-            if let Some(event) = self.pending_events.pop_front() {
-                self.pending_event_bytes = self.pending_event_bytes.saturating_sub(event.len());
+            if let Some(event) = self.take_pending_sse_event() {
                 return Ok(Some(event));
             }
         }
+    }
+
+    fn take_pending_sse_event(&mut self) -> Option<String> {
+        let event = self.pending_events.pop_front()?;
+        self.pending_event_bytes = self.pending_event_bytes.saturating_sub(event.len());
+        Some(event)
+    }
+
+    /// Polls for one completed SSE `data` payload without waiting on the body.
+    ///
+    /// `Poll::Pending` means the body has no frame ready, so a proxy route can
+    /// drop its mutex instead of holding it across the next SSE wait.
+    pub fn try_next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Poll<Option<String>>, ModernHttpExecutorError> {
+        if cx.checkpoint().is_err() {
+            self.close();
+            return Err(ModernHttpExecutorError::Cancelled);
+        }
+        if let Some(event) = self.take_pending_sse_event() {
+            return Ok(Poll::Ready(Some(event)));
+        }
+        if self.end_of_stream.is_some() {
+            return Ok(Poll::Ready(None));
+        }
+        let waker = Waker::noop();
+        let mut task_cx = Context::from_waker(&waker);
+        let response = self
+            .response
+            .as_mut()
+            .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
+        let Poll::Ready(frame) = Pin::new(&mut response.body).poll_frame(&mut task_cx) else {
+            return Ok(Poll::Pending);
+        };
+        let frame = reject_body_frame_after_cancellation(cx, frame)?;
+        let Some(frame) = frame else {
+            let parser = self
+                .parser
+                .take()
+                .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
+            let end_of_stream = parser.finish().map_err(ModernHttpExecutorError::SseParse)?;
+            self.response = None;
+            self.end_of_stream = Some(end_of_stream);
+            return Ok(Poll::Ready(None));
+        };
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(_) => {
+                self.close();
+                return Err(ModernHttpExecutorError::ResponseBodyReadFailed);
+            }
+        };
+        let Some(mut data) = frame.into_data() else {
+            return Ok(Poll::Pending);
+        };
+        while data.has_remaining() {
+            let chunk = data.chunk();
+            self.push_body_frame(chunk)?;
+            data.advance(chunk.len());
+        }
+        if let Some(event) = self.take_pending_sse_event() {
+            return Ok(Poll::Ready(Some(event)));
+        }
+        Ok(Poll::Pending)
     }
 
     /// Returns the parser's EOF report once [`Self::next_event`] observed EOF.

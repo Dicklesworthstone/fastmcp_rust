@@ -1423,9 +1423,9 @@ pub trait ProxyBackend: Send {
         ))
     }
 
-    /// Takes a ready incremental catalog event, or drives one bounded stdio
-    /// receive turn. `None` means the bound elapsed without an event.
-    #[cfg(feature = "tasks")]
+    /// Takes a ready incremental catalog event, or drives one bounded receive
+    /// turn. `None` means the bound elapsed without an event so the caller can
+    /// drop the route mutex instead of waiting on SSE or stdio.
     fn try_next_incremental_catalog_listener(
         &mut self,
         cx: &Cx,
@@ -5601,17 +5601,36 @@ impl ProxyBackend for ProxyHttpClient {
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<StdioSubscriptionEvent> {
+        loop {
+            if let Some(event) =
+                self.try_next_incremental_catalog_listener(cx, request_cancellation)?
+            {
+                return Ok(event);
+            }
+            if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                self.live_catalog_listener = None;
+                return Err(McpError::request_cancelled());
+            }
+            block_on(asupersync::time::sleep(
+                cx.now(),
+                std::time::Duration::from_millis(20),
+            ));
+        }
+    }
+
+    fn try_next_incremental_catalog_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<StdioSubscriptionEvent>> {
         if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             self.live_catalog_listener = None;
             return Err(McpError::request_cancelled());
         }
-        let event = {
-            let listener = self.live_catalog_listener.as_mut().ok_or_else(|| {
-                McpError::invalid_request("No live HTTP catalog subscription is active")
-            })?;
-            block_on(listener.next_event(cx))
-        };
-        let event = match event {
+        let listener = self.live_catalog_listener.as_mut().ok_or_else(|| {
+            McpError::invalid_request("No live HTTP catalog subscription is active")
+        })?;
+        let event = match listener.try_next_event(cx) {
             Ok(event) => event,
             Err(error) => {
                 self.live_catalog_listener = None;
@@ -5621,11 +5640,12 @@ impl ProxyBackend for ProxyHttpClient {
             }
         };
         match event {
+            None => Ok(None),
             Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
-                Ok(StdioSubscriptionEvent::Acknowledged(accepted_filter))
+                Ok(Some(StdioSubscriptionEvent::Acknowledged(accepted_filter)))
             }
             Some(ModernHttpSubscriptionListenEvent::Notification(notification)) => {
-                Ok(StdioSubscriptionEvent::Notification(notification))
+                Ok(Some(StdioSubscriptionEvent::Notification(notification)))
             }
             #[cfg(feature = "tasks")]
             Some(ModernHttpSubscriptionListenEvent::TaskNotification(_)) => {
@@ -5636,13 +5656,7 @@ impl ProxyBackend for ProxyHttpClient {
             }
             Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
                 self.live_catalog_listener = None;
-                Ok(StdioSubscriptionEvent::Terminal)
-            }
-            None => {
-                self.live_catalog_listener = None;
-                Err(McpError::invalid_request(
-                    "Proxy HTTP incremental catalog listener ended after its terminal result",
-                ))
+                Ok(Some(StdioSubscriptionEvent::Terminal))
             }
         }
     }
@@ -5740,6 +5754,53 @@ impl ProxyBackend for ProxyHttpClient {
                 Err(McpError::invalid_request(
                     "Proxy HTTP incremental official Tasks listener ended after its terminal result",
                 ))
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn try_next_incremental_final_task_listener(
+        &mut self,
+        cx: &Cx,
+        request_cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<Option<ProxyFinalTaskListenerEvent>> {
+        if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.live_task_listener = None;
+            return Err(McpError::request_cancelled());
+        }
+        let listener = self.live_task_listener.as_mut().ok_or_else(|| {
+            McpError::invalid_request("No live HTTP official Tasks subscription is active")
+        })?;
+        let event = match listener.try_next_event(cx) {
+            Ok(event) => event,
+            Err(ModernHttpSubscriptionListenError::CallerCancelled { .. }) => {
+                self.live_task_listener = None;
+                return Err(McpError::request_cancelled());
+            }
+            Err(error) => {
+                self.live_task_listener = None;
+                return Err(McpError::invalid_request(format!(
+                    "Proxy HTTP incremental official Tasks listener failed: {error}"
+                )));
+            }
+        };
+        match event {
+            None => Ok(None),
+            Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => Ok(Some(
+                ProxyFinalTaskListenerEvent::Acknowledged(accepted_filter),
+            )),
+            Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => Ok(Some(
+                ProxyFinalTaskListenerEvent::Notification(notification),
+            )),
+            Some(ModernHttpSubscriptionListenEvent::Notification(_)) => {
+                self.live_task_listener = None;
+                Err(McpError::invalid_request(
+                    "Proxy incremental official Tasks listener received a catalog event",
+                ))
+            }
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
+                self.live_task_listener = None;
+                Ok(Some(ProxyFinalTaskListenerEvent::Terminal))
             }
         }
     }
@@ -7864,14 +7925,29 @@ impl ProxyClient {
     }
 
     /// Drives one incremental catalog listener event on this proxy route.
+    ///
+    /// The route mutex is held only to poll or bound-receive. Waiting for the
+    /// next SSE or stdio frame happens after the lock is released so the same
+    /// route can still issue ordinary requests.
     pub fn next_catalog_listener_event(
         &self,
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<fastmcp_client::StdioSubscriptionEvent> {
-        self.with_backend(|backend| {
-            backend.next_incremental_catalog_listener(cx, request_cancellation)
-        })
+        loop {
+            if let Some(event) = self.with_backend(|backend| {
+                backend.try_next_incremental_catalog_listener(cx, request_cancellation)
+            })? {
+                return Ok(event);
+            }
+            if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                return Err(McpError::request_cancelled());
+            }
+            block_on(asupersync::time::sleep(
+                cx.now(),
+                std::time::Duration::from_millis(20),
+            ));
+        }
     }
 
     /// Starts an incremental official Tasks listener on a stdio or HTTP
@@ -7893,9 +7969,21 @@ impl ProxyClient {
         cx: &Cx,
         request_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<StdioTaskSubscriptionEvent> {
-        match self.with_backend(|backend| {
-            backend.next_incremental_final_task_listener(cx, request_cancellation)
-        })? {
+        let event = loop {
+            if let Some(event) = self.with_backend(|backend| {
+                backend.try_next_incremental_final_task_listener(cx, request_cancellation)
+            })? {
+                break event;
+            }
+            if request_cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                return Err(McpError::request_cancelled());
+            }
+            block_on(asupersync::time::sleep(
+                cx.now(),
+                std::time::Duration::from_millis(20),
+            ));
+        };
+        match event {
             ProxyFinalTaskListenerEvent::Acknowledged(filter) => {
                 Ok(StdioTaskSubscriptionEvent::Acknowledged(filter))
             }
