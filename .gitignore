@@ -66,3 +66,15 @@ beads_compliance_audit/
 
 # Beads compliance audit dir (managed by /beads-compliance-and-completion-verification skill)
 /beads_compliance_audit/
+
+# WAL certification sidecars (`*.db-wal` does not match beads.db-wal-cert).
+# Per-machine br fsqlite probes, like -wal/-shm; never canonical tracker state.
+.beads/*.db-wal-cert
+.beads/*.db-wal-cert-head
+
+# Remote compilation helper target trees (worker-local cargo target, gigabytes).
+.rch-target/
+.rch-target-*/
+
+# Isolated worktree-verify clones; never product source.
+.wm-verify*/
