@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-redis = { version = "=1.6.0", default-features = false, features = ["acl", "script"] }
+redis = { version = "=1.4.1", default-features = false, features = ["acl", "script"] }
 
 [lib]
 path = "src/lib.rs"
