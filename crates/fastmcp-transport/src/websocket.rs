@@ -4579,7 +4579,7 @@ mod tests {
             ),
             Err(TransportError::Cancelled)
         ));
-        assert!(
+        assert_eq!(
             send_half
                 .writer
                 .inner
@@ -4587,7 +4587,8 @@ mod tests {
                 .expect("split writer lock")
                 .writer
                 .writer
-                .is_empty()
+                .len(),
+            0
         );
     }
 
@@ -5158,7 +5159,7 @@ mod tests {
             ),
             Err(TransportError::Closed)
         ));
-        assert!(
+        assert_eq!(
             send_half
                 .writer
                 .inner
@@ -5166,7 +5167,8 @@ mod tests {
                 .expect("server split writer lock")
                 .writer
                 .writer
-                .is_empty()
+                .len(),
+            0
         );
     }
 
