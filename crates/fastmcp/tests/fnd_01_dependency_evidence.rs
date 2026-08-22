@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 904795;
 const FROZEN_POLICY_SHA256: &str =
-    "f6f9f5685fa13a374254bbb722c1396df261fc1199450b478aec2a19ac9cfcfb";
+    "dd136717c60e59dfff3ccd2cbe64ccd7f8771d673abc4b8efb6f0cd0e176f098";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 

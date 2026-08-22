@@ -1,6 +1,6 @@
 {
   "archive_sha256": "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd",
-  "candidate_above_pin_available": false,
+  "candidate_above_pin": "none available; crates.io max_version = 0.4.9 at census 2026-08-22",
   "crate_download_url": "https://static.crates.io/crates/asupersync/asupersync-0.4.9.crate",
   "crate_sha256": "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd",
   "description": "Spec-first, cancel-correct, capability-secure async runtime for Rust.",
