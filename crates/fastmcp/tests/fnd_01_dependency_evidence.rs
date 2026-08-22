@@ -33734,7 +33734,7 @@ _ => unreachable!("closed family matrix"),
 
 #[rustfmt::skip]
 mod bootstrap {
-    #[cfg(any(fnd01_bootstrap, test))]
+    #[cfg(any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64")))]
     use super::phase_b_std::run_phase_b;
     use super::trust_std::{
         BootstrapMode, TrustError, TrustResult, build_gate_handshake,
@@ -33755,11 +33755,11 @@ mod bootstrap {
         MAX_PACKAGE_ARTIFACT_BYTES, MAX_RECEIPT_BYTES,
         MAX_SUPPLY_BUNDLE_BYTES,
     };
-    #[cfg(any(fnd01_bootstrap, test))]
+    #[cfg(any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64")))]
     use super::trust_std::{
         emit_entry_diagnostic, has_exact_gate_intent, parse_integration_seal,
     };
-    #[cfg(any(fnd01_bootstrap, test))]
+    #[cfg(any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64")))]
     use std::cell::Cell;
     use std::ffi::OsString;
 
@@ -34021,7 +34021,7 @@ mod bootstrap {
         emit_gate_handshake(&handshake)
     }
 
-    #[cfg(any(fnd01_bootstrap, test))]
+    #[cfg(any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64")))]
     pub(super) fn run_role(arguments: Vec<OsString>) -> TrustResult<()> {
         let arguments = parse_bootstrap_arguments(arguments)?;
         if arguments.mode == BootstrapMode::Gate {
