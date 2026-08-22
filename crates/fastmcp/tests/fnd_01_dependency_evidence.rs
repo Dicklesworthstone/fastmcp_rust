@@ -34286,7 +34286,7 @@ mod ordinary {
     );
     const ACTION_CHECKOUT: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
     const ACTION_RUST_TOOLCHAIN: &str =
-        "dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c";
+        "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
     const ACTION_RUST_CACHE: &str = "Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32";
     const ACTION_UPLOAD_ARTIFACT: &str =
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
@@ -34305,7 +34305,7 @@ mod ordinary {
         (ACTION_GITHUB_RELEASE, 0, 1),
     ];
     const WORKFLOW_ACTION_IDENTITY_COUNT: usize = 38;
-    const PACKAGE_VERSION: &str = "0.3.2";
+    const PACKAGE_VERSION: &str = "0.7.0";
     const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const SPARSE_PARSER_VERSION: &str = concat!(
         "cargo-1.99.0-nightly-",
@@ -85070,7 +85070,7 @@ original = "value"
         assert_core_conformance_rejection(
             &ancestry_drift,
             &files,
-            "FND01|Error|E_CORE_CONFORMANCE_TREE_CHAIN|core_2026_07_28",
+            "FND01|Error|E_CORE_CONFORMANCE_TREE_CHAIN|core_2026_07_28|",
             &baseline_binding,
             baseline_source_tree_sha256,
         );
