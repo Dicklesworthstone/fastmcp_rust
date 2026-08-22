@@ -518,7 +518,10 @@ fn clt_01_a_positive() {
     let uncorrelated = executor.take_uncorrelated_responses();
     assert_eq!(uncorrelated.len(), 1);
     assert_eq!(uncorrelated[0].id, Some(RequestId::Number(999)));
-    assert_eq!(executor.pending_records(), [] as [fastmcp_client::PendingRequestRecord; 0]);
+    assert_eq!(
+        executor.pending_records(),
+        [] as [fastmcp_client::PendingRequestRecord; 0]
+    );
     assert_eq!(probe.sent_len(), 2);
 
     let (duplicate_transport, duplicate_probe) = ScriptedTransport::new([
@@ -563,7 +566,10 @@ fn clt_01_a_positive() {
             .id,
         Some(RequestId::Number(32))
     );
-    assert_eq!(abandoned.take_uncorrelated_responses(), [] as [fastmcp_protocol::JsonRpcResponse; 0]);
+    assert_eq!(
+        abandoned.take_uncorrelated_responses(),
+        [] as [fastmcp_protocol::JsonRpcResponse; 0]
+    );
     assert_eq!(abandoned_probe.sent_len(), 3);
 
     let (malformed_transport, malformed_probe) = ScriptedTransport::new([Err(
@@ -600,7 +606,10 @@ fn clt_01_a_positive() {
             .code,
         McpErrorCode::InternalError
     );
-    assert_eq!(malformed.pending_records(), [] as [fastmcp_client::PendingRequestRecord; 0]);
+    assert_eq!(
+        malformed.pending_records(),
+        [] as [fastmcp_client::PendingRequestRecord; 0]
+    );
     assert_eq!(malformed_probe.sent_len(), 2);
 
     let (backpressured_transport, backpressured_probe) = ScriptedTransport::backpressured();
@@ -610,8 +619,14 @@ fn clt_01_a_positive() {
         Err(error) => error,
     };
     assert_eq!(backpressure_error.code, McpErrorCode::InternalError);
-    assert_eq!(backpressured.pending_records(), [] as [fastmcp_client::PendingRequestRecord; 0]);
-    assert_eq!(backpressured.terminal_records(), [] as [fastmcp_client::ExecutionTerminalRecord; 0]);
+    assert_eq!(
+        backpressured.pending_records(),
+        [] as [fastmcp_client::PendingRequestRecord; 0]
+    );
+    assert_eq!(
+        backpressured.terminal_records(),
+        [] as [fastmcp_client::ExecutionTerminalRecord; 0]
+    );
     assert_eq!(backpressured_probe.sent_len(), 0);
 
     let (closed_transport, closed_probe) = ScriptedTransport::new([Err(TransportError::Closed)]);
@@ -643,7 +658,10 @@ fn clt_01_a_positive() {
             .code,
         McpErrorCode::InternalError
     );
-    assert_eq!(closed.pending_records(), [] as [fastmcp_client::PendingRequestRecord; 0]);
+    assert_eq!(
+        closed.pending_records(),
+        [] as [fastmcp_client::PendingRequestRecord; 0]
+    );
     assert_eq!(closed_probe.sent_len(), 2);
 }
 
@@ -664,11 +682,20 @@ fn clt_01_a_planted_negative() {
     };
     assert_eq!(error.code, McpErrorCode::InvalidRequest);
     assert_eq!(executor.pending_records(), before);
-    assert_eq!(executor.terminal_records(), [] as [fastmcp_client::ExecutionTerminalRecord; 0]);
+    assert_eq!(
+        executor.terminal_records(),
+        [] as [fastmcp_client::ExecutionTerminalRecord; 0]
+    );
     assert_eq!(probe.sent_len(), 1);
     assert!(executor.take_notifications().is_empty());
-    assert_eq!(executor.take_uncorrelated_responses(), [] as [fastmcp_protocol::JsonRpcResponse; 0]);
-    assert_eq!(executor.take_cancellation_events(), [] as [fastmcp_client::CancellationRequested; 0]);
+    assert_eq!(
+        executor.take_uncorrelated_responses(),
+        [] as [fastmcp_protocol::JsonRpcResponse; 0]
+    );
+    assert_eq!(
+        executor.take_cancellation_events(),
+        [] as [fastmcp_client::CancellationRequested; 0]
+    );
 }
 
 #[test]
@@ -1071,6 +1098,9 @@ fn clt_01_b_planted_negative() {
             .is_empty()
     );
     assert_eq!(executor.take_notifications().len(), 1);
-    assert_eq!(executor.take_cancellation_events(), [] as [fastmcp_client::CancellationRequested; 0]);
+    assert_eq!(
+        executor.take_cancellation_events(),
+        [] as [fastmcp_client::CancellationRequested; 0]
+    );
     assert_eq!(probe.sent_len(), 1);
 }

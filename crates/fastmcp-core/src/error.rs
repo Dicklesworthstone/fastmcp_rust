@@ -668,7 +668,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>("{{bad json").unwrap_err();
         let mcp_err: McpError = serde_err.into();
         assert_eq!(mcp_err.code, McpErrorCode::ParseError);
-        assert!(!mcp_err.message.is_empty());
+        assert_ne!(mcp_err.message, "");
     }
 
     #[test]

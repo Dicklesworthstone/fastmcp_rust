@@ -1654,14 +1654,14 @@ mod tests {
     fn test_method_and_color_helpers_return_values() {
         let renderer = RequestResponseRenderer::new(DisplayContext::new_agent());
 
-        assert!(!renderer.method_color("tools/list").is_empty());
-        assert!(!renderer.method_color("resources/list").is_empty());
-        assert!(!renderer.method_color("prompts/list").is_empty());
-        assert!(!renderer.method_color("initialize").is_empty());
-        assert!(!renderer.method_color("misc/method").is_empty());
-        assert!(!renderer.dim_color().is_empty());
-        assert!(!renderer.success_color().is_empty());
-        assert!(!renderer.error_color().is_empty());
+        assert_ne!(renderer.method_color("tools/list"), "");
+        assert_ne!(renderer.method_color("resources/list"), "");
+        assert_ne!(renderer.method_color("prompts/list"), "");
+        assert_ne!(renderer.method_color("initialize"), "");
+        assert_ne!(renderer.method_color("misc/method"), "");
+        assert_ne!(renderer.dim_color(), "");
+        assert_ne!(renderer.success_color(), "");
+        assert_ne!(renderer.error_color(), "");
     }
 
     #[test]

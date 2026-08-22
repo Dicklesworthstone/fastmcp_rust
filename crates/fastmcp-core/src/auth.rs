@@ -607,12 +607,12 @@ mod tests {
     fn auth_context_constructors() {
         let anon = AuthContext::anonymous();
         assert!(anon.subject.is_none());
-        assert!(anon.scopes.is_empty());
+        assert_eq!(anon.scopes, [] as [std::string::String; 0]);
         assert!(anon.claims.is_none());
 
         let user = AuthContext::with_subject("user123");
         assert_eq!(user.subject.as_deref(), Some("user123"));
-        assert!(user.scopes.is_empty());
+        assert_eq!(user.scopes, [] as [std::string::String; 0]);
         assert!(user.claims.is_none());
     }
 
@@ -631,7 +631,7 @@ mod tests {
     fn auth_context_default_is_anonymous() {
         let def = AuthContext::default();
         assert!(def.subject.is_none());
-        assert!(def.scopes.is_empty());
+        assert_eq!(def.scopes, [] as [std::string::String; 0]);
         assert!(def.claims.is_none());
     }
 

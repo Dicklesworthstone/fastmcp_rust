@@ -688,7 +688,7 @@ mod tests {
         let theme = tc.console().theme();
         render_logo(tc.console(), theme);
         // Just verify it produced some output
-        assert!(!tc.output_string().is_empty());
+        assert_ne!(tc.output_string(), "");
     }
 
     #[test]

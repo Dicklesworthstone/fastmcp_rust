@@ -392,9 +392,9 @@ mod tests {
     fn test_clear() {
         let tc = TestConsole::new();
         tc.console().print("Some output");
-        assert!(!tc.output().is_empty());
+        assert_ne!(tc.output(), [] as [std::string::String; 0]);
         tc.clear();
-        assert!(tc.output().is_empty());
+        assert_eq!(tc.output(), [] as [std::string::String; 0]);
     }
 
     #[test]

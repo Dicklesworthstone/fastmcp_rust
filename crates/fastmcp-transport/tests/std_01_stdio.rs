@@ -136,7 +136,10 @@ fn std_01_a_positive() {
         )]),
         "a response cannot consume an unrelated in-flight waiter"
     );
-    assert!(uncorrelated.is_empty());
+    assert_eq!(
+        uncorrelated,
+        [] as [std::option::Option<fastmcp_protocol::RequestId>; 0]
+    );
     assert_eq!(
         requests,
         vec![

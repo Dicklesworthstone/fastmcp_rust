@@ -7268,8 +7268,7 @@ impl AuthDispatchCustody {
         request: &mut JsonRpcRequest,
         // Underscore-prefixed because non-websocket builds never read it; the
         // websocket arm does, so the binding stays named for that arm.
-        #[allow(clippy::used_underscore_binding)]
-        _websocket_connection_generation: Option<u64>,
+        #[allow(clippy::used_underscore_binding)] _websocket_connection_generation: Option<u64>,
     ) -> Result<Sha256Digest, McpError> {
         match self {
             Self::Http(receipt) => receipt.commit(ctx, inbound, request),

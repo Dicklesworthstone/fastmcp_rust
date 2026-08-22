@@ -478,7 +478,7 @@ mod tests {
         let rendered = renderer.render_if_present(&caps, tc.console());
 
         assert!(!rendered);
-        assert!(tc.output().is_empty());
+        assert_eq!(tc.output(), [] as [std::string::String; 0]);
     }
 
     #[test]

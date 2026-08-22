@@ -637,7 +637,10 @@ mod tests {
     fn field_collector_default_is_empty() {
         let collector = FieldCollector::default();
         assert!(collector.message.is_none());
-        assert!(collector.fields.is_empty());
+        assert_eq!(
+            collector.fields,
+            [] as [(std::string::String, std::string::String); 0]
+        );
     }
 
     #[test]

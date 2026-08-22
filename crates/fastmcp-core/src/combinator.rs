@@ -852,7 +852,7 @@ mod tests {
         let cx = make_cx();
         let futures: Vec<BoxFuture<'_, i32>> = vec![];
         let results = block_on(join_all(&cx, futures));
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [i32; 0]);
     }
 
     #[test]
@@ -900,7 +900,7 @@ mod tests {
         assert!(result.is_ok());
         let qr = result.unwrap();
         assert!(qr.quorum_met);
-        assert!(qr.successes.is_empty());
+        assert_eq!(qr.successes, [] as [i32; 0]);
     }
 
     #[test]
@@ -1202,7 +1202,7 @@ mod tests {
         let result = block_on(quorum(&cx, 2, futures));
         let qr = result.unwrap();
         assert!(!qr.quorum_met);
-        assert!(qr.successes.is_empty());
+        assert_eq!(qr.successes, [] as [i32; 0]);
         assert!(qr.failure_count >= 2);
     }
 

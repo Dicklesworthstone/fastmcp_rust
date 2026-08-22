@@ -8064,9 +8064,7 @@ impl ProxyClient {
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyCatalogListener>> {
         if let Some(request) = self
-            .with_backend(|backend| {
-                backend.start_catalog_listener_request(notifications.clone())
-            })?
+            .with_backend(|backend| backend.start_catalog_listener_request(notifications.clone()))?
         {
             return request.open(ctx).await;
         }

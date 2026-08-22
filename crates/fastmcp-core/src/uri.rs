@@ -2614,8 +2614,8 @@ mod tests {
         let resource_error = parse_default_resource("http://example.test/mcp").unwrap_err();
         let _: &dyn std::error::Error = &http_error;
         let _: &dyn std::error::Error = &resource_error;
-        assert!(!http_error.to_string().is_empty());
-        assert!(!resource_error.to_string().is_empty());
+        assert_ne!(http_error.to_string(), "");
+        assert_ne!(resource_error.to_string(), "");
     }
 
     #[test]
