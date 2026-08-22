@@ -16,3 +16,13 @@ last-touched
 
 # bv (beads viewer) lock file
 .bv.lock
+
+# Crash-recovery, backup, and local-state artifacts (never commit)
+*.bak
+beads.db-*
+beads.base.jsonl
+.br_recovery/
+.local_version
+recovery_*/
+_tmp_*
+.write.lock.stale-*
