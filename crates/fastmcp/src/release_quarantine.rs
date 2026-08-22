@@ -490,9 +490,9 @@ fn quarantine_identity() -> WorkflowIdentity {
 /// Freezes exactly two workflow identities — the immutable historical
 /// `release.yml` publisher (revision `7c02d8e0`, the last pre-quarantine
 /// bytes) and the checked-in quarantine verification definition (revision
-/// `3f40ed16`) — plus the ordered twelve-context/six-sink closed sets, the
-/// seventy-two reachability cells, and the standing unresolved provider-side
-/// observations.
+/// `1c607aa4`, re-frozen over dependabot action-pin bumps) — plus the ordered
+/// twelve-context/six-sink closed sets, the seventy-two reachability cells,
+/// and the standing unresolved provider-side observations.
 #[must_use]
 pub fn quarantine_workflow_inventory() -> QuarantineWorkflowInventory {
     let mut reachability_cells = Vec::with_capacity(ORDERED_CONTEXTS.len() * ORDERED_SINKS.len());
