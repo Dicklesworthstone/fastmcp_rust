@@ -2494,7 +2494,7 @@ mod non_signing_tests {
     #[test]
     fn discovery_does_not_advertise_signing() {
         let doc = DiscoveryDocument::new("https://issuer.example", "https://issuer.example");
-        assert!(doc.id_token_signing_alg_values_supported.is_empty());
+        assert_eq!(doc.id_token_signing_alg_values_supported.len(), 0);
         assert!(doc.jwks_uri.is_none());
         assert_eq!(
             doc.code_challenge_methods_supported,

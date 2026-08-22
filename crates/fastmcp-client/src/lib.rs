@@ -24618,8 +24618,6 @@ mod tests {
             Some(JsonRpcMessage::Response(response)) if response.id == Some(RequestId::Number(99))
         ));
     }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    use std::io::Read as _;
     #[cfg(unix)]
     use std::net::{TcpListener, TcpStream};
     use std::process::{Command, Stdio};
@@ -24679,8 +24677,7 @@ mod tests {
                 ClientProtocolPlan::stdio(policy),
                 Cx::for_testing(),
             )
-            .err()
-            .expect("feature-off legacy policies must fail before command resolution");
+            .expect_err("feature-off legacy policies must fail before command resolution");
 
             assert_eq!(error.code, McpErrorCode::InvalidParams);
         }
@@ -28170,7 +28167,7 @@ mod tests {
             )
             .expect_err("invalid timeout must fail before progress-token allocation");
         assert_eq!(progress_error.code, McpErrorCode::InvalidParams);
-        assert!(progress_events.is_empty());
+        assert_eq!(progress_events.len(), 0);
         assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
 
         assert_eq!(client.responses.pending_len(), 0);
@@ -28230,7 +28227,7 @@ mod tests {
         let error = result.expect_err("a silent peer must time out the progress request");
 
         assert!(error.message.contains("timed out"));
-        assert!(progress_events.is_empty());
+        assert_eq!(progress_events.len(), 0);
         assert!(client.is_initialized());
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 1);
@@ -28566,7 +28563,7 @@ mod tests {
         let error = result.expect_err("a silent peer must time out without progress");
 
         assert!(error.message.contains("timed out"));
-        assert!(progress_events.is_empty());
+        assert_eq!(progress_events.len(), 0);
         assert!(client.is_initialized());
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 1);
@@ -28776,7 +28773,7 @@ mod tests {
         let first_error =
             first.expect_err("the first request must time out while the peer is idle");
         assert!(first_error.message.contains("timed out"));
-        assert!(first_progress.is_empty());
+        assert_eq!(first_progress.len(), 0);
         assert!(client.responses.terminal_error().is_none());
 
         client.timeout_policy =
@@ -28804,7 +28801,7 @@ mod tests {
                 "second": true
             })
         );
-        assert!(second_progress.is_empty());
+        assert_eq!(second_progress.len(), 0);
         assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert_eq!(client.responses.pending_len(), 0);
         assert_eq!(client.responses.tombstone_len(), 0);
@@ -30661,14 +30658,14 @@ mod tests {
     fn bounded_list_page_counts_brackets_commas_and_items_in_byte_budget() {
         let empty = bounded_list_page(Vec::<u8>::new(), None, None, ListPageLimits::new(0, 2))
             .expect("empty vector exactly fits two bytes");
-        assert!(empty.items.is_empty());
+        assert_eq!(empty.items.len(), 0);
         assert!(!empty.local_truncated);
         assert_eq!(measure_serialized_bytes(&empty.items, 2).unwrap(), 2);
 
         let bracket_only_budget =
             bounded_list_page(vec![0_u8], None, None, ListPageLimits::new(1, 2))
                 .expect("the retained empty vector still fits");
-        assert!(bracket_only_budget.items.is_empty());
+        assert_eq!(bracket_only_budget.items.len(), 0);
         assert!(bracket_only_budget.local_truncated);
 
         let single = bounded_list_page(vec![0_u8], None, None, ListPageLimits::new(1, 3))
@@ -30696,7 +30693,7 @@ mod tests {
     fn bounded_list_page_accepts_zero_items_but_rejects_sub_empty_vec_byte_limits() {
         let zero_items = bounded_list_page(vec![0_u8], None, None, ListPageLimits::new(0, 2))
             .expect("zero retained items is a valid caller budget");
-        assert!(zero_items.items.is_empty());
+        assert_eq!(zero_items.items.len(), 0);
         assert!(zero_items.local_truncated);
 
         for byte_limit in [0, 1] {
@@ -30946,7 +30943,7 @@ mod tests {
                     .expect("a foreign modern cancellation leaves the live owner intact")
                     .is_none()
             );
-            assert!(executor.executor.take_cancellation_events().is_empty());
+            assert_eq!(executor.executor.take_cancellation_events().len(), 0);
         }
         client
             .close()
@@ -31896,7 +31893,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(progress_events.is_empty());
+        assert_eq!(progress_events.len(), 0);
 
         assert!(client.list_resources().is_err());
         assert!(client.list_resource_templates().is_err());
@@ -31936,6 +31933,7 @@ mod tests {
 
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
+    #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn client_stdio_fails_for_nonexistent_command() {
         let result = Client::stdio("definitely-not-a-real-command-xyz", &[]);
         assert!(result.is_err());
@@ -31952,8 +31950,7 @@ mod tests {
             &[],
             Cx::for_testing(),
         )
-        .err()
-        .expect("the feature-off direct constructor attempts only its modern command");
+        .expect_err("the feature-off direct constructor attempts only its modern command");
 
         assert_eq!(DEFAULT_STDIO_PROTOCOL_POLICY, ProtocolPolicy::ModernOnly);
         assert_eq!(error.code, McpErrorCode::InternalError);
@@ -32112,8 +32109,8 @@ mod tests {
         client.close().expect("client cleanup");
     }
 
-    #[cfg(unix)]
     #[test]
+    #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn eager_initialization_uses_bounded_server_response_writes() {
         // The direct child control path intentionally accepts only frames that
         // fit the POSIX minimum atomic pipe-write bound. An oversized
@@ -34918,8 +34915,7 @@ mod tests {
         let cancellation = McpRequestCancellation::new();
         let error = client
             .next_subscription_event(&cx, &cancellation)
-            .err()
-            .expect("a catalog event before acknowledgement must fail closed");
+            .expect_err("a catalog event before acknowledgement must fail closed");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert_eq!(
             error.message,
@@ -35132,8 +35128,7 @@ mod tests {
         ));
         let error = client
             .next_final_task_subscription_event(&cx, &cancellation)
-            .err()
-            .expect("one changed taskId must fail closed at selected-stdio ingress");
+            .expect_err("one changed taskId must fail closed at selected-stdio ingress");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert_eq!(
             error.message,
@@ -35165,8 +35160,7 @@ mod tests {
         let cancellation = McpRequestCancellation::new();
         let error = client
             .next_final_task_subscription_event(&cx, &cancellation)
-            .err()
-            .expect("a foreign subscription ID cannot acknowledge the live listener");
+            .expect_err("a foreign subscription ID cannot acknowledge the live listener");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert_eq!(
             error.message,
@@ -35203,8 +35197,7 @@ mod tests {
 
         let first_error = client
             .next_final_task_subscription_event(&cx, &cancellation)
-            .err()
-            .expect("an uncommitted upstream cancellation must be reported");
+            .expect_err("an uncommitted upstream cancellation must be reported");
         assert_ne!(first_error.code, McpErrorCode::RequestCancelled);
         assert!(
             client.live_task_subscription.is_some(),
@@ -35212,8 +35205,7 @@ mod tests {
         );
         let second_error = client
             .next_final_task_subscription_event(&cx, &cancellation)
-            .err()
-            .expect("the retained listener must preserve its original cancellation failure");
+            .expect_err("the retained listener must preserve its original cancellation failure");
         assert_eq!(second_error.code, first_error.code);
         assert_eq!(second_error.message, first_error.message);
         assert!(
@@ -36541,6 +36533,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn clt_01_j_planted_negative() {
         // This differs from the positive discovery response only in the final
         // cache scope. It must be rejected rather than silently replaced by
@@ -36560,8 +36553,8 @@ mod tests {
         assert_eq!(error.code, McpErrorCode::InternalError);
     }
 
-    #[cfg(unix)]
     #[test]
+    #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn clt_01_i_planted_negative() {
         // Only the discovery result's advertised version differs from the
         // accepted modern path. A malformed modern success may not turn into
@@ -36657,6 +36650,7 @@ mod tests {
         client.close().expect("compatibility modern cleanup");
     }
 
+    #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     #[cfg(unix)]
     #[test]
     fn clt_02_discovery_non_complete_result_types_do_not_select_an_era() {
@@ -36713,6 +36707,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn clt_02_i_planted_negative() {
@@ -37116,6 +37111,7 @@ mod tests {
         client.close().expect("legacy client cleanup");
     }
 
+    #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     #[cfg(unix)]
     #[test]
     fn leg_03_i_planted_negative() {

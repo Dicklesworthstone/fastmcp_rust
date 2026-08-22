@@ -9364,7 +9364,7 @@ mod tests {
         };
         assert_eq!(subscription_id, &RequestId::from("subscription-7"));
         assert!(diagnostic.is_none());
-        assert!(listen_result.extras.members().is_empty());
+        assert_eq!(listen_result.extras.members().len(), 0);
         assert_eq!(
             serde_json::from_str::<Value>(
                 &result
@@ -11242,7 +11242,7 @@ mod tests {
     #[test]
     fn list_roots_result_empty() {
         let result = ListRootsResult::empty();
-        assert!(result.roots.is_empty());
+        assert_eq!(result.roots.len(), 0);
     }
 
     #[test]
@@ -11589,7 +11589,7 @@ mod tests {
             "inputSchema": {"type": "object"}
         });
         let tool: Tool = serde_json::from_value(json).expect("deserialize");
-        assert!(tool.tags.is_empty());
+        assert_eq!(tool.tags.len(), 0);
 
         // Deserialize tool with tags
         let json = serde_json::json!({
@@ -11606,7 +11606,7 @@ mod tests {
             "name": "Test"
         });
         let resource: Resource = serde_json::from_value(json).expect("deserialize");
-        assert!(resource.tags.is_empty());
+        assert_eq!(resource.tags.len(), 0);
 
         // Deserialize resource with tags
         let json = serde_json::json!({
@@ -11622,7 +11622,7 @@ mod tests {
             "name": "prompt"
         });
         let prompt: Prompt = serde_json::from_value(json).expect("deserialize");
-        assert!(prompt.tags.is_empty());
+        assert_eq!(prompt.tags.len(), 0);
 
         // Deserialize prompt with tags
         let json = serde_json::json!({

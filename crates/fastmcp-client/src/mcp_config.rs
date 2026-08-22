@@ -1144,7 +1144,7 @@ mod tests {
     fn test_empty_config() {
         let config = McpConfig::new();
         assert!(config.mcp_servers.is_empty());
-        assert!(config.server_names().is_empty());
+        assert_eq!(config.server_names().len(), 0);
     }
 
     #[test]
@@ -1503,7 +1503,7 @@ mod tests {
     #[test]
     fn test_default_config_paths_not_empty() {
         let paths = default_config_paths();
-        assert!(!paths.is_empty());
+        assert_ne!(paths.len(), 0);
     }
 
     #[test]
@@ -1907,13 +1907,13 @@ mod tests {
     #[test]
     fn test_config_loader_existing_paths_empty() {
         let loader = ConfigLoader::from_path("/nonexistent/file.json");
-        assert!(loader.existing_paths().is_empty());
+        assert_eq!(loader.existing_paths().len(), 0);
     }
 
     #[test]
     fn test_config_loader_default() {
         let loader = ConfigLoader::default();
-        assert!(!loader.search_paths().is_empty());
+        assert_ne!(loader.search_paths().len(), 0);
     }
 
     #[test]
@@ -1921,7 +1921,7 @@ mod tests {
         let mut config = McpConfig::new();
         config.add_server("a", ServerConfig::new("cmd").disabled());
         config.add_server("b", ServerConfig::new("cmd").disabled());
-        assert!(config.enabled_servers().is_empty());
+        assert_eq!(config.enabled_servers().len(), 0);
     }
 
     #[test]
@@ -1965,7 +1965,7 @@ mod tests {
         let json = r#"{"mcpServers": {"srv": {"command": "echo"}}}"#;
         let config = McpConfig::from_json(json).expect("parse");
         let srv = config.get_server("srv").unwrap();
-        assert!(srv.args.is_empty());
+        assert_eq!(srv.args.len(), 0);
         assert!(srv.env.is_empty());
         assert!(srv.cwd.is_none());
         assert!(!srv.disabled);

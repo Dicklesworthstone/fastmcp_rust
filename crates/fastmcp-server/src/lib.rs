@@ -25570,7 +25570,7 @@ mod lib_unit_tests {
             .dispatch_request(
                 &Cx::for_testing(),
                 &mut session,
-                initialize_test_request(1, "client", Default::default()),
+                initialize_test_request(1, "client", ClientCapabilities::default()),
                 &notification_sender,
                 &test_request_sender(),
             )
@@ -25600,7 +25600,7 @@ mod lib_unit_tests {
             .dispatch_request(
                 &Cx::for_testing(),
                 &mut session,
-                initialize_test_request(1, "client", Default::default()),
+                initialize_test_request(1, "client", ClientCapabilities::default()),
                 &notification_sender,
                 &test_request_sender(),
             )
@@ -25691,7 +25691,7 @@ mod lib_unit_tests {
             .dispatch_request(
                 &Cx::for_testing(),
                 &mut session,
-                initialize_test_request(1, "client", Default::default()),
+                initialize_test_request(1, "client", ClientCapabilities::default()),
                 &notification_sender,
                 &test_request_sender(),
             )

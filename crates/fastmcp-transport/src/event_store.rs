@@ -1113,7 +1113,7 @@ mod tests {
         let event_id = store
             .store_event("stream1", Some(serde_json::json!({"test": true})))
             .unwrap();
-        assert!(!event_id.is_empty());
+        assert_ne!(event_id.len(), 0);
 
         let events = store.get_events_after("stream1", None);
         assert_eq!(events.len(), 1);
@@ -1126,7 +1126,7 @@ mod tests {
         let store = EventStore::new();
 
         let event_id = store.store_priming_event("stream1").unwrap();
-        assert!(!event_id.is_empty());
+        assert_ne!(event_id.len(), 0);
 
         let events = store.get_events_after("stream1", None);
         assert_eq!(events.len(), 1);
@@ -1464,7 +1464,7 @@ mod tests {
         });
 
         assert!(stream_id.is_none());
-        assert!(replayed.is_empty());
+        assert_eq!(replayed.len(), 0);
     }
 
     #[test]

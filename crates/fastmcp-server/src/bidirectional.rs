@@ -3042,7 +3042,7 @@ mod tests {
         let DualEraServerToClientResult::Legacy(roots) = roots else {
             panic!("legacy roots must not create an MRTR retry");
         };
-        assert!(roots.roots.is_empty());
+        assert_eq!(roots.roots.len(), 0);
 
         assert_eq!(boundary.era(), ProtocolEra::Legacy2024);
         assert_eq!(
@@ -4784,7 +4784,7 @@ mod tests {
         let sender = make_sender_with_responder(|_| serde_json::json!({ "roots": [] }));
         let roots = TransportRootsProvider::new(sender, McpContext::new(Cx::for_testing(), 0));
         let result = block_on(roots.list_roots()).unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
     }
 
     #[test]

@@ -3527,7 +3527,7 @@ mod tests {
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .expect("valid base64");
-                assert!(decoded.is_empty());
+                assert_eq!(decoded.len(), 0);
             }
             _ => panic!("expected Image content"),
         }

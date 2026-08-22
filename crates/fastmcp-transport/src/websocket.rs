@@ -3865,7 +3865,7 @@ mod tests {
     fn test_frame_close() {
         let frame = WsFrame::close();
         assert_eq!(frame.frame_type, WsFrameType::Close);
-        assert!(frame.payload.is_empty());
+        assert_eq!(frame.payload.len(), 0);
         assert!(frame.fin);
     }
 
@@ -4015,7 +4015,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(draw_calls.get(), 1);
-        assert!(buffer.is_empty());
+        assert_eq!(buffer.len(), 0);
     }
 
     #[test]
@@ -4204,7 +4204,7 @@ mod tests {
             let mut server_writer = WsWriter::new(&mut server_output);
             assert!(server_writer.write_frame(&invalid).is_err());
         }
-        assert!(server_output.is_empty());
+        assert_eq!(server_output.len(), 0);
 
         let draw_calls = std::cell::Cell::new(0);
         let mut client_output = Vec::new();
@@ -4217,7 +4217,7 @@ mod tests {
             assert!(error.is_err());
         }
         assert_eq!(draw_calls.get(), 0);
-        assert!(client_output.is_empty());
+        assert_eq!(client_output.len(), 0);
     }
 
     #[test]
@@ -4233,7 +4233,7 @@ mod tests {
             let mut server_writer = WsWriter::new(&mut server_output);
             assert!(server_writer.write_frame(&invalid).is_err());
         }
-        assert!(server_output.is_empty());
+        assert_eq!(server_output.len(), 0);
 
         let draw_calls = std::cell::Cell::new(0);
         let mut client_output = Vec::new();
@@ -4246,7 +4246,7 @@ mod tests {
             assert!(error.is_err());
         }
         assert_eq!(draw_calls.get(), 0);
-        assert!(client_output.is_empty());
+        assert_eq!(client_output.len(), 0);
     }
 
     #[test]
@@ -4397,7 +4397,7 @@ mod tests {
                 if source.kind() == std::io::ErrorKind::InvalidData
         ));
         assert!(!transport.fragmented_text);
-        assert!(transport.fragment_buffer.is_empty());
+        assert_eq!(transport.fragment_buffer.len(), 0);
     }
 
     #[test]
@@ -4412,7 +4412,7 @@ mod tests {
             TransportError::Io(ref source)
                 if source.kind() == std::io::ErrorKind::InvalidData
         ));
-        assert!(transport.writer.writer.is_empty());
+        assert_eq!(transport.writer.writer.len(), 0);
     }
 
     #[test]
@@ -5184,7 +5184,7 @@ mod tests {
                     && source.to_string().contains("UTF-8")
         ));
         assert!(transport.closed);
-        assert!(transport.fragment_buffer.is_empty());
+        assert_eq!(transport.fragment_buffer.len(), 0);
         assert!(!transport.fragmented_text);
         assert_eq!(transport.writer.writer, [0x88, 0x02, 0x03, 0xef]);
 
@@ -5210,7 +5210,7 @@ mod tests {
                     && source.to_string().contains("UTF-8")
         ));
         assert!(transport.closed);
-        assert!(transport.fragment_buffer.is_empty());
+        assert_eq!(transport.fragment_buffer.len(), 0);
         assert!(!transport.fragmented_text);
 
         let mut close_reader = WsReader::new(Cursor::new(transport.writer.writer.as_slice()));
@@ -5231,7 +5231,7 @@ mod tests {
                 if source.kind() == std::io::ErrorKind::InvalidData
         ));
         assert!(transport.closed);
-        assert!(transport.fragment_buffer.is_empty());
+        assert_eq!(transport.fragment_buffer.len(), 0);
         assert!(!transport.fragmented_text);
         assert_eq!(transport.writer.writer, [0x88, 0x02, 0x03, 0xef]);
     }
@@ -5248,7 +5248,7 @@ mod tests {
             Err(TransportError::Io(_))
         ));
         assert!(transport.closed);
-        assert!(transport.fragment_buffer.is_empty());
+        assert_eq!(transport.fragment_buffer.len(), 0);
         assert!(!transport.fragmented_text);
     }
 
@@ -5434,7 +5434,7 @@ mod tests {
         }
 
         // Check that pong was written
-        assert!(!response_buf.is_empty());
+        assert_ne!(response_buf.len(), 0);
         assert_eq!(response_buf[0] & 0x0F, 0x0A); // Pong opcode
     }
 
@@ -5491,7 +5491,7 @@ mod tests {
         }
 
         // Verify responses were written (unmasked for server -> client)
-        assert!(!response_buffer.is_empty());
+        assert_ne!(response_buffer.len(), 0);
         // Each response should be a separate text frame
         #[allow(clippy::naive_bytecount)]
         let frame_count = response_buffer
@@ -5643,7 +5643,7 @@ mod tests {
         assert!(matches!(result, Err(TransportError::Cancelled)));
 
         // Nothing should be written
-        assert!(writer.is_empty());
+        assert_eq!(writer.len(), 0);
     }
 
     #[test]
@@ -5795,7 +5795,7 @@ mod tests {
         let request = JsonRpcRequest::new("test", None, 1i64);
         let result = transport.send(&cx, &JsonRpcMessage::Request(request));
         assert!(matches!(result, Err(TransportError::Cancelled)));
-        assert!(writer.is_empty());
+        assert_eq!(writer.len(), 0);
     }
 
     #[test]

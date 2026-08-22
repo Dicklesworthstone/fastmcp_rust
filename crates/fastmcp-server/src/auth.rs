@@ -1050,7 +1050,7 @@ mod tests {
         };
         let auth = provider.authenticate(&ctx(), req).unwrap();
         assert_eq!(auth.subject, None);
-        assert!(auth.scopes.is_empty());
+        assert_eq!(auth.scopes.len(), 0);
     }
 
     #[test]

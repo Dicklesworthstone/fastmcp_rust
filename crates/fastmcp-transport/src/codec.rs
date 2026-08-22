@@ -1104,7 +1104,7 @@ mod tests {
         let messages = codec.decode(&batch).unwrap();
 
         assert_eq!(messages.len(), 4);
-        assert!(codec.buffer.is_empty());
+        assert_eq!(codec.buffer.len(), 0);
     }
 
     #[test]
@@ -1281,7 +1281,7 @@ mod tests {
 
         // Shrink max size to less than buffered data
         codec.set_max_message_size(5);
-        assert!(codec.buffer.is_empty());
+        assert_eq!(codec.buffer.len(), 0);
 
         // Restore a usable limit and prove the old prefix is not spliced onto
         // the next complete frame.
@@ -1321,7 +1321,7 @@ mod tests {
 
         let messages = codec.decode(&many_messages).unwrap();
         assert_eq!(messages.len(), 200);
-        assert!(codec.buffer.is_empty());
+        assert_eq!(codec.buffer.len(), 0);
 
         let next_msg = b"{\"jsonrpc\":\"2.0\",\"method\":\"after_compact\",\"id\":2}\n";
         let messages = codec.decode(next_msg).unwrap();

@@ -7748,7 +7748,7 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
         let data = serde_json::json!({"result": "ok"});
         let response = HttpResponse::ok().with_json(&data);
 
-        assert!(!response.body.is_empty());
+        assert_ne!(response.body.len(), 0);
         assert_eq!(
             response.headers.get("content-type"),
             Some(&"application/json".to_string())
@@ -7767,7 +7767,7 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
             .with_json(&FailingSerialize);
         assert_eq!(response.status, HttpStatus::INTERNAL_SERVER_ERROR);
         assert_eq!(response.body, JSON_ENCODING_ERROR_BODY);
-        assert!(!response.body.is_empty());
+        assert_ne!(response.body.len(), 0);
         assert_eq!(
             response.headers.get("content-type").map(String::as_str),
             Some("application/json")
@@ -7878,7 +7878,7 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
         );
         assert_eq!(response.status, HttpStatus::INTERNAL_SERVER_ERROR);
         assert_eq!(response.body, JSON_ENCODING_ERROR_BODY);
-        assert!(!response.body.is_empty());
+        assert_ne!(response.body.len(), 0);
         assert_eq!(
             response
                 .headers
@@ -7945,7 +7945,7 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
         let store = SessionStore::with_defaults();
 
         let id = store.create().unwrap();
-        assert!(!id.is_empty());
+        assert_ne!(id.len(), 0);
 
         let session = store.get(&id);
         assert!(session.is_some());
@@ -8277,7 +8277,7 @@ Content-Length: {}\r\n\
             let error = transport.write_response(&response).unwrap_err();
 
             assert!(matches!(error, HttpError::InvalidHeader(_)));
-            assert!(transport.writer.is_empty());
+            assert_eq!(transport.writer.len(), 0);
         }
 
         let mut response = HttpResponse::ok();
@@ -8292,7 +8292,7 @@ Content-Length: {}\r\n\
             transport.write_response(&response),
             Err(HttpError::InvalidHeader(_))
         ));
-        assert!(transport.writer.is_empty());
+        assert_eq!(transport.writer.len(), 0);
     }
 
     #[test]
@@ -8572,7 +8572,7 @@ Content-Length: {}\r\n\
             Err(TransportError::Cancelled)
         ));
         assert!(transport.response_pending);
-        assert!(transport.writer.is_empty());
+        assert_eq!(transport.writer.len(), 0);
 
         let masked_deadline_cx = Cx::for_testing_with_budget(
             asupersync::Budget::new().with_deadline(asupersync::Time::ZERO),
@@ -10798,7 +10798,7 @@ Content-Length: {}\r\n\
         assert!(matches!(result, Err(TransportError::Cancelled)));
 
         // Nothing should be written
-        assert!(output.is_empty());
+        assert_eq!(output.len(), 0);
     }
 
     #[test]
@@ -10929,7 +10929,7 @@ Content-Length: {}\r\n\
         let config = HttpHandlerConfig::default();
         assert_eq!(config.base_path, "/mcp/v1");
         assert!(!config.allow_cors);
-        assert!(config.cors_origins.is_empty());
+        assert_eq!(config.cors_origins.len(), 0);
         assert_eq!(config.max_body_size, 10 * 1024 * 1024);
     }
 

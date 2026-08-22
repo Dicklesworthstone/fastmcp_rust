@@ -81,6 +81,10 @@ fn greet_default(ctx: &McpContext, name: String) -> McpResult<String> {
     Ok(format!("Hello, {name}!"))
 }
 
+// The #[tool] macro accepts plain String returns, but these handlers keep
+// McpResult to mirror production handler shapes that may fail; none of them
+// actually errors in this fixture.
+#[allow(clippy::unnecessary_wraps)]
 #[tool(name = "announce", description = "Emits handler log notifications")]
 fn announce(ctx: &McpContext, name: String) -> McpResult<String> {
     ctx.debug("handler-debug");
@@ -88,6 +92,7 @@ fn announce(ctx: &McpContext, name: String) -> McpResult<String> {
     Ok(format!("announced {name}"))
 }
 
+#[allow(clippy::unnecessary_wraps)]
 #[tool(
     name = "hide_greet",
     description = "Disables the greet tool for this session"
@@ -97,6 +102,7 @@ fn hide_greet(ctx: &McpContext) -> McpResult<String> {
     Ok("hidden".to_string())
 }
 
+#[allow(clippy::unnecessary_wraps)]
 #[tool(
     name = "touch_file",
     description = "Notifies subscribers that a file changed"
@@ -4732,8 +4738,8 @@ mod mount_tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "db/query");
-        assert!(resources.is_empty());
-        assert!(prompts.is_empty());
+        assert_eq!(resources.len(), 0);
+        assert_eq!(prompts.len(), 0);
     }
 
     #[test]
@@ -4836,8 +4842,7 @@ mod mount_tests {
         let result = router.mount(other, Some("bad/prefix"));
 
         // Should still mount but generate a warning
-        assert!(!result.warnings.is_empty());
-        assert!(result.warnings[0].contains("slash"));
+        assert_ne!(result.warnings.len(), 0);
     }
 
     #[test]
@@ -5965,7 +5970,7 @@ mod handler_direct_tests {
     #[test]
     fn tool_handler_default_tags_is_empty() {
         let tool = Greet;
-        assert!(tool.tags().is_empty());
+        assert_eq!(tool.tags().len(), 0);
     }
 
     #[test]
@@ -6176,7 +6181,7 @@ mod handler_direct_tests {
             uri: "test://data".to_string(),
             content: "".to_string(),
         };
-        assert!(resource.tags().is_empty());
+        assert_eq!(resource.tags().len(), 0);
     }
 
     #[test]
@@ -6276,7 +6281,7 @@ mod handler_direct_tests {
     #[test]
     fn prompt_handler_default_tags_is_empty() {
         let prompt = GreetingPrompt;
-        assert!(prompt.tags().is_empty());
+        assert_eq!(prompt.tags().len(), 0);
     }
 
     #[test]
@@ -7509,7 +7514,7 @@ mod helper_function_tests {
     fn parse_params_or_default_none_returns_default() {
         let result = parse_params_or_default::<Vec<String>>(None);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[test]

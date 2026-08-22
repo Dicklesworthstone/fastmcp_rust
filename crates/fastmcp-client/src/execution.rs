@@ -3750,7 +3750,7 @@ mod tests {
         );
         let notifications = executor.take_notifications();
         assert_eq!(notifications.len(), 1);
-        assert!(executor.pending_records().is_empty());
+        assert_eq!(executor.pending_records().len(), 0);
         let uncorrelated = executor.take_uncorrelated_responses();
         assert_eq!(uncorrelated.len(), 1);
         assert_eq!(uncorrelated[0].id, Some(RequestId::Number(999)));
@@ -3833,7 +3833,7 @@ mod tests {
             send_error: Some(std::io::ErrorKind::WouldBlock),
         });
         assert!(backpressured.execute(&cx, request(21)).is_err());
-        assert!(backpressured.pending_records().is_empty());
+        assert_eq!(backpressured.pending_records().len(), 0);
         assert!(backpressured.execute(&cx, request(22)).is_err());
     }
 
@@ -3928,7 +3928,7 @@ mod tests {
         assert_eq!(executor.pending_records(), before);
         assert_eq!(executor.state.borrow().transport.sent.len(), 1);
         assert!(executor.take_notifications().is_empty());
-        assert!(executor.take_uncorrelated_responses().is_empty());
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
     }
 
     #[test]
@@ -3994,7 +3994,7 @@ mod tests {
                 .code,
             fastmcp_core::McpErrorCode::RequestCancelled,
         );
-        assert!(explicit.terminal_records().is_empty());
+        assert_eq!(explicit.terminal_records().len(), 0);
         assert_eq!(
             explicit.take_cancellation_events(),
             vec![CancellationRequested {
@@ -4081,7 +4081,7 @@ mod tests {
             .shutdown(&cx)
             .expect("bounded shutdown closes transport");
         assert!(shutdown.wait(&cx, &mut closing).is_err());
-        assert!(shutdown.terminal_records().is_empty());
+        assert_eq!(shutdown.terminal_records().len(), 0);
     }
 
     #[test]
@@ -4108,8 +4108,8 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(executor.take_notifications().len(), 1);
-        assert!(executor.terminal_records().is_empty());
-        assert!(executor.take_cancellation_events().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
     }
 
     #[test]
@@ -4143,8 +4143,8 @@ mod tests {
         assert_eq!(preserved_raw_result.as_deref(), Some(raw_result));
 
         drop(dropped);
-        assert!(executor.pending_records().is_empty());
-        assert!(executor.terminal_records().is_empty());
+        assert_eq!(executor.pending_records().len(), 0);
+        assert_eq!(executor.terminal_records().len(), 0);
         assert_eq!(
             executor.take_cancellation_events(),
             vec![CancellationRequested {
@@ -4531,8 +4531,8 @@ mod tests {
             .drive_frame(&cx, frame)
             .expect("the sole ingress frame first drains the dropped owner's cancellation");
 
-        assert!(executor.pending_records().is_empty());
-        assert!(executor.take_uncorrelated_responses().is_empty());
+        assert_eq!(executor.pending_records().len(), 0);
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
         assert_eq!(
             executor.take_cancellation_events(),
             vec![CancellationRequested {
@@ -4772,8 +4772,8 @@ mod tests {
             .execute(&cx, alias)
             .expect_err("a late response never consumes the tombstone before its expiry");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert!(executor.pending_records().is_empty());
-        assert!(executor.take_uncorrelated_responses().is_empty());
+        assert_eq!(executor.pending_records().len(), 0);
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
     }
 
     #[test]
@@ -4868,7 +4868,7 @@ mod tests {
         assert_eq!(state.terminal_records.len(), 1);
         drop(state);
         drop(active);
-        assert!(executor.terminal_records().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
     }
 
     #[test]
@@ -4906,7 +4906,7 @@ mod tests {
             .wait(&cx, &mut first)
             .expect("consuming the terminal result releases its retained state");
         assert!(executor.state.borrow().completed.is_empty());
-        assert!(executor.terminal_records().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
         assert_eq!(
             executor
                 .execute(&cx, request(92))
@@ -4953,7 +4953,7 @@ mod tests {
             .expect("first owner receives its terminal result");
         drop(completed);
         assert!(executor.state.borrow().completed.is_empty());
-        assert!(executor.terminal_records().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
         let completed_key = RequestId::Number(93)
             .correlation_key()
             .expect("numeric test ID is canonical");
@@ -4984,7 +4984,7 @@ mod tests {
             .borrow_mut()
             .terminal_expirations
             .insert(key, Instant::now());
-        assert!(executor.terminal_records().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
         assert_eq!(
             executor
                 .wait(&cx, &mut expired)
@@ -5036,8 +5036,8 @@ mod tests {
                 .code,
             McpErrorCode::RequestCancelled,
         );
-        assert!(executor.terminal_records().is_empty());
-        assert!(executor.take_uncorrelated_responses().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
         assert_eq!(executor.state.borrow().transport.sent.len(), 2);
     }
 
@@ -5087,7 +5087,7 @@ mod tests {
             .wait(&cx, &mut adjacent)
             .expect("late dropped response must not poison the adjacent owner");
         assert_eq!(response.id, Some(RequestId::Number(87)));
-        assert!(executor.take_uncorrelated_responses().is_empty());
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
     }
 
     #[test]
@@ -5140,8 +5140,8 @@ mod tests {
             .drive(&cx)
             .expect("invalid peer cancellation is ignored without terminating the client");
         assert_eq!(executor.pending_records(), pending_before);
-        assert!(executor.terminal_records().is_empty());
-        assert!(executor.take_cancellation_events().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
         assert_eq!(executor.state.borrow().transport.sent.len(), 1);
         executor
             .cancel(&cx, &mut execution)
@@ -5245,7 +5245,7 @@ mod tests {
             .wait(&cx, &mut cancelled_execution)
             .expect("the ordinary request remains owned by its terminal response");
         assert_eq!(cancelled.state.borrow().transport.sent.len(), 1);
-        assert!(cancelled.take_cancellation_events().is_empty());
+        assert_eq!(cancelled.take_cancellation_events().len(), 0);
         assert!(cancelled.take_notifications().is_empty());
     }
 
@@ -5280,9 +5280,9 @@ mod tests {
             .expect("the other owner remains eligible for its final result");
         assert!(diagnostic.is_none());
         assert!(matches!(accepted, DecodedResult::Complete(_)));
-        assert!(executor.terminal_records().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
         assert_eq!(executor.state.borrow().transport.sent.len(), 2);
-        assert!(executor.take_uncorrelated_responses().is_empty());
+        assert_eq!(executor.take_uncorrelated_responses().len(), 0);
     }
 
     #[test]
@@ -5402,10 +5402,10 @@ mod tests {
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].params.task.base().task_id, task_id);
         assert!(executor.state.borrow().task_subscriptions.is_empty());
-        assert!(executor.pending_records().is_empty());
+        assert_eq!(executor.pending_records().len(), 0);
         assert_eq!(executor.state.borrow().transport.sent.len(), 2);
-        assert!(executor.terminal_records().is_empty());
-        assert!(executor.take_cancellation_events().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
     }
 
     #[test]
@@ -5459,8 +5459,8 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(executor.state.borrow().transport.sent.len(), 1);
-        assert!(executor.terminal_records().is_empty());
-        assert!(executor.take_cancellation_events().is_empty());
+        assert_eq!(executor.terminal_records().len(), 0);
+        assert_eq!(executor.take_cancellation_events().len(), 0);
         assert!(executor.take_notifications().is_empty());
     }
 

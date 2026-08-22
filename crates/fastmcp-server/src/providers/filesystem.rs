@@ -2507,7 +2507,7 @@ mod tests {
         let provider = FilesystemProvider::new(root.path());
         assert_eq!(provider.root, root.path().to_path_buf());
         assert!(provider.prefix.is_none());
-        assert!(provider.include_patterns.is_empty());
+        assert_eq!(provider.include_patterns.len(), 0);
         assert_eq!(
             provider.exclude_patterns,
             vec![".*".to_string(), "**/.*".to_string()]

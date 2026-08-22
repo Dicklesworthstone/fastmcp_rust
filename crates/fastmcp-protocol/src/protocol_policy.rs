@@ -1098,7 +1098,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[test]
     fn auto_stdio_request_without_modern_metadata_selects_legacy() {
         let mut classifier = StdioEraClassifier::new(ProtocolPolicy::Auto);
         assert_eq!(
@@ -1233,10 +1232,9 @@ pub(crate) mod tests {
             policy.modern_discovery_versions(),
             [ProtocolVersion::MODERN_2026]
         );
-        assert!(
-            ProtocolPolicy::LegacyOnly
-                .modern_discovery_versions()
-                .is_empty()
+        assert_eq!(
+            ProtocolPolicy::LegacyOnly.modern_discovery_versions().len(),
+            0
         );
         assert_eq!(policy.preferred_versions(), policy.supported_versions());
         assert!(policy.permits(ProtocolVersion::MODERN_2026));

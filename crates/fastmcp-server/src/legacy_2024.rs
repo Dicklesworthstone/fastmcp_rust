@@ -1842,7 +1842,7 @@ mod tests {
             "refusal must name the method taxonomy: {response}"
         );
         assert_eq!(adapter.snapshot(), before);
-        assert!(adapter.handler.methods.is_empty());
+        assert_eq!(adapter.handler.methods.len(), 0);
     }
 
     #[test]
@@ -1859,7 +1859,7 @@ mod tests {
         };
         assert_eq!(response["error"]["code"], -32600);
         assert_eq!(adapter.snapshot(), before);
-        assert!(adapter.handler.methods.is_empty());
+        assert_eq!(adapter.handler.methods.len(), 0);
     }
 
     #[test]
@@ -1905,7 +1905,7 @@ mod tests {
             .expect_err("changing only the URI must not notify an unsubscribed resource");
         assert_eq!(error.code().as_i32(), Some(-32600));
         assert_eq!(adapter.snapshot(), before);
-        assert!(adapter.handler.methods.is_empty());
+        assert_eq!(adapter.handler.methods.len(), 0);
     }
 
     #[test]
@@ -1932,7 +1932,7 @@ mod tests {
             assert_eq!(response["error"]["code"], -32600, "{member}");
             assert_eq!(adapter.snapshot(), before, "{member}");
         }
-        assert!(adapter.handler.methods.is_empty());
+        assert_eq!(adapter.handler.methods.len(), 0);
     }
 
     #[test]
@@ -2110,7 +2110,7 @@ mod tests {
             ),
             Ok(Legacy2024Outbound::NoResponse)
         ));
-        assert!(adapter.snapshot().pending_reverse_request_ids.is_empty());
+        assert_eq!(adapter.snapshot().pending_reverse_request_ids.len(), 0);
         assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::Operating);
     }
 
@@ -2166,7 +2166,7 @@ mod tests {
             .expect_err("fractional request IDs must not receive a pre-admission response");
         assert_eq!(error.code().as_i32(), Some(-32600));
         assert_eq!(adapter.snapshot(), before);
-        assert!(adapter.handler.methods.is_empty());
+        assert_eq!(adapter.handler.methods.len(), 0);
     }
 
     #[test]
@@ -2256,7 +2256,7 @@ mod tests {
         let right_before_close = lifecycle.snapshot(right).unwrap();
         assert_eq!(left_before_close.subscriptions, ["file:///left-only"]);
         assert_eq!(left_before_close.reservation_count, 1);
-        assert!(right_before_close.subscriptions.is_empty());
+        assert_eq!(right_before_close.subscriptions.len(), 0);
         assert_eq!(right_before_close.reservation_count, 0);
 
         let left_closed = lifecycle.close(left).unwrap();

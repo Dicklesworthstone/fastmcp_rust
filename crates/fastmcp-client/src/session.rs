@@ -1123,6 +1123,6 @@ mod tests {
         assert!(session.server_capabilities().prompts.is_none());
         assert!(session.server_capabilities().logging.is_none());
         assert!(session.server_capabilities().tasks.is_none());
-        assert!(session.protocol_version().is_empty());
+        assert_eq!(session.protocol_version().len(), 0);
     }
 }

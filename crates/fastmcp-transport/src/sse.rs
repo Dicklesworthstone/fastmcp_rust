@@ -1868,7 +1868,7 @@ mod tests {
             recv_half.recv(&cx),
             Err(TransportError::Cancelled)
         ));
-        assert!(output.bytes().is_empty());
+        assert_eq!(output.bytes().len(), 0);
     }
 
     #[test]
@@ -1969,7 +1969,7 @@ mod tests {
         let event = reader.read_event(&Cx::for_testing()).unwrap().unwrap();
 
         assert_eq!(event.event_type, SseEventType::Message);
-        assert!(event.data.is_empty());
+        assert_eq!(event.data.len(), 0);
     }
 
     #[test]
@@ -2217,7 +2217,7 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
             TransportError::Codec(CodecError::MessageTooLarge(size))
                 if size == MAX_SSE_MESSAGE_SIZE + 1
         ));
-        assert!(writer.inner().is_empty());
+        assert_eq!(writer.inner().len(), 0);
     }
 
     #[test]
@@ -2232,7 +2232,7 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
             writer.write_message(&cx, &oversized),
             Err(TransportError::Codec(CodecError::MessageTooLarge(_)))
         ));
-        assert!(writer.inner().is_empty());
+        assert_eq!(writer.inner().len(), 0);
         assert_eq!(writer.event_counter, 0);
 
         let invalid = JsonRpcMessage::Response(JsonRpcResponse {
@@ -2245,7 +2245,7 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
             writer.write_message(&cx, &invalid),
             Err(TransportError::Codec(CodecError::Json(_)))
         ));
-        assert!(writer.inner().is_empty());
+        assert_eq!(writer.inner().len(), 0);
         assert_eq!(writer.event_counter, 0);
     }
 
@@ -2271,7 +2271,7 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
 
         assert!(matches!(error, TransportError::Io(_)));
         assert!(writer.closed);
-        assert!(!writer.inner().bytes.is_empty());
+        assert_ne!(writer.inner().bytes.len(), 0);
         assert!(matches!(
             writer.write_event(&cx, &SseEvent::message("retry")),
             Err(TransportError::Closed)
@@ -2312,7 +2312,7 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
                 TransportError::Io(ref source)
                     if source.kind() == std::io::ErrorKind::InvalidInput
             ));
-            assert!(writer.inner().is_empty());
+            assert_eq!(writer.inner().len(), 0);
         }
     }
 
@@ -2332,7 +2332,7 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
                 TransportError::Io(ref source)
                     if source.kind() == std::io::ErrorKind::InvalidInput
             ));
-            assert!(writer.inner().is_empty());
+            assert_eq!(writer.inner().len(), 0);
         }
 
         let mut writer = SseWriter::new(Vec::new());
@@ -2344,7 +2344,7 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
             TransportError::Io(ref source)
                 if source.kind() == std::io::ErrorKind::InvalidInput
         ));
-        assert!(writer.inner().is_empty());
+        assert_eq!(writer.inner().len(), 0);
     }
 
     #[test]
@@ -2735,7 +2735,7 @@ data: }\n\
             TransportError::Io(ref source)
                 if source.kind() == std::io::ErrorKind::InvalidInput
         ));
-        assert!(writer.inner().is_empty());
+        assert_eq!(writer.inner().len(), 0);
         assert_eq!(writer.event_counter, u64::MAX);
     }
 
@@ -2745,7 +2745,7 @@ data: }\n\
         let mut writer = SseWriter::new(buffer);
 
         // inner() returns a reference
-        assert!(writer.inner().is_empty());
+        assert_eq!(writer.inner().len(), 0);
 
         // inner_mut() allows mutation
         writer.inner_mut().extend_from_slice(b"raw");
@@ -2804,7 +2804,7 @@ event: endpoint\ndata: http://localhost/post\n\n";
             Err(TransportError::Io(_))
         ));
         assert!(transport.closed);
-        assert!(!transport.request_sink.bytes.is_empty());
+        assert_ne!(transport.request_sink.bytes.len(), 0);
         assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
         assert!(transport.close().is_ok());
         assert!(transport.close().is_ok());
@@ -2846,7 +2846,7 @@ event: endpoint\ndata: http://localhost/post\n\n";
                 &JsonRpcMessage::Request(JsonRpcRequest::new("still-open", None, 2_i64)),
             )
             .unwrap();
-        assert!(!transport.request_sink.is_empty());
+        assert_ne!(transport.request_sink.len(), 0);
     }
 
     #[test]

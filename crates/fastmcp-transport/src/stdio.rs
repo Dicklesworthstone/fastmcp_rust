@@ -1720,7 +1720,7 @@ mod tests {
             Err(TransportError::Cancelled)
         ));
         assert!(transport.closed);
-        assert!(transport.line_buffer.is_empty());
+        assert_eq!(transport.line_buffer.len(), 0);
     }
 
     #[test]
@@ -1785,7 +1785,7 @@ mod tests {
             Err(TransportError::Cancelled)
         ));
         assert!(transport.closed);
-        assert!(transport.line_buffer.is_empty());
+        assert_eq!(transport.line_buffer.len(), 0);
         assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
     }
 
@@ -1839,7 +1839,7 @@ mod tests {
 
         assert!(matches!(transport.recv(&cx), Err(TransportError::Timeout)));
         assert!(!transport.closed);
-        assert!(transport.line_buffer.is_empty());
+        assert_eq!(transport.line_buffer.len(), 0);
 
         let message = cx
             .masked(|| transport.recv(&cx))
@@ -1865,7 +1865,7 @@ mod tests {
             Err(TransportError::Cancelled)
         ));
         assert!(transport.closed);
-        assert!(transport.line_buffer.is_empty());
+        assert_eq!(transport.line_buffer.len(), 0);
         assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
     }
 
@@ -1952,7 +1952,7 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(transport.closed);
-        assert!(transport.line_buffer.is_empty());
+        assert_eq!(transport.line_buffer.len(), 0);
         assert!(matches!(
             transport.recv_until(&cx, None),
             Err(TransportError::Closed)
@@ -2004,7 +2004,7 @@ mod tests {
             Err(TransportError::ReceiveDeadlineExceeded)
         ));
         assert!(transport.closed);
-        assert!(transport.line_buffer.is_empty());
+        assert_eq!(transport.line_buffer.len(), 0);
         assert!(matches!(
             transport.recv_until(&Cx::for_testing(), None),
             Err(TransportError::Closed)
@@ -2298,7 +2298,7 @@ mod tests {
 
         assert!(matches!(transport.recv(&cx), Err(TransportError::Io(_))));
         assert!(transport.closed);
-        assert!(transport.line_buffer.is_empty());
+        assert_eq!(transport.line_buffer.len(), 0);
         assert!(matches!(transport.recv(&cx), Err(TransportError::Closed)));
     }
 
@@ -2698,7 +2698,7 @@ mod tests {
         assert!(matches!(error, TransportError::Io(_)));
         assert!(transport.closed);
         let writer = transport.writer.as_ref().unwrap();
-        assert!(!writer.bytes.is_empty());
+        assert_ne!(writer.bytes.len(), 0);
         assert!(!writer.bytes.ends_with(b"\n"));
         assert!(matches!(
             transport.send(&cx, &JsonRpcMessage::Request(request.clone())),
@@ -2733,7 +2733,7 @@ mod tests {
         transport
             .send_request_direct(&cx, &JsonRpcRequest::new("still-open", None, 2_i64))
             .unwrap();
-        assert!(!transport.writer.as_ref().unwrap().is_empty());
+        assert_ne!(transport.writer.as_ref().unwrap().len(), 0);
     }
 
     // =========================================================================
@@ -3159,7 +3159,7 @@ mod tests {
 
         // Verify data was flushed
         let sent = String::from_utf8(output).unwrap();
-        assert!(!sent.is_empty());
+        assert_ne!(sent.len(), 0);
         assert!(sent.contains("\"method\":\"test\""));
     }
 

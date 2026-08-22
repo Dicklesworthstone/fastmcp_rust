@@ -4783,7 +4783,7 @@ mod tests {
     }
 
     fn unknown_form_with_value_lengths(value_lengths: &[usize]) -> Vec<u8> {
-        assert!(!value_lengths.is_empty());
+        assert_ne!(value_lengths.len(), 0);
         let mut input = Vec::new();
         for (index, value_len) in value_lengths.iter().copied().enumerate() {
             if index != 0 {
@@ -6517,7 +6517,7 @@ mod tests {
 
         let (code, redirect) = server.authorize(&request).unwrap();
 
-        assert!(!code.is_empty());
+        assert_ne!(code.len(), 0);
         assert!(redirect.contains("code="));
         assert!(redirect.contains("state=xyz"));
     }
@@ -6840,8 +6840,8 @@ mod tests {
                     .expect("token pair contains refresh token"),
             ))
             .expect("returned refresh token was committed");
-        assert!(access.token.is_empty());
-        assert!(refresh.token.is_empty());
+        assert_eq!(access.token.len(), 0);
+        assert_eq!(refresh.token.len(), 0);
         let final_draw_completed = final_draw_completed
             .get()
             .expect("second draw completion timestamp");
@@ -7921,7 +7921,7 @@ mod tests {
     #[test]
     fn server_list_clients() {
         let server = OAuthServer::with_defaults();
-        assert!(server.list_clients().is_empty());
+        assert_eq!(server.list_clients().len(), 0);
 
         let client = OAuthClient::builder("a")
             .redirect_uri("http://127.0.0.1/cb")
@@ -8186,7 +8186,7 @@ mod tests {
             resource: None,
         };
         let resp = server.token(&token_req).unwrap();
-        assert!(!resp.access_token.is_empty());
+        assert_ne!(resp.access_token.len(), 0);
         assert!(resp.refresh_token.is_some());
         assert_eq!(resp.token_type, "bearer");
         assert_eq!(resp.scope, Some("read".to_string()));
@@ -8354,7 +8354,7 @@ mod tests {
         let c1 = compute_s256_challenge(v).unwrap();
         let c2 = compute_s256_challenge(v).unwrap();
         assert_eq!(c1, c2);
-        assert!(!c1.is_empty());
+        assert_ne!(c1.len(), 0);
     }
 
     #[test]

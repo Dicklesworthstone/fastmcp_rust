@@ -106,7 +106,7 @@ mod trust_std {
     pub const FINAL_GATE_SEAL_ENV: &str = "FASTMCP_FND01_FINAL_GATE_SEAL";
     pub const RUN_ID_ENV: &str = "FASTMCP_FND01_RUN_ID";
     pub const MAX_POLICY_BYTES: u64 = 8 * 1024 * 1024;
-    pub const MAX_VERIFIER_BYTES: u64 = 4 * 1024 * 1024;
+    pub const MAX_VERIFIER_BYTES: u64 = 8 * 1024 * 1024;
     pub const MAX_HARNESS_BYTES: u64 = 256 * 1024;
     pub const MAX_RECEIPT_BYTES: u64 = 64 * 1024 * 1024;
     pub const MAX_ADVISORY_DATABASE_BYTES: u64 = 16 * 1024 * 1024;
@@ -18348,7 +18348,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             direct_child_kill_wait_seconds:
                 DIRECT_CHILD_KILL_WAIT_SECONDS,
             max_source_file_bytes: MAX_SOURCE_FILE_BYTES,
-            max_verifier_test_bytes: 4 * 1024 * 1024,
+            max_verifier_test_bytes: 8 * 1024 * 1024,
             max_bootstrap_harness_bytes: 262_144,
             max_bootstrap_lock_bytes: MAX_BOOTSTRAP_LOCK_BYTES,
             max_archive_compressed_bytes: MAX_ARCHIVE_COMPRESSED_BYTES,
@@ -19482,7 +19482,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             "max_acquisition_spool_bytes = 134217728",
             "max_supply_bundle_bytes = 1073741824",
             "max_source_file_bytes = 1048576",
-            "max_verifier_test_bytes = 4194304",
+            "max_verifier_test_bytes = 8388608",
             "max_archive_compressed_bytes = 8388608",
             "max_tree_entry_count = 1000000",
             "max_run_scratch_total_bytes = 68719476736",
@@ -40898,7 +40898,7 @@ activate = 1\n";
             || bounds.max_selector_depth != 16
             || bounds.max_source_file_bytes != 1_048_576
             || bounds.max_policy_bytes != HARD_MAX_POLICY_BYTES
-            || bounds.max_verifier_test_bytes != 4_194_304
+            || bounds.max_verifier_test_bytes != 8_388_608
             || bounds.max_bootstrap_harness_bytes != 262_144
             || bounds.max_receipt_toml_bytes != 67_108_864
             || bounds.max_supply_bundle_bytes != 1_073_741_824
@@ -88540,11 +88540,11 @@ original = "value"
             ).expect("peer-specific environment pristine reacceptance");
         }
 
-        assert_eq!(MAX_VERIFIER_BYTES, 4_194_304, "independent verifier source cap");
-        let error = sdk_validate_verifier_source_bound(4_194_305)
+        assert_eq!(MAX_VERIFIER_BYTES, 8_388_608, "independent verifier source cap");
+        let error = sdk_validate_verifier_source_bound(8_388_609)
             .expect_err("one byte over the verifier source cap must reject");
         assert_eq!(error.code, "E_FILE_BOUND");
-        sdk_validate_verifier_source_bound(4_194_304)
+        sdk_validate_verifier_source_bound(8_388_608)
             .expect("exact verifier source cap pristine reacceptance");
 
         let executable = sdk_test_binding("fnd01-sdk-runner", "/private/tmp/sdk-runner");

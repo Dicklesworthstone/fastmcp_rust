@@ -12402,7 +12402,7 @@ mod router_tests {
         assert_eq!(r.resource_templates_count(), 0);
         assert_eq!(r.prompts_count(), 0);
         assert!(r.tools().is_empty());
-        assert!(r.resources().is_empty());
+        assert_eq!(r.resources().len(), 0);
         assert!(r.resource_templates().is_empty());
         assert!(r.prompts().is_empty());
     }
@@ -12546,7 +12546,7 @@ mod router_tests {
                 None,
             )
             .expect("the exact legacy prompt route retains its explicit registration");
-        assert!(legacy_prompt.messages.is_empty());
+        assert_eq!(legacy_prompt.messages.len(), 0);
 
         let modern_resources = router
             .dispatch_stateless(
@@ -14124,7 +14124,7 @@ mod router_tests {
             .expect("tool registration succeeds");
         let result = main.mount(sub, None);
         assert_eq!(result.tools, 1);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings.len(), 0);
         assert!(result.warnings[0].contains("already exists"));
     }
 
@@ -14139,7 +14139,7 @@ mod router_tests {
         let result = main.mount(sub, Some("bad/prefix"));
         assert!(!result.is_success());
         assert_eq!(result.tools, 0);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings.len(), 0);
         assert!(result.warnings[0].contains("slashes"));
         assert!(!result.errors[0].contains("bad/prefix"));
         assert_eq!(main.tools_count(), 1);
@@ -15116,7 +15116,7 @@ mod router_tests {
         let mut sub = Router::new();
         sub.add_resource(NamedResource::new("file:///a"));
         let result = main.mount(sub, None);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings.len(), 0);
         assert!(result.warnings[0].contains("Resource"));
     }
 
@@ -15127,7 +15127,7 @@ mod router_tests {
         let mut sub = Router::new();
         sub.add_prompt(NamedPrompt::new("p"));
         let result = main.mount(sub, None);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings.len(), 0);
         assert!(result.warnings[0].contains("Prompt"));
     }
 
@@ -15630,7 +15630,7 @@ mod router_tests {
             tags: vec![],
         });
         let result = main.mount(sub, None);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings.len(), 0);
         assert!(result.warnings[0].contains("Resource template"));
     }
 
@@ -15679,7 +15679,7 @@ mod router_tests {
             .handle_tools_call(&request_ctx, params, state, None, None)
             .unwrap();
         assert!(!result.is_error);
-        assert!(!result.content.is_empty());
+        assert_ne!(result.content.len(), 0);
     }
 
     // ── handle_tools_call: not found ─────────────────────────────────────
@@ -15894,7 +15894,7 @@ mod router_tests {
         let result = block_on(request_ctx.get_prompt("greet", HashMap::new()))
             .expect("a registered nested prompt must complete");
         assert_eq!(result.description.as_deref(), Some("Prompt greet"));
-        assert!(result.messages.is_empty());
+        assert_eq!(result.messages.len(), 0);
     }
 
     #[test]
@@ -16027,7 +16027,7 @@ mod router_tests {
         let result = r
             .handle_prompts_get(&request_ctx, params, state, None, None)
             .expect("a zero balance is not a retroactive failure");
-        assert!(result.messages.is_empty());
+        assert_eq!(result.messages.len(), 0);
     }
 
     #[test]
@@ -16863,7 +16863,7 @@ mod router_tests {
         sub.add_tool(NamedTool::new("t"))
             .expect("tool registration succeeds");
         let result = main.mount_tools(sub, None);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings.len(), 0);
         assert!(result.warnings[0].contains("Tool"));
     }
 
@@ -16876,7 +16876,7 @@ mod router_tests {
         let mut sub = Router::new();
         sub.add_prompt(NamedPrompt::new("p"));
         let result = main.mount_prompts(sub, None);
-        assert!(!result.warnings.is_empty());
+        assert_ne!(result.warnings.len(), 0);
         assert!(result.warnings[0].contains("Prompt"));
     }
 
@@ -21662,7 +21662,7 @@ mod router_tests {
             )
             .expect("exact legacy prompts/list remains session-stateful");
         assert!(legacy_tools.tools.is_empty());
-        assert!(legacy_resources.resources.is_empty());
+        assert_eq!(legacy_resources.resources.len(), 0);
         assert!(legacy_templates.resource_templates.is_empty());
         assert!(legacy_prompts.prompts.is_empty());
 
@@ -23627,7 +23627,7 @@ mod router_tests {
             )
             .expect_err("generic registration must not expose an Apps View to exact 2024");
         assert_eq!(resource_error.code, McpErrorCode::InvalidRequest);
-        assert!(router.resources().is_empty());
+        assert_eq!(router.resources().len(), 0);
 
         router
             .add_mcp_apps_ui_resource_with_behavior(
@@ -23719,6 +23719,6 @@ mod router_tests {
         let prefixed = prefixed_destination.mount(prefixed_source, Some("peer"));
         assert!(!prefixed.is_success());
         assert!(prefixed_destination.tools().is_empty());
-        assert!(prefixed_destination.resources().is_empty());
+        assert_eq!(prefixed_destination.resources().len(), 0);
     }
 }

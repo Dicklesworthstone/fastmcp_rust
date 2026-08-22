@@ -4540,7 +4540,7 @@ mod tests {
         let tool = StubTool;
         assert!(tool.icon().is_none());
         assert!(tool.version().is_none());
-        assert!(tool.tags().is_empty());
+        assert_eq!(tool.tags().len(), 0);
         assert!(tool.annotations().is_none());
         assert!(tool.output_schema().is_none());
         assert_eq!(
@@ -4972,7 +4972,7 @@ mod tests {
         assert!(res.template().is_none());
         assert!(res.icon().is_none());
         assert!(res.version().is_none());
-        assert!(res.tags().is_empty());
+        assert_eq!(res.tags().len(), 0);
         assert!(res.timeout().is_none());
     }
 
@@ -5083,7 +5083,7 @@ mod tests {
         let prompt = StubPrompt;
         assert!(prompt.icon().is_none());
         assert!(prompt.version().is_none());
-        assert!(prompt.tags().is_empty());
+        assert_eq!(prompt.tags().len(), 0);
         assert!(prompt.timeout().is_none());
     }
 
@@ -5120,7 +5120,7 @@ mod tests {
     fn mounted_tool_handler_delegates_defaults() {
         let inner = Box::new(StubTool) as BoxedToolHandler;
         let mounted = MountedToolHandler::new(inner, "m_stub".to_string());
-        assert!(mounted.tags().is_empty());
+        assert_eq!(mounted.tags().len(), 0);
         assert!(mounted.annotations().is_none());
         assert!(mounted.output_schema().is_none());
         assert_eq!(
@@ -5273,7 +5273,7 @@ mod tests {
         let inner = Box::new(StubResource) as BoxedResourceHandler;
         let mounted =
             MountedResourceHandler::new(inner, "file:///stub".to_string(), "file:///m".to_string());
-        assert!(mounted.tags().is_empty());
+        assert_eq!(mounted.tags().len(), 0);
     }
 
     // ── MountedPromptHandler ─────────────────────────────────────────
@@ -5291,7 +5291,7 @@ mod tests {
     fn mounted_prompt_handler_delegates_defaults() {
         let inner = Box::new(StubPrompt) as BoxedPromptHandler;
         let mounted = MountedPromptHandler::new(inner, "ns_stub".to_string());
-        assert!(mounted.tags().is_empty());
+        assert_eq!(mounted.tags().len(), 0);
         assert!(mounted.timeout().is_none());
     }
 
