@@ -81,9 +81,9 @@ fn greet_default(ctx: &McpContext, name: String) -> McpResult<String> {
     Ok(format!("Hello, {name}!"))
 }
 
-// The #[tool] macro accepts plain String returns, but these handlers keep
-// McpResult to mirror production handler shapes that may fail; none of them
-// actually errors in this fixture.
+// These fixture handlers never actually fail, so clippy flags the Result as
+// unnecessary; the McpResult return is retained deliberately so the fixtures
+// keep the same fallible handler shape production tools use.
 #[allow(clippy::unnecessary_wraps)]
 #[tool(name = "announce", description = "Emits handler log notifications")]
 fn announce(ctx: &McpContext, name: String) -> McpResult<String> {
