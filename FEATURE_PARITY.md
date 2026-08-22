@@ -195,6 +195,12 @@ This is a historical source comparison between the Rust port and Python FastMCP 
 | `tasks/submit` | ✅ | 🚧 | Legacy method; RPC returns `MethodNotFound` |
 | `tasks/cancel` | ✅ | 🟡 | Served by default (in-memory store); `final_tasks` replaces the store. Live `bind_http` `tasks/cancel` of a created Task reaches `FinalTask::Cancelled`; a near-identical missing id stays an error. Live `bind_websocket` keeps the same cancel/`Cancelled`/missing-id split. Live `as_proxy_typed("ext", …)` and live `as_proxy("ext", stdio Client)` forward `tasks/cancel` of an upstream-created Task and refuse a near-identical missing id |
 
+Bound (stateless HTTP as_proxy): a gateway HTTP `as_proxy` does not
+auto-follow an upstream MRTR `input_required` Task across POSTs.
+Per-request dispatch is stateless and upstream `requestState` cannot
+resume on a later POST; callers resume such upstream Tasks only through an
+explicit matching `tasks/update`, as proven in the `tasks/update` row above.
+
 The historical `TaskManager` source remains test-only for implementation
 archaeology. Production builds expose neither a manager constructor/builder
 edge nor a network capability while TASK-01/TASK-02 remain open.

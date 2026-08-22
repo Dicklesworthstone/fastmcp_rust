@@ -96,6 +96,10 @@
   `bind_http`, do not promote JWT/Redis/Docket/Apps/EMA/OAuth CC, and
   are not aggregate MCP 2026-07-28 evidence. The public
   `PROTOCOL_VERSION` constant remains `2024-11-05`.
+  HTTP gateway `as_proxy` also does not auto-follow an upstream MRTR
+  `input_required` Task across POSTs: per-request dispatch is stateless
+  and upstream `requestState` cannot resume, so callers resume only
+  through an explicit matching `tasks/update`.
 - Frozen dependency evidence is not current for the live dependency
   graph: the renamed-facade macro work introduces
   `proc-macro-crate = 3.5.0`, which is absent from the sealed FND-01

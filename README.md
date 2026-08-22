@@ -672,6 +672,7 @@ fn commit_revision(
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
 | **Authentication Admission** | JSON-RPC credential fields are a stripped legacy fallback. Public turnkey HTTP is live, but no complete transport-boundary native `Authorization` admission/challenge path is qualified |
 | **Tasks RPC** | `tasks/list` and `tasks/submit` stay `MethodNotFound`. Official `tasks/get`, `tasks/update`, and `tasks/cancel` run by default on a process-local in-memory store; `ServerBuilder::final_tasks` replaces that store |
+| **HTTP as_proxy auto-follow** | A gateway HTTP `as_proxy` does not auto-follow an upstream MRTR `input_required` task across POSTs; per-request dispatch is stateless and upstream `requestState` cannot resume. Callers resume such upstream tasks through an explicit matching `tasks/update` |
 | **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
 | **Early Development** | API may change before 1.0 |
 
