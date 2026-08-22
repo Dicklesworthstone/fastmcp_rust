@@ -32013,6 +32013,7 @@ _ => unreachable!("closed family matrix"),
             assert!(!arguments.run_root.exists());
         }
 
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         #[test]
         fn phase_b_produce_acquisition_authority_matrix() {
             if std::env::var_os("FASTMCP_FND01_RUN_ID").is_some() {
