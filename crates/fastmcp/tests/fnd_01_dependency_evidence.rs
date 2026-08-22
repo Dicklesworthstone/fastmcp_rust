@@ -85094,20 +85094,20 @@ original = "value"
         for (family, pointer, replacement, expected) in [
         ("wrong byte length", "/artifacts/0/byte_length", "1", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-ts|byte_length"),
         ("wrong SHA-256", "/artifacts/1/sha256", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|sha256"),
-        ("wrong Git blob", "/artifacts/1/git_blob_sha1", "0", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-schema-json|git_blob_sha1"),
+        ("wrong Git blob", "/artifacts/1/git_blob_sha1", "0", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-schema-json|blob_url"),
         ("changed retrieval URL", "/artifacts/4/retrieval_url", "https://raw.githubusercontent.com/modelcontextprotocol/conformance/5f5440bb26a62e2cf3440b92da5a667efa03b267/docs/specification/2026-07-28/changelog.mdx", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|core-changelog|retrieval_url"),
         ("floating revision or latest URL", "/artifacts/4/repository_revision", "main", "FND01|Error|E_CORE_CONFORMANCE_AUTHORITY|core-changelog|repository_revision"),
-        ("duplicate or missing scenario ID", "/conformance_scenarios/1/id", "auth/enterprise-managed-authorization", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|conformance_scenarios"),
-        ("missing, duplicate, or changed scenario-local declared check ID", "/scenario_local_check_declarations/0/check_id", "complete-flow-jwt-bearer", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
-        ("expected-success versus conditional-failure check-role mismatch", "/scenario_local_check_declarations/0/expected_success_path", "false", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations"),
-        ("incomplete transitive helper inventory mislabeled complete", "/conformance/check_inventory_scope/complete_transitive_helper_inventory_established", "true", "FND01|Error|E_CORE_CONFORMANCE_NO_CLAIM|check_inventory_scope"),
+        ("duplicate or missing scenario ID", "/conformance_scenarios/1/id", "auth/enterprise-managed-authorization", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|conformance_scenarios|"),
+        ("missing, duplicate, or changed scenario-local declared check ID", "/scenario_local_check_declarations/0/check_id", "complete-flow-jwt-bearer", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations|"),
+        ("expected-success versus conditional-failure check-role mismatch", "/scenario_local_check_declarations/0/expected_success_path", "false", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|scenario_local_check_declarations|"),
+        ("incomplete transitive helper inventory mislabeled complete", "/conformance/check_inventory_scope/complete_transitive_helper_inventory_established", "true", "FND01|Error|E_CORE_CONFORMANCE_NO_CLAIM|check_inventory_scope|"),
         ("file-level auth scenario classification", "/artifacts/6/repository", "not-a-url", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|repository"),
         ("nonfatal missing cache header mislabeled as forced input", "/artifacts/6/git_tree", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|git_tree"),
         ("empty-scope omission mislabeled as a forced signed-scope failure", "/artifacts/6/source_page_url", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-enterprise-auth|source_page_url"),
         ("missing exact-issuer ID-JAG policy mislabeled as production-only evidence", "/artifacts/7/retrieval_date", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|retrieval_date"),
         ("expected policy rejection mislabeled as upstream pass", "/artifacts/7/vendored_path", "", "FND01|Error|E_CORE_CONFORMANCE_ARTIFACT|conformance-client-credentials|vendored_path"),
-        ("wrong final error code", "/final_error_codes/2/code", "-32023", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|final_error_codes"),
-        ("missing or duplicate Section 5 ambiguity entry", "/ambiguities/1/id", "5.1", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|ambiguities"),
+        ("wrong final error code", "/final_error_codes/2/code", "-32023", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|final_error_codes|"),
+        ("missing or duplicate Section 5 ambiguity entry", "/ambiguities/1/id", "5.1", "FND01|Error|E_CORE_CONFORMANCE_REGISTRY|ambiguities|"),
     ] {
         let mut drifted = baseline.clone();
         let value = if pointer.ends_with("byte_length")
