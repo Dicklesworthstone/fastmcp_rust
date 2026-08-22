@@ -34287,12 +34287,12 @@ mod ordinary {
     const ACTION_CHECKOUT: &str = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1";
     const ACTION_RUST_TOOLCHAIN: &str =
         "dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772";
-    const ACTION_RUST_CACHE: &str = "Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32";
+    const ACTION_RUST_CACHE: &str = "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6";
     const ACTION_UPLOAD_ARTIFACT: &str =
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
     const ACTION_DOWNLOAD_ARTIFACT: &str =
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
-    const ACTION_INSTALL: &str = "taiki-e/install-action@1beb33eee6d086258184383af9a538940be190ed";
+    const ACTION_INSTALL: &str = "taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad";
     const ACTION_GITHUB_RELEASE: &str =
         "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65";
     const WORKFLOW_ACTION_IDENTITIES: &[(&str, usize, usize)] = &[
