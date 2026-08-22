@@ -778,7 +778,7 @@ fn tool_no_params_empty_schema() {
     let props = def.input_schema["properties"].as_object().unwrap();
     assert!(props.is_empty());
     let required = def.input_schema["required"].as_array().unwrap();
-    assert!(required.is_empty());
+    assert_eq!(required.len(), 0);
 }
 
 #[test]
@@ -944,7 +944,7 @@ fn tool_default_version_is_none() {
 #[test]
 fn tool_default_tags_are_empty() {
     let handler = GreetSimple;
-    assert!(handler.tags().is_empty());
+    assert_eq!(handler.tags().len(), 0);
 }
 
 #[test]
@@ -1662,7 +1662,7 @@ fn tool_all_optional_none_required() {
     let handler = AllOptionalTool;
     let def = handler.definition();
     let required = def.input_schema["required"].as_array().unwrap();
-    assert!(required.is_empty());
+    assert_eq!(required.len(), 0);
 }
 
 #[test]
@@ -2213,7 +2213,7 @@ fn resource_default_version_is_none() {
 #[test]
 fn resource_default_tags_are_empty() {
     let handler = AppConfigResource;
-    assert!(handler.tags().is_empty());
+    assert_eq!(handler.tags().len(), 0);
 }
 
 #[test]
@@ -2480,7 +2480,7 @@ fn resource_version_without_tags() {
     let handler = PlainVersionedResourceResource;
     let def = handler.definition();
     assert_eq!(def.version.as_deref(), Some("1.0.0"));
-    assert!(def.tags.is_empty());
+    assert_eq!(def.tags, [] as [std::string::String; 0]);
 }
 
 /// Resource with no version or tags (backwards compat).
@@ -2494,7 +2494,7 @@ fn resource_no_version_no_tags_stays_none() {
     let handler = BasicResourceResource;
     let def = handler.definition();
     assert!(def.version.is_none());
-    assert!(def.tags.is_empty());
+    assert_eq!(def.tags, [] as [std::string::String; 0]);
 }
 
 // ============================================================================
@@ -2831,7 +2831,7 @@ fn prompt_default_version_is_none() {
 #[test]
 fn prompt_default_tags_are_empty() {
     let handler = GreetingPromptPrompt;
-    assert!(handler.tags().is_empty());
+    assert_eq!(handler.tags().len(), 0);
 }
 
 #[test]
@@ -3151,7 +3151,7 @@ fn prompt_no_version_no_tags_stays_none() {
     let handler = BasicPromptPrompt;
     let def = handler.definition();
     assert!(def.version.is_none());
-    assert!(def.tags.is_empty());
+    assert_eq!(def.tags, [] as [std::string::String; 0]);
 }
 
 // ============================================================================

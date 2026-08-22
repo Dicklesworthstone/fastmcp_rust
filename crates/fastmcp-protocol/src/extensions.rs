@@ -1096,7 +1096,6 @@ impl NegotiatedExtensionSet {
     }
 
     /// Returns enabled descriptors in deterministic identifier order.
-    #[must_use]
     pub fn active_extensions(&self) -> impl ExactSizeIterator<Item = &NegotiatedExtension> {
         self.active.values()
     }
@@ -1664,7 +1663,6 @@ impl ExtensionDescriptorRegistry {
     }
 
     /// Returns the frozen descriptors in deterministic identifier order.
-    #[must_use]
     pub fn descriptors(&self) -> impl ExactSizeIterator<Item = &ExtensionDescriptor> {
         self.descriptors.values()
     }

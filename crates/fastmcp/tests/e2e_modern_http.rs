@@ -692,8 +692,8 @@ fn as_proxy_auth_response_json_body(response: &[u8]) -> serde_json::Value {
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .expect("native HTTP response contains a complete header terminator");
-    let headers =
-        std::str::from_utf8(&response[..header_end]).expect("native HTTP response headers are ASCII");
+    let headers = std::str::from_utf8(&response[..header_end])
+        .expect("native HTTP response headers are ASCII");
     let mut content_length = None;
     let mut chunked = false;
     for header in headers.lines().skip(1) {
@@ -742,8 +742,8 @@ fn as_proxy_auth_response_json_body(response: &[u8]) -> serde_json::Value {
             cursor = chunk_end + 2;
         }
     } else {
-        let content_length = content_length
-            .expect("native HTTP response uses Content-Length or chunked framing");
+        let content_length =
+            content_length.expect("native HTTP response uses Content-Length or chunked framing");
         body[..content_length].to_vec()
     };
     serde_json::from_slice(&decoded).expect("authenticated as_proxy tool response is JSON-RPC")
@@ -17306,17 +17306,20 @@ fn e2e_public_http_as_proxy_gateway_custom_verifier_refuses_missing_and_static_a
     let tool_body =
         serde_json::to_vec(&tool).expect("as_proxy custom-auth tool request serializes");
 
-    let missing = as_proxy_auth_native_post(gateway.address(), None, "tools/call", &prefixed, &tool_body);
+    let missing =
+        as_proxy_auth_native_post(gateway.address(), None, "tools/call", &prefixed, &tool_body);
     assert!(
         missing.starts_with(b"HTTP/1.1 401"),
         "missing Authorization must be refused by the custom-verifier gateway: {}",
         String::from_utf8_lossy(&missing)
     );
     assert!(
-        as_proxy_auth_response_headers(&missing).lines().any(|header| header
-            .to_ascii_lowercase()
-            .starts_with("www-authenticate:")
-            && header.to_ascii_lowercase().contains("bearer")),
+        as_proxy_auth_response_headers(&missing)
+            .lines()
+            .any(
+                |header| header.to_ascii_lowercase().starts_with("www-authenticate:")
+                    && header.to_ascii_lowercase().contains("bearer")
+            ),
         "the missing-token custom-verifier challenge must advertise Bearer: {}",
         String::from_utf8_lossy(&missing)
     );
@@ -17328,8 +17331,13 @@ fn e2e_public_http_as_proxy_gateway_custom_verifier_refuses_missing_and_static_a
 
     // One variable vs the static-token sibling: the static verifier's
     // matching value must now be refused by the custom verifier.
-    let static_refused =
-        as_proxy_auth_native_post(gateway.address(), Some("Bearer alpha"), "tools/call", &prefixed, &tool_body);
+    let static_refused = as_proxy_auth_native_post(
+        gateway.address(),
+        Some("Bearer alpha"),
+        "tools/call",
+        &prefixed,
+        &tool_body,
+    );
     assert!(
         static_refused.starts_with(b"HTTP/1.1 401"),
         "the static-token bearer value must be refused by the custom verifier: {}",
@@ -17636,7 +17644,8 @@ fn e2e_public_http_legacy_as_proxy_gateway_static_token_refuses_missing_and_wron
 }
 #[cfg(feature = "proxy")]
 #[test]
-fn e2e_public_http_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+fn e2e_public_http_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma()
+{
     let upstream = spawn_legacy_as_proxy_counting_upstream();
     let gateway = spawn_legacy_as_proxy_http_gateway_configured_with_auth(
         upstream.address(),
@@ -17652,7 +17661,10 @@ fn e2e_public_http_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_s
 
     let (_missing_stream, missing) =
         write_legacy_native_http(gateway.address(), "GET", "/sse", None, &[], false);
-    assert_legacy_bearer_challenge(&missing, "missing Authorization on custom-verifier as_proxy GET /sse");
+    assert_legacy_bearer_challenge(
+        &missing,
+        "missing Authorization on custom-verifier as_proxy GET /sse",
+    );
     assert_eq!(
         upstream.handler_call_snapshot().tool,
         0,
@@ -17693,8 +17705,8 @@ fn e2e_public_http_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_s
         })),
         2_i64,
     );
-    let tool_body = serde_json::to_vec(&tool)
-        .expect("exact-2024 as_proxy custom-auth tools/call serializes");
+    let tool_body =
+        serde_json::to_vec(&tool).expect("exact-2024 as_proxy custom-auth tools/call serializes");
 
     let (_missing_post, missing_post) = write_legacy_native_http(
         gateway.address(),
@@ -20230,7 +20242,8 @@ fn e2e_public_http_as_proxy_stdio_gateway_static_token_refuses_missing_and_wrong
 }
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
 #[test]
-fn e2e_public_http_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+fn e2e_public_http_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_static_admits_gamma()
+{
     let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_auth(
         false,
         Vec::new(),
@@ -20263,8 +20276,13 @@ fn e2e_public_http_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_st
     let tool_body =
         serde_json::to_vec(&tool).expect("stdio as_proxy custom-auth tool request serializes");
 
-    let missing =
-        as_proxy_auth_native_post(gateway.address(), None, "tools/call", "ext/echo", &tool_body);
+    let missing = as_proxy_auth_native_post(
+        gateway.address(),
+        None,
+        "tools/call",
+        "ext/echo",
+        &tool_body,
+    );
     assert!(
         missing.starts_with(b"HTTP/1.1 401"),
         "missing Authorization must be refused by the custom-verifier stdio gateway: {}",
@@ -20402,7 +20420,8 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_static_token_refuses_missing_an
 }
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
-fn e2e_public_http_legacy_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_static_admits_gamma()
+ {
     let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
         Vec::new(),
         false,
@@ -42399,7 +42418,8 @@ mod live_websocket_bind {
     }
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
-    fn e2e_public_websocket_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+    fn e2e_public_websocket_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma()
+     {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
             let cx = Cx::current().expect(
@@ -53094,7 +53114,8 @@ mod live_websocket_bind {
     }
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     #[test]
-    fn e2e_public_websocket_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+    fn e2e_public_websocket_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma()
+     {
         let runtime = websocket_test_runtime();
         runtime.block_on(async {
             let cx = Cx::current().expect(

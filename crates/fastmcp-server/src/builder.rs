@@ -1857,7 +1857,7 @@ impl ServerBuilder {
         self,
         client: fastmcp_client::Client,
     ) -> Result<Self, fastmcp_core::McpError> {
-        self.as_proxy_raw_with_proxy_client(ProxyClient::from_client(client)?)
+        self.into_proxy_raw_with_proxy_client(ProxyClient::from_client(client)?)
     }
 
     /// Registers one already-negotiated, typed upstream catalog without any
@@ -1882,7 +1882,7 @@ impl ServerBuilder {
     }
 
     #[cfg(feature = "proxy")]
-    fn as_proxy_raw_with_proxy_client(
+    fn into_proxy_raw_with_proxy_client(
         self,
         proxy_client: ProxyClient,
     ) -> Result<Self, fastmcp_core::McpError> {
@@ -6974,7 +6974,7 @@ mod tests {
             let result = ServerBuilder::new("srv", "1.0")
                 .on_duplicate(DuplicateBehavior::Error)
                 .tool(TestTool)
-                .as_proxy_raw_with_proxy_client(ProxyClient::from_backend(
+                .into_proxy_raw_with_proxy_client(ProxyClient::from_backend(
                     DuplicatePolicyProxyBackend,
                 ));
 

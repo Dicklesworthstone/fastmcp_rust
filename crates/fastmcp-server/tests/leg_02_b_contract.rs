@@ -221,7 +221,10 @@ fn complete_reverse_request(
         ),
         Ok(Legacy2024Outbound::NoResponse)
     );
-    assert!(adapter.snapshot().pending_reverse_request_ids.is_empty());
+    assert_eq!(
+        adapter.snapshot().pending_reverse_request_ids,
+        Vec::<i64>::new()
+    );
     assert_eq!(adapter.snapshot().reservation_count, 0);
 }
 
@@ -451,8 +454,11 @@ fn exercise_partition(
     assert_eq!(adapter.lifecycle(), Legacy2024Lifecycle::Closed);
     assert_eq!(adapter.snapshot().reservation_count, 0);
     assert_eq!(adapter.snapshot().close_release_count, 1);
-    assert!(adapter.snapshot().subscriptions.is_empty());
-    assert!(adapter.snapshot().pending_reverse_request_ids.is_empty());
+    assert_eq!(adapter.snapshot().subscriptions, Vec::<String>::new());
+    assert_eq!(
+        adapter.snapshot().pending_reverse_request_ids,
+        Vec::<i64>::new()
+    );
     (binding, adapter, rows)
 }
 

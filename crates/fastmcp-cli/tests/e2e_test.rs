@@ -2,7 +2,9 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, ExitStatus, Stdio};
@@ -2947,7 +2949,7 @@ fn e2e_static_protocol_fixture_ignores_nested_notification_ids() {
     let output = run_with_deadline(command, Duration::from_secs(10))
         .expect("static protocol fixture must exit after its input closes");
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.stderr, b"");
 
     let responses = std::str::from_utf8(&output.stdout)
         .expect("fixture output must be UTF-8")

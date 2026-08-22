@@ -135,8 +135,10 @@ required-features = ["testing-lab", "legacy-2024-11-05", "tasks"]
 [[test]]
 name = "e2e_modern_http"
 path = "tests/e2e_modern_http.rs"
-# This dual-era HTTP harness directly names the sealed exact-2024 facade.
-required-features = ["legacy-2024-11-05"]
+# This dual-era HTTP harness directly names the sealed exact-2024 facade and
+# its Tasks/proxy fixtures; the canonical gate feature set matches every
+# recorded acceptance run for this target.
+required-features = ["legacy-2024-11-05", "tasks", "proxy"]
 
 [[test]]
 name = "e2e_stress"

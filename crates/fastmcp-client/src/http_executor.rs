@@ -963,6 +963,9 @@ impl ModernHttpSubscriptionListener {
 pub const MAX_QUEUED_FINAL_HTTP_PROGRESS_NOTIFICATIONS: usize = 64;
 
 /// One accepted record from an ordinary final core HTTP response stream.
+/// The envelope is moved a handful of times per response stream; heap indirection
+/// on the terminal path costs more than the bounded stack copy.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ModernHttpFinalCoreEvent {
     /// An exact progress notification retained without `f64` conversion.
@@ -1578,7 +1581,7 @@ impl ModernHttpSseResponseStream {
             return Ok(Poll::Ready(None));
         }
         let waker = Waker::noop();
-        let mut task_cx = Context::from_waker(&waker);
+        let mut task_cx = Context::from_waker(waker);
         let response = self
             .response
             .as_mut()
@@ -6014,7 +6017,7 @@ impl ModernHttpClient {
         maximum_response_bytes: usize,
     ) -> Result<FinalToolCallOutcome, ModernHttpFinalCoreListenError> {
         let limits = SseLimits::new(
-            maximum_response_bytes.min(64 * 1024).max(1),
+            maximum_response_bytes.clamp(1, 64 * 1024),
             maximum_response_bytes.max(1),
             256,
         )

@@ -4260,6 +4260,9 @@ where
 }
 
 #[cfg(any(test, feature = "websocket-experimental"))]
+// Held protocol-native for one short negotiation window per client; boxing
+// would touch every construction and match site for no allocation win.
+#[allow(clippy::large_enum_variant)]
 enum WebSocketInitialization {
     Legacy(InitializeResult),
     Modern {
@@ -7481,6 +7484,9 @@ where
     fn take_ready_catalog_subscription_event(
         &mut self,
     ) -> McpResult<Option<StdioSubscriptionEvent>> {
+        // Function-local drain state; the wide terminal variant never leaves
+        // this call frame, so boxing only adds indirection.
+        #[allow(clippy::large_enum_variant)]
         enum ReadyCatalog {
             Event(StdioSubscriptionEvent),
             Terminal {
@@ -12727,6 +12733,9 @@ impl HttpClient {
         Ok(event)
     }
 
+    // The Result is load-bearing under `--features tasks`, where the filter
+    // parse and taskIds refusal can fail; clippy only sees the default set.
+    #[allow(clippy::unnecessary_wraps)]
     fn refuse_http_catalog_task_ids(
         &self,
         notifications: &SubscriptionFilter,
@@ -13618,6 +13627,9 @@ pub struct Client {
 
 /// Successful client negotiation, kept in its protocol-native shape until it
 /// is committed to session state.
+// Held protocol-native for one short negotiation window per client; boxing
+// would touch every construction and match site for no allocation win.
+#[allow(clippy::large_enum_variant)]
 enum ClientInitialization {
     /// Exact 2024-11-05 initialization response.
     Legacy(InitializeResult),
@@ -19971,6 +19983,9 @@ impl Client {
     fn take_ready_catalog_subscription_event(
         &mut self,
     ) -> McpResult<Option<StdioSubscriptionEvent>> {
+        // Function-local drain state; the wide terminal variant never leaves
+        // this call frame, so boxing only adds indirection.
+        #[allow(clippy::large_enum_variant)]
         enum ReadyCatalog {
             Event(StdioSubscriptionEvent),
             Terminal {

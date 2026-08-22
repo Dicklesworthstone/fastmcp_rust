@@ -84,12 +84,10 @@ impl McpAppsUiResource {
             mime_type: Some(MCP_APPS_HTML_MIME_TYPE.to_owned()),
             size: None,
             annotations: None,
-            meta: self.apps_metadata.as_ref().map_or(None, |metadata| {
-                Some(
-                    metadata
-                        .to_open_metadata()
-                        .expect("validated MCP Apps resource metadata serializes"),
-                )
+            meta: self.apps_metadata.as_ref().map(|metadata| {
+                metadata
+                    .to_open_metadata()
+                    .expect("validated MCP Apps resource metadata serializes")
             }),
         }
     }

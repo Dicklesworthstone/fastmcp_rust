@@ -10804,7 +10804,7 @@ mod tests {
         let _ = std::mem::size_of::<ClientSession>();
         let _: Option<ClientHttpNegotiation> = None;
         let _: Option<CompleteResult<()>> = None;
-        assert!(McpConfig::new().server_names().is_empty());
+        assert_eq!(McpConfig::new().server_names(), [] as [&str; 0]);
         assert!(
             ModernHttpRequest::new(
                 "https://mcp.example.test/mcp",

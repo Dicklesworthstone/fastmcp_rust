@@ -974,7 +974,7 @@ fn e2e_list_custom_config_errors_are_strict_and_metadata_only() {
         ],
     );
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let stderr = stderr_str(&output);
     assert!(!stderr.contains(JSON_SECRET));
     assert!(!stderr.contains('\u{1b}'));
@@ -999,7 +999,7 @@ fn e2e_list_custom_config_errors_are_strict_and_metadata_only() {
         ],
     );
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     let stderr = stderr_str(&output);
     assert!(!stderr.contains(TOML_SECRET));
     assert!(stderr.contains("category: syntax"));
@@ -1083,7 +1083,7 @@ fn e2e_list_explicit_client_config_requires_object_registry_and_valid_core_entri
             &["list", "--target", "claude", "--format", "json"],
         );
         assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, b"");
         let stderr = stderr_str(&output);
         assert!(stderr.contains(expected));
         assert!(!stderr.contains(FIELD_SECRET));

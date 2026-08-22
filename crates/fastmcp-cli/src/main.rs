@@ -10601,9 +10601,9 @@ mod tests {
                     protocol_policy,
                 } => {
                     assert_eq!(server, "./my-server");
-                    assert!(args.is_empty());
+                    assert_eq!(args, Vec::<String>::new());
                     assert!(cwd.is_none());
-                    assert!(env.is_empty());
+                    assert_eq!(env, Vec::<String>::new());
                     assert_eq!(protocol_policy, CliProtocolPolicy::default());
                 }
                 _ => unreachable!("Expected Run command"),
@@ -10959,7 +10959,7 @@ mod tests {
                 } => {
                     assert!(server.is_none());
                     assert_eq!(http_url.as_deref(), Some("http://127.0.0.1:8123/mcp"));
-                    assert!(args.is_empty());
+                    assert_eq!(args, Vec::<String>::new());
                     assert_eq!(protocol_policy, CliProtocolPolicy::ModernOnly);
                 }
                 _ => unreachable!("Expected Inspect command"),
@@ -12393,7 +12393,7 @@ mod tests {
             assert_eq!(safe_mutation, OutputMutationMetadata::default());
 
             let (zero_budget, zero_budget_mutation) = sanitize_peer_text_with_metadata("safe", 0);
-            assert!(zero_budget.is_empty());
+            assert_eq!(zero_budget, "");
             assert!(!zero_budget_mutation.redacted);
             assert!(!zero_budget_mutation.sanitized);
             assert!(zero_budget_mutation.truncated);
@@ -13082,7 +13082,7 @@ mod tests {
 
             let config: McpServerConfig = serde_json::from_str(json).unwrap();
             assert_eq!(config.command, "server");
-            assert!(config.args.is_empty());
+            assert_eq!(config.args, Vec::<String>::new());
             assert!(config.env.is_none());
             assert!(config.cwd.is_none());
             assert!(!config.disabled);
@@ -13797,7 +13797,7 @@ mod tests {
             let error = write_stdout_output(&mut writer, &output, "test output", false)
                 .expect_err("oversized output must be rejected");
 
-            assert!(writer.bytes.is_empty());
+            assert_eq!(writer.bytes, Vec::<u8>::new());
             assert!(error.message.contains("Refusing to write test output"));
         }
     }
@@ -15396,7 +15396,7 @@ mod tests {
                 ("LETTER".to_owned(), "x".to_owned()),
             ]);
 
-            assert!(redacted_dev_text(b"<xxx", &environment, false).is_empty());
+            assert_eq!(redacted_dev_text(b"<xxx", &environment, false), "");
         }
 
         #[test]
@@ -15405,19 +15405,19 @@ mod tests {
 
             let rendered = redacted_dev_text_with_budget(b"aaaaaaab", &environment, false, 4);
 
-            assert!(rendered.is_empty());
+            assert_eq!(rendered, "");
         }
 
         #[test]
         fn dev_diagnostics_fail_closed_on_synthesized_secret_text() {
             let escaped = HashMap::from([("TOKEN".to_owned(), "x1B".to_owned())]);
-            assert!(redacted_dev_text(b"\x1b", &escaped, false).is_empty());
+            assert_eq!(redacted_dev_text(b"\x1b", &escaped, false), "");
 
             let joined = HashMap::from([
                 ("INNER".to_owned(), "X".to_owned()),
                 ("SYNTHESIZED".to_owned(), "a<redacted>b".to_owned()),
             ]);
-            assert!(redacted_dev_text(b"aXb", &joined, false).is_empty());
+            assert_eq!(redacted_dev_text(b"aXb", &joined, false), "");
         }
 
         #[test]

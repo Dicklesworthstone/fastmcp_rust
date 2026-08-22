@@ -493,7 +493,7 @@ mod helper_tests {
     fn template_params_none() {
         let params =
             extract_template_params("static/path/no/params").expect("literal-only template parses");
-        assert!(params.is_empty());
+        assert_eq!(params, [] as [String; 0]);
     }
 
     #[test]

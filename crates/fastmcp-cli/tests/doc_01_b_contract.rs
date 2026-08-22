@@ -256,7 +256,7 @@ fn doc_01_b_public_binary_positive() {
         .output()
         .expect("spawn the shipped fastmcp subcommand help");
     assert!(subcommand_help.status.success());
-    assert!(subcommand_help.stderr.is_empty());
+    assert_eq!(subcommand_help.stderr, b"");
     let subcommand_stdout = normalized_stdout(&subcommand_help);
     assert!(subcommand_stdout.contains("Run an MCP server binary."));
     assert!(!subcommand_stdout.contains("Protocol status: MCP 2026-07-28"));

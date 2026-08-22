@@ -512,7 +512,6 @@ impl Session {
     }
 
     /// Returns the resource URIs this session currently subscribes to.
-    #[must_use]
     pub fn subscribed_resource_uris(&self) -> impl Iterator<Item = &str> {
         self.resource_subscriptions.iter().map(String::as_str)
     }

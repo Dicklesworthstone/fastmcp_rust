@@ -486,7 +486,7 @@ impl ClientBuilder {
     #[must_use]
     pub fn forward_inbound_legacy_reverse(mut self) -> Self {
         let inbound = Arc::clone(&self.inbound_legacy_reverse);
-        self.capabilities.sampling = Some(Default::default());
+        self.capabilities.sampling = Some(fastmcp_protocol::SamplingCapability::default());
         self.capabilities.roots = Some(RootsCapability {
             list_changed: false,
         });

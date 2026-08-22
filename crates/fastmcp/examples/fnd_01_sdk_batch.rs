@@ -6,7 +6,18 @@
 
 #![forbid(unsafe_code)]
 
-#[allow(dead_code, unused_imports)]
+// Same rationale as fnd_01_evidence_harness: the included verifier compiles
+// under multiple cfg surfaces, and off-Linux non-test builds bind helpers it
+// does not consume, so binary-context lint classes are allowed at the wrapper.
+#[allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    unused_mut,
+    unreachable_code,
+    clippy::used_underscore_binding,
+    clippy::diverging_sub_expression
+)]
 #[path = "../tests/fnd_01_dependency_evidence.rs"]
 mod evidence;
 

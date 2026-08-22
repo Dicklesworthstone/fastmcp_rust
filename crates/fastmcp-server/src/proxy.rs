@@ -100,6 +100,9 @@ pub type FinalProgressCallback<'a> = &'a mut dyn FnMut(FinalProgressNotification
 /// needed to perform its one request after the proxy route mutex is released.
 #[doc(hidden)]
 #[cfg(feature = "tasks")]
+// One short-lived reserved request; boxing serde_json::Value would churn
+// every construction and match for no allocation win.
+#[allow(clippy::large_enum_variant)]
 pub enum ProxyFinalTaskOperation {
     /// A task-capable final tools/call request.
     CallTool {
@@ -623,6 +626,9 @@ pub enum ProxyCatalogListenerEvent {
 /// A listener emits [`Self::Acknowledged`] exactly once before emitting a
 /// notification or [`Self::Terminal`].
 #[derive(Debug)]
+// Events are drained one at a time off a bounded queue; boxing the
+// notification variant would only add indirection to the hot path.
+#[allow(clippy::large_enum_variant)]
 #[cfg(feature = "tasks")]
 pub enum ProxyFinalTaskListenerEvent {
     /// Upstream accepted the requested task filter.
@@ -3278,6 +3284,9 @@ impl ProxyFinalTaskListener for ProxyBufferedFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioFinalTaskListener {
     client: ProxyClient,
+    /// Owned handle for best-effort cancellation after the request context
+    /// is gone; `Cx::for_request` is test-gated and unavailable here.
+    cx: Cx,
 }
 
 #[cfg(feature = "tasks")]
@@ -3320,7 +3329,7 @@ impl ProxyFinalTaskListener for ProxyIncrementalStdioFinalTaskListener {
 #[cfg(feature = "tasks")]
 impl Drop for ProxyIncrementalStdioFinalTaskListener {
     fn drop(&mut self) {
-        let cx = Cx::for_request();
+        let cx = self.cx.clone();
         let _ = self
             .client
             .with_backend(|backend| backend.cancel_incremental_final_task_listener(&cx));
@@ -3332,6 +3341,9 @@ impl Drop for ProxyIncrementalStdioFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioCatalogListener {
     client: ProxyClient,
+    /// Owned handle for best-effort cancellation after the request context
+    /// is gone; `Cx::for_request` is test-gated and unavailable here.
+    cx: Cx,
 }
 
 #[cfg(feature = "tasks")]
@@ -3372,7 +3384,7 @@ impl ProxyCatalogListener for ProxyIncrementalStdioCatalogListener {
 #[cfg(feature = "tasks")]
 impl Drop for ProxyIncrementalStdioCatalogListener {
     fn drop(&mut self) {
-        let cx = Cx::for_request();
+        let cx = self.cx.clone();
         let _ = self
             .client
             .with_backend(|backend| backend.cancel_incremental_catalog_listener(&cx));
@@ -8029,17 +8041,17 @@ impl ProxyClient {
         // Prefer an independent HTTP SSE request so the route mutex stays free
         // while the gateway listen loop waits. Incremental listen is for
         // backends that own a sequential ingress loop (stdio).
-        match self
-            .with_backend(|backend| backend.start_final_task_listener(notifications.clone()))?
+        if let Some(request) =
+            self.with_backend(|backend| backend.start_final_task_listener(notifications.clone()))?
         {
-            Some(request) => return request.open(ctx).await,
-            None => {}
+            return request.open(ctx).await;
         }
         if self.with_backend(|backend| {
             backend.start_incremental_final_task_listener(notifications.clone())
         })? {
             return Ok(Box::new(ProxyIncrementalStdioFinalTaskListener {
                 client: self.clone(),
+                cx: ctx.cx().clone(),
             }));
         }
         self.with_backend(|backend| backend.open_final_task_listener(notifications))
@@ -8051,17 +8063,19 @@ impl ProxyClient {
         ctx: &McpContext,
         notifications: SubscriptionFilter,
     ) -> McpResult<Box<dyn ProxyCatalogListener>> {
-        match self
-            .with_backend(|backend| backend.start_catalog_listener_request(notifications.clone()))?
+        if let Some(request) = self
+            .with_backend(|backend| {
+                backend.start_catalog_listener_request(notifications.clone())
+            })?
         {
-            Some(request) => return request.open(ctx).await,
-            None => {}
+            return request.open(ctx).await;
         }
         if self.with_backend(|backend| {
             backend.start_incremental_catalog_listener(notifications.clone())
         })? {
             return Ok(Box::new(ProxyIncrementalStdioCatalogListener {
                 client: self.clone(),
+                cx: ctx.cx().clone(),
             }));
         }
         Err(McpError::invalid_request(

@@ -999,6 +999,9 @@ struct OidcSigningActivationDependencies {
 /// must repeat publication and the public-endpoint read-back before signing can
 /// resume.
 #[cfg(feature = "builtin-auth-server")]
+// The state lives behind one mutex-guarded slot and every transition moves
+// the whole value; boxing a variant would only add indirection to the CAS.
+#[allow(clippy::large_enum_variant)]
 enum OidcIdTokenSigningState {
     /// No signer has been admitted for this issuer.
     Inactive,
@@ -1363,7 +1366,7 @@ impl OidcProvider {
             OidcError::SigningError("OIDC signing activation state is unavailable".to_string())
         })?;
         let state = std::mem::replace(&mut *slot, OidcIdTokenSigningState::Inactive);
-        let OidcIdTokenSigningState::Active(mut active) = state else {
+        let OidcIdTokenSigningState::Active(active) = state else {
             *slot = state;
             return Err(OidcError::SigningError(
                 "OIDC signer rotation requires an Active generation".to_string(),

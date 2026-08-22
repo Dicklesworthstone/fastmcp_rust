@@ -7250,6 +7250,9 @@ struct WebSocketAuthCustody {
     rejected_inband_request_ids: Mutex<HashSet<u64>>,
 }
 
+// The WebSocket arm is an Arc handle by design; the Http receipt is the
+// wide variant and both are moved once per admission.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum AuthDispatchCustody {
     Http(AuthAdmissionReceipt),
@@ -7263,6 +7266,9 @@ impl AuthDispatchCustody {
         ctx: &McpContext,
         inbound: &InboundRequestContext,
         request: &mut JsonRpcRequest,
+        // Underscore-prefixed because non-websocket builds never read it; the
+        // websocket arm does, so the binding stays named for that arm.
+        #[allow(clippy::used_underscore_binding)]
         _websocket_connection_generation: Option<u64>,
     ) -> Result<Sha256Digest, McpError> {
         match self {
