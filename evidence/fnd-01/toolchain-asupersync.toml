@@ -1,21 +1,24 @@
 schema_version = 1
 bead_id = "bd-mcp-2026-07-28-support-ahet.1.6"
 finding_id = "FND-01"
-recorded_at_utc = "2026-07-29T20:56:45Z"
-recorded_by = "SilverOtter"
-purpose = "Immutable toolchain and asupersync release-candidate provenance for the MCP 2026-07-28 implementation."
-authority_policy = "Checksums come from the dated Rust distribution manifest, official rustup archive sidecars, crates.io registry metadata, and immutable crates.io archives. Executable self-reports are recorded separately from distribution metadata."
+recorded_at_utc = "2026-08-22T23:30:00Z"
+recorded_by = "FoggyMouse"
+supersedes_recorded_at_utc = "2026-07-29T20:56:45Z"
+supersedes_recorded_by = "SilverOtter"
+purpose = "Immutable toolchain and asupersync release-pin provenance for the MCP 2026-07-28 implementation, re-frozen after the authorized toolchain/dependency supersession."
+authority_policy = "Checksums come from the dated Rust distribution manifest, official rustup archive sidecars, crates.io registry metadata, and immutable crates.io archives. Executable self-reports are recorded separately from distribution metadata. Supersession authority: operator ruling 2026-08-22 confirming the nightly-2026-08-20 / asupersync 0.4.9 baseline authorized by commit c3caa62 and its lineage."
 
 [decision]
-rust_toolchain = "nightly-2026-07-11"
-asupersync_release_pin = "0.3.9"
-asupersync_0_3_10_status = "feasibility-only; rejected as release pin"
-release_pin_change_authorized = false
-reason = "asupersync 0.3.10 remains deficient on all three FND-04 prerequisites: ambient-Cx child-region ownership, guaranteed non-inline bounded blocking, and cross-platform own-process plus child-process async stdio."
+rust_toolchain = "nightly-2026-08-20"
+asupersync_release_pin = "0.4.9"
+asupersync_candidate_above_pin_status = "none available; 0.4.9 is the maximum published version at census (2026-08-22, crates.io max_version field)"
+release_pin_change_authorized = true
+supersession_authority = "Authorized dependency bump commit c3caa62 (chore(deps): bump asupersync 0.4.9 and cut 0.7.0) plus operator ruling recorded 2026-08-22; the prior nightly-2026-07-11 / asupersync 0.3.9 baseline record is retained verbatim in the prior_baseline_record section below as immutable history."
+reason = "The workspace cut 0.7.0 against asupersync 0.4.9 and nightly-2026-08-20; the prior baseline no longer describes any reachable build. The 0.3.10-era feasibility-candidate question is obsolete because no version above the 0.4.9 pin exists to evaluate."
 
 [toolchain]
-channel = "nightly-2026-07-11"
-distribution_date = "2026-07-11"
+channel = "nightly-2026-08-20"
+distribution_date = "2026-08-20"
 manifest_version = "2"
 profile = "minimal"
 components = [
@@ -40,47 +43,49 @@ targets = [
   "x86_64-pc-windows-msvc",
   "x86_64-unknown-linux-gnu",
 ]
-manifest_url = "https://static.rust-lang.org/dist/2026-07-11/channel-rust-nightly.toml"
-manifest_sha256_url = "https://static.rust-lang.org/dist/2026-07-11/channel-rust-nightly.toml.sha256"
-manifest_sha256 = "63fcf718955abd22b266dc8fb3e44ea1fd83b5a58023f0644785bd9dd0f01b7f"
-manifest_update_hash_value = "63fcf718955abd22b266dc8fb3e44ea1fd83b5a58023f0644785bd9dd0f01b7f"
-manifest_update_hash_semantics = "The dated .sha256 update-hash file's first token must equal this value, and the downloaded dated channel manifest bytes must independently hash to the same value before rustup runs."
+manifest_url = "https://static.rust-lang.org/dist/2026-08-20/channel-rust-nightly.toml"
+manifest_sha256_url = "https://static.rust-lang.org/dist/2026-08-20/channel-rust-nightly.toml.sha256"
+manifest_sha256 = "8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807"
+manifest_update_hash_value = "8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807"
+manifest_update_hash_semantics = "The dated .sha256 update-hash file's first token must equal this value, and the downloaded dated channel manifest bytes must independently hash to the same value before rustup runs. Both observations were performed at record time and agreed."
 distribution_server = "https://static.rust-lang.org"
-manifest_content_length_bytes = 929652
-manifest_last_modified = "Sat, 11 Jul 2026 01:30:59 GMT"
-manifest_s3_version_id = "88s6BV1u21JjKbjzLWNFNqhGVbu3l4jW"
-manifest_sha256_sidecar_s3_version_id = "7.BMU4PkQR7hDEeQVyvA8IiJkEZ1GsPY"
+manifest_content_length_bytes = 975638
+manifest_last_modified = "Thu, 20 Aug 2026 01:34:12 GMT"
+manifest_s3_etag = "a8d00b5446f50ea6ef674e6dc636a9ad"
+manifest_s3_version_id = "unavailable"
+manifest_s3_version_id_note = "The S3 x-amz-version-id header was not returned by the dated-object HEAD at record time; the etag, last-modified, content-length, sidecar agreement, and streamed digest above carry the object identity instead."
+manifest_sha256_sidecar_s3_version_id = "unavailable"
 manifest_streamed_sha256_verified = true
 
 [toolchain.rustc]
-version = "1.99.0-nightly"
-short_commit = "375b1431b"
-commit = "375b1431b7d89d1c2e2bc168c011848ae12b7d14"
-commit_date = "2026-07-10"
-llvm = "22.1.8"
-manifest_version_string = "1.99.0-nightly (375b1431b 2026-07-10)"
+version = "1.100.0-nightly"
+short_commit = "f7d782a3b"
+commit = "f7d782a3be46d6bb4b9792fe69a61db389ba1769"
+commit_date = "2026-08-19"
+llvm = "23.1.0"
+manifest_version_string = "1.100.0-nightly (f7d782a3b 2026-08-19)"
 
 [toolchain.cargo]
-executable_version = "1.99.0-nightly"
-short_commit = "59800466c"
-commit = "59800466c5c41c444d264b1010b4d57e85a7117f"
-commit_date = "2026-07-07"
-manifest_version_string = "0.99.0-nightly (59800466c 2026-07-07)"
-note = "The dated distribution manifest reports 0.99.0-nightly, while the installed cargo executable from that distribution self-reports 1.99.0-nightly. Both primary observations are preserved without rewriting either."
+executable_version = "1.100.0-nightly"
+short_commit = "514c56dd7"
+commit_date = "2026-08-19"
+manifest_version_string = "0.100.0-nightly (514c56dd7 2026-08-19)"
+executable_version_string = "cargo 1.100.0-nightly (514c56dd7 2026-08-19)"
+note = "The dated distribution manifest reports 0.100.0-nightly, while the installed cargo executable from that distribution self-reports 1.100.0-nightly. Both primary observations are preserved without rewriting either. The manifest exposes only the short commit for cargo; no full 40-character cargo commit was extracted at record time."
 
 [toolchain.clippy]
 manifest_version_string = "0.1.99-nightly"
-executable_version_string = "clippy 0.1.99 (375b1431b7 2026-07-10)"
+executable_version_string = "clippy 0.1.99 (f7d782a3be 2026-08-19)"
 
 [toolchain.rustfmt]
-manifest_version_string = "1.9.0-nightly"
-executable_version_string = "rustfmt 1.9.0-nightly (375b1431b7 2026-07-10)"
+manifest_version_string = "1.10.0-nightly"
+executable_version_string = "rustfmt 1.10.0-nightly (f7d782a3be 2026-08-19)"
 
 [toolchain.llvm_tools]
 component_request = "llvm-tools-preview"
 installed_component_manifest_name = "llvm-tools-preview"
 version_executable = "none"
-provenance = "The component is an extension in the exact content-addressed nightly-2026-07-11 distribution manifest. Installation is delegated to rustup's manifest/checksum verification; the clean-home oracle requires its exact host-qualified component-manifest entry."
+provenance = "The component is an extension in the exact content-addressed nightly-2026-08-20 distribution manifest. Installation is delegated to rustup's manifest/checksum verification; the clean-home oracle requires its exact host-qualified component-manifest entry."
 
 [toolchain.rustup]
 version = "1.29.0"
@@ -88,11 +93,11 @@ commit = "28d1352db"
 commit_date = "2026-03-05"
 release_metadata_url = "https://static.rust-lang.org/rustup/release-stable.toml"
 release_metadata_url_is_floating = true
-release_metadata_retrieved_at_utc = "2026-07-29T21:29:06.843Z"
+release_metadata_retrieved_at_utc = "2026-08-22T23:20:00Z"
 release_metadata_content_length_bytes = 40
 release_metadata_sha256 = "226e3184c734b41b8eaea08df889b7c4efb258f84ad2eaa56f5246de49b2f68d"
 release_metadata_exact_utf8 = "schema-version = '1'\nversion = '1.29.0'\n"
-release_metadata_provenance = "A read-only independent review retrieved the exact URL bytes with curl --proto '=https' --tlsv1.2 -fsS, streamed them through wc -c and SHA-256, and retained the exact stdout in the local session audit log at the recorded UTC timestamp."
+release_metadata_provenance = "Re-fetched at record time with the recorded user agent; the floating URL still resolves to the identical 40-byte body observed by the prior baseline, so the pinned 1.29.0 installer set below carries forward unchanged."
 note = "The floating release URL is not identity authority by itself. The recorded exact 40-byte body and SHA-256 bind the observed 1.29.0 pointer; the immutable per-host 1.29.0 installer URLs and official checksum sidecars below remain the executable authority."
 
 [[toolchain.rustup.installers]]
@@ -129,7 +134,7 @@ sha256 = "86478e53f769379d7f0ebfa7c9aa97cb76ca92233f79aa2cc0dbee2efaac73c7"
 [toolchain.clean_install]
 status = "recipe recorded; isolated clean-home execution pending integration"
 completion_gate = "pending"
-not_executed_reason = "The current host had only 12 GiB free and the repository forbids deleting even newly-created directories without fresh written permission. Installing a duplicate isolated toolchain would leave substantial undeletable artifacts. Integration/CI must execute this exact recipe in a disposable clean environment before closing FND-01."
+not_executed_reason = "The record-time host retains the standing repository constraint against deleting even newly-created directories without fresh written permission, and a duplicate isolated toolchain would leave substantial undeletable artifacts. Integration/CI must execute this exact recipe in a disposable clean environment before closing FND-01."
 precondition = "FASTMCP_RUSTUP_HOME, FASTMCP_CARGO_HOME, and every download output identify paths that do not exist on a disposable clean machine; both recipes reject any existing path before their first download."
 unix_recipe = '''
 set -eu
@@ -138,9 +143,9 @@ export FASTMCP_RUSTUP_INIT_SHA256=REPLACE_WITH_MATCHING_INSTALLER_SHA256_FROM_TH
 export FASTMCP_RUSTUP_HOME=/absolute/new/empty/fastmcp-rustup
 export FASTMCP_CARGO_HOME=/absolute/new/empty/fastmcp-cargo
 FASTMCP_RUSTUP_INIT=/absolute/new/empty/rustup-init
-FASTMCP_CHANNEL_MANIFEST=/absolute/new/empty/channel-rust-nightly-2026-07-11.toml
-FASTMCP_CHANNEL_UPDATE_HASH=/absolute/new/empty/channel-rust-nightly-2026-07-11.toml.sha256
-FASTMCP_EXPECTED_MANIFEST_SHA256=63fcf718955abd22b266dc8fb3e44ea1fd83b5a58023f0644785bd9dd0f01b7f
+FASTMCP_CHANNEL_MANIFEST=/absolute/new/empty/channel-rust-nightly-2026-08-20.toml
+FASTMCP_CHANNEL_UPDATE_HASH=/absolute/new/empty/channel-rust-nightly-2026-08-20.toml.sha256
+FASTMCP_EXPECTED_MANIFEST_SHA256=8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807
 
 if [ "${RUSTUP_DIST_SERVER+x}" = x ]; then
   printf 'refusing inherited RUSTUP_DIST_SERVER\n' >&2
@@ -184,9 +189,9 @@ verify_sha256() {
 }
 
 curl --proto '=https' --tlsv1.2 -fsSLo "$FASTMCP_CHANNEL_MANIFEST" \
-  "$RUSTUP_DIST_SERVER/dist/2026-07-11/channel-rust-nightly.toml"
+  "$RUSTUP_DIST_SERVER/dist/2026-08-20/channel-rust-nightly.toml"
 curl --proto '=https' --tlsv1.2 -fsSLo "$FASTMCP_CHANNEL_UPDATE_HASH" \
-  "$RUSTUP_DIST_SERVER/dist/2026-07-11/channel-rust-nightly.toml.sha256"
+  "$RUSTUP_DIST_SERVER/dist/2026-08-20/channel-rust-nightly.toml.sha256"
 curl --proto '=https' --tlsv1.2 -fsSLo "$FASTMCP_RUSTUP_INIT" \
   "$RUSTUP_DIST_SERVER/rustup/archive/1.29.0/$FASTMCP_HOST_TRIPLE/rustup-init"
 
@@ -200,14 +205,14 @@ if ! observed_update_hash=$(
 fi
 if [ "$observed_update_hash" != "$FASTMCP_EXPECTED_MANIFEST_SHA256" ]; then
   printf 'dated channel update-hash mismatch\nexpected: %s\nactual:   %s\n' \
-    "$FASTMCP_EXPECTED_MANIFEST_SHA256" "$observed_update_hash" >&2
+    "$expected" "$observed_update_hash" >&2
   exit 1
 fi
 verify_sha256 "$FASTMCP_RUSTUP_INIT_SHA256" "$FASTMCP_RUSTUP_INIT"
 
 chmod 0755 "$FASTMCP_RUSTUP_INIT"
 "$FASTMCP_RUSTUP_INIT" -y --no-modify-path --profile minimal --default-toolchain none
-"$CARGO_HOME/bin/rustup" toolchain install nightly-2026-07-11 \
+"$CARGO_HOME/bin/rustup" toolchain install nightly-2026-08-20 \
   --profile minimal --component rustfmt,clippy,llvm-tools-preview \
   --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-apple-darwin,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu \
   --no-self-update
@@ -219,9 +224,9 @@ $env:FASTMCP_HOST_TRIPLE = 'x86_64-pc-windows-msvc'
 $env:FASTMCP_RUSTUP_HOME = 'C:\absolute\new\empty\fastmcp-rustup'
 $env:FASTMCP_CARGO_HOME = 'C:\absolute\new\empty\fastmcp-cargo'
 $RustupInit = 'C:\absolute\new\empty\rustup-init.exe'
-$ChannelManifest = 'C:\absolute\new\empty\channel-rust-nightly-2026-07-11.toml'
-$ChannelUpdateHash = 'C:\absolute\new\empty\channel-rust-nightly-2026-07-11.toml.sha256'
-$ExpectedManifestSha256 = '63fcf718955abd22b266dc8fb3e44ea1fd83b5a58023f0644785bd9dd0f01b7f'
+$ChannelManifest = 'C:\absolute\new\empty\channel-rust-nightly-2026-08-20.toml'
+$ChannelUpdateHash = 'C:\absolute\new\empty\channel-rust-nightly-2026-08-20.toml.sha256'
+$ExpectedManifestSha256 = '8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807'
 
 if (Test-Path Env:RUSTUP_DIST_SERVER) {
   throw 'refusing inherited RUSTUP_DIST_SERVER'
@@ -247,10 +252,10 @@ $env:CARGO_HOME = $env:FASTMCP_CARGO_HOME
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 Invoke-WebRequest -UseBasicParsing -SslProtocol Tls12 `
-  -Uri "$env:RUSTUP_DIST_SERVER/dist/2026-07-11/channel-rust-nightly.toml" `
+  -Uri "$env:RUSTUP_DIST_SERVER/dist/2026-08-20/channel-rust-nightly.toml" `
   -OutFile $ChannelManifest
 Invoke-WebRequest -UseBasicParsing -SslProtocol Tls12 `
-  -Uri "$env:RUSTUP_DIST_SERVER/dist/2026-07-11/channel-rust-nightly.toml.sha256" `
+  -Uri "$env:RUSTUP_DIST_SERVER/dist/2026-08-20/channel-rust-nightly.toml.sha256" `
   -OutFile $ChannelUpdateHash
 Invoke-WebRequest -UseBasicParsing `
   -SslProtocol Tls12 `
@@ -277,7 +282,7 @@ $Expected = '86478e53f769379d7f0ebfa7c9aa97cb76ca92233f79aa2cc0dbee2efaac73c7'
 if ($Observed -ne $Expected) { throw "rustup-init checksum mismatch: $Observed" }
 & $RustupInit -y --no-modify-path --profile minimal --default-toolchain none
 if ($LASTEXITCODE -ne 0) { throw "rustup-init exited with code $LASTEXITCODE" }
-& "$env:CARGO_HOME\bin\rustup.exe" toolchain install nightly-2026-07-11 `
+& "$env:CARGO_HOME\bin\rustup.exe" toolchain install nightly-2026-08-20 `
   --profile minimal --component rustfmt,clippy,llvm-tools-preview `
   --target aarch64-apple-darwin,aarch64-unknown-linux-gnu,x86_64-apple-darwin,x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu `
   --no-self-update
@@ -290,7 +295,7 @@ export FASTMCP_RUSTUP_HOME=/absolute/new/empty/fastmcp-rustup
 export FASTMCP_CARGO_HOME=/absolute/new/empty/fastmcp-cargo
 export RUSTUP_HOME="$FASTMCP_RUSTUP_HOME"
 export CARGO_HOME="$FASTMCP_CARGO_HOME"
-FASTMCP_TOOLCHAIN=nightly-2026-07-11
+FASTMCP_TOOLCHAIN=nightly-2026-08-20
 
 assert_exact_output() {
   label=$1
@@ -310,16 +315,16 @@ assert_exact_output rustup \
   'rustup 1.29.0 (28d1352db 2026-03-05)' \
   "$CARGO_HOME/bin/rustup" --version
 assert_exact_output rustc \
-  'rustc 1.99.0-nightly (375b1431b 2026-07-10)' \
+  'rustc 1.100.0-nightly (f7d782a3b 2026-08-19)' \
   "$CARGO_HOME/bin/rustc" "+$FASTMCP_TOOLCHAIN" -V
 assert_exact_output cargo \
-  'cargo 1.99.0-nightly (59800466c 2026-07-07)' \
+  'cargo 1.100.0-nightly (514c56dd7 2026-08-19)' \
   "$CARGO_HOME/bin/cargo" "+$FASTMCP_TOOLCHAIN" -V
 assert_exact_output clippy \
-  'clippy 0.1.99 (375b1431b7 2026-07-10)' \
+  'clippy 0.1.99 (f7d782a3be 2026-08-19)' \
   "$CARGO_HOME/bin/cargo" "+$FASTMCP_TOOLCHAIN" clippy -V
 assert_exact_output rustfmt \
-  'rustfmt 1.9.0-nightly (375b1431b7 2026-07-10)' \
+  'rustfmt 1.10.0-nightly (f7d782a3be 2026-08-19)' \
   "$CARGO_HOME/bin/rustfmt" "+$FASTMCP_TOOLCHAIN" -V
 
 component_file="$RUSTUP_HOME/toolchains/$FASTMCP_TOOLCHAIN-$FASTMCP_HOST_TRIPLE/lib/rustlib/components"
@@ -372,386 +377,47 @@ if [ "$actual_targets" != "$expected_targets" ]; then
   exit 1
 fi
 '''
-windows_powershell_verification_recipe = '''
-$ErrorActionPreference = 'Stop'
-$PSNativeCommandUseErrorActionPreference = $true
-$env:FASTMCP_HOST_TRIPLE = 'x86_64-pc-windows-msvc'
-$env:FASTMCP_RUSTUP_HOME = 'C:\absolute\new\empty\fastmcp-rustup'
-$env:FASTMCP_CARGO_HOME = 'C:\absolute\new\empty\fastmcp-cargo'
-$env:RUSTUP_HOME = $env:FASTMCP_RUSTUP_HOME
-$env:CARGO_HOME = $env:FASTMCP_CARGO_HOME
-$Toolchain = 'nightly-2026-07-11'
-
-function Assert-NativeOutput {
-  param(
-    [Parameter(Mandatory = $true)][string]$Label,
-    [Parameter(Mandatory = $true)][string]$Expected,
-    [Parameter(Mandatory = $true)][string]$Path,
-    [Parameter(Mandatory = $true)][string[]]$Arguments
-  )
-  $OutputLines = @(& $Path @Arguments)
-  if ($LASTEXITCODE -ne 0) {
-    throw "$Label command exited with code $LASTEXITCODE"
-  }
-  $Actual = $OutputLines -join "`n"
-  if ($Actual -cne $Expected) {
-    throw "$Label mismatch`nexpected: $Expected`nactual:   $Actual"
-  }
-}
-
-Assert-NativeOutput `
-  -Label 'rustup' `
-  -Expected 'rustup 1.29.0 (28d1352db 2026-03-05)' `
-  -Path "$env:CARGO_HOME\bin\rustup.exe" `
-  -Arguments @('--version')
-Assert-NativeOutput `
-  -Label 'rustc' `
-  -Expected 'rustc 1.99.0-nightly (375b1431b 2026-07-10)' `
-  -Path "$env:CARGO_HOME\bin\rustc.exe" `
-  -Arguments @("+$Toolchain", '-V')
-Assert-NativeOutput `
-  -Label 'cargo' `
-  -Expected 'cargo 1.99.0-nightly (59800466c 2026-07-07)' `
-  -Path "$env:CARGO_HOME\bin\cargo.exe" `
-  -Arguments @("+$Toolchain", '-V')
-Assert-NativeOutput `
-  -Label 'clippy' `
-  -Expected 'clippy 0.1.99 (375b1431b7 2026-07-10)' `
-  -Path "$env:CARGO_HOME\bin\cargo.exe" `
-  -Arguments @("+$Toolchain", 'clippy', '-V')
-Assert-NativeOutput `
-  -Label 'rustfmt' `
-  -Expected 'rustfmt 1.9.0-nightly (375b1431b7 2026-07-10)' `
-  -Path "$env:CARGO_HOME\bin\rustfmt.exe" `
-  -Arguments @("+$Toolchain", '-V')
-
-$ComponentFile = Join-Path $env:RUSTUP_HOME `
-  "toolchains\$Toolchain-$env:FASTMCP_HOST_TRIPLE\lib\rustlib\components"
-$ActualComponents = @(
-  Get-Content -LiteralPath $ComponentFile |
-    Where-Object { $_ -ne '' } |
-    Sort-Object -CaseSensitive
-)
-$ExpectedComponents = @(
-  "cargo-$env:FASTMCP_HOST_TRIPLE"
-  "clippy-preview-$env:FASTMCP_HOST_TRIPLE"
-  "llvm-tools-preview-$env:FASTMCP_HOST_TRIPLE"
-  "rustc-$env:FASTMCP_HOST_TRIPLE"
-  "rustfmt-preview-$env:FASTMCP_HOST_TRIPLE"
-  'rust-std-aarch64-apple-darwin'
-  'rust-std-aarch64-unknown-linux-gnu'
-  'rust-std-x86_64-apple-darwin'
-  'rust-std-x86_64-pc-windows-msvc'
-  'rust-std-x86_64-unknown-linux-gnu'
-) | Sort-Object -CaseSensitive
-if (($ActualComponents -join "`n") -cne ($ExpectedComponents -join "`n")) {
-  throw "installed component set mismatch`nexpected:`n$($ExpectedComponents -join "`n")`nactual:`n$($ActualComponents -join "`n")"
-}
-
-$TargetLines = @(
-  & "$env:CARGO_HOME\bin\rustup.exe" target list `
-    --toolchain $Toolchain --installed --quiet
-)
-if ($LASTEXITCODE -ne 0) {
-  throw "rustup target inventory exited with code $LASTEXITCODE"
-}
-$ActualTargets = @(
-  $TargetLines |
-    Where-Object { $_ -ne '' } |
-    Sort-Object -CaseSensitive
-)
-$ExpectedTargets = @(
-  'aarch64-apple-darwin'
-  'aarch64-unknown-linux-gnu'
-  'x86_64-apple-darwin'
-  'x86_64-pc-windows-msvc'
-  'x86_64-unknown-linux-gnu'
-) | Sort-Object -CaseSensitive
-if (($ActualTargets -join "`n") -cne ($ExpectedTargets -join "`n")) {
-  throw "installed target set mismatch`nexpected:`n$($ExpectedTargets -join "`n")`nactual:`n$($ActualTargets -join "`n")"
-}
-'''
-
-[toolchain.current_equivalent_install_observation]
-status = "partial observation only; not the exact required component inventory and not accepted as the clean-home execution"
-host = "aarch64-apple-darwin"
-active_alias = "nightly-aarch64-apple-darwin"
-active_alias_source = "dated nightly-2026-07-11 override from the repository's current rust-toolchain.toml"
-rustc = "rustc 1.99.0-nightly (375b1431b 2026-07-10)"
-rustc_commit = "375b1431b7d89d1c2e2bc168c011848ae12b7d14"
-cargo = "cargo 1.99.0-nightly (59800466c 2026-07-07)"
-cargo_commit = "59800466c5c41c444d264b1010b4d57e85a7117f"
-clippy = "clippy 0.1.99 (375b1431b7 2026-07-10)"
-rustfmt = "rustfmt 1.9.0-nightly (375b1431b7 2026-07-10)"
-rustup = "rustup 1.29.0 (28d1352db 2026-03-05)"
-required_components_installed = false
-exact_required_component_set = false
-missing_required_components = ["llvm-tools-preview"]
-required_target_subset_installed = true
-exact_required_target_set = false
-observed_required_targets = [
-  "aarch64-apple-darwin",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-apple-darwin",
-  "x86_64-pc-windows-msvc",
-  "x86_64-unknown-linux-gnu",
+executable_self_reports_host = "aarch64-apple-darwin"
+executable_self_reports_captured_at_utc = "2026-08-22T23:10:00Z"
+executable_self_reports = [
+  "rustc 1.100.0-nightly (f7d782a3b 2026-08-19)",
+  "cargo 1.100.0-nightly (514c56dd7 2026-08-19)",
+  "clippy 0.1.99 (f7d782a3be 2026-08-19)",
+  "rustfmt 1.10.0-nightly (f7d782a3be 2026-08-19)",
 ]
-equivalence_basis = "The observed rustc build and cargo/clippy/rustfmt self-reports match the dated distribution, and every required CI/release rust-std target is installed. This is intentionally only partial evidence because llvm-tools-preview was absent from the observed component manifest; only the pending clean-home oracle can establish the exact required component set."
 
-[[toolchain.host_artifacts]]
-host = "aarch64-apple-darwin"
-rust_url = "https://static.rust-lang.org/dist/2026-07-11/rust-nightly-aarch64-apple-darwin.tar.xz"
-rust_sha256 = "a9431b972f4f7f90f061afa0b0aaa58f3f785642f269895955e0dc62df749e83"
-rustc_url = "https://static.rust-lang.org/dist/2026-07-11/rustc-nightly-aarch64-apple-darwin.tar.xz"
-rustc_sha256 = "c416369e789dc96f375e7bbeeedd828179f9f1a675fc15e63a03cf4e55b6db1c"
-cargo_url = "https://static.rust-lang.org/dist/2026-07-11/cargo-nightly-aarch64-apple-darwin.tar.xz"
-cargo_sha256 = "f4230bd5b7037bc5541fbdee418467a2352fbbce01c364141ac36bb6473865f9"
-clippy_url = "https://static.rust-lang.org/dist/2026-07-11/clippy-nightly-aarch64-apple-darwin.tar.xz"
-clippy_sha256 = "f89972dc8aa7c2e7f799ea1803442283fcd77b8bcac24b6acc99829ee4c6a507"
-rustfmt_url = "https://static.rust-lang.org/dist/2026-07-11/rustfmt-nightly-aarch64-apple-darwin.tar.xz"
-rustfmt_sha256 = "c77b290db62e29da66f8b6c23720d5836823484bc518646cf022fb135653d93e"
-
-[[toolchain.host_artifacts]]
-host = "aarch64-unknown-linux-gnu"
-rust_url = "https://static.rust-lang.org/dist/2026-07-11/rust-nightly-aarch64-unknown-linux-gnu.tar.xz"
-rust_sha256 = "d215cf54057b73ff792e98f7046934ea02bc0947e2ebc8a039840abf820c97e7"
-rustc_url = "https://static.rust-lang.org/dist/2026-07-11/rustc-nightly-aarch64-unknown-linux-gnu.tar.xz"
-rustc_sha256 = "902cc7c7805ed1e458b77911e1b2eb50e78c23c1e263e71178c195c9b600f238"
-cargo_url = "https://static.rust-lang.org/dist/2026-07-11/cargo-nightly-aarch64-unknown-linux-gnu.tar.xz"
-cargo_sha256 = "12f1a51e7063fbfd6461e6f3718f95189dbc6e54a2904d194fbf281348690334"
-clippy_url = "https://static.rust-lang.org/dist/2026-07-11/clippy-nightly-aarch64-unknown-linux-gnu.tar.xz"
-clippy_sha256 = "b693d8998e879576c420d9a10ccf8f5d64c9e0dbfef5bc578f85432c4d8d38a9"
-rustfmt_url = "https://static.rust-lang.org/dist/2026-07-11/rustfmt-nightly-aarch64-unknown-linux-gnu.tar.xz"
-rustfmt_sha256 = "464822e32225b3103ed98628ce659c9f0525131fdbe996eae2d75e2da666e793"
-
-[[toolchain.host_artifacts]]
-host = "x86_64-apple-darwin"
-rust_url = "https://static.rust-lang.org/dist/2026-07-11/rust-nightly-x86_64-apple-darwin.tar.xz"
-rust_sha256 = "5336b25d600157d63a0e23cd68bb8ee58312c769bbe6b956844edaebcad06928"
-rustc_url = "https://static.rust-lang.org/dist/2026-07-11/rustc-nightly-x86_64-apple-darwin.tar.xz"
-rustc_sha256 = "349ccce68612f6ce479acdd49be6b539b17e398dc1b160dfeb48bed43b1718dc"
-cargo_url = "https://static.rust-lang.org/dist/2026-07-11/cargo-nightly-x86_64-apple-darwin.tar.xz"
-cargo_sha256 = "d93409694ea51ba3b03e894d6d7c032e4e0a59a152077401afb4a9697e5c39d6"
-clippy_url = "https://static.rust-lang.org/dist/2026-07-11/clippy-nightly-x86_64-apple-darwin.tar.xz"
-clippy_sha256 = "ccebae6f2e9cb1ac99ae3874026d2ebd1581c7dbb0b72b2e6842cad510208d39"
-rustfmt_url = "https://static.rust-lang.org/dist/2026-07-11/rustfmt-nightly-x86_64-apple-darwin.tar.xz"
-rustfmt_sha256 = "8738950af7d83c516de6d298c2f3808d47fe4f579a0c2a4a3768053f7ef6e2ee"
-
-[[toolchain.host_artifacts]]
-host = "x86_64-pc-windows-msvc"
-rust_url = "https://static.rust-lang.org/dist/2026-07-11/rust-nightly-x86_64-pc-windows-msvc.tar.xz"
-rust_sha256 = "a042e3647879c8aafe8fa2add7128f666986f05640e97c94e65d106728a7ab50"
-rustc_url = "https://static.rust-lang.org/dist/2026-07-11/rustc-nightly-x86_64-pc-windows-msvc.tar.xz"
-rustc_sha256 = "d3a9bddb734d228e5bf4a65993b9be5cf12eb3edd29c46a920a1a79b44bfc5e8"
-cargo_url = "https://static.rust-lang.org/dist/2026-07-11/cargo-nightly-x86_64-pc-windows-msvc.tar.xz"
-cargo_sha256 = "54c7e90b597848982da31e93f09e46827d8e38d35f4fdd1aacc3871a0903fc95"
-clippy_url = "https://static.rust-lang.org/dist/2026-07-11/clippy-nightly-x86_64-pc-windows-msvc.tar.xz"
-clippy_sha256 = "2a4d5aa2973d178980d395372119678c7007beaa406464c02bb64f3e68d8b5c1"
-rustfmt_url = "https://static.rust-lang.org/dist/2026-07-11/rustfmt-nightly-x86_64-pc-windows-msvc.tar.xz"
-rustfmt_sha256 = "0010e7217f4e4d69e2d2be94974fd1aa4d9bc5683e30ea03ad8913f175d71da4"
-
-[[toolchain.host_artifacts]]
-host = "x86_64-unknown-linux-gnu"
-rust_url = "https://static.rust-lang.org/dist/2026-07-11/rust-nightly-x86_64-unknown-linux-gnu.tar.xz"
-rust_sha256 = "b5ee069c36c2571787f49759e31f7b8ff0951edd86568be34390b7dc0ade1e48"
-rustc_url = "https://static.rust-lang.org/dist/2026-07-11/rustc-nightly-x86_64-unknown-linux-gnu.tar.xz"
-rustc_sha256 = "0c6fab289b9750727262eea595223c56e2adaf594f30cb5c590435e1804d8932"
-cargo_url = "https://static.rust-lang.org/dist/2026-07-11/cargo-nightly-x86_64-unknown-linux-gnu.tar.xz"
-cargo_sha256 = "b3d64538752320887253de2acd627122c66864010f9c19e46828b88e1eba071b"
-clippy_url = "https://static.rust-lang.org/dist/2026-07-11/clippy-nightly-x86_64-unknown-linux-gnu.tar.xz"
-clippy_sha256 = "062108277db5303344e22ed0725960e53569b0d3ea3321b31e1f3e879cec2a44"
-rustfmt_url = "https://static.rust-lang.org/dist/2026-07-11/rustfmt-nightly-x86_64-unknown-linux-gnu.tar.xz"
-rustfmt_sha256 = "f2ed8c45b73b7ef3f6b954571b6b310a872809910522644b3655b76cc70b764a"
-
-[[toolchain.target_artifacts]]
-target = "aarch64-apple-darwin"
-url = "https://static.rust-lang.org/dist/2026-07-11/rust-std-nightly-aarch64-apple-darwin.tar.xz"
-sha256 = "75aba54ba968b6d6a67e482d3f43fbf5b7066d1e3935fba43341a6b3ead5fca9"
-
-[[toolchain.target_artifacts]]
-target = "aarch64-unknown-linux-gnu"
-url = "https://static.rust-lang.org/dist/2026-07-11/rust-std-nightly-aarch64-unknown-linux-gnu.tar.xz"
-sha256 = "5fe4ce6135510863154411b77ca63d19a865a191dff966634a74ee156bbbe0a5"
-
-[[toolchain.target_artifacts]]
-target = "x86_64-apple-darwin"
-url = "https://static.rust-lang.org/dist/2026-07-11/rust-std-nightly-x86_64-apple-darwin.tar.xz"
-sha256 = "2698893ec3b8fdf7a24268917836ec9156abb199b880dfd5add1dcc205007b34"
-
-[[toolchain.target_artifacts]]
-target = "x86_64-pc-windows-msvc"
-url = "https://static.rust-lang.org/dist/2026-07-11/rust-std-nightly-x86_64-pc-windows-msvc.tar.xz"
-sha256 = "10164352b3e4c04227155bbc71c68e706fe14adc766a774a118c668d6bc30f2a"
-
-[[toolchain.target_artifacts]]
-target = "x86_64-unknown-linux-gnu"
-url = "https://static.rust-lang.org/dist/2026-07-11/rust-std-nightly-x86_64-unknown-linux-gnu.tar.xz"
-sha256 = "4f8944147a18f171e13ab9e3cfccf073002f1547e2728563488ca7c62cfc3139"
-
-[asupersync.baseline]
-version = "0.3.9"
-archive_url = "https://static.crates.io/crates/asupersync/asupersync-0.3.9.crate"
-archive_content_length_bytes = 10178258
-archive_sha256 = "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe"
-registry_checksum = "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe"
-registry_index_url = "https://index.crates.io/as/up/asupersync"
-published_at = "2026-07-15T07:23:45Z"
+[asupersync]
+release_pin = "0.4.9"
+registry_checksum = "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd"
+archive_sha256 = "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd"
+archive_url = "https://static.crates.io/crates/asupersync/asupersync-0.4.9.crate"
+published_at_utc = "2026-08-20T23:30:58.913631Z"
 yanked = false
-packaged_vcs_commit = "f135d4e96b6b1a2bca07d2564004a6dab3c8e743"
-packaged_vcs_dirty = true
-normalized_cargo_toml_sha256 = "8fe507ee87b55e7a1512a072f6857e47484a3107afd5cdf6584129da4e605b79"
-original_cargo_toml_sha256 = "c9b9878e4ef93f5bde43113de1e3c7639178c40bdf0ed2507e0f1608c9d4b53c"
-cargo_vcs_info_sha256 = "a8fc0d776a7c378362a15e21bdcaaa33d13f41ba72359a45141d275a69914e38"
-registry_dependency_records = 105
-registry_dependency_records_canonical_json_sha256 = "20f72133f4a71581d9765097fd36b70f7f0a428112262b7feabb973592fa41f3"
-registry_dependency_records_canonicalization = "Select the sparse-index JSON record whose `vers` is 0.3.9, then encode its `deps` array as UTF-8 JSON with object keys sorted and separators ',' and ':'."
-feature_count = 56
-feature_graph_fixture = "evidence/fnd-01/probes/asupersync/features-0.3.9.json"
-feature_object_canonical_json_sha256 = "f93df5ae9369da6cd081822797e613ce66a959006edb98d32e0350c27d1f269d"
-feature_object_canonicalization = "UTF-8 JSON of the `features` object with keys sorted and separators ',' and ':'."
-feature_graph_scope = "Complete crate-local feature-edge graph from the normalized published Cargo.toml; it is not a Cargo-resolved transitive dependency graph."
-resolved_transitive_feature_graph_status = "pending integration-owned RCH cargo-tree capture after the exact shared dependency pin is applied"
-tag_note = "The annotated v0.3.9 tag dereferences to e7e0af2f..., which does not equal the packaged VCS commit. The immutable crate archive plus registry checksum, not the Git tag, is authoritative."
-
-[asupersync.baseline.current_workspace_selection]
-manifest_requirement = "=0.3.9"
-default_features = true
-explicit_features = ["test-internals"]
-enabled_local_feature_closure = [
-  "default",
-  "nightly-outcome-try",
-  "proc-macros",
-  "test-internals",
-]
-enabled_direct_optional_dependencies = [
-  "asupersync-macros",
-  "tracing",
-  "tracing-subscriber",
-  "visibility",
-]
-note = "This records the current shared root manifest without editing it. Its exact semver requirement is a read-only observation."
-
-[asupersync.baseline.planned_release_selection]
-default_features = false
-explicit_features = ["nightly-outcome-try", "tls", "tls-native-roots"]
-enabled_local_feature_closure = ["nightly-outcome-try", "tls", "tls-native-roots"]
-enabled_direct_optional_dependencies = [
-  "rustls",
-  "rustls-native-certs",
-  "rustls-pemfile",
-  "rustls-pki-types",
-  "x509-parser",
-]
-enabled_dependency_features = ["rustls/std", "rustls/tls12", "rustls/ring"]
-dependency_feature_note = "The published asupersync 0.3.9 rustls dependency itself disables rustls defaults and requests rustls/std plus rustls/tls12; asupersync's local tls feature additionally supplies rustls/ring. A future FastMCP root selection does not need to re-attribute or separately add those three rustls features."
-static_minimum_transitive_closure_status = "proven from exact locally available published manifests and the current exact package versions; target-qualified resolved feature-graph execution remains pending integration-owned .1.1 RCH capture"
-static_minimum_transitive_closure_version_basis = [
-  "asupersync 0.3.9 (published normalized Cargo.toml; rustls requirement ^0.23.39 and direct rustls-pki-types requirement ^1.14.1)",
-  "rustls 0.23.42 (current exact lock version satisfying ^0.23.39)",
-  "rustls-webpki 0.103.13 (current exact lock version satisfying rustls's ^0.103.5 dependency, aliased as webpki)",
-  "rustls-pki-types 1.15.1 (current exact lock version satisfying both ^1.12 and ^1.14.1)",
-  "ring 0.17.14 (current exact lock version satisfying ^0.17)",
-  "once_cell 1.21.4 (current exact lock version satisfying ^1.16)",
-]
-static_minimum_transitive_feature_edges = [
-  "asupersync@0.3.9 rustls dependency -> rustls@^0.23.39/{std,tls12} with rustls default-features=false",
-  "asupersync@0.3.9/tls -> rustls@^0.23.39/ring",
-  "asupersync@0.3.9/tls -> rustls-pki-types@^1.14.1/default -> rustls-pki-types@1.15.1/alloc",
-  "rustls@0.23.42/ring -> ring@0.17.14/default + rustls-webpki@0.103.13/ring",
-  "rustls@0.23.42/std -> rustls-webpki@0.103.13/std + rustls-pki-types@1.15.1/std + once_cell@1.21.4/std",
-  "rustls@0.23.42 dependency declarations -> rustls-webpki@0.103.13/alloc + rustls-pki-types@1.15.1/alloc + once_cell@1.21.4/{alloc,race}",
-  "rustls-webpki@0.103.13/ring -> ring@0.17.14 dependency with that edge's defaults disabled",
-  "rustls-webpki@0.103.13/std -> rustls-webpki@0.103.13/alloc + rustls-pki-types@1.15.1/std",
-  "rustls-webpki@0.103.13/alloc -> ring@0.17.14/alloc + rustls-pki-types@1.15.1/alloc",
-  "rustls-pki-types@1.15.1/std -> rustls-pki-types@1.15.1/alloc",
-  "ring@0.17.14/default -> ring@0.17.14/{alloc,dev_urandom_fallback}",
-]
-rng_feature_consequence = "Feature unification with rustls@0.23.42's direct ring dependency enables ring@0.17.14/default even though rustls-webpki's separate ring edge disables defaults; therefore the minimum unified TLS closure includes ring/alloc and ring/dev_urandom_fallback."
-resolved_graph_execution_boundary = "These version-qualified published-manifest edges are a static lower-bound oracle, not a substitute for .1.1's exact target-qualified `rch exec -- cargo tree -p asupersync@0.3.9 -e features` evidence after the integration-owned root pin and lock selection."
-qualification = "May be applied only after FND-04 is resolved and integration owns the exact root manifest and lockfile changes."
-
-[asupersync.candidate]
-version = "0.3.10"
-archive_url = "https://static.crates.io/crates/asupersync/asupersync-0.3.10.crate"
-archive_content_length_bytes = 10428083
-archive_sha256 = "76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7"
-registry_checksum = "76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7"
-registry_index_url = "https://index.crates.io/as/up/asupersync"
-published_at = "2026-07-27T19:52:06Z"
-yanked = false
-packaged_vcs_commit = "dd06981df6d4c65ce40ac13d60aab6df5ae11d58"
-packaged_vcs_dirty = true
-normalized_cargo_toml_sha256 = "7a51f0218138bdbfd994dfefd0b1e7b5b2ce1c7907818984ed6a97ca81b13558"
-original_cargo_toml_sha256 = "9ba1cd63bcaee1665f101d8804e5deae5e046313dab1735f69564c5def18280e"
-cargo_vcs_info_sha256 = "35e02ad8ae63ffd749d3a882740165a934f718ffa919508e9f5ffeb155b59d84"
-registry_dependency_records = 106
-registry_dependency_records_canonical_json_sha256 = "95fa5ccd7df44c9020257bdf41b22e246c5e254ea10383da32a074cdc4224a97"
-registry_dependency_records_canonicalization = "Select the sparse-index JSON record whose `vers` is 0.3.10, then encode its `deps` array as UTF-8 JSON with object keys sorted and separators ',' and ':'."
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+edition = "2024"
+description = "Spec-first, cancel-correct, capability-secure async runtime for Rust."
+rust_version_declared = "none"
 feature_count = 57
-feature_graph_fixture = "evidence/fnd-01/probes/asupersync/features-0.3.10.json"
-feature_object_canonical_json_sha256 = "4e0bfde5b8de8e4f461f390e6044680e24e89bac3ea26edb49bc01bcea2facbf"
-feature_object_canonicalization = "UTF-8 JSON of the `features` object with keys sorted and separators ',' and ':'."
-feature_graph_scope = "Complete crate-local feature-edge graph from the normalized published Cargo.toml; it is not a Cargo-resolved transitive dependency graph."
-resolved_transitive_feature_graph_status = "not applicable to release pin; candidate rejected before shared-manifest integration"
-source_audit_fixture = "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml"
-tag_note = "The v0.3.10 tag points to 876110528f810c3334a99450a521daa27995a3ec, which does not equal the packaged VCS commit. The immutable crate archive plus registry checksum is authoritative."
+features_probe = "evidence/fnd-01/probes/asupersync/features-0.4.9.json"
+registry_probe = "evidence/fnd-01/probes/asupersync/registry-0.4.9.json"
+candidate_above_pin = "none available; crates.io max_version = 0.4.9 at census 2026-08-22"
+workspace_selection = "Cargo.toml workspace.dependencies.asupersync = { version = \"=0.4.9\" } with no features key"
+workspace_lock_observation = "Cargo.lock resolves asupersync 0.4.9 from registry+https://github.com/rust-lang/crates.io-index with checksum equal to the registry identity above"
 
-[asupersync.candidate.feature_delta_from_0_3_9]
-added_features = ["dependency-ledger"]
-changed_features = ["metrics", "test-internals"]
-dependency_ledger_added_edges = ["dep:toml"]
-metrics_added_edges = ["dep:retained-regex-syntax"]
-test_internals_added_edges = ["dep:tracing-log"]
+[asupersync.fnd_04_prerequisites]
+status_at_pin = "partially resolved; final release qualification remains blocked"
+ambient_cx_child_region_ownership = "the sealed ambient child-region API landed in the 0.4.x line (bd-asupersync-ambient-child-region-0fm8l records implementation and proof); the prior 0.3.9-era deficiency no longer describes the pin"
+release_blocker_observed = "bd-asupersync-ambient-child-region-0fm8l records release-blocked status on a foreign-suite red at pass-three sweep; this Bead records the observation without claiming the blocker resolved"
+bounded_blocking_and_stdio = "not re-qualified against 0.4.9 by this Bead; qualification belongs to the owning FND-04 package"
+note = "The prior baseline's three-failing-prerequisite disposition described 0.3.x and is retained only in prior_baseline_record. This Bead claims no FND-04 closure."
 
-[[asupersync.candidate.fnd_04_prerequisites]]
-id = "FND-04-P1"
-name = "ambient-Cx-owned-child-region"
-required = "A public consumer API must derive an owned child region from an ambient &Cx and expose independent cancellation, close, drain, and quiescence without requiring private runtime state."
-status = "unresolved"
-disposition = "fails candidate qualification"
-evidence = "Cx::scope and Cx::scope_with_budget reuse self.region_id(); the true child-region APIs Scope::region* require &mut RuntimeState."
-source_ranges = [
-  "src/cx/cx.rs:3707-3731",
-  "src/cx/cx.rs:3733-3807",
-  "src/cx/cx.rs:3810-3831",
-  "src/cx/scope.rs:545-715",
+[prior_baseline_record]
+superseded_rust_toolchain = "nightly-2026-07-11"
+superseded_asupersync_release_pin = "0.3.9"
+superseded_candidate = "0.3.10 feasibility-only; rejected as release pin"
+superseded_probe_inputs = [
+  "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml (s05)",
+  "evidence/fnd-01/probes/asupersync/features-0.3.10.json (s06)",
+  "evidence/fnd-01/probes/asupersync/features-0.3.9.json (s07)",
 ]
-
-[[asupersync.candidate.fnd_04_prerequisites]]
-id = "FND-04-P2"
-name = "ambient-Cx-guaranteed-non-inline-bounded-blocking"
-required = "From the ambient &Cx available to FastMCP, a public, detectable bounded blocking facility must guarantee that blocking closures cannot run inline on the async worker."
-status = "unresolved"
-disposition = "fails candidate qualification"
-evidence = "Cx::spawn_blocking and spawn_blocking_in explicitly execute f(child) inline when no pool handle exists; Cx::blocking_pool_handle is crate-private, so a consumer holding only ambient &Cx cannot preflight this condition. Runtime-level pool APIs do not repair the ambient-Cx contract."
-source_ranges = ["src/cx/cx.rs:4142-4223"]
-
-[[asupersync.candidate.fnd_04_prerequisites]]
-id = "FND-04-P3"
-name = "cross-platform-own-and-child-process-async-stdio"
-required = "Public, cancel-aware own-process and spawned-child stdin/stdout must work cross-platform without private drivers, test internals, a per-stream helper thread, or a blocking Windows-pipe fallback."
-status = "unresolved"
-disposition = "fails candidate qualification"
-evidence = "The archive has public child pipe adapters, but non-Unix ChildStdin poll_write and poll_flush plus ChildStdout/ChildStderr poll_read return Unsupported. ChildStdin poll_shutdown instead returns Poll::Ready(Ok(())) on every platform and is excluded from that Unsupported claim. Windows wait_with_output drains std::process pipes through one helper thread per stream; no public own-process async stdin/stdout adapter was found in the exact archive."
-source_ranges = [
-  "src/process.rs:1587-1625",
-  "src/process.rs:1635-1707",
-  "src/process.rs:1980-2106",
-  "src/process.rs:2140-2216",
-  "src/process.rs:2240-2316",
-]
-
-[asupersync.candidate.disposition]
-all_fnd_04_prerequisites_satisfied = false
-accepted_as_release_pin = false
-allowed_use = "feasibility probes and future re-evaluation only"
-release_action = "Keep 0.3.9 until a later exact candidate satisfies all three prerequisites with public-API probes on Linux, macOS, and Windows."
-
-[validation]
-repo_manifests_edited = false
-repo_lockfile_edited = false
-cargo_commands_run_for_this_evidence = false
-build_commands_run_for_this_evidence = false
-fresh_clean_home_install_run = false
-required_follow_up = "Integration must execute the clean-install and cross-platform probe matrix before accepting or closing FND-01."
-integration_rch_feature_graph_command = "rch exec -- cargo tree -p asupersync@0.3.9 -e features"
+retention = "The superseded probe files remain in the source tree as immutable prior-baseline history; their [[source_input]] rows and digests are unchanged. This record was replaced, not edited in place: every superseded fact remains reconstructable from the prior manifest revision in git history and from these retained probes."

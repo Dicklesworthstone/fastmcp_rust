@@ -1,4 +1,13 @@
 {
+  "_provenance": {
+    "feature_count": 57,
+    "package": "asupersync",
+    "recorded_at_utc": "2026-08-22T23:30:00Z",
+    "recorded_by": "FoggyMouse",
+    "schema_version": 1,
+    "source": "Cargo.toml [features] extracted from the immutable crates.io archive asupersync-0.4.9.crate (sha256 be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd)",
+    "version": "0.4.9"
+  },
   "dependencies": {
     "dependencies": {
       "arbitrary": {
@@ -416,7 +425,6 @@
       }
     }
   },
-  "feature_count": 57,
   "features": {
     "atp-cli": [
       "dep:clap",
@@ -625,11 +633,5 @@
     "wasm-runtime": [
       "wasm-browser-preview"
     ]
-  },
-  "package": "asupersync",
-  "recorded_at_utc": "2026-08-22T22:40:00Z",
-  "recorded_by": "FoggyMouse",
-  "schema_version": 1,
-  "source": "Cargo.toml [features] extracted from the immutable crates.io archive asupersync-0.4.9.crate (sha256 above in registry-0.4.9.json)",
-  "version": "0.4.9"
+  }
 }

@@ -14,8 +14,8 @@ hash_algorithm = "sha256"
 authoring_bead = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 final_attester_bead = "bd-mcp-2026-07-28-support-ahet.1.15"
-source_input_count = 68
-source_input_total_bytes = 3017187
+source_input_count = 71
+source_input_total_bytes = 3018823
 negative_case_count = 188
 derived_output_count = 14
 derived_toml_count = 10
@@ -135,7 +135,7 @@ max_policy_shape_registry_bytes = 1048576
 max_external_input_entry_count = 1000000
 max_external_input_member_bytes = 2147483648
 max_external_input_total_bytes = 68719476736
-exact_source_input_count = 68
+exact_source_input_count = 71
 exact_negative_case_count = 188
 exact_derived_output_count = 14
 exact_derived_toml_count = 10
@@ -151,9 +151,9 @@ path_scope = "repository-relative POSIX ASCII path beginning evidence/fnd-01/"
 ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
-file_count = 68
-total_bytes = 3017187
-sha256 = "258eb69efbed9dee6201430b389b24801b71f0d625d8dd17921f2a52b97bbac3"
+file_count = 71
+total_bytes = 3018823
+sha256 = "c2c5f6fe282ce2ed9888a981050ed57982d7a6059739e2d8276faf9c8dec1147"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
@@ -5655,9 +5655,9 @@ tree_sha256 = "d7294a8444f0892df030fdb94ea68437c18eed317354717bffc8b7e62c441816"
 [[source_family]]
 id = "toolchain"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
-file_count = 4
-total_bytes = 59668
-tree_sha256 = "f86c13205964776b456b26686f953eed0471b3437598fabf4023d1aa0e904839"
+file_count = 7
+total_bytes = 61304
+tree_sha256 = "063e363770a0732f20de01dfcb470e751bedcf46538c4b98a53fb8c7f61ee9de"
 
 [[source_family]]
 id = "serialization"
@@ -6839,8 +6839,8 @@ id = "s35"
 family = "toolchain"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
 path = "evidence/fnd-01/toolchain-asupersync.toml"
-byte_length = 39211
-sha256 = "5e7fda0e5c45d18ea1a828e212a7d36ff99ef4d4b0c03fefcdfa30a7bddbd314"
+byte_length = 20933
+sha256 = "cb11f94e34be61dfad47f1635047d7f84dd3e2e5633fe44b41c785a84acdc1b0"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
@@ -7337,6 +7337,51 @@ path = "evidence/fnd-01/vendor/core/mcp-schema-2024-11-05-48234828.ts"
 byte_length = 31201
 sha256 = "ad3264cdc22c5091b8ae96c5f5c769a2c7388473d84ca3de6fd55a4feeadfb1e"
 parse_kind = "utf8_text"
+observation_kind = "local_file"
+bytes_available = true
+rehash_mode = "exact_local"
+claim_ceiling = "local-byte-proof"
+required = true
+source_tree_member = true
+
+[[source_input]]
+id = "s69"
+family = "toolchain"
+owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
+path = "evidence/fnd-01/probes/asupersync/features-0.4.9.json"
+byte_length = 12973
+sha256 = "c3eef99f055aea7f66c2faa0aba61c7c2c40667ba5575cb7e43520691b8a0c54"
+parse_kind = "json"
+observation_kind = "local_file"
+bytes_available = true
+rehash_mode = "exact_local"
+claim_ceiling = "local-byte-proof"
+required = true
+source_tree_member = true
+
+[[source_input]]
+id = "s70"
+family = "toolchain"
+owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
+path = "evidence/fnd-01/probes/asupersync/registry-0.4.9.json"
+byte_length = 886
+sha256 = "9844ba8be0dea5d265981015bae9ec7b86e4595c659de78b797783c8cc4c38f2"
+parse_kind = "json"
+observation_kind = "local_file"
+bytes_available = true
+rehash_mode = "exact_local"
+claim_ceiling = "local-byte-proof"
+required = true
+source_tree_member = true
+
+[[source_input]]
+id = "s71"
+family = "toolchain"
+owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
+path = "evidence/fnd-01/probes/toolchain-2026-08-20.json"
+byte_length = 6055
+sha256 = "367d90decbb580ad76eea36f4d4d931ee2c2d90dcf0e6c01162772be1ceed066"
+parse_kind = "json"
 observation_kind = "local_file"
 bytes_available = true
 rehash_mode = "exact_local"

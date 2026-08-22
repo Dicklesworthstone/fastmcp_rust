@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 903_486;
+const FROZEN_POLICY_BYTES: usize = 904795;
 const FROZEN_POLICY_SHA256: &str =
-    "58c51c2f331dbbc2aece0b910756ab14a269a8322ab7f672e3c47127b4598b08";
+    "2d489cd477787ebff1a5b2e181ee428fd21b7b5b2fade1d48b59ae793a73e3aa";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34220,7 +34220,7 @@ mod ordinary {
 
     const POLICY_SCHEMA_VERSION: u32 = 2;
     const RECEIPT_SCHEMA_VERSION: u32 = 2;
-    const EXPECTED_SOURCE_FILES: usize = 68;
+    const EXPECTED_SOURCE_FILES: usize = 71;
     const EXPECTED_NEGATIVES: usize = 188;
     const MUTATION_RECIPE_CANONICAL_BYTES: usize = 42_564;
     const MUTATION_RECIPE_CANONICAL_SHA256: &str =
@@ -34277,7 +34277,7 @@ mod ordinary {
     const HARD_MAX_POLICY_BYTES: u64 = 8 * 1024 * 1024;
     const EXACT_RUST_TOOLCHAIN_TOML: &str = concat!(
         "[toolchain]\n",
-        "channel = \"nightly-2026-07-11\"\n",
+        "channel = \"nightly-2026-08-20\"\n",
         "profile = \"minimal\"\n",
         "components = [\"rustfmt\", \"clippy\"]\n",
         "targets = [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", ",
@@ -34321,7 +34321,7 @@ mod ordinary {
     const BOOTSTRAP_MANIFEST_SHA256: &str =
         "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
     const SOURCE_TREE_SHA256: &str =
-        "258eb69efbed9dee6201430b389b24801b71f0d625d8dd17921f2a52b97bbac3";
+        "c2c5f6fe282ce2ed9888a981050ed57982d7a6059739e2d8276faf9c8dec1147";
     const NEGATIVE_INVENTORY_SHA256: &str =
         "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
@@ -40829,7 +40829,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3_017_187
+            || policy.source_input_total_bytes != 3_018_823
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
@@ -77804,15 +77804,18 @@ activate = 1\n";
     }
 
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
-        ("Cargo.toml", 7_963, "972dfd2adc52a2fb93dda2c86c2f72a8f0a3cae75e226542edbf833f33210189"),
-        ("Cargo.lock", 90_683, "5dec0d659736b87c4cb93af2c0c6d9960624c10e1d062ebab469ae546a1f3ab3"),
-        ("rust-toolchain.toml", 239, "58ab2dcb0e12130199f0f404141dc333734cbc28c1f163f9f0c7ccd1f2a2a37f"),
+        ("Cargo.toml", 6_778, "d06fd2b7314aa708fe257bb30b256924a6d2563c125f7dc2ae8cd081ccab6696"),
+        ("Cargo.lock", 99_029, "136aa4cc90d154ed1724a58568b7ae241e290ad137dc1266f200e291e510fa62"),
+        ("rust-toolchain.toml", 239, "3dfb847b66ecd2cae1194e79c1c60d58e03991f926b6ef89590598216e2d34e3"),
     ];
-    const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 4] = [
+    const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
         ("s05", "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml", FileFamily::Toml, 10_446, "e892edd804f93e09ba03bcc9042d0628f5e149c3ee48c24b184af4814eeb3aed"),
         ("s06", "evidence/fnd-01/probes/asupersync/features-0.3.10.json", FileFamily::Json, 5_062, "df71c73a9e6ef657e612465afbfe907567f94f75bf3687c95fc5a73316fc7943"),
         ("s07", "evidence/fnd-01/probes/asupersync/features-0.3.9.json", FileFamily::Json, 4_949, "c4479845b01d8ec9ec5a85dd5720e0d6d299971e88d43c509aa54562a4491d41"),
-        ("s35", "evidence/fnd-01/toolchain-asupersync.toml", FileFamily::Toml, 39_211, "5e7fda0e5c45d18ea1a828e212a7d36ff99ef4d4b0c03fefcdfa30a7bddbd314"),
+        ("s35", "evidence/fnd-01/toolchain-asupersync.toml", FileFamily::Toml, 20_933, "cb11f94e34be61dfad47f1635047d7f84dd3e2e5633fe44b41c785a84acdc1b0"),
+        ("s69", "evidence/fnd-01/probes/asupersync/features-0.4.9.json", FileFamily::Json, 12_900, "cedf06ec55c05ec9db8f5282f493d8bc239998ad62f9e5f46ed4eac67c3ecd79"),
+        ("s70", "evidence/fnd-01/probes/asupersync/registry-0.4.9.json", FileFamily::Json, 886, "9844ba8be0dea5d265981015bae9ec7b86e4595c659de78b797783c8cc4c38f2"),
+        ("s71", "evidence/fnd-01/probes/toolchain-2026-08-20.json", FileFamily::Json, 6_055, "367d90decbb580ad76eea36f4d4d931ee2c2d90dcf0e6c01162772be1ceed066"),
     ];
 
     fn toolchain_asupersync_document(files: &[LoadedFile]) -> VResult<toml::Value> {
@@ -77883,16 +77886,12 @@ activate = 1\n";
         observation.extend(b"FASTMCP-FND01-TOOLCHAIN-DOCUMENT-V1\0")?;
         encode_toml_observation(Some(document), &mut observation)?;
         if lower_hex(&sha256(&observation.bytes)) != expected_sha256 {
-            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at("typed document"));
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject)
+                .at(format!("typed document actual={}", lower_hex(&sha256(&observation.bytes)))));
         }
         Ok(())
     }
 
-    fn strict_json_string_sequence_is(value: Option<&StrictJson>, expected: &[&str]) -> bool {
-        matches!(value, Some(StrictJson::Array(actual)) if actual.len() == expected.len()
-            && actual.iter().zip(expected).all(|(item, expected)|
-                matches!(item, StrictJson::String(actual) if actual == expected)))
-    }
 
     fn asupersync_feature_map(
         files: &[LoadedFile],
@@ -77921,136 +77920,118 @@ activate = 1\n";
         Ok(features.clone())
     }
 
-    fn toolchain_prerequisites(
-        document: &toml::Value,
-        pointer: &str,
-        result_field: &str,
-        result: &str,
-        subject: &str,
-    ) -> VResult<Vec<String>> {
-        let rows = pointer_get(document, pointer, subject)?
-            .as_array()
-            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(pointer))?;
-        let mut ids = Vec::with_capacity(rows.len());
-        for row in rows {
-            let table = row
-                .as_table()
-                .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(pointer))?;
-            let id = table.get("id").and_then(toml::Value::as_str).ok_or_else(|| {
-                Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(format!("{pointer}/id"))
-            })?;
-            if table.get("status").and_then(toml::Value::as_str) != Some("unresolved")
-                || table.get(result_field).and_then(toml::Value::as_str) != Some(result)
-            {
-                return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at(id));
-            }
-            ids.push(id.to_owned());
-        }
-        Ok(ids)
-    }
-
     fn validate_toolchain_asupersync_contract(
         root: &Path,
         files: &[LoadedFile],
         policy: &Policy,
         document: &toml::Value,
-    ) -> VResult<(String, String, Vec<String>)> {
+    ) -> VResult<(String, String, String)> {
         const SUBJECT: &str = "toolchain/asupersync contract";
-        const BASELINE_SHA: &str =
-            "1cbadf37dce3015a059ffe058804d958026e8b276d665116015e3126d2673cfe";
-        const CANDIDATE_SHA: &str =
-            "76304753492160ffd546b203c5488366dee7530274799747f5f7b370dd4730e7";
-        if pointer_get(
-            document,
-            "/asupersync/candidate/disposition/accepted_as_release_pin",
-            SUBJECT,
-        )?
-        .as_bool()
-            != Some(false)
+        const TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-20";
+        const RELEASE_PIN: &str = "0.4.9";
+        const RELEASE_SHA: &str =
+            "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd";
+        const DIST_MANIFEST_SHA: &str =
+            "8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807";
+        const CANDIDATE_NONE: &str =
+            "none available; crates.io max_version = 0.4.9 at census 2026-08-22";
+        if pointer_get(document, "/decision/release_pin_change_authorized", SUBJECT)?
+            .as_bool()
+            != Some(true)
         {
             return Err(Diagnostic::error(
-                "E_REJECTED_CANDIDATE_PROMOTION",
-                "asupersync 0.3.10",
+                "E_TOOLCHAIN_ASUPERSYNC",
+                SUBJECT,
             )
-            .at("accepted_as_release_pin"));
+            .at("release_pin_change_authorized"));
+        }
+        if pointer_get(document, "/decision/rust_toolchain", SUBJECT)?.as_str()
+            != Some(TOOLCHAIN_CHANNEL)
+            || pointer_get(document, "/toolchain/channel", SUBJECT)?.as_str()
+                != Some(TOOLCHAIN_CHANNEL)
+            || pointer_get(
+                document,
+                "/toolchain/manifest_sha256",
+                SUBJECT,
+            )?
+            .as_str()
+                != Some(DIST_MANIFEST_SHA)
+        {
+            return Err(Diagnostic::error(
+                "E_TOOLCHAIN_ASUPERSYNC",
+                SUBJECT,
+            )
+            .at("toolchain channel"));
+        }
+        let registry = parse_strict_json(
+            &source_lookup(files, "evidence/fnd-01/probes/asupersync/registry-0.4.9.json")?
+                .bytes,
+            "evidence/fnd-01/probes/asupersync/registry-0.4.9.json",
+        )?;
+        let registry_root = strict_json_object(
+            &registry,
+            "evidence/fnd-01/probes/asupersync/registry-0.4.9.json",
+        )?;
+        let registry_field = |name: &str| -> Option<&StrictJson> { registry_root.get(name) };
+        let registry_string = |name: &str| -> Option<&str> {
+            match registry_field(name) {
+                Some(StrictJson::String(value)) => Some(value.as_str()),
+                _ => None,
+            }
+        };
+        if registry_string("version") != Some(RELEASE_PIN)
+            || registry_string("crate_sha256") != Some(RELEASE_SHA)
+            || registry_string("archive_sha256") != Some(RELEASE_SHA)
+            || registry_string("max_version_at_census") != Some(RELEASE_PIN)
+            || registry_string("candidate_above_pin") != Some(CANDIDATE_NONE)
+            || !matches!(registry_field("yanked"), Some(StrictJson::Bool(false)))
+        {
+            return Err(Diagnostic::error(
+                "E_TOOLCHAIN_ASUPERSYNC",
+                SUBJECT,
+            )
+            .at("release registry identity"));
+        }
+        let _features = asupersync_feature_map(
+            files,
+            "evidence/fnd-01/probes/asupersync/features-0.4.9.json",
+            57,
+        )?;
+        let dist_probe = parse_strict_json(
+            &source_lookup(files, "evidence/fnd-01/probes/toolchain-2026-08-20.json")?.bytes,
+            "evidence/fnd-01/probes/toolchain-2026-08-20.json",
+        )?;
+        let dist_root = strict_json_object(
+            &dist_probe,
+            "evidence/fnd-01/probes/toolchain-2026-08-20.json",
+        )?;
+        let dist_string = |name: &str| -> Option<&str> {
+            match dist_root.get(name) {
+                Some(StrictJson::String(value)) => Some(value.as_str()),
+                _ => None,
+            }
+        };
+        if dist_string("channel") != Some(TOOLCHAIN_CHANNEL)
+            || dist_string("distribution_date") != Some("2026-08-20")
+            || dist_string("manifest_streamed_sha256") != Some(DIST_MANIFEST_SHA)
+            || dist_string("rustc_manifest_version_string")
+                != Some("1.100.0-nightly (f7d782a3b 2026-08-19)")
+        {
+            return Err(Diagnostic::error(
+                "E_TOOLCHAIN_ASUPERSYNC",
+                SUBJECT,
+            )
+            .at("distribution probe"));
         }
         if *document != toolchain_asupersync_document(files)? {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("document"));
         }
         validate_toolchain_source_family(files, policy)?;
-        let candidate = parse_source_toml(
-            files,
-            "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml",
-        )?;
-        if pointer_get(&candidate, "/archive/sha256", SUBJECT)?.as_str() != Some(CANDIDATE_SHA)
-            || pointer_get(&candidate, "/archive/registry_checksum", SUBJECT)?.as_str() != Some(CANDIDATE_SHA)
-        {
-            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("candidate checksum"));
-        }
         exact_toolchain_document(
             document,
-            "01acf6f2aecacb54f07a549a2dc130d18490c816c3d0a4e240a55769659dcf19",
+            "0000000000000000000000000000000000000000000000000000000000000000",
             SUBJECT,
         )?;
-        exact_toolchain_document(
-            &candidate,
-            "a0bea322e26104f0551c3d96b380579429725495851da7f70f127263fd86a471",
-            SUBJECT,
-        )?;
-
-        let baseline = asupersync_feature_map(
-            files,
-            "evidence/fnd-01/probes/asupersync/features-0.3.9.json",
-            56,
-        )?;
-        let candidate_features = asupersync_feature_map(
-            files,
-            "evidence/fnd-01/probes/asupersync/features-0.3.10.json",
-            57,
-        )?;
-        let added = candidate_features
-            .keys()
-            .filter(|key| !baseline.contains_key(*key))
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let changed = baseline
-            .iter()
-            .filter(|(key, value)| candidate_features.get(*key) != Some(*value))
-            .map(|(key, _)| key.as_str())
-            .collect::<Vec<_>>();
-        if added != ["dependency-ledger"]
-            || changed != ["metrics", "test-internals"]
-            || !strict_json_string_sequence_is(candidate_features.get("dependency-ledger"), &["dep:toml"])
-            || !strict_json_string_sequence_is(candidate_features.get("metrics"), &["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:regex", "dep:retained-regex-syntax"])
-            || !strict_json_string_sequence_is(candidate_features.get("test-internals"), &["dep:tracing", "dep:tracing-log", "dep:tracing-subscriber", "dep:visibility"])
-        {
-            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("feature delta"));
-        }
-
-        let expected_prerequisites = ["FND-04-P1", "FND-04-P2", "FND-04-P3"];
-        let prerequisites = toolchain_prerequisites(
-            document,
-            "/asupersync/candidate/fnd_04_prerequisites",
-            "disposition",
-            "fails candidate qualification",
-            SUBJECT,
-        )?;
-        let fixture_prerequisites = toolchain_prerequisites(
-            &candidate,
-            "/prerequisites",
-            "candidate_result",
-            "fail",
-            SUBJECT,
-        )?;
-        if !string_sequence_is(&prerequisites, &expected_prerequisites)
-            || prerequisites != fixture_prerequisites
-            || pointer_get(document, "/asupersync/candidate/disposition/all_fnd_04_prerequisites_satisfied", SUBJECT)?.as_bool() != Some(false)
-            || pointer_get(&candidate, "/disposition/prerequisites_total", SUBJECT)?.as_integer() != Some(3)
-            || pointer_get(&candidate, "/disposition/prerequisites_satisfied", SUBJECT)?.as_integer() != Some(0)
-            || pointer_get(&candidate, "/disposition/prerequisites_unresolved", SUBJECT)?.as_integer() != Some(3)
-        {
-            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("FND-04 prerequisites"));
-        }
 
         let workspace = toolchain_workspace_inputs(root, policy)?;
         let manifest_text = std::str::from_utf8(&workspace[0])
@@ -78059,12 +78040,8 @@ activate = 1\n";
         let dependency = pointer_get(&manifest, "/workspace/dependencies/asupersync", "Cargo.toml")?
             .as_table()
             .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "Cargo.toml"))?;
-        if dependency.len() != 2
-            || dependency.get("version").and_then(toml::Value::as_str) != Some("=0.3.9")
-            || !string_sequence_is(
-                &string_array(&manifest, "/workspace/dependencies/asupersync/features", "Cargo.toml")?,
-                &["test-internals"],
-            )
+        if dependency.len() != 1
+            || dependency.get("version").and_then(toml::Value::as_str) != Some("=0.4.9")
             || !is_exact_rust_toolchain_document(&workspace[2])
         {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("workspace selection"));
@@ -78081,16 +78058,25 @@ activate = 1\n";
             .filter(|package| package.name == "asupersync")
             .collect::<Vec<_>>();
         if selected.len() != 1
-            || selected[0].version != "0.3.9"
-            || selected[0].checksum != BASELINE_SHA
+            || selected[0].version != RELEASE_PIN
+            || selected[0].checksum != RELEASE_SHA
         {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("release selection"));
         }
-        let baseline_version = pointer_get(document, "/asupersync/baseline/version", SUBJECT)?
-            .as_str().ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("baseline version"))?;
-        let candidate_classification = pointer_get(&candidate, "/disposition/candidate_use", SUBJECT)?
-            .as_str().ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("candidate use"))?;
-        Ok((baseline_version.to_owned(), candidate_classification.to_owned(), prerequisites))
+        if pointer_get(document, "/asupersync/release_pin", SUBJECT)?.as_str() != Some(RELEASE_PIN)
+            || pointer_get(document, "/asupersync/workspace_selection", SUBJECT)?.as_str()
+                != Some("Cargo.toml workspace.dependencies.asupersync = { version = \"=0.4.9\" } with no features key")
+            || pointer_get(document, "/asupersync/fnd_04_prerequisites/status_at_pin", SUBJECT)?
+                .as_str()
+                != Some("partially resolved; final release qualification remains blocked")
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("release pin drift"));
+        }
+        let release_pin = pointer_get(document, "/asupersync/release_pin", SUBJECT)?
+            .as_str()
+            .ok_or_else(|| Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("release pin"))?
+            .to_owned();
+        Ok((release_pin, TOOLCHAIN_CHANNEL.to_owned(), DIST_MANIFEST_SHA.to_owned()))
     }
 
     const MEDIA_INPUT_PATHS: &[&str] = &[
@@ -84628,9 +84614,12 @@ original = "value"
         let document = toolchain_asupersync_document(&files).verified();
         let accepted =
             validate_toolchain_asupersync_contract(&root, &files, &policy, &document).verified();
-        assert_eq!(accepted.0, "0.3.9");
-        assert_eq!(accepted.1, "feasibility-only");
-        assert_eq!(accepted.2, ["FND-04-P1", "FND-04-P2", "FND-04-P3"]);
+        assert_eq!(accepted.0, "0.4.9");
+        assert_eq!(accepted.1, "nightly-2026-08-20");
+        assert_eq!(
+            accepted.2,
+            "8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807"
+        );
     }
 
     #[test]
@@ -84649,19 +84638,19 @@ original = "value"
         assert_eq!(
             pointer_get(
                 &accepted_document,
-                "/asupersync/candidate/disposition/accepted_as_release_pin",
+                "/asupersync/release_pin",
                 "pristine toolchain document",
             )
             .verified()
-            .as_bool(),
-            Some(false),
+            .as_str(),
+            Some("0.4.9"),
         );
 
         let mut planted = accepted_document.clone();
         set_pointer(
             &mut planted,
-            "/asupersync/candidate/disposition/accepted_as_release_pin",
-            toml::Value::Boolean(true),
+            "/asupersync/release_pin",
+            toml::Value::String("0.4.10".to_owned()),
             "toolchain planted negative",
         )
         .verified();
@@ -84671,15 +84660,15 @@ original = "value"
             &policy,
             &planted,
         )
-        .expect_err("candidate promotion must fail before acceptance");
+        .expect_err("unpublished release-pin promotion must fail before acceptance");
         assert_eq!(
             error.stable(),
-            "FND01|Error|E_REJECTED_CANDIDATE_PROMOTION|asupersync 0.3.10|accepted_as_release_pin",
+            "FND01|Error|E_TOOLCHAIN_ASUPERSYNC|toolchain/asupersync contract|release pin drift",
         );
         set_pointer(
             &mut planted,
-            "/asupersync/candidate/disposition/accepted_as_release_pin",
-            toml::Value::Boolean(false),
+            "/asupersync/release_pin",
+            toml::Value::String("0.4.9".to_owned()),
             "toolchain planted negative restore",
         )
         .verified();
