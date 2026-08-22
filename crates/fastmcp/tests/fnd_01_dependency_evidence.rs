@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 904795;
 const FROZEN_POLICY_SHA256: &str =
-    "2d489cd477787ebff1a5b2e181ee428fd21b7b5b2fade1d48b59ae793a73e3aa";
+    "eeb86652fbfa4b717f4179a22881bfc3259e7567a769b1ed8ca465bba7b18322";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -41017,7 +41017,7 @@ activate = 1\n";
                 .source_input_contract
                 .checked_in_archives_remain_local_exact_bytes
             || policy.parse_inventory.toml != 22
-            || policy.parse_inventory.json != 15
+            || policy.parse_inventory.json != 18
             || policy.parse_inventory.utf8_text != 24
             || policy.parse_inventory.opaque_binary != 4
             || policy.parse_inventory.gzip_tar != 3
