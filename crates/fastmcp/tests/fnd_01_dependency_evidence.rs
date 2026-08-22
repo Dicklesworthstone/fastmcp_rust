@@ -97345,6 +97345,7 @@ fn fallible(value: Option<u8>) {
             .expect("compiled environment profile digest")
     }
 
+    #[derive(Debug)]
     struct OrdinaryToolReprobe {
         tool_set_sha256: [u8; 32],
         #[allow(dead_code)]
