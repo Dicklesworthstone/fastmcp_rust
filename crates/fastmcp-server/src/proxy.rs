@@ -3284,8 +3284,15 @@ impl ProxyFinalTaskListener for ProxyBufferedFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioFinalTaskListener {
     client: ProxyClient,
-    /// Owned handle for best-effort cancellation after the request context
-    /// is gone; `Cx::for_request` is test-gated and unavailable here.
+    /// Owned handle for best-effort Drop-time cancellation. Cloning the
+    /// request context means this backstop inherits its cancellation state:
+    /// if the owning context is already cancelled when the listener is
+    /// abandoned without polling, the transport checkpoint refuses the
+    /// `notifications/cancelled` frame and only the local tombstone is
+    /// committed. Full coverage of that window requires an owned uncancelled
+    /// child region from an ambient `&Cx` — the absent asupersync primitive
+    /// tracked by FND-04 (bd-63l5). The inline cancel in `next_async` covers
+    /// the polled path with a live context.
     cx: Cx,
 }
 
@@ -3341,8 +3348,12 @@ impl Drop for ProxyIncrementalStdioFinalTaskListener {
 #[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioCatalogListener {
     client: ProxyClient,
-    /// Owned handle for best-effort cancellation after the request context
-    /// is gone; `Cx::for_request` is test-gated and unavailable here.
+    /// Owned handle for best-effort Drop-time cancellation. Inherits the
+    /// request context's cancellation state: an already-cancelled context
+    /// refuses the transport checkpoint, so the backstop commits only the
+    /// local tombstone in that window. The polled path cancels through
+    /// `next_async` with a live context. Owned uncancelled child regions are
+    /// the absent asupersync primitive tracked by FND-04 (bd-63l5).
     cx: Cx,
 }
 
