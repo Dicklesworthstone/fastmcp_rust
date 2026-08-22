@@ -1,0 +1,19 @@
+{
+  "candidate_above_pin_available": false,
+  "crate_download_url": "https://static.crates.io/crates/asupersync/asupersync-0.4.9.crate",
+  "crate_sha256": "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd",
+  "description": "Spec-first, cancel-correct, capability-secure async runtime for Rust.",
+  "edition": "2024",
+  "license": "LicenseRef-MIT-OpenAI-Anthropic-Rider",
+  "max_version_at_census": "0.4.9",
+  "package": "asupersync",
+  "published_at_utc": "2026-08-20T23:30:58.913631Z",
+  "purpose": "Registry identity for the asupersync 0.4.9 release pin under the authorized dependency bump (commit c3caa62 lineage).",
+  "recorded_at_utc": "2026-08-22T22:40:00Z",
+  "recorded_by": "FoggyMouse",
+  "retrieval_user_agent": "OpenAI File Downloader, XaiImageApiFetch/1.0",
+  "rust_version_declared": null,
+  "schema_version": 1,
+  "version": "0.4.9",
+  "yanked": false
+}

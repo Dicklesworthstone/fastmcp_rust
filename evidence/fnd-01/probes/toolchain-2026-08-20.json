@@ -1,0 +1,135 @@
+{
+  "channel": "nightly-2026-08-20",
+  "components": {
+    "cargo": {
+      "aarch64-apple-darwin": {
+        "sha256": "607ecf44499385919d6d7926e0a453607078d81a764b92f94ed448605c5e14b3",
+        "version": "0.100.0-nightly (514c56dd7 2026-08-19)"
+      },
+      "aarch64-unknown-linux-gnu": {
+        "sha256": "36b17e3b8019d361cc39b72c0bbb87375cf0f819aaa24db2f5ce28b0f8835986",
+        "version": "0.100.0-nightly (514c56dd7 2026-08-19)"
+      },
+      "x86_64-apple-darwin": {
+        "sha256": "018bae18beefcfda2ef68c6b7d10b69481c577aec9f400d72ef80a32815f08d0",
+        "version": "0.100.0-nightly (514c56dd7 2026-08-19)"
+      },
+      "x86_64-pc-windows-msvc": {
+        "sha256": "4ae9fbfc21d396cd8a81a818cd56725923a7f2d273f4e96c0ffdf78a7321e02f",
+        "version": "0.100.0-nightly (514c56dd7 2026-08-19)"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "sha256": "0de1039680eb7c1c31f6c45aecde18b90fb8517a42439dfd389d287adf4f8114",
+        "version": "0.100.0-nightly (514c56dd7 2026-08-19)"
+      }
+    },
+    "clippy-preview": {
+      "aarch64-apple-darwin": {
+        "sha256": "b7f5864123134b5455a9ca11bf69772cb552b6b3a1d6608010f46a536ec7f08a",
+        "version": "0.1.99-nightly"
+      },
+      "aarch64-unknown-linux-gnu": {
+        "sha256": "29a36abfc7b18bee95e2e837015189ec11c21c91f88f01ebcee008df71ddac5b",
+        "version": "0.1.99-nightly"
+      },
+      "x86_64-apple-darwin": {
+        "sha256": "0e94344db31b790683fe030bacc14e332acd88ae6d0ab2b742d24ce0099c96bc",
+        "version": "0.1.99-nightly"
+      },
+      "x86_64-pc-windows-msvc": {
+        "sha256": "8bd3a449f0bf43d6ac49458e81e218e6605869eeed0282c7a6a95cc4f52fe972",
+        "version": "0.1.99-nightly"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "sha256": "5d9e0f0018a8f3f68720dd84fcbdc278582845d94c641573eed89d2ca7a0f697",
+        "version": "0.1.99-nightly"
+      }
+    },
+    "llvm-tools-preview": {
+      "aarch64-apple-darwin": {
+        "sha256": "b14ee8e82b61b63c754d65d8db27b949c7512530a1eeda243321185f46b53bec",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "aarch64-unknown-linux-gnu": {
+        "sha256": "a40f7d5d065985d09167e8140d350319c4cf4b97f76d85c32bb0cf5e34cc63fe",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-apple-darwin": {
+        "sha256": "4352395435ef03bf106527b9dfcdde9b29d92f475c72a33c118a10cfe665305a",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-pc-windows-msvc": {
+        "sha256": "0d25f944a8f916687f0ff630c8313382abee56ca26454c2fdf39a6a5692fc734",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "sha256": "289c4141f611e3a08017b25281ec3ec5d810b3131885a99326fef4a6b22a108d",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      }
+    },
+    "rust-std": {
+      "aarch64-apple-darwin": {
+        "sha256": "e141238c957ba3086d37e206546e973fb69d6799eb21b41c626cb2d86b839cf4",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "aarch64-unknown-linux-gnu": {
+        "sha256": "ddb995d058ef0c1e305e3b378f1c496901322c8ec462dcfcabb5e5e25202a81e",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-apple-darwin": {
+        "sha256": "ff73a4e8e451097cf5066606494fcf627dd3b9342e44d4bd47a387d25852e4a2",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-pc-windows-msvc": {
+        "sha256": "9ea6e972e008d4013ca6312c8af3e9d6109f6911fb680ca2680f265af35b40ed",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "sha256": "64600c72503dfe1c8c6f69e3a933cb6ca984fe898016d3d65116160727dc54b2",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      }
+    },
+    "rustc": {
+      "aarch64-apple-darwin": {
+        "sha256": "56821f392f9ba9cec54ffec2939ff9312861d438cac420eb4ce6c9060e0b86c4",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "aarch64-unknown-linux-gnu": {
+        "sha256": "ec4e01a28262d9e818d42f132a95a649310eb29c6de32c987ee4917d5312c91d",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-apple-darwin": {
+        "sha256": "3dd2026e388f722e0905bbbc042045101115af98420beda120a7a6016d618b11",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-pc-windows-msvc": {
+        "sha256": "bc74c0cb64c570d02e66db9360330cab9e0ba8979e4d90f616285cc0ee172cc4",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      },
+      "x86_64-unknown-linux-gnu": {
+        "sha256": "5ddf6a2472eb778bb4bf57c1bbe118913d5958ec59baf399283d42ed40b5d1be",
+        "version": "1.100.0-nightly (f7d782a3b 2026-08-19)"
+      }
+    }
+  },
+  "distribution_date": "2026-08-20",
+  "executable_self_reports": {
+    "cargo": "cargo 1.100.0-nightly (514c56dd7 2026-08-19)",
+    "clippy_driver": "",
+    "host": "aarch64-apple-darwin",
+    "note": "Local machine runs the exact pinned channel (rust-toolchain.toml nightly-2026-08-20); self-reports captured 2026-08-22.",
+    "rustc": "rustc 1.100.0-nightly (f7d782a3b 2026-08-19)",
+    "rustfmt": "rustfmt 1.10.0-nightly (f7d782a3be 2026-08-19)"
+  },
+  "manifest_content_length_bytes": 975638,
+  "manifest_last_modified": "Thu, 20 Aug 2026 01:34:12 GMT",
+  "manifest_sha256_url": "https://static.rust-lang.org/dist/2026-08-20/channel-rust-nightly.toml.sha256",
+  "manifest_streamed_sha256": "8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807",
+  "manifest_url": "https://static.rust-lang.org/dist/2026-08-20/channel-rust-nightly.toml",
+  "purpose": "Dated nightly distribution facts for the post-supersession toolchain baseline targeted by the bd-mcp-2026-07-28-support-ahet.1.6 re-scope.",
+  "recorded_at_utc": "2026-08-22T22:40:00Z",
+  "recorded_by": "FoggyMouse",
+  "retrieval_user_agent": "OpenAI File Downloader, XaiImageApiFetch/1.0",
+  "rustc_manifest_version_string": "1.100.0-nightly (f7d782a3b 2026-08-19)",
+  "schema_version": 1
+}

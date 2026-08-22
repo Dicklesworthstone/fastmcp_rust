@@ -1,0 +1,635 @@
+{
+  "dependencies": {
+    "dependencies": {
+      "arbitrary": {
+        "features": [
+          "derive"
+        ],
+        "optional": true,
+        "version": "1"
+      },
+      "asupersync-macros": {
+        "optional": true,
+        "version": "0.4.9"
+      },
+      "async-trait": {
+        "optional": true,
+        "version": "0.1"
+      },
+      "backtrace": {
+        "optional": true,
+        "version": "0.3"
+      },
+      "base64": {
+        "default-features": false,
+        "features": [
+          "std"
+        ],
+        "version": "0.23"
+      },
+      "bincode": {
+        "features": [
+          "serde"
+        ],
+        "package": "bincode-next",
+        "version": "3.1.1"
+      },
+      "brotli": {
+        "optional": true,
+        "version": "8.0"
+      },
+      "chrono": {
+        "features": [
+          "serde"
+        ],
+        "optional": true,
+        "version": "0.4"
+      },
+      "clap": {
+        "features": [
+          "derive"
+        ],
+        "optional": true,
+        "version": "4.4"
+      },
+      "crc32fast": {
+        "version": "1.4"
+      },
+      "crossbeam-queue": {
+        "version": "0.3"
+      },
+      "env_logger": {
+        "optional": true,
+        "version": "0.11"
+      },
+      "flate2": {
+        "optional": true,
+        "version": "1.1"
+      },
+      "franken-decision": {
+        "version": "0.4.9"
+      },
+      "franken-evidence": {
+        "version": "0.4.9"
+      },
+      "franken-kernel": {
+        "version": "0.4.9"
+      },
+      "futures-lite": {
+        "version": "2.6"
+      },
+      "getrandom": {
+        "version": "0.4"
+      },
+      "hashbrown": {
+        "version": "0.17"
+      },
+      "hex": {
+        "version": "0.4"
+      },
+      "hmac": {
+        "version": "0.13"
+      },
+      "loom": {
+        "optional": true,
+        "version": "0.7"
+      },
+      "lz4_flex": {
+        "optional": true,
+        "version": "0.14"
+      },
+      "memchr": {
+        "version": "2.8"
+      },
+      "nkeys": {
+        "version": "0.4.5"
+      },
+      "num_cpus": {
+        "optional": true,
+        "version": "1.0"
+      },
+      "opentelemetry": {
+        "default-features": false,
+        "features": [
+          "metrics",
+          "trace"
+        ],
+        "optional": true,
+        "version": "0.32"
+      },
+      "opentelemetry-proto": {
+        "default-features": false,
+        "features": [
+          "gen-tonic-messages",
+          "trace",
+          "metrics",
+          "logs"
+        ],
+        "optional": true,
+        "version": "0.32"
+      },
+      "opentelemetry_sdk": {
+        "default-features": false,
+        "features": [
+          "metrics",
+          "trace"
+        ],
+        "optional": true,
+        "version": "0.32"
+      },
+      "parking_lot": {
+        "version": "0.12"
+      },
+      "pin-project": {
+        "version": "1.1"
+      },
+      "prost": {
+        "version": "0.14"
+      },
+      "rdkafka": {
+        "default-features": false,
+        "optional": true,
+        "version": "0.39"
+      },
+      "regex": {
+        "optional": true,
+        "version": "1.12"
+      },
+      "retained-regex-syntax": {
+        "optional": true,
+        "package": "regex-syntax",
+        "version": "=0.8.11"
+      },
+      "rmp-serde": {
+        "version": "1.3"
+      },
+      "rusqlite": {
+        "features": [
+          "bundled",
+          "hooks"
+        ],
+        "optional": true,
+        "version": "0.40"
+      },
+      "rustc-demangle": {
+        "optional": true,
+        "version": "0.1"
+      },
+      "rustls": {
+        "default-features": false,
+        "features": [
+          "std",
+          "tls12"
+        ],
+        "optional": true,
+        "version": "0.23.39"
+      },
+      "rustls-native-certs": {
+        "optional": true,
+        "version": "0.8"
+      },
+      "rustls-pemfile": {
+        "optional": true,
+        "version": "2.2"
+      },
+      "rustls-pki-types": {
+        "optional": true,
+        "version": "1.14.1"
+      },
+      "semver": {
+        "features": [
+          "serde"
+        ],
+        "version": "1.0"
+      },
+      "serde": {
+        "features": [
+          "derive"
+        ],
+        "version": "1.0"
+      },
+      "serde_json": {
+        "version": "1.0"
+      },
+      "serde_yaml": {
+        "optional": true,
+        "version": "0.9"
+      },
+      "sha1": {
+        "version": "0.11"
+      },
+      "sha2": {
+        "features": [
+          "zeroize"
+        ],
+        "version": "0.11"
+      },
+      "slab": {
+        "version": "0.4"
+      },
+      "smallvec": {
+        "version": "1.15"
+      },
+      "sqlparser": {
+        "optional": true,
+        "version": "0.62"
+      },
+      "subtle": {
+        "version": "2.6"
+      },
+      "sysinfo": {
+        "version": "0.39"
+      },
+      "tempfile": {
+        "version": "3.25"
+      },
+      "thiserror": {
+        "version": "2.0"
+      },
+      "time": {
+        "features": [
+          "formatting"
+        ],
+        "optional": true,
+        "version": ">=0.3"
+      },
+      "tokio": {
+        "features": [
+          "rt",
+          "fs",
+          "process"
+        ],
+        "optional": true,
+        "version": "1.0"
+      },
+      "toml": {
+        "optional": true,
+        "version": "1.0"
+      },
+      "tower": {
+        "optional": true,
+        "version": "0.5.3"
+      },
+      "tracing": {
+        "optional": true,
+        "version": "0.1"
+      },
+      "tracing-log": {
+        "optional": true,
+        "version": "0.2"
+      },
+      "tracing-subscriber": {
+        "features": [
+          "env-filter"
+        ],
+        "optional": true,
+        "version": "0.3"
+      },
+      "unicode-normalization": {
+        "version": "0.1.25"
+      },
+      "visibility": {
+        "optional": true,
+        "version": "0.1"
+      },
+      "webpki-roots": {
+        "optional": true,
+        "version": "1.0"
+      },
+      "whoami": {
+        "optional": true,
+        "version": "2"
+      },
+      "x509-parser": {
+        "optional": true,
+        "version": "0.18"
+      },
+      "zeroize": {
+        "features": [
+          "derive"
+        ],
+        "version": "1.8"
+      }
+    },
+    "dev-dependencies": {
+      "chrono": {
+        "features": [
+          "serde"
+        ],
+        "version": "0.4"
+      },
+      "fastrand": {
+        "version": "2.3"
+      },
+      "flate2": {
+        "version": "1.1"
+      },
+      "httparse": {
+        "version": "1.8"
+      },
+      "insta": {
+        "features": [
+          "json",
+          "yaml"
+        ],
+        "version": "1.40"
+      },
+      "lz4_flex": {
+        "version": "0.14"
+      },
+      "opentelemetry-proto": {
+        "default-features": false,
+        "features": [
+          "gen-tonic-messages",
+          "trace",
+          "metrics",
+          "logs"
+        ],
+        "version": "0.32"
+      },
+      "opentelemetry_sdk": {
+        "default-features": false,
+        "features": [
+          "metrics",
+          "testing"
+        ],
+        "version": "0.32"
+      },
+      "proptest": {
+        "version": "1.10"
+      },
+      "raptorq": {
+        "version": "2.0"
+      },
+      "rayon": {
+        "version": "1.12"
+      },
+      "redis": {
+        "version": "1.2"
+      },
+      "serde_yaml": {
+        "version": "0.9"
+      },
+      "sqlx": {
+        "default-features": false,
+        "features": [
+          "mysql",
+          "runtime-tokio",
+          "tls-none"
+        ],
+        "version": "0.9"
+      },
+      "tempfile": {
+        "version": "3.25"
+      },
+      "tokio": {
+        "features": [
+          "rt",
+          "sync",
+          "time"
+        ],
+        "version": "1.0"
+      },
+      "tokio-util": {
+        "features": [
+          "codec"
+        ],
+        "version": "0.7"
+      },
+      "toml": {
+        "version": "1.0"
+      },
+      "tracing": {
+        "version": "0.1"
+      },
+      "tracing-log": {
+        "version": "0.2"
+      },
+      "tracing-subscriber": {
+        "features": [
+          "env-filter"
+        ],
+        "version": "0.3"
+      },
+      "trybuild": {
+        "version": "1.0"
+      }
+    }
+  },
+  "feature_count": 57,
+  "features": {
+    "atp-cli": [
+      "dep:clap",
+      "tls",
+      "dep:rustls-native-certs"
+    ],
+    "atpd-daemon": [
+      "cli",
+      "dep:tracing-subscriber"
+    ],
+    "benchmark-adapters": [
+      "dep:async-trait",
+      "dep:tokio",
+      "dep:tracing",
+      "tokio/macros",
+      "tokio/sync",
+      "tokio/time",
+      "dep:num_cpus",
+      "dep:whoami",
+      "dep:chrono"
+    ],
+    "browser-io": [],
+    "browser-trace": [],
+    "cancel-correctness-oracle": [],
+    "channel-mpsc-select-e2e": [],
+    "ci-cross-platform": [
+      "messaging-fabric",
+      "waker-profiling",
+      "wasm-browser-preview",
+      "wasm-runtime",
+      "browser-io",
+      "browser-trace",
+      "deterministic-mode",
+      "native-runtime",
+      "wasm-browser-dev",
+      "wasm-browser-prod",
+      "wasm-browser-deterministic",
+      "wasm-browser-minimal",
+      "test-internals",
+      "legacy-internal-test-harnesses",
+      "serialization-golden-harnesses",
+      "real-service-e2e",
+      "h3-websocket-e2e",
+      "raptorq-roundtrip-e2e",
+      "obligation-cleanup-e2e",
+      "metrics",
+      "tracing-integration",
+      "proc-macros",
+      "tower",
+      "trace-compression",
+      "debug-server",
+      "config-file",
+      "lock-metrics",
+      "obligation-leak-detection",
+      "tls",
+      "tls-native-roots",
+      "tls-webpki-roots",
+      "cli",
+      "sqlite",
+      "postgres",
+      "mysql",
+      "quic",
+      "http3",
+      "tailscale-path-provider",
+      "tokio-compat",
+      "compression",
+      "simd-intrinsics",
+      "loom-tests",
+      "cancel-correctness-oracle",
+      "lab-stack-traces",
+      "criterion-benches",
+      "atpd-daemon",
+      "fuzz"
+    ],
+    "cli": [
+      "dep:clap",
+      "dep:time",
+      "trace-compression",
+      "dep:serde_yaml",
+      "dep:chrono",
+      "dep:env_logger",
+      "config-file",
+      "tracing-integration"
+    ],
+    "compression": [
+      "dep:flate2",
+      "dep:brotli"
+    ],
+    "config-file": [
+      "dep:toml"
+    ],
+    "criterion-benches": [],
+    "debug-server": [],
+    "default": [
+      "proc-macros",
+      "nightly-outcome-try"
+    ],
+    "dependency-ledger": [
+      "dep:toml"
+    ],
+    "deterministic-mode": [],
+    "fuzz": [
+      "dep:arbitrary",
+      "dep:opentelemetry-proto"
+    ],
+    "h3-websocket-e2e": [],
+    "http3": [
+      "quic"
+    ],
+    "io-uring": [
+      "dep:io-uring"
+    ],
+    "kafka": [
+      "dep:rdkafka"
+    ],
+    "lab-stack-traces": [
+      "dep:backtrace",
+      "dep:rustc-demangle"
+    ],
+    "legacy-internal-test-harnesses": [],
+    "lock-metrics": [],
+    "loom-tests": [
+      "dep:loom"
+    ],
+    "messaging-fabric": [],
+    "metrics": [
+      "dep:opentelemetry",
+      "dep:opentelemetry_sdk",
+      "dep:regex",
+      "dep:retained-regex-syntax"
+    ],
+    "mysql": [],
+    "native-runtime": [],
+    "nightly-outcome-try": [],
+    "obligation-cleanup-e2e": [],
+    "obligation-leak-detection": [],
+    "postgres": [],
+    "proc-macros": [
+      "dep:asupersync-macros"
+    ],
+    "quic": [],
+    "raptorq-roundtrip-e2e": [],
+    "real-service-e2e": [
+      "channel-mpsc-select-e2e",
+      "h3-websocket-e2e",
+      "obligation-cleanup-e2e",
+      "raptorq-roundtrip-e2e"
+    ],
+    "runtime-metrics": [],
+    "serialization-golden-harnesses": [],
+    "simd-intrinsics": [],
+    "sqlite": [
+      "dep:rusqlite",
+      "dep:sqlparser"
+    ],
+    "tailscale-path-provider": [],
+    "test-internals": [
+      "dep:tracing",
+      "dep:tracing-log",
+      "dep:tracing-subscriber",
+      "dep:visibility"
+    ],
+    "tls": [
+      "dep:rustls",
+      "dep:rustls-pki-types",
+      "rustls/ring",
+      "dep:rustls-pemfile",
+      "dep:x509-parser"
+    ],
+    "tls-native-roots": [
+      "tls",
+      "dep:rustls-native-certs"
+    ],
+    "tls-webpki-roots": [
+      "tls",
+      "dep:webpki-roots"
+    ],
+    "tokio-compat": [],
+    "tower": [
+      "dep:tower"
+    ],
+    "trace-compression": [
+      "dep:lz4_flex"
+    ],
+    "tracing-integration": [
+      "dep:tracing"
+    ],
+    "waker-profiling": [],
+    "wasm-browser-deterministic": [
+      "wasm-runtime",
+      "deterministic-mode",
+      "browser-trace"
+    ],
+    "wasm-browser-dev": [
+      "wasm-runtime",
+      "browser-io"
+    ],
+    "wasm-browser-minimal": [
+      "wasm-runtime"
+    ],
+    "wasm-browser-preview": [],
+    "wasm-browser-prod": [
+      "wasm-runtime",
+      "browser-io"
+    ],
+    "wasm-runtime": [
+      "wasm-browser-preview"
+    ]
+  },
+  "package": "asupersync",
+  "recorded_at_utc": "2026-08-22T22:40:00Z",
+  "recorded_by": "FoggyMouse",
+  "schema_version": 1,
+  "source": "Cargo.toml [features] extracted from the immutable crates.io archive asupersync-0.4.9.crate (sha256 above in registry-0.4.9.json)",
+  "version": "0.4.9"
+}
