@@ -34083,7 +34083,7 @@ mod bootstrap {
         )
     }
 
-    #[cfg(any(fnd01_bootstrap, test))]
+    #[cfg(any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64")))]
     pub fn harness_main<I>(arguments: I) -> i32
     where
         I: IntoIterator<Item = OsString>,
@@ -98843,7 +98843,7 @@ fn fallible(value: Option<u8>) {
     }
 } // mod ordinary
 
-#[cfg(any(fnd01_bootstrap, test))]
+#[cfg(any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64")))]
 pub use bootstrap::harness_main;
 #[cfg(all(not(fnd01_bootstrap), not(test)))]
 pub use ordinary::harness_main;
