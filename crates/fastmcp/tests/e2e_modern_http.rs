@@ -611,6 +611,143 @@ impl TokenVerifier for PublicHttpCustomVerifier {
         Err(McpError::invalid_request("unknown custom token"))
     }
 }
+/// Admission mode for shared as_proxy gateway fixtures: no auth provider,
+/// the deterministic static-token verifier, or the custom non-static
+/// verifier. One-variable admission proofs swap only this variant.
+#[cfg(feature = "proxy")]
+#[derive(Clone, Copy)]
+enum AsProxyGatewayAuth {
+    None,
+    Static,
+    Custom,
+}
+
+/// Sends one bounded native HTTP POST with optional Authorization plus the
+/// routed Mcp-Method/Mcp-Name headers and returns the raw response bytes for
+/// as_proxy gateway admission proofs.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn as_proxy_auth_native_post(
+    address: SocketAddr,
+    authorization: Option<&str>,
+    mcp_method: &str,
+    mcp_name: &str,
+    body: &[u8],
+) -> Vec<u8> {
+    const MAX_NATIVE_HTTP_RESPONSE_BYTES: usize = 1 << 20;
+    let mut stream = std::net::TcpStream::connect_timeout(&address, HTTP_OPERATION_BOUND)
+        .expect("native HTTP client connects to the as_proxy auth gateway");
+    stream
+        .set_read_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client read deadline is configured");
+    stream
+        .set_write_timeout(Some(HTTP_OPERATION_BOUND))
+        .expect("native HTTP client write deadline is configured");
+    let authorization_header =
+        authorization.map_or_else(String::new, |value| format!("Authorization: {value}\r\n"));
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {address}\r\n{authorization_header}Accept: application/json\r\nContent-Type: application/json\r\nMCP-Protocol-Version: {}\r\nMcp-Method: {mcp_method}\r\nMcp-Name: {mcp_name}\r\nContent-Length: {}\r\n\r\n",
+        modern::PROTOCOL_VERSION,
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.write_all(body))
+        .expect("native HTTP request commits to the as_proxy auth gateway");
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .expect("native HTTP response reads within its configured deadline");
+        if read == 0 {
+            break;
+        }
+        assert!(
+            response
+                .len()
+                .checked_add(read)
+                .is_some_and(|size| size <= MAX_NATIVE_HTTP_RESPONSE_BYTES),
+            "native HTTP response exceeds the test's bounded response budget"
+        );
+        response.extend_from_slice(&buffer[..read]);
+    }
+    response
+}
+
+/// Returns the ASCII header block of a raw native HTTP response.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn as_proxy_auth_response_headers(response: &[u8]) -> &str {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("native HTTP response contains a complete header terminator");
+    std::str::from_utf8(&response[..header_end]).expect("native HTTP response headers are ASCII")
+}
+
+/// Decodes the JSON body of a raw native HTTP response using Content-Length
+/// or chunked framing.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn as_proxy_auth_response_json_body(response: &[u8]) -> serde_json::Value {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .expect("native HTTP response contains a complete header terminator");
+    let headers =
+        std::str::from_utf8(&response[..header_end]).expect("native HTTP response headers are ASCII");
+    let mut content_length = None;
+    let mut chunked = false;
+    for header in headers.lines().skip(1) {
+        let (name, value) = header
+            .split_once(':')
+            .expect("native HTTP response header has a field delimiter");
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .expect("native HTTP Content-Length is a valid byte count"),
+            );
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+        {
+            chunked = true;
+        }
+    }
+    let body = &response[header_end + 4..];
+    let decoded = if chunked {
+        let mut cursor = 0;
+        let mut decoded = Vec::new();
+        loop {
+            let size_end = body[cursor..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .map(|offset| cursor + offset)
+                .expect("chunked response contains a complete chunk-size line");
+            let size_line = std::str::from_utf8(&body[cursor..size_end])
+                .expect("chunked response chunk size is ASCII");
+            let size = usize::from_str_radix(size_line.split(';').next().unwrap_or_default(), 16)
+                .expect("chunked response chunk size is hexadecimal");
+            cursor = size_end + 2;
+            if size == 0 {
+                return serde_json::from_slice(&decoded)
+                    .expect("authenticated as_proxy tool response is JSON-RPC");
+            }
+            let chunk_end = cursor
+                .checked_add(size)
+                .expect("chunked response chunk length does not overflow");
+            decoded.extend_from_slice(&body[cursor..chunk_end]);
+            cursor = chunk_end + 2;
+        }
+    } else {
+        let content_length = content_length
+            .expect("native HTTP response uses Content-Length or chunked framing");
+        body[..content_length].to_vec()
+    };
+    serde_json::from_slice(&decoded).expect("authenticated as_proxy tool response is JSON-RPC")
+}
 
 /// Returns image and audio content blocks on a live modern tools/call.
 struct PublicHttpRichTool;
@@ -4565,7 +4702,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_options(
 }
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
-fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
+fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
     precreate_task: bool,
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
@@ -4573,7 +4710,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
     cache_tools: Option<Vec<String>>,
     rate_limit: bool,
     sliding_window: bool,
-    static_token: bool,
+    gateway_auth: AsProxyGatewayAuth,
     strict_input: bool,
     list_page_size: Option<usize>,
     on_duplicate: Option<DuplicateBehavior>,
@@ -4687,15 +4824,22 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
                     rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
                 );
             }
-            if static_token {
-                let verifier = StaticTokenVerifier::new([(
-                    "alpha",
-                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
-                )])
-                .expect("the deterministic stdio as_proxy gateway bearer verifier is valid")
-                .with_allowed_schemes(["Bearer"])
-                .expect("the stdio as_proxy gateway bearer scheme allowlist is valid");
-                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            match gateway_auth {
+                AsProxyGatewayAuth::None => {}
+                AsProxyGatewayAuth::Static => {
+                    let verifier = StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the deterministic stdio as_proxy gateway bearer verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the stdio as_proxy gateway bearer scheme allowlist is valid");
+                    builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+                }
+                AsProxyGatewayAuth::Custom => {
+                    builder =
+                        builder.auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier));
+                }
             }
             if strict_input {
                 builder = builder.strict_input_validation(true);
@@ -4784,6 +4928,38 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
             handler_calls,
         },
         task_id,
+    )
+}
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_stdio_as_proxy_gateway_with_duplicate(
+    precreate_task: bool,
+    extra_env: Vec<(String, String)>,
+    mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+    on_duplicate: Option<DuplicateBehavior>,
+) -> (HttpServerFixture, Option<FinalTaskId>) {
+    spawn_modern_http_stdio_as_proxy_gateway_with_auth(
+        precreate_task,
+        extra_env,
+        mask_error_details,
+        request_timeout_secs,
+        cache_tools,
+        rate_limit,
+        sliding_window,
+        if static_token {
+            AsProxyGatewayAuth::Static
+        } else {
+            AsProxyGatewayAuth::None
+        },
+        strict_input,
+        list_page_size,
+        on_duplicate,
     )
 }
 
@@ -12136,7 +12312,7 @@ fn spawn_modern_http_identity_proxy_gateway(upstream: SocketAddr) -> HttpServerF
 }
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
-fn spawn_modern_http_identity_proxy_gateway_configured(
+fn spawn_modern_http_identity_proxy_gateway_configured_with_auth(
     upstream: SocketAddr,
     gateway_instructions: Option<String>,
     mask_error_details: bool,
@@ -12144,7 +12320,7 @@ fn spawn_modern_http_identity_proxy_gateway_configured(
     cache_tools: Option<Vec<String>>,
     rate_limit: bool,
     sliding_window: bool,
-    static_token: bool,
+    gateway_auth: AsProxyGatewayAuth,
     strict_input: bool,
     list_page_size: Option<usize>,
 ) -> HttpServerFixture {
@@ -12227,15 +12403,22 @@ fn spawn_modern_http_identity_proxy_gateway_configured(
                     rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
                 );
             }
-            if static_token {
-                let verifier = StaticTokenVerifier::new([(
-                    "alpha",
-                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
-                )])
-                .expect("the deterministic as_proxy gateway bearer verifier is valid")
-                .with_allowed_schemes(["Bearer"])
-                .expect("the as_proxy gateway bearer scheme allowlist is valid");
-                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            match gateway_auth {
+                AsProxyGatewayAuth::None => {}
+                AsProxyGatewayAuth::Static => {
+                    let verifier = StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the deterministic as_proxy gateway bearer verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the as_proxy gateway bearer scheme allowlist is valid");
+                    builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+                }
+                AsProxyGatewayAuth::Custom => {
+                    builder =
+                        builder.auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier));
+                }
             }
             if strict_input {
                 builder = builder.strict_input_validation(true);
@@ -12318,6 +12501,36 @@ fn spawn_modern_http_identity_proxy_gateway_configured(
         nonquiescent: None,
         handler_calls,
     }
+}
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn spawn_modern_http_identity_proxy_gateway_configured(
+    upstream: SocketAddr,
+    gateway_instructions: Option<String>,
+    mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+) -> HttpServerFixture {
+    spawn_modern_http_identity_proxy_gateway_configured_with_auth(
+        upstream,
+        gateway_instructions,
+        mask_error_details,
+        request_timeout_secs,
+        cache_tools,
+        rate_limit,
+        sliding_window,
+        if static_token {
+            AsProxyGatewayAuth::Static
+        } else {
+            AsProxyGatewayAuth::None
+        },
+        strict_input,
+        list_page_size,
+    )
 }
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -17057,6 +17270,109 @@ fn e2e_public_http_as_proxy_gateway_static_token_refuses_missing_and_wrong() {
     gateway.shutdown();
     upstream.shutdown();
 }
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+    let upstream = spawn_modern_as_proxy_counting_upstream();
+    let gateway = spawn_modern_http_identity_proxy_gateway_configured_with_auth(
+        upstream.address(),
+        None,
+        false,
+        None,
+        None,
+        false,
+        false,
+        AsProxyGatewayAuth::Custom,
+        false,
+        None,
+    );
+    let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": prefixed,
+            "arguments": {"value": "alpha"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/tasks": {}
+                    }
+                },
+            },
+        })),
+        2_i64,
+    );
+    let tool_body =
+        serde_json::to_vec(&tool).expect("as_proxy custom-auth tool request serializes");
+
+    let missing = as_proxy_auth_native_post(gateway.address(), None, "tools/call", &prefixed, &tool_body);
+    assert!(
+        missing.starts_with(b"HTTP/1.1 401"),
+        "missing Authorization must be refused by the custom-verifier gateway: {}",
+        String::from_utf8_lossy(&missing)
+    );
+    assert!(
+        as_proxy_auth_response_headers(&missing).lines().any(|header| header
+            .to_ascii_lowercase()
+            .starts_with("www-authenticate:")
+            && header.to_ascii_lowercase().contains("bearer")),
+        "the missing-token custom-verifier challenge must advertise Bearer: {}",
+        String::from_utf8_lossy(&missing)
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "missing Authorization must not reach the custom-verifier as_proxy upstream"
+    );
+
+    // One variable vs the static-token sibling: the static verifier's
+    // matching value must now be refused by the custom verifier.
+    let static_refused =
+        as_proxy_auth_native_post(gateway.address(), Some("Bearer alpha"), "tools/call", &prefixed, &tool_body);
+    assert!(
+        static_refused.starts_with(b"HTTP/1.1 401"),
+        "the static-token bearer value must be refused by the custom verifier: {}",
+        String::from_utf8_lossy(&static_refused)
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "a static-token bearer value must not reach the custom-verifier as_proxy upstream"
+    );
+
+    let admitted = as_proxy_auth_native_post(
+        gateway.address(),
+        Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+        "tools/call",
+        &prefixed,
+        &tool_body,
+    );
+    assert!(
+        admitted.starts_with(b"HTTP/1.1 200"),
+        "the custom verifier token must admit prefixed tools/call: {}",
+        String::from_utf8_lossy(&admitted)
+    );
+    let admitted_json = as_proxy_auth_response_json_body(&admitted);
+    let text = admitted_json["result"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|block| block["text"].as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        text, "tool:alpha",
+        "the custom verifier token must reach the prefixed upstream: {admitted_json}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "only the custom verifier token may invoke the as_proxy upstream"
+    );
+
+    gateway.shutdown();
+    upstream.shutdown();
+}
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 #[test]
@@ -17312,6 +17628,116 @@ fn e2e_public_http_legacy_as_proxy_gateway_static_token_refuses_missing_and_wron
         upstream.handler_call_snapshot().tool,
         1,
         "only the matching bearer token may invoke the as_proxy upstream"
+    );
+
+    drop(sse);
+    gateway.shutdown();
+    upstream.shutdown();
+}
+#[cfg(feature = "proxy")]
+#[test]
+fn e2e_public_http_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+    let upstream = spawn_legacy_as_proxy_counting_upstream();
+    let gateway = spawn_legacy_as_proxy_http_gateway_configured_with_auth(
+        upstream.address(),
+        None,
+        false,
+        PUBLIC_HTTP_TOOL_NAME,
+        false,
+        AsProxyGatewayAuth::Custom,
+        false,
+        None,
+    );
+    let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+
+    let (_missing_stream, missing) =
+        write_legacy_native_http(gateway.address(), "GET", "/sse", None, &[], false);
+    assert_legacy_bearer_challenge(&missing, "missing Authorization on custom-verifier as_proxy GET /sse");
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "missing Authorization must not reach the custom-verifier as_proxy upstream"
+    );
+
+    // One variable vs the static-token sibling: the static verifier's
+    // matching value must now be refused by the custom verifier.
+    let (_static_stream, static_refused) = write_legacy_native_http(
+        gateway.address(),
+        "GET",
+        "/sse",
+        Some("Bearer alpha"),
+        &[],
+        false,
+    );
+    assert_legacy_bearer_challenge(
+        &static_refused,
+        "static token value on custom-verifier as_proxy GET /sse",
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "a static-token bearer value must not reach the custom-verifier as_proxy upstream"
+    );
+
+    let (mut sse, opened, messages) = initialize_legacy_native_session(
+        gateway.address(),
+        Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+        "e2e-public-http-legacy-as-proxy-custom-auth",
+    );
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": prefixed,
+            "arguments": {"value": "alpha"},
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool)
+        .expect("exact-2024 as_proxy custom-auth tools/call serializes");
+
+    let (_missing_post, missing_post) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        None,
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(
+        &missing_post,
+        "missing Authorization on custom-verifier as_proxy POST /messages",
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        0,
+        "missing Authorization on POST /messages must not reach the custom-verifier as_proxy upstream"
+    );
+
+    let (_tool_stream, tool_response) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+        &tool_body,
+        false,
+    );
+    assert!(
+        tool_response.starts_with(b"HTTP/1.1 202") || tool_response.starts_with(b"HTTP/1.1 200"),
+        "the custom verifier token must admit prefixed as_proxy tools/call: {}",
+        String::from_utf8_lossy(&tool_response)
+    );
+
+    let mut sse_body = opened;
+    let retained = read_legacy_sse_until(&mut sse, &mut sse_body, "tool:alpha");
+    assert!(
+        retained.contains("tool:alpha"),
+        "the exact-2024 custom-verifier bearer token must reach the prefixed upstream: {retained}"
+    );
+    assert_eq!(
+        upstream.handler_call_snapshot().tool,
+        1,
+        "only the custom verifier token may invoke the as_proxy upstream"
     );
 
     drop(sse);
@@ -19802,6 +20228,84 @@ fn e2e_public_http_as_proxy_stdio_gateway_static_token_refuses_missing_and_wrong
 
     gateway.shutdown();
 }
+#[cfg(all(unix, feature = "proxy", feature = "tasks"))]
+#[test]
+fn e2e_public_http_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+    let (gateway, _) = spawn_modern_http_stdio_as_proxy_gateway_with_auth(
+        false,
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        AsProxyGatewayAuth::Custom,
+        false,
+        None,
+        None,
+    );
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": "ext/echo",
+            "arguments": {"message": "alpha"},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/tasks": {}
+                    }
+                },
+            },
+        })),
+        2_i64,
+    );
+    let tool_body =
+        serde_json::to_vec(&tool).expect("stdio as_proxy custom-auth tool request serializes");
+
+    let missing =
+        as_proxy_auth_native_post(gateway.address(), None, "tools/call", "ext/echo", &tool_body);
+    assert!(
+        missing.starts_with(b"HTTP/1.1 401"),
+        "missing Authorization must be refused by the custom-verifier stdio gateway: {}",
+        String::from_utf8_lossy(&missing)
+    );
+
+    // One variable vs the static-token sibling: the static verifier's
+    // matching value must now be refused by the custom verifier.
+    let static_refused = as_proxy_auth_native_post(
+        gateway.address(),
+        Some("Bearer alpha"),
+        "tools/call",
+        "ext/echo",
+        &tool_body,
+    );
+    assert!(
+        static_refused.starts_with(b"HTTP/1.1 401"),
+        "the static-token bearer value must be refused by the custom verifier: {}",
+        String::from_utf8_lossy(&static_refused)
+    );
+
+    let admitted = as_proxy_auth_native_post(
+        gateway.address(),
+        Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+        "tools/call",
+        "ext/echo",
+        &tool_body,
+    );
+    assert!(
+        admitted.starts_with(b"HTTP/1.1 200"),
+        "the custom verifier token must admit prefixed stdio tools/call: {}",
+        String::from_utf8_lossy(&admitted)
+    );
+    let body = String::from_utf8_lossy(&admitted);
+    assert!(
+        body.contains("alpha"),
+        "the custom-verifier stdio as_proxy token must reach ext/echo: {body}"
+    );
+
+    gateway.shutdown();
+}
 
 #[cfg(all(unix, feature = "proxy"))]
 #[test]
@@ -19891,6 +20395,98 @@ fn e2e_public_http_legacy_as_proxy_stdio_gateway_static_token_refuses_missing_an
     assert!(
         retained.contains("alpha"),
         "the matching exact-2024 stdio as_proxy bearer token must reach ext/echo: {retained}"
+    );
+
+    drop(sse);
+    gateway.shutdown();
+}
+#[cfg(all(unix, feature = "proxy"))]
+#[test]
+fn e2e_public_http_legacy_as_proxy_stdio_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+    let gateway = spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
+        Vec::new(),
+        false,
+        None,
+        None,
+        false,
+        false,
+        AsProxyGatewayAuth::Custom,
+        false,
+        None,
+        None,
+    );
+
+    let (_missing_stream, missing) =
+        write_legacy_native_http(gateway.address(), "GET", "/sse", None, &[], false);
+    assert_legacy_bearer_challenge(
+        &missing,
+        "missing Authorization on custom-verifier stdio as_proxy GET /sse",
+    );
+
+    // One variable vs the static-token sibling: the static verifier's
+    // matching value must now be refused by the custom verifier.
+    let (_static_stream, static_refused) = write_legacy_native_http(
+        gateway.address(),
+        "GET",
+        "/sse",
+        Some("Bearer alpha"),
+        &[],
+        false,
+    );
+    assert_legacy_bearer_challenge(
+        &static_refused,
+        "static token value on custom-verifier stdio as_proxy GET /sse",
+    );
+
+    let (mut sse, opened, messages) = initialize_legacy_native_session(
+        gateway.address(),
+        Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+        "e2e-public-http-legacy-stdio-as-proxy-custom-auth",
+    );
+
+    let tool = JsonRpcRequest::new(
+        "tools/call",
+        Some(json!({
+            "name": "ext/echo",
+            "arguments": {"message": "alpha"},
+        })),
+        2_i64,
+    );
+    let tool_body = serde_json::to_vec(&tool)
+        .expect("exact-2024 stdio as_proxy custom-auth tools/call serializes");
+
+    let (_missing_post, missing_post) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        None,
+        &tool_body,
+        false,
+    );
+    assert_legacy_bearer_challenge(
+        &missing_post,
+        "missing Authorization on custom-verifier stdio as_proxy POST /messages",
+    );
+
+    let (_tool_stream, tool_response) = write_legacy_native_http(
+        gateway.address(),
+        "POST",
+        &messages,
+        Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+        &tool_body,
+        false,
+    );
+    assert!(
+        tool_response.starts_with(b"HTTP/1.1 202") || tool_response.starts_with(b"HTTP/1.1 200"),
+        "the custom verifier token must admit prefixed stdio as_proxy tools/call: {}",
+        String::from_utf8_lossy(&tool_response)
+    );
+
+    let mut sse_body = opened;
+    let retained = read_legacy_sse_until(&mut sse, &mut sse_body, "alpha");
+    assert!(
+        retained.contains("alpha"),
+        "the exact-2024 stdio as_proxy custom-verifier token must reach ext/echo: {retained}"
     );
 
     drop(sse);
@@ -31946,14 +32542,14 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_options(
 }
 
 #[cfg(all(unix, feature = "proxy"))]
-fn spawn_legacy_http_stdio_as_proxy_gateway_with_duplicate(
+fn spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
     extra_env: Vec<(String, String)>,
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
     cache_tools: Option<Vec<String>>,
     rate_limit: bool,
     sliding_window: bool,
-    static_token: bool,
+    gateway_auth: AsProxyGatewayAuth,
     strict_input: bool,
     list_page_size: Option<usize>,
     on_duplicate: Option<DuplicateBehavior>,
@@ -32045,15 +32641,22 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_duplicate(
                     rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
                 );
             }
-            if static_token {
-                let verifier = StaticTokenVerifier::new([(
-                    "alpha",
-                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
-                )])
-                .expect("the deterministic exact-2024 stdio as_proxy gateway bearer verifier is valid")
-                .with_allowed_schemes(["Bearer"])
-                .expect("the exact-2024 stdio as_proxy gateway bearer scheme allowlist is valid");
-                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            match gateway_auth {
+                AsProxyGatewayAuth::None => {}
+                AsProxyGatewayAuth::Static => {
+                    let verifier = StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the deterministic exact-2024 stdio as_proxy gateway bearer verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the exact-2024 stdio as_proxy gateway bearer scheme allowlist is valid");
+                    builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+                }
+                AsProxyGatewayAuth::Custom => {
+                    builder =
+                        builder.auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier));
+                }
             }
             if strict_input {
                 builder = builder.strict_input_validation(true);
@@ -32141,6 +32744,36 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_duplicate(
         handler_calls,
     }
 }
+#[cfg(all(unix, feature = "proxy"))]
+fn spawn_legacy_http_stdio_as_proxy_gateway_with_duplicate(
+    extra_env: Vec<(String, String)>,
+    mask_error_details: bool,
+    request_timeout_secs: Option<u64>,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+    on_duplicate: Option<DuplicateBehavior>,
+) -> HttpServerFixture {
+    spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
+        extra_env,
+        mask_error_details,
+        request_timeout_secs,
+        cache_tools,
+        rate_limit,
+        sliding_window,
+        if static_token {
+            AsProxyGatewayAuth::Static
+        } else {
+            AsProxyGatewayAuth::None
+        },
+        strict_input,
+        list_page_size,
+        on_duplicate,
+    )
+}
 
 #[cfg(feature = "proxy")]
 fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture {
@@ -32157,13 +32790,13 @@ fn spawn_legacy_as_proxy_http_gateway(upstream: SocketAddr) -> HttpServerFixture
 }
 
 #[cfg(feature = "proxy")]
-fn spawn_legacy_as_proxy_http_gateway_configured(
+fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
     upstream: SocketAddr,
     cache_tools: Option<Vec<String>>,
     rate_limit: bool,
     required_tool_name: &'static str,
     sliding_window: bool,
-    static_token: bool,
+    gateway_auth: AsProxyGatewayAuth,
     strict_input: bool,
     list_page_size: Option<usize>,
 ) -> HttpServerFixture {
@@ -32280,15 +32913,22 @@ fn spawn_legacy_as_proxy_http_gateway_configured(
                     rate_limiting::SlidingWindowRateLimitingMiddleware::new(1, 60),
                 );
             }
-            if static_token {
-                let verifier = StaticTokenVerifier::new([(
-                    "alpha",
-                    AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
-                )])
-                .expect("the deterministic exact-2024 as_proxy gateway bearer verifier is valid")
-                .with_allowed_schemes(["Bearer"])
-                .expect("the exact-2024 as_proxy gateway bearer scheme allowlist is valid");
-                builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+            match gateway_auth {
+                AsProxyGatewayAuth::None => {}
+                AsProxyGatewayAuth::Static => {
+                    let verifier = StaticTokenVerifier::new([(
+                        "alpha",
+                        AuthContext::with_subject(PUBLIC_HTTP_AUTH_SUBJECT),
+                    )])
+                    .expect("the deterministic exact-2024 as_proxy gateway bearer verifier is valid")
+                    .with_allowed_schemes(["Bearer"])
+                    .expect("the exact-2024 as_proxy gateway bearer scheme allowlist is valid");
+                    builder = builder.auth_provider(TokenAuthProvider::new(verifier));
+                }
+                AsProxyGatewayAuth::Custom => {
+                    builder =
+                        builder.auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier));
+                }
             }
             if strict_input {
                 builder = builder.strict_input_validation(true);
@@ -32370,6 +33010,32 @@ fn spawn_legacy_as_proxy_http_gateway_configured(
         nonquiescent: None,
         handler_calls,
     }
+}
+#[cfg(feature = "proxy")]
+fn spawn_legacy_as_proxy_http_gateway_configured(
+    upstream: SocketAddr,
+    cache_tools: Option<Vec<String>>,
+    rate_limit: bool,
+    required_tool_name: &'static str,
+    sliding_window: bool,
+    static_token: bool,
+    strict_input: bool,
+    list_page_size: Option<usize>,
+) -> HttpServerFixture {
+    spawn_legacy_as_proxy_http_gateway_configured_with_auth(
+        upstream,
+        cache_tools,
+        rate_limit,
+        required_tool_name,
+        sliding_window,
+        if static_token {
+            AsProxyGatewayAuth::Static
+        } else {
+            AsProxyGatewayAuth::None
+        },
+        strict_input,
+        list_page_size,
+    )
 }
 
 #[cfg(feature = "proxy")]
@@ -41723,6 +42389,147 @@ mod live_websocket_bind {
                 upstream.handler_call_snapshot().tool,
                 1,
                 "only the matching bearer token may invoke the as_proxy upstream"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned modern WebSocket as_proxy custom-auth runtime installs an ambient context",
+            );
+            let upstream = spawn_modern_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(public_http_target(upstream.address(), "/mcp")),
+                None,
+                None,
+                "e2e-ws-as-proxy-custom-auth-gateway".to_owned(),
+                "e2e-ws-as-proxy-custom-auth-gateway".to_owned(),
+                "modern-http".to_owned(),
+                0,
+                0,
+                0,
+            )
+            .expect("modern as_proxy WebSocket custom-auth gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-ws-as-proxy-custom-auth-upstream",
+                    "native-h1:e2e-ws-as-proxy-custom-auth-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-ws-as-proxy-custom-auth".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live modern HTTP counting proxy upstream must connect for the custom verifier",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live modern HTTP counting proxy catalog is typed");
+            let server = modern::ServerBuilder::new("e2e-ws-as-proxy-custom-auth-gateway", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
+                .as_proxy_typed("ext", proxy, catalog)
+                .expect("modern as_proxy_typed custom-auth install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public ModernOnly bind_websocket as_proxy custom auth must bind");
+            let address = bound
+                .local_addr()
+                .expect("public ModernOnly bind_websocket as_proxy custom auth publishes its address");
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public ModernOnly bind_websocket as_proxy custom auth serve must be admitted");
+
+            let (missing, _missing_stream) = websocket_upgrade_status(&cx, address, None).await;
+            assert!(
+                missing.starts_with(b"HTTP/1.1 401"),
+                "omitting Authorization must refuse the custom-verifier as_proxy WebSocket upgrade: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert!(
+                String::from_utf8_lossy(&missing)
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate"),
+                "the missing-token custom-verifier WebSocket upgrade must challenge Bearer: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "missing Authorization must not reach the custom-verifier as_proxy upstream"
+            );
+
+            // One variable vs the static-token sibling: the static verifier's
+            // matching value must now be refused by the custom verifier.
+            let (static_refused, _static_stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                static_refused.starts_with(b"HTTP/1.1 401"),
+                "the static-token bearer value must be refused by the custom verifier: {}",
+                String::from_utf8_lossy(&static_refused)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "a static-token bearer value must not reach the custom-verifier as_proxy upstream"
+            );
+
+            let (accepted, stream) = websocket_upgrade_status(
+                &cx,
+                address,
+                Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+            )
+            .await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the custom verifier token must complete RFC 6455 upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live modern custom-auth as_proxy initialize",
+                modern::ClientBuilder::new()
+                    .client_info("e2e-as-proxy-ws-custom-auth", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("an admitted custom-verifier as_proxy WebSocket upgrade must negotiate ModernOnly");
+            let prefixed = format!("ext/{PUBLIC_HTTP_TOOL_NAME}");
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live modern custom-auth as_proxy tools/call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the custom verifier token must reach the prefixed as_proxy upstream");
+            assert!(
+                admitted.content.iter().any(|content| match content {
+                    ContentBlock::Text { text, .. } => text == "tool:alpha",
+                    _ => false,
+                }),
+                "the custom verifier token must reach the modern upstream: {admitted:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "only the custom verifier token may invoke the as_proxy upstream"
             );
 
             drop(client);
@@ -52277,6 +53084,145 @@ mod live_websocket_bind {
                 upstream.handler_call_snapshot().tool,
                 1,
                 "only the matching bearer token may invoke the as_proxy upstream"
+            );
+
+            drop(client);
+            cx.set_cancel_requested(true);
+            listener.abort();
+            upstream.shutdown();
+        });
+    }
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn e2e_public_websocket_legacy_as_proxy_gateway_custom_verifier_refuses_missing_and_static_admits_gamma() {
+        let runtime = websocket_test_runtime();
+        runtime.block_on(async {
+            let cx = Cx::current().expect(
+                "owned exact-2024 WebSocket as_proxy custom-auth runtime installs an ambient context",
+            );
+            let upstream = spawn_legacy_as_proxy_counting_upstream();
+            let plan = ClientProtocolPlan::http(
+                ProtocolPolicy::LegacyOnly,
+                None,
+                Some(public_http_target(upstream.address(), "/sse")),
+                Some(public_http_target(upstream.address(), "/messages")),
+                "e2e-legacy-ws-custom-proxy-auth-gateway".to_owned(),
+                "e2e-legacy-ws-custom-proxy-auth-gateway".to_owned(),
+                "legacy-http-sse".to_owned(),
+                1,
+                1,
+                1,
+            )
+            .expect("legacy as_proxy WebSocket custom-auth gateway HTTP plan is valid");
+            let mut registry = ProxyClient::upstream_binding_registry();
+            let proxy = registry
+                .connect_http_with_protocol_plan(
+                    "e2e-legacy-ws-custom-auth-upstream",
+                    "native-h1:e2e-legacy-ws-custom-auth-upstream",
+                    1,
+                    plan,
+                    ClientInfo {
+                        name: "e2e-legacy-ws-custom-proxy-auth".to_owned(),
+                        version: "1.0.0".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                    cx.clone(),
+                )
+                .expect(
+                    "live exact-2024 HTTP counting proxy upstream must connect for the custom verifier",
+                );
+            let catalog = proxy
+                .catalog_typed()
+                .expect("live exact-2024 HTTP counting proxy catalog is typed");
+            let server = legacy_2024::ServerBuilder::new("e2e-legacy-ws-custom-auth-gateway", "1.0.0")
+                .auth_provider(TokenAuthProvider::new(PublicHttpCustomVerifier))
+                .as_proxy_typed("child", proxy, catalog)
+                .expect("legacy as_proxy_typed custom-auth install must succeed")
+                .build();
+            let bound = server
+                .bind_websocket(&cx, "127.0.0.1:0")
+                .await
+                .expect("public LegacyOnly bind_websocket as_proxy custom auth must bind");
+            let address = bound.local_addr().expect(
+                "public LegacyOnly bind_websocket as_proxy custom auth publishes its address",
+            );
+            let scope = cx.scope();
+            let listener = cx
+                .spawn_in(&scope, move |serve_cx| async move { bound.serve(&serve_cx).await })
+                .expect("public LegacyOnly bind_websocket as_proxy custom auth serve must be admitted");
+
+            let (missing, _missing_stream) = websocket_upgrade_status(&cx, address, None).await;
+            assert!(
+                missing.starts_with(b"HTTP/1.1 401"),
+                "omitting Authorization must refuse the custom-verifier as_proxy WebSocket upgrade: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert!(
+                String::from_utf8_lossy(&missing)
+                    .to_ascii_lowercase()
+                    .contains("www-authenticate"),
+                "the missing-token custom-verifier WebSocket upgrade must challenge Bearer: {}",
+                String::from_utf8_lossy(&missing)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "missing Authorization must not reach the custom-verifier as_proxy upstream"
+            );
+
+            // One variable vs the static-token sibling: the static verifier's
+            // matching value must now be refused by the custom verifier.
+            let (static_refused, _static_stream) =
+                websocket_upgrade_status(&cx, address, Some("Bearer alpha")).await;
+            assert!(
+                static_refused.starts_with(b"HTTP/1.1 401"),
+                "the static-token bearer value must be refused by the custom verifier: {}",
+                String::from_utf8_lossy(&static_refused)
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                0,
+                "a static-token bearer value must not reach the custom-verifier as_proxy upstream"
+            );
+
+            let (accepted, stream) = websocket_upgrade_status(
+                &cx,
+                address,
+                Some(&format!("Bearer {PUBLIC_HTTP_CUSTOM_AUTH_TOKEN}")),
+            )
+            .await;
+            assert!(
+                accepted.starts_with(b"HTTP/1.1 101"),
+                "the custom verifier token must complete RFC 6455 upgrade: {}",
+                String::from_utf8_lossy(&accepted)
+            );
+            let transport = AsyncWsClientTransport::from_upgraded(stream);
+            let mut client = websocket_client_bounded(
+                &cx,
+                "live exact-2024 custom-auth as_proxy initialize",
+                legacy_2024::ClientBuilder::new()
+                    .client_info("e2e-public-ws-legacy-as-proxy-custom-auth", "1.0.0")
+                    .connect_websocket_with_cx(&cx, transport),
+            )
+            .await
+            .expect("an admitted custom-verifier as_proxy WebSocket upgrade must negotiate LegacyOnly");
+            let prefixed = format!("child/{PUBLIC_HTTP_TOOL_NAME}");
+            let admitted = websocket_client_bounded(
+                &cx,
+                "live exact-2024 custom-auth as_proxy tools/call",
+                client.call_tool(&cx, &prefixed, json!({"value": "alpha"})),
+            )
+            .await
+            .expect("the custom verifier token must reach the prefixed as_proxy upstream");
+            assert_eq!(
+                legacy_http_tool_text(&admitted).as_deref(),
+                Some("tool:alpha"),
+                "the custom verifier token must reach the exact-2024 upstream: {admitted:?}"
+            );
+            assert_eq!(
+                upstream.handler_call_snapshot().tool,
+                1,
+                "only the custom verifier token may invoke the as_proxy upstream"
             );
 
             drop(client);
