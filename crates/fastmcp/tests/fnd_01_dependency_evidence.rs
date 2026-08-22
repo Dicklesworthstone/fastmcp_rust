@@ -85645,6 +85645,8 @@ original = "value"
             | "crates/fastmcp/src/lib.rs" => STATE_PARTITION_RNG_SEALED_APIS.contains(&api),
             "crates/fastmcp-core/src/state.rs"
             | "crates/fastmcp-server/src/oauth.rs"
+            | "crates/fastmcp-server/src/bidirectional.rs"
+            | "crates/fastmcp-server/src/tasks.rs"
             | "crates/fastmcp-transport/src/http.rs"
             | "crates/fastmcp-cli/src/main.rs" => api == "draw_security_identifier",
             "crates/fastmcp-transport/src/websocket.rs" => api == "draw_websocket_mask",
@@ -86284,7 +86286,7 @@ original = "value"
         ),
         (
             "crate::sha256_bounded",
-            "pub fn sha256_bounded(input: &[u8], max_input_bytes: usize) -> Result<Sha256Digest, CryptoInputTooLongError>",
+            "pub fn sha256_bounded(input: &[u8], max_input_bytes: usize,) -> Result<Sha256Digest, CryptoInputTooLongError>",
         ),
         (
             "HmacSha256Key::from_bytes",
@@ -86292,11 +86294,11 @@ original = "value"
         ),
         (
             "HmacSha256Key::authenticate_bounded",
-            "pub fn authenticate_bounded(&self, input: &[u8], max_input_bytes: usize) -> Result<HmacSha256Tag, CryptoInputTooLongError>",
+            "pub fn authenticate_bounded(&self, input: &[u8], max_input_bytes: usize,) -> Result<HmacSha256Tag, CryptoInputTooLongError>",
         ),
         (
             "HmacSha256Key::verify_bounded",
-            "pub fn verify_bounded(&self, input: &[u8], max_input_bytes: usize, tag: &HmacSha256Tag) -> Result<(), HmacVerificationError>",
+            "pub fn verify_bounded(&self, input: &[u8], max_input_bytes: usize, tag: &HmacSha256Tag,) -> Result<(), HmacVerificationError>",
         ),
         (
             "HmacSha256Tag::from_bytes",
@@ -86880,11 +86882,11 @@ original = "value"
     )
     .expect("fixed state partition draw expression tokenizes");
         let expected_seam_signature = TokenStream::from_str(
-        "from_map_with_partition_draw<F, E>(values: HashMap<String, serde_json::Value>, draw: F) -> Self where F: FnOnce() -> Result<[u8; CACHE_PARTITION_BYTES], E>,",
+        "from_map_with_partition_draw<F, E>(values: HashMap<String, serde_json::Value>, draw: F,) -> Self where F: FnOnce() -> Result<[u8; CACHE_PARTITION_BYTES], E>,",
     )
     .expect("fixed state partition draw signature tokenizes");
         let expected_seam_body = TokenStream::from_str(
-        "let cache_partition = draw().ok(); Self { inner: Arc::new(Mutex::new(values)), local: None, cache_partition, revision: Arc::new(AtomicU64::new(0)), }",
+        "let cache_partition = draw().ok(); Self { inner: Arc::new(Mutex::new(values)), local: None, cache_partition, revision: Arc::new(AtomicU64::new(0)), ephemeral: false, }",
     )
     .expect("fixed state partition draw body tokenizes");
         let from_map_fingerprint =
@@ -87080,6 +87082,7 @@ original = "value"
         }
         None
     }
+
 
     #[test]
     fn fnd_01_state_partition_rng_uses_sealed_core_positive() {
