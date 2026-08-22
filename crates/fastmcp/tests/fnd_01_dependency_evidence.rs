@@ -35258,9 +35258,9 @@ activate = 1\n";
         (
             "toolchain",
             "bd-mcp-2026-07-28-support-ahet.1.6",
-            4,
-            59_668,
-            "f86c13205964776b456b26686f953eed0471b3437598fabf4023d1aa0e904839",
+            7,
+            61_304,
+            "063e363770a0732f20de01dfcb470e751bedcf46538c4b98a53fb8c7f61ee9de",
         ),
         (
             "serialization",
