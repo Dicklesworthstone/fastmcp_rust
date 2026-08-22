@@ -2485,7 +2485,7 @@ checked_in_archives_remain_local_exact_bytes = true
 
 [parse_inventory]
 toml = 22
-json = 15
+json = 18
 utf8_text = 24
 opaque_binary = 4
 gzip_tar = 3
