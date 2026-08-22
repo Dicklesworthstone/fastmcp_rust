@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 904795;
+const FROZEN_POLICY_BYTES: usize = 904796;
 const FROZEN_POLICY_SHA256: &str =
-    "dd136717c60e59dfff3ccd2cbe64ccd7f8771d673abc4b8efb6f0cd0e176f098";
+    "b526836d25ed7a082e32f8a5099680ef0a4a2ed2a8c3b15626d0ec2a38b54327";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34321,7 +34321,7 @@ mod ordinary {
     const BOOTSTRAP_MANIFEST_SHA256: &str =
         "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
     const SOURCE_TREE_SHA256: &str =
-        "d51cb449d115087920957c0e18423224e5bc1f3afdb1618deeabb82e910aac36";
+        "b79e1e235c329a99cb9785ab51515499968ddcba840629bfc04a0c6e5f8cf0b8";
     const NEGATIVE_INVENTORY_SHA256: &str =
         "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
@@ -35259,8 +35259,8 @@ activate = 1\n";
             "toolchain",
             "bd-mcp-2026-07-28-support-ahet.1.6",
             7,
-            61_392,
-            "bc000e28226329a1e7e4be53be0d5c1fed2d97132e9f0d199eef9c07c090debd",
+            61445,
+            "0a8e5976338ea2378e25727a0905001f29d4babd385c4eba842e199031d06941",
         ),
         (
             "serialization",
@@ -40829,7 +40829,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3_018_911
+            || policy.source_input_total_bytes != 3018964
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
@@ -77813,8 +77813,8 @@ activate = 1\n";
         ("s06", "evidence/fnd-01/probes/asupersync/features-0.3.10.json", FileFamily::Json, 5_062, "df71c73a9e6ef657e612465afbfe907567f94f75bf3687c95fc5a73316fc7943"),
         ("s07", "evidence/fnd-01/probes/asupersync/features-0.3.9.json", FileFamily::Json, 4_949, "c4479845b01d8ec9ec5a85dd5720e0d6d299971e88d43c509aa54562a4491d41"),
         ("s35", "evidence/fnd-01/toolchain-asupersync.toml", FileFamily::Toml, 20_933, "cb11f94e34be61dfad47f1635047d7f84dd3e2e5633fe44b41c785a84acdc1b0"),
-        ("s69", "evidence/fnd-01/probes/asupersync/features-0.4.9.json", FileFamily::Json, 12_900, "cedf06ec55c05ec9db8f5282f493d8bc239998ad62f9e5f46ed4eac67c3ecd79"),
-        ("s70", "evidence/fnd-01/probes/asupersync/registry-0.4.9.json", FileFamily::Json, 974, "d883dc67d9d99fb123ef4357e890878ac78aa0997d74eb4dada06b3aae552371"),
+        ("s69", "evidence/fnd-01/probes/asupersync/features-0.4.9.json", FileFamily::Json, 12_973, "c3eef99f055aea7f66c2faa0aba61c7c2c40667ba5575cb7e43520691b8a0c54"),
+        ("s70", "evidence/fnd-01/probes/asupersync/registry-0.4.9.json", FileFamily::Json, 1027, "792e81ff636190300e372006012f324e8235fb9fc43e819a7eda6e8ca32d8056"),
         ("s71", "evidence/fnd-01/probes/toolchain-2026-08-20.json", FileFamily::Json, 6_055, "367d90decbb580ad76eea36f4d4d931ee2c2d90dcf0e6c01162772be1ceed066"),
     ];
 
@@ -77847,7 +77847,7 @@ activate = 1\n";
 
     fn validate_toolchain_source_family(files: &[LoadedFile], policy: &Policy) -> VResult<()> {
         const OWNER: &str = "bd-mcp-2026-07-28-support-ahet.1.6";
-        const TREE: &str = "bc000e28226329a1e7e4be53be0d5c1fed2d97132e9f0d199eef9c07c090debd";
+        const TREE: &str = "0a8e5976338ea2378e25727a0905001f29d4babd385c4eba842e199031d06941";
         let actual = files.iter().filter(|file| file.contract.family == "toolchain").collect::<Vec<_>>();
         if actual.len() != TOOLCHAIN_SOURCE_INPUTS.len() {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at("file count"));
@@ -77869,8 +77869,8 @@ activate = 1\n";
         let (tree, bytes) = source_tree_digest_refs(&actual)?;
         let families = policy.source_family.iter().filter(|family| family.id == "toolchain").collect::<Vec<_>>();
         if families.len() != 1 || families[0].owner_bead != OWNER
-            || families[0].file_count != 7 || families[0].total_bytes != 61_392
-            || families[0].tree_sha256 != TREE || bytes != 61_392 || lower_hex(&tree) != TREE
+            || families[0].file_count != 7 || families[0].total_bytes != 61445
+            || families[0].tree_sha256 != TREE || bytes != 61445 || lower_hex(&tree) != TREE
         {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at("family tree"));
         }
@@ -77886,8 +77886,7 @@ activate = 1\n";
         observation.extend(b"FASTMCP-FND01-TOOLCHAIN-DOCUMENT-V1\0")?;
         encode_toml_observation(Some(document), &mut observation)?;
         if lower_hex(&sha256(&observation.bytes)) != expected_sha256 {
-            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject)
-                .at(format!("typed document actual={}", lower_hex(&sha256(&observation.bytes)))));
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", subject).at("typed document"));
         }
         Ok(())
     }
@@ -78029,7 +78028,7 @@ activate = 1\n";
         validate_toolchain_source_family(files, policy)?;
         exact_toolchain_document(
             document,
-            "0000000000000000000000000000000000000000000000000000000000000000",
+            "4fe9dde2db55e8f981dd12acc4cee673493abdb054dce131a2b7a2c8346a8fb0",
             SUBJECT,
         )?;
 
@@ -88000,7 +87999,7 @@ original = "value"
             "verifier_source_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
             "runner_source_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
             "executable_byte_length": 7,
-            "executable_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+            "executable_sha256": "4fe9dde2db55e8f981dd12acc4cee673493abdb054dce131a2b7a2c8346a8fb0",
             "success": true,
         })).expect("test RCH JSON")
     }
@@ -88219,7 +88218,7 @@ original = "value"
                 diagnostic: "fnd01.sdk_matrix.registry_artifact_digest_mismatch",
                 target: "evidence/fnd-01/sdk-matrix.toml",
                 needle: b"e9433b8d271acad34381bebb50fa68f464edfdef2ee26a35dfd564b5c9ac05e6",
-                replacement: b"0000000000000000000000000000000000000000000000000000000000000000",
+                replacement: b"4fe9dde2db55e8f981dd12acc4cee673493abdb054dce131a2b7a2c8346a8fb0",
             },
             SdkMatrixPlant {
                 id: "lock-byte-digest",
@@ -89094,7 +89093,7 @@ fn fallible(value: Option<u8>) {
                 ..RECEIPT_CONTRACT_MIRROR_PIN
             },
             ReceiptContractMirrorPin {
-                sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                sha256: "4fe9dde2db55e8f981dd12acc4cee673493abdb054dce131a2b7a2c8346a8fb0",
                 ..RECEIPT_CONTRACT_MIRROR_PIN
             },
         ];

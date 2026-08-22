@@ -15,7 +15,7 @@ authoring_bead = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 final_attester_bead = "bd-mcp-2026-07-28-support-ahet.1.15"
 source_input_count = 71
-source_input_total_bytes = 3018911
+source_input_total_bytes = 3018964
 negative_case_count = 188
 derived_output_count = 14
 derived_toml_count = 10
@@ -152,8 +152,8 @@ ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
 file_count = 71
-total_bytes = 3018911
-sha256 = "d51cb449d115087920957c0e18423224e5bc1f3afdb1618deeabb82e910aac36"
+total_bytes = 3018964
+sha256 = "b79e1e235c329a99cb9785ab51515499968ddcba840629bfc04a0c6e5f8cf0b8"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
@@ -5656,8 +5656,8 @@ tree_sha256 = "d7294a8444f0892df030fdb94ea68437c18eed317354717bffc8b7e62c441816"
 id = "toolchain"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
 file_count = 7
-total_bytes = 61392
-tree_sha256 = "bc000e28226329a1e7e4be53be0d5c1fed2d97132e9f0d199eef9c07c090debd"
+total_bytes = 61445
+tree_sha256 = "0a8e5976338ea2378e25727a0905001f29d4babd385c4eba842e199031d06941"
 
 [[source_family]]
 id = "serialization"
