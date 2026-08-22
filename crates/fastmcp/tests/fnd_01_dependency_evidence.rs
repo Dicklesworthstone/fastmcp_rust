@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 904795;
 const FROZEN_POLICY_SHA256: &str =
-    "eeb86652fbfa4b717f4179a22881bfc3259e7567a769b1ed8ca465bba7b18322";
+    "3a07a22247bfa9806d1034968320674c1f89e1742f51af8204e14b9d2ec61700";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34321,7 +34321,7 @@ mod ordinary {
     const BOOTSTRAP_MANIFEST_SHA256: &str =
         "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
     const SOURCE_TREE_SHA256: &str =
-        "c2c5f6fe282ce2ed9888a981050ed57982d7a6059739e2d8276faf9c8dec1147";
+        "d51cb449d115087920957c0e18423224e5bc1f3afdb1618deeabb82e910aac36";
     const NEGATIVE_INVENTORY_SHA256: &str =
         "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
@@ -77814,7 +77814,7 @@ activate = 1\n";
         ("s07", "evidence/fnd-01/probes/asupersync/features-0.3.9.json", FileFamily::Json, 4_949, "c4479845b01d8ec9ec5a85dd5720e0d6d299971e88d43c509aa54562a4491d41"),
         ("s35", "evidence/fnd-01/toolchain-asupersync.toml", FileFamily::Toml, 20_933, "cb11f94e34be61dfad47f1635047d7f84dd3e2e5633fe44b41c785a84acdc1b0"),
         ("s69", "evidence/fnd-01/probes/asupersync/features-0.4.9.json", FileFamily::Json, 12_900, "cedf06ec55c05ec9db8f5282f493d8bc239998ad62f9e5f46ed4eac67c3ecd79"),
-        ("s70", "evidence/fnd-01/probes/asupersync/registry-0.4.9.json", FileFamily::Json, 886, "9844ba8be0dea5d265981015bae9ec7b86e4595c659de78b797783c8cc4c38f2"),
+        ("s70", "evidence/fnd-01/probes/asupersync/registry-0.4.9.json", FileFamily::Json, 974, "d883dc67d9d99fb123ef4357e890878ac78aa0997d74eb4dada06b3aae552371"),
         ("s71", "evidence/fnd-01/probes/toolchain-2026-08-20.json", FileFamily::Json, 6_055, "367d90decbb580ad76eea36f4d4d931ee2c2d90dcf0e6c01162772be1ceed066"),
     ];
 
