@@ -50966,7 +50966,7 @@ activate = 1\n";
             ACTION_RUST_CACHE => &["key"],
             ACTION_UPLOAD_ARTIFACT => &["name", "path", "if-no-files-found", "retention-days"],
             ACTION_DOWNLOAD_ARTIFACT => &["path", "merge-multiple"],
-            ACTION_INSTALL => &["tool"],
+            ACTION_INSTALL => &["tool", "checksum", "fallback"],
             ACTION_GITHUB_RELEASE => &[
                 "tag_name",
                 "name",
