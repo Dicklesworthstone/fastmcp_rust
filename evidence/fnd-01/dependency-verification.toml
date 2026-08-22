@@ -152,7 +152,7 @@ ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
 file_count = 71
-total_bytes = 3018823
+total_bytes = 3018911
 sha256 = "d51cb449d115087920957c0e18423224e5bc1f3afdb1618deeabb82e910aac36"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
@@ -5656,8 +5656,8 @@ tree_sha256 = "d7294a8444f0892df030fdb94ea68437c18eed317354717bffc8b7e62c441816"
 id = "toolchain"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.6"
 file_count = 7
-total_bytes = 61304
-tree_sha256 = "063e363770a0732f20de01dfcb470e751bedcf46538c4b98a53fb8c7f61ee9de"
+total_bytes = 61392
+tree_sha256 = "bc000e28226329a1e7e4be53be0d5c1fed2d97132e9f0d199eef9c07c090debd"
 
 [[source_family]]
 id = "serialization"

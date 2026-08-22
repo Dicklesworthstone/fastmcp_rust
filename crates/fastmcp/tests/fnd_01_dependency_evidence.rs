@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 904795;
 const FROZEN_POLICY_SHA256: &str =
-    "3a07a22247bfa9806d1034968320674c1f89e1742f51af8204e14b9d2ec61700";
+    "f6f9f5685fa13a374254bbb722c1396df261fc1199450b478aec2a19ac9cfcfb";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -35259,8 +35259,8 @@ activate = 1\n";
             "toolchain",
             "bd-mcp-2026-07-28-support-ahet.1.6",
             7,
-            61_304,
-            "063e363770a0732f20de01dfcb470e751bedcf46538c4b98a53fb8c7f61ee9de",
+            61_392,
+            "bc000e28226329a1e7e4be53be0d5c1fed2d97132e9f0d199eef9c07c090debd",
         ),
         (
             "serialization",
@@ -77847,7 +77847,7 @@ activate = 1\n";
 
     fn validate_toolchain_source_family(files: &[LoadedFile], policy: &Policy) -> VResult<()> {
         const OWNER: &str = "bd-mcp-2026-07-28-support-ahet.1.6";
-        const TREE: &str = "f86c13205964776b456b26686f953eed0471b3437598fabf4023d1aa0e904839";
+        const TREE: &str = "bc000e28226329a1e7e4be53be0d5c1fed2d97132e9f0d199eef9c07c090debd";
         let actual = files.iter().filter(|file| file.contract.family == "toolchain").collect::<Vec<_>>();
         if actual.len() != TOOLCHAIN_SOURCE_INPUTS.len() {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at("file count"));
@@ -77869,8 +77869,8 @@ activate = 1\n";
         let (tree, bytes) = source_tree_digest_refs(&actual)?;
         let families = policy.source_family.iter().filter(|family| family.id == "toolchain").collect::<Vec<_>>();
         if families.len() != 1 || families[0].owner_bead != OWNER
-            || families[0].file_count != 4 || families[0].total_bytes != 59_668
-            || families[0].tree_sha256 != TREE || bytes != 59_668 || lower_hex(&tree) != TREE
+            || families[0].file_count != 7 || families[0].total_bytes != 61_392
+            || families[0].tree_sha256 != TREE || bytes != 61_392 || lower_hex(&tree) != TREE
         {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", "toolchain source family").at("family tree"));
         }
