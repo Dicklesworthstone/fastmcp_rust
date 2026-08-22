@@ -31933,7 +31933,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
 ("generated-path",b"acquisition_spool_path_formula = \".fnd01-run/integration-producer/<run-id>/acquisition-spool.bin\"",11),
 ("native-tool",b"native_tool_candidate_count = 20",12),
         ];
-
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         #[test]
         fn phase_b_authority_fails_before_side_effects() {
             let SyntheticPhaseBInputs {
