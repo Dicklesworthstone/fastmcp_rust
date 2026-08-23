@@ -8,9 +8,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(unexpected_cfgs)]
 
-const FROZEN_POLICY_BYTES: usize = 904796;
+const FROZEN_POLICY_BYTES: usize = 904756;
 const FROZEN_POLICY_SHA256: &str =
-    "1dbe60378c7d4bd97a9bf5bc8fc9e694b899dc2b33005ee81de791f26f144b14";
+    "5cdde2fcb5a5431cce548ac7ed945f6c51a592f923e49abd87c4ac849a6009e5";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -18071,14 +18071,14 @@ mod phase_b_std {
     const CARGO_CONFIG_POLICY_SHA256: &str =
         "3c456f7e7b2b13528eacf9bf3928d601268f8e36049b9fcaf852974ed10c2080";
     const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
-    const DIRECT_BYTES: usize = 4429;
-    const DIRECT_SHA256: &str = "20b4cd01a9edacab78e1bab2ff508fc753ba03aca8673e0ecee5fed481eb02dd";
-    const UNION_BYTES: usize = 3779;
-    const UNION_SHA256: &str = "41014b8356e3cecc3a79b392107e7790a9e440a01ad3f586d21914fd07946957";
+    const DIRECT_BYTES: usize = 4378;
+    const DIRECT_SHA256: &str = "d9035150bacd9de8b80dadc65c496e30dc92fde09ddb0b7e0e9cc6374001da3a";
+    const UNION_BYTES: usize = 3728;
+    const UNION_SHA256: &str = "eb13a7ec45d615b38371e374a2df94f418f6474063470686b015c69a8f5a5377";
     const NATIVE_TOOL_BYTES: usize = 3911;
     const NATIVE_TOOL_SHA256: &str = "f699966ccfc01221f2dd81d6e801825c0f9fc56583ce6d474cdb03baaa47dc9b";
-    const MANIFEST_BYTES: usize = 7379;
-    const MANIFEST_SHA256: &str = "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
+    const MANIFEST_BYTES: usize = 7329;
+    const MANIFEST_SHA256: &str = "ba29adcd18fc714a5d257bb9f991a2d3bf8c98d6f25491fcf699ecea180f368f";
     const ACQUISITION_ENVIRONMENT_POLICY: &[u8] = br#"[[environment_profile]]
 id = "acquisition"
 required = [["AR", "{tool.host-ar.path}"], ["CARGO_HOME", "{producer-cargo-home}"], ["CARGO_REGISTRIES_CRATES_IO_PROTOCOL", "sparse"], ["CARGO_TARGET_DIR", "{producer-custom-target}"], ["CC", "{tool.host-cc.path}"], ["CLIPPY_DRIVER", "{tool.clippy-driver.path}"], ["LANG", "C"], ["LC_ALL", "C"], ["PATH", "{closed-execution-bin}"], ["RANLIB", "{tool.host-ranlib.path}"], ["RUSTC", "{tool.rustc.path}"], ["RUSTDOC", "{tool.rustdoc.path}"], ["RUSTFMT", "{tool.rustfmt.path}"], ["RUSTUP_TOOLCHAIN", "nightly-2026-07-11"], ["SOURCE_DATE_EPOCH", "0"], ["TZ", "UTC"]]
@@ -18218,11 +18218,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     const PRODUCE_POLICY_JOIN_PREFIX: &[u8] =
         b"FND01PHASEBPOLICYJOINv1\0";
     const JOIN_DRIFT: &str = "compiled acquisition join drifted before effects";
-    const PRODUCE_POLICY_JOIN_BYTES: usize = 21999;
+    const PRODUCE_POLICY_JOIN_BYTES: usize = 21897;
     const PRODUCE_POLICY_JOIN_SHA256: [u8; 32] = [
-        0x4d, 0x92, 0xa9, 0x9b, 0x07, 0x06, 0xee, 0xe8, 0x62, 0xbe, 0x58, 0x7f, 0x21, 0x6c,
-        0xcd, 0x28, 0x02, 0xed, 0xfe, 0x3a, 0x3f, 0x89, 0xd1, 0x9a, 0x85, 0xda, 0xe9, 0xb1,
-        0x72, 0x5c, 0x8a, 0xf7,
+        0xa3, 0xff, 0xc3, 0x06, 0xbe, 0xc7, 0xe3, 0x06,
+        0xaa, 0xa0, 0x1c, 0x61, 0x27, 0x1f, 0xba, 0x6d,
+        0x5d, 0xc9, 0x46, 0x1d, 0xb7, 0xdc, 0x7d, 0x3c,
+        0xa9, 0x26, 0xe6, 0xee, 0xe5, 0x2f, 0xec, 0xb8,
     ];
 
     #[derive(Clone, Copy)]
@@ -18240,9 +18241,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     } }
     const DIRECT: &[Direct] = &[
         d!("argon2","0.5.3",false,&["alloc","password-hash","zeroize"],false,"fnd01_union_8d6d3e60e1b38873acd93acb"),
-        d!("asupersync","0.3.10",false,&["nightly-outcome-try","tls","tls-native-roots"],false,"fnd01_union_744e5e837aaf669dfed6a2a2"),
         d!("asupersync","0.3.9",false,&["nightly-outcome-try","tls","tls-native-roots"],false,"fnd01_union_e0a4c1206760e2342c1f0b16"),
         d!("asupersync","0.3.9",true,&["test-internals"],false,"fnd01_union_c0aaef5d1949346f6b94fc83"),
+        d!("asupersync","0.4.9",true,&[],false,"fnd01_union_7392005b1f987e55776a9313"),
         d!("base64","0.22.1",true,&[],false,"fnd01_union_ae4c5062e9f1289b6a7a6a61"),
         d!("cap-fs-ext","4.0.2",false,&["std"],false,"fnd01_union_196e86ae173e5402ae44e5ab"),
         d!("cap-std","4.0.2",false,&[],false,"fnd01_union_4b32e5461b81bfd7949e4fcb"),
@@ -34317,9 +34318,9 @@ mod ordinary {
         "registry/index/index.crates.io-1949cf8c6b5b557f/.cache/";
     const ACQUISITION_SPARSE_CONFIG_PATH: &str =
         "registry/index/index.crates.io-1949cf8c6b5b557f/config.json";
-    const BOOTSTRAP_MANIFEST_BYTES: u64 = 7_379;
+    const BOOTSTRAP_MANIFEST_BYTES: u64 = 7_329;
     const BOOTSTRAP_MANIFEST_SHA256: &str =
-        "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
+        "ba29adcd18fc714a5d257bb9f991a2d3bf8c98d6f25491fcf699ecea180f368f";
     const SOURCE_TREE_SHA256: &str =
         "10cafa60d8c12320720a0f4561ff64cce16a81f182fa0a28f409ce302e6c9e41";
     const NEGATIVE_INVENTORY_SHA256: &str =
