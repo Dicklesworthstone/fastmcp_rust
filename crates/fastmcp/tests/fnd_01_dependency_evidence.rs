@@ -88444,6 +88444,62 @@ original = "value"
             assert_eq!(reaccepted, accepted, "{}: pristine typed validation", plant.id);
         }
 
+        // comment-492 negative strengthening: one-byte drift in a frozen
+        // input OUTSIDE the SDK binding set must fail the production SDK
+        // validator at the typed source-tree boundary instead of bypassing
+        // it, followed by unchanged-state pristine reacceptance.
+        const TREE_PLANT_TARGET: &str = "evidence/fnd-01/probes/toolchain-2026-08-20.json";
+        const TREE_PLANT_NEEDLE: &[u8] = b"\"channel\": \"nightly-2026-08-20\",";
+        const TREE_PLANT_REPLACEMENT: &[u8] = b"\"channel\":  \"nightly-2026-08-20\",";
+        let drifted = sdk_matrix_raw_candidate(
+            &files,
+            TREE_PLANT_TARGET,
+            TREE_PLANT_NEEDLE,
+            TREE_PLANT_REPLACEMENT,
+        )
+        .expect("foreign-source candidate");
+        assert_sdk_matrix_single_delta(
+            &files,
+            &drifted,
+            TREE_PLANT_TARGET,
+            TREE_PLANT_NEEDLE,
+            TREE_PLANT_REPLACEMENT,
+        )
+        .unwrap_or_else(|diagnostic| panic!("foreign-source: {}", diagnostic.stable()));
+        assert_eq!(
+            fnd_01_sdk_matrix_validate_complete_input_binding(&document, &drifted)
+                .expect("drifted preimage recompute"),
+            baseline_preimage,
+            "tree plant is orthogonal to the complete-input binding",
+        );
+        let tree_error = fnd_01_sdk_matrix_validate(
+            &drifted,
+            &policy,
+            ExternalSdkExecutionFacts::Absent,
+        )
+        .expect_err("non-SDK frozen-input drift must not bypass the SDK validator");
+        assert_eq!(
+            tree_error.code, "E_TREE_DIGEST_MISMATCH",
+            "tree drift fails at the typed source-tree boundary"
+        );
+        assert!(
+            tree_error
+                .stable()
+                .starts_with("FND01|Error|E_TREE_DIGEST_MISMATCH|FND-01 source tree|"),
+            "{}",
+            tree_error.stable()
+        );
+        let reaccepted_after_tree = fnd_01_sdk_matrix_validate(
+            &files,
+            &policy,
+            ExternalSdkExecutionFacts::Absent,
+        )
+        .expect("pristine reacceptance after tree-boundary rejection");
+        assert_eq!(
+            reaccepted_after_tree, accepted,
+            "unchanged-state typed validation after tree plant"
+        );
+
         for (spec, (sdk_id, expected_ids)) in SDK_RUNTIME_SPECS.iter()
             .zip(SDK_TEST_EXPECTED_ADDITIONAL_TOOL_IDS.iter())
         {
