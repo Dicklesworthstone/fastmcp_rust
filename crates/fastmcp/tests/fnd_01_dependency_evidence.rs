@@ -29218,7 +29218,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "libgit2: 1.9.4 (sys:0.21.0 vendored)",
                     "libcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)",
                     "ssl: OpenSSL 3.6.3 9 Jun 2026",
-                    "os: Ubuntu 26.4.0 (resolute) [unknown bitness]",
+                    "os: Ubuntu 25.10.0 (questing) [64-bit]",
                 ],
                 tool_id,
             ),
