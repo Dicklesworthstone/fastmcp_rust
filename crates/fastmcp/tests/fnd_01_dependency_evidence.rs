@@ -88140,7 +88140,13 @@ original = "value"
                 sdk_id,
             ).expect("independent exact peer environment");
         }
-        let executable = sdk_test_binding("fnd01-sdk-runner", "/private/tmp/sdk-runner");
+        // aa97c9e canonized the 7-byte runner digest in the receipt fixture;
++        // the paired executable binding must carry the same identity or the
++        // receipt-vs-binding comparison fails on executable_sha256.
++        let executable = SdkExecutableBinding {
++            sha256: "4fe9dde2db55e8f981dd12acc4cee673493abdb054dce131a2b7a2c8346a8fb0".to_owned(),
++            ..sdk_test_binding("fnd01-sdk-runner", "/private/tmp/sdk-runner")
++        };
         let local = sdk_test_rch_local(&executable);
         let rch_bytes = sdk_test_rch_bytes("run-1");
         sdk_validate_rch_receipt(&rch_bytes, &local).expect("exact strict RCH receipt");
@@ -88535,7 +88541,13 @@ original = "value"
         sdk_validate_verifier_source_bound(8_388_608)
             .expect("exact verifier source cap pristine reacceptance");
 
-        let executable = sdk_test_binding("fnd01-sdk-runner", "/private/tmp/sdk-runner");
+        // aa97c9e canonized the 7-byte runner digest in the receipt fixture;
++        // the paired executable binding must carry the same identity or the
++        // receipt-vs-binding comparison fails on executable_sha256.
++        let executable = SdkExecutableBinding {
++            sha256: "4fe9dde2db55e8f981dd12acc4cee673493abdb054dce131a2b7a2c8346a8fb0".to_owned(),
++            ..sdk_test_binding("fnd01-sdk-runner", "/private/tmp/sdk-runner")
++        };
         let local = sdk_test_rch_local(&executable);
         let pristine_rch_bytes = sdk_test_rch_bytes("run-1");
         let pristine_rch_json = serde_json::from_slice::<serde_json::Value>(&pristine_rch_bytes)
