@@ -88459,7 +88459,7 @@ original = "value"
         // it, followed by unchanged-state pristine reacceptance.
         const TREE_PLANT_TARGET: &str = "evidence/fnd-01/probes/toolchain-2026-08-20.json";
         const TREE_PLANT_NEEDLE: &[u8] = b"\"channel\": \"nightly-2026-08-20\",";
-        const TREE_PLANT_REPLACEMENT: &[u8] = b"\"channel\":  \"nightly-2026-08-20\",";
+        const TREE_PLANT_REPLACEMENT: &[u8] = b"\"channel\": \"nightly-2026-08-21\",";
         let drifted = sdk_matrix_raw_candidate(
             &files,
             TREE_PLANT_TARGET,
