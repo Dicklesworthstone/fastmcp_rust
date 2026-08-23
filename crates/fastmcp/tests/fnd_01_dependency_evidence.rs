@@ -29221,7 +29221,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     "libgit2: 1.9.4 (sys:0.21.0 vendored)",
                     "libcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)",
                     "ssl: OpenSSL 3.6.3 9 Jun 2026",
-                    "os: Ubuntu 25.10.0 (questing) [64-bit]",
+                    "os: Ubuntu 25.10.0 (questing) [unknown bitness]",
                 ],
                 tool_id,
             ),
@@ -91877,7 +91877,7 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_RUSTC_B64: &str = "cnVzdGMgMS45OS4wLW5pZ2h0bHkgKDM3NWIxNDMxYiAyMDI2LTA3LTEwKQpiaW5hcnk6IHJ1c3RjCmNvbW1pdC1oYXNoOiAzNzViMTQzMWI3ZDg5ZDFjMmUyYmMxNjhjMDExODQ4YWUxMmI3ZDE0CmNvbW1pdC1kYXRlOiAyMDI2LTA3LTEwCmhvc3Q6IHg4Nl82NC11bmtub3duLWxpbnV4LWdudQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpMTFZNIHZlcnNpb246IDIyLjEuOAo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_CARGO_B64: &str = "Y2FyZ28gMS45OS4wLW5pZ2h0bHkgKDU5ODAwNDY2YyAyMDI2LTA3LTA3KQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpjb21taXQtaGFzaDogNTk4MDA0NjZjNWM0MWM0NDRkMjY0YjEwMTBiNGQ1N2U4NWE3MTE3Zgpjb21taXQtZGF0ZTogMjAyNi0wNy0wNwpob3N0OiB4ODZfNjQtdW5rbm93bi1saW51eC1nbnUKbGliZ2l0MjogMS45LjQgKHN5czowLjIxLjAgdmVuZG9yZWQpCmxpYmN1cmw6IDguMjEuMC1ERVYgKHN5czowLjQuOTArY3VybC04LjIxLjAgdmVuZG9yZWQgc3NsOk9wZW5TU0wvMy42LjMpCnNzbDogT3BlblNTTCAzLjYuMyA5IEp1biAyMDI2Cm9zOiBVYnVudHUgMjYuNC4wIChyZXNvbHV0ZSkgW3Vua25vd24gYml0bmVzc10K";
+    const ORDINARY_PROBE_CARGO_B64: &str = "Y2FyZ28gMS45OS4wLW5pZ2h0bHkgKDU5ODAwNDY2YyAyMDI2LTA3LTA3KQpyZWxlYXNlOiAxLjk5LjAtbmlnaHRseQpjb21taXQtaGFzaDogNTk4MDA0NjZjNWM0MWM0NDRkMjY0YjEwMTBiNGQ1N2U4NWE3MTE3Zgpjb21taXQtZGF0ZTogMjAyNi0wNy0wNwpob3N0OiB4ODZfNjQtdW5rbm93bi1saW51eC1nbnUKbGliZ2l0MjogMS45LjQgKHN5czowLjIxLjAgdmVuZG9yZWQpCmxpYmN1cmw6IDguMjEuMC1ERVYgKHN5czowLjQuOTArY3VybC04LjIxLjAgdmVuZG9yZWQgc3NsOk9wZW5TU0wvMy42LjMpCnNzbDogT3BlblNTTCAzLjYuMyA5IEp1biAyMDI2Cm9zOiBVYnVudHUgMjUuMTAuMCAocXVlc3RpbmcpIFt1bmtub3duIGJpdG5lc3NdCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_RUSTDOC_B64: &str = "cnVzdGRvYyAxLjk5LjAtbmlnaHRseSAoMzc1YjE0MzFiIDIwMjYtMDctMTApCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -91967,7 +91967,7 @@ fn fallible(value: Option<u8>) {
     fn ordinary_tool_probe_fixtures() -> [OrdinaryToolProbeFixture; 20] {
         [
             OrdinaryToolProbeFixture { tool_id: "rustc", parser_id: "rustc-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustc", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTC_B64, raw_sha256: "d2a0a4fa48442a6c214130f08b2e9041725872a05d74680d9fd803ff8cb99c04" },
-            OrdinaryToolProbeFixture { tool_id: "cargo", parser_id: "cargo-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CARGO_B64, raw_sha256: "9f37a625adbcbf2fe66626c0a3a690432efba31c56de13e40cdd1fc1fe0f114d" },
+            OrdinaryToolProbeFixture { tool_id: "cargo", parser_id: "cargo-vv-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo", argv_tail: &["-Vv"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CARGO_B64, raw_sha256: "411c44317aa49193ad47d8cae8efac0235ca303ee4d5f2e86b47627bbf96c506" },
             OrdinaryToolProbeFixture { tool_id: "rustdoc", parser_id: "rustdoc-pinned-1.99", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustdoc", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTDOC_B64, raw_sha256: "8b9d7c46d8dc09d41da9e1b590b12a6b3b82b1a00c866623067104618a7b1a88" },
             OrdinaryToolProbeFixture { tool_id: "rustfmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/rustfmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
             OrdinaryToolProbeFixture { tool_id: "cargo-fmt", parser_id: "rustfmt-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-fmt", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUSTFMT_B64, raw_sha256: "fb0ca1cba546790ff7e1921ca3095bf0de2f3035c2b14344aac51b35d60f1c5a" },
