@@ -29086,16 +29086,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     fn require_clang_version_lines(
         parser: &str,
         lines: StrictVersionLines<'_>,
+        expected_first_line: &str,
         target: &str,
         allow_extra_host_lines: bool,
     ) -> TrustResult<()> {
         let expected_count = if allow_extra_host_lines { 8 } else { 4 };
         if lines.len() != expected_count
-            || lines.first() != Some("Ubuntu clang version 22.1.2 (1ubuntu1)")
+            || lines.first() != Some(expected_first_line)
             || lines.get(1) != Some(target)
             || lines.get(2) != Some("Thread model: posix")
         {
-            return Err(tool_version_error(format!("{parser}: clang identity/target grammar")));
+            return Err(tool_version_error(format!(
+                "{parser}: clang identity/target grammar"
+            )));
         }
         let installed = lines
             .get(3)
@@ -29255,7 +29258,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 lines,
                 &[
                     "llvm-nm, compatible with GNU nm",
-                    "Ubuntu LLVM version 22.1.2",
+                    "Ubuntu LLVM version 20.1.8",
                     "  Optimized build.",
                 ],
                 tool_id,
@@ -29263,13 +29266,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ("llvm-version-family", "apple-ar") => require_exact_version_lines(
                 parser,
                 lines,
-                &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                &["Ubuntu LLVM version 20.1.8", "  Optimized build."],
                 tool_id,
             ),
             ("openssl-version-a", "openssl") => {
                 if lines.len() != 10
                     || lines.required(0)
-                        != "OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)"
+                        != "OpenSSL 3.5.3 16 Sep 2025 (Library: OpenSSL 3.5.3 16 Sep 2025)"
                     || lines.required(2) != "platform: debian-amd64"
                 {
                     return Err(tool_version_error(format!(
@@ -29307,6 +29310,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     require_clang_version_lines(
                         parser,
                         lines,
+                        "Ubuntu clang version 22.1.2 (1ubuntu1)",
                         "Target: x86_64-pc-linux-gnu",
                         true,
                     )
@@ -29328,7 +29332,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     require_exact_version_lines(
                         parser,
                         lines,
-                        &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                        &["Ubuntu LLVM version 20.1.8", "  Optimized build."],
                         tool_id,
                     )
                 } else {
@@ -29336,8 +29340,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                         parser,
                         lines,
                         &[
-                            "GNU ar (GNU Binutils for Ubuntu) 2.46",
-                            "Copyright (C) 2026 Free Software Foundation, Inc.",
+                            "GNU ar (GNU Binutils for Ubuntu) 2.45",
+                            "Copyright (C) 2025 Free Software Foundation, Inc.",
                             "This program is free software; you may redistribute it under the terms of",
                             "the GNU General Public License version 3 or (at your option) any later version.",
                             "This program has absolutely no warranty.",
@@ -29354,7 +29358,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                     require_exact_version_lines(
                         parser,
                         lines,
-                        &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                        &["Ubuntu LLVM version 20.1.8", "  Optimized build."],
                         tool_id,
                     )
                 } else {
@@ -29362,8 +29366,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                         parser,
                         lines,
                         &[
-                            "GNU ranlib (GNU Binutils for Ubuntu) 2.46",
-                            "Copyright (C) 2026 Free Software Foundation, Inc.",
+                            "GNU ranlib (GNU Binutils for Ubuntu) 2.45",
+                            "Copyright (C) 2025 Free Software Foundation, Inc.",
                             "This program is free software; you may redistribute it under the terms of",
                             "the GNU General Public License version 3 or (at your option) any later version.",
                             "This program has absolutely no warranty.",
@@ -29382,12 +29386,14 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ("apple-clang-version", "apple-clang") => require_clang_version_lines(
                 parser,
                 lines,
+                "Ubuntu clang version 20.1.8 (0ubuntu4)",
                 "Target: aarch64-apple-darwin",
                 false,
             ),
             ("windows-clang-cl-version", "windows-clang-cl") => require_clang_version_lines(
                 parser,
                 lines,
+                "Ubuntu clang version 20.1.8 (0ubuntu4)",
                 "Target: x86_64-pc-windows-msvc",
                 false,
             ),
@@ -29419,7 +29425,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ("lld-coff-version", "windows-lld-link") => require_exact_version_lines(
                 parser,
                 lines,
-                &["Ubuntu LLD 22.1.2"],
+                &["Ubuntu LLD 20.1.8"],
                 tool_id,
             ),
             _ => Err(tool_version_error(format!(
@@ -91881,29 +91887,29 @@ fn fallible(value: Option<u8>) {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_RUST_LLD_B64: &str = "TExEIDIyLjEuOCAoL2NoZWNrb3V0L3NyYy9sbHZtLXByb2plY3QvbGx2bSBhMDRjMWVjZWQ1NWYyZjNlYThkYmQzZDE3ZGIwYjZkZjI3MWMwODA5KSAoY29tcGF0aWJsZSB3aXRoIEdOVSBsaW5rZXJzKQo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_LLVM_NM_B64: &str = "bGx2bS1ubSwgY29tcGF0aWJsZSB3aXRoIEdOVSBubQpVYnVudHUgTExWTSB2ZXJzaW9uIDIyLjEuMgogIE9wdGltaXplZCBidWlsZC4K";
+    const ORDINARY_PROBE_LLVM_NM_B64: &str = "bGx2bS1ubSwgY29tcGF0aWJsZSB3aXRoIEdOVSBubQpVYnVudHUgTExWTSB2ZXJzaW9uIDIwLjEuOAogIE9wdGltaXplZCBidWlsZC4K";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_LLVM_TOOL_B64: &str = "VWJ1bnR1IExMVk0gdmVyc2lvbiAyMi4xLjIKICBPcHRpbWl6ZWQgYnVpbGQuCg==";
+    const ORDINARY_PROBE_LLVM_TOOL_B64: &str = "VWJ1bnR1IExMVk0gdmVyc2lvbiAyMC4xLjgKICBPcHRpbWl6ZWQgYnVpbGQuCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_OPENSSL_B64: &str = "T3BlblNTTCAzLjUuNSAyNyBKYW4gMjAyNiAoTGlicmFyeTogT3BlblNTTCAzLjUuNSAyNyBKYW4gMjAyNikKYnVpbHQgb246IFdlZCBKdWwgMjkgMTY6NTA6NTMgMjAyNiBVVEMKcGxhdGZvcm06IGRlYmlhbi1hbWQ2NApvcHRpb25zOiAgYm4oNjQsNjQpCmNvbXBpbGVyOiBnY2MgLWZQSUMgLXB0aHJlYWQgLW02NCAtV2EsLS1ub2V4ZWNzdGFjayAtV2FsbCAtZnplcm8tY2FsbC11c2VkLXJlZ3M9dXNlZC1ncHIgLVdhLC0tbm9leGVjc3RhY2sgLWcgLU8yIC1XZXJyb3I9aW1wbGljaXQtZnVuY3Rpb24tZGVjbGFyYXRpb24gLWZuby1vbWl0LWZyYW1lLXBvaW50ZXIgLW1uby1vbWl0LWxlYWYtZnJhbWUtcG9pbnRlciAtZmZpbGUtcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC16cHczQkcvb3BlbnNzbC0zLjUuNT0uIC1mc3RhY2stcHJvdGVjdG9yLXN0cm9uZyAtZnN0YWNrLWNsYXNoLXByb3RlY3Rpb24gLVdmb3JtYXQgLVdlcnJvcj1mb3JtYXQtc2VjdXJpdHkgLWZjZi1wcm90ZWN0aW9uIC1mZGVidWctcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC16cHczQkcvb3BlbnNzbC0zLjUuNT0vdXNyL3NyYy9vcGVuc3NsLTMuNS41LTF1YnVudHUzLjMgLURPUEVOU1NMX1VTRV9OT0RFTEVURSAtRExfRU5ESUFOIC1ET1BFTlNTTF9QSUMgLURPUEVOU1NMX0JVSUxESU5HX09QRU5TU0wgLURaTElCIC1EWlNURCAtRE5ERUJVRyAtV2RhdGUtdGltZSAtRF9GT1JUSUZZX1NPVVJDRT0zCk9QRU5TU0xESVI6ICIvdXNyL2xpYi9zc2wiCkVOR0lORVNESVI6ICIvdXNyL2xpYi94ODZfNjQtbGludXgtZ251L2VuZ2luZXMtMyIKTU9EVUxFU0RJUjogIi91c3IvbGliL3g4Nl82NC1saW51eC1nbnUvb3NzbC1tb2R1bGVzIgpTZWVkaW5nIHNvdXJjZTogb3Mtc3BlY2lmaWMgSklUVEVSICgzMDYwMzAwKQpDUFVJTkZPOiBPUEVOU1NMX2lhMzJjYXA9MHhmZWZhMzIwMzA3OGJmZmZmOjB4MDA0MTVmNWVmMWJmMDdhOToweDAwMDAwMDIwMDAwMDAwMTA6MHgwMDAwMDAwMDAwMDAwMDAwOjB4MDAwMDAwMDAwMDAwMDAwMAo=";
+    const ORDINARY_PROBE_OPENSSL_B64: &str = "T3BlblNTTCAzLjUuMyAxNiBTZXAgMjAyNSAoTGlicmFyeTogT3BlblNTTCAzLjUuMyAxNiBTZXAgMjAyNSkKYnVpbHQgb246IFR1ZSBKdW4gIDIgMTc6MjE6MzYgMjAyNiBVVEMKcGxhdGZvcm06IGRlYmlhbi1hbWQ2NApvcHRpb25zOiAgYm4oNjQsNjQpCmNvbXBpbGVyOiBnY2MgLWZQSUMgLXB0aHJlYWQgLW02NCAtV2EsLS1ub2V4ZWNzdGFjayAtV2FsbCAtZnplcm8tY2FsbC11c2VkLXJlZ3M9dXNlZC1ncHIgLVdhLC0tbm9leGVjc3RhY2sgLWcgLU8yIC1XZXJyb3I9aW1wbGljaXQtZnVuY3Rpb24tZGVjbGFyYXRpb24gLWZuby1vbWl0LWZyYW1lLXBvaW50ZXIgLW1uby1vbWl0LWxlYWYtZnJhbWUtcG9pbnRlciAtZmZpbGUtcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC1LVmRBSUIvb3BlbnNzbC0zLjUuMz0uIC1mc3RhY2stcHJvdGVjdG9yLXN0cm9uZyAtZnN0YWNrLWNsYXNoLXByb3RlY3Rpb24gLVdmb3JtYXQgLVdlcnJvcj1mb3JtYXQtc2VjdXJpdHkgLWZjZi1wcm90ZWN0aW9uIC1mZGVidWctcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC1LVmRBSUIvb3BlbnNzbC0zLjUuMz0vdXNyL3NyYy9vcGVuc3NsLTMuNS4zLTF1YnVudHUzLjQgLURPUEVOU1NMX1VTRV9OT0RFTEVURSAtRExfRU5ESUFOIC1ET1BFTlNTTF9QSUMgLURPUEVOU1NMX0JVSUxESU5HX09QRU5TU0wgLURaTElCIC1EWlNURCAtRE5ERUJVRyAtV2RhdGUtdGltZSAtRF9GT1JUSUZZX1NPVVJDRT0zCk9QRU5TU0xESVI6ICIvdXNyL2xpYi9zc2wiCkVOR0lORVNESVI6ICIvdXNyL2xpYi94ODZfNjQtbGludXgtZ251L2VuZ2luZXMtMyIKTU9EVUxFU0RJUjogIi91c3IvbGliL3g4Nl82NC1saW51eC1nbnUvb3NzbC1tb2R1bGVzIgpTZWVkaW5nIHNvdXJjZTogb3Mtc3BlY2lmaWMKQ1BVSU5GTzogT1BFTlNTTF9pYTMyY2FwPTB4ZmVmODMyMDMwNzhiZmZmZjoweDAwMDAwMDAwMjA5YzAxYTk6MHgwMDAwMDAwMDA4MDAwMDAwOjB4MDAwMDAwMDAwMDAwMDAwMDoweDAwMDAwMDAwMDAwMDAwMDAK";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_HOST_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiB4ODZfNjQtcGMtbGludXgtZ251ClRocmVhZCBtb2RlbDogcG9zaXgKSW5zdGFsbGVkRGlyOiAvdXNyL2xpYi9sbHZtLTIyL2JpbgpGb3VuZCBjYW5kaWRhdGUgR0NDIGluc3RhbGxhdGlvbjogL3Vzci9saWIvZ2NjL3g4Nl82NC1saW51eC1nbnUvMTUKU2VsZWN0ZWQgR0NDIGluc3RhbGxhdGlvbjogL3Vzci9saWIvZ2NjL3g4Nl82NC1saW51eC1nbnUvMTUKQ2FuZGlkYXRlIG11bHRpbGliOiAuO0BtNjQKU2VsZWN0ZWQgbXVsdGlsaWI6IC47QG02NAo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_HOST_GCC_B64: &str = "VXNpbmcgYnVpbHQtaW4gc3BlY3MuCkNPTExFQ1RfR0NDPS91c3IvYmluL2NjCkNPTExFQ1RfTFRPX1dSQVBQRVI9L3Vzci9saWJleGVjL2djYy94ODZfNjQtbGludXgtZ251LzE1L2x0by13cmFwcGVyCk9GRkxPQURfVEFSR0VUX05BTUVTPW52cHR4LW5vbmU6YW1kZ2NuLWFtZGhzYQpPRkZMT0FEX1RBUkdFVF9ERUZBVUxUPTEKVGFyZ2V0OiB4ODZfNjQtbGludXgtZ251CkNvbmZpZ3VyZWQgd2l0aDogLi4vc3JjL2NvbmZpZ3VyZSAtdiAtLXdpdGgtcGtndmVyc2lvbj0nVWJ1bnR1IDE1LjIuMC0xNnVidW50dTEnIC0td2l0aC1idWd1cmw9ZmlsZTovLy91c3Ivc2hhcmUvZG9jL2djYy0xNS9SRUFETUUuQnVncyAtLWVuYWJsZS1sYW5ndWFnZXM9YyxhZGEsYysrLGdvLGQsZm9ydHJhbixvYmpjLG9iai1jKyssbTIscnVzdCxjb2JvbCxhbGdvbDY4IC0tcHJlZml4PS91c3IgLS13aXRoLWdjYy1tYWpvci12ZXJzaW9uLW9ubHkgLS1wcm9ncmFtLXN1ZmZpeD0tMTUgLS1wcm9ncmFtLXByZWZpeD14ODZfNjQtbGludXgtZ251LSAtLWVuYWJsZS1zaGFyZWQgLS1lbmFibGUtbGlua2VyLWJ1aWxkLWlkIC0tbGliZXhlY2Rpcj0vdXNyL2xpYmV4ZWMgLS13aXRob3V0LWluY2x1ZGVkLWdldHRleHQgLS1lbmFibGUtdGhyZWFkcz1wb3NpeCAtLWxpYmRpcj0vdXNyL2xpYiAtLWVuYWJsZS1ubHMgLS1lbmFibGUtYm9vdHN0cmFwIC0tZW5hYmxlLWNsb2NhbGU9Z251IC0tZW5hYmxlLWxpYnN0ZGN4eC1kZWJ1ZyAtLWVuYWJsZS1saWJzdGRjeHgtdGltZT15ZXMgLS13aXRoLWRlZmF1bHQtbGlic3RkY3h4LWFiaT1uZXcgLS1lbmFibGUtbGlic3RkY3h4LWJhY2t0cmFjZSAtLWVuYWJsZS1nbnUtdW5pcXVlLW9iamVjdCAtLWRpc2FibGUtdnRhYmxlLXZlcmlmeSAtLWVuYWJsZS1wbHVnaW4gLS1lbmFibGUtZGVmYXVsdC1waWUgLS13aXRoLXN5c3RlbS16bGliIC0tZW5hYmxlLWxpYnBob2Jvcy1jaGVja2luZz1yZWxlYXNlIC0td2l0aC10YXJnZXQtc3lzdGVtLXpsaWI9YXV0byAtLWVuYWJsZS1vYmpjLWdjPWF1dG8gLS1lbmFibGUtbXVsdGlhcmNoIC0tZGlzYWJsZS13ZXJyb3IgLS1lbmFibGUtY2V0IC0td2l0aC1hcmNoLTMyPWk2ODYgLS13aXRoLWFiaT1tNjQgLS13aXRoLW11bHRpbGliLWxpc3Q9bTMyLG02NCxteDMyIC0tZW5hYmxlLW11bHRpbGliIC0td2l0aC10dW5lPWdlbmVyaWMgLS1lbmFibGUtb2ZmbG9hZC10YXJnZXRzPW52cHR4LW5vbmU9L2J1aWxkL2djYy0xNS1qMzVUQVgvZ2NjLTE1LTE1LjIuMC9kZWJpYW4vdG1wLW52cHR4L3VzcixhbWRnY24tYW1kaHNhPS9idWlsZC9nY2MtMTUtajM1VEFYL2djYy0xNS0xNS4yLjAvZGViaWFuL3RtcC1nY24vdXNyIC0tZW5hYmxlLW9mZmxvYWQtZGVmYXVsdGVkIC0td2l0aG91dC1jdWRhLWRyaXZlciAtLWVuYWJsZS1jaGVja2luZz1yZWxlYXNlIC0tYnVpbGQ9eDg2XzY0LWxpbnV4LWdudSAtLWhvc3Q9eDg2XzY0LWxpbnV4LWdudSAtLXRhcmdldD14ODZfNjQtbGludXgtZ251IC0td2l0aC1idWlsZC1jb25maWc9Ym9vdHN0cmFwLWx0by1sZWFuIC0tZW5hYmxlLWxpbmstc2VyaWFsaXphdGlvbj0yClRocmVhZCBtb2RlbDogcG9zaXgKU3VwcG9ydGVkIExUTyBjb21wcmVzc2lvbiBhbGdvcml0aG1zOiB6bGliIHpzdGQKZ2NjIHZlcnNpb24gMTUuMi4wIChVYnVudHUgMTUuMi4wLTE2dWJ1bnR1MSkgCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_GNU_AR_B64: &str = "R05VIGFyIChHTlUgQmludXRpbHMgZm9yIFVidW50dSkgMi40NgpDb3B5cmlnaHQgKEMpIDIwMjYgRnJlZSBTb2Z0d2FyZSBGb3VuZGF0aW9uLCBJbmMuClRoaXMgcHJvZ3JhbSBpcyBmcmVlIHNvZnR3YXJlOyB5b3UgbWF5IHJlZGlzdHJpYnV0ZSBpdCB1bmRlciB0aGUgdGVybXMgb2YKdGhlIEdOVSBHZW5lcmFsIFB1YmxpYyBMaWNlbnNlIHZlcnNpb24gMyBvciAoYXQgeW91ciBvcHRpb24pIGFueSBsYXRlciB2ZXJzaW9uLgpUaGlzIHByb2dyYW0gaGFzIGFic29sdXRlbHkgbm8gd2FycmFudHkuCg==";
+    const ORDINARY_PROBE_GNU_AR_B64: &str = "R05VIGFyIChHTlUgQmludXRpbHMgZm9yIFVidW50dSkgMi40NQpDb3B5cmlnaHQgKEMpIDIwMjUgRnJlZSBTb2Z0d2FyZSBGb3VuZGF0aW9uLCBJbmMuClRoaXMgcHJvZ3JhbSBpcyBmcmVlIHNvZnR3YXJlOyB5b3UgbWF5IHJlZGlzdHJpYnV0ZSBpdCB1bmRlciB0aGUgdGVybXMgb2YKdGhlIEdOVSBHZW5lcmFsIFB1YmxpYyBMaWNlbnNlIHZlcnNpb24gMyBvciAoYXQgeW91ciBvcHRpb24pIGFueSBsYXRlciB2ZXJzaW9uLgpUaGlzIHByb2dyYW0gaGFzIGFic29sdXRlbHkgbm8gd2FycmFudHkuCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_GNU_RANLIB_B64: &str = "R05VIHJhbmxpYiAoR05VIEJpbnV0aWxzIGZvciBVYnVudHUpIDIuNDYKQ29weXJpZ2h0IChDKSAyMDI2IEZyZWUgU29mdHdhcmUgRm91bmRhdGlvbiwgSW5jLgpUaGlzIHByb2dyYW0gaXMgZnJlZSBzb2Z0d2FyZTsgeW91IG1heSByZWRpc3RyaWJ1dGUgaXQgdW5kZXIgdGhlIHRlcm1zIG9mCnRoZSBHTlUgR2VuZXJhbCBQdWJsaWMgTGljZW5zZSB2ZXJzaW9uIDMgb3IgKGF0IHlvdXIgb3B0aW9uKSBhbnkgbGF0ZXIgdmVyc2lvbi4KVGhpcyBwcm9ncmFtIGhhcyBhYnNvbHV0ZWx5IG5vIHdhcnJhbnR5Lgo=";
+    const ORDINARY_PROBE_GNU_RANLIB_B64: &str = "R05VIHJhbmxpYiAoR05VIEJpbnV0aWxzIGZvciBVYnVudHUpIDIuNDUKQ29weXJpZ2h0IChDKSAyMDI1IEZyZWUgU29mdHdhcmUgRm91bmRhdGlvbiwgSW5jLgpUaGlzIHByb2dyYW0gaXMgZnJlZSBzb2Z0d2FyZTsgeW91IG1heSByZWRpc3RyaWJ1dGUgaXQgdW5kZXIgdGhlIHRlcm1zIG9mCnRoZSBHTlUgR2VuZXJhbCBQdWJsaWMgTGljZW5zZSB2ZXJzaW9uIDMgb3IgKGF0IHlvdXIgb3B0aW9uKSBhbnkgbGF0ZXIgdmVyc2lvbi4KVGhpcyBwcm9ncmFtIGhhcyBhYnNvbHV0ZWx5IG5vIHdhcnJhbnR5Lgo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_AARCH64_GCC_B64: &str = "VXNpbmcgYnVpbHQtaW4gc3BlY3MuCkNPTExFQ1RfR0NDPS91c3IvYmluL2FhcmNoNjQtbGludXgtZ251LWdjYwpDT0xMRUNUX0xUT19XUkFQUEVSPS91c3IvbGliZXhlYy9nY2MtY3Jvc3MvYWFyY2g2NC1saW51eC1nbnUvMTUvbHRvLXdyYXBwZXIKVGFyZ2V0OiBhYXJjaDY0LWxpbnV4LWdudQpDb25maWd1cmVkIHdpdGg6IC4uL3NyYy9jb25maWd1cmUgLXYgLS13aXRoLXBrZ3ZlcnNpb249J1VidW50dSAxNS4yLjAtMTZ1YnVudHUxJyAtLXdpdGgtYnVndXJsPWZpbGU6Ly8vdXNyL3NoYXJlL2RvYy9nY2MtMTUvUkVBRE1FLkJ1Z3MgLS1lbmFibGUtbGFuZ3VhZ2VzPWMsYWRhLGMrKyxnbyxkLGZvcnRyYW4sb2JqYyxvYmotYysrLG0yLGNvYm9sLGFsZ29sNjggLS1wcmVmaXg9L3VzciAtLXdpdGgtZ2NjLW1ham9yLXZlcnNpb24tb25seSAtLXByb2dyYW0tc3VmZml4PS0xNSAtLWVuYWJsZS1zaGFyZWQgLS1lbmFibGUtbGlua2VyLWJ1aWxkLWlkIC0tbGliZXhlY2Rpcj0vdXNyL2xpYmV4ZWMgLS13aXRob3V0LWluY2x1ZGVkLWdldHRleHQgLS1lbmFibGUtdGhyZWFkcz1wb3NpeCAtLWxpYmRpcj0vdXNyL2xpYiAtLWVuYWJsZS1ubHMgLS13aXRoLXN5c3Jvb3Q9LyAtLWVuYWJsZS1jbG9jYWxlPWdudSAtLWVuYWJsZS1saWJzdGRjeHgtZGVidWcgLS1lbmFibGUtbGlic3RkY3h4LXRpbWU9eWVzIC0td2l0aC1kZWZhdWx0LWxpYnN0ZGN4eC1hYmk9bmV3IC0tZW5hYmxlLWxpYnN0ZGN4eC1iYWNrdHJhY2UgLS1lbmFibGUtZ251LXVuaXF1ZS1vYmplY3QgLS1kaXNhYmxlLWxpYnF1YWRtYXRoIC0tZGlzYWJsZS1saWJxdWFkbWF0aC1zdXBwb3J0IC0tZW5hYmxlLXBsdWdpbiAtLWVuYWJsZS1kZWZhdWx0LXBpZSAtLXdpdGgtc3lzdGVtLXpsaWIgLS1lbmFibGUtbGlicGhvYm9zLWNoZWNraW5nPXJlbGVhc2UgLS13aXRob3V0LXRhcmdldC1zeXN0ZW0temxpYiAtLWVuYWJsZS1tdWx0aWFyY2ggLS1lbmFibGUtZml4LWNvcnRleC1hNTMtODQzNDE5IC0tZGlzYWJsZS13ZXJyb3IgLS1lbmFibGUtY2hlY2tpbmc9cmVsZWFzZSAtLWJ1aWxkPXg4Nl82NC1saW51eC1nbnUgLS1ob3N0PXg4Nl82NC1saW51eC1nbnUgLS10YXJnZXQ9YWFyY2g2NC1saW51eC1nbnUgLS1wcm9ncmFtLXByZWZpeD1hYXJjaDY0LWxpbnV4LWdudS0gLS1pbmNsdWRlZGlyPS91c3IvYWFyY2g2NC1saW51eC1nbnUvaW5jbHVkZSAtLXdpdGgtYnVpbGQtY29uZmlnPWJvb3RzdHJhcC1sdG8tbGVhbiAtLWVuYWJsZS1saW5rLXNlcmlhbGl6YXRpb249MgpUaHJlYWQgbW9kZWw6IHBvc2l4ClN1cHBvcnRlZCBMVE8gY29tcHJlc3Npb24gYWxnb3JpdGhtczogemxpYiB6c3RkCmdjYyB2ZXJzaW9uIDE1LjIuMCAoVWJ1bnR1IDE1LjIuMC0xNnVidW50dTEpIAo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_APPLE_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiBhYXJjaDY0LWFwcGxlLWRhcndpbgpUaHJlYWQgbW9kZWw6IHBvc2l4Ckluc3RhbGxlZERpcjogL3Vzci9saWIvbGx2bS0yMi9iaW4K";
+    const ORDINARY_PROBE_APPLE_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjAuMS44ICgwdWJ1bnR1NCkKVGFyZ2V0OiBhYXJjaDY0LWFwcGxlLWRhcndpbgpUaHJlYWQgbW9kZWw6IHBvc2l4Ckluc3RhbGxlZERpcjogL3Vzci9saWIvbGx2bS0yMC9iaW4K";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_WINDOWS_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiB4ODZfNjQtcGMtd2luZG93cy1tc3ZjClRocmVhZCBtb2RlbDogcG9zaXgKSW5zdGFsbGVkRGlyOiAvdXNyL2xpYi9sbHZtLTIyL2Jpbgo=";
+    const ORDINARY_PROBE_WINDOWS_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjAuMS44ICgwdWJ1bnR1NCkKVGFyZ2V0OiB4ODZfNjQtcGMtd2luZG93cy1tc3ZjClRocmVhZCBtb2RlbDogcG9zaXgKSW5zdGFsbGVkRGlyOiAvdXNyL2xpYi9sbHZtLTIwL2Jpbgo=";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_LLVM_LIB_B64: &str = "T1ZFUlZJRVc6IExMVk0gTGliCgpVU0FHRTogbGx2bS1saWIgW29wdGlvbnNdIGZpbGUuLi4KCk9QVElPTlM6CiAgL2RlZjo8dmFsdWU+ICAgICAgICAgICAgZGVmIGZpbGUgdG8gdXNlIHRvIGdlbmVyYXRlIGltcG9ydCBsaWJyYXJ5CiAgL2RlZkFybTY0TmF0aXZlOjx2YWx1ZT4gZGVmIGZpbGUgdG8gdXNlIHRvIGdlbmVyYXRlIG5hdGl2ZSBBUk02NCBzeW1ib2xzIGluIEFSTTY0RUMgaW1wb3J0IGxpYnJhcnkKICAvaWdub3JlOjx2YWx1ZT4gICAgICAgICBTcGVjaWZ5IHdhcm5pbmcgY29kZXMgdG8gaWdub3JlCiAgL2xpYnBhdGg6PHZhbHVlPiAgICAgICAgT2JqZWN0IGZpbGUgc2VhcmNoIHBhdGgKICAvbGlzdCAgICAgICAgICAgICAgICAgICBMaXN0IGNvbnRlbnRzIG9mIC5saWIgZmlsZSBvbiBzdGRvdXQKICAvbGx2bWxpYmVtcHR5ICAgICAgICAgICBXaGVuIGdpdmVuIG5vIGNvbnRlbnRzLCBwcm9kdWNlIGFuIGVtcHR5IC5saWIgZmlsZQogIC9sbHZtbGliaW5kZXg6bm8gICAgICAgIERvIG5vdCB3cml0ZSBhbiBpbmRleCB0byB0aGUgb3V0cHV0CiAgL2xsdm1saWJpbmRleCAgICAgICAgICAgV3JpdGUgYW4gaW5kZXggdG8gdGhlIG91dHB1dCAoZGVmYXVsdCkKICAvbGx2bWxpYnRoaW4gICAgICAgICAgICBNYWtlIC5saWIgcG9pbnQgdG8gLm9iaiBmaWxlcyBpbnN0ZWFkIG9mIGNvcHlpbmcgdGhlaXIgY29udGVudHMKICAvbWFjaGluZTo8dmFsdWU+ICAgICAgICBTcGVjaWZ5IHRhcmdldCBwbGF0Zm9ybQogIC9vdXQ6PHZhbHVlPiAgICAgICAgICAgIFBhdGggdG8gZmlsZSB0byB3cml0ZSBvdXRwdXQKICAvV1g6bm8gICAgICAgICAgICAgICAgICBEb24ndCB0cmVhdCB3YXJuaW5ncyBhcyBlcnJvcnMgKGRlZmF1bHQpCiAgL1dYICAgICAgICAgICAgICAgICAgICAgVHJlYXQgd2FybmluZ3MgYXMgZXJyb3JzCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ORDINARY_PROBE_LLD_LINK_B64: &str = "VWJ1bnR1IExMRCAyMi4xLjIK";
+    const ORDINARY_PROBE_LLD_LINK_B64: &str = "VWJ1bnR1IExMRCAyMC4xLjgK";
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_probe_decode_base64(encoded: &str) -> Vec<u8> {
