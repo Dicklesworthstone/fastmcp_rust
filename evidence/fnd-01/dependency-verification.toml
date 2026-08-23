@@ -2710,7 +2710,7 @@ canonical_allowed_cotrigger_ids_encoding = "u32be count followed by each canonic
 canonical_suppressed_ids_encoding = "u32be count followed by each canonical string in declared order"
 canonical_count = 188
 canonical_bytes = 77379
-canonical_sha256 = "57bebc92bcbfb85c4d5e18f7b8a06b004dd3c9c7500b8b67cde82f819214e32a"
+canonical_sha256 = "fc2f8dfe5e971fae935ae5cd46e072215157bcde8cbb12a63ae58d9b5c69ab2f"
 
 [observation_typing]
 allowed_kinds = [
@@ -10268,9 +10268,9 @@ selector = "/artifacts"
 rule = "E_IDENTITY_BINDING"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "9759cf129032ca311c4d5d58fddb4a616691b16669c845142f856ef1491e4926"
+baseline_observation_sha256 = "12d76473cc40f37719882bd0b89e242b70af3a9c97316b110c5e3d41197e3dcd"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "18e212f52ec646e41dca85940088392e82a04aaff3bfde0f8ee96de0b3fc108c"
+violating_observation_sha256 = "feb57b986ce880977c81046a1d6f2d29e010bb3fee39a8b2e3f7bc17e836e473"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10348,7 +10348,7 @@ selector = "/retrieved_on"
 rule = "E_PROVENANCE"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "0bf7048c21d5db753476d60754b7914d19fdd6f9e10362115ee0845b5d296753"
+baseline_observation_sha256 = "141914b04cbd7b626a186992e962bc2a6b4a400f0a249754c9d75a05c706d00c"
 violation_mode = "exact_observation_sha256"
 violating_observation_sha256 = "99abfc27d044704b22bc2514ac1f9b022f0dcb074c6ca46dba3b6d8691d6ac92"
 expected_trigger_count = 1
@@ -10396,9 +10396,9 @@ selector = "/bytes/18"
 rule = "E_CONTENT_BINDING"
 baseline_mode = "canonical_source_value"
 observation_mode = "raw_source_bytes"
-baseline_observation_sha256 = "6fefe2a3d49a9276ecfbcf296312c63daaa77aa9c8f9b10130d7b73c9f026f06"
+baseline_observation_sha256 = "ef7aaf4c380d9d16c67bf5d9776dd3df735b2d5119e3d231981b8d021c9f20af"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "c8ae4c8b5a6d7323665de225fcddcc2a44c5d3b896b2981efda6586682e4b3af"
+violating_observation_sha256 = "af1fb1e6a629780f54bf6d33d6e7f75ee7d224c09d6ddb1e69582d3552258b1f"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10526,7 +10526,7 @@ selector = "/required_sets/core_authorization_drafts"
 rule = "E_EXACT_SET"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "0eff830d1d712e08f2a6f5db178fc29c47cd76e38ff151b8659d4b4f090d5d4e"
+baseline_observation_sha256 = "b845e655c45c66dd8bb867fb6ce68feec0dfd6a96e23beb9561f77e9f2ee23e9"
 violation_mode = "exact_observation_sha256"
 violating_observation_sha256 = "d1a7d5bc3a42800e69379c16708fc0883a4f151e2f72efb969bfa1a70b6bf641"
 expected_trigger_count = 1
@@ -10558,9 +10558,9 @@ selector = "/authority"
 rule = "E_AUTHORITY"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "fe13c9f9dad7a786fe21b13256ed2e481c9fff3c045951d33c10abe39394bfca"
+baseline_observation_sha256 = "21c864d119a9812b8bc86716fd1f1f4b374c5d88a1336340021d330ed3183374"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "30d7ec96c636f6ac75a3369ba6fa9c7556e47eb1c77c92e84b483b4da8019f3c"
+violating_observation_sha256 = "25e6b1e6a3674f88d4b5070b005aa6fb9a327b4cceb3ea6e3c0927ffbf04566d"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10590,9 +10590,9 @@ selector = "/authority"
 rule = "E_AUTHORITY"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "fe13c9f9dad7a786fe21b13256ed2e481c9fff3c045951d33c10abe39394bfca"
+baseline_observation_sha256 = "21c864d119a9812b8bc86716fd1f1f4b374c5d88a1336340021d330ed3183374"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "8bc81015a58b4f2f7cdd01c8440c540c2c69cc92046414112c2b490e74a0f5e3"
+violating_observation_sha256 = "e149f79985d5e8640b5aff39a610bc77686a8433e3b85a0ee3cb805f4b9415d6"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10606,9 +10606,9 @@ selector = "/authority"
 rule = "E_AUTHORITY"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "fe13c9f9dad7a786fe21b13256ed2e481c9fff3c045951d33c10abe39394bfca"
+baseline_observation_sha256 = "21c864d119a9812b8bc86716fd1f1f4b374c5d88a1336340021d330ed3183374"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "52ba189bf234ad4f060264ee35d1c61e39c0f82b42635fc57764d238eeb780d7"
+violating_observation_sha256 = "117e7abbc5114982c9e9aac6313903f9bbb4d90919af8315e0de51d20b81e038"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10622,9 +10622,9 @@ selector = "/authority"
 rule = "E_AUTHORITY"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "fe13c9f9dad7a786fe21b13256ed2e481c9fff3c045951d33c10abe39394bfca"
+baseline_observation_sha256 = "21c864d119a9812b8bc86716fd1f1f4b374c5d88a1336340021d330ed3183374"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "51b35cf1c9bb90af9685da0f88b25457a49f6bf3aea0d93e01070a66c4574efa"
+violating_observation_sha256 = "0c104b04a504ab8befddcf246daedd58acd1f2ea0138598b6e359298004bbc1c"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10782,9 +10782,9 @@ selector = "/scenarios/id=auth~1client-credentials-jwt"
 rule = "E_CLASSIFICATION"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "f910bfb691f8b01ee58b6cb42938622cccb712103e50f9a027e8f0ecabfb2096"
+baseline_observation_sha256 = "c4ed89339e77f56bdfb00b1b65781ceb6061c1762bfcca4864b4b910e90219f5"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "20eb23b7f33cfed1486fc34666a187199294dc0d89fa64e9027628d657aeed7e"
+violating_observation_sha256 = "b967ebfd075f1cf09081897fed854f07f84f7ae7b02da3b4340f61d2d237f00a"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10798,9 +10798,9 @@ selector = "/scenarios/id=auth~1client-credentials-jwt"
 rule = "E_CLASSIFICATION"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "f910bfb691f8b01ee58b6cb42938622cccb712103e50f9a027e8f0ecabfb2096"
+baseline_observation_sha256 = "c4ed89339e77f56bdfb00b1b65781ceb6061c1762bfcca4864b4b910e90219f5"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "d7ff8376fc9db4aab68ccf87042a8d13ff161184dfe4ff0b1d56229007894eda"
+violating_observation_sha256 = "9c880298763ca57a94b8c30c1c8e5f3774d78a77871483705d82ca9e8b07f7de"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10846,9 +10846,9 @@ selector = "/scenarios/id=auth~1client-credentials-basic"
 rule = "E_CLASSIFICATION"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "32999b895e31cf8177859b4afaf3b1068656290313d9f217ae79d7640f1b8468"
+baseline_observation_sha256 = "57e691fa72ee89086edeb33c87f78d91b3399b609a6b7730bef373a06d7a06b3"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "0709070861dbd2207d9e1dd19fc4cf5e4412be2523a7f4fd0231ba8e44cec96e"
+violating_observation_sha256 = "94900a8d0ed33c15c32aac075e56aa23ee59d4c8aee31d2c1ee1aec40981aa81"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10878,9 +10878,9 @@ selector = "/title_policy"
 rule = "E_AUTHORITY"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "17bc2502af02a21854b5d175f3cb8311c4a3bbf74d338e4fafffd076b39af63e"
+baseline_observation_sha256 = "bb15b25a58315bf78ae1daecd6327e9a258cfcc4b1492fa6129c4c10a7b66c2b"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "80e557d189b7e11f06a73c301bf84c425475ace8e128e773900df07cb0a623e3"
+violating_observation_sha256 = "9c221fd71bf55b28f686f55b227f36b841983267f7ab03d228a0221db8153e94"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10894,9 +10894,9 @@ selector = "/scenarios/id=auth~1client-credentials-basic"
 rule = "E_FLOW_INVARIANT"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "32999b895e31cf8177859b4afaf3b1068656290313d9f217ae79d7640f1b8468"
+baseline_observation_sha256 = "57e691fa72ee89086edeb33c87f78d91b3399b609a6b7730bef373a06d7a06b3"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "c1c4a3e93c84a1dc1e56328aa0f17d014f69939f307b42db74325fabe2ea5fae"
+violating_observation_sha256 = "f277da2fc45b8ebb60398238972a16bacf3d57e4e1e9255bc5ad8b9ffc8fe994"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10910,9 +10910,9 @@ selector = "/scenarios/id=auth~1client-credentials-basic"
 rule = "E_FLOW_INVARIANT"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "32999b895e31cf8177859b4afaf3b1068656290313d9f217ae79d7640f1b8468"
+baseline_observation_sha256 = "57e691fa72ee89086edeb33c87f78d91b3399b609a6b7730bef373a06d7a06b3"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "233bdeaf9210fb48ff547b84b69cc2502c73ec1e19a347a2253afb376dcc1bc3"
+violating_observation_sha256 = "d67df9a3c8b9e83353f91c196d46afeb0c7a4740eb4817545674b469419ecde5"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -10926,9 +10926,9 @@ selector = "/authority"
 rule = "E_PROFILE_CONTRACT"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "fe13c9f9dad7a786fe21b13256ed2e481c9fff3c045951d33c10abe39394bfca"
+baseline_observation_sha256 = "21c864d119a9812b8bc86716fd1f1f4b374c5d88a1336340021d330ed3183374"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "f573ba0aa68f65d326729e7434e6799ec9564e094fb4d2bac11025a3105e043a"
+violating_observation_sha256 = "cabc9d62977e9ef2daa47e34cabf50a02a5ac87f3ba9e59a4fcd91b9f2f9239c"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -11086,9 +11086,9 @@ selector = "/authority"
 rule = "E_IDENTITY_BINDING"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "fe13c9f9dad7a786fe21b13256ed2e481c9fff3c045951d33c10abe39394bfca"
+baseline_observation_sha256 = "21c864d119a9812b8bc86716fd1f1f4b374c5d88a1336340021d330ed3183374"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "8f612752431c724e843d676cec160867fef6107408bbb5b0709a8513b6633771"
+violating_observation_sha256 = "8124ad7e0110928471e816b98740d4cc6457119822ced445db52f1c02421e9f4"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -11102,9 +11102,9 @@ selector = "/authority"
 rule = "E_AUTHORITY"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "fe13c9f9dad7a786fe21b13256ed2e481c9fff3c045951d33c10abe39394bfca"
+baseline_observation_sha256 = "21c864d119a9812b8bc86716fd1f1f4b374c5d88a1336340021d330ed3183374"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "f8390fc02b11ddef9b44ee21beb1c80d5f581e0f6c7a2d7f029e991c50860eaa"
+violating_observation_sha256 = "4c34dcbf1ee2772214de37c83a45fbdac395ae42825ed7088662d70477ebec10"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -11118,9 +11118,9 @@ selector = "/artifacts"
 rule = "E_IMMUTABLE_SOURCE"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "9759cf129032ca311c4d5d58fddb4a616691b16669c845142f856ef1491e4926"
+baseline_observation_sha256 = "12d76473cc40f37719882bd0b89e242b70af3a9c97316b110c5e3d41197e3dcd"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "4d8a67c0f0cd37824b70db027c88f3a0c0b9536999e25a217c5ba1aa999c5c05"
+violating_observation_sha256 = "aa8a19460ba511ac35cb8627866303d416164fd3cf777b0b2b18b8b511b96715"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -11311,9 +11311,9 @@ selector = "/provenance_policy/evidence_controlled_provenance_fields"
 rule = "E_PROVENANCE_SCOPE"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "a4887551dc4aa6f643e9bc263bdf532a647d06759df1c0a38783ef1559dcb787"
+baseline_observation_sha256 = "088298105e2aa3b9c82be24d6c691e48314c9788695bd0a80b32f9dcda26abe2"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "87747a27f9ce51e58ae37ef7e4f36958dd572c25b10b8fefb5ff119e3d556944"
+violating_observation_sha256 = "724d15f806124af0b61ce0fb52ab14e21c766b25b9a97a849fb80e5d82d9ec60"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -11647,7 +11647,7 @@ selector = "/apps/server_settings/only_valid_value"
 rule = "E_SCHEMA_CONTRACT"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "b3d6a1b6369ff268bcb2018da158a4f7b6612c6aa537978985c27e1d07b75c34"
+baseline_observation_sha256 = "21bc0063a87b475edaa3152dce0018f10f29f162fa0a8ae72d2b065407c57429"
 violation_mode = "exact_observation_sha256"
 violating_observation_sha256 = "1910424c8506e5826128dc892662fffb3f3d42d72be54023e078e79458dd0a8c"
 expected_trigger_count = 1
