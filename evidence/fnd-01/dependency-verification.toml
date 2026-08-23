@@ -2710,7 +2710,7 @@ canonical_allowed_cotrigger_ids_encoding = "u32be count followed by each canonic
 canonical_suppressed_ids_encoding = "u32be count followed by each canonical string in declared order"
 canonical_count = 188
 canonical_bytes = 77379
-canonical_sha256 = "66240fbc127cf06ac32f96ebd54d80cf540ae08d26cc2be834b1efc209ccfecb"
+canonical_sha256 = "57bebc92bcbfb85c4d5e18f7b8a06b004dd3c9c7500b8b67cde82f819214e32a"
 
 [observation_typing]
 allowed_kinds = [

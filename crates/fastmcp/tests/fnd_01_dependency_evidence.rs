@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 904756;
 const FROZEN_POLICY_SHA256: &str =
-    "5071c0ce48eca5d20e48227c3b9ab3aabb4c7cd701ec06b1ee58dbed633a2863";
+    "911dfa405fc3ff805236b1318a046842f880549b83560e648a8c51bedc0998b5";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34228,7 +34228,7 @@ mod ordinary {
         "609f0ce94ad6403a3324f1afd705f641573469a833fd3271e84b0647e86f2f5a";
     const ASSERTION_CANONICAL_BYTES: usize = 77_379;
     const ASSERTION_CANONICAL_SHA256: &str =
-        "66240fbc127cf06ac32f96ebd54d80cf540ae08d26cc2be834b1efc209ccfecb";
+        "57bebc92bcbfb85c4d5e18f7b8a06b004dd3c9c7500b8b67cde82f819214e32a";
     const EXPECTED_RECEIPTS: usize = 14;
     const EXPECTED_RECEIPT_TOMLS: usize = 10;
     const EXPECTED_RECEIPT_BINARIES: usize = 4;
