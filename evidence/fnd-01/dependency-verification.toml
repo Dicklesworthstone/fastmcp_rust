@@ -9467,9 +9467,9 @@ selector = "/peers"
 rule = "extra_non_tier1_peer"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "cc75efc88c4199e1d6da5a8121a289d8e4e2066a525ad7b1908153dae3928a17"
+baseline_observation_sha256 = "6a300a3a7486aa14d7c272b8fc3ff676bc8a63a1b23cf72f05f79bdbce97067f"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "33245b8095052334011e088cb288a4df2474bc9a03a09b507904fea7e1ea233f"
+violating_observation_sha256 = "1ccc1c99c9ab9d0718c299bff0818be8b10cdb7f24bc8b78643cb15cbd71b50c"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 
@@ -9483,9 +9483,9 @@ selector = "/peers"
 rule = "duplicate_peer"
 baseline_mode = "canonical_source_value"
 observation_mode = "canonical_selected_toml"
-baseline_observation_sha256 = "cc75efc88c4199e1d6da5a8121a289d8e4e2066a525ad7b1908153dae3928a17"
+baseline_observation_sha256 = "6a300a3a7486aa14d7c272b8fc3ff676bc8a63a1b23cf72f05f79bdbce97067f"
 violation_mode = "exact_observation_sha256"
-violating_observation_sha256 = "fdb86015ffc803d984e2263a497a246c076eda5e386472cd3553842fed76efbf"
+violating_observation_sha256 = "01e0e9fe3950d50d4082a2194eddc5381ce67f2308a5a5afae38b01ffefaf28f"
 expected_trigger_count = 1
 allowed_cotrigger_ids = []
 

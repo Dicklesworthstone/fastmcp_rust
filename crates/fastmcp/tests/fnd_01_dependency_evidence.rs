@@ -97420,7 +97420,7 @@ fn fallible(value: Option<u8>) {
         let f = load_sources(&r, &p).unwrap();
         let t = validate_source_tree(&f, &p).unwrap();
         let mut x = f.clone();
-        x[0].bytes[0] ^= 1;
+        x[0].digest[0] ^= 1;
         assert_eq!(validate_source_tree(&x, &p).unwrap_err().code, "E_TREE_DIGEST_MISMATCH");
         assert_eq!(validate_source_tree(&f, &p).unwrap(), t);
     }
