@@ -79630,7 +79630,7 @@ activate = 1\n";
         assert_eq!(EXACT_RUST_TOOLCHAIN_TOML.len(), 239);
         assert_eq!(
             lower_hex(&sha256(EXACT_RUST_TOOLCHAIN_TOML.as_bytes())),
-            "58ab2dcb0e12130199f0f404141dc333734cbc28c1f163f9f0c7ccd1f2a2a37f",
+            "3dfb847b66ecd2cae1194e79c1c60d58e03991f926b6ef89590598216e2d34e3",
         );
         assert!(is_exact_rust_toolchain_document(
             EXACT_RUST_TOOLCHAIN_TOML.as_bytes(),
@@ -79645,8 +79645,8 @@ activate = 1\n";
             format!("# comment\n{EXACT_RUST_TOOLCHAIN_TOML}"),
             format!("\u{feff}{EXACT_RUST_TOOLCHAIN_TOML}"),
             EXACT_RUST_TOOLCHAIN_TOML.replacen(
-                "channel = \"nightly-2026-07-11\"\nprofile = \"minimal\"",
-                "profile = \"minimal\"\nchannel = \"nightly-2026-07-11\"",
+                "channel = \"nightly-2026-08-20\"\nprofile = \"minimal\"",
+                "profile = \"minimal\"\nchannel = \"nightly-2026-08-20\"",
                 1,
             ),
             EXACT_RUST_TOOLCHAIN_TOML.replacen(
