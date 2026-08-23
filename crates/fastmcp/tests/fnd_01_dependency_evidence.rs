@@ -98927,7 +98927,7 @@ fn fallible(value: Option<u8>) {
     }
 } // mod ordinary
 
-#[cfg(any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(fnd01_bootstrap, not(test)))]
 pub use bootstrap::harness_main;
 #[cfg(all(not(fnd01_bootstrap), not(test)))]
 pub use ordinary::harness_main;
