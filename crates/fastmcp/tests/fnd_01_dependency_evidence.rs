@@ -78031,6 +78031,15 @@ activate = 1\n";
             )
             .at("distribution probe"));
         }
+        if pointer_get(document, "/asupersync/release_pin", SUBJECT)?.as_str() != Some(RELEASE_PIN)
+            || pointer_get(document, "/asupersync/workspace_selection", SUBJECT)?.as_str()
+                != Some("Cargo.toml workspace.dependencies.asupersync = { version = \"=0.4.9\" } with no features key")
+            || pointer_get(document, "/asupersync/fnd_04_prerequisites/status_at_pin", SUBJECT)?
+                .as_str()
+                != Some("partially resolved; final release qualification remains blocked")
+        {
+            return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("release pin drift"));
+        }
         if *document != toolchain_asupersync_document(files)? {
             return Err(Diagnostic::error("E_TOOLCHAIN_ASUPERSYNC", SUBJECT).at("document"));
         }
