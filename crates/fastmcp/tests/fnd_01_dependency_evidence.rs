@@ -91974,18 +91974,18 @@ fn fallible(value: Option<u8>) {
             OrdinaryToolProbeFixture { tool_id: "cargo-clippy", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/cargo-clippy", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
             OrdinaryToolProbeFixture { tool_id: "clippy-driver", parser_id: "clippy-pinned-nightly", selected_lexical: "/fixture/toolchains/nightly-2026-07-11/bin/clippy-driver", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_CLIPPY_B64, raw_sha256: "0ae76f82f831aea0cb8537bd5bc37ddc91c3c709b502e87d07cc3f4e4fb5370b" },
             OrdinaryToolProbeFixture { tool_id: "rust-lld", parser_id: "lld-gnu-version", selected_lexical: "/fixture/sysroot/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld", argv_tail: &["-flavor", "gnu", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_RUST_LLD_B64, raw_sha256: "cf7558b748e63be07ad8a4ea32997ff7315fe798159af4194065e4e852008bd3" },
-            OrdinaryToolProbeFixture { tool_id: "llvm-nm", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-nm-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_NM_B64, raw_sha256: "a68721459737cfa09b9215344fed1aa8d05068472fc496b5ec1ba53fa9dff24b" },
-            OrdinaryToolProbeFixture { tool_id: "openssl", parser_id: "openssl-version-a", selected_lexical: "/usr/bin/openssl", argv_tail: &["version", "-a"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_OPENSSL_B64, raw_sha256: "34203b8a6481d7dc9897573e3048aeaec5c04bb149217f5ed5621dc7da1120ca" },
+            OrdinaryToolProbeFixture { tool_id: "llvm-nm", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-nm-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_NM_B64, raw_sha256: "a9a6125fbdabb754b16d35d5e345f35746e2f43f4c0b0a5e08b94194b52859fb" },
+            OrdinaryToolProbeFixture { tool_id: "openssl", parser_id: "openssl-version-a", selected_lexical: "/usr/bin/openssl", argv_tail: &["version", "-a"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_OPENSSL_B64, raw_sha256: "7436f55ee9e0598fbe4c9671dff4209d3f1a6c7cd7b2ce5d88381671addfcc21" },
             OrdinaryToolProbeFixture { tool_id: "host-cc", parser_id: "host-c-compiler-v", selected_lexical: "/usr/bin/clang-22", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_HOST_CLANG_B64, raw_sha256: "fbab69bc31638e38b444a45b8a73635d8b6ccaa801e2d958dbd8948182c45964" },
-            OrdinaryToolProbeFixture { tool_id: "host-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
-            OrdinaryToolProbeFixture { tool_id: "host-ranlib", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ranlib-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "host-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "84f80330fb211e9fec28fe8ed57abdd2e0b27c635d433521d9e8f6d2b4f603d9" },
+            OrdinaryToolProbeFixture { tool_id: "host-ranlib", parser_id: "archiver-version", selected_lexical: "/usr/bin/llvm-ranlib-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "84f80330fb211e9fec28fe8ed57abdd2e0b27c635d433521d9e8f6d2b4f603d9" },
             OrdinaryToolProbeFixture { tool_id: "aarch64-linux-cc", parser_id: "aarch64-c-compiler-v", selected_lexical: "/usr/bin/aarch64-linux-gnu-gcc", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_AARCH64_GCC_B64, raw_sha256: "20a5376b7b7e218a03789f05f3d4c29e49d31eb0e54c0356d20e2747629243ae" },
-            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/aarch64-linux-gnu-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_GNU_AR_B64, raw_sha256: "43f5d0d9d22ba26ea2f3bf7843526d9397252213091aed88da1d21894008536e" },
-            OrdinaryToolProbeFixture { tool_id: "apple-clang", parser_id: "apple-clang-version", selected_lexical: "/usr/bin/clang-22", argv_tail: &["--target=aarch64-apple-darwin", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_APPLE_CLANG_B64, raw_sha256: "921c5adaf09212c716a5405f4c8e3142f73213575ee60d31811a04aa68f28f91" },
-            OrdinaryToolProbeFixture { tool_id: "apple-ar", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
-            OrdinaryToolProbeFixture { tool_id: "windows-clang-cl", parser_id: "windows-clang-cl-version", selected_lexical: "/usr/bin/clang-cl-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_WINDOWS_CLANG_B64, raw_sha256: "4cf331bc93b25c3c6c31cc7654125723dadbdb9e8806571f56dd6354786beb76" },
+            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-ar", parser_id: "archiver-version", selected_lexical: "/usr/bin/aarch64-linux-gnu-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_GNU_AR_B64, raw_sha256: "e5346edb4354ec49f5268dc8035e12b599fdfb4d64b2cdf97e8b7400c021d133" },
+            OrdinaryToolProbeFixture { tool_id: "apple-clang", parser_id: "apple-clang-version", selected_lexical: "/usr/bin/clang-22", argv_tail: &["--target=aarch64-apple-darwin", "--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_APPLE_CLANG_B64, raw_sha256: "ba0d433f4f3dfee5bd76bd4d8e0a9347d29bda449ab4a62a6ac04df06ff77ba4" },
+            OrdinaryToolProbeFixture { tool_id: "apple-ar", parser_id: "llvm-version-family", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "84f80330fb211e9fec28fe8ed57abdd2e0b27c635d433521d9e8f6d2b4f603d9" },
+            OrdinaryToolProbeFixture { tool_id: "windows-clang-cl", parser_id: "windows-clang-cl-version", selected_lexical: "/usr/bin/clang-cl-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_WINDOWS_CLANG_B64, raw_sha256: "7754c7b152bef66cb2c8b945914c2dbb4f7e7807adfde46493f95b006392c7f2" },
             OrdinaryToolProbeFixture { tool_id: "windows-lib", parser_id: "llvm-lib-help", selected_lexical: "/usr/bin/llvm-lib-22", argv_tail: &["/help"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_LIB_B64, raw_sha256: "815c4f3d012e79d0f2c3d0a7ffb23bf69c648249ad5187ad1246bac69c6a0f1c" },
-            OrdinaryToolProbeFixture { tool_id: "windows-lld-link", parser_id: "lld-coff-version", selected_lexical: "/usr/bin/lld-link-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLD_LINK_B64, raw_sha256: "170a202b75f25f80cbb26fa3e6e3c7ec02e74a8a7f190aa861d31d59774ff8eb" },
+            OrdinaryToolProbeFixture { tool_id: "windows-lld-link", parser_id: "lld-coff-version", selected_lexical: "/usr/bin/lld-link-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLD_LINK_B64, raw_sha256: "fe472e86073d215e48682fc92d9a214c6eba2bd1416813dfe68f6bac941a056c" },
         ]
     }
 
@@ -92205,7 +92205,7 @@ fn fallible(value: Option<u8>) {
             "clippy-pinned-nightly" => (b"clippy 0.1.99", b"clippy 0.1.98"),
             "lld-gnu-version" => (b"GNU linkers", b"GNV linkers"),
             "llvm-version-family" | "archiver-version" | "lld-coff-version" => {
-                (b"22.1.2", b"22.1.3")
+                (b"20.1.8", b"20.1.9")
             }
             "openssl-version-a" => (b"platform: debian-amd64", b"platform: debian-amd65"),
             "host-c-compiler-v" => (
@@ -92378,8 +92378,8 @@ fn fallible(value: Option<u8>) {
             "apple-ar",
             "/usr/bin/llvm-ar-22",
             ORDINARY_PROBE_LLVM_TOOL_B64,
-            b"22.1.2",
-            b"22.1.3",
+            b"20.1.8",
+            b"20.1.9",
             "llvm-version-family|apple-ar: exact-line[0]",
         );
         supplementary_role_grammars += 1;
@@ -92388,8 +92388,8 @@ fn fallible(value: Option<u8>) {
             "aarch64-linux-ar",
             "/usr/bin/aarch64-linux-gnu-ar",
             ORDINARY_PROBE_GNU_AR_B64,
+            b"2.45",
             b"2.46",
-            b"2.47",
             "archiver-version|aarch64-linux-ar: exact-line[0]",
         );
         supplementary_role_grammars += 1;
@@ -92398,8 +92398,8 @@ fn fallible(value: Option<u8>) {
             "host-ranlib",
             "/usr/bin/ranlib",
             ORDINARY_PROBE_GNU_RANLIB_B64,
+            b"2.45",
             b"2.46",
-            b"2.47",
             "archiver-version|host-ranlib: exact-line[0]",
         );
         supplementary_role_grammars += 1;
@@ -92696,12 +92696,12 @@ fn fallible(value: Option<u8>) {
         );
         assert_eq!(
             encode_lower_hex(&baseline.observations[openssl].raw_sha256),
-            "34203b8a6481d7dc9897573e3048aeaec5c04bb149217f5ed5621dc7da1120ca",
+            "7436f55ee9e0598fbe4c9671dff4209d3f1a6c7cd7b2ce5d88381671addfcc21",
             "frozen baseline OpenSSL raw digest",
         );
         assert_eq!(
             encode_lower_hex(&changed.observations[openssl].raw_sha256),
-            "ad22925207ab43bd5914df86f30206124f71bf763a347be0d0aea573ff243666",
+            "e350540ee306c1a65e61b809e8a14ffb0a6d0c60c035db2a0af66bad19141d08",
             "frozen changed OpenSSL raw digest",
         );
         for ordinal in 0..20 {
