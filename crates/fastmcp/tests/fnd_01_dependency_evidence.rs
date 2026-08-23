@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 904796;
 const FROZEN_POLICY_SHA256: &str =
-    "b526836d25ed7a082e32f8a5099680ef0a4a2ed2a8c3b15626d0ec2a38b54327";
+    "1dbe60378c7d4bd97a9bf5bc8fc9e694b899dc2b33005ee81de791f26f144b14";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34321,7 +34321,7 @@ mod ordinary {
     const BOOTSTRAP_MANIFEST_SHA256: &str =
         "46e94fe446043694b7b7305e2c1d29260cfeac1d7d8982e4e07bf7837a3a72b2";
     const SOURCE_TREE_SHA256: &str =
-        "b79e1e235c329a99cb9785ab51515499968ddcba840629bfc04a0c6e5f8cf0b8";
+        "10cafa60d8c12320720a0f4561ff64cce16a81f182fa0a28f409ce302e6c9e41";
     const NEGATIVE_INVENTORY_SHA256: &str =
         "294b4285f5fd3f0c36a3cb7dd8fccfb967dde29405805f3e1609858c75c973d5";
     const INTEGRATION_PRODUCER: &str = "bd-mcp-2026-07-28-support-ahet.1.1";
@@ -35266,8 +35266,8 @@ activate = 1\n";
             "serialization",
             "bd-mcp-2026-07-28-support-ahet.1.7",
             2,
-            64_187,
-            "d0c43f5edb32bd8a440716e30bcbef8da0705c08b9d24d0c4a1116d465f6f580",
+            64518,
+            "46dd698e88b6a243aaad0efcd41dc1411efd1f65c0b4d529decaf611896576d0",
         ),
         (
             "jose",
@@ -36571,6 +36571,7 @@ activate = 1\n";
         static_evidence: ValidatedSdkStaticEvidence,
         execution: ExecutionValidation,
         support_claim: bool,
+        source_tree_sha256: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40829,7 +40830,7 @@ activate = 1\n";
             || policy.integration_producer_bead != INTEGRATION_PRODUCER
             || policy.final_attester_bead != FINAL_ATTESTER
             || policy.source_input_count != EXPECTED_SOURCE_FILES
-            || policy.source_input_total_bytes != 3018964
+            || policy.source_input_total_bytes != 3019295
             || policy.negative_case_count != EXPECTED_NEGATIVES
             || policy.derived_output_count != EXPECTED_RECEIPTS
             || policy.derived_toml_count != EXPECTED_RECEIPT_TOMLS
@@ -73883,6 +73884,7 @@ activate = 1\n";
         }
         fnd_01_sdk_matrix_validate_revision_six_dimensions(&document, files)?;
         fnd_01_sdk_matrix_validate_revision_six_contract(&document)?;
+        let source_tree_sha256 = lower_hex(&validate_source_tree(files, policy)?);
         let static_evidence = derive_sdk_revision_six_static_evidence(&document, files, policy)?;
         let execution = match external_facts {
             ExternalSdkExecutionFacts::Absent => ExecutionValidation::Unverified,
@@ -73906,6 +73908,7 @@ activate = 1\n";
             static_evidence,
             execution,
             support_claim: false,
+            source_tree_sha256,
         })
     }
 
@@ -75897,9 +75900,15 @@ activate = 1\n";
                 "serialization-uri advisory",
             )? != "ebddc1a4d8e7901cfa2171932950ca6a69f92c08b2159fb35b3e98ceb16e8ef8"
             || record_string(advisory, "result", "serialization-uri advisory")?
-                != "recorded historical clean result; execution remains unverified"
+                != "clean result reproduced 2026-08-23 against pinned advisory-db 7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2"
             || record_string(advisory, "execution_status", "serialization-uri advisory")?
-                != "recorded-unverified"
+                != "reproduced-and-bound"
+            || record_string(advisory, "reproduction_tool_version", "serialization-uri advisory")?
+                != "cargo-audit-audit 0.22.0"
+            || record_string(advisory, "consumer_lock_sha256", "serialization-uri advisory")?
+                != lower_hex(&sha256(consumer_lock_bytes))
+            || record_string(advisory, "reproduction_output_sha256", "serialization-uri advisory")?
+                != "ebddc1a4d8e7901cfa2171932950ca6a69f92c08b2159fb35b3e98ceb16e8ef8"
             || !record_array(advisory, "vulnerabilities", "serialization-uri advisory")?.is_empty()
             || !record_array(advisory, "warnings", "serialization-uri advisory")?.is_empty()
             || !record_array(
@@ -88045,6 +88054,12 @@ original = "value"
         .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()));
         assert_eq!(validation.execution, ExecutionValidation::Unverified);
         assert!(!validation.support_claim);
+        assert_eq!(
+            validation.source_tree_sha256,
+            lower_hex(&validate_source_tree(&files, &policy)
+                .unwrap_or_else(|diagnostic| panic!("{}", diagnostic.stable()))),
+            "typed join must carry the exact FND-01 frozen source-tree identity",
+        );
         sdk_validate_zero_credit_claims(false, false)
             .expect("successful public receipt preserves zero credit and no support claim");
         assert_eq!(validation.static_evidence.peers.len(), 4);

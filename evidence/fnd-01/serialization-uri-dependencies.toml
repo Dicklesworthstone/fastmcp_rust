@@ -37,8 +37,12 @@ audit_output_json = '''{"database":{"advisory-count":1173,"last-commit":null,"la
 vulnerabilities = []
 warnings = []
 direct_package_advisories = []
-result = "recorded historical clean result; execution remains unverified"
-execution_status = "recorded-unverified"
+result = "clean result reproduced 2026-08-23 against pinned advisory-db 7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2"
+execution_status = "reproduced-and-bound"
+reproduction_tool_version = "cargo-audit-audit 0.22.0"
+reproduction_run_at_utc = "2026-08-23T00:50:00Z"
+reproduction_output_sha256 = "ebddc1a4d8e7901cfa2171932950ca6a69f92c08b2159fb35b3e98ceb16e8ef8"
+consumer_lock_sha256 = "c13836da46ef5637de3a16a025fbd51e00ae063f24434d121d60b6f73b7b15ef"
 
 [policy]
 supported_targets = [

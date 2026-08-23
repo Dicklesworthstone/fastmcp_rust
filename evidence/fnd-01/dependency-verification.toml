@@ -15,7 +15,7 @@ authoring_bead = "bd-mcp-2026-07-28-support-ahet.1.14"
 integration_producer_bead = "bd-mcp-2026-07-28-support-ahet.1.1"
 final_attester_bead = "bd-mcp-2026-07-28-support-ahet.1.15"
 source_input_count = 71
-source_input_total_bytes = 3018964
+source_input_total_bytes = 3019295
 negative_case_count = 188
 derived_output_count = 14
 derived_toml_count = 10
@@ -152,8 +152,8 @@ ordering = "ascending raw path bytes"
 record_encoding = "u32be(path_len) || path || u64be(file_len) || raw_sha256(file_bytes)"
 domain_prefix = "none"
 file_count = 71
-total_bytes = 3018964
-sha256 = "b79e1e235c329a99cb9785ab51515499968ddcba840629bfc04a0c6e5f8cf0b8"
+total_bytes = 3019295
+sha256 = "10cafa60d8c12320720a0f4561ff64cce16a81f182fa0a28f409ce302e6c9e41"
 excluded_exact_paths = [
   "evidence/fnd-01/dependency-verification.toml",
   "crates/fastmcp/tests/fnd_01_dependency_evidence.rs",
@@ -5663,8 +5663,8 @@ tree_sha256 = "0a8e5976338ea2378e25727a0905001f29d4babd385c4eba842e199031d06941"
 id = "serialization"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.7"
 file_count = 2
-total_bytes = 64187
-tree_sha256 = "d0c43f5edb32bd8a440716e30bcbef8da0705c08b9d24d0c4a1116d465f6f580"
+total_bytes = 64518
+tree_sha256 = "46dd698e88b6a243aaad0efcd41dc1411efd1f65c0b4d529decaf611896576d0"
 
 [[source_family]]
 id = "jose"
@@ -6794,8 +6794,8 @@ id = "s32"
 family = "serialization"
 owner_bead = "bd-mcp-2026-07-28-support-ahet.1.7"
 path = "evidence/fnd-01/serialization-uri-dependencies.toml"
-byte_length = 33461
-sha256 = "ef0eee8ba450565773587f9d4825ea50f296f0270208a1054b3a12758cb4e22e"
+byte_length = 33792
+sha256 = "72c385308ec4487eab34f50e2f17c78f07e7c136b8339110f81b01e41b48af1a"
 parse_kind = "toml"
 observation_kind = "local_file"
 bytes_available = true
