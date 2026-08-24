@@ -3669,10 +3669,36 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             serde_json::json!({ "type": "boolean" })
         },
         "Option" => {
-            // For Option<T>, get the inner type
+            // For Option<T>, emit T's schema widened to admit JSON null, so
+            // callers may spell "omitted" as an explicit null (serde maps both
+            // to None). Schemas without a "type" keyword (empty or custom
+            // object schemas) are left untouched: an absent "type" already
+            // admits null, and custom json_schema() output is not ours to
+            // rewrite.
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                    return type_to_json_schema(inner_ty);
+                    let inner_schema = type_to_json_schema(inner_ty);
+                    return quote! {{
+                        let mut schema = #inner_schema;
+                        if let Some(obj) = schema.as_object_mut() {
+                            match obj.get_mut("type") {
+                                Some(serde_json::Value::String(existing)) => {
+                                    let existing = existing.clone();
+                                    obj.insert(
+                                        "type".to_string(),
+                                        serde_json::json!([existing, "null"]),
+                                    );
+                                }
+                                Some(serde_json::Value::Array(types)) => {
+                                    if !types.iter().any(|t| t == "null") {
+                                        types.push(serde_json::json!("null"));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        schema
+                    }};
                 }
             }
             quote! { serde_json::json!({}) }
@@ -4811,23 +4837,29 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 param_extractions.push(quote! {
                     let #name: #ty = match arguments.get(#name_str) {
-                        Some(value) => Some(
+                        // Explicit JSON null on an Option parameter is the
+                        // wire spelling of "omitted": fall through to the
+                        // default exactly as if the field were absent.
+                        Some(value) if !value.is_null() => Some(
                             serde_json::from_value(value.clone()).map_err(|e| {
                                 fastmcp_core::McpError::invalid_params(e.to_string())
                             })?,
                         ),
-                        None => #default_expr,
+                        _ => #default_expr,
                     };
                 });
             } else {
                 param_extractions.push(quote! {
                     let #name: #ty = match arguments.get(#name_str) {
-                        Some(value) => Some(
+                        // Explicit JSON null on an Option parameter is the
+                        // wire spelling of "omitted" (Python parity): both
+                        // deserialize to None.
+                        Some(value) if !value.is_null() => Some(
                             serde_json::from_value(value.clone()).map_err(|e| {
                                 fastmcp_core::McpError::invalid_params(e.to_string())
                             })?,
                         ),
-                        None => None,
+                        _ => None,
                     };
                 });
             }
@@ -5901,7 +5933,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// //   "type": "object",
 /// //   "properties": {
 /// //     "name": { "type": "string", "description": "The name of the person" },
-/// //     "age": { "type": "integer", "description": "Optional age" },
+/// //     "age": { "type": ["integer", "null"], "description": "Optional age" },
 /// //     "tags": { "type": "array", "items": { "type": "string" }, "description": "List of tags" }
 /// //   },
 /// //   "required": ["name", "tags"]
@@ -5914,7 +5946,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - `i8`..`i128`, `u8`..`u128`, `isize`, `usize` → `"integer"`
 /// - `f32`, `f64` → `"number"`
 /// - `bool` → `"boolean"`
-/// - `Option<T>` → schema for T, field not required
+/// - `Option<T>` → schema for T widened with `"null"` (e.g. `["integer", "null"]`), field not required; explicit JSON `null` is treated as omitted
 /// - `Vec<T>` → `"array"` with items schema
 /// - `HashMap<String, T>` → `"object"` with additionalProperties
 /// - Other types → `"object"` (custom types should derive JsonSchema)

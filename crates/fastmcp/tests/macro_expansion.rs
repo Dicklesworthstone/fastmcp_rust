@@ -654,6 +654,26 @@ fn tool_call_missing_required_param_errors() {
     assert!(result.is_err());
 }
 
+#[test]
+fn tool_call_optional_param_explicit_null_matches_omitted() {
+    let handler = AddNumbers;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"a": 3, "b": 4, "label": null}))
+        .unwrap();
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "7");
+}
+
+#[test]
+fn tool_call_required_param_still_rejects_null() {
+    let handler = AddNumbers;
+    let ctx = test_ctx();
+    // `a` is i64, not Option<i64>: explicit null stays a loud type error.
+    let result = handler.call(&ctx, json!({"a": null, "b": 4}));
+    assert!(result.is_err());
+}
+
 // --- Tool with default parameter value ---
 
 /// Greets with a default punctuation suffix.
@@ -680,6 +700,41 @@ fn tool_call_uses_default_param_when_missing() {
     let result = handler.call(&ctx, json!({"name": "World"})).unwrap();
     let text = expect_text(&result[0]);
     assert_eq!(text, "Hello, World!");
+}
+
+// --- Tool with a defaulted Option parameter ---
+
+/// Echoes with a defaulted optional suffix.
+#[tool(defaults(suffix = "?"))]
+fn echo_defaulted_option(msg: String, suffix: Option<String>) -> String {
+    format!("{msg}{}", suffix.unwrap_or_default())
+}
+
+#[test]
+fn tool_defaulted_option_omitted_uses_default() {
+    let handler = EchoDefaultedOption;
+    let ctx = test_ctx();
+    let result = handler.call(&ctx, json!({"msg": "hi"})).unwrap();
+    assert_eq!(expect_text(&result[0]), "hi?");
+}
+
+#[test]
+fn tool_defaulted_option_explicit_null_uses_default() {
+    let handler = EchoDefaultedOption;
+    let ctx = test_ctx();
+    // null is the wire spelling of "omitted", so the default applies.
+    let result = handler.call(&ctx, json!({"msg": "hi", "suffix": null})).unwrap();
+    assert_eq!(expect_text(&result[0]), "hi?");
+}
+
+#[test]
+fn tool_defaulted_option_value_wins() {
+    let handler = EchoDefaultedOption;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"msg": "hi", "suffix": "!"}))
+        .unwrap();
+    assert_eq!(expect_text(&result[0]), "hi!");
 }
 
 // --- Tool with context parameter ---
@@ -1672,6 +1727,30 @@ fn tool_all_optional_call_empty() {
     let result = handler.call(&ctx, json!({})).unwrap();
     let text = expect_text(&result[0]);
     assert_eq!(text, "a=none, b=none, c=none");
+}
+
+#[test]
+fn tool_optional_param_schema_is_nullable_union() {
+    let handler = AllOptionalTool;
+    let def = handler.definition();
+    let props = def.input_schema["properties"].as_object().unwrap();
+    assert_eq!(props["a"]["type"], json!(["string", "null"]));
+    assert_eq!(props["b"]["type"], json!(["integer", "null"]));
+    assert_eq!(props["c"]["type"], json!(["boolean", "null"]));
+    // Optional params stay out of `required` even though they admit null.
+    let required = def.input_schema["required"].as_array().unwrap();
+    assert_eq!(required.len(), 0);
+}
+
+#[test]
+fn tool_all_optional_call_explicit_null_is_omitted() {
+    let handler = AllOptionalTool;
+    let ctx = test_ctx();
+    let result = handler
+        .call(&ctx, json!({"a": null, "b": 42, "c": null}))
+        .unwrap();
+    let text = expect_text(&result[0]);
+    assert_eq!(text, "a=none, b=42, c=none");
 }
 
 #[test]
@@ -3189,7 +3268,8 @@ fn json_schema_struct_field_types() {
     let schema = Person::json_schema();
     let props = schema["properties"].as_object().unwrap();
     assert_eq!(props["name"]["type"], "string");
-    assert_eq!(props["age"]["type"], "integer");
+    // Option<u32> widens to a nullable union: explicit null == omitted.
+    assert_eq!(props["age"]["type"], json!(["integer", "null"]));
     assert_eq!(props["tags"]["type"], "array");
     assert_eq!(props["tags"]["items"]["type"], "string");
 }

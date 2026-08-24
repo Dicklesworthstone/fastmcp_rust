@@ -8,7 +8,19 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## [Unreleased] (after v0.7.0)
 
-_No unreleased changes._
+### Macros / schema generation
+
+- **`Option<T>` tool parameters are now nullable on the wire.** The generated
+  input schema widens `Option<T>` to a `["<T>", "null"]` type union, and the
+  generated extraction treats an explicit JSON `null` argument exactly like an
+  omitted field (both produce `None`; a declared `default` still applies).
+  Previously an explicit `null` failed input-schema validation and, past that,
+  deserialization — surfacing as `InvalidParams` naming the field. Required
+  (non-`Option`) parameters still reject `null` loudly. The same widening
+  applies to `Option<T>` fields in `#[derive(JsonSchema)]` structs, whose
+  serde deserialization already accepted `null`. Schemas without a `"type"`
+  keyword (empty or custom `json_schema()` shapes) are left untouched.
+  (Requested via mcp_agent_mail_rust GH#255 transcript-safe identity parity.)
 
 ---
 
