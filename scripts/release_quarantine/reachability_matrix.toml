@@ -1,0 +1,88 @@
+# REL-QUAR-00 checked-in event/job/permission/action reachability matrix.
+#
+# Bead: bd-mcp-rel-quar-00-p1f0 (fastmcp_rust).
+#
+# Every mandated event source must terminate in an EXTERNALLY INERT state:
+# zero external mutation (no crates publish, no GitHub release, no tag
+# creation/move, no public asset upload) and zero secret access.
+#
+# `reachable_workflows` is cross-checked by quarantine_reachability.py
+# against the triggers actually parsed from .github/workflows/*.yml. A
+# mismatch is a quarantine finding: it means a trigger was added/removed
+# without updating this matrix (or vice versa).
+#
+# Provider-side facts (workflow disablement, credential rotation, live runs)
+# are NOT encoded here; they are collected read-only via
+# `quarantine_reachability.py --provider-audit`.
+
+[[paths]]
+source = "tag_push"
+reachable_workflows = []
+terminal_state = "externally_inert"
+rationale = "No checked-in workflow declares a tag or push.tags trigger; a tag push starts nothing. Quarantine policy rejects any tags trigger, so drift fails closed."
+
+[[paths]]
+source = "branch_push"
+reachable_workflows = [".github/workflows/ci.yml"]
+terminal_state = "externally_inert"
+rationale = "CI listens on push.branches [main] only and runs with contents:read, SHA-pinned allowlisted actions, persist-credentials:false, no secrets references, and private expiring artifacts only."
+
+[[paths]]
+source = "pull_request"
+reachable_workflows = [".github/workflows/ci.yml"]
+terminal_state = "externally_inert"
+rationale = "CI pull_request runs inherit the read-only fork token by construction; no workflow secret is referenced anywhere in the definition."
+
+[[paths]]
+source = "manual_dispatch"
+reachable_workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml"]
+terminal_state = "externally_inert"
+rationale = "Both workflows allow workflow_dispatch with ZERO inputs, so no dispatch input can reach a shell command, ref, environment, action argument, or credential selection. The release identity is additionally provider-disabled (verified via --provider-audit)."
+
+[[paths]]
+source = "rerun"
+reachable_workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml"]
+terminal_state = "externally_inert"
+rationale = "A rerun re-executes one of the event classes above under the same inert definitions; rerunning the provider-disabled release identity remains blocked by its disabled state."
+
+[[paths]]
+source = "reusable_invocation"
+reachable_workflows = []
+terminal_state = "externally_inert"
+rationale = "No workflow declares workflow_call; there is no reusable-workflow entry point to invoke permissively. Any workflow_call trigger is a quarantine finding."
+
+[[paths]]
+source = "environment_approval"
+reachable_workflows = []
+terminal_state = "externally_inert"
+rationale = "No job declares a GitHub environment and none is referenced; environment-gated approval cannot gate any mutation path because no such path exists."
+
+[[paths]]
+source = "fork_context"
+reachable_workflows = [".github/workflows/ci.yml"]
+terminal_state = "externally_inert"
+rationale = "Fork PRs run CI with the unprivileged fork-scoped GITHUB_TOKEN; the definitions reference no repository/org/environment secrets at all."
+
+[[paths]]
+source = "token_present"
+reachable_workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml"]
+terminal_state = "externally_inert"
+rationale = "Token presence changes nothing: every permission block is contents:read, no step reads any secret expression, and checkout uses persist-credentials:false."
+
+[[paths]]
+source = "token_absent"
+reachable_workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml"]
+terminal_state = "externally_inert"
+rationale = "Definitions never dereference secrets, so removing every token leaves behavior identical: build/test/package diagnostics only."
+
+[[paths]]
+source = "adversarial_ref_input"
+reachable_workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml"]
+terminal_state = "externally_inert"
+rationale = "Dispatch declares no inputs; push/PR events carry no attacker-controlled version/tag input into any command. Historical-ref dispatch of OLD publisher YAML is neutralized only by the provider-disabled immutable workflow ID plus credential rotation, which --provider-audit verifies read-only."
+
+[[paths]]
+source = "historical_queued_run"
+reachable_workflows = [".github/workflows/ci.yml", ".github/workflows/release.yml"]
+terminal_state = "externally_inert"
+rationale = "Policy: a source edit can never mark a queued/in-progress pre-quarantine run safe. --provider-audit enumerates live runs of the release identity; ANY non-completed run is reported as a blocking stop-the-line fact requiring separately authorized human provider review."
