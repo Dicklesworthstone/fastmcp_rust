@@ -6,7 +6,17 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.7.0)
+## [Unreleased] (after v0.7.1)
+
+## [v0.7.1](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.7.1) -- 2026-08-24 (GitHub Release)
+
+A patch release with one wire-visible change. The bulk of the 110 commits since
+v0.7.0 are FND-01 supply-chain verification harness maintenance — assertion
+baselines, pinned tool identities, fixture digests — which changes no public
+API and is not enumerated here.
+
+Consumers on `^0.7` pick this up without a manifest edit, which is the point:
+the schema fix below was requested by a downstream that is pinned there.
 
 ### Macros / schema generation
 
@@ -21,6 +31,23 @@ Format: version timeline, organized by landed capabilities. Commit links point t
   serde deserialization already accepted `null`. Schemas without a `"type"`
   keyword (empty or custom `json_schema()` shapes) are left untouched.
   (Requested via mcp_agent_mail_rust GH#255 transcript-safe identity parity.)
+
+### Fixed
+
+- **Null-union widening is now idempotent.** Re-running schema generation over
+  an already-widened `Option<T>` no longer nests a second `"null"` into the
+  type union.
+
+### Internal
+
+- FND-01 evidence harness: re-froze assertion baselines and dependency
+  verification digests after tool-identity rebinds, restored the audited redis
+  probe candidate pin `=1.4.1` (an unauthorized `=1.6.0` bump had broken
+  `E_SHA256_MISMATCH` admission across roughly two dozen shared-verifier
+  tests), and fixed an `E0252` collision where a peer-gate conversion made
+  `bootstrap::harness_main` export on plain `linux-x86_64` builds.
+- Release quarantine: checked-in reachability matrix plus a fail-closed
+  checker; quarantine identity re-frozen after action-pin bumps.
 
 ---
 
