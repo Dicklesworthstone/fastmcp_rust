@@ -2,7 +2,7 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use fastmcp_rust::prelude::*;
+use fastmcp_rust::{auto::Server, prelude::*};
 
 #[tool]
 fn echo(ctx: &McpContext, message: String) -> String {
