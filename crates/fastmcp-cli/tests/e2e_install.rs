@@ -1512,7 +1512,11 @@ fn e2e_install_dry_run_redacts_arguments_and_sanitizes_names_and_paths() {
         ],
     );
     assert!(output.status.success());
-    assert!(output.stderr.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "expected no stderr, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = stdout_str(&output);
     for secret in [POSITIONAL_SECRET, ATTACHED_SECRET, SHORT_SECRET] {
         assert!(!stdout.contains(secret));
