@@ -87,8 +87,8 @@
 ---
 
 ```bash
-# Historical published package; it does not contain unverified in-tree work
-cargo add fastmcp-rust
+# Current published package; publication is not aggregate conformance evidence
+cargo add fastmcp-rust@0.7.0
 
 # Or use the git dependency for bleeding-edge changes
 cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
@@ -323,15 +323,15 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ## Installation
 
-### From crates.io (historical 0.3.2 package)
+### From crates.io (current 0.7.0 package)
 
-The published `0.3.2` package predates the current in-tree hardening work. Do
-not treat installing it as evidence for the source-tree examples or MCP
-2026-07-28 support.
+The non-yanked `0.7.0` package was published on 2026-08-20. Publication does
+not establish aggregate MCP 2026-07-28 conformance, production readiness, or
+qualification of every in-tree feature.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.3.2"
+fastmcp-rust = "0.7.0"
 ```
 
 ### As a Git Dependency
@@ -351,10 +351,11 @@ cargo build --release
 
 ### CLI binaries (GitHub Releases)
 
-Current `fastmcp` binaries are published on GitHub Releases, not crates.io.
-Archives use `fastmcp-<os>-<arch>` names (`.tar.xz` on Unix, `.zip` on
-Windows). Linux and macOS ship amd64/x86_64 and arm64/aarch64 aliases;
-Windows ships amd64 MSVC.
+Prebuilt `fastmcp` binaries are published on GitHub Releases. The
+`fastmcp-cli` source package is also available from crates.io for Cargo-based
+installation. Release archives use `fastmcp-<os>-<arch>` names (`.tar.xz` on
+Unix, `.zip` on Windows). Linux and macOS ship amd64/x86_64 and arm64/aarch64
+aliases; Windows ships amd64 MSVC.
 
 ```bash
 # Example: macOS Apple Silicon
@@ -363,10 +364,10 @@ tar -xJf fastmcp-darwin-arm64.tar.xz
 ./fastmcp --version
 ```
 
-### CLI (optional; historical 0.3.2 package)
+### CLI via Cargo (optional)
 
 ```bash
-cargo install fastmcp-cli
+cargo install fastmcp-cli --version 0.7.0
 ```
 
 ### Client request deadlines (current source tree)
@@ -412,7 +413,7 @@ caller-owned cancellation domain for those ordinary verbs.
 Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse` when the GET event
 stream and POST message endpoints are already known.
 
-The published 0.3.2 CLI predates these flags. From a current source checkout,
+The published 0.7.0 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
 ```bash

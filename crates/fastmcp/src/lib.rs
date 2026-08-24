@@ -23,8 +23,10 @@
 //! (`rust-version = "1.100"`). Do not assume JWT/OIDC production readiness,
 //! Redis Tasks, Apps media rendering, or aggregate release-gate evidence from
 //! this façade alone.
-//! Release publication remains quarantined; these crate docs do not supply
-//! publication authority or provider-side release-safety evidence.
+//! Version `0.7.0` has been published; publication does not resolve the open
+//! release-qualification and license-representation findings, and these crate
+//! docs do not supply aggregate conformance or provider-side release-safety
+//! evidence.
 //!
 //! # Quick Start
 //!
