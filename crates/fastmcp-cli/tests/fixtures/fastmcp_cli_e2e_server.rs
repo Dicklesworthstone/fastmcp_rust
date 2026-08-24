@@ -2,7 +2,7 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use fastmcp_rust::{auto::Server, prelude::*};
+use fastmcp_rust::{auto::ServerBuilder, prelude::*};
 
 #[tool]
 fn echo(ctx: &McpContext, message: String) -> String {
@@ -26,7 +26,7 @@ fn greeting(_ctx: &McpContext, name: String) -> Vec<PromptMessage> {
 }
 
 fn main() {
-    Server::new("fastmcp-cli-e2e-server", "1.0.0")
+    ServerBuilder::new("fastmcp-cli-e2e-server", "1.0.0")
         .tool(Echo)
         .resource(StatusResource)
         .prompt(GreetingPrompt)

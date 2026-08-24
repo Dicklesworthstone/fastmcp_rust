@@ -22,7 +22,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fastmcp_protocol::{LegacyContent, LegacyPromptMessage, LegacyResourceContent, Tool};
-use fastmcp_rust::prelude::{MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES};
+use fastmcp_rust::modern::{MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES};
 use fastmcp_rust::server::FinalMethodOutcome;
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
@@ -452,7 +452,7 @@ impl LifecycleThreadHarness {
     where
         F: FnOnce(&Cx, fastmcp_rust::memory::MemoryTransport) -> McpResult<()> + Send + 'static,
     {
-        let (peer, server_transport) = create_memory_transport_pair();
+        let (peer, server_transport) = fastmcp_rust::memory::create_memory_transport_pair();
         // This must be unbounded: an assertion can unwind before it observes
         // the result, and the worker must still be able to exit so the RAII
         // join guard can settle it instead of waiting on a blocked send.
@@ -576,16 +576,13 @@ fn assert_live_facade_era_admission<F>(
         1,
         "{facade}: era-correct tool request must mutate the real handler exactly once"
     );
+    let expected_result_type = opening_is_modern.then(|| json!("complete"));
     assert_eq!(
         accepted
             .result
             .as_ref()
             .and_then(|result| result.get("resultType")),
-        if opening_is_modern {
-            Some(&json!("complete"))
-        } else {
-            None
-        },
+        expected_result_type.as_ref(),
         "{facade}: successful tool response must retain its era-specific framing"
     );
 
@@ -2000,7 +1997,7 @@ impl ResourceHandler for PublicTypedMrtrResource {
             self.resumed_calls.fetch_add(1, Ordering::SeqCst);
             if self
                 .input_required_after_resume
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

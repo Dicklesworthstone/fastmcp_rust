@@ -144,7 +144,7 @@ fn facade_websocket_surface_is_namespace_consistent() {
             let legacy_client = fastmcp_rust::legacy_2024::ClientBuilder::new()
                 .connect_websocket_with_cx(cx, legacy_transport)
                 .await?;
-            let _ = legacy_client.session();
+            let _ = legacy_client.server_capabilities();
 
             let auto_client = fastmcp_rust::auto::ClientBuilder::new()
                 .connect_websocket_auto_with_cx(cx, move |_| async move {
@@ -175,10 +175,10 @@ fn facade_websocket_surface_is_namespace_consistent() {
         let _: Option<prelude::WebSocketResponse> = None;
         let _: Option<prelude::BoundWebSocketServer> = None;
         let _: Option<prelude::WebSocketServerShutdown> = None;
-        let _ = fastmcp_rust::modern::Server::bind_websocket;
+        let _ = fastmcp_rust::modern::Server::bind_websocket::<String>;
         #[cfg(feature = "legacy-2024-11-05")]
         {
-            let _ = fastmcp_rust::legacy_2024::Server::bind_websocket;
+            let _ = fastmcp_rust::legacy_2024::Server::bind_websocket::<String>;
         }
     }
 
@@ -435,7 +435,7 @@ fn facade_only_apps_with_legacy_companion_surfaces_compile() {
     let _: Option<legacy_2024::LegacyReverseRequestHandlers> = None;
     let _: Option<legacy_2024::LegacySamplingRequestHandler> = None;
     let _: Option<legacy_2024::LegacyRootsRequestHandler> = None;
-    let _: Option<legacy_2024::LegacySseHttpClient> = None;
+    let _: Option<fastmcp_rust::LegacySseHttpClient> = None;
 }
 
 #[cfg(feature = "proxy")]
