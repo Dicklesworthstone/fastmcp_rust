@@ -972,14 +972,12 @@ impl FastMcpConsole {
     }
 
     /// Print a renderable.
+    ///
+    /// Non-rich consoles still render the value through the color-disabled
+    /// backend so structured content is preserved in agent and CI logs.
     pub fn render<R: Renderable>(&self, renderable: &R) {
         let console = self.lock_inner();
-        if self.enabled {
-            console.print_renderable(renderable);
-        } else {
-            // Plain fallback: caller should provide alternative or we log a placeholder
-            console.print_plain("[Complex Output]");
-        }
+        console.print_renderable(renderable);
     }
 
     /// Print a renderable with a trusted plain-text fallback closure.
@@ -1828,6 +1826,20 @@ mod tests {
     }
 
     #[test]
+    fn disabled_render_preserves_renderable_content_without_placeholder() {
+        let (writer, captured) = SharedWriter::new();
+        let console = FastMcpConsole::with_writer(writer, false);
+        let panel = Panel::from_text("plain-render-content-canary");
+
+        console.render(&panel);
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap_or_default();
+        assert_eq!(output.matches("plain-render-content-canary").count(), 1);
+        assert!(!output.contains("[Complex Output]"), "output: {output:?}");
+        assert!(!output.contains('\u{1b}'), "output: {output:?}");
+    }
+
+    #[test]
     fn console_default_impl() {
         // Default should not panic and should produce a valid console
         let console = FastMcpConsole::default();
@@ -1866,7 +1878,6 @@ mod tests {
         for expected in [
             "Hello",
             "plain",
-            "[Complex Output]",
             "--- Title ---",
             "styled",
             "table fallback",
@@ -1878,6 +1889,7 @@ mod tests {
                 "missing {expected:?} from configured writer output: {output:?}"
             );
         }
+        assert!(!output.contains("[Complex Output]"), "output: {output:?}");
         assert!(!output.contains("[bold]"));
     }
 }
