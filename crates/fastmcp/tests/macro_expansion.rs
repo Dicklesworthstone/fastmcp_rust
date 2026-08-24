@@ -166,7 +166,7 @@ fn facade_websocket_surface_is_namespace_consistent() {
     }
 
     async fn binds_modern_websocket(
-        server: &fastmcp_rust::modern::Server,
+        server: fastmcp_rust::modern::Server,
         cx: &Cx,
     ) -> McpResult<()> {
         let listener = server.bind_websocket(cx, String::new()).await?;
@@ -176,7 +176,7 @@ fn facade_websocket_surface_is_namespace_consistent() {
 
     #[cfg(feature = "legacy-2024-11-05")]
     async fn binds_legacy_websocket(
-        server: &fastmcp_rust::legacy_2024::Server,
+        server: fastmcp_rust::legacy_2024::Server,
         cx: &Cx,
     ) -> McpResult<()> {
         let listener = server.bind_websocket(cx, String::new()).await?;
