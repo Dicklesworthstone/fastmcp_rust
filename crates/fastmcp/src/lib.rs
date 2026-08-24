@@ -131,8 +131,16 @@ pub mod __private {
     /// Apps-off bypass around the facade's public feature boundary.
     pub mod protocol {
         #[cfg(feature = "apps")]
+        pub use fastmcp_protocol::common_types::{AbsoluteUri, OpenMetadata};
         pub use fastmcp_protocol::{
-            AbsoluteUri, MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MAX_MCP_APPS_BRIDGE_TEXT_BYTES,
+            CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
+            FinalReadResourceResult, Icon, Prompt, PromptArgument, PromptMessage, Resource,
+            ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate, UriTemplatePart,
+            common_types,
+        };
+        #[cfg(feature = "apps")]
+        pub use fastmcp_protocol::{
+            MAX_MCP_APPS_BRIDGE_IN_FLIGHT, MAX_MCP_APPS_BRIDGE_TEXT_BYTES,
             MCP_APPS_HOST_VIEW_PROTOCOL_VERSION, McpAppsBridgeError, McpAppsBridgeImplementation,
             McpAppsBridgeRequestId, McpAppsCancelledNotification, McpAppsDisplayModeParams,
             McpAppsDownloadContent, McpAppsDownloadFileParams, McpAppsHostCapabilities,
@@ -144,13 +152,6 @@ pub mod __private {
             McpAppsSandboxSignal, McpAppsToolCallParams, McpAppsToolMetadata,
             McpAppsToolVisibility, McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
             McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
-            OpenMetadata,
-        };
-        pub use fastmcp_protocol::{
-            CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalGetPromptResult,
-            FinalReadResourceResult, Icon, Prompt, PromptArgument, PromptMessage, Resource,
-            ResourceContent, ResourceTemplate, Tool, ToolAnnotations, UriTemplate, UriTemplatePart,
-            common_types,
         };
     }
 }
@@ -5778,6 +5779,14 @@ pub mod modern {
         pub fn on_duplicate(self, behavior: DuplicateBehavior) -> Self {
             Self {
                 inner: self.inner.on_duplicate(behavior),
+            }
+        }
+
+        /// Sets logging behavior without changing the modern-only policy.
+        #[must_use]
+        pub fn logging(self, config: LoggingConfig) -> Self {
+            Self {
+                inner: self.inner.logging(config),
             }
         }
 

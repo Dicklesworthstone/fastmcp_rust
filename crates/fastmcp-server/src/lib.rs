@@ -20287,11 +20287,19 @@ mod lib_unit_tests {
                 Some("failing WebSocket child settlement proof complete"),
             );
             let join_cx = Cx::for_testing();
-            let error = listener_task
+            let listener_result = listener_task
                 .join(&join_cx)
                 .await
-                .map_err(|error| format!("failing WebSocket listener join failed: {error:?}"))?
-                .expect_err("failing WebSocket child must prevent a quiescent success result");
+                .map_err(|error| format!("failing WebSocket listener join failed: {error:?}"))?;
+            let error = match listener_result {
+                Err(error) => error,
+                Ok(_) => {
+                    return Err(
+                        "failing WebSocket child unexpectedly produced a quiescent success result"
+                            .to_owned(),
+                    );
+                }
+            };
             if !error
                 .message
                 .contains("WebSocket connection child settlement failure")
@@ -20953,7 +20961,7 @@ mod lib_unit_tests {
                 7_104_i64,
             );
             accepted
-                .write_all(&masked_websocket_message(request))
+                .write_all(&masked_websocket_message(JsonRpcMessage::Request(request)))
                 .await
                 .map_err(|error| format!("valid WebSocket tool write failed: {error}"))?;
             accepted
@@ -21020,7 +21028,7 @@ mod lib_unit_tests {
                 7_105_i64,
             );
             accepted
-                .write_all(&masked_websocket_message(mixed))
+                .write_all(&masked_websocket_message(JsonRpcMessage::Request(mixed)))
                 .await
                 .map_err(|error| format!("mixed WebSocket credential write failed: {error}"))?;
             accepted
@@ -21145,7 +21153,7 @@ mod lib_unit_tests {
             let live_child_release = Arc::clone(&release_live_child);
             let live_child_started = Arc::new(AtomicBool::new(false));
             let live_child_started_observer = Arc::clone(&live_child_started);
-            let mut retained_live = cx
+            let retained_live = cx
                 .spawn_in(&scope, move |_child_cx| async move {
                     live_child_started_observer.store(true, Ordering::Release);
                     while !live_child_release.load(Ordering::Acquire) {
@@ -21235,7 +21243,7 @@ mod lib_unit_tests {
     #[cfg(feature = "websocket")]
     #[test]
     fn websocket_settle_for_returns_listener_failure_after_cleanup() {
-        run_live_http_test(|cx| async move {
+        run_live_http_test(|_cx| async move {
             let shutdown_calls = Arc::new(AtomicUsize::new(0));
             let shutdown_observer = Arc::clone(&shutdown_calls);
             let server = Arc::new(

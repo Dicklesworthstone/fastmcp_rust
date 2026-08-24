@@ -2679,7 +2679,7 @@ mod signer_activation_tests {
                     .expect("bounded test-only PKCS#8 fixture");
                 let key_pair = RsaKeyPair::from_pkcs8(&private_key)
                     .expect("valid test-only external-custody key");
-                let mut signature = vec![0_u8; key_pair.public_modulus_len()];
+                let mut signature = vec![0_u8; key_pair.public().modulus_len()];
                 key_pair
                     .sign(
                         &RSA_PKCS1_SHA256,
@@ -3202,7 +3202,7 @@ mod signer_activation_tests {
                 .is_ok()
         );
         let cx = Cx::for_testing();
-        fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline())).0
+        fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline()))
     }
 
     fn signing_deadline() -> ExternalRs256SigningDeadline {
@@ -3229,8 +3229,7 @@ mod signer_activation_tests {
             &refresh,
             None,
             signing_deadline(),
-        ))
-        .0;
+        ));
         assert!(matches!(
             refresh_result,
             Err(OidcError::OAuth(OAuthError::InvalidGrant(_)))
@@ -3246,8 +3245,7 @@ mod signer_activation_tests {
                 &credential,
                 None,
                 signing_deadline(),
-            ))
-            .0;
+            ));
             assert!(matches!(
                 result,
                 Err(OidcError::OAuth(OAuthError::InvalidGrant(_)))
@@ -3267,8 +3265,7 @@ mod signer_activation_tests {
             &issued.access_token,
             None,
             signing_deadline(),
-        ))
-        .0;
+        ));
         assert!(matches!(result, Err(OidcError::MissingOpenIdScope)));
         assert_eq!(calls.load(Ordering::Acquire), 0);
     }
@@ -3294,7 +3291,7 @@ mod signer_activation_tests {
                     // endpoint: the verifier attests a sibling origin.
                     origin: "https://fastmcp.invalid.evil",
                 }),
-                Arc::clone(&store),
+                store.clone(),
             )
             .expect("install test verifier and durable store");
         provider
@@ -3306,8 +3303,7 @@ mod signer_activation_tests {
         assert!(matches!(
             fastmcp_core::block_on(
                 provider.activate_id_token_signing(&Cx::for_testing(), signing_deadline(),)
-            )
-            .0,
+            ),
             Err(OidcError::SigningError(_))
         ));
         assert!(provider.activated_jwks_document().is_err());
@@ -3340,8 +3336,7 @@ mod signer_activation_tests {
         assert!(matches!(
             fastmcp_core::block_on(
                 provider.activate_id_token_signing(&Cx::for_testing(), signing_deadline(),)
-            )
-            .0,
+            ),
             Err(OidcError::SigningError(_))
         ));
         assert!(provider.activated_jwks_document().is_err());
@@ -3402,7 +3397,7 @@ mod signer_activation_tests {
                     generation: 12,
                     origin: "https://fastmcp.invalid",
                 }),
-                Arc::clone(&store),
+                store.clone(),
             )
             .expect("install verifier and durable activation store");
         provider
@@ -3414,7 +3409,7 @@ mod signer_activation_tests {
 
         let cx = Cx::for_testing();
         assert!(matches!(
-            fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline())).0,
+            fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline())),
             Err(OidcError::SigningError(_))
         ));
         assert!(provider.activated_jwks_document().is_err());
@@ -3450,7 +3445,6 @@ mod signer_activation_tests {
         let cx = Cx::for_testing();
         assert!(
             fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline()))
-                .0
                 .is_ok()
         );
         assert_eq!(
@@ -3479,7 +3473,7 @@ mod signer_activation_tests {
                     generation: signer.binding().ring_generation(),
                     origin: "https://fastmcp.invalid",
                 }),
-                Arc::clone(&store),
+                store.clone(),
             )
             .expect("install activation dependencies");
         provider
@@ -3512,8 +3506,7 @@ mod signer_activation_tests {
             &issued.access_token,
             None,
             signing_deadline(),
-        ))
-        .0;
+        ));
         assert!(matches!(result, Err(OidcError::SigningError(_))));
         assert_eq!(
             calls.load(Ordering::Acquire),
@@ -3555,7 +3548,6 @@ mod signer_activation_tests {
             Some("dynamic-nonce"),
             signing_deadline(),
         ))
-        .0
         .expect("active externally-custodied signer issues a compact ID token");
         let public_jwks = provider
             .activated_jwks_document()
@@ -3636,7 +3628,7 @@ mod signer_activation_tests {
             .expect("OIDC provider");
         provider
             .set_id_token_signing_activation_dependencies(
-                Arc::clone(&verifier),
+                verifier.clone(),
                 Arc::new(TestDurableActivationStore::default()),
             )
             .expect("install mutable read-back verifier");
@@ -3728,7 +3720,7 @@ mod signer_activation_tests {
         let (oauth, issued) = issue_access_token(&["openid"]);
         let provider = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("OIDC provider");
         provider
-            .set_id_token_signing_activation_dependencies(Arc::clone(&verifier), Arc::clone(&store))
+            .set_id_token_signing_activation_dependencies(verifier.clone(), store.clone())
             .expect("install mutable verifier and durable store");
         provider
             .begin_id_token_signing_activation(
@@ -3746,7 +3738,6 @@ mod signer_activation_tests {
             Some("rotation-live-key"),
             signing_deadline(),
         ))
-        .0
         .expect("issue token under the oldest key");
 
         let middle_calls = Arc::new(AtomicUsize::new(0));
@@ -3884,7 +3875,7 @@ mod signer_activation_tests {
         let (oauth, issued) = issue_access_token(&["openid"]);
         let first = OidcProvider::with_defaults(Arc::clone(&oauth)).expect("first provider");
         first
-            .set_id_token_signing_activation_dependencies(Arc::clone(&verifier), Arc::clone(&store))
+            .set_id_token_signing_activation_dependencies(verifier.clone(), store.clone())
             .expect("first activation dependencies");
         first
             .begin_id_token_signing_activation(
@@ -3902,7 +3893,6 @@ mod signer_activation_tests {
             Some("restart-live-key"),
             signing_deadline(),
         ))
-        .0
         .expect("old key signs an ID token before restart");
         let before_restart = store
             .load(&Cx::for_testing(), "https://fastmcp.invalid/")
@@ -3918,7 +3908,7 @@ mod signer_activation_tests {
 
         let restarted = OidcProvider::with_defaults(oauth).expect("restarted provider");
         restarted
-            .set_id_token_signing_activation_dependencies(Arc::clone(&verifier), Arc::clone(&store))
+            .set_id_token_signing_activation_dependencies(verifier.clone(), store.clone())
             .expect("restart activation dependencies");
         restarted
             .begin_id_token_signing_activation(
@@ -4069,7 +4059,7 @@ mod signer_activation_tests {
         let cx = Cx::for_testing();
 
         let result =
-            fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline())).0;
+            fastmcp_core::block_on(provider.activate_id_token_signing(&cx, signing_deadline()));
         assert!(matches!(
             result,
             Err(OidcError::ExternalSigning(
@@ -4096,8 +4086,7 @@ mod signer_activation_tests {
             &issued.access_token,
             None,
             signing_deadline(),
-        ))
-        .0;
+        ));
         assert!(matches!(
             result,
             Err(OidcError::ExternalSigning(
@@ -4126,7 +4115,6 @@ mod signer_activation_tests {
             None,
             signing_deadline(),
         ))
-        .0
         .expect("issue ID token to establish durable retirement fence");
         assert!(
             provider
@@ -4167,7 +4155,7 @@ mod signer_activation_tests {
                     generation: signer.binding().ring_generation(),
                     origin: "https://fastmcp.invalid",
                 }),
-                Arc::clone(&store),
+                store.clone(),
             )
             .expect("first dependencies");
         first
@@ -4186,7 +4174,6 @@ mod signer_activation_tests {
         fastmcp_core::block_on(
             first.activate_id_token_signing(&Cx::for_testing(), signing_deadline()),
         )
-        .0
         .expect("first activation");
 
         let restarted = OidcProvider::with_defaults(oauth).expect("fresh-process provider");
@@ -4198,7 +4185,7 @@ mod signer_activation_tests {
                     generation: signer.binding().ring_generation(),
                     origin: "https://fastmcp.invalid",
                 }),
-                Arc::clone(&store),
+                store.clone(),
             )
             .expect("restart dependencies");
         restarted
@@ -4217,7 +4204,6 @@ mod signer_activation_tests {
         fastmcp_core::block_on(
             restarted.activate_id_token_signing(&Cx::for_testing(), signing_deadline()),
         )
-        .0
         .expect("fresh read-back and CAS are required after restart");
         assert_eq!(
             store
