@@ -101,7 +101,7 @@ triage_prompt += "/Users/jemanuel/projects/fastmcp_rust.\n\n";
 triage_prompt += "FIRST (mandatory before any other tool use):\n";
 triage_prompt += "1. Read /Users/jemanuel/projects/fastmcp_rust/AGENTS.md in full (use read_file; multiple chunks if needed).\n";
 triage_prompt += "2. Read /Users/jemanuel/projects/fastmcp_rust/README.md in full.\n";
-triage_prompt += "Internalize: no file deletion; no irreversible git; main not master; asupersync only (NO tokio); ";
+triage_prompt += "Internalize: no file deletion; no irreversible git; main is the sole branch; asupersync only (NO tokio); ";
 triage_prompt += "MCP 2026-07-28 unverified; FND-01 does not claim aggregate MCP support; br never runs git; ";
 triage_prompt += "bv only with --robot-*; no script-based mass code edits.\n\n";
 triage_prompt += "Follow /beads-br and /beads-bv skills strictly:\n";
@@ -277,7 +277,7 @@ for id in execute_ids {
     p += "- asupersync only (NO tokio/hyper/reqwest/axum)\n";
     p += "- NEVER delete files without explicit user permission\n";
     p += "- No git reset --hard / git clean / rm -rf\n";
-    p += "- Work on main only; never master\n";
+    p += "- Work on main as the sole branch\n";
     p += "- No script-based mass code transforms; edit files manually/in-place\n";
     p += "- No file proliferation (no mainV2.rs style forks)\n";
     p += "- MCP 2026-07-28 under implementation / unverified; FND-01 does not claim aggregate support\n";
