@@ -64,8 +64,7 @@ handler rendering require one of the protocol features:
 
 The remaining nonsecurity presentation features compose those protocol
 features where needed: `proxy-legacy` implies `proxy` and
-`legacy-2024-11-05`; `proxy-tasks` implies `proxy` and `tasks`; and
-`redis-tasks` implies `tasks`.
+`legacy-2024-11-05`; `proxy-tasks` implies `proxy` and `tasks`.
 
 ## Detection and Environment Variables
 

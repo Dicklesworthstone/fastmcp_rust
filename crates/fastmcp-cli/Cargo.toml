@@ -75,12 +75,6 @@ websocket-experimental = [
     "fastmcp-console/websocket-experimental",
     "fastmcp-server?/websocket-experimental",
 ]
-redis-tasks = [
-    "tasks",
-    "dep:fastmcp-server",
-    "fastmcp-server/redis-tasks",
-    "fastmcp-console/redis-tasks",
-]
 jwt-resource-auth = [
     "dep:fastmcp-server",
     "fastmcp-server/jwt-resource-auth",
