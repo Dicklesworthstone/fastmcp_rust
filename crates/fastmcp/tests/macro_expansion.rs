@@ -3344,8 +3344,8 @@ fn json_schema_nested_vec() {
 fn json_schema_optional_vec() {
     let schema = Nested::json_schema();
     let props = schema["properties"].as_object().unwrap();
-    // Option<Vec<String>> → array of strings, not required
-    assert_eq!(props["optional_items"]["type"], "array");
+    // Option<Vec<String>> → nullable array of strings, not required
+    assert_eq!(props["optional_items"]["type"], json!(["array", "null"]));
     assert_eq!(props["optional_items"]["items"]["type"], "string");
     let required: Vec<&str> = schema["required"]
         .as_array()
@@ -3628,8 +3628,8 @@ fn json_schema_map_of_lists_field() {
 fn json_schema_optional_map_field() {
     let schema = DeeplyNested::json_schema();
     let props = schema["properties"].as_object().unwrap();
-    // Option<HashMap<String, i32>> - should be object, not required
-    assert_eq!(props["optional_map"]["type"], "object");
+    // Option<HashMap<String, i32>> - nullable object, not required
+    assert_eq!(props["optional_map"]["type"], json!(["object", "null"]));
     assert_eq!(
         props["optional_map"]["additionalProperties"]["type"],
         "integer"
@@ -3675,10 +3675,10 @@ fn json_schema_many_optionals_properties() {
     let props = schema["properties"].as_object().unwrap();
     // All 5 fields should be present
     assert_eq!(props.len(), 5);
-    assert_eq!(props["opt1"]["type"], "string");
-    assert_eq!(props["opt2"]["type"], "integer");
-    assert_eq!(props["opt3"]["type"], "boolean");
-    assert_eq!(props["opt4"]["type"], "array");
+    assert_eq!(props["opt1"]["type"], json!(["string", "null"]));
+    assert_eq!(props["opt2"]["type"], json!(["integer", "null"]));
+    assert_eq!(props["opt3"]["type"], json!(["boolean", "null"]));
+    assert_eq!(props["opt4"]["type"], json!(["array", "null"]));
 }
 
 // --- Enum with multiple variant types ---

@@ -3681,20 +3681,27 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                     return quote! {{
                         let mut schema = #inner_schema;
                         if let Some(obj) = schema.as_object_mut() {
-                            match obj.get_mut("type") {
+                            let widened = match obj.get("type") {
                                 Some(serde_json::Value::String(existing)) => {
-                                    let existing = existing.clone();
-                                    obj.insert(
-                                        "type".to_string(),
-                                        serde_json::json!([existing, "null"]),
-                                    );
-                                }
-                                Some(serde_json::Value::Array(types)) => {
-                                    if !types.iter().any(|t| t == "null") {
-                                        types.push(serde_json::json!("null"));
+                                    if existing == "null" {
+                                        None
+                                    } else {
+                                        Some(serde_json::json!([existing.clone(), "null"]))
                                     }
                                 }
-                                _ => {}
+                                Some(serde_json::Value::Array(types)) => {
+                                    if types.iter().any(|t| t == "null") {
+                                        None
+                                    } else {
+                                        let mut types = types.clone();
+                                        types.push(serde_json::json!("null"));
+                                        Some(serde_json::Value::Array(types))
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(widened) = widened {
+                                obj.insert("type".to_string(), widened);
                             }
                         }
                         schema
