@@ -723,7 +723,9 @@ fn tool_defaulted_option_explicit_null_uses_default() {
     let handler = EchoDefaultedOption;
     let ctx = test_ctx();
     // null is the wire spelling of "omitted", so the default applies.
-    let result = handler.call(&ctx, json!({"msg": "hi", "suffix": null})).unwrap();
+    let result = handler
+        .call(&ctx, json!({"msg": "hi", "suffix": null}))
+        .unwrap();
     assert_eq!(expect_text(&result[0]), "hi?");
 }
 
