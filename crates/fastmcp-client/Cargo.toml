@@ -20,9 +20,6 @@ apps = ["fastmcp-protocol/apps", "dep:html5ever"]
 # Opt-in caller-upgraded async WebSocket client. This does not add URI parsing,
 # HTTP Upgrade, or a blocking byte-stream client.
 websocket-experimental = ["fastmcp-transport/websocket-experimental"]
-# Placeholder gated by the CLI's safe-icon-rendering feature. No client
-# code is gated on it yet; it exists so that CLI feature resolves.
-safe-icon-rendering = []
 
 [dependencies]
 fastmcp-core.workspace = true

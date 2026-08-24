@@ -50,7 +50,6 @@ apps = [
     "fastmcp-console/apps",
     "fastmcp-server?/apps",
 ]
-safe-icon-rendering = ["fastmcp-client/safe-icon-rendering"]
 builtin-auth-server = [
     "dep:fastmcp-server",
     "fastmcp-server/builtin-auth-server",
