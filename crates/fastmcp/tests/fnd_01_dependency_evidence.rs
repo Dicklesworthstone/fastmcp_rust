@@ -92643,8 +92643,8 @@ fn fallible(value: Option<u8>) {
         let openssl = 9usize;
         let changed_raw = ordinary_probe_replace_once_same_length(
             &changed_inputs[openssl].stdout,
-            b"Wed Jul 29 16:50:53 2026 UTC",
-            b"Wed Jul 29 16:50:54 2026 UTC",
+            b"Tue Jun  2 17:21:36 2026 UTC",
+            b"Tue Jun  2 17:21:37 2026 UTC",
         );
         ordinary_tool_probe_replace_selected_raw(&mut changed_inputs[openssl], changed_raw);
         assert_eq!(
@@ -92701,7 +92701,7 @@ fn fallible(value: Option<u8>) {
         );
         assert_eq!(
             encode_lower_hex(&changed.observations[openssl].raw_sha256),
-            "e350540ee306c1a65e61b809e8a14ffb0a6d0c60c035db2a0af66bad19141d08",
+            "f96c32d294d9f0a498d4342d73ba9c543b4f87ae7560d214689b05689c0f50b8",
             "frozen changed OpenSSL raw digest",
         );
         for ordinal in 0..20 {
