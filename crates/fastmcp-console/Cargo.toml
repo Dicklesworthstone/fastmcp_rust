@@ -52,7 +52,6 @@ proxy = []
 proxy-legacy = ["proxy", "legacy-2024-11-05"]
 proxy-tasks = ["proxy", "tasks"]
 websocket-experimental = []
-redis-tasks = ["tasks"]
 jwt-resource-auth = []
 
 [[example]]
