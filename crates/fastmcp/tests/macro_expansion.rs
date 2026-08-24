@@ -165,6 +165,25 @@ fn facade_websocket_surface_is_namespace_consistent() {
         Ok(())
     }
 
+    async fn binds_modern_websocket(
+        server: &fastmcp_rust::modern::Server,
+        cx: &Cx,
+    ) -> McpResult<()> {
+        let listener = server.bind_websocket(cx, String::new()).await?;
+        let _ = listener.local_addr()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn binds_legacy_websocket(
+        server: &fastmcp_rust::legacy_2024::Server,
+        cx: &Cx,
+    ) -> McpResult<()> {
+        let listener = server.bind_websocket(cx, String::new()).await?;
+        let _ = listener.local_addr()?;
+        Ok(())
+    }
+
     fn exposes_async_websocket_types<IO>() {
         let _: Option<AsyncWsClientTransport<IO>> = None;
         let _: Option<AsyncWsServerTransport<()>> = None;
@@ -175,10 +194,10 @@ fn facade_websocket_surface_is_namespace_consistent() {
         let _: Option<prelude::WebSocketResponse> = None;
         let _: Option<prelude::BoundWebSocketServer> = None;
         let _: Option<prelude::WebSocketServerShutdown> = None;
-        let _ = fastmcp_rust::modern::Server::bind_websocket::<String>;
+        let _ = binds_modern_websocket;
         #[cfg(feature = "legacy-2024-11-05")]
         {
-            let _ = fastmcp_rust::legacy_2024::Server::bind_websocket::<String>;
+            let _ = binds_legacy_websocket;
         }
     }
 

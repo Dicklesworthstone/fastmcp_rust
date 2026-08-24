@@ -34157,6 +34157,9 @@ mod bootstrap {
             }
         }
     }
+
+    #[cfg(test)]
+    const _: fn(Vec<OsString>) -> i32 = harness_main::<Vec<OsString>>;
 }
 
 #[cfg(not(fnd01_bootstrap))]
