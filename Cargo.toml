@@ -45,7 +45,7 @@ serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }
 serde_yaml = { version = "=0.9.34" }
 
 # Logging (facade only, zero-cost when disabled)
-log = { version = "=0.4.33" }
+log = { version = "=0.4.34" }
 
 # Opaque cursor encoding for pagination
 base64 = { version = "=0.23.1" }
