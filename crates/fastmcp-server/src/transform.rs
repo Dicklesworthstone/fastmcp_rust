@@ -614,6 +614,7 @@ fn transform_input_schema(
     let mut props_to_add: Vec<(String, serde_json::Value)> = Vec::with_capacity(capacity);
     let mut required_renames: Vec<(String, String)> = Vec::with_capacity(capacity);
     let mut required_removes: Vec<String> = Vec::with_capacity(capacity);
+    let mut required_adds: Vec<String> = Vec::with_capacity(capacity);
 
     // First pass: collect property transformations
     {
@@ -651,6 +652,11 @@ fn transform_input_schema(
                     schema_obj.insert(String::from("default"), default.clone());
                 }
 
+                // Apply required override
+                if transform.required == Some(true) {
+                    required_adds.push(new_name.clone());
+                }
+
                 if new_name != original_name {
                     props_to_remove.push(original_name.clone());
                     props_to_add.push((new_name.clone(), new_schema));
@@ -686,6 +692,12 @@ fn transform_input_schema(
             v.as_str()
                 .is_none_or(|s| !required_removes.iter().any(|r| r == s))
         });
+        // Handle adds
+        for name in required_adds {
+            if !required.iter().any(|v| v.as_str() == Some(&name)) {
+                required.push(serde_json::json!(name));
+            }
+        }
     }
 
     schema
@@ -1255,6 +1267,48 @@ mod tests {
         let def = transformed.definition();
         let required = def.input_schema["required"].as_array().unwrap();
         assert!(!required.iter().any(|v| v == "q"));
+    }
+
+    // ── Schema required override modifies required array ──────────────
+
+    #[test]
+    fn transform_schema_required_makes_optional_arg_required() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("n", ArgTransform::new().required())
+            .build();
+
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "n"));
+        assert!(required.iter().any(|v| v == "q"));
+    }
+
+    #[test]
+    fn transform_schema_unspecified_required_preserves_optional_arg() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("n", ArgTransform::new())
+            .build();
+
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|v| v == "n"));
+        assert!(required.iter().any(|v| v == "q"));
+    }
+
+    #[test]
+    fn transform_schema_renamed_and_required() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("n", ArgTransform::new().name("limit").required())
+            .build();
+
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "limit"));
+        assert!(!required.iter().any(|v| v == "n"));
+        assert!(required.iter().any(|v| v == "q"));
     }
 
     // ── Combined transforms ──────────────────────────────────────────
