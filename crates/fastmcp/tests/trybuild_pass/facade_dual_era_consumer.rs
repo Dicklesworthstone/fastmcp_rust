@@ -609,7 +609,28 @@ async fn connect_exact_legacy_http_with_explicit_context(
     legacy_2024::connect_http_with_cx(sse_endpoint, message_post_endpoint, cx).await
 }
 
-fn assert_typed_facade_http_builder_exports() {
+async fn connect_auto_stdio_with_explicit_context(
+    builder: auto::ClientBuilder,
+    cx: &auto::Cx,
+) -> auto::McpResult<auto::Client> {
+    builder.connect_stdio_with_cx("server", &[], cx).await
+}
+
+async fn connect_modern_stdio_with_explicit_context(
+    builder: modern::ClientBuilder,
+    cx: &modern::Cx,
+) -> modern::McpResult<modern::Client> {
+    builder.connect_stdio_with_cx("server", &[], cx).await
+}
+
+async fn connect_exact_legacy_stdio_with_explicit_context(
+    builder: legacy_2024::ClientBuilder,
+    cx: &legacy_2024::Cx,
+) -> legacy_2024::McpResult<legacy_2024::Client> {
+    builder.connect_stdio_with_cx("server", &[], cx).await
+}
+
+fn assert_typed_facade_client_builder_exports() {
     let _: fn(
         legacy_2024::CanonicalHttpUrl,
         legacy_2024::CanonicalHttpUrl,
@@ -617,6 +638,9 @@ fn assert_typed_facade_http_builder_exports() {
         legacy_2024::http_client_builder;
     let _ = connect_modern_http_from_configured_builder;
     let _ = connect_exact_legacy_http_with_explicit_context;
+    let _ = connect_auto_stdio_with_explicit_context;
+    let _ = connect_modern_stdio_with_explicit_context;
+    let _ = connect_exact_legacy_stdio_with_explicit_context;
 }
 
 async fn use_final_only_http_resource_and_completion_apis(
@@ -719,7 +743,7 @@ async fn use_final_only_http_mrtr_apis(
 }
 
 fn assert_client_http_and_subscription_exports() {
-    assert_typed_facade_http_builder_exports();
+    assert_typed_facade_client_builder_exports();
     let _ = modern::HttpClient::connect;
     let _ = modern::HttpClient::call_tool_outcome;
     let _ = modern::HttpClient::list_tools;
@@ -864,8 +888,8 @@ fn assert_final_typed_client_and_dual_era_http_surface() {
         legacy_builder.protocol_policy(),
         legacy_2024::ProtocolPolicy::LegacyOnly
     );
-    let _: fn(&str, &[&str]) -> fastmcp_rust::McpResult<legacy_2024::Client> =
-        legacy_2024::Client::stdio;
+    let _: fn(&str, &[&str], legacy_2024::Cx) -> fastmcp_rust::McpResult<legacy_2024::Client> =
+        legacy_2024::Client::stdio_with_cx;
 
     let _: Option<fastmcp_rust::ModernHttpSubscriptionListenCollector> = None;
     let _: Option<fastmcp_rust::ModernHttpSubscriptionListenError> = None;

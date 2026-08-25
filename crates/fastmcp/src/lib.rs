@@ -1256,6 +1256,12 @@ pub mod auto {
         }
 
         /// Connects the selected HTTP plan with an explicit capability context.
+        ///
+        /// ```compile_fail
+        /// use fastmcp_rust::auto;
+        ///
+        /// let _client = auto::ClientBuilder::new().connect_http();
+        /// ```
         pub async fn connect_http_with_cx(
             self,
             cx: &Cx,
@@ -2503,6 +2509,12 @@ pub mod modern {
         }
 
         /// Connects the final-only stdio plan with an explicit capability context.
+        ///
+        /// ```compile_fail
+        /// use fastmcp_rust::modern;
+        ///
+        /// let _client = modern::ClientBuilder::new().connect_stdio("server", &[]);
+        /// ```
         pub async fn connect_stdio_with_cx(
             self,
             command: &str,
@@ -2537,6 +2549,14 @@ pub mod modern {
         ///
         /// The builder retains its client identity, capabilities, timeout policy,
         /// and MCP Apps configuration; only its immutable transport plan changes.
+        ///
+        /// ```compile_fail
+        /// use fastmcp_rust::{CanonicalHttpUrl, modern};
+        ///
+        /// let endpoint = CanonicalHttpUrl::parse("https://example.com/mcp")
+        ///     .expect("canonical modern endpoint");
+        /// let _client = modern::ClientBuilder::new().connect_http(endpoint);
+        /// ```
         pub async fn connect_http_with_cx(
             self,
             endpoint: CanonicalHttpUrl,
@@ -8066,6 +8086,12 @@ pub mod legacy_2024 {
         ///
         /// The returned facade client has already completed an immutable
         /// legacy selection; no Auto negotiation occurs in this entry point.
+        ///
+        /// ```compile_fail
+        /// use fastmcp_rust::legacy_2024;
+        ///
+        /// let _client = legacy_2024::ClientBuilder::new().connect_stdio("server", &[]);
+        /// ```
         pub async fn connect_stdio_with_cx(
             self,
             command: &str,
@@ -8096,6 +8122,12 @@ pub mod legacy_2024 {
         }
 
         /// Connects and initializes the sealed exact-2024 HTTP+SSE plan with `cx`.
+        ///
+        /// ```compile_fail
+        /// use fastmcp_rust::legacy_2024;
+        ///
+        /// let _client = legacy_2024::ClientBuilder::new().connect_http();
+        /// ```
         pub async fn connect_http_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
             self.inner
                 .connect_http_client_with_cx(cx)
@@ -9620,6 +9652,16 @@ pub mod legacy_2024 {
 
     /// Connects the default exact-2024 builder over its required SSE and
     /// message-post endpoints with an explicit cancellation context.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_rust::{CanonicalHttpUrl, legacy_2024};
+    ///
+    /// let sse = CanonicalHttpUrl::parse("https://example.com/sse")
+    ///     .expect("canonical SSE endpoint");
+    /// let post = CanonicalHttpUrl::parse("https://example.com/messages")
+    ///     .expect("canonical message endpoint");
+    /// let _client = legacy_2024::connect_http(sse, post);
+    /// ```
     pub async fn connect_http_with_cx(
         sse_endpoint: CanonicalHttpUrl,
         message_post_endpoint: CanonicalHttpUrl,
@@ -11724,7 +11766,8 @@ mod tests {
             legacy_builder.protocol_policy(),
             legacy_2024::ProtocolPolicy::LegacyOnly
         );
-        let _: fn(&str, &[&str]) -> McpResult<legacy_2024::Client> = legacy_2024::Client::stdio;
+        let _: fn(&str, &[&str], legacy_2024::Cx) -> McpResult<legacy_2024::Client> =
+            legacy_2024::Client::stdio_with_cx;
 
         let _: Option<auto::ClientHttpConnection> = None;
         let _: Option<auto::ModernHttpSubscriptionListenCollector> = None;
@@ -11743,8 +11786,6 @@ mod tests {
             legacy.protocol_policy(),
             legacy_2024::ProtocolPolicy::LegacyOnly
         );
-        let _: fn(&str, &[&str]) -> super::McpResult<legacy_2024::Client> =
-            legacy_2024::Client::stdio;
         let _: fn(&str, &[&str], super::Cx) -> super::McpResult<legacy_2024::Client> =
             legacy_2024::Client::stdio_with_cx;
 
@@ -11891,8 +11932,12 @@ mod tests {
         let _: fn(&legacy_2024::JsonRpcRequest) -> McpResult<legacy_2024::ServerNotification> =
             legacy_2024::Client::decode_server_notification;
         let _: fn(&mut legacy_2024::Client) -> McpResult<()> = legacy_2024::Client::close;
-        let _: fn(legacy_2024::ClientBuilder, &str, &[&str]) -> McpResult<legacy_2024::Client> =
-            legacy_2024::ClientBuilder::connect_stdio;
+        async fn legacy_builder_connects_stdio(
+            builder: legacy_2024::ClientBuilder,
+            cx: &Cx,
+        ) -> McpResult<legacy_2024::Client> {
+            builder.connect_stdio_with_cx("server", &[], cx).await
+        }
 
         fn legacy_builder_connects_http_with_cx(builder: legacy_2024::ClientBuilder, cx: &Cx) {
             std::mem::drop(builder.connect_http_with_cx(cx));
@@ -11962,6 +12007,7 @@ mod tests {
             std::mem::drop(client.roots_list_changed(cx));
         }
 
+        let _ = legacy_builder_connects_stdio;
         let _: fn(legacy_2024::ClientBuilder, &Cx) = legacy_builder_connects_http_with_cx;
         let _: fn(&mut legacy_2024::HttpClient, &Cx) = legacy_http_requests;
         let _: fn(&legacy_2024::HttpClient) -> Option<&str> =

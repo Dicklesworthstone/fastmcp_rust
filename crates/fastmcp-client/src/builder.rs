@@ -1193,6 +1193,16 @@ impl ClientBuilder {
     ) -> McpResult<StdioConnectionAttempt> {
         self.validate_feature_configuration()?;
         self.validate_reverse_callback_configuration(&protocol_plan)?;
+
+        // Keep command resolution and optional process-group setup on the
+        // admitted side of the caller's cancellation and retry bounds.
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if Instant::now() >= retry_deadline {
+            return Err(Self::connection_retry_elapsed_error());
+        }
+
         // Build the command
         let executable = resolve_stdio_command(command, self.working_dir.as_deref())?;
         let (mut cmd, child_ownership, mut group_anchor) =
@@ -1213,10 +1223,23 @@ impl ClientBuilder {
         for (key, value) in &self.env_vars {
             cmd.env(key, value);
         }
-        // Command setup may consume the retry budget; never create a child
-        // once the post-delay retry deadline has expired.
-        if Instant::now() >= retry_deadline {
-            return Err(Self::connection_retry_elapsed_error());
+        // Command setup, including an optional Unix process-group anchor, may
+        // consume the caller's cancellation or retry budget. Re-admit the MCP
+        // subprocess immediately before creation and report anchor cleanup if
+        // the attempt has expired in the meantime.
+        let admission_error = if cx.checkpoint().is_err() {
+            Some(McpError::request_cancelled())
+        } else if Instant::now() >= retry_deadline {
+            Some(Self::connection_retry_elapsed_error())
+        } else {
+            None
+        };
+        if let Some(error) = admission_error {
+            return combine_operation_with_cleanup(Err(error), || {
+                group_anchor
+                    .as_mut()
+                    .map_or(Ok(()), ProcessGroupAnchor::cleanup)
+            });
         }
         // Spawn the subprocess
         let child = match cmd.spawn() {
@@ -2465,6 +2488,30 @@ mod tests {
         );
         let err = result.err().expect("error result");
         assert_eq!(err.code, McpErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn cancelled_direct_attempt_is_refused_before_command_setup() {
+        let cx = Cx::for_request();
+        cx.set_cancel_requested(true);
+        let retry_deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("short retry deadline fits the monotonic clock");
+
+        let error = match ClientBuilder::new().try_connect_with_protocol_plan(
+            "fastmcp-client-cancelled-direct-attempt-must-not-spawn",
+            &[],
+            &cx,
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            false,
+            false,
+            retry_deadline,
+        ) {
+            Ok(_) => panic!("a cancelled retry attempt must be rejected before process creation"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
     }
 
     #[test]

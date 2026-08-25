@@ -13295,7 +13295,8 @@ impl Server {
     /// This allows integration with a real asupersync runtime.
     ///
     /// ```compile_fail
-    /// use fastmcp_server::{Server, Transport};
+    /// use fastmcp_server::Server;
+    /// use fastmcp_transport::Transport;
     ///
     /// fn omitted_context<T>(server: Server, transport: T)
     /// where
@@ -13365,7 +13366,8 @@ impl Server {
     /// structured errors under `data.run` and `data.close`.
     ///
     /// ```compile_fail
-    /// use fastmcp_server::{Server, Transport};
+    /// use fastmcp_server::Server;
+    /// use fastmcp_transport::Transport;
     ///
     /// fn omitted_context<T>(server: Server, transport: T)
     /// where
