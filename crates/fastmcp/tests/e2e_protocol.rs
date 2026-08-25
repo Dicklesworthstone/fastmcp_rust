@@ -23,12 +23,12 @@ use fastmcp_core::block_on;
 use fastmcp_protocol::{LegacyContent, LegacyResourceContent};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
-    AuthContext, CacheScope, CacheTtl, ContentBlock, EmbeddedResourceContents, McpContext,
+    AuthContext, CacheScope, CacheTtl, ContentBlock, Cx, EmbeddedResourceContents, McpContext,
     McpErrorCode, McpResult, PromptMessage, Role, StaticTokenVerifier, TokenAuthProvider,
 };
 #[cfg(unix)]
 use fastmcp_rust::{
-    Client, ClientCapabilities, Cx, ListPromptsParams, ListResourceTemplatesParams,
+    Client, ClientCapabilities, ListPromptsParams, ListResourceTemplatesParams,
     ListResourcesParams, ListToolsParams, ProtocolEra, ProtocolPolicy, RequestTimeoutPolicy, auto,
     legacy_2024, modern,
 };
@@ -231,7 +231,8 @@ fn setup_test_server_and_client() -> TestHarness {
 
     // Run server in background thread
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     TestHarness::new(TestClient::new(client_transport), handle)
@@ -252,7 +253,10 @@ fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
         .auth_provider(provider)
         .build();
 
-    let handle = spawn_thread(move || server.run_transport(server_transport));
+    let handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
+    });
 
     TestHarness::new(TestClient::new(client_transport), handle)
 }
@@ -1114,7 +1118,8 @@ fn e2e_server_with_tools_only() {
     let server = builder.tool(GreetingToolHandler).build();
 
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1139,7 +1144,8 @@ fn e2e_server_with_resources_only() {
     let server = builder.resource(TextFileResourceHandlerResource).build();
 
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1162,7 +1168,8 @@ fn e2e_server_with_prompts_only() {
     let server = builder.prompt(GreetingPromptHandlerPrompt).build();
 
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1185,7 +1192,8 @@ fn e2e_empty_server() {
     let server = builder.build();
 
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     let mut client = TestHarness::new(TestClient::new(client_transport), handle);
@@ -1209,7 +1217,8 @@ fn e2e_custom_client_info() {
     let server = builder.tool(GreetingToolHandler).build();
 
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     let client = TestClient::new(client_transport).with_client_info("custom-client", "3.0.0");

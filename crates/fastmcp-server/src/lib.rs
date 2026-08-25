@@ -13290,23 +13290,20 @@ impl Server {
         }
     }
 
-    /// Runs the server on a custom transport under one ambient server context.
-    ///
-    /// This is useful for SSE/WebSocket integrations where the transport is
-    /// provided by an external server framework.
-    pub fn run_transport<T>(self, transport: T) -> !
-    where
-        T: Transport + Send + 'static,
-    {
-        block_on(async move {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_transport_with_cx(&cx, transport)
-        })
-    }
-
     /// Runs the server on a custom transport with a provided Cx.
     ///
     /// This allows integration with a real asupersync runtime.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_server::{Server, Transport};
+    ///
+    /// fn omitted_context<T>(server: Server, transport: T)
+    /// where
+    ///     T: Transport + Send + 'static,
+    /// {
+    ///     server.run_transport(transport);
+    /// }
+    /// ```
     pub fn run_transport_with_cx<T>(self, cx: &Cx, transport: T) -> !
     where
         T: Transport + Send + 'static,
@@ -32213,11 +32210,13 @@ mod lib_unit_tests {
     }
 
     #[test]
-    fn no_context_returning_and_sse_runtime_wrappers_are_absent() {
+    fn no_context_transport_and_sse_runtime_wrappers_are_absent() {
         let source = include_str!("lib.rs");
 
+        assert!(!source.contains("pub fn run_transport<T>"));
         assert!(!source.contains("pub fn run_transport_returning<T>"));
         assert!(!source.contains("pub fn run_sse<W, R>"));
+        assert!(source.contains("pub fn run_transport_with_cx<T>"));
         assert!(source.contains("pub fn run_transport_returning_with_cx<T>"));
         assert!(source.contains("pub async fn run_sse_with_cx<W, R>"));
     }
