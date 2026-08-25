@@ -24,9 +24,10 @@ homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"
 readme = "README.md"
 
 [workspace.dependencies]
-# Runtime (our own).  Production surfaces use runtime-installed ambient
-# contexts; test-only constructors remain opt-in at the test or facade-lab
-# boundary and must not leak into the workspace production graph.
+# Runtime (our own). Library surfaces accept caller-owned contexts; process
+# owners install an ambient context only at their top-level runtime boundary.
+# Test-only constructors remain opt-in at the test or facade-lab boundary and
+# must not leak into the workspace production graph.
 # =0.4.9 (was =0.4.8): latest crates.io patch on the v0.4.3 public floor.
 # Additive RuntimeHandle request-Cx / blocking-pool APIs, SQLite cancel
 # correctness, and owned-OTLP mapping. No public item was removed or renamed.
@@ -174,5 +175,4 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 too_many_lines = "allow"
 items_after_statements = "allow"
-
 

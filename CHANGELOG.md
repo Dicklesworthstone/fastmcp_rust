@@ -8,6 +8,22 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## [Unreleased] (after v0.7.1)
 
+### Fixed
+
+- Non-rich console rendering now preserves `Renderable` content instead of
+  replacing it with a `[Complex Output]` placeholder.
+- Unified all-feature builds use the explicit Auto server facade in the CLI
+  interoperability fixture and current facade/component APIs in compile probes.
+- The FND bootstrap entry-point compile probe now carries the same platform
+  availability condition as the entry point it references.
+
+### Packaging
+
+- Removed the deferred `redis-tasks` feature and Redis dependency from the
+  active workspace graph; the retained Docket source remains excluded.
+- Removed the empty `safe-icon-rendering` feature rather than advertising a
+  capability with no implementation behind it.
+
 ## [v0.7.1](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.7.1) -- 2026-08-24 (GitHub Release)
 
 A patch release with one wire-visible change. The bulk of the 110 commits since

@@ -14,19 +14,19 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/License-review%20required-yellow.svg" alt="License review required">
-  <img src="https://img.shields.io/badge/rust-nightly--2026--07--11-orange.svg" alt="Rust Version">
+  <img src="https://img.shields.io/badge/rust-nightly--2026--08--20-orange.svg" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-purple.svg" alt="Rust Edition">
   <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
 
-> **Protocol status (2026-08-02):** MCP 2026-07-28 support is under
+> **Protocol status (2026-08-24):** MCP 2026-07-28 support is under
 > implementation and remains unverified. The root compatibility
 > `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
 > `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
-> historical parity rows are not conformance or release evidence. Release publication
-> remains quarantined; source edits alone do not prove historical workflow
-> identities, queued runs, or credentials inert, so provider-side evidence is
-> still required.
+> historical parity rows are not conformance or release evidence. Versions
+> through 0.7.1 have been published, but publication and source edits alone do
+> not prove historical workflow identities, queued runs, or credentials inert;
+> provider-side release-safety evidence is still required.
 
 ### Current qualification boundaries
 
@@ -87,8 +87,8 @@
 ---
 
 ```bash
-# Historical published package; it does not contain unverified in-tree work
-cargo add fastmcp-rust
+# Current published package; publication is not aggregate conformance evidence
+cargo add fastmcp-rust@0.7.1
 
 # Or use the git dependency for bleeding-edge changes
 cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
@@ -323,15 +323,15 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ## Installation
 
-### From crates.io (historical 0.3.2 package)
+### From crates.io (current 0.7.1 package)
 
-The published `0.3.2` package predates the current in-tree hardening work. Do
-not treat installing it as evidence for the source-tree examples or MCP
-2026-07-28 support.
+The non-yanked `0.7.1` package was published on 2026-08-24. Publication does
+not establish aggregate MCP 2026-07-28 conformance, production readiness, or
+qualification of every in-tree feature.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.3.2"
+fastmcp-rust = "0.7.1"
 ```
 
 ### As a Git Dependency
@@ -351,10 +351,11 @@ cargo build --release
 
 ### CLI binaries (GitHub Releases)
 
-Current `fastmcp` binaries are published on GitHub Releases, not crates.io.
-Archives use `fastmcp-<os>-<arch>` names (`.tar.xz` on Unix, `.zip` on
-Windows). Linux and macOS ship amd64/x86_64 and arm64/aarch64 aliases;
-Windows ships amd64 MSVC.
+Prebuilt `fastmcp` binaries are published on GitHub Releases. The
+`fastmcp-cli` source package is also available from crates.io for Cargo-based
+installation. Release archives use `fastmcp-<os>-<arch>` names (`.tar.xz` on
+Unix, `.zip` on Windows). Linux and macOS ship amd64/x86_64 and arm64/aarch64
+aliases; Windows ships amd64 MSVC.
 
 ```bash
 # Example: macOS Apple Silicon
@@ -363,10 +364,10 @@ tar -xJf fastmcp-darwin-arm64.tar.xz
 ./fastmcp --version
 ```
 
-### CLI (optional; historical 0.3.2 package)
+### CLI via Cargo (optional)
 
 ```bash
-cargo install fastmcp-cli
+cargo install fastmcp-cli --version 0.7.1
 ```
 
 ### Client request deadlines (current source tree)
@@ -381,16 +382,17 @@ supplied a progress token can reset idle.
 ```rust
 use std::time::Duration;
 
-use fastmcp_rust::prelude::{Client, ClientBuilder, McpResult, RequestTimeoutPolicy};
+use fastmcp_rust::prelude::{Client, ClientBuilder, Cx, McpResult, RequestTimeoutPolicy};
 
-fn connect() -> McpResult<Client> {
+async fn connect(cx: &Cx) -> McpResult<Client> {
     let policy = RequestTimeoutPolicy::new(
         Duration::from_secs(20),
         Duration::from_secs(90),
     )?;
     ClientBuilder::new()
         .request_timeout_policy(policy)
-        .connect_stdio("my-mcp-server", &[])
+        .connect_stdio_with_cx("my-mcp-server", &[], cx)
+        .await
 }
 ```
 
@@ -409,10 +411,10 @@ core result for ordinary catalog and invocation traffic. HTTP and WebSocket
 `list_tools_with_cancellation`/`call_tool_with_cancellation`/
 `read_resource_with_cancellation`/`get_prompt_with_cancellation` honor a
 caller-owned cancellation domain for those ordinary verbs.
-Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse` when the GET event
-stream and POST message endpoints are already known.
+Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
+event stream and POST message endpoints are already known.
 
-The published 0.3.2 CLI predates these flags. From a current source checkout,
+The published 0.7.1 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
 ```bash
@@ -655,7 +657,7 @@ fn commit_revision(
 |------------|---------|
 | **Pinned Nightly Required** | The project contract pins `nightly-2026-08-20`; do not substitute a different toolchain merely because it supports Edition 2024 |
 | **Protocol Modernization** | The root compatibility `PROTOCOL_VERSION` remains `2024-11-05`; the modern facade's `modern::PROTOCOL_VERSION` is `2026-07-28`. MCP 2026-07-28 implementation and verification are incomplete |
-| **Runtime-context migration** | Production entry points obtain an ambient `Cx` from the runtime; `test-internals` is confined to test-only dependencies and the facade's opt-in `testing-lab` feature |
+| **Runtime-context migration** | Library client constructors and returning/custom transport runners require a caller-owned `Cx`. The process-owning CLI and `Server::run_stdio` install the ambient context at their top-level runtime boundary; `test-internals` is confined to test-only dependencies and the facade's opt-in `testing-lab` feature |
 | **Network Transports** | The turnkey `run_http*` entry points provide a caller-owned dual-era HTTP listener and dispatch lifecycle. The experimental `websocket-experimental` facade profile also provides native async `bind_websocket` and `serve_websocket` listener lifecycles, plus caller-driven client connection. These surfaces do not establish aggregate conformance or complete lifecycle qualification |
 | **Client Transport Coverage** | `fastmcp-client::Client` is subprocess-stdio only; public `ClientHttpConnection` and `HttpClient` provide modern HTTP and exact legacy SSE integration with typed `list_tools`/`call_tool`/`read_resource`/`get_prompt` verbs. Modern HTTP answers typed reverse `sampling/createMessage`, `roots/list`, and `elicitation/create` requests that arrive on a request-owned SSE body by POSTing the JSON-RPC response. Public `HttpClient::call_tool` and `WebSocketClient::call_tool` also follow modern server `input_required` by invoking those same installed handlers locally and retrying with `inputResponses`. Live `bind_http` JSON `tools/call` returns `ctx.final_sampling` and `ctx.final_roots` as `input_required`; a write-half EOF after the request is ordinary H1 completion and does not cancel that result. Public `modern::Client` stdio `call_tool_result` / `read_resource_result` / `get_prompt_result` keep the same live `input_required` branch. A Modern2026 stdio session stamps the same `_meta` protocol version and client capabilities on `start_multiplexed_request` that the typed verbs already send. Public stdio `read_resource` / `get_prompt` follow installed modern reverse handlers the same way `call_tool` does. Stateless HTTP retries stay session-bound, so a second POST cannot resume the first POST's `requestState`. With `websocket-experimental`, the facade exposes `WebSocketClient` with incremental catalog listen, the same typed verbs, and the same modern reverse handlers: ModernOnly and LegacyOnly builders accept an owned async WebSocket transport, while Auto accepts a caller-owned factory that yields a fresh upgraded transport for initial modern discovery and its sole permitted exact-2024 retry |
 | **Experimental WebSocket TLS** | The experimental async transport supports `ws://` and `wss://`. `wss://` can use the built-in WebPKI-rooted connector or a caller-supplied TLS connector for private roots, pinning, or client certificates; this connection support does not imply complete TLS, lifecycle, or MCP conformance qualification |
@@ -666,7 +668,7 @@ fn commit_revision(
 | **Subprocess cleanup** | `Client::close(&mut self) -> McpResult<()>` is the proof-bearing path; Drop is best effort. `fastmcp test` uses Unix-only anchored process-group ownership; successful connections report explicit final cleanup separately, and initialization-cleanup failures remain visible. Descendants can escape via a new group/session, host forks can copy the control descriptor, and `SIGCHLD=SIG_IGN`, `SA_NOCLDWAIT`, or competing global reapers can invalidate reap evidence. Windows Job Object support is not implemented |
 | **Development subprocess cleanup** | On Unix, each `fastmcp dev` build/server group contains a signal-immune watchdog tied to a private owner-held control pipe, so ordinary shutdown, child-handle drop, and CLI owner death trigger bounded TERM-then-KILL cleanup. A host-side fork that copies the owner descriptor or a descendant that changes group/session remains outside this boundary; non-Unix `dev` remains fail-closed |
 | **Synchronous HTTP readers** | Low-level HTTP parsing checkpoints before/after reads and retries `EINTR`, but a generic synchronous `Read` already blocked in the kernel cannot be preempted. A bounded host must supply readiness-aware/asynchronous I/O. Public turnkey `run_http*` uses its caller-owned asynchronous listener lifecycle, whose broader qualification boundaries remain documented here |
-| **Returning transport runners** | `run_transport_returning*` returns fatal receive/send/close errors and preserves simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. The legacy custom loop still uses one ambient `Cx` and does not prove request-owned isolation |
+| **Returning transport runners** | `run_transport_returning_with_cx` and the split returning variants return fatal receive/send/close errors and preserve simultaneous run-plus-close failures. Clean EOF/cancellation is `Ok(())`. The legacy custom loop still shares one caller-owned `Cx` across requests and does not prove request-owned isolation |
 | **Request Cancellation Ownership** | Unix modern stdio request work runs in independently owned bounded child contexts, but process-exiting shutdown does not wait unboundedly for a non-cooperative child; cancellation therefore is not yet a complete quiescence or `awaitCleanup` guarantee |
 | **Bidirectional Response Routing** | On Unix, stdio continuously routes inbound responses while exact-2024 lifecycle work or modern request children are active. Non-Unix stdio and custom/SSE/WebSocket paths do not provide the same split routing. Public HTTP has separate dual-era routing, while end-to-end bidirectional lifecycle qualification remains open |
 | **Response Cache Partitioning** | Eligible entries are partitioned by committed authentication facts and opaque session identity/revision; ambiguous admission and state mutation fail closed. This does not promote OAuth/OIDC or establish protocol conformance |
