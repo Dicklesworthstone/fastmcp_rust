@@ -169,7 +169,7 @@ fn facade_websocket_surface_is_namespace_consistent() {
         server: fastmcp_rust::modern::Server,
         cx: &Cx,
     ) -> McpResult<()> {
-        let listener = server.bind_websocket(cx, String::new()).await?;
+        let listener = server.bind_websocket(cx, "127.0.0.1:0").await?;
         let _ = listener.local_addr()?;
         Ok(())
     }
@@ -179,7 +179,7 @@ fn facade_websocket_surface_is_namespace_consistent() {
         server: fastmcp_rust::legacy_2024::Server,
         cx: &Cx,
     ) -> McpResult<()> {
-        let listener = server.bind_websocket(cx, String::new()).await?;
+        let listener = server.bind_websocket(cx, "127.0.0.1:0").await?;
         let _ = listener.local_addr()?;
         Ok(())
     }

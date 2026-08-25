@@ -34158,7 +34158,10 @@ mod bootstrap {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(fnd01_bootstrap, all(target_os = "linux", target_arch = "x86_64"))
+    ))]
     const _: fn(Vec<OsString>) -> i32 = harness_main::<Vec<OsString>>;
 }
 
