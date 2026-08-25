@@ -1201,12 +1201,13 @@ pub mod auto {
             Self::from_inner(self.inner.owned_process_group(enabled))
         }
 
-        /// Connects the selected stdio plan using the current capability context.
-        pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
-            self.inner.connect_stdio(command, args)
-        }
-
         /// Connects the selected stdio plan with an explicit capability context.
+        ///
+        /// ```compile_fail
+        /// use fastmcp_rust::auto;
+        ///
+        /// let _client = auto::ClientBuilder::new().connect_stdio("server", &[]);
+        /// ```
         pub fn connect_stdio_with_cx(
             self,
             command: &str,
@@ -2486,13 +2487,6 @@ pub mod modern {
             Self {
                 inner: self.inner.owned_process_group(enabled),
             }
-        }
-
-        /// Connects the final-only stdio plan using the current capability context.
-        pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
-            self.inner
-                .connect_stdio(command, args)
-                .map(Client::from_inner)
         }
 
         /// Connects the final-only stdio plan with an explicit capability context.
@@ -7166,19 +7160,13 @@ pub mod legacy_2024 {
             Self { inner }
         }
 
-        /// Opens one exact MCP 2024-11-05 stdio client.
-        pub fn stdio(command: &str, args: &[&str]) -> McpResult<Self> {
-            fastmcp_client::Client::stdio_with_protocol_plan(
-                command,
-                args,
-                fastmcp_client::ClientProtocolPlan::stdio(
-                    fastmcp_protocol::protocol_policy::ProtocolPolicy::LegacyOnly,
-                ),
-            )
-            .map(Self::from_inner)
-        }
-
         /// Opens one exact MCP 2024-11-05 stdio client with `cx`.
+        ///
+        /// ```compile_fail
+        /// use fastmcp_rust::legacy_2024;
+        ///
+        /// let _client = legacy_2024::Client::stdio("server", &[]);
+        /// ```
         pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
             fastmcp_client::Client::stdio_with_protocol_plan_with_cx(
                 command,
@@ -8060,17 +8048,10 @@ pub mod legacy_2024 {
             ProtocolPolicy::LegacyOnly
         }
 
-        /// Connects the sealed exact-2024 stdio plan.
+        /// Connects the sealed exact-2024 stdio plan with `cx`.
         ///
         /// The returned facade client has already completed an immutable
         /// legacy selection; no Auto negotiation occurs in this entry point.
-        pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
-            self.inner
-                .connect_stdio(command, args)
-                .map(Client::from_inner)
-        }
-
-        /// Connects the sealed exact-2024 stdio plan with `cx`.
         pub fn connect_stdio_with_cx(
             self,
             command: &str,
