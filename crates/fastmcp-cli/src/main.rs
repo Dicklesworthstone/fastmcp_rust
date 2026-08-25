@@ -1050,14 +1050,17 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             output,
             protocol_policy,
         } => match server.as_deref() {
-            Some(server) => cmd_inspect(
-                cx,
-                server,
-                &args,
-                format,
-                output.as_deref(),
-                protocol_policy,
-            ),
+            Some(server) => {
+                cmd_inspect(
+                    cx,
+                    server,
+                    &args,
+                    format,
+                    output.as_deref(),
+                    protocol_policy,
+                )
+                .await
+            }
             None if http_url.is_some()
                 || legacy_sse_url.is_some()
                 || legacy_message_url.is_some() =>
@@ -1107,15 +1110,18 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
             absolute_timeout,
             verbose,
             json,
-        } => cmd_test(
-            cx,
-            &server,
-            &args,
-            idle_timeout,
-            absolute_timeout,
-            verbose,
-            json,
-        ),
+        } => {
+            cmd_test(
+                cx,
+                &server,
+                &args,
+                idle_timeout,
+                absolute_timeout,
+                verbose,
+                json,
+            )
+            .await
+        }
         Commands::Dev {
             target,
             reload_dirs,
@@ -3690,7 +3696,7 @@ fn combine_test_failure_with_output(
 }
 
 /// Test command: Test MCP server connectivity.
-fn cmd_test(
+async fn cmd_test(
     cx: &Cx,
     server: &str,
     args: &[String],
@@ -3726,7 +3732,8 @@ fn cmd_test(
     let client = fastmcp_client::ClientBuilder::new()
         .request_timeout_policy(timeout_policy)
         .owned_process_group(true)
-        .connect_stdio_with_cx(server, &args_refs, cx);
+        .connect_stdio_with_cx(server, &args_refs, cx)
+        .await;
     let mut client = match client {
         Ok(client) => client,
         Err(mut error) => {
@@ -5319,7 +5326,7 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
 }
 
 /// Inspect command: Connect to a server and display its capabilities.
-fn cmd_inspect(
+async fn cmd_inspect(
     cx: &Cx,
     server: &str,
     args: &[String],
@@ -5332,7 +5339,8 @@ fn cmd_inspect(
 
     // Connect to the server
     let mut client = client_builder_for_protocol_policy(protocol_policy)?
-        .connect_stdio_with_cx(server, &args_refs, cx)?;
+        .connect_stdio_with_cx(server, &args_refs, cx)
+        .await?;
     let negotiated_protocol_version = client.protocol_version().to_owned();
 
     // Preserve the negotiated era's capability model. Modern discovery is an

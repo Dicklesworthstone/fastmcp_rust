@@ -13826,7 +13826,7 @@ impl Client {
             // selected-era constructors retain this direct lightweight path.
             ProtocolPolicy::Auto => ClientBuilder::new()
                 .protocol_plan(protocol_plan)
-                .connect_stdio_with_cx(command, args, &cx),
+                .connect_stdio_once_with_cx(command, args, &cx),
         }
     }
 
@@ -32115,11 +32115,14 @@ mod tests {
         );
         let script = format!("printf '%s\\n' '{request_line}'; exec sleep 2");
 
-        let result = ClientBuilder::new()
-            .request_timeout_policy(
-                RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
-            )
-            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request());
+        let result = block_on(
+            ClientBuilder::new()
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
+                        .unwrap(),
+                )
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+        );
         let error = result
             .err()
             .expect("oversized initialization control response must fail closed");
@@ -33571,11 +33574,13 @@ mod tests {
         let script = modern_raw_extension_client_script(
             r#"{"jsonrpc":"2.0","id":2,"result":{"echoed":{"input":"ok"},"resultType":"complete"}}"#,
         );
-        let mut client = ClientBuilder::new()
-            .extension_registry(registry, discovery, || accept_raw_extension_settings)
-            .expect("frozen raw extension registry is builder-owned")
-            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
-            .expect("raw extension discovery negotiates the public stdio client");
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("frozen raw extension registry is builder-owned")
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+        )
+        .expect("raw extension discovery negotiates the public stdio client");
 
         assert!(client.negotiated_extensions().is_some());
         let result = client
@@ -33682,10 +33687,12 @@ mod tests {
         let first_script = modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
             "mode": "raw"
         })));
-        let mut first = builder
-            .clone()
-            .connect_stdio_with_cx("sh", &["-c", first_script.as_str()], &Cx::for_request())
-            .expect("the first cloned builder gets an isolated resolver");
+        let mut first = block_on(builder.clone().connect_stdio_with_cx(
+            "sh",
+            &["-c", first_script.as_str()],
+            &Cx::for_request(),
+        ))
+        .expect("the first cloned builder gets an isolated resolver");
         first
             .close()
             .expect("the first isolated raw extension client closes");
@@ -33694,9 +33701,12 @@ mod tests {
             modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
                 "mode": "raw"
             })));
-        let mut second = builder
-            .connect_stdio_with_cx("sh", &["-c", second_script.as_str()], &Cx::for_request())
-            .expect("a sibling cloned builder cannot inherit the first resolver state");
+        let mut second = block_on(builder.connect_stdio_with_cx(
+            "sh",
+            &["-c", second_script.as_str()],
+            &Cx::for_request(),
+        ))
+        .expect("a sibling cloned builder cannot inherit the first resolver state");
         second
             .close()
             .expect("the second isolated raw extension client closes");
@@ -33712,11 +33722,13 @@ mod tests {
         let script = modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
             "mode": "raw"
         })));
-        let mut client = ClientBuilder::new()
-            .extension_registry(registry, discovery, || accept_raw_extension_settings)
-            .expect("raw extension registry is frozen before raw API admission")
-            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
-            .expect("modern discovery negotiates the registered raw method");
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("raw extension registry is frozen before raw API admission")
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+        )
+        .expect("modern discovery negotiates the registered raw method");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
 
         let error = client
@@ -33756,11 +33768,13 @@ mod tests {
             fastmcp_protocol::extensions::ExtensionFallbackPolicy::ClientInactiveFallback,
         );
         let script = modern_raw_extension_no_contact_client_script(None);
-        let mut client = ClientBuilder::new()
-            .extension_registry(registry, discovery, || accept_raw_extension_settings)
-            .expect("raw extension registry permits the inactive fallback")
-            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
-            .expect("modern discovery retains inactive raw extension state");
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("raw extension registry permits the inactive fallback")
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+        )
+        .expect("modern discovery retains inactive raw extension state");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
 
         let error = client
@@ -33784,11 +33798,13 @@ mod tests {
         let script = modern_raw_extension_no_contact_client_script(Some(serde_json::json!({
             "mode": "raw"
         })));
-        let mut client = ClientBuilder::new()
-            .extension_registry(registry, discovery, || accept_raw_extension_settings)
-            .expect("server-to-client raw descriptor freezes for discovery")
-            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request())
-            .expect("raw extension negotiation itself remains bilateral");
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("server-to-client raw descriptor freezes for discovery")
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
+        )
+        .expect("raw extension negotiation itself remains bilateral");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
 
         let error = client
@@ -33809,16 +33825,18 @@ mod tests {
             ExtensionDirection::ClientToServer,
             fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
         );
-        let mut client = ClientBuilder::new()
-            .extension_registry(registry, discovery, || accept_raw_extension_settings)
-            .expect("raw extension registry may be configured before era selection")
-            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
-            .connect_stdio_with_cx(
-                "sh",
-                &["-c", legacy_raw_extension_no_contact_client_script()],
-                &Cx::for_request(),
-            )
-            .expect("exact legacy lifecycle completes before raw extension rejection");
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .expect("raw extension registry may be configured before era selection")
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .connect_stdio_with_cx(
+                    "sh",
+                    &["-c", legacy_raw_extension_no_contact_client_script()],
+                    &Cx::for_request(),
+                ),
+        )
+        .expect("exact legacy lifecycle completes before raw extension rejection");
         let next_id_before = client.next_id.load(Ordering::SeqCst);
 
         let error = client

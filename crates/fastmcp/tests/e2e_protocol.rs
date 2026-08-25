@@ -18,6 +18,8 @@ use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use fastmcp_core::block_on;
 use fastmcp_protocol::{LegacyContent, LegacyResourceContent};
 use fastmcp_rust::testing::prelude::*;
 use fastmcp_rust::{
@@ -1237,8 +1239,7 @@ fn connect_auto_stdio_to_shipped_echo_server(server_policy: &str) -> Client {
     );
 
     let cx = Cx::for_request();
-    builder
-        .connect_stdio_with_cx(command, &[], &cx)
+    block_on(builder.connect_stdio_with_cx(command, &[], &cx))
         .expect("the public Auto facade client connects to the shipped stdio example")
 }
 
@@ -1257,7 +1258,7 @@ fn connect_modern_stdio_to_shipped_echo_server_with_env(
     for (key, value) in extra_env {
         builder = builder.env(*key, *value);
     }
-    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
 }
 
 #[cfg(unix)]
@@ -1296,7 +1297,7 @@ fn connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
     for (key, value) in extra_env {
         builder = builder.env(*key, *value);
     }
-    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
 }
 
 #[cfg(unix)]
@@ -1334,18 +1335,20 @@ fn connect_bounded_modern_stdio_with_mrtr(
     handlers: modern::ReverseRequestHandlers,
 ) -> McpResult<modern::Client> {
     let command = shipped_echo_server_executable();
-    modern::client_builder()
-        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
-        .request_timeout_policy(
-            RequestTimeoutPolicy::new(
-                STDIO_COMPLETION_IDLE_TIMEOUT,
-                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+    block_on(
+        modern::client_builder()
+            .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(
+                    STDIO_COMPLETION_IDLE_TIMEOUT,
+                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                )
+                .expect("the public completion timeout policy is valid"),
             )
-            .expect("the public completion timeout policy is valid"),
-        )
-        .capabilities(capabilities)
-        .modern_reverse_request_handlers(handlers)
-        .connect_stdio_with_cx(command, &[], &Cx::for_request())
+            .capabilities(capabilities)
+            .modern_reverse_request_handlers(handlers)
+            .connect_stdio_with_cx(command, &[], &Cx::for_request()),
+    )
 }
 
 #[cfg(unix)]
@@ -1429,7 +1432,7 @@ fn connect_legacy_stdio_to_shipped_echo_server_with_reverse_handlers_and_env(
         legacy_2024::ProtocolPolicy::LegacyOnly
     );
 
-    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
 }
 
 #[cfg(unix)]
@@ -1714,7 +1717,7 @@ fn connect_bounded_modern_stdio_with_client_title(
     if let Some(title) = title {
         builder = builder.title(title);
     }
-    builder.connect_stdio_with_cx(command, &[], &Cx::for_request())
+    block_on(builder.connect_stdio_with_cx(command, &[], &Cx::for_request()))
 }
 
 #[cfg(unix)]
@@ -1774,17 +1777,19 @@ fn connect_legacy_stdio_with_client_name(
     client_name: &str,
 ) -> McpResult<legacy_2024::Client> {
     let command = shipped_echo_server_executable();
-    legacy_2024::client_builder()
-        .client_info(client_name, "1.0.0")
-        .env("FASTMCP_PROTOCOL_POLICY", server_policy)
-        .request_timeout_policy(
-            RequestTimeoutPolicy::new(
-                STDIO_COMPLETION_IDLE_TIMEOUT,
-                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+    block_on(
+        legacy_2024::client_builder()
+            .client_info(client_name, "1.0.0")
+            .env("FASTMCP_PROTOCOL_POLICY", server_policy)
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(
+                    STDIO_COMPLETION_IDLE_TIMEOUT,
+                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                )
+                .expect("the public completion timeout policy is valid"),
             )
-            .expect("the public completion timeout policy is valid"),
-        )
-        .connect_stdio_with_cx(command, &[], &Cx::for_request())
+            .connect_stdio_with_cx(command, &[], &Cx::for_request()),
+    )
 }
 
 #[cfg(unix)]
@@ -2947,24 +2952,28 @@ fn e2e_public_stdio_result_verbs_keep_live_input_required() {
 #[cfg(unix)]
 #[test]
 fn e2e_public_stdio_read_resource_and_get_prompt_follow_installed_roots_handler() {
-    let mut client = modern::client_builder()
-        .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
-        .request_timeout_policy(
-            RequestTimeoutPolicy::new(
-                STDIO_COMPLETION_IDLE_TIMEOUT,
-                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+    let mut client = block_on(
+        modern::client_builder()
+            .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(
+                    STDIO_COMPLETION_IDLE_TIMEOUT,
+                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                )
+                .expect("the public follow timeout policy is valid"),
             )
-            .expect("the public follow timeout policy is valid"),
-        )
-        .modern_reverse_request_handlers(
-            modern::ReverseRequestHandlers::new().with_modern_roots_list(
-                |_cx, _cancellation, _params| {
-                    Box::pin(async { Ok(modern::FinalEmbeddedRootsListResult { roots: vec![] }) })
-                },
-            ),
-        )
-        .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request())
-        .expect("a ModernOnly facade client installs a roots handler before discovery");
+            .modern_reverse_request_handlers(
+                modern::ReverseRequestHandlers::new().with_modern_roots_list(
+                    |_cx, _cancellation, _params| {
+                        Box::pin(async {
+                            Ok(modern::FinalEmbeddedRootsListResult { roots: vec![] })
+                        })
+                    },
+                ),
+            )
+            .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request()),
+    )
+    .expect("a ModernOnly facade client installs a roots handler before discovery");
 
     let resource = client
         .read_resource("info://mrtr-resource")
@@ -4289,17 +4298,19 @@ fn e2e_public_stdio_legacy_resource_composes_nested_tool_and_resource() {
 #[cfg(unix)]
 #[test]
 fn e2e_public_stdio_legacy_handler_timeout_refuses_late_tool_and_admits_fast_peer() {
-    let mut client = legacy_2024::client_builder()
-        .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
-        .request_timeout_policy(
-            RequestTimeoutPolicy::new(
-                STDIO_COMPLETION_IDLE_TIMEOUT,
-                STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+    let mut client = block_on(
+        legacy_2024::client_builder()
+            .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(
+                    STDIO_COMPLETION_IDLE_TIMEOUT,
+                    STDIO_COMPLETION_ABSOLUTE_TIMEOUT,
+                )
+                .expect("the public handler-timeout client policy is valid"),
             )
-            .expect("the public handler-timeout client policy is valid"),
-        )
-        .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request())
-        .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
+            .connect_stdio_with_cx(shipped_echo_server_executable(), &[], &Cx::for_request()),
+    )
+    .expect("a LegacyOnly facade client completes the exact legacy lifecycle");
 
     let timed_out = client
         .call_tool("slow_echo", json!({}))
@@ -7924,23 +7935,23 @@ fn e2e_public_stdio_legacy_complete_is_retained_and_unknown_prompt_is_refused() 
 #[test]
 fn e2e_public_stdio_legacy_roots_list_changed_is_admitted_and_unadvertised_peer_is_refused() {
     let command = shipped_echo_server_executable();
-    let mut admitted = legacy_2024::client_builder()
-        .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
-        .capabilities(ClientCapabilities {
-            roots: Some(legacy_2024::RootsCapability { list_changed: true }),
-            ..ClientCapabilities::default()
-        })
-        .reverse_request_handlers(
-            legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
-                |_cx, _cancel, _params| {
-                    Box::pin(async { Ok(legacy_2024::ListRootsResult::new(Vec::new())) })
-                },
-            ),
-        )
-        .connect_stdio_with_cx(command, &[], &Cx::for_request())
-        .expect(
-            "an advertised roots.listChanged stdio client completes the exact legacy lifecycle",
-        );
+    let mut admitted = block_on(
+        legacy_2024::client_builder()
+            .env("FASTMCP_PROTOCOL_POLICY", "legacy-only")
+            .capabilities(ClientCapabilities {
+                roots: Some(legacy_2024::RootsCapability { list_changed: true }),
+                ..ClientCapabilities::default()
+            })
+            .reverse_request_handlers(
+                legacy_2024::LegacyReverseRequestHandlers::new().with_roots_list(
+                    |_cx, _cancel, _params| {
+                        Box::pin(async { Ok(legacy_2024::ListRootsResult::new(Vec::new())) })
+                    },
+                ),
+            )
+            .connect_stdio_with_cx(command, &[], &Cx::for_request()),
+    )
+    .expect("an advertised roots.listChanged stdio client completes the exact legacy lifecycle");
 
     admitted.roots_list_changed().expect(
         "live exact-2024 stdio must admit notifications/roots/list_changed when advertised",

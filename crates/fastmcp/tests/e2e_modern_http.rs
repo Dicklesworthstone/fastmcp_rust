@@ -4750,6 +4750,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
                     .max_retries(2)
                     .retry_delay_ms(150)
                     .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                    .await
                 {
                     Ok(mut client) => {
                         if precreate_task {
@@ -5455,13 +5456,15 @@ fn e2e_public_http_as_proxy_stdio_forwards_prefixed_echo() {
 #[test]
 fn e2e_public_stdio_hide_catalog_refuses_later_read_and_prompt() {
     let cx = Cx::for_request();
-    let mut client = modern::ClientBuilder::new()
-        .client_info("e2e-stdio-hide-catalog", "1.0.0")
-        .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
-        .max_retries(2)
-        .retry_delay_ms(150)
-        .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
-        .expect("a ModernOnly facade client connects to the shipped echo server");
+    let mut client = core::block_on(
+        modern::ClientBuilder::new()
+            .client_info("e2e-stdio-hide-catalog", "1.0.0")
+            .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+            .max_retries(2)
+            .retry_delay_ms(150)
+            .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx),
+    )
+    .expect("a ModernOnly facade client connects to the shipped echo server");
 
     let before = client
         .read_resource("info://server")
@@ -32611,6 +32614,7 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
                     .max_retries(2)
                     .retry_delay_ms(150)
                     .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], &cx)
+                    .await
                 {
                     Ok(client) => {
                         stdio = Some(client);
@@ -36684,13 +36688,14 @@ mod live_websocket_bind {
     fn connect_warmed_stdio_as_proxy_upstream(cx: &Cx, client_name: &str) -> modern::Client {
         let mut last_error = None;
         for attempt in 1_u32..=4 {
-            match modern::ClientBuilder::new()
-                .client_info(client_name, "1.0.0")
-                .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
-                .max_retries(2)
-                .retry_delay_ms(150)
-                .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], cx)
-            {
+            match core::block_on(
+                modern::ClientBuilder::new()
+                    .client_info(client_name, "1.0.0")
+                    .env("FASTMCP_PROTOCOL_POLICY", "modern-only")
+                    .max_retries(2)
+                    .retry_delay_ms(150)
+                    .connect_stdio_with_cx(env!("CARGO_BIN_EXE_echo_server"), &[], cx),
+            ) {
                 Ok(mut client) => match client.list_tools(None) {
                     Ok(_) => return client,
                     Err(error) => {

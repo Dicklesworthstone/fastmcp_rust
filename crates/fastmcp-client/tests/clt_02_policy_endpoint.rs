@@ -3,7 +3,7 @@ use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientHttpConnectionError, ClientHttpNegotiationError,
     ClientProtocolPlan, ClientSession, ModernHttpClientError, ProtocolEra, ProtocolPolicy,
 };
-use fastmcp_core::McpErrorCode;
+use fastmcp_core::{McpErrorCode, block_on};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
 
 const ABSENT_STDIO_COMMAND: &str = "./clt-02-intentionally-absent-server";
@@ -47,14 +47,14 @@ fn clt_02_a_positive() {
     let plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
     let builder = default_builder.clone().protocol_plan(plan.clone());
     let state_before_connect = builder.selected_protocol_plan().clone();
-    let error =
-        match builder
-            .clone()
-            .connect_stdio_with_cx(ABSENT_STDIO_COMMAND, &[], &Cx::for_request())
-        {
-            Ok(_) => panic!("accepted modern policy must reach command admission"),
-            Err(error) => error,
-        };
+    let error = match block_on(builder.clone().connect_stdio_with_cx(
+        ABSENT_STDIO_COMMAND,
+        &[],
+        &Cx::for_request(),
+    )) {
+        Ok(_) => panic!("accepted modern policy must reach command admission"),
+        Err(error) => error,
+    };
 
     assert_eq!(builder.selected_protocol_plan(), &plan);
     assert_eq!(plan.policy(), ProtocolPolicy::ModernOnly);
@@ -99,11 +99,11 @@ fn clt_02_a_planted_negative() {
     let refusal = ClientProtocolPlan::stdio(ProtocolPolicy::Auto);
     let refusal_builder = ClientBuilder::new().protocol_plan(refusal.clone());
     let refusal_state = refusal_builder.selected_protocol_plan().clone();
-    let error = match refusal_builder.clone().connect_stdio_with_cx(
+    let error = match block_on(refusal_builder.clone().connect_stdio_with_cx(
         ABSENT_STDIO_COMMAND,
         &[],
         &Cx::for_request(),
-    ) {
+    )) {
         Ok(_) => {
             panic!("auto policy without the legacy adapter must be refused before spawn")
         }
