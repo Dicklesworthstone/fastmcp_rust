@@ -14427,11 +14427,13 @@ exec sleep 2
 "#
         );
         let cx = Cx::for_testing();
-        let mut client = fastmcp_client::ClientBuilder::new()
-            .auto_initialize(true)
-            .request_timeout_policy(scripted_peer_timeout_policy())
-            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx)
-            .expect("spawn scripted auto-initializing client");
+        let mut client = block_on(
+            fastmcp_client::ClientBuilder::new()
+                .auto_initialize(true)
+                .request_timeout_policy(scripted_peer_timeout_policy())
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+        )
+        .expect("spawn scripted auto-initializing client");
         assert!(!client.is_initialized());
 
         let catalog = ProxyCatalog::from_client(&mut client)
@@ -14463,11 +14465,13 @@ exec sleep 2
         );
         let script = format!("printf '%s\\n' '{initialize}'; exec sleep 2");
         let cx = Cx::for_testing();
-        let mut client = fastmcp_client::ClientBuilder::new()
-            .auto_initialize(true)
-            .request_timeout_policy(scripted_peer_timeout_policy())
-            .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx)
-            .expect("spawn scripted auto-initializing client");
+        let mut client = block_on(
+            fastmcp_client::ClientBuilder::new()
+                .auto_initialize(true)
+                .request_timeout_policy(scripted_peer_timeout_policy())
+                .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
+        )
+        .expect("spawn scripted auto-initializing client");
 
         let catalog = ProxyCatalog::from_client(&mut client)
             .expect("unadvertised lists are skipped only after initialization");

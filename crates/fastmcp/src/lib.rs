@@ -1223,13 +1223,13 @@ pub mod auto {
         ///
         /// let _client = auto::ClientBuilder::new().connect_stdio("server", &[]);
         /// ```
-        pub fn connect_stdio_with_cx(
+        pub async fn connect_stdio_with_cx(
             self,
             command: &str,
             args: &[&str],
             cx: &Cx,
         ) -> McpResult<Client> {
-            self.inner.connect_stdio_with_cx(command, args, cx)
+            self.inner.connect_stdio_with_cx(command, args, cx).await
         }
 
         /// Negotiates Auto WebSocket discovery with caller-owned fresh transports.
@@ -2505,7 +2505,7 @@ pub mod modern {
         }
 
         /// Connects the final-only stdio plan with an explicit capability context.
-        pub fn connect_stdio_with_cx(
+        pub async fn connect_stdio_with_cx(
             self,
             command: &str,
             args: &[&str],
@@ -2513,6 +2513,7 @@ pub mod modern {
         ) -> McpResult<Client> {
             self.inner
                 .connect_stdio_with_cx(command, args, cx)
+                .await
                 .map(Client::from_inner)
         }
 
@@ -8067,7 +8068,7 @@ pub mod legacy_2024 {
         ///
         /// The returned facade client has already completed an immutable
         /// legacy selection; no Auto negotiation occurs in this entry point.
-        pub fn connect_stdio_with_cx(
+        pub async fn connect_stdio_with_cx(
             self,
             command: &str,
             args: &[&str],
@@ -8075,6 +8076,7 @@ pub mod legacy_2024 {
         ) -> McpResult<Client> {
             self.inner
                 .connect_stdio_with_cx(command, args, cx)
+                .await
                 .map(Client::from_inner)
         }
 
@@ -11795,6 +11797,7 @@ mod tests {
             let mut client = legacy_2024::Client::builder()
                 .reverse_request_handlers(handlers)
                 .connect_stdio_with_cx("sh", &["-c", script], &cx)
+                .await
                 .expect("sealed legacy facade initializes before the callback request");
 
             let result = client
