@@ -978,7 +978,7 @@ fn main() -> ExitCode {
                 "FastMCP CLI runtime did not install a cancellation context",
             )
         })?;
-        run_cli(&cx, cli).await
+        Box::pin(run_cli(&cx, cli)).await
     });
 
     match result {
@@ -1065,7 +1065,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 || legacy_sse_url.is_some()
                 || legacy_message_url.is_some() =>
             {
-                cmd_inspect_http(
+                Box::pin(cmd_inspect_http(
                     cx,
                     http_url.as_deref(),
                     legacy_sse_url.as_deref(),
@@ -1073,7 +1073,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                     format,
                     output.as_deref(),
                     protocol_policy,
-                )
+                ))
                 .await
             }
             None => Err(fastmcp_core::McpError::invalid_params(

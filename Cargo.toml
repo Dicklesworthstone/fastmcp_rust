@@ -138,6 +138,9 @@ collapsible_if = "allow"
 clone_on_copy = "allow"
 match_wildcard_for_single_variants = "allow"
 manual_assert = "allow"
+# `assert!(value.is_empty())` states the tested predicate directly. Rewriting
+# hundreds of tests to construct type-heavy empty comparison values adds noise.
+assert_is_empty = "allow"
 if_not_else = "allow"
 trivially_copy_pass_by_ref = "allow"
 struct_excessive_bools = "allow"

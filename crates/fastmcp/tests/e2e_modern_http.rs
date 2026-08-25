@@ -14,6 +14,12 @@
 //! not change later matched-era handler observables. It is not an aggregate
 //! MCP 2026-07-28 conformance claim.
 
+#![allow(
+    clippy::default_trait_access,
+    clippy::fn_params_excessive_bools,
+    clippy::unnested_or_patterns
+)]
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -27073,6 +27079,7 @@ fn spawn_legacy_progress_http_server() -> HttpServerFixture {
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // Mirrors the optional `_meta` wire field at call sites.
 fn legacy_http_progress_meta(
     marker: legacy_2024::ProgressMarker,
 ) -> Option<legacy_2024::RequestMeta> {
@@ -38730,13 +38737,13 @@ mod live_websocket_bind {
                 "owned modern WebSocket as_proxy Tasks listen runtime installs an ambient context",
             );
             let upstream = spawn_modern_task_http_server();
-            let mut creator = websocket_client_bounded(
+            let mut creator = Box::pin(websocket_client_bounded(
                 &cx,
                 "live modern WebSocket as_proxy Tasks listen upstream create",
                 modern::ClientBuilder::new()
                     .client_info("e2e-ws-as-proxy-tasks-listen-creator", "1.0.0")
                     .connect_http_with_cx(public_http_target(upstream.address(), "/mcp"), &cx),
-            )
+            ))
             .await
             .expect("the public facade connects to the live Tasks upstream");
             let created = websocket_client_bounded(

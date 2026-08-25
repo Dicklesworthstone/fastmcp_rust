@@ -97427,14 +97427,22 @@ fn fallible(value: Option<u8>) {
     }
     #[test]
     fn ordinary_wrapper_one_binding_mutation_fails_closed() {
-        let r = repository_root();
-        let (p, _) = read_policy(&r).unwrap();
-        let f = load_sources(&r, &p).unwrap();
-        let t = validate_source_tree(&f, &p).unwrap();
-        let mut x = f.clone();
-        x[0].digest[0] ^= 1;
-        assert_eq!(validate_source_tree(&x, &p).unwrap_err().code, "E_TREE_DIGEST_MISMATCH");
-        assert_eq!(validate_source_tree(&f, &p).unwrap(), t);
+        let repository = repository_root();
+        let (policy, _) = read_policy(&repository).unwrap();
+        let sources = load_sources(&repository, &policy).unwrap();
+        let validated_tree = validate_source_tree(&sources, &policy).unwrap();
+        let mut mutated_sources = sources.clone();
+        mutated_sources[0].digest[0] ^= 1;
+        assert_eq!(
+            validate_source_tree(&mutated_sources, &policy)
+                .unwrap_err()
+                .code,
+            "E_TREE_DIGEST_MISMATCH"
+        );
+        assert_eq!(
+            validate_source_tree(&sources, &policy).unwrap(),
+            validated_tree
+        );
     }
 
     fn ordinary_environment_set_digest() -> [u8; 32] {

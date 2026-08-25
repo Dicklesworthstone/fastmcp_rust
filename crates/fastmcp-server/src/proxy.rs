@@ -11008,6 +11008,7 @@ mod tests {
     }
 
     #[derive(Default)]
+    #[allow(clippy::struct_field_names)] // Each field records the last observed backend call.
     struct TestState {
         last_tool: Option<(String, serde_json::Value)>,
         last_resource: Option<String>,
@@ -14093,8 +14094,7 @@ exec sleep 2
                 ClientCapabilities::default(),
                 Cx::for_request(),
             )
-            .err()
-            .expect("a contradictory modern discovery response must not downgrade to legacy");
+            .expect_err("a contradictory modern discovery response must not downgrade to legacy");
 
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert!(bindings.live_http.is_empty());
@@ -14358,8 +14358,7 @@ exec sleep 2
                 fastmcp_client::ClientProtocolPlan::stdio(ProtocolPolicy::Auto),
                 Cx::for_testing(),
             )
-            .err()
-            .expect("a contradictory modern success must not start the available legacy peer");
+            .expect_err("a contradictory modern success must not start the available legacy peer");
 
         assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
         assert!(
@@ -16461,10 +16460,9 @@ exec sleep 2
             "split_once('/') would leave the rest of a nested prefix on the upstream URI"
         );
         assert!(
-            proxy
+            !proxy
                 .subscription_rewrites_for_test()
-                .get("db://orders")
-                .is_none(),
+                .contains_key("db://orders"),
             "unsubscribe must drop the inbound rewrite"
         );
     }

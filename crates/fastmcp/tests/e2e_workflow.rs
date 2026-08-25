@@ -1651,7 +1651,7 @@ fn settle_final_tasks_http_server(
     join: &mut Option<JoinHandle<()>>,
 ) -> Result<(), String> {
     match shutdown.try_send(()) {
-        Ok(()) | Err(mpsc::TrySendError::Full(())) | Err(mpsc::TrySendError::Disconnected(())) => {}
+        Ok(()) | Err(mpsc::TrySendError::Full(()) | mpsc::TrySendError::Disconnected(())) => {}
     }
     let outcome = finished
         .recv_timeout(FINAL_TASKS_E2E_BOUND)
@@ -2025,9 +2025,9 @@ impl ResourceHandler for PublicTypedMrtrResource {
 }
 
 struct PublicTypedMrtrPrompt {
-    initial_calls: Arc<AtomicUsize>,
-    resumed_calls: Arc<AtomicUsize>,
-    legacy_calls: Arc<AtomicUsize>,
+    initial_requests: Arc<AtomicUsize>,
+    resume_attempts: Arc<AtomicUsize>,
+    legacy_fallbacks: Arc<AtomicUsize>,
 }
 
 impl PromptHandler for PublicTypedMrtrPrompt {
@@ -2047,7 +2047,7 @@ impl PromptHandler for PublicTypedMrtrPrompt {
         _ctx: &McpContext,
         _arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
-        self.legacy_calls.fetch_add(1, Ordering::SeqCst);
+        self.legacy_fallbacks.fetch_add(1, Ordering::SeqCst);
         Ok(vec![PromptMessage {
             role: Role::Assistant,
             content: Content::text("exact legacy prompt result"),
@@ -2063,7 +2063,7 @@ impl PromptHandler for PublicTypedMrtrPrompt {
         _ctx: &McpContext,
         _arguments: HashMap<String, String>,
     ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
-        self.initial_calls.fetch_add(1, Ordering::SeqCst);
+        self.initial_requests.fetch_add(1, Ordering::SeqCst);
         Ok(FinalMethodOutcome::InputRequired(
             typed_roots_input_required(),
         ))
@@ -2091,7 +2091,7 @@ impl PromptHandler for PublicTypedMrtrPrompt {
                 }
                 Err(error) => return Outcome::Err(error),
             }
-            self.resumed_calls.fetch_add(1, Ordering::SeqCst);
+            self.resume_attempts.fetch_add(1, Ordering::SeqCst);
             Outcome::Ok(FinalMethodOutcome::Complete(CompleteResult::new(
                 FinalGetPromptResult {
                     description: Some("exact final prompt result".to_owned()),
@@ -2924,9 +2924,9 @@ fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds
             input_required_after_resume: Arc::new(AtomicUsize::new(MAX_MRTR_CONTINUATION_ROUNDS)),
         })
         .prompt(PublicTypedMrtrPrompt {
-            initial_calls: Arc::clone(&prompt_initial),
-            resumed_calls: Arc::clone(&prompt_resumed),
-            legacy_calls: Arc::clone(&prompt_legacy),
+            initial_requests: Arc::clone(&prompt_initial),
+            resume_attempts: Arc::clone(&prompt_resumed),
+            legacy_fallbacks: Arc::clone(&prompt_legacy),
         })
         .build();
     let fixture = FinalTasksHttpFixture::spawn(server, runner);

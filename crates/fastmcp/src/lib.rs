@@ -3653,11 +3653,11 @@ pub mod modern {
         /// the underlying activation receipt rejects a missing or inactive Apps
         /// negotiation before the Host is constructed.
         #[cfg(feature = "apps")]
-        pub fn mcp_apps_wire_host<'client, T>(
-            &'client mut self,
+        pub fn mcp_apps_wire_host<T>(
+            &mut self,
             transport: T,
             configuration: McpAppsWireHostConfiguration,
-        ) -> Result<McpAppsWireHost<T, McpAppsClientWirePolicy<'client>>, McpAppsHostError>
+        ) -> Result<McpAppsWireHost<T, McpAppsClientWirePolicy<'_>>, McpAppsHostError>
         where
             T: McpAppsWireBridgeTransport,
         {
@@ -4502,11 +4502,11 @@ pub mod modern {
         /// underlying activation receipt still rejects missing or inactive Apps
         /// negotiation before constructing the Host.
         #[cfg(feature = "apps")]
-        pub fn mcp_apps_wire_host<'client, T>(
-            &'client mut self,
+        pub fn mcp_apps_wire_host<T>(
+            &mut self,
             transport: T,
             configuration: McpAppsWireHostConfiguration,
-        ) -> Result<McpAppsWireHost<T, McpAppsHttpClientWirePolicy<'client>>, McpAppsHostError>
+        ) -> Result<McpAppsWireHost<T, McpAppsHttpClientWirePolicy<'_>>, McpAppsHostError>
         where
             T: McpAppsWireBridgeTransport,
         {

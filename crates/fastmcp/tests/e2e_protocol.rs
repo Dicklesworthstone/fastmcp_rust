@@ -1310,25 +1310,28 @@ fn connect_bounded_modern_stdio_to_shipped_echo_server_with_env(
 }
 
 #[cfg(unix)]
-fn stdio_mrtr_capabilities(
+struct StdioMrtrCapabilities {
     sampling: bool,
     roots: bool,
     form: bool,
     url: bool,
-) -> modern::ClientCapabilities {
+}
+
+#[cfg(unix)]
+fn stdio_mrtr_capabilities(requested: StdioMrtrCapabilities) -> modern::ClientCapabilities {
     let mut capabilities = modern::ClientCapabilities::default();
-    if sampling {
-        capabilities.sampling = Some(Default::default());
+    if requested.sampling {
+        capabilities.sampling = Some(fastmcp_protocol::SamplingCapability::default());
     }
-    if roots {
+    if requested.roots {
         capabilities.roots = serde_json::from_value(json!({})).expect("roots capability is valid");
     }
-    if form || url {
+    if requested.form || requested.url {
         let mut elicitation = json!({});
-        if form {
+        if requested.form {
             elicitation["form"] = json!({});
         }
-        if url {
+        if requested.url {
             elicitation["url"] = json!({});
         }
         capabilities.elicitation =
@@ -3010,7 +3013,12 @@ fn e2e_public_stdio_read_resource_and_get_prompt_follow_installed_roots_handler(
 fn e2e_public_stdio_modern_sampling_elicitation_keep_input_required() {
     let mut client = connect_bounded_modern_stdio_with_mrtr(
         "modern-only",
-        stdio_mrtr_capabilities(true, true, true, true),
+        stdio_mrtr_capabilities(StdioMrtrCapabilities {
+            sampling: true,
+            roots: true,
+            form: true,
+            url: true,
+        }),
         modern::ReverseRequestHandlers::new(),
     )
     .expect("a ModernOnly facade client advertises sampling, roots, and elicitation");
@@ -3064,7 +3072,12 @@ fn e2e_public_stdio_modern_sampling_elicitation_keep_input_required() {
 fn e2e_public_stdio_modern_sampling_elicitation_fail_closed_without_capability() {
     let mut no_sampling = connect_bounded_modern_stdio_with_mrtr(
         "modern-only",
-        stdio_mrtr_capabilities(false, true, true, true),
+        stdio_mrtr_capabilities(StdioMrtrCapabilities {
+            sampling: false,
+            roots: true,
+            form: true,
+            url: true,
+        }),
         modern::ReverseRequestHandlers::new(),
     )
     .expect("a ModernOnly facade client connects without advertising sampling");
@@ -3078,7 +3091,12 @@ fn e2e_public_stdio_modern_sampling_elicitation_fail_closed_without_capability()
 
     let mut no_url = connect_bounded_modern_stdio_with_mrtr(
         "modern-only",
-        stdio_mrtr_capabilities(true, true, true, false),
+        stdio_mrtr_capabilities(StdioMrtrCapabilities {
+            sampling: true,
+            roots: true,
+            form: true,
+            url: false,
+        }),
         modern::ReverseRequestHandlers::new(),
     )
     .expect("a ModernOnly facade client connects without advertising URL elicitation");
@@ -3133,7 +3151,12 @@ fn e2e_public_stdio_modern_sampling_elicitation_follow_installed_handlers() {
         });
     let mut client = connect_bounded_modern_stdio_with_mrtr(
         "modern-only",
-        stdio_mrtr_capabilities(true, true, true, true),
+        stdio_mrtr_capabilities(StdioMrtrCapabilities {
+            sampling: true,
+            roots: true,
+            form: true,
+            url: true,
+        }),
         handlers,
     )
     .expect("a ModernOnly facade client installs sampling, roots, and elicitation handlers");
