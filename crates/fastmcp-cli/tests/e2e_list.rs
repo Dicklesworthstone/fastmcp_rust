@@ -312,15 +312,9 @@ fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> 
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error) if proc_process_disappeared(&error) => continue,
-            Err(error) => {
-                return Err(format!("failed to read process {pid} state: {error}"));
-            }
+        let Some((state, group)) = read_linux_process_state_and_group(pid)? else {
+            continue;
         };
-        let (state, group) = linux_process_state_and_group(&stat)
-            .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
         if group == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
             return Ok(true);
         }
@@ -377,11 +371,41 @@ fn process_group_has_live_member(process_group_id: u32) -> Result<bool, String> 
 
 #[cfg(target_os = "linux")]
 fn process_is_zombie(pid: u32) -> Result<bool, String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
-    let (state, _) = linux_process_state_and_group(&stat)
-        .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
+    let (state, _) = read_linux_process_state_and_group(pid)?
+        .ok_or_else(|| format!("process {pid} disappeared before it could be reaped"))?;
     Ok(matches!(state, 'Z' | 'X' | 'x'))
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_process_state_and_group(pid: u32) -> Result<Option<(char, u32)>, String> {
+    const MAX_STAT_READ_ATTEMPTS: usize = 3;
+
+    let path = format!("/proc/{pid}/stat");
+    for attempt in 0..MAX_STAT_READ_ATTEMPTS {
+        match std::fs::read_to_string(&path) {
+            Ok(stat) => {
+                if let Some(parsed) = linux_process_state_and_group(&stat) {
+                    return Ok(Some(parsed));
+                }
+                if attempt + 1 < MAX_STAT_READ_ATTEMPTS {
+                    std::thread::yield_now();
+                }
+            }
+            Err(error) if proc_process_disappeared(&error) => return Ok(None),
+            Err(error) => {
+                return Err(format!("failed to read process {pid} state: {error}"));
+            }
+        }
+    }
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if proc_process_disappeared(&error) => Ok(None),
+        Err(error) => Err(format!(
+            "failed to recheck malformed process {pid} state: {error}"
+        )),
+        Ok(_) => Err(format!(
+            "malformed /proc/{pid}/stat after {MAX_STAT_READ_ATTEMPTS} reads"
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]

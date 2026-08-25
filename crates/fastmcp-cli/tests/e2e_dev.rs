@@ -608,10 +608,8 @@ fn proc_process_disappeared(error: &std::io::Error) -> bool {
 }
 
 fn linux_process_is_zombie(pid: u32) -> Result<bool, String> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|error| format!("failed to read process {pid} state: {error}"))?;
-    let (state, _) = linux_process_state_and_group(&stat)
-        .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
+    let (state, _) = read_linux_process_state_and_group(pid)?
+        .ok_or_else(|| format!("process {pid} disappeared before it could be reaped"))?;
     Ok(matches!(state, 'Z' | 'X' | 'x'))
 }
 
@@ -629,20 +627,45 @@ fn linux_process_group_has_live_member(process_group_id: u32) -> Result<bool, St
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error) if proc_process_disappeared(&error) => continue,
-            Err(error) => {
-                return Err(format!("failed to read process {pid} state: {error}"));
-            }
+        let Some((state, group)) = read_linux_process_state_and_group(pid)? else {
+            continue;
         };
-        let (state, group) = linux_process_state_and_group(&stat)
-            .ok_or_else(|| format!("malformed /proc/{pid}/stat"))?;
         if group == process_group_id && !matches!(state, 'Z' | 'X' | 'x') {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn read_linux_process_state_and_group(pid: u32) -> Result<Option<(char, u32)>, String> {
+    const MAX_STAT_READ_ATTEMPTS: usize = 3;
+
+    let path = format!("/proc/{pid}/stat");
+    for attempt in 0..MAX_STAT_READ_ATTEMPTS {
+        match std::fs::read_to_string(&path) {
+            Ok(stat) => {
+                if let Some(parsed) = linux_process_state_and_group(&stat) {
+                    return Ok(Some(parsed));
+                }
+                if attempt + 1 < MAX_STAT_READ_ATTEMPTS {
+                    std::thread::yield_now();
+                }
+            }
+            Err(error) if proc_process_disappeared(&error) => return Ok(None),
+            Err(error) => {
+                return Err(format!("failed to read process {pid} state: {error}"));
+            }
+        }
+    }
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if proc_process_disappeared(&error) => Ok(None),
+        Err(error) => Err(format!(
+            "failed to recheck malformed process {pid} state: {error}"
+        )),
+        Ok(_) => Err(format!(
+            "malformed /proc/{pid}/stat after {MAX_STAT_READ_ATTEMPTS} reads"
+        )),
+    }
 }
 
 fn linux_process_state_and_group(stat: &str) -> Option<(char, u32)> {
@@ -1041,10 +1064,9 @@ fn wait_for_marker_file(path: &Path, timeout: Duration) {
 }
 
 fn assert_live_process_in_group(pid: u32, process_group_id: u32, context: &str) {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .unwrap_or_else(|error| panic!("{context}: failed to read process {pid} state: {error}"));
-    let (state, observed_group_id) = linux_process_state_and_group(&stat)
-        .unwrap_or_else(|| panic!("{context}: malformed /proc/{pid}/stat"));
+    let (state, observed_group_id) = read_linux_process_state_and_group(pid)
+        .unwrap_or_else(|error| panic!("{context}: {error}"))
+        .unwrap_or_else(|| panic!("{context}: process {pid} disappeared"));
     assert!(
         !matches!(state, 'Z' | 'X' | 'x'),
         "{context}: process {pid} was not live"
