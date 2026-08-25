@@ -24,10 +24,10 @@
 //! # Usage
 //!
 //! ```ignore
-//! use fastmcp_rust::mcp_config::{McpConfig, ConfigLoader};
+//! use fastmcp_rust::mcp_config::{ConfigError, ConfigLoader, McpConfig};
 //!
 //! // Load from default location
-//! let config = ConfigLoader::default()?.load()?;
+//! let config = ConfigLoader::default().load()?;
 //!
 //! // Create a client for a specific server
 //! # use asupersync::Cx;

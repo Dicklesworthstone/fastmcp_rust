@@ -384,7 +384,7 @@ use std::time::Duration;
 
 use fastmcp_rust::prelude::{Client, ClientBuilder, Cx, McpResult, RequestTimeoutPolicy};
 
-fn connect(cx: &Cx) -> McpResult<Client> {
+async fn connect(cx: &Cx) -> McpResult<Client> {
     let policy = RequestTimeoutPolicy::new(
         Duration::from_secs(20),
         Duration::from_secs(90),
@@ -392,6 +392,7 @@ fn connect(cx: &Cx) -> McpResult<Client> {
     ClientBuilder::new()
         .request_timeout_policy(policy)
         .connect_stdio_with_cx("my-mcp-server", &[], cx)
+        .await
 }
 ```
 
@@ -410,8 +411,8 @@ core result for ordinary catalog and invocation traffic. HTTP and WebSocket
 `list_tools_with_cancellation`/`call_tool_with_cancellation`/
 `read_resource_with_cancellation`/`get_prompt_with_cancellation` honor a
 caller-owned cancellation domain for those ordinary verbs.
-Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse` when the GET event
-stream and POST message endpoints are already known.
+Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
+event stream and POST message endpoints are already known.
 
 The published 0.7.1 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:

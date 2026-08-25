@@ -3116,14 +3116,14 @@ fn e2e_public_sse_constructor_invokes_live_legacy_handlers() {
     )
     .expect("the standalone SSE constructor must invoke the live legacy tool");
     let CoreResult::Legacy(legacy_2024::LegacyCoreResult::ToolsCall(result)) = result else {
-        panic!("Client::sse must stay on the exact-2024 tool result: {result:?}");
+        panic!("Client::sse_with_cx must stay on the exact-2024 tool result: {result:?}");
     };
     let tool = serde_json::to_value(result)
         .expect("the exact-2024 SSE tool result serializes for its observable assertion");
     assert_eq!(
         tool["content"][0]["text"],
         json!(PUBLIC_HTTP_TOOL_TEXT),
-        "Client::sse must retain the live handler value"
+        "Client::sse_with_cx must retain the live handler value"
     );
     drop(client);
     server.shutdown();
@@ -3263,7 +3263,7 @@ fn e2e_public_sse_compose_nested_tool_and_resource() {
     )
     .expect("exact-2024 SSE must compose a nested tool call and resource read");
     let CoreResult::Legacy(legacy_2024::LegacyCoreResult::ToolsCall(result)) = result else {
-        panic!("Client::sse compose must stay on the exact-2024 tool result: {result:?}");
+        panic!("Client::sse_with_cx compose must stay on the exact-2024 tool result: {result:?}");
     };
     let tool = serde_json::to_value(result).expect("the exact-2024 SSE compose result serializes");
     assert_eq!(
@@ -3335,7 +3335,9 @@ fn e2e_public_sse_prompt_composes_nested_tool_and_resource() {
     )
     .expect("exact-2024 SSE must compose a nested tool call and resource read from prompts/get");
     let CoreResult::Legacy(legacy_2024::LegacyCoreResult::PromptsGet(result)) = result else {
-        panic!("Client::sse prompt compose must stay on the exact-2024 prompt result: {result:?}");
+        panic!(
+            "Client::sse_with_cx prompt compose must stay on the exact-2024 prompt result: {result:?}"
+        );
     };
     let prompt = serde_json::to_value(result).expect("the exact-2024 SSE prompt result serializes");
     assert_eq!(
@@ -3407,7 +3409,7 @@ fn e2e_public_sse_resource_composes_nested_tool_and_resource() {
     .expect("exact-2024 SSE must compose a nested tool call and resource read from resources/read");
     let CoreResult::Legacy(legacy_2024::LegacyCoreResult::ResourcesRead(result)) = result else {
         panic!(
-            "Client::sse resource compose must stay on the exact-2024 resource result: {result:?}"
+            "Client::sse_with_cx resource compose must stay on the exact-2024 resource result: {result:?}"
         );
     };
     let resource =

@@ -83,7 +83,7 @@ let _ = HttpClient::take_legacy_notification;
 ```compile_fail
 use fastmcp_client::Client;
 
-let _ = Client::sse;
+let _ = Client::sse_with_cx;
 ```
 "#
 )]
@@ -13982,11 +13982,18 @@ impl Client {
 
     /// Connects a ready high-level HTTP client with an explicit cancellation context.
     ///
-    /// This is the HTTP counterpart to [`Self::stdio_with_protocol_plan`].
+    /// This is the HTTP counterpart to [`Self::stdio_with_protocol_plan_with_cx`].
     /// The returned [`HttpClient`] owns policy selection and completes the
     /// legacy lifecycle before allowing ordinary application requests. The
     /// caller retains runtime, cancellation, and deadline ownership through
     /// `cx`.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_client::{Client, ClientProtocolPlan, ProtocolPolicy};
+    ///
+    /// let plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+    /// let _client = Client::http(plan);
+    /// ```
     pub async fn http_with_cx(
         protocol_plan: ClientProtocolPlan,
         cx: &Cx,
@@ -14004,6 +14011,15 @@ impl Client {
     /// GET event stream and POST message endpoints. Auto still uses SSE only
     /// as a fallback after a modern HTTP probe; this method never probes
     /// MCP 2026-07-28 or creates a runtime.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_client::{CanonicalHttpUrl, Client};
+    ///
+    /// let sse = CanonicalHttpUrl::parse("https://example.com/sse").expect("canonical SSE URL");
+    /// let post = CanonicalHttpUrl::parse("https://example.com/messages")
+    ///     .expect("canonical message URL");
+    /// let _client = Client::sse(sse, post);
+    /// ```
     #[cfg(feature = "legacy-2024-11-05")]
     pub async fn sse_with_cx(
         sse_endpoint: CanonicalHttpUrl,
@@ -31889,7 +31905,7 @@ mod tests {
     }
 
     // ========================================
-    // Client::builder and Client::stdio error
+    // Client::builder and explicit-context client constructors
     // ========================================
 
     #[test]
@@ -31901,7 +31917,15 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn client_sse_requires_the_caller_owned_context() {
-        let _ = Client::sse_with_cx;
+        async fn connect(
+            sse_endpoint: CanonicalHttpUrl,
+            message_post_endpoint: CanonicalHttpUrl,
+            cx: &Cx,
+        ) -> Result<HttpClient, HttpClientError> {
+            Client::sse_with_cx(sse_endpoint, message_post_endpoint, cx).await
+        }
+
+        let _ = connect;
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
