@@ -33,6 +33,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
+use asupersync::Cx;
+use asupersync::runtime::reactor::create_reactor;
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use clap::{Parser, Subcommand};
 use serde::de::DeserializeOwned;
 use serde::ser::SerializeMap;
@@ -962,107 +965,21 @@ fn main() -> ExitCode {
     };
     // FND-01: no eager crates.io update checks (CLI-NO-UREQ / CLI-NO-SEMVER).
 
-    let selected_protocol_policy = cli.command.protocol_policy();
-    let result = selected_protocol_policy
-        .map_or(Ok(()), validate_cli_protocol_policy)
-        .and_then(|()| match cli.command {
-            Commands::Run {
-                server,
-                args,
-                cwd,
-                env,
-                protocol_policy,
-            } => cmd_run(&server, &args, cwd.as_deref(), &env, protocol_policy),
-            Commands::Inspect {
-                server,
-                http_url,
-                legacy_sse_url,
-                legacy_message_url,
-                args,
-                format,
-                output,
-                protocol_policy,
-            } => match server.as_deref() {
-                Some(server) => {
-                    cmd_inspect(server, &args, format, output.as_deref(), protocol_policy)
-                }
-                None if http_url.is_some()
-                    || legacy_sse_url.is_some()
-                    || legacy_message_url.is_some() =>
-                {
-                    cmd_inspect_http(
-                        http_url.as_deref(),
-                        legacy_sse_url.as_deref(),
-                        legacy_message_url.as_deref(),
-                        format,
-                        output.as_deref(),
-                        protocol_policy,
-                    )
-                }
-                None => Err(fastmcp_core::McpError::invalid_params(
-                    "inspect requires a server command or explicit HTTP endpoints",
-                )),
-            },
-            Commands::Install {
-                name,
-                server,
-                args,
-                cwd,
-                target,
-                dry_run,
-                protocol_policy,
-            } => cmd_install(
-                &name,
-                &server,
-                &args,
-                cwd.as_deref(),
-                target,
-                dry_run,
-                protocol_policy,
-            ),
-            Commands::List {
-                target,
-                config,
-                format,
-                verbose,
-            } => cmd_list(target, config, format, verbose),
-            Commands::Test {
-                server,
-                args,
-                idle_timeout,
-                absolute_timeout,
-                verbose,
-                json,
-            } => cmd_test(
-                &server,
-                &args,
-                idle_timeout,
-                absolute_timeout,
-                verbose,
-                json,
-            ),
-            Commands::Dev {
-                target,
-                reload_dirs,
-                reload_patterns,
-                no_reload,
-                debounce,
-                clear,
-                env,
-                protocol_policy,
-                verbose,
-            } => cmd_dev(DevConfig {
-                target,
-                reload_dirs,
-                reload_patterns,
-                no_reload,
-                debounce_ms: debounce,
-                clear,
-                env,
-                protocol_policy,
-                verbose,
-            }),
-        });
+    let runtime = match build_cli_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            write_cli_error(&error);
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async move {
+        let cx = Cx::current().ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "FastMCP CLI runtime did not install a cancellation context",
+            )
+        })?;
+        run_cli(&cx, cli).await
+    });
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1090,6 +1007,136 @@ fn main() -> ExitCode {
             write_cli_error(&e);
             ExitCode::FAILURE
         }
+    }
+}
+
+fn build_cli_runtime() -> McpResult<Runtime> {
+    let reactor = create_reactor().map_err(|error| {
+        fastmcp_core::McpError::internal_error(format!(
+            "Failed to create the FastMCP CLI I/O reactor: {error}"
+        ))
+    })?;
+    RuntimeBuilder::current_thread()
+        .with_reactor(reactor)
+        .build()
+        .map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "Failed to build the FastMCP CLI runtime: {error}"
+            ))
+        })
+}
+
+async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
+    let selected_protocol_policy = cli.command.protocol_policy();
+    if let Some(protocol_policy) = selected_protocol_policy {
+        validate_cli_protocol_policy(protocol_policy)?;
+    }
+
+    match cli.command {
+        Commands::Run {
+            server,
+            args,
+            cwd,
+            env,
+            protocol_policy,
+        } => cmd_run(&server, &args, cwd.as_deref(), &env, protocol_policy),
+        Commands::Inspect {
+            server,
+            http_url,
+            legacy_sse_url,
+            legacy_message_url,
+            args,
+            format,
+            output,
+            protocol_policy,
+        } => match server.as_deref() {
+            Some(server) => cmd_inspect(
+                cx,
+                server,
+                &args,
+                format,
+                output.as_deref(),
+                protocol_policy,
+            ),
+            None if http_url.is_some()
+                || legacy_sse_url.is_some()
+                || legacy_message_url.is_some() =>
+            {
+                cmd_inspect_http(
+                    cx,
+                    http_url.as_deref(),
+                    legacy_sse_url.as_deref(),
+                    legacy_message_url.as_deref(),
+                    format,
+                    output.as_deref(),
+                    protocol_policy,
+                )
+                .await
+            }
+            None => Err(fastmcp_core::McpError::invalid_params(
+                "inspect requires a server command or explicit HTTP endpoints",
+            )),
+        },
+        Commands::Install {
+            name,
+            server,
+            args,
+            cwd,
+            target,
+            dry_run,
+            protocol_policy,
+        } => cmd_install(
+            &name,
+            &server,
+            &args,
+            cwd.as_deref(),
+            target,
+            dry_run,
+            protocol_policy,
+        ),
+        Commands::List {
+            target,
+            config,
+            format,
+            verbose,
+        } => cmd_list(target, config, format, verbose),
+        Commands::Test {
+            server,
+            args,
+            idle_timeout,
+            absolute_timeout,
+            verbose,
+            json,
+        } => cmd_test(
+            cx,
+            &server,
+            &args,
+            idle_timeout,
+            absolute_timeout,
+            verbose,
+            json,
+        ),
+        Commands::Dev {
+            target,
+            reload_dirs,
+            reload_patterns,
+            no_reload,
+            debounce,
+            clear,
+            env,
+            protocol_policy,
+            verbose,
+        } => cmd_dev(DevConfig {
+            target,
+            reload_dirs,
+            reload_patterns,
+            no_reload,
+            debounce_ms: debounce,
+            clear,
+            env,
+            protocol_policy,
+            verbose,
+        }),
     }
 }
 
@@ -3644,6 +3691,7 @@ fn combine_test_failure_with_output(
 
 /// Test command: Test MCP server connectivity.
 fn cmd_test(
+    cx: &Cx,
     server: &str,
     args: &[String],
     idle_timeout_secs: u64,
@@ -3678,7 +3726,7 @@ fn cmd_test(
     let client = fastmcp_client::ClientBuilder::new()
         .request_timeout_policy(timeout_policy)
         .owned_process_group(true)
-        .connect_stdio(server, &args_refs);
+        .connect_stdio_with_cx(server, &args_refs, cx);
     let mut client = match client {
         Ok(client) => client,
         Err(mut error) => {
@@ -5272,6 +5320,7 @@ fn cmd_dev_supported(config: DevConfig) -> McpResult<()> {
 
 /// Inspect command: Connect to a server and display its capabilities.
 fn cmd_inspect(
+    cx: &Cx,
     server: &str,
     args: &[String],
     format: InspectFormat,
@@ -5282,8 +5331,8 @@ fn cmd_inspect(
     let args_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     // Connect to the server
-    let mut client =
-        client_builder_for_protocol_policy(protocol_policy)?.connect_stdio(server, &args_refs)?;
+    let mut client = client_builder_for_protocol_policy(protocol_policy)?
+        .connect_stdio_with_cx(server, &args_refs, cx)?;
     let negotiated_protocol_version = client.protocol_version().to_owned();
 
     // Preserve the negotiated era's capability model. Modern discovery is an
@@ -5572,7 +5621,8 @@ fn parse_http_inspect_endpoint(
 
 /// Inspects an explicit, policy-bound HTTP endpoint bundle through the
 /// shipped dual-era client.
-fn cmd_inspect_http(
+async fn cmd_inspect_http(
+    cx: &Cx,
     http_url: Option<&str>,
     legacy_sse_url: Option<&str>,
     legacy_message_url: Option<&str>,
@@ -5587,23 +5637,13 @@ fn cmd_inspect_http(
         legacy_message_url,
         protocol_policy,
     )?;
-    // The CLI is the application-owned runtime boundary. The client library
-    // receives this context explicitly and never creates or re-enters a
-    // runtime merely to make HTTP connection look synchronous.
-    let mut client = fastmcp_core::runtime::block_on(async {
-        let cx = asupersync::Cx::current().ok_or_else(|| {
-            fastmcp_core::McpError::internal_error(
-                "inspect HTTP runtime did not install a cancellation context",
-            )
+    let mut client = Client::http_with_cx(protocol_plan, cx)
+        .await
+        .map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "inspect could not connect to the configured HTTP endpoint bundle: {error}"
+            ))
         })?;
-        Client::http_with_cx(protocol_plan, &cx)
-            .await
-            .map_err(|error| {
-                fastmcp_core::McpError::internal_error(format!(
-                    "inspect could not connect to the configured HTTP endpoint bundle: {error}"
-                ))
-            })
-    })?;
 
     let negotiated_version = client.connection().protocol_version().ok_or_else(|| {
         fastmcp_core::McpError::internal_error(
@@ -5614,7 +5654,7 @@ fn cmd_inspect_http(
     let server_info = client.server_info().clone();
     let capabilities = http_inspect_capabilities(&client)?;
     let (acquisition_truncated, tools, resources, resource_templates, prompts) =
-        http_inspect_catalogs(&mut client, &capabilities)?;
+        http_inspect_catalogs(cx, &mut client, &capabilities).await?;
 
     write_inspect_report(
         &server_info,
@@ -5661,7 +5701,8 @@ fn http_inspect_capabilities(
 }
 
 #[allow(clippy::type_complexity)]
-fn http_inspect_catalogs(
+async fn http_inspect_catalogs(
+    cx: &Cx,
     client: &mut fastmcp_client::HttpClient,
     capabilities: &InspectCapabilities,
 ) -> McpResult<(
@@ -5674,15 +5715,16 @@ fn http_inspect_catalogs(
     let mut acquisition_truncated = false;
     let tools = if capabilities.advertises("tools") {
         let (items, truncated) =
-            http_inspect_tools_result(http_inspect_core_request(client, "tools/list")?)?;
+            http_inspect_tools_result(http_inspect_core_request(cx, client, "tools/list").await?)?;
         acquisition_truncated |= truncated;
         items
     } else {
         Vec::new()
     };
     let resources = if capabilities.advertises("resources") {
-        let (items, truncated) =
-            http_inspect_resources_result(http_inspect_core_request(client, "resources/list")?)?;
+        let (items, truncated) = http_inspect_resources_result(
+            http_inspect_core_request(cx, client, "resources/list").await?,
+        )?;
         acquisition_truncated |= truncated;
         items
     } else {
@@ -5690,7 +5732,7 @@ fn http_inspect_catalogs(
     };
     let resource_templates = if capabilities.advertises("resources") {
         let (items, truncated) = http_inspect_resource_templates_result(
-            http_inspect_core_request(client, "resources/templates/list")?,
+            http_inspect_core_request(cx, client, "resources/templates/list").await?,
         )?;
         acquisition_truncated |= truncated;
         items
@@ -5698,8 +5740,9 @@ fn http_inspect_catalogs(
         Vec::new()
     };
     let prompts = if capabilities.advertises("prompts") {
-        let (items, truncated) =
-            http_inspect_prompts_result(http_inspect_core_request(client, "prompts/list")?)?;
+        let (items, truncated) = http_inspect_prompts_result(
+            http_inspect_core_request(cx, client, "prompts/list").await?,
+        )?;
         acquisition_truncated |= truncated;
         items
     } else {
@@ -5714,25 +5757,19 @@ fn http_inspect_catalogs(
     ))
 }
 
-fn http_inspect_core_request(
+async fn http_inspect_core_request(
+    cx: &Cx,
     client: &mut fastmcp_client::HttpClient,
     method: &'static str,
 ) -> McpResult<fastmcp_client::CoreResult> {
-    fastmcp_core::runtime::block_on(async {
-        let cx = asupersync::Cx::current().ok_or_else(|| {
-            fastmcp_core::McpError::internal_error(
-                "inspect HTTP runtime did not install a cancellation context",
-            )
-        })?;
-        client
-            .request_final_core(&cx, method, serde_json::json!({}))
-            .await
-            .map_err(|error| {
-                fastmcp_core::McpError::internal_error(format!(
-                    "inspect HTTP {method} request failed: {error}"
-                ))
-            })
-    })
+    client
+        .request_final_core(cx, method, serde_json::json!({}))
+        .await
+        .map_err(|error| {
+            fastmcp_core::McpError::internal_error(format!(
+                "inspect HTTP {method} request failed: {error}"
+            ))
+        })
 }
 
 fn http_inspect_tools_result(
@@ -10547,6 +10584,34 @@ fn get_cline_config_path() -> McpResult<PathBuf> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn cli_runtime_installs_context_only_during_runtime_entry() {
+        assert!(
+            Cx::current().is_none(),
+            "the process must not have an ambient CLI context before runtime entry"
+        );
+
+        let runtime = build_cli_runtime().expect("the CLI runtime and reactor must initialize");
+        let runtime_has_context = runtime.block_on(async { Cx::current().is_some() });
+
+        assert!(runtime_has_context);
+        assert!(
+            Cx::current().is_none(),
+            "the runtime-installed CLI context must not leak after runtime exit"
+        );
+    }
+
+    #[test]
+    fn production_cli_has_one_runtime_boundary_and_no_library_runtime_entry() {
+        let source = include_str!("main.rs");
+        let (production, _) = source
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("the CLI unit-test boundary must remain present");
+
+        assert_eq!(production.matches(".block_on(").count(), 1);
+        assert!(!production.contains("fastmcp_core::runtime::block_on"));
+    }
 
     fn make_test_server_info() -> fastmcp_protocol::ServerInfo {
         fastmcp_protocol::ServerInfo {
