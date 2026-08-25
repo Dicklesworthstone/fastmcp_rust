@@ -3335,7 +3335,8 @@ fn workflow_concurrent_clients_isolation() {
 
         // Spawn server thread
         let handle = spawn_thread(move || {
-            server.run_transport(server_transport);
+            let cx = Cx::for_testing();
+            server.run_transport_with_cx(&cx, server_transport);
         });
         server_joins.push(handle);
 
@@ -3414,7 +3415,8 @@ fn workflow_concurrent_interleaved_operations() {
                 .build();
 
             let server_handle = spawn_thread(move || {
-                server.run_transport(server_transport);
+                let cx = Cx::for_testing();
+                server.run_transport_with_cx(&cx, server_transport);
             });
             let _server_join = ThreadJoins::new(vec![server_handle]);
 
@@ -3484,7 +3486,8 @@ fn workflow_concurrent_no_crosstalk() {
                 .build();
 
             let server_handle = spawn_thread(move || {
-                server.run_transport(server_transport);
+                let cx = Cx::for_testing();
+                server.run_transport_with_cx(&cx, server_transport);
             });
             let _server_join = ThreadJoins::new(vec![server_handle]);
 
@@ -3552,7 +3555,8 @@ fn workflow_concurrent_session_state_persistence() {
         .build();
 
     let server_handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
@@ -3624,7 +3628,8 @@ fn workflow_concurrent_stress_test() {
                 .build();
 
             let server_handle = spawn_thread(move || {
-                server.run_transport(server_transport);
+                let cx = Cx::for_testing();
+                server.run_transport_with_cx(&cx, server_transport);
             });
             let _server_join = ThreadJoins::new(vec![server_handle]);
 
@@ -3707,21 +3712,30 @@ fn session_capabilities_reflect_server_handlers() {
     // Server with only tools
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("tools-only", "1.0.0").tool(EchoTool).build();
-    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
+    });
 
     // Server with only resources
     let (client_transport2, server_transport2) = create_memory_transport_pair();
     let server2 = Server::new("resources-only", "1.0.0")
         .resource(StatusResource)
         .build();
-    let server_handle2 = spawn_thread(move || server2.run_transport(server_transport2));
+    let server_handle2 = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server2.run_transport_with_cx(&cx, server_transport2);
+    });
 
     // Server with only prompts
     let (client_transport3, server_transport3) = create_memory_transport_pair();
     let server3 = Server::new("prompts-only", "1.0.0")
         .prompt(HelpPromptPrompt)
         .build();
-    let server_handle3 = spawn_thread(move || server3.run_transport(server_transport3));
+    let server_handle3 = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server3.run_transport_with_cx(&cx, server_transport3);
+    });
     let _server_joins = ThreadJoins::new(vec![server_handle, server_handle2, server_handle3]);
 
     let mut client = TestClient::new(client_transport);
@@ -3768,7 +3782,10 @@ fn session_operations_fail_before_init() {
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("test-server", "1.0.0").tool(EchoTool).build();
-    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
+    });
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -3791,7 +3808,10 @@ fn session_close_graceful() {
 
     let (client_transport, server_transport) = create_memory_transport_pair();
     let server = Server::new("close-test", "1.0.0").tool(EchoTool).build();
-    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
+    });
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
@@ -3828,8 +3848,14 @@ fn session_state_isolated_per_client() {
         .tool(SessionGetHandler)
         .build();
 
-    let server_a_handle = spawn_thread(move || server_a.run_transport(server_a_transport));
-    let server_b_handle = spawn_thread(move || server_b.run_transport(server_b_transport));
+    let server_a_handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server_a.run_transport_with_cx(&cx, server_a_transport);
+    });
+    let server_b_handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server_b.run_transport_with_cx(&cx, server_b_transport);
+    });
     let _server_joins = ThreadJoins::new(vec![server_a_handle, server_b_handle]);
 
     let mut client_a = TestClient::new(client_a_transport);
@@ -3908,7 +3934,10 @@ fn session_tracks_client_info() {
     let server = Server::new("client-info-test", "1.0.0")
         .tool(EchoTool)
         .build();
-    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
+    });
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client =
@@ -4183,7 +4212,8 @@ fn setup_tool_test_server() -> TestHarness {
         .build();
 
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     TestHarness::new(TestClient::new(client_transport), handle)
@@ -4793,7 +4823,8 @@ fn setup_resource_test_server() -> TestHarness {
         .build();
 
     let handle = spawn_thread(move || {
-        server.run_transport(server_transport);
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
     });
 
     TestHarness::new(TestClient::new(client_transport), handle)
@@ -5041,7 +5072,10 @@ fn resource_read_before_init_fails() {
     let server = Server::new("test", "1.0.0")
         .resource(PlainTextResource)
         .build();
-    let server_handle = spawn_thread(move || server.run_transport(server_transport));
+    let server_handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
+        server.run_transport_with_cx(&cx, server_transport);
+    });
     let _server_join = ThreadJoins::new(vec![server_handle]);
 
     let mut client = TestClient::new(client_transport);
