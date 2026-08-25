@@ -13,9 +13,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
-license = "MIT"
+license-file = "LICENSE"
 # Cargo lower-bound check only; the supported compiler is the dated nightly
 # pinned in rust-toolchain.toml (nightly-2026-08-25 / rustc 1.100.0-nightly).
 rust-version = "1.100"
@@ -97,15 +97,15 @@ clap = { version = "=4.6.6", features = ["derive", "env", "wrap_help"] }
 trybuild = { version = "=1.0.120", default-features = false }
 
 # Internal crates
-fastmcp-rust = { version = "0.7.1", path = "crates/fastmcp" }
-fastmcp-core = { version = "0.7.1", path = "crates/fastmcp-core" }
-fastmcp-transport = { version = "0.7.1", path = "crates/fastmcp-transport" }
-fastmcp-protocol = { version = "0.7.1", path = "crates/fastmcp-protocol" }
-fastmcp-server = { version = "0.7.1", path = "crates/fastmcp-server", default-features = false }
-fastmcp-client = { version = "0.7.1", path = "crates/fastmcp-client", default-features = false }
-fastmcp-derive = { version = "0.7.1", path = "crates/fastmcp-macros" }
-fastmcp-console = { version = "0.7.1", path = "crates/fastmcp-console" }
-fastmcp-cli = { version = "0.7.1", path = "crates/fastmcp-cli" }
+fastmcp-rust = { version = "0.8.0", path = "crates/fastmcp" }
+fastmcp-core = { version = "0.8.0", path = "crates/fastmcp-core" }
+fastmcp-transport = { version = "0.8.0", path = "crates/fastmcp-transport" }
+fastmcp-protocol = { version = "0.8.0", path = "crates/fastmcp-protocol" }
+fastmcp-server = { version = "0.8.0", path = "crates/fastmcp-server", default-features = false }
+fastmcp-client = { version = "0.8.0", path = "crates/fastmcp-client", default-features = false }
+fastmcp-derive = { version = "0.8.0", path = "crates/fastmcp-macros" }
+fastmcp-console = { version = "0.8.0", path = "crates/fastmcp-console" }
+fastmcp-cli = { version = "0.8.0", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -175,4 +175,3 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 too_many_lines = "allow"
 items_after_statements = "allow"
-

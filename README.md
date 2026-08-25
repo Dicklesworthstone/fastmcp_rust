@@ -13,18 +13,18 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/License-review%20required-yellow.svg" alt="License review required">
+  <img src="https://img.shields.io/badge/License-MIT%20with%20rider-blue.svg" alt="MIT License with rider">
   <img src="https://img.shields.io/badge/rust-nightly--2026--08--20-orange.svg" alt="Rust Version">
   <img src="https://img.shields.io/badge/edition-2024-purple.svg" alt="Rust Edition">
   <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
 
-> **Protocol status (2026-08-24):** MCP 2026-07-28 support is under
+> **Protocol status (2026-08-25):** MCP 2026-07-28 support is under
 > implementation and remains unverified. The root compatibility
 > `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
 > `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
 > historical parity rows are not conformance or release evidence. Versions
-> through 0.7.1 have been published, but publication and source edits alone do
+> through 0.8.0 have been published, but publication and source edits alone do
 > not prove historical workflow identities, queued runs, or credentials inert;
 > provider-side release-safety evidence is still required.
 
@@ -88,7 +88,7 @@
 
 ```bash
 # Current published package; publication is not aggregate conformance evidence
-cargo add fastmcp-rust@0.7.1
+cargo add fastmcp-rust@0.8.0
 
 # Or use the git dependency for bleeding-edge changes
 cargo add fastmcp-rust --git https://github.com/Dicklesworthstone/fastmcp_rust
@@ -323,15 +323,15 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ## Installation
 
-### From crates.io (current 0.7.1 package)
+### From crates.io (current 0.8.0 package)
 
-The non-yanked `0.7.1` package was published on 2026-08-24. Publication does
+The `0.8.0` package was published on 2026-08-25. Publication does
 not establish aggregate MCP 2026-07-28 conformance, production readiness, or
 qualification of every in-tree feature.
 
 ```toml
 [dependencies]
-fastmcp-rust = "0.7.1"
+fastmcp-rust = "0.8.0"
 ```
 
 ### As a Git Dependency
@@ -367,7 +367,7 @@ tar -xJf fastmcp-darwin-arm64.tar.xz
 ### CLI via Cargo (optional)
 
 ```bash
-cargo install fastmcp-cli --version 0.7.1
+cargo install fastmcp-cli --version 0.8.0
 ```
 
 ### Client request deadlines (current source tree)
@@ -414,7 +414,7 @@ caller-owned cancellation domain for those ordinary verbs.
 Exact MCP 2024-11-05 HTTP+SSE clients use `Client::sse_with_cx` when the GET
 event stream and POST message endpoints are already known.
 
-The published 0.7.1 CLI includes these flags. From a current source checkout,
+The published 0.8.0 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
 ```bash
@@ -738,12 +738,11 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-The release-license representation is unresolved: workspace Cargo metadata
-declares `MIT`, [LICENSE](LICENSE) contains an additional OpenAI/Anthropic
-rider, and [LICENSE-MIT](LICENSE-MIT) contains plain MIT text. Do not infer
-authoritative release terms from one of these inputs in isolation. Publication
-remains blocked until the explicit release-license decision required by the
-implementation plan is reviewed and applied consistently.
+FastMCP Rust is distributed under the terms in [LICENSE](LICENSE): the MIT
+License with the included OpenAI/Anthropic rider. Every workspace crate uses
+that file as its Cargo `license-file`. [LICENSE-MIT](LICENSE-MIT) is retained
+as a reference copy of the underlying MIT text; it is not an alternative
+license for this project.
 
 ---
 

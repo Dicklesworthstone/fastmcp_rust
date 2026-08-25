@@ -2,7 +2,7 @@
 name = "fastmcp-transport"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
 description = "Transport layer (stdio, SSE, WebSocket) for FastMCP"
 repository.workspace = true

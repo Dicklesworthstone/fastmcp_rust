@@ -2,7 +2,7 @@
 name = "fastmcp-derive"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
 description = "Procedural macros for FastMCP (#[tool], #[resource], #[prompt])"
 repository.workspace = true

@@ -2,7 +2,7 @@
 name = "fastmcp-core"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 rust-version.workspace = true
 description = "Core types and context for FastMCP"
 repository.workspace = true

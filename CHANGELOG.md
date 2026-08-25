@@ -6,7 +6,30 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
-## [Unreleased] (after v0.7.1)
+## [Unreleased] (after v0.8.0)
+
+## [v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.0) -- 2026-08-25 (GitHub Release)
+
+Pre-1.0 minor release making caller-owned asupersync contexts explicit across
+library connection and server-runner boundaries. This release does **not**
+claim aggregate MCP 2026-07-28 conformance, FND-01 freeze, or production
+qualification of every in-tree profile.
+
+### Runtime ownership and cancellation
+
+- **Caller-owned contexts at library boundaries.** HTTP, configuration, and
+  subprocess-stdio client constructors now require `&Cx`; retrying stdio
+  connection setup is async and remains under that same caller context.
+  Returning server runners and custom-transport runners likewise require a
+  caller-owned context. Only process-owning CLI/top-level entry points install
+  an ambient context.
+- **No facade `block_on` export.** The facade no longer encourages nested or
+  hidden runtime creation; applications drive async work from their own
+  asupersync runtime boundary.
+- **Cancel-correct admission and cleanup.** Client and server setup paths check
+  cancellation before spawning, tear down children when connection admission
+  fails, and preserve explicit cleanup errors instead of silently orphaning
+  subprocess or transport state.
 
 ### Fixed
 
@@ -16,6 +39,8 @@ Format: version timeline, organized by landed capabilities. Commit links point t
   interoperability fixture and current facade/component APIs in compile probes.
 - The FND bootstrap entry-point compile probe now carries the same platform
   availability condition as the entry point it references.
+- `ArgTransform::required()` now marks optional transformed arguments as
+  required in emitted legacy and final tool schemas, including after renames.
 
 ### Packaging
 
@@ -23,6 +48,11 @@ Format: version timeline, organized by landed capabilities. Commit links point t
   active workspace graph; the retained Docket source remains excluded.
 - Removed the empty `safe-icon-rendering` feature rather than advertising a
   capability with no implementation behind it.
+- Aligned every published crate on the rider-bearing root `LICENSE` through
+  Cargo `license-file` metadata. `LICENSE-MIT` remains a reference copy of the
+  underlying MIT text, not an alternative project license.
+
+**Exact changes:** [v0.7.1...v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.7.1...v0.8.0)
 
 ## [v0.7.1](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.7.1) -- 2026-08-24 (GitHub Release)
 
