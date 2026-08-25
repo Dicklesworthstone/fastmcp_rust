@@ -79,7 +79,9 @@
   readiness.
 - **Subprocess cleanup is explicit and platform-bounded:**
   `Client::close(&mut self)` returns cleanup failures. The opt-in owned-group mode used by
-  `fastmcp test` is Unix-only and fails before spawn elsewhere. It uses a live
+  `fastmcp test` is Unix-only and fails before spawn elsewhere. Its
+  `--protocol-policy` option binds both client negotiation and the launched
+  FastMCP server profile. It uses a live
   anchor plus an owner-death channel, but cannot contain descendants that
   change group/session, withstand a competing global child reaper, or close a
   control descriptor copied by a host-side fork. Drop is best effort.
@@ -418,7 +420,7 @@ The published 0.8.0 CLI includes these flags. From a current source checkout,
 run the CLI through the workspace to configure the two limits independently:
 
 ```bash
-cargo run -p fastmcp-cli -- test --idle-timeout 30 --absolute-timeout 120 my-mcp-server
+cargo run -p fastmcp-cli -- test --protocol-policy auto --idle-timeout 30 --absolute-timeout 120 my-mcp-server
 ```
 
 The current `fastmcp test` subprocess runner is Unix-only because success

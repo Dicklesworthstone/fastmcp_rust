@@ -3621,6 +3621,12 @@ mod tests {
         JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result))
     }
 
+    fn source_frame(message: JsonRpcMessage) -> ReceivedTransportFrame {
+        let source = serde_json::to_vec(&message).expect("scripted message serializes");
+        ReceivedTransportFrame::admit(source.into_boxed_slice())
+            .expect("scripted source frame passes transport admission")
+    }
+
     fn legacy_reverse_request(id: i64) -> JsonRpcMessage {
         JsonRpcMessage::Request(JsonRpcRequest::new(
             "sampling/createMessage",
@@ -5356,9 +5362,9 @@ mod tests {
     fn unit_task_01_executor_subscription_lifecycle_positive() {
         let cx = Cx::for_testing();
         let task_id = TaskId::parse("task-73").expect("bounded task id");
-        let executor = RequestExecutor::with_result_peer_era(
-            ScriptedTransport::new([
-                Ok(response(
+        let executor = RequestExecutor::with_source_frame_receiver(
+            ScriptedTransport::with_source_frames([
+                Ok(source_frame(response(
                     72,
                     serde_json::json!({
                         "resultType": "task",
@@ -5368,18 +5374,21 @@ mod tests {
                         "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
                         "ttlMs": null,
                     }),
-                )),
-                Ok(tasks_subscription_acknowledgement(73, &task_id)),
-                Ok(tasks_status_notification(73, &task_id)),
-                Ok(response(
+                ))),
+                Ok(source_frame(tasks_subscription_acknowledgement(
+                    73, &task_id,
+                ))),
+                Ok(source_frame(tasks_status_notification(73, &task_id))),
+                Ok(source_frame(response(
                     73,
                     serde_json::json!({
                         "resultType": "complete",
                         "_meta": {"io.modelcontextprotocol/subscriptionId": 73},
                     }),
-                )),
+                ))),
             ]),
             ResultPeerEra::Modern,
+            Some(receive_scripted_source_frame),
         );
         let mut task_execution = executor
             .execute_task_tool_call(&cx, task_tool_call_request(72))

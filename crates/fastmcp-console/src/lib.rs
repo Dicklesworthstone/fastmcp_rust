@@ -18,12 +18,12 @@ pub mod status;
 #[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
 pub mod tables;
 pub mod testing;
+#[path = "client/traffic.rs"]
+pub mod traffic;
 
 pub use console::{UntrustedDisplayText, console};
 pub mod config;
 
-#[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]
-pub use client::RequestResponseRenderer;
 pub use config::ConsoleConfig;
 pub use detection::{DisplayContext, is_agent_context, should_enable_rich};
 pub use error::ErrorBoundary;
@@ -31,6 +31,7 @@ pub use error::ErrorBoundary;
 pub use handlers::{HandlerRegistryRenderer, ServerCapabilities};
 pub use rich_rust;
 pub use theme::theme;
+pub use traffic::RequestResponseRenderer;
 
 #[cfg(test)]
 mod feature_surface_tests {
@@ -41,6 +42,7 @@ mod feature_surface_tests {
         let _ = super::ConsoleConfig::new();
         let _ = super::ErrorBoundary::new(&console);
         let _ = super::logging::RichLoggerBuilder::new();
+        let _ = super::RequestResponseRenderer::new(super::DisplayContext::new_agent());
     }
 
     #[cfg(any(feature = "legacy-2024-11-05", feature = "tasks", feature = "apps"))]

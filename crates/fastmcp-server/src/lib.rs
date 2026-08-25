@@ -214,10 +214,9 @@ mod modern_http_only {
     use asupersync::Cx;
     use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId};
     use fastmcp_transport::http::{
-        HttpError, HttpHandlerConfig, HttpRequest, HttpRequestHandler, HttpResponse,
-        HttpResponseRepresentation, HttpStatus, StreamableHttpRequestCancellation,
-        StreamableHttpRequestResponseSender, StreamableHttpRequestResponseStream,
-        StreamableHttpResponseStream, StreamableHttpTransport,
+        HttpError, HttpRequest, HttpRequestHandler, HttpResponse, HttpResponseRepresentation,
+        HttpStatus, StreamableHttpRequestCancellation, StreamableHttpRequestResponseSender,
+        StreamableHttpRequestResponseStream, StreamableHttpResponseStream, StreamableHttpTransport,
     };
     use fastmcp_transport::sse::SseEvent;
     use fastmcp_transport::{Transport, TransportError};
@@ -491,6 +490,8 @@ use crate::http_admission::{
 };
 
 use asupersync::bytes::BytesMut;
+#[cfg(any(feature = "legacy-2024-11-05", feature = "websocket", test))]
+use asupersync::channel::mpsc as asupersync_mpsc;
 use asupersync::codec::{Decoder, Encoder, Framed};
 use asupersync::http::h1::{
     Http1Codec, HttpError as Http1DecodeError, Method as Http1Method, Response as Http1Response,
@@ -500,12 +501,9 @@ use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
-use asupersync::{
-    Budget, CancelKind, Cx, RegionId,
-    channel::{mpsc as asupersync_mpsc, oneshot},
-};
+use asupersync::{Budget, CancelKind, Cx, RegionId, channel::oneshot};
+use fastmcp_console::RequestResponseRenderer;
 use fastmcp_console::banner::StartupBanner;
-use fastmcp_console::client::RequestResponseRenderer;
 use fastmcp_console::console::FastMcpConsole;
 use fastmcp_console::logging::RichLoggerBuilder;
 use fastmcp_core::logging::{debug, error, info, targets};
@@ -2171,6 +2169,7 @@ fn legacy_adapter_response<H: Legacy2024Handler>(
     block_on(legacy_adapter_response_async(adapter, binding, request))
 }
 
+#[cfg(any(feature = "legacy-2024-11-05", test))]
 async fn legacy_adapter_response_async<H: Legacy2024Handler>(
     adapter: &mut Legacy2024ServerAdapter<H>,
     binding: LegacyPeerBinding,

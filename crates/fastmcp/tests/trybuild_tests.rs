@@ -1498,9 +1498,8 @@ const FACADE_ONLY_CONSUMER: &str = r#"
 use mcp::{
     ClientHttpNegotiation, CompleteResult, ConfigLoader, Content, JsonSchema, McpConfig,
     McpResult, FinalRequestMeta, LegacySseHttpClient, ModernHttpClient, ModernHttpExecutor,
-    ModernHttpRequest, MrtrExchangeRegistry, PromptHandler, PromptMessage, ProtocolPolicy,
-    ResourceHandler, Role, ServerConfig, ToolHandler, auto, legacy_2024, modern, prompt,
-    resource, tool,
+    ModernHttpRequest, MrtrExchangeRegistry, PromptHandler, PromptMessage, ResourceHandler, Role,
+    ServerConfig, ToolHandler, auto, legacy_2024, modern, prompt, resource, tool,
 };
 
 #[derive(JsonSchema)]
@@ -1545,7 +1544,7 @@ fn facade_mrtr_resumable_resource(
         modern::InputRequiredResult::new(
             None,
             Some(request_state.to_owned()),
-            mcp::ResultMeta::default(),
+            mcp::ResultMeta::empty(),
         )
         .expect("request state makes the renamed-facade MRTR resource result valid"),
     )
@@ -1564,7 +1563,7 @@ fn facade_mrtr_resumable_prompt(
         modern::InputRequiredResult::new(
             None,
             Some(request_state.to_owned()),
-            mcp::ResultMeta::default(),
+            mcp::ResultMeta::empty(),
         )
         .expect("request state makes the renamed-facade MRTR prompt result valid"),
     )
@@ -1609,7 +1608,6 @@ fn assert_renamed_facade_sealed_builders() {
         .list_page_size(1)
         .mask_error_details(true)
         .strict_input_validation(true)
-        .resource_subscriptions()
         .instructions("renamed facade modern server")
         .without_banner()
         .build();
@@ -1742,6 +1740,7 @@ fn assert_dual_era_facade_surface() {
             total: Some(1),
             has_more: Some(false),
         },
+        meta: None,
     };
     assert_eq!(legacy_completion.argument.value, "bo");
     assert_eq!(legacy_completion_result.completion.values[0], "boston");

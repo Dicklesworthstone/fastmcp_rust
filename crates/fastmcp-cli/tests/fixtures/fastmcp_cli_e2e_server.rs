@@ -10,6 +10,12 @@ fn echo(ctx: &McpContext, message: String) -> String {
     message
 }
 
+#[tool]
+fn sized_output(_ctx: &McpContext, bytes: usize) -> String {
+    const MAX_FIXTURE_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+    "x".repeat(bytes.min(MAX_FIXTURE_OUTPUT_BYTES))
+}
+
 #[resource(uri = "test://status")]
 fn status(_ctx: &McpContext) -> String {
     "ready".to_owned()
@@ -28,6 +34,7 @@ fn greeting(_ctx: &McpContext, name: String) -> Vec<PromptMessage> {
 fn main() {
     ServerBuilder::new("fastmcp-cli-e2e-server", "1.0.0")
         .tool(Echo)
+        .tool(SizedOutput)
         .resource(StatusResource)
         .prompt(GreetingPrompt)
         .build()

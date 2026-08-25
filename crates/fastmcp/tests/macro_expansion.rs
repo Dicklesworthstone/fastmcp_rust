@@ -1366,7 +1366,14 @@ fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
 
     assert!(response.error.is_none());
     assert_eq!(result["resultType"], "input_required");
-    assert_eq!(result["requestState"], "retry-state");
+    let request_state = result["requestState"]
+        .as_str()
+        .expect("the framework emits an opaque MRTR continuation state");
+    assert!(!request_state.is_empty());
+    assert_ne!(
+        request_state, "retry-state",
+        "handler-controlled state must not cross the framework MRTR boundary"
+    );
 }
 
 #[cfg(feature = "tasks")]
@@ -1401,9 +1408,8 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
             &facade_final_tool_outcome_request("final_tool_outcome_direct", "create-task", true),
         )
         .expect("task-capable facade final tools/call returns a wire response");
-    let result = response.result.expect("task final tools/call has a result");
-
     assert!(response.error.is_none());
+    let result = response.result.expect("task final tools/call has a result");
     assert_eq!(result["resultType"], "task");
     assert_eq!(result["status"], "working");
     assert_eq!(result["statusMessage"], "queued");
@@ -1416,9 +1422,14 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
     let retained = runtime
         .get_task(&task_id)
         .expect("the created task remains readable from the caller-owned runtime");
+    let mut durable_task = result.clone();
+    durable_task
+        .as_object_mut()
+        .expect("task result is an object")
+        .remove("resultType");
     assert_eq!(
         serde_json::to_value(retained.task).expect("created task serializes"),
-        result,
+        durable_task,
         "the public task result is the exact durable caller-owned task state"
     );
     assert_eq!(
@@ -2282,16 +2293,19 @@ fn async_macro_final_resource_outcome_reaches_public_final_resources_read() {
             },
             "uri": "final://resource/async-outcome",
         })),
-        65_i64,
+        64_i64,
     );
     let response = server
         .dispatch_stateless(&facade_final_inbound(), &request)
         .expect("the public final resources/read route invokes the async macro outcome hook");
+    assert!(
+        response.error.is_none(),
+        "final resources/read returned an unexpected error: {:?}",
+        response.error
+    );
     let result = response
         .result
         .expect("final resources/read returns its outcome as a result");
-
-    assert!(response.error.is_none());
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["contents"][0]["text"], "async-outcome");
 }

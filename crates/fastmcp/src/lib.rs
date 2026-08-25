@@ -11815,7 +11815,9 @@ mod tests {
             case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) ;; *) exit 1 ;; esac; \
             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"method\":\"sampling/createMessage\",\"id\":41,\"params\":{\"messages\":[],\"maxTokens\":9}}'; \
             IFS= read -r callback || exit 1; \
-            case \"$callback\" in *'\"id\":41'*'\"model\":\"facade-model\"'*) ;; *) exit 1 ;; esac; \
+            case \"$callback\" in *'\"id\":41'*) ;; *) exit 1 ;; esac; \
+            case \"$callback\" in *'\"model\":\"facade-model\"'*) ;; *) exit 1 ;; esac; \
+            case \"$callback\" in *'\"error\"'*) exit 1 ;; *) ;; esac; \
             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"facade-result\"}],\"isError\":false}}'; \
             exec sleep 2";
         let handlers = legacy_2024::LegacyReverseRequestHandlers::new()

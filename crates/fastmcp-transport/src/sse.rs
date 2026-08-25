@@ -70,7 +70,8 @@ use asupersync::Cx;
 use fastmcp_protocol::{JsonRpcMessage, JsonRpcRequest, JsonRpcResponse};
 
 #[cfg(feature = "legacy-2024-11-05")]
-use crate::{Codec, CodecError, Transport, TransportError, TransportRecvHalf, TransportSendHalf};
+use crate::{Codec, Transport, TransportRecvHalf, TransportSendHalf};
+use crate::{CodecError, TransportError};
 
 /// Maximum wire-line size for SSE events.
 const MAX_SSE_LINE_SIZE: usize = 64 * 1024;
@@ -405,7 +406,6 @@ impl ModernSseDecoder {
 // =============================================================================
 
 /// SSE event types used by MCP.
-#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseEventType {
     /// The `endpoint` event sent by the server to indicate the POST URL.
@@ -414,7 +414,6 @@ pub enum SseEventType {
     Message,
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 impl SseEventType {
     /// Returns the event type string for SSE format.
     #[must_use]
@@ -437,7 +436,6 @@ impl SseEventType {
 }
 
 /// A parsed SSE event.
-#[cfg(feature = "legacy-2024-11-05")]
 #[derive(Debug, Clone)]
 pub struct SseEvent {
     /// The event type.
@@ -450,7 +448,6 @@ pub struct SseEvent {
     pub retry: Option<u64>,
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 impl SseEvent {
     /// Creates a new endpoint event with the given POST URL.
     #[must_use]
@@ -586,7 +583,6 @@ impl SseEvent {
     }
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn has_invalid_sse_data_characters(data: &str) -> bool {
     let bytes = data.as_bytes();
     bytes.iter().enumerate().any(|(index, byte)| match byte {
@@ -596,7 +592,6 @@ fn has_invalid_sse_data_characters(data: &str) -> bool {
     })
 }
 
-#[cfg(feature = "legacy-2024-11-05")]
 fn invalid_sse_field(field: &str) -> TransportError {
     TransportError::Io(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,

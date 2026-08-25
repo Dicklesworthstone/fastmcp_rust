@@ -285,7 +285,11 @@ impl ProcessGroupGuard {
                 self.process_group_id
             ));
         }
-        let exit_status = match self.child_mut().try_wait() {
+        let exit_status = match if child_exited {
+            self.child_mut().wait().map(Some)
+        } else {
+            self.child_mut().try_wait()
+        } {
             Ok(status) => status,
             Err(error) => {
                 cleanup_errors.push(format!(
@@ -689,6 +693,7 @@ fn forward_bounded_lines<R>(
     pipe: R,
     sender: mpsc::SyncSender<String>,
     stop_after: Option<&str>,
+    hold_open_until: Option<mpsc::Receiver<()>>,
 ) -> bool
 where
     R: Read,
@@ -696,6 +701,7 @@ where
     let mut reader = BufReader::new(pipe);
     let mut line = Vec::new();
     let mut truncated = false;
+    let mut hold_open_until = hold_open_until;
     loop {
         let available = match reader.fill_buf() {
             Ok([]) => {
@@ -703,6 +709,13 @@ where
                     let matched = stop_after
                         .is_some_and(|needle| bounded_line_contains(&line, truncated, needle));
                     if !send_bounded_line(&sender, &mut line, truncated) {
+                        return false;
+                    }
+                    if matched
+                        && hold_open_until
+                            .take()
+                            .is_some_and(|permit| permit.recv().is_err())
+                    {
                         return false;
                     }
                     return matched;
@@ -730,6 +743,12 @@ where
                 return false;
             }
             if matched {
+                if hold_open_until
+                    .take()
+                    .is_some_and(|permit| permit.recv().is_err())
+                {
+                    return false;
+                }
                 return true;
             }
             truncated = false;
@@ -817,11 +836,11 @@ fn spawn_dev(root: &Path, args: &[&str]) -> (DevProcess, mpsc::Receiver<String>)
     let (tx, rx) = mpsc::sync_channel::<String>(LIVE_OUTPUT_CHANNEL_CAPACITY);
     let tx_out = tx.clone();
     drop(std::thread::spawn(move || {
-        let _ = forward_bounded_lines(stdout, tx_out, None);
+        let _ = forward_bounded_lines(stdout, tx_out, None, None);
     }));
 
     drop(std::thread::spawn(move || {
-        let _ = forward_bounded_lines(stderr, tx, None);
+        let _ = forward_bounded_lines(stderr, tx, None, None);
     }));
 
     (DevProcess { process }, rx)
@@ -1310,9 +1329,15 @@ done
         .expect("fastmcp dev stdout must be piped");
     let (output_sender, output_receiver) =
         mpsc::sync_channel::<String>(LIVE_OUTPUT_CHANNEL_CAPACITY);
+    let (close_stdout, close_stdout_after_server_start) = mpsc::sync_channel(1);
     let (closed_sender, closed_receiver) = mpsc::sync_channel(1);
     drop(std::thread::spawn(move || {
-        let matched = forward_bounded_lines(stdout, output_sender, Some("Watching for changes"));
+        let matched = forward_bounded_lines(
+            stdout,
+            output_sender,
+            Some("Watching for changes"),
+            Some(close_stdout_after_server_start),
+        );
         let _ = closed_sender.send(matched);
     }));
     let mut process = DevProcess { process: guarded };
@@ -1321,12 +1346,6 @@ done
         &output_receiver,
         "Watching for changes",
         Duration::from_secs(10),
-    );
-    assert!(
-        closed_receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("stdout closer must report before its deadline"),
-        "fastmcp dev stdout closed before the watcher became ready"
     );
     let (server_pid, managed_group_id) =
         wait_for_process_marker(&process_marker, Duration::from_secs(10));
@@ -1337,12 +1356,22 @@ done
     assert_live_process_in_group(
         server_pid,
         managed_group_id,
-        "fixture server after watcher readiness and stdout closure",
+        "fixture server before watcher stdout closure",
+    );
+    close_stdout
+        .send(())
+        .expect("permit stdout closure after the server is proven live");
+    assert!(
+        closed_receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("stdout closer must report before its deadline"),
+        "fastmcp dev stdout closed before the watcher and server became ready"
     );
 
     // The stdout reader returned (and therefore closed the pipe) only after it
-    // observed watcher readiness. Touching this exact matching path now makes
-    // the requested terminal clear fail while the idle child is live.
+    // observed watcher readiness and the harness proved the managed server
+    // live. Touching this exact matching path now makes the requested terminal
+    // clear fail while that idle child is live.
     write_file(&reload_trigger, "reload\n");
 
     let status = wait_for_dev_exit(

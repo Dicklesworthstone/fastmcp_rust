@@ -1,7 +1,10 @@
 use asupersync::Cx;
 use fastmcp_client::{
-    CanonicalHttpUrl, ClientBuilder, ClientHttpConnectionError, ClientHttpNegotiationError,
-    ClientProtocolPlan, ClientSession, ModernHttpClientError, ProtocolEra, ProtocolPolicy,
+    CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ClientSession, ProtocolEra, ProtocolPolicy,
+};
+#[cfg(not(feature = "legacy-2024-11-05"))]
+use fastmcp_client::{
+    ClientHttpConnectionError, ClientHttpNegotiationError, ModernHttpClientError,
 };
 use fastmcp_core::{McpErrorCode, block_on};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerCapabilities, ServerInfo};
@@ -12,6 +15,7 @@ fn url(value: &str) -> CanonicalHttpUrl {
     CanonicalHttpUrl::parse(value).expect("test endpoint must be canonical")
 }
 
+#[cfg(not(feature = "legacy-2024-11-05"))]
 fn auto_http_plan() -> ClientProtocolPlan {
     ClientProtocolPlan::http(
         ProtocolPolicy::Auto,
@@ -89,6 +93,7 @@ fn clt_02_a_positive() {
 }
 
 #[test]
+#[cfg(not(feature = "legacy-2024-11-05"))]
 fn clt_02_a_planted_negative() {
     let baseline = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
     let accepted_builder = ClientBuilder::new().protocol_plan(baseline.clone());
@@ -129,7 +134,9 @@ fn clt_02_a_planted_negative() {
     assert!(matches!(
         http_error,
         ClientHttpConnectionError::Modern(ModernHttpClientError::Negotiation(
-            ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly
+            ClientHttpNegotiationError::FeatureConfigurationUnavailable {
+                policy: ProtocolPolicy::Auto,
+            }
         ))
     ));
 }

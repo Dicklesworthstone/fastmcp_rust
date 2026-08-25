@@ -3117,8 +3117,10 @@ impl ClientHttpConnection {
         &mut self,
         implementation: fastmcp_protocol::common_types::Implementation,
     ) {
-        if let Self::Modern(client) = self {
-            client.set_client_implementation(implementation);
+        match self {
+            Self::Modern(client) => client.set_client_implementation(implementation),
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::LegacySse(_) => {}
         }
     }
 
@@ -3335,17 +3337,21 @@ impl ClientHttpConnection {
         &mut self,
         handlers: ReverseRequestHandlers,
     ) -> fastmcp_core::McpResult<()> {
-        let Self::Modern(client) = self else {
-            return Err(fastmcp_core::McpError::invalid_params(
+        match self {
+            Self::Modern(client) => {
+                client.reverse_request_handlers = handlers;
+                Ok(())
+            }
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::LegacySse(_) => Err(fastmcp_core::McpError::invalid_params(
                 "modern reverse request handlers require the modern HTTP transport",
-            ));
-        };
-        client.reverse_request_handlers = handlers;
-        Ok(())
+            )),
+        }
     }
 
     /// Returns the installed modern reverse handlers when this connection is
     /// the MCP 2026-07-28 HTTP transport.
+    #[cfg_attr(not(feature = "legacy-2024-11-05"), allow(clippy::unnecessary_wraps))]
     pub(crate) fn modern_reverse_request_handlers(&self) -> Option<&ReverseRequestHandlers> {
         match self {
             Self::Modern(client) => Some(&client.reverse_request_handlers),
@@ -3839,10 +3845,14 @@ impl ClientHttpConnection {
         ),
         ClientHttpConnectionError,
     > {
-        let Self::Modern(client) = self else {
-            return Err(ClientHttpConnectionError::ExpectedJsonResponse {
-                actual: ModernHttpResponseKind::Sse,
-            });
+        let client = match self {
+            Self::Modern(client) => client,
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::LegacySse(_) => {
+                return Err(ClientHttpConnectionError::ExpectedJsonResponse {
+                    actual: ModernHttpResponseKind::Sse,
+                });
+            }
         };
         let limits = SseLimits::new(
             maximum_response_bytes.max(1_024),
@@ -4356,6 +4366,10 @@ impl ClientHttpConnection {
     /// without an ID. MCP 2026-07-28 rejects every client notification over
     /// HTTP before a POST can be opened; client cancellation closes the owned
     /// response body instead.
+    #[cfg_attr(
+        not(feature = "legacy-2024-11-05"),
+        allow(clippy::unused_async, clippy::unused_async_trait_impl)
+    )]
     pub async fn notify(
         &mut self,
         cx: &Cx,
@@ -4468,7 +4482,7 @@ fn legacy_http_server_request_response(
                 return crate::method_not_found_response(request);
             };
             let result = crate::decode_reverse_request_params(request).and_then(|params| {
-                crate::invoke_locked_reverse_request_handler(
+                crate::invoke_shared_reverse_request_handler(
                     cx,
                     handler,
                     ReverseRequestCancellation::new(),
@@ -4482,7 +4496,7 @@ fn legacy_http_server_request_response(
                 return crate::method_not_found_response(request);
             };
             let result = crate::decode_reverse_request_params(request).and_then(|params| {
-                crate::invoke_locked_reverse_request_handler(
+                crate::invoke_shared_reverse_request_handler(
                     cx,
                     handler,
                     ReverseRequestCancellation::new(),
@@ -4557,7 +4571,7 @@ fn modern_http_server_request_response(
             };
             let result = crate::decode_reverse_request_params::<FinalCreateMessageParams>(request)
                 .and_then(|params| {
-                    crate::invoke_locked_reverse_request_handler(
+                    crate::invoke_shared_reverse_request_handler(
                         cx,
                         handler,
                         ReverseRequestCancellation::new(),
@@ -4575,7 +4589,7 @@ fn modern_http_server_request_response(
             let result =
                 crate::decode_reverse_request_params::<FinalEmbeddedRootsListParams>(request)
                     .and_then(|params| {
-                        crate::invoke_locked_reverse_request_handler(
+                        crate::invoke_shared_reverse_request_handler(
                             cx,
                             handler,
                             ReverseRequestCancellation::new(),
@@ -4592,7 +4606,7 @@ fn modern_http_server_request_response(
             };
             let result = crate::decode_reverse_request_params::<ElicitRequestParams>(request)
                 .and_then(|params| {
-                    crate::invoke_locked_reverse_request_handler(
+                    crate::invoke_shared_reverse_request_handler(
                         cx,
                         handler,
                         ReverseRequestCancellation::new(),
@@ -5265,17 +5279,6 @@ impl ModernHttpClient {
                     .entry(extension_id.clone())
                     .or_insert_with(|| settings.clone());
             }
-        }
-        #[cfg(feature = "tasks")]
-        if admit_final_tasks_result_discriminator(
-            &self.server_discovery(),
-            OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
-        )
-        .is_ok()
-        {
-            extensions
-                .entry(fastmcp_protocol::TASKS_EXTENSION.to_owned())
-                .or_insert_with(|| serde_json::json!({}));
         }
         (!extensions.is_empty()).then_some(extensions)
     }
@@ -14704,7 +14707,7 @@ mod tests {
                 &mut discovery_stream,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"serverInfo":{"name":"stateless","version":"1"},"ttlMs":0,"cacheScope":"private"}}"#,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"io.modelcontextprotocol/ui":{}}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"stateless","version":"1"}},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
             let (mut json_stream, _) = listener.accept().expect("accept stateless JSON POST");
@@ -15145,7 +15148,7 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 &mut initial,
                 200,
                 "application/json",
-                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"},"sampling":{"method":"sampling/createMessage"}},"requestState":"retry-two"}}"#,
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"},"sampling":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":16}}},"requestState":"retry-two"}}"#,
             );
 
             if complete_retry {
@@ -15160,7 +15163,11 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                     retry_request["params"]["inputResponses"],
                     serde_json::json!({
                         "roots": {"roots": []},
-                        "sampling": {"messages": []},
+                        "sampling": {
+                            "role": "assistant",
+                            "model": "mrtr-test-model",
+                            "content": {"type": "text", "text": "complete"},
+                        },
                     })
                 );
                 assert_eq!(retry_request["params"]["requestState"], "retry-two");
@@ -15229,7 +15236,14 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 let mut responses =
                     BTreeMap::from([("roots".to_owned(), serde_json::json!({"roots": []}))]);
                 if complete_retry {
-                    responses.insert("sampling".to_owned(), serde_json::json!({"messages": []}));
+                    responses.insert(
+                        "sampling".to_owned(),
+                        serde_json::json!({
+                            "role": "assistant",
+                            "model": "mrtr-test-model",
+                            "content": {"type": "text", "text": "complete"},
+                        }),
+                    );
                 }
                 Ok(responses)
             },

@@ -617,15 +617,48 @@ impl<R: Read + AsFd, W: Write> StdioTransport<R, W> {
         &mut self,
         cx: &Cx,
         deadline: Option<Instant>,
-        mut should_stop: F,
+        should_stop: F,
     ) -> Result<JsonRpcMessage, TransportError>
+    where
+        F: FnMut() -> bool,
+    {
+        let (message, completed_at) =
+            self.recv_until_or_stopped_with_completion(cx, deadline, should_stop)?;
+
+        if deadline.is_some_and(|deadline| completed_at >= deadline) {
+            return Err(self.latch_consumed_read_failure(TransportError::ReceiveDeadlineExceeded));
+        }
+        Ok(message)
+    }
+
+    /// Receives one frame while observing an internal stop predicate and
+    /// preserves a complete, framing-aligned message across `deadline`.
+    ///
+    /// This is the stop-aware counterpart to
+    /// [`Self::recv_until_with_completion`]. A deadline reached before a
+    /// complete frame remains an error (and a consumed partial frame remains
+    /// terminal), but a complete frame carries its observed completion time
+    /// back to the request-policy owner. A true stop predicate always wins and
+    /// latches the transport closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Cancelled`] when `should_stop` becomes true,
+    /// or the same deadline, cancellation, I/O, closure, and codec errors as
+    /// [`Self::recv_until_with_completion`].
+    pub fn recv_until_or_stopped_with_completion<F>(
+        &mut self,
+        cx: &Cx,
+        deadline: Option<Instant>,
+        mut should_stop: F,
+    ) -> Result<(JsonRpcMessage, Instant), TransportError>
     where
         F: FnMut() -> bool,
     {
         let result = self.recv_with_readiness(cx, |reader, cx| {
             wait_for_unix_readiness(reader, cx, deadline, &mut should_stop)
         });
-        let (message, completed_at) = match result {
+        let completed = match result {
             Ok(completed) => completed,
             Err(error) => {
                 // A transport-owner failure can race EOF or another read
@@ -643,10 +676,7 @@ impl<R: Read + AsFd, W: Write> StdioTransport<R, W> {
         if should_stop() {
             return Err(self.latch_consumed_read_failure(TransportError::Cancelled));
         }
-        if deadline.is_some_and(|deadline| completed_at >= deadline) {
-            return Err(self.latch_consumed_read_failure(TransportError::ReceiveDeadlineExceeded));
-        }
-        Ok(message)
+        Ok(completed)
     }
 }
 
@@ -896,6 +926,13 @@ impl<R: Read + Send> ClientTransportRecvHalf for StdioRecvHalf<R> {
 impl<R: Read + AsFd> StdioRecvHalf<R> {
     /// Receives through the bounded Unix readiness path and wakes when either
     /// split half becomes terminal.
+    ///
+    /// `deadline` bounds an empty or partial-frame readiness wait. A complete,
+    /// framing-aligned message that finishes after this short polling boundary
+    /// is returned instead of discarded; the request-policy owner can compare
+    /// its post-receive observation with the longer request deadline. A
+    /// partial-frame deadline remains terminal and is returned before the
+    /// shared closed state is latched.
     pub fn recv_until_or_closed(
         &mut self,
         cx: &Cx,
@@ -908,11 +945,16 @@ impl<R: Read + AsFd> StdioRecvHalf<R> {
         let terminal = Arc::clone(&self.terminal);
         let result = self
             .transport
-            .recv_until_or_stopped(cx, deadline, || terminal.load(Ordering::Acquire));
-        if self.transport.is_closed() {
+            .recv_until_or_stopped_with_completion(cx, deadline, || {
+                terminal.load(Ordering::Acquire)
+            })
+            .map(|(message, _completed_at)| message);
+        let sibling_closed = self.terminal.load(Ordering::Acquire);
+        let receiver_closed = self.transport.is_closed();
+        if receiver_closed {
             self.terminal.store(true, Ordering::Release);
         }
-        if self.is_closed() {
+        if sibling_closed || (receiver_closed && result.is_ok()) {
             return Err(TransportError::Closed);
         }
         result
@@ -2532,6 +2574,72 @@ mod tests {
             Err(TransportError::Closed)
         ));
         receive.join().expect("split receive thread must not panic");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_split_partial_frame_preserves_receive_deadline_before_latching_closed() {
+        let (mut peer, reader) = UnixStream::pair().expect("create split peer");
+        peer.write_all(br#"{"jsonrpc":"2.0","method":"partial""#)
+            .expect("write split frame prefix");
+        peer.flush().expect("flush split frame prefix");
+        let transport = StdioTransport::new(reader, Vec::new());
+        let (mut recv_half, mut send_half) = transport.into_split();
+        let deadline = Instant::now() + Duration::from_millis(40);
+
+        assert!(matches!(
+            recv_half.recv_until_or_closed(&Cx::for_testing(), Some(deadline)),
+            Err(TransportError::ReceiveDeadlineExceeded)
+        ));
+        assert!(recv_half.is_closed());
+        assert!(matches!(
+            recv_half.recv_until_or_closed(&Cx::for_testing(), None),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            send_half.send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::json!({"too_late": true}),
+                )),
+            ),
+            Err(TransportError::Closed)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_split_poll_slice_preserves_complete_frame_that_finishes_after_deadline() {
+        let (mut peer, reader) = UnixStream::pair().expect("create split peer");
+        peer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"slow-complete\",\"id\":1}\n")
+            .expect("write complete split frame");
+        peer.flush().expect("flush complete split frame");
+        let reader = SlowReadyReader {
+            inner: reader,
+            delay: Duration::from_millis(80),
+        };
+        let transport = StdioTransport::new(reader, Vec::new());
+        let (mut recv_half, mut send_half) = transport.into_split();
+        let deadline = Instant::now() + Duration::from_millis(40);
+
+        let message = recv_half
+            .recv_until_or_closed(&Cx::for_testing(), Some(deadline))
+            .expect("a complete frame must survive a request poll-slice boundary");
+        let JsonRpcMessage::Request(request) = message else {
+            panic!("expected split ingress request");
+        };
+        assert_eq!(request.method, "slow-complete");
+        assert!(!recv_half.is_closed());
+        send_half
+            .send(
+                &Cx::for_testing(),
+                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                    fastmcp_protocol::RequestId::Number(1),
+                    serde_json::json!({"still_open": true}),
+                )),
+            )
+            .expect("a preserved complete frame must leave both halves usable");
     }
 
     #[test]

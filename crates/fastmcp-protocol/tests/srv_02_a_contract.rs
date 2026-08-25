@@ -25,7 +25,7 @@ fn srv_02_a_positive() {
     ]);
     let capabilities = ServerDiscoverCapabilities::from_registry(
         &registry,
-        BTreeMap::from([("io.fastmcp.example".to_owned(), json!({"enabled": true}))]),
+        BTreeMap::from([("io.fastmcp/example".to_owned(), json!({"enabled": true}))]),
     )
     .expect("bounded installed extension is discoverable");
     let result = ServerDiscoverResult::new(
@@ -66,7 +66,7 @@ fn srv_02_a_positive() {
     assert_eq!(wire["capabilities"]["prompts"]["listChanged"], json!(true));
     assert!(wire["capabilities"].get("subscriptions").is_none());
     assert_eq!(
-        wire["capabilities"]["extensions"]["io.fastmcp.example"]["enabled"],
+        wire["capabilities"]["extensions"]["io.fastmcp/example"]["enabled"],
         json!(true)
     );
     assert_eq!(wire["ttlMs"], json!(60_000));
@@ -124,10 +124,20 @@ fn srv_02_a_planted_negative() {
         compatibility.peer_diagnostic(),
         Some(ResultPeerDiagnostic::ModernMissingResultType)
     );
+    let compatibility_wire =
+        serde_json::to_value(compatibility).expect("compatibility result re-encodes");
+    let mut canonicalized = planted.clone();
+    canonicalized
+        .as_object_mut()
+        .expect("planted result is an object")
+        .insert("resultType".to_owned(), json!("complete"));
     assert_eq!(
-        serde_json::to_value(compatibility).expect("compatibility result re-encodes"),
-        planted,
-        "captured peer evidence must retain the discriminator omission"
+        compatibility_wire, canonicalized,
+        "compatibility evidence remains diagnostic while final emission restores the discriminator"
+    );
+    assert_ne!(
+        compatibility_wire, planted,
+        "a peer omission must never make locally emitted final discovery omit resultType"
     );
     assert_eq!(
         serde_json::to_vec(&admitted).expect("admitted state still encodes"),

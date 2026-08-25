@@ -1,7 +1,7 @@
-use fastmcp_rust::{FinalToolOutcome, ToolHandler, tool};
+use fastmcp_rust::{ToolHandler, tool};
 
 #[tool(tasks)]
-fn enabled_tasks_opt_in() -> FinalToolOutcome {
+fn enabled_tasks_opt_in() -> fastmcp_rust::FinalToolOutcome {
     unreachable!()
 }
 

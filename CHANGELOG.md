@@ -41,6 +41,19 @@ qualification of every in-tree profile.
   availability condition as the entry point it references.
 - `ArgTransform::required()` now marks optional transformed arguments as
   required in emitted legacy and final tool schemas, including after renames.
+- Split Unix stdio receive halves now preserve a partial-frame deadline as the
+  elected timeout outcome before latching the connection closed, while a
+  complete aligned frame that finishes across a short readiness-poll boundary
+  remains available to the request deadline owner.
+- `fastmcp test --protocol-policy` now binds client negotiation and the spawned
+  FastMCP server to the same explicit `auto`, `modern-only`, or `legacy-only`
+  profile.
+- WebSocket request cancellation now preserves the client-owned receive half,
+  so a silent cancelled request or one late terminal response cannot make an
+  otherwise reusable connection lose ingress.
+- Modern HTTP requests advertise the official Tasks extension only on
+  Tasks-aware operations, and `FinalTaskHandle::watch` now reaches the
+  task-capable subscription path instead of the task-refusing catalog helper.
 
 ### Packaging
 

@@ -9473,10 +9473,11 @@ mod tests {
         assert!(
             matches!(
                 request.decode_response(&wrong_role),
-                Err(CoreDispatchError::InvalidResult {
-                    era: ProtocolEra::Modern2026,
-                    method: SUBSCRIPTIONS_LISTEN,
-                })
+                Err(CoreDispatchError::ResultCodec(error))
+                    if error.kind()
+                        == crate::result::ResultDecodeErrorKind::InvalidKnownMember
+                        && error.path()
+                            == "$._meta.io.modelcontextprotocol/logLevel"
             ),
             "only request-only logLevel changes the valid subscriptions/listen terminal result"
         );

@@ -22,19 +22,56 @@ use crate::messages::{
 };
 use crate::protocol_version::FINAL_PROTOCOL_VERSION;
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum WireValue {
-    Raw(Box<RawValue>),
-    Value(Value),
-}
+const SERDE_JSON_RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+struct WireValue(String);
 
 impl WireValue {
-    fn into_json(self) -> Result<String, serde_json::Error> {
-        match self {
-            Self::Raw(raw) => Ok(raw.get().to_owned()),
-            Self::Value(value) => serde_json::to_string(&value),
+    fn into_json(self) -> String {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for WireValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct WireValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for WireValueVisitor {
+            type Value = WireValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("any valid JSON value")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let Some(key) = map.next_key::<std::borrow::Cow<'_, str>>()? else {
+                    return Err(A::Error::custom("raw JSON value is missing its source"));
+                };
+                if key != SERDE_JSON_RAW_VALUE_TOKEN {
+                    return Err(A::Error::custom("invalid raw JSON value source"));
+                }
+                let source = map.next_value::<std::borrow::Cow<'_, str>>()?;
+                Ok(WireValue(source.into_owned()))
+            }
+
+            fn visit_newtype_struct<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: Deserializer<'de>,
+            {
+                let value = Value::deserialize(deserializer)?;
+                serde_json::to_string(&value)
+                    .map(WireValue)
+                    .map_err(D2::Error::custom)
+            }
         }
+
+        deserializer.deserialize_newtype_struct(SERDE_JSON_RAW_VALUE_TOKEN, WireValueVisitor)
     }
 }
 
@@ -597,6 +634,27 @@ impl FinalTaskCallToolResult {
     }
 }
 
+fn json_values_equal_ignoring_object_order(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left_value)| {
+                    right.get(key).is_some_and(|right_value| {
+                        json_values_equal_ignoring_object_order(left_value, right_value)
+                    })
+                })
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| json_values_equal_ignoring_object_order(left, right))
+        }
+        _ => left == right,
+    }
+}
+
 impl Serialize for FinalTaskCallToolResult {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -604,7 +662,11 @@ impl Serialize for FinalTaskCallToolResult {
     {
         let canonical = self.canonical_value().map_err(serde::ser::Error::custom)?;
         if let Some(exact_wire) = &self.exact_wire {
-            if serde_json::from_str::<Value>(exact_wire).ok().as_ref() == Some(&canonical) {
+            if serde_json::from_str::<Value>(exact_wire)
+                .ok()
+                .as_ref()
+                .is_some_and(|exact| json_values_equal_ignoring_object_order(exact, &canonical))
+            {
                 return RawValue::from_string(exact_wire.clone())
                     .map_err(serde::ser::Error::custom)?
                     .serialize(serializer);
@@ -619,9 +681,7 @@ impl<'de> Deserialize<'de> for FinalTaskCallToolResult {
     where
         D: Deserializer<'de>,
     {
-        let wire = WireValue::deserialize(deserializer)?
-            .into_json()
-            .map_err(D::Error::custom)?;
+        let wire = WireValue::deserialize(deserializer)?.into_json();
         Self::decode_exact_wire(&wire).map_err(D::Error::custom)
     }
 }
@@ -796,9 +856,7 @@ impl<'de> Deserialize<'de> for Task {
     where
         D: Deserializer<'de>,
     {
-        let wire = WireValue::deserialize(deserializer)?
-            .into_json()
-            .map_err(D::Error::custom)?;
+        let wire = WireValue::deserialize(deserializer)?.into_json();
         decode_task_wire(&wire).map_err(D::Error::custom)
     }
 }
@@ -807,11 +865,15 @@ impl<'de> Deserialize<'de> for Task {
 /// the exact nested `tools/call` result so peer member order and numeric
 /// lexemes are not reconstructed through `serde_json::Value`.
 fn decode_task_wire(wire: &str) -> Result<Task, TaskWireError> {
-    let Value::Object(mut members) =
+    let Value::Object(members) =
         serde_json::from_str(wire).map_err(|_| TaskWireError::Invalid("task"))?
     else {
         return Err(TaskWireError::Invalid("task"));
     };
+    decode_task_members(wire, members)
+}
+
+fn decode_task_members(wire: &str, mut members: Map<String, Value>) -> Result<Task, TaskWireError> {
     let status: TaskStatus = serde_json::from_value(
         members
             .get("status")
@@ -883,17 +945,6 @@ where
         Task::Completed { result, .. } => map.serialize_entry("result", result)?,
         Task::Failed { error, .. } => map.serialize_entry("error", error)?,
         Task::Working(_) | Task::Cancelled(_) => {}
-    }
-    Ok(())
-}
-
-fn preserve_completed_task_result_from_wire(
-    task: &mut Task,
-    wire: &str,
-) -> Result<(), TaskWireError> {
-    if let Task::Completed { result: target, .. } = task {
-        *target =
-            FinalTaskCallToolResult::decode_exact_wire(raw_completed_task_result(wire)?.get())?;
     }
     Ok(())
 }
@@ -1076,9 +1127,7 @@ impl<'de> Deserialize<'de> for CreateTaskResult {
     where
         D: Deserializer<'de>,
     {
-        let wire = WireValue::deserialize(deserializer)?
-            .into_json()
-            .map_err(D::Error::custom)?;
+        let wire = WireValue::deserialize(deserializer)?.into_json();
         Self::decode_exact_wire(&wire).map_err(D::Error::custom)
     }
 }
@@ -1122,11 +1171,8 @@ impl CreateTaskResult {
             .filter(|(key, _)| task_fields.contains(key.as_str()))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let task = serde_json::from_value(Value::Object(task_members))
-            .map_err(|_| TaskWireError::Invalid("task"))?;
+        let task = decode_task_members(wire, task_members)?;
         members.retain(|key, _| !task_fields.contains(key.as_str()));
-        let mut task = task;
-        preserve_completed_task_result_from_wire(&mut task, wire)?;
         Ok(Self {
             task,
             meta,
@@ -1289,9 +1335,7 @@ impl<'de> Deserialize<'de> for CompleteTaskResult {
     where
         D: Deserializer<'de>,
     {
-        let wire = WireValue::deserialize(deserializer)?
-            .into_json()
-            .map_err(D::Error::custom)?;
+        let wire = WireValue::deserialize(deserializer)?.into_json();
         let Value::Object(mut members) = serde_json::from_str(&wire).map_err(D::Error::custom)?
         else {
             return Err(D::Error::custom("task result must be an object"));
@@ -1321,9 +1365,7 @@ impl<'de> Deserialize<'de> for CompleteTaskResult {
             .filter(|(key, _)| task_fields.contains(key.as_str()))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let mut task =
-            serde_json::from_value(Value::Object(task_members)).map_err(D::Error::custom)?;
-        preserve_completed_task_result_from_wire(&mut task, &wire).map_err(D::Error::custom)?;
+        let task = decode_task_members(&wire, task_members).map_err(D::Error::custom)?;
         members.retain(|key, _| !task_fields.contains(key.as_str()));
         if diagnostic.is_some() {
             members.insert(
@@ -1402,9 +1444,7 @@ impl<'de> Deserialize<'de> for TaskStatusNotificationParams {
     where
         D: Deserializer<'de>,
     {
-        let wire = WireValue::deserialize(deserializer)?
-            .into_json()
-            .map_err(D::Error::custom)?;
+        let wire = WireValue::deserialize(deserializer)?.into_json();
         let Value::Object(mut members) = serde_json::from_str(&wire).map_err(D::Error::custom)?
         else {
             return Err(D::Error::custom(
@@ -1435,9 +1475,7 @@ impl<'de> Deserialize<'de> for TaskStatusNotificationParams {
             .filter(|(key, _)| task_keys.contains(key.as_str()))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let mut task =
-            serde_json::from_value(Value::Object(task_members)).map_err(D::Error::custom)?;
-        preserve_completed_task_result_from_wire(&mut task, &wire).map_err(D::Error::custom)?;
+        let task = decode_task_members(&wire, task_members).map_err(D::Error::custom)?;
         members.retain(|key, _| !task_keys.contains(key.as_str()));
         Ok(Self {
             task,
@@ -1648,7 +1686,9 @@ mod tests {
             additional: BTreeMap::new(),
         })
         .expect("serialize");
-        let decoded: CreateTaskResult = serde_json::from_value(wire.clone()).expect("deserialize");
+        let wire_source = serde_json::to_string(&wire).expect("task result wire serializes");
+        let decoded: CreateTaskResult =
+            serde_json::from_str(&wire_source).expect("deserialize admitted task result source");
         assert_eq!(serde_json::to_value(decoded).expect("reserialize"), wire);
 
         let get: GetTaskResult = serde_json::from_value(serde_json::json!({
@@ -1754,6 +1794,21 @@ mod tests {
     fn completed_task_uses_exact_nested_call_tool_result_wire() {
         let wire = r#"{"resultType":"complete","taskId":"task-1","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{"x-first":1.20e+4,"content":[],"x-second":123456789012345678901234567890},"x-envelope":{"preserved":true}}"#;
         let decoded: GetTaskResult = serde_json::from_str(wire).expect("flattened completed task");
+        let Task::Completed { result, .. } = &decoded.task else {
+            panic!("fixture is a completed task");
+        };
+        let retained: Value = serde_json::from_str(
+            result
+                .exact_wire
+                .as_deref()
+                .expect("peer result retains exact source"),
+        )
+        .expect("retained result source remains valid JSON");
+        let canonical = result.canonical_value().expect("canonical result value");
+        assert!(
+            json_values_equal_ignoring_object_order(&retained, &canonical),
+            "retained and canonical result snapshots differ: retained={retained:?}; canonical={canonical:?}"
+        );
         assert_eq!(
             serde_json::to_string(&decoded).expect("re-serialize exact nested result"),
             wire,

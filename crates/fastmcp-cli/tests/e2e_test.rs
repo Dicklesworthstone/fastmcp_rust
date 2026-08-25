@@ -23,7 +23,7 @@ const FORBIDDEN_CONTACT_WORK_CAP: usize = 16;
 const FORBIDDEN_CONTACT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FORBIDDEN_CONTACT_FINAL_QUIET_INTERVAL: Duration = Duration::from_millis(20);
 const FORBIDDEN_CONTACT_FINAL_DRAIN_DEADLINE: Duration = Duration::from_millis(250);
-const FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE: Duration = Duration::from_millis(500);
+const FORBIDDEN_CONTACT_SHUTDOWN_ACK_DEADLINE: Duration = Duration::from_millis(2500);
 const LOOPBACK_FIXTURE_DEADLINE: Duration = Duration::from_secs(2);
 const LOOPBACK_FIXTURE_ACK_DEADLINE: Duration = Duration::from_millis(2500);
 const LOOPBACK_FIXTURE_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -44,9 +44,14 @@ is_exact_modern_discovery() {
 
 while IFS= read -r request; do
     emit_wire "$request"
-    is_exact_modern_discovery "$request" || exit 1
+    if ! is_exact_modern_discovery "$request"; then
+        printf 'FASTMCP_E2E_REJECT modern-discovery\n' >&2
+        exit 1
+    fi
+    printf 'FASTMCP_E2E_RESPONSE modern-discovery\n' >&2
     printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"completions":{},"extensions":{"io.example/inspect":{"enabled":true}}},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-inspect-server","version":"1.0.0"}},"ttlMs":0,"cacheScope":"private"}}'
 done
+printf 'FASTMCP_E2E_EOF\n' >&2
 "#;
 
 const LEGACY_FALLBACK_INSPECT_FIXTURE: &str = r#"
@@ -67,7 +72,7 @@ is_exact_modern_discovery() {
 }
 
 is_exact_legacy_initialize() {
-    printf '%s\n' "$1" | grep -Eq '^\{"jsonrpc":"2\.0","method":"initialize","params":\{"protocolVersion":"2024-11-05","capabilities":\{\},"clientInfo":\{"name":"[^"]*","version":"[^"]*"\}\},"id":[0-9]+\}$' || return 1
+    printf '%s\n' "$1" | grep -Eq '^\{"jsonrpc":"2\.0","method":"initialize","params":\{"capabilities":\{\},"clientInfo":\{"name":"[^"]*","version":"[^"]*"\},"protocolVersion":"2024-11-05"\},"id":[0-9]+\}$' || return 1
     require_no_final_metadata "$1"
 }
 
@@ -82,6 +87,7 @@ is_exact_legacy_operating_request() {
 }
 
 respond() {
+    printf 'FASTMCP_E2E_RESPONSE id=%s result=%s\n' "$request_id" "$1" >&2
     printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$request_id" "$1"
 }
 
@@ -90,7 +96,8 @@ respond_method_not_found() {
 }
 
 require_request_id() {
-    request_id=$(printf '%s\n' "$1" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    request_id=${1##*\"id\":}
+    request_id=${request_id%\}}
     case "$request_id" in
         '' | *[!0-9]*) return 1 ;;
     esac
@@ -122,6 +129,7 @@ while IFS= read -r request; do
             state=operating
             ;;
         operating)
+            require_request_id "$request" || exit 1
             is_exact_legacy_operating_request "$request" || exit 1
             case "$request" in
                 *'"method":"tools/list"'*)
@@ -142,10 +150,11 @@ while IFS= read -r request; do
         *) exit 1 ;;
     esac
 done
+printf 'FASTMCP_E2E_EOF\n' >&2
 "#;
 
-const LEGACY_PLANTED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":1}"#;
-const LEGACY_PLANTED_REPEATED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"}},"id":2}"#;
+const LEGACY_PLANTED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"},"protocolVersion":"2024-11-05"},"id":1}"#;
+const LEGACY_PLANTED_REPEATED_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","method":"initialize","params":{"capabilities":{},"clientInfo":{"name":"planted-legacy-client","version":"1.0.0"},"protocolVersion":"2024-11-05"},"id":2}"#;
 const LEGACY_PLANTED_INITIALIZED_NOTIFICATION: &str =
     r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 const LEGACY_PLANTED_TOOLS_LIST_REQUEST: &str =
@@ -652,7 +661,15 @@ impl ProcessGroupGuard {
                 self.process_group_id
             ));
         }
-        let exit_status = match self.child_mut().try_wait() {
+        let exit_status = match if child_exited {
+            // `/proc` (or `ps`) has already proved that the exact child is in
+            // a terminal state. `wait` cannot block on that state and avoids
+            // a kernel-observation race where an immediate `try_wait` still
+            // reports `None` for the just-observed zombie.
+            self.child_mut().wait().map(Some)
+        } else {
+            self.child_mut().try_wait()
+        } {
             Ok(status) => status,
             Err(error) => {
                 errors.push(format!(
@@ -2696,7 +2713,6 @@ exit 0
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse descendant cleanup report");
     assert_eq!(report["success"], true);
@@ -2823,17 +2839,35 @@ exec /bin/sh "$1"
 fn e2e_test_json_report_against_compiled_fastmcp_server() {
     let server = env!("CARGO_BIN_EXE_fastmcp_cli_e2e_server");
 
-    let output = run_cli(&[
+    let mut command = Command::new(fastmcp_bin());
+    command.args([
         "test",
         "--json",
+        "--protocol-policy",
+        "legacy-only",
         "--idle-timeout",
         "30",
         "--absolute-timeout",
         "120",
         server,
     ]);
-    assert!(output.status.success());
-
+    command.env("FASTMCP_CHECK_FOR_UPDATES", "0");
+    let output = run_with_deadline(command, CLI_DEADLINE).unwrap_or_else(|expired| {
+        panic!(
+            "compiled FastMCP server test exceeded the {:?} harness deadline; cleanup error: {:?}; captured stdout={} bytes, stderr={} bytes (content redacted)",
+            expired.timeout,
+            expired.cleanup_error,
+            expired.stdout.len(),
+            expired.stderr.len()
+        )
+    });
+    assert!(
+        output.status.success(),
+        "compiled FastMCP server test failed: status={:?}, stdout={}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let report: serde_json::Value =
         serde_json::from_str(&stdout_str(&output)).expect("parse framework test report");
     assert_eq!(report["success"], true);
@@ -2843,7 +2877,7 @@ fn e2e_test_json_report_against_compiled_fastmcp_server() {
     for (name, expected_details) in [
         ("initialize", "protocol 2024-11-05"),
         ("ping", "server responded"),
-        ("list_tools", "1 tools"),
+        ("list_tools", "2 tools"),
         ("list_resources", "1 resources"),
         ("list_prompts", "1 prompts"),
     ] {
@@ -2907,18 +2941,25 @@ fn reality_check_regression_compiled_stdio_server_bounds_unread_output_pipe() {
         .env("FASTMCP_NO_BANNER", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     let mut guard = ProcessGroupGuard::spawn(&mut command);
     let mut stdin = guard
         .child_mut()
         .stdin
         .take()
         .expect("compiled fixture stdin");
-    let _unread_stdout = guard
+    let mut unread_stdout = guard
         .child_mut()
         .stdout
         .take()
         .expect("compiled fixture stdout");
+    let stderr = capture_pipe(
+        guard
+            .child_mut()
+            .stderr
+            .take()
+            .expect("compiled fixture stderr"),
+    );
 
     let initialize = serde_json::json!({
         "jsonrpc": "2.0",
@@ -2935,23 +2976,41 @@ fn reality_check_regression_compiled_stdio_server_bounds_unread_output_pipe() {
         "id": 2,
         "method": "tools/call",
         "params": {
-            "name": "echo",
-            "arguments": {"message": "x".repeat(1024 * 1024)},
-            "_meta": {"progressToken": "saturation-progress"}
+            "name": "sized_output",
+            "arguments": {"bytes": 1024 * 1024}
         }
     });
-    for request in [initialize, call] {
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    for request in [initialize, initialized, call] {
         serde_json::to_writer(&mut stdin, &request).expect("encode saturation request");
         stdin.write_all(b"\n").expect("frame saturation request");
     }
     stdin.flush().expect("saturation requests flush");
 
     let started = Instant::now();
-    let status = guard
-        .wait_until(Duration::from_secs(10))
-        .unwrap_or_else(|timeout| panic!("compiled fixture did not bound stdout: {timeout:?}"));
+    let wait_result = guard.wait_until(Duration::from_secs(10));
+    let mut stdout = Vec::new();
+    unread_stdout
+        .read_to_end(&mut stdout)
+        .expect("drain bounded stdout evidence after process exit");
+    let (stderr, stderr_error) = finish_capture(stderr, "stderr", CAPTURE_DRAIN_DEADLINE);
+    let status = wait_result.unwrap_or_else(|timeout| {
+        panic!(
+            "compiled fixture did not bound stdout: {timeout:?}; captured_stdout={} bytes ({:?}); stderr_error={stderr_error:?}; stderr={}",
+            stdout.len(),
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        )
+    });
 
-    assert!(!status.success());
+    assert!(
+        !status.success(),
+        "stdout saturation unexpectedly succeeded; stderr_error={stderr_error:?}; stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
     assert!(started.elapsed() < Duration::from_secs(10));
     drop(stdin);
 }

@@ -350,6 +350,8 @@ fn http_03_b_runtime_planted_negative() {
         .local_addr()
         .expect("read native HTTP listener address");
     let target = format!("http://{address}/mcp");
+    let legacy_sse_target = format!("http://{address}/legacy-sse");
+    let legacy_message_target = format!("http://{address}/legacy-message");
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept disposable probe");
         let captured = read_request(&mut stream);
@@ -377,7 +379,12 @@ fn http_03_b_runtime_planted_negative() {
     let cx = Cx::for_request();
     let refusal = runtime_block_on(ModernHttpClient::connect(
         &cx,
-        plan(&target, &target, &target, ProtocolPolicy::Auto),
+        plan(
+            &target,
+            &legacy_sse_target,
+            &legacy_message_target,
+            ProtocolPolicy::Auto,
+        ),
         client_info(),
         ClientCapabilities::default(),
     ));

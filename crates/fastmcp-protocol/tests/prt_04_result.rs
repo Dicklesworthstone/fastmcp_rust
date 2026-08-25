@@ -28,7 +28,7 @@ impl CompleteResultPayload for LookupResult {
 
 #[test]
 fn prt_04_a_positive() {
-    let source = r#"{"resultType":"complete","_meta":{"trace":true},"serverInfo":{"name":"FastMCP","version":"0.1"},"extension":{"integer":123456789012345678901234567890,"decimal":1.20e+4,"nil":null}}"#;
+    let source = r#"{"resultType":"complete","_meta":{"trace":true,"io.modelcontextprotocol/serverInfo":{"name":"FastMCP","version":"0.1"}},"extension":{"integer":123456789012345678901234567890,"decimal":1.20e+4,"nil":null}}"#;
     let (decoded, diagnostic) = decode_peer_result(
         source,
         ResultPeerEra::Modern,
@@ -42,7 +42,8 @@ fn prt_04_a_positive() {
     assert_eq!(
         complete
             .meta
-            .server_info
+            .final_server_info()
+            .expect("final server identity metadata is valid")
             .as_ref()
             .map(|info| info.name.as_str()),
         Some("FastMCP")

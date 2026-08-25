@@ -27,35 +27,6 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
 fn get_test_server_binary() -> PathBuf {
     TEST_SERVER_PATH
         .get_or_init(|| {
-            eprintln!("[E2E] Building test_server binary...");
-            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-            let mut command = Command::new(cargo);
-            command
-                .args([
-                    "build",
-                    "--locked",
-                    "--offline",
-                    "--message-format=json-render-diagnostics",
-                    "--package",
-                    "fastmcp-console",
-                    "--example",
-                    "test_server",
-                ])
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            configure_process_group(&mut command);
-            let mut child = command.spawn().expect("Failed to start test_server build");
-            let output = capture_with_timeout(&mut child, Duration::from_mins(5));
-
-            assert!(
-                output.exit_code == 0,
-                "Failed to build test_server (exit {}; {} stdout lines, {} stderr lines)",
-                output.exit_code,
-                output.stdout.len(),
-                output.stderr.len()
-            );
-
             let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let binary_name = format!("test_server{}", std::env::consts::EXE_SUFFIX);
             let current_executable = std::env::current_exe().ok();
@@ -70,6 +41,63 @@ fn get_test_server_binary() -> PathBuf {
                 current_executable.as_deref(),
                 &binary_name,
             );
+            if let Some(binary_path) = candidates.iter().find(|candidate| candidate.is_file()) {
+                eprintln!(
+                    "[E2E] Using Cargo-built test_server at {}",
+                    binary_path.display()
+                );
+                return binary_path.clone();
+            }
+
+            // A target-selected integration-test command does not necessarily
+            // build examples. Its outer Cargo process still owns the active
+            // target lock, so a nested build must use an independent target
+            // root instead of waiting on that lock until the fixture timeout.
+            let fixture_target_dir = e2e_fixture_target_dir(
+                &manifest_dir,
+                configured_target_dir.as_deref(),
+            );
+            eprintln!(
+                "[E2E] Building test_server in isolated target {}...",
+                fixture_target_dir.display()
+            );
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut command = Command::new(cargo);
+            command
+                .args([
+                    "build",
+                    "--locked",
+                    "--offline",
+                    "--message-format=json-render-diagnostics",
+                    "--package",
+                    "fastmcp-console",
+                    "--example",
+                    "test_server",
+                    "--target-dir",
+                ])
+                .arg(&fixture_target_dir)
+                .current_dir(&manifest_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            configure_process_group(&mut command);
+            let mut child = command.spawn().expect("Failed to start test_server build");
+            let output = capture_with_timeout(&mut child, Duration::from_mins(15));
+
+            assert!(
+                output.exit_code == 0,
+                "Failed to build test_server (exit {}; {} stdout lines, {} stderr lines)",
+                output.exit_code,
+                output.stdout.len(),
+                output.stderr.len()
+            );
+
+            let fixture_candidates = test_server_binary_candidates(
+                &manifest_dir,
+                Some(fixture_target_dir.as_os_str()),
+                configured_target.as_deref(),
+                None,
+                &binary_name,
+            );
             let binary_path = cargo_example_executable(&output.stdout, "test_server")
                 .expect("Cargo stdout must contain only valid JSON message records")
                 .map(|path| {
@@ -80,7 +108,7 @@ fn get_test_server_binary() -> PathBuf {
                     }
                 })
                 .unwrap_or_else(|| {
-                    let searched = candidates
+                    let searched = fixture_candidates
                         .iter()
                         .map(|candidate| candidate.display().to_string())
                         .collect::<Vec<_>>()
@@ -180,19 +208,7 @@ fn test_server_binary_candidates(
         push_unique_path(&mut profile_directories, target_prefix.join("debug"));
     }
 
-    let target_dir = configured_target_dir.map_or_else(
-        || manifest_dir.join("../../target"),
-        |configured| {
-            let configured = PathBuf::from(configured);
-            if configured.is_absolute() {
-                configured
-            } else {
-                // Environment-supplied relative target directories are resolved
-                // from the nested Cargo command's working directory.
-                manifest_dir.join(configured)
-            }
-        },
-    );
+    let target_dir = cargo_target_dir(manifest_dir, configured_target_dir);
     if let Some(target) = configured_target.filter(|target| !target.is_empty()) {
         push_unique_path(
             &mut profile_directories,
@@ -205,6 +221,32 @@ fn test_server_binary_candidates(
         .into_iter()
         .map(|profile| profile.join("examples").join(binary_name))
         .collect()
+}
+
+fn cargo_target_dir(
+    manifest_dir: &Path,
+    configured_target_dir: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    configured_target_dir.map_or_else(
+        || manifest_dir.join("../../target"),
+        |configured| {
+            let configured = PathBuf::from(configured);
+            if configured.is_absolute() {
+                configured
+            } else {
+                // Environment-supplied relative target directories are resolved
+                // from the nested Cargo command's working directory.
+                manifest_dir.join(configured)
+            }
+        },
+    )
+}
+
+fn e2e_fixture_target_dir(
+    manifest_dir: &Path,
+    configured_target_dir: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    cargo_target_dir(manifest_dir, configured_target_dir).join("fastmcp-console-e2e-fixture")
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -1779,6 +1821,19 @@ mod helper_contract_tests {
                     .join("relative-target/aarch64-unknown-linux-gnu/debug/examples/test_server"),
                 manifest.join("relative-target/debug/examples/test_server"),
             ]
+        );
+    }
+
+    #[test]
+    fn fixture_build_uses_a_distinct_target_lock_for_absolute_and_relative_roots() {
+        let manifest = Path::new("/workspace/crates/fastmcp-console");
+        assert_eq!(
+            e2e_fixture_target_dir(manifest, Some(std::ffi::OsStr::new("/custom-target")),),
+            PathBuf::from("/custom-target/fastmcp-console-e2e-fixture")
+        );
+        assert_eq!(
+            e2e_fixture_target_dir(manifest, Some(std::ffi::OsStr::new("relative-target")),),
+            manifest.join("relative-target/fastmcp-console-e2e-fixture")
         );
     }
 

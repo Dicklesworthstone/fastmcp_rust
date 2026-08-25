@@ -140,7 +140,12 @@ fn modern_progress_and_final(
                 "resultType": "complete",
                 "content": [],
                 "isError": false,
-                "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"},
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "custom-transport-peer",
+                        "version": "1.0.0",
+                    },
+                },
             }),
         )),
     ]

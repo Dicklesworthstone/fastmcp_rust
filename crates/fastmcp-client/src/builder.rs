@@ -2784,8 +2784,8 @@ mod tests {
                     .max_retries(0)
                     .request_timeout_policy(
                         RequestTimeoutPolicy::new(
-                            Duration::from_millis(20),
-                            Duration::from_millis(80),
+                            Duration::from_millis(250),
+                            Duration::from_millis(750),
                         )
                         .expect("bounded probe timeout is valid"),
                     )

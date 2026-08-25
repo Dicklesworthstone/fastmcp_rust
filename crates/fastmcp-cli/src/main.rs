@@ -667,6 +667,10 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
 
+        /// Protocol-policy selection for both client negotiation and server launch.
+        #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
+        protocol_policy: CliProtocolPolicy,
+
         /// Per-request idle timeout in seconds (1-300).
         ///
         /// Starts when initialization or a later MCP request is committed.
@@ -756,10 +760,13 @@ impl Commands {
             | Self::Install {
                 protocol_policy, ..
             }
+            | Self::Test {
+                protocol_policy, ..
+            }
             | Self::Dev {
                 protocol_policy, ..
             } => Some(*protocol_policy),
-            Self::List { .. } | Self::Test { .. } => None,
+            Self::List { .. } => None,
         }
     }
 }
@@ -1106,6 +1113,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
         Commands::Test {
             server,
             args,
+            protocol_policy,
             idle_timeout,
             absolute_timeout,
             verbose,
@@ -1115,6 +1123,7 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
                 cx,
                 &server,
                 &args,
+                protocol_policy,
                 idle_timeout,
                 absolute_timeout,
                 verbose,
@@ -3700,6 +3709,7 @@ async fn cmd_test(
     cx: &Cx,
     server: &str,
     args: &[String],
+    protocol_policy: CliProtocolPolicy,
     idle_timeout_secs: u64,
     absolute_timeout_secs: u64,
     verbose: bool,
@@ -3729,8 +3739,12 @@ async fn cmd_test(
         Duration::from_secs(idle_timeout_secs),
         Duration::from_secs(absolute_timeout_secs),
     )?;
-    let client = fastmcp_client::ClientBuilder::new()
+    let client = client_builder_for_protocol_policy(protocol_policy)?
         .request_timeout_policy(timeout_policy)
+        .env(
+            FASTMCP_PROTOCOL_POLICY_ENV,
+            protocol_policy.server_launch_value(),
+        )
         .owned_process_group(true)
         .connect_stdio_with_cx(server, &args_refs, cx)
         .await;
@@ -11253,6 +11267,7 @@ mod tests {
             match cli.command {
                 Commands::Test {
                     server,
+                    protocol_policy,
                     idle_timeout,
                     absolute_timeout,
                     verbose,
@@ -11260,6 +11275,7 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(server, "./server");
+                    assert_eq!(protocol_policy, CliProtocolPolicy::default());
                     assert_eq!(idle_timeout, 30);
                     assert_eq!(absolute_timeout, 120);
                     assert!(!verbose);
@@ -11274,6 +11290,8 @@ mod tests {
             let cli = Cli::try_parse_from([
                 "fastmcp",
                 "test",
+                "--protocol-policy",
+                "legacy-only",
                 "--idle-timeout",
                 "45",
                 "--absolute-timeout",
@@ -11285,12 +11303,14 @@ mod tests {
             .unwrap();
             match cli.command {
                 Commands::Test {
+                    protocol_policy,
                     idle_timeout,
                     absolute_timeout,
                     verbose,
                     json,
                     ..
                 } => {
+                    assert_eq!(protocol_policy, CliProtocolPolicy::LegacyOnly);
                     assert_eq!(idle_timeout, 45);
                     assert_eq!(absolute_timeout, 180);
                     assert!(verbose);

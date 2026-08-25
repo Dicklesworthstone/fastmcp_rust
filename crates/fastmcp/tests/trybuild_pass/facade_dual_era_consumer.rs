@@ -25,7 +25,7 @@ fn facade_mrtr_resumable_resource(
         modern::InputRequiredResult::new(
             None,
             Some(request_state.to_owned()),
-            fastmcp_rust::ResultMeta::default(),
+            fastmcp_rust::ResultMeta::empty(),
         )
         .expect("request state makes the facade MRTR resource result valid"),
     )
@@ -44,7 +44,7 @@ fn facade_mrtr_resumable_prompt(
         modern::InputRequiredResult::new(
             None,
             Some(request_state.to_owned()),
-            fastmcp_rust::ResultMeta::default(),
+            fastmcp_rust::ResultMeta::empty(),
         )
         .expect("request state makes the facade MRTR prompt result valid"),
     )
@@ -1140,6 +1140,7 @@ fn assert_dual_era_completion_exports() {
             total: Some(1),
             has_more: Some(false),
         },
+        meta: None,
     };
 
     let _ = (modern_params, modern_result, legacy_params, legacy_result);

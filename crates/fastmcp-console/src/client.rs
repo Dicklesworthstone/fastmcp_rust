@@ -3,8 +3,7 @@
 //! Provides beautiful rendering of connected client information,
 //! with plain-text fallback for agent contexts.
 
-pub mod traffic;
-pub use traffic::RequestResponseRenderer;
+pub use crate::traffic::RequestResponseRenderer;
 
 use fastmcp_protocol::{ClientCapabilities, ClientInfo};
 use rich_rust::r#box::ROUNDED;

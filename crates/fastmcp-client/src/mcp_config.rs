@@ -1619,7 +1619,7 @@ mod tests {
             Ok(_) => panic!("an unresolved command must not create a client"),
             Err(error) => error,
         };
-        assert!(matches!(active_error, ConfigError::ClientError(_)));
+        assert!(matches!(active_error, ConfigError::SpawnError(_)));
         assert!(!matches!(
             active_error,
             ConfigError::ClientError(McpError {

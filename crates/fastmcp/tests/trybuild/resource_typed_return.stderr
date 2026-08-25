@@ -1,4 +1,4 @@
-error: ambiguous or cross-era final #[resource] return; use CompleteResult<ReadResourceResult>, Result<CompleteResult<ReadResourceResult>, E>, or McpResult<CompleteResult<ReadResourceResult>> so the legacy handler can project Vec<ResourceContent>
+error: ambiguous or cross-era final #[resource] return; use CompleteResult<ReadResourceResult> or CompleteResult<FinalReadResourceResult>, Result<CompleteResult<ReadResourceResult>, E>, Result<CompleteResult<FinalReadResourceResult>, E>, McpResult<CompleteResult<ReadResourceResult>>, or McpResult<CompleteResult<FinalReadResourceResult>> so the legacy handler can project Vec<ResourceContent>
  --> tests/trybuild/resource_typed_return.rs:6:4
   |
 6 | fn final_resource() -> fastmcp_rust::CompleteResult<fastmcp_rust::GetPromptResult> {
