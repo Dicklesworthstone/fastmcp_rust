@@ -347,8 +347,9 @@ fn setup_workflow_server() -> TestHarness {
         .build();
 
     let handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
         server
-            .run_transport_returning(server_transport)
+            .run_transport_returning_with_cx(&cx, server_transport)
             .expect("workflow server loop");
     });
 
@@ -1061,8 +1062,9 @@ fn workflow_two_independent_servers() {
         .build_server_builder();
     let server_a = builder_a.tool(EchoTool).build();
     let handle_a = spawn_thread(move || {
+        let cx = Cx::for_testing();
         server_a
-            .run_transport_returning(server_a_transport)
+            .run_transport_returning_with_cx(&cx, server_a_transport)
             .expect("server A loop");
     });
 
@@ -1072,8 +1074,9 @@ fn workflow_two_independent_servers() {
         .build_server_builder();
     let server_b = builder_b.resource(StatusResource).build();
     let handle_b = spawn_thread(move || {
+        let cx = Cx::for_testing();
         server_b
-            .run_transport_returning(server_b_transport)
+            .run_transport_returning_with_cx(&cx, server_b_transport)
             .expect("server B loop");
     });
 
@@ -1215,8 +1218,9 @@ fn workflow_server_name_and_version() {
 
     let server = builder.tool(EchoTool).build();
     let handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
         server
-            .run_transport_returning(server_transport)
+            .run_transport_returning_with_cx(&cx, server_transport)
             .expect("workflow server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);
@@ -1235,8 +1239,9 @@ fn workflow_capabilities_match_handlers() {
 
     let server = builder.tool(EchoTool).resource(StatusResource).build();
     let handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
         server
-            .run_transport_returning(server_transport)
+            .run_transport_returning_with_cx(&cx, server_transport)
             .expect("workflow server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);
@@ -1261,8 +1266,9 @@ fn workflow_custom_client_info_accepted() {
 
     let server = builder.tool(EchoTool).build();
     let handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
         server
-            .run_transport_returning(server_transport)
+            .run_transport_returning_with_cx(&cx, server_transport)
             .expect("workflow server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);
@@ -3935,8 +3941,9 @@ fn session_multiple_clients_independent_lifecycle() {
             .tool(EchoTool)
             .build();
         let handle = spawn_thread(move || {
+            let cx = Cx::for_testing();
             server
-                .run_transport_returning(server_transport)
+                .run_transport_returning_with_cx(&cx, server_transport)
                 .expect("lifecycle server loop");
         });
         server_joins.push(handle);
@@ -3984,8 +3991,9 @@ fn session_state_persists_across_operations() {
         .tool(EchoTool)
         .build();
     let handle = spawn_thread(move || {
+        let cx = Cx::for_testing();
         server
-            .run_transport_returning(server_transport)
+            .run_transport_returning_with_cx(&cx, server_transport)
             .expect("persistence server loop");
     });
     let _joins = ThreadJoins::new(vec![handle]);

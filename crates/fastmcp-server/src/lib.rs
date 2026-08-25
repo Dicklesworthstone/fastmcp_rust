@@ -13366,6 +13366,17 @@ impl Server {
     /// observed, the server cannot send a required response, or transport
     /// close fails. A simultaneous run and close failure retains both
     /// structured errors under `data.run` and `data.close`.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_server::{Server, Transport};
+    ///
+    /// fn omitted_context<T>(server: Server, transport: T)
+    /// where
+    ///     T: Transport + Send + 'static,
+    /// {
+    ///     server.run_transport_returning(transport);
+    /// }
+    /// ```
     pub fn run_transport_returning_with_cx<T>(self, cx: &Cx, transport: T) -> McpResult<()>
     where
         T: Transport + Send + 'static,
@@ -13587,49 +13598,20 @@ impl Server {
         std::process::exit(exit_code)
     }
 
-    /// Runs the server on a custom transport until clean closure, cancellation,
-    /// or failure.
-    ///
-    /// This uses one ambient server [`Cx`], but unlike
-    /// [`run_transport`](Self::run_transport) it does not exit the process.
-    /// Independently owned per-request child contexts are not yet provided by
-    /// this legacy loop. Clean EOF and cancellation return `Ok(())`; failures
-    /// are returned to the caller.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when startup fails, a fatal receive/protocol failure is
-    /// observed, the server cannot send a required response, or transport
-    /// close fails.
-    pub fn run_transport_returning<T>(self, transport: T) -> McpResult<()>
-    where
-        T: Transport + Send + 'static,
-    {
-        block_on(async move {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_transport_returning_with_cx(&cx, transport)
-        })
-    }
-
-    /// Runs the server using SSE transport with a testing Cx.
-    ///
-    /// This is a convenience wrapper around [`SseServerTransport`].
-    #[cfg(feature = "legacy-2024-11-05")]
-    pub fn run_sse<W, R>(self, writer: W, request_source: R, endpoint_url: impl Into<String>) -> !
-    where
-        W: Write + Send + 'static,
-        R: Iterator<Item = JsonRpcRequest> + Send + 'static,
-    {
-        let (recv_half, send_half) =
-            SseServerTransport::new(writer, request_source, endpoint_url).into_split();
-        block_on(async move {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.run_split_transport_with_label(&cx, recv_half, send_half, "sse")
-                .await
-        })
-    }
-
     /// Runs the server using SSE transport with a provided Cx.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_server::Server;
+    /// use std::io::Write;
+    ///
+    /// fn omitted_context<W, R>(server: Server, writer: W, requests: R)
+    /// where
+    ///     W: Write + Send + 'static,
+    ///     R: Iterator<Item = fastmcp_protocol::JsonRpcRequest> + Send + 'static,
+    /// {
+    ///     server.run_sse(writer, requests, "http://localhost/events");
+    /// }
+    /// ```
     #[cfg(feature = "legacy-2024-11-05")]
     pub async fn run_sse_with_cx<W, R>(
         self,
@@ -32220,7 +32202,7 @@ mod lib_unit_tests {
         assert!(source.contains(
             "#[cfg(feature = \"legacy-2024-11-05\")]\nuse fastmcp_transport::sse::SseServerTransport;"
         ));
-        assert!(source.contains("#[cfg(feature = \"legacy-2024-11-05\")]\n    pub fn run_sse"));
+        assert!(!source.contains("#[cfg(feature = \"legacy-2024-11-05\")]\n    pub fn run_sse"));
         assert!(
             source.contains(
                 "#[cfg(feature = \"legacy-2024-11-05\")]\n    pub async fn run_sse_with_cx"
@@ -32228,6 +32210,16 @@ mod lib_unit_tests {
         );
         assert!(source.contains("fn sse_response_head(response: &HttpResponse)"));
         assert!(!source.contains("legacy_sse_response_head"));
+    }
+
+    #[test]
+    fn no_context_returning_and_sse_runtime_wrappers_are_absent() {
+        let source = include_str!("lib.rs");
+
+        assert!(!source.contains("pub fn run_transport_returning<T>"));
+        assert!(!source.contains("pub fn run_sse<W, R>"));
+        assert!(source.contains("pub fn run_transport_returning_with_cx<T>"));
+        assert!(source.contains("pub async fn run_sse_with_cx<W, R>"));
     }
 
     #[cfg(not(feature = "legacy-2024-11-05"))]
