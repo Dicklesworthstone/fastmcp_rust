@@ -92,6 +92,20 @@
 //! - **Cooperative cancellation**: Explicit checkpoints surface cancellation
 //! - **Request budgets**: Deadline, poll, and cost limits travel with the context
 //! - **Deterministic test support**: Asupersync's lab runtime is available to tests
+//!
+//! Applications own their top-level runtime. The facade deliberately does not
+//! export a `block_on` convenience at either the crate root or through the
+//! prelude:
+//!
+//! ```compile_fail
+//! use fastmcp_rust::block_on;
+//! # let _ = block_on(async {});
+//! ```
+//!
+//! ```compile_fail
+//! use fastmcp_rust::prelude::block_on;
+//! # let _ = block_on(async {});
+//! ```
 
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
@@ -350,8 +364,7 @@ pub use fastmcp_core::{
     HARD_LOGICAL_EXCHANGE_MAX_STATE_BYTES, HARD_LOGICAL_EXCHANGE_MAX_WALL_CLOCK,
     LogicalExchangeBudget, LogicalExchangeBudgetError, LogicalExchangeBudgetResource,
     MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES, ParseDurationError, ProtocolLimit,
-    ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, SessionState, block_on,
-    parse_duration,
+    ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, SessionState, parse_duration,
 };
 // The established root `NotificationSender` is the server router callback;
 // expose the McpContext progress capability without changing that legacy name.
@@ -9896,7 +9909,7 @@ pub mod prelude {
         SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
         StdioRequestExecution, StdioRequestExecutor, ToolCallResult, ToolCaller, ToolContentItem,
         ToolHandler, Transport, TransportElicitationSender, TransportRootsProvider,
-        TransportSamplingSender, block_on, decode_strict_jsonrpc_message,
+        TransportSamplingSender, decode_strict_jsonrpc_message,
     };
     #[cfg(feature = "legacy-2024-11-05")]
     pub use crate::{
