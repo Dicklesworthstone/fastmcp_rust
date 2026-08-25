@@ -24,13 +24,15 @@
 //! # Usage
 //!
 //! ```ignore
-//! use fastmcp_rust::mcp_config::{ConfigError, ConfigLoader, McpConfig};
+//! use fastmcp_rust::{
+//!     Cx,
+//!     mcp_config::{ConfigError, ConfigLoader, McpConfig},
+//! };
 //!
 //! // Load from default location
 //! let config = ConfigLoader::default().load()?;
 //!
 //! // Create a client for a specific server
-//! # use asupersync::Cx;
 //! # fn create_client(config: &McpConfig, cx: &Cx) -> Result<(), ConfigError> {
 //! let client = config.client(cx, "filesystem")?;
 //! # let _ = client;
@@ -758,6 +760,12 @@ fn spawn_client_from_config(
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
+    // Configuration expansion may consume the caller's cancellation budget.
+    // Re-admit the subprocess immediately before creation so an observed
+    // cancellation cannot still produce a child.
+    if cx.checkpoint().is_err() {
+        return Err(ConfigError::ClientError(McpError::request_cancelled()));
+    }
     // Spawn the process
     let child = cmd.spawn().map_err(|error| {
         ConfigError::SpawnError(format!(
@@ -869,6 +877,15 @@ fn create_and_initialize_client(
             );
         }
     };
+
+    if cx.checkpoint().is_err() {
+        return combine_operation_with_cleanup(Err(McpError::request_cancelled()), || {
+            combine_cleanup_results(
+                transport.close().map_err(transport_error_to_mcp),
+                child_guard.cleanup(),
+            )
+        });
+    }
 
     // Return client
     Ok(Client::from_parts(
