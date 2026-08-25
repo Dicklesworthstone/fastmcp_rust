@@ -113,6 +113,6 @@ See `crates/fastmcp-console/examples`:
 
 The workspace release-license representation is unresolved: Cargo metadata,
 the root `LICENSE`, and the root `LICENSE-MIT` do not currently describe one
-consistent set of terms. Version `0.7.0` was published despite that
+consistent set of terms. Version `0.7.1` was published despite that
 inconsistency; do not infer authoritative release terms or license resolution
 from publication or this crate page.
