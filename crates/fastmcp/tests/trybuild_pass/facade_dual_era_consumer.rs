@@ -611,20 +611,10 @@ async fn connect_exact_legacy_http_with_explicit_context(
 
 fn assert_typed_facade_http_builder_exports() {
     let _: fn(
-        modern::ClientBuilder,
-        modern::CanonicalHttpUrl,
-    ) -> Result<modern::HttpClient, modern::HttpClientConnectError> =
-        modern::ClientBuilder::connect_http;
-    let _: fn(
         legacy_2024::CanonicalHttpUrl,
         legacy_2024::CanonicalHttpUrl,
     ) -> Result<legacy_2024::ClientBuilder, legacy_2024::HttpEndpointBundleError> =
         legacy_2024::http_client_builder;
-    let _: fn(
-        legacy_2024::CanonicalHttpUrl,
-        legacy_2024::CanonicalHttpUrl,
-    ) -> Result<legacy_2024::HttpClient, legacy_2024::HttpClientConnectError> =
-        legacy_2024::connect_http;
     let _ = connect_modern_http_from_configured_builder;
     let _ = connect_exact_legacy_http_with_explicit_context;
 }

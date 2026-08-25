@@ -1243,22 +1243,12 @@ pub mod auto {
                 .map(WebSocketClient::from_inner)
         }
 
-        /// Connects the selected HTTP plan using the current capability context.
-        pub fn connect_http(self) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
-            self.inner.connect_http()
-        }
-
         /// Connects the selected HTTP plan with an explicit capability context.
         pub async fn connect_http_with_cx(
             self,
             cx: &Cx,
         ) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
             self.inner.connect_http_with_cx(cx).await
-        }
-
-        /// Connects a ready selected HTTP client using the current capability context.
-        pub fn connect_http_client(self) -> Result<HttpClient, HttpClientError> {
-            self.inner.connect_http_client()
         }
 
         /// Connects a ready selected HTTP client with an explicit capability context.
@@ -2536,24 +2526,11 @@ pub mod modern {
                 .map(WebSocketClient::from_inner)
         }
 
-        /// Connects this configured final-only builder over one final HTTP endpoint.
+        /// Connects this configured final-only builder over one final HTTP endpoint
+        /// with an explicit cancellation context.
         ///
         /// The builder retains its client identity, capabilities, timeout policy,
         /// and MCP Apps configuration; only its immutable transport plan changes.
-        pub fn connect_http(
-            self,
-            endpoint: CanonicalHttpUrl,
-        ) -> Result<HttpClient, HttpClientConnectError> {
-            let plan = modern_http_plan(endpoint).map_err(HttpClientConnectError::Plan)?;
-            self.inner
-                .protocol_plan(plan)
-                .connect_http_client()
-                .map_err(HttpClientConnectError::Connect)
-                .and_then(HttpClient::from_inner)
-        }
-
-        /// Connects this configured final-only builder over one final HTTP endpoint
-        /// with an explicit cancellation context.
         pub async fn connect_http_with_cx(
             self,
             endpoint: CanonicalHttpUrl,
@@ -8124,22 +8101,12 @@ pub mod legacy_2024 {
                 .map(WebSocketClient::from_inner)
         }
 
-        /// Connects and initializes the sealed exact-2024 HTTP+SSE plan.
-        pub fn connect_http(self) -> Result<HttpClient, HttpClientError> {
-            self.inner.connect_http_client().map(HttpClient::from_inner)
-        }
-
         /// Connects and initializes the sealed exact-2024 HTTP+SSE plan with `cx`.
         pub async fn connect_http_with_cx(self, cx: &Cx) -> Result<HttpClient, HttpClientError> {
             self.inner
                 .connect_http_client_with_cx(cx)
                 .await
                 .map(HttpClient::from_inner)
-        }
-
-        /// Connects a ready exact-2024 HTTP client.
-        pub fn connect_http_client(self) -> Result<HttpClient, HttpClientError> {
-            self.inner.connect_http_client().map(HttpClient::from_inner)
         }
 
         /// Connects a ready exact-2024 HTTP client with `cx`.
@@ -9647,7 +9614,7 @@ pub mod legacy_2024 {
     ///
     /// Callers may further configure client identity, capabilities, timeouts,
     /// and legacy reverse callbacks before connecting with the component's
-    /// `connect_http_client` or `connect_http_client_with_cx` method.
+    /// `connect_http_client_with_cx` method.
     pub fn http_client_builder(
         sse_endpoint: CanonicalHttpUrl,
         message_post_endpoint: CanonicalHttpUrl,
@@ -9655,18 +9622,6 @@ pub mod legacy_2024 {
         legacy_http_plan(sse_endpoint, message_post_endpoint).map(|plan| {
             ClientBuilder::from_inner(fastmcp_client::ClientBuilder::new().protocol_plan(plan))
         })
-    }
-
-    /// Connects the default exact-2024 builder over its required SSE and
-    /// message-post endpoints using the current capability context.
-    pub fn connect_http(
-        sse_endpoint: CanonicalHttpUrl,
-        message_post_endpoint: CanonicalHttpUrl,
-    ) -> Result<HttpClient, HttpClientConnectError> {
-        http_client_builder(sse_endpoint, message_post_endpoint)
-            .map_err(HttpClientConnectError::Plan)?
-            .connect_http_client()
-            .map_err(HttpClientConnectError::Connect)
     }
 
     /// Connects the default exact-2024 builder over its required SSE and
@@ -11305,10 +11260,7 @@ mod tests {
             Client::open_subscriptions_listener;
         #[cfg(feature = "legacy-2024-11-05")]
         {
-            let _: fn(
-                crate::CanonicalHttpUrl,
-                crate::CanonicalHttpUrl,
-            ) -> Result<crate::HttpClient, crate::HttpClientError> = Client::sse;
+            let _ = Client::sse_with_cx;
         }
         let _: fn(
             &mut Client,
@@ -11947,11 +11899,6 @@ mod tests {
         let _: fn(legacy_2024::ClientBuilder, &str, &[&str]) -> McpResult<legacy_2024::Client> =
             legacy_2024::ClientBuilder::connect_stdio;
 
-        fn legacy_builder_connects_http(builder: legacy_2024::ClientBuilder) {
-            let _: Result<legacy_2024::HttpClient, legacy_2024::HttpClientError> =
-                builder.connect_http();
-        }
-
         fn legacy_builder_connects_http_with_cx(builder: legacy_2024::ClientBuilder, cx: &Cx) {
             std::mem::drop(builder.connect_http_with_cx(cx));
         }
@@ -12020,7 +11967,6 @@ mod tests {
             std::mem::drop(client.roots_list_changed(cx));
         }
 
-        let _: fn(legacy_2024::ClientBuilder) = legacy_builder_connects_http;
         let _: fn(legacy_2024::ClientBuilder, &Cx) = legacy_builder_connects_http_with_cx;
         let _: fn(&mut legacy_2024::HttpClient, &Cx) = legacy_http_requests;
         let _: fn(&legacy_2024::HttpClient) -> Option<&str> =

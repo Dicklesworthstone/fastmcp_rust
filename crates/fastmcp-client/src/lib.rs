@@ -13991,18 +13991,13 @@ impl Client {
         ClientBuilder::new()
     }
 
-    /// Connects a ready high-level HTTP client from an immutable protocol plan.
+    /// Connects a ready high-level HTTP client with an explicit cancellation context.
     ///
     /// This is the HTTP counterpart to [`Self::stdio_with_protocol_plan`].
     /// The returned [`HttpClient`] owns policy selection and completes the
-    /// legacy lifecycle before allowing ordinary application requests.
-    pub fn http(protocol_plan: ClientProtocolPlan) -> Result<HttpClient, HttpClientError> {
-        ClientBuilder::new()
-            .protocol_plan(protocol_plan)
-            .connect_http_client()
-    }
-
-    /// Connects a ready high-level HTTP client with an explicit cancellation context.
+    /// legacy lifecycle before allowing ordinary application requests. The
+    /// caller retains runtime, cancellation, and deadline ownership through
+    /// `cx`.
     pub async fn http_with_cx(
         protocol_plan: ClientProtocolPlan,
         cx: &Cx,
@@ -14013,22 +14008,13 @@ impl Client {
             .await
     }
 
-    /// Connects one exact MCP 2024-11-05 HTTP+SSE client.
+    /// Connects one exact MCP 2024-11-05 HTTP+SSE client with an explicit
+    /// cancellation context.
     ///
     /// This is the standalone SSE constructor for callers who already know the
     /// GET event stream and POST message endpoints. Auto still uses SSE only
     /// as a fallback after a modern HTTP probe; this method never probes
-    /// MCP 2026-07-28.
-    #[cfg(feature = "legacy-2024-11-05")]
-    pub fn sse(
-        sse_endpoint: CanonicalHttpUrl,
-        message_post_endpoint: CanonicalHttpUrl,
-    ) -> Result<HttpClient, HttpClientError> {
-        Self::http(Self::legacy_sse_plan(sse_endpoint, message_post_endpoint)?)
-    }
-
-    /// Connects one exact MCP 2024-11-05 HTTP+SSE client with an explicit
-    /// cancellation context.
+    /// MCP 2026-07-28 or creates a runtime.
     #[cfg(feature = "legacy-2024-11-05")]
     pub async fn sse_with_cx(
         sse_endpoint: CanonicalHttpUrl,
@@ -31925,9 +31911,7 @@ mod tests {
 
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
-    fn client_sse_is_the_standalone_exact_legacy_http_constructor() {
-        let _: fn(CanonicalHttpUrl, CanonicalHttpUrl) -> Result<HttpClient, HttpClientError> =
-            Client::sse;
+    fn client_sse_requires_the_caller_owned_context() {
         let _ = Client::sse_with_cx;
     }
 
