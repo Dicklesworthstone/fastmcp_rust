@@ -682,22 +682,23 @@ impl ClientBuilder {
         ClientHttpNegotiation::from_protocol_plan(&self.protocol_plan)
     }
 
-    /// Connects the configured HTTP plan using the current capability context.
-    ///
-    /// `Auto` selects the admitted final stateless route or exact legacy
-    /// SSE route internally; callers receive one ready connection.
-    pub fn connect_http(self) -> Result<ClientHttpConnection, ClientHttpConnectionError> {
-        block_on(async {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.connect_http_with_cx(&cx).await
-        })
-    }
-
     /// Connects the configured HTTP plan with an explicit cancellation context.
     ///
     /// The connection consumes at most one disposable modern probe before
     /// `Auto` may open its exact legacy SSE fallback. It never leaves protocol
     /// classification to the caller.
+    ///
+    /// HTTP connection is deliberately available only through this
+    /// caller-owned context. In particular, the client library never creates
+    /// or re-enters a runtime to make this asynchronous boundary look
+    /// synchronous.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_client::ClientBuilder;
+    ///
+    /// // Omitting the caller-owned context is not a supported HTTP API.
+    /// let _ = ClientBuilder::new().connect_http();
+    /// ```
     pub async fn connect_http_with_cx(
         self,
         cx: &Cx,
@@ -758,17 +759,6 @@ impl ClientBuilder {
         }
 
         Ok(connection)
-    }
-
-    /// Connects a ready high-level HTTP client using the current capability context.
-    ///
-    /// In addition to selecting the immutable HTTP era, this completes the
-    /// exact legacy initialization lifecycle when the plan selects SSE.
-    pub fn connect_http_client(self) -> Result<HttpClient, HttpClientError> {
-        block_on(async {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.connect_http_client_with_cx(&cx).await
-        })
     }
 
     /// Connects a ready high-level HTTP client with an explicit cancellation context.

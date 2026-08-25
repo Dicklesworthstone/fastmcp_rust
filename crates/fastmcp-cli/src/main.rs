@@ -5587,10 +5587,22 @@ fn cmd_inspect_http(
         legacy_message_url,
         protocol_policy,
     )?;
-    let mut client = Client::http(protocol_plan).map_err(|error| {
-        fastmcp_core::McpError::internal_error(format!(
-            "inspect could not connect to the configured HTTP endpoint bundle: {error}"
-        ))
+    // The CLI is the application-owned runtime boundary. The client library
+    // receives this context explicitly and never creates or re-enters a
+    // runtime merely to make HTTP connection look synchronous.
+    let mut client = fastmcp_core::runtime::block_on(async {
+        let cx = asupersync::Cx::current().ok_or_else(|| {
+            fastmcp_core::McpError::internal_error(
+                "inspect HTTP runtime did not install a cancellation context",
+            )
+        })?;
+        Client::http_with_cx(protocol_plan, &cx)
+            .await
+            .map_err(|error| {
+                fastmcp_core::McpError::internal_error(format!(
+                    "inspect could not connect to the configured HTTP endpoint bundle: {error}"
+                ))
+            })
     })?;
 
     let negotiated_version = client.connection().protocol_version().ok_or_else(|| {
