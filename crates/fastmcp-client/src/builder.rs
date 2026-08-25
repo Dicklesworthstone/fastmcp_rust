@@ -7,8 +7,7 @@
 //!
 //! ```ignore
 //! use std::time::Duration;
-//! use asupersync::Cx;
-//! use fastmcp_rust::{Client, ClientBuilder, McpResult, RequestTimeoutPolicy};
+//! use fastmcp_rust::{Client, ClientBuilder, Cx, McpResult, RequestTimeoutPolicy};
 //!
 //! async fn connect(cx: &Cx) -> McpResult<Client> {
 //!     ClientBuilder::new()
@@ -59,6 +58,7 @@ use fastmcp_transport::websocket::AsyncWsClientTransport;
 use crate::ReverseRequestCancellation;
 #[cfg(feature = "websocket-experimental")]
 use crate::WebSocketClient;
+use crate::http_executor::ModernHttpExecutorError;
 use crate::{
     AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
@@ -615,16 +615,19 @@ impl ClientBuilder {
     /// # Example
     ///
     /// ```ignore
-    /// # use asupersync::Cx;
-    /// # let cx = Cx::for_testing();
-    /// let client = ClientBuilder::new()
+    /// # use fastmcp_rust::{ClientBuilder, Cx, McpResult};
+    /// # async fn connect(cx: &Cx) -> McpResult<()> {
+    /// let mut client = ClientBuilder::new()
     ///     .auto_initialize(true)
-    ///     .connect_stdio_with_cx("uvx", &["my-server"], &cx)
+    ///     .connect_stdio_with_cx("uvx", &["my-server"], cx)
     ///     .await?;
     ///
     /// // Subprocess is running but not yet initialized
     /// // Initialization happens on first use:
     /// let tools = client.list_tools()?; // Initializes here
+    /// # let _ = tools;
+    /// # Ok(())
+    /// # }
     /// ```
     #[must_use]
     pub fn auto_initialize(mut self, enabled: bool) -> Self {
@@ -762,6 +765,20 @@ impl ClientBuilder {
             }
         }
 
+        if cx.checkpoint().is_err() {
+            #[cfg(feature = "legacy-2024-11-05")]
+            if connection.selected_protocol_era()
+                == fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024
+            {
+                return Err(ClientHttpConnectionError::Legacy(
+                    crate::LegacySseHttpClientError::Cancelled,
+                ));
+            }
+            return Err(ClientHttpConnectionError::Modern(
+                ModernHttpClientError::Executor(ModernHttpExecutorError::Cancelled),
+            ));
+        }
+
         Ok(connection)
     }
 
@@ -796,6 +813,9 @@ impl ClientBuilder {
         .await?;
         if let Some(implementation) = client_implementation {
             client.set_client_implementation(implementation);
+        }
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
         Ok(client)
     }
@@ -846,6 +866,13 @@ impl ClientBuilder {
 
             match self.try_connect(command, args, cx, retry_deadline) {
                 Ok(mut client) => {
+                    if cx.checkpoint().is_err() {
+                        let cleanup = client.close();
+                        return combine_operation_with_cleanup(
+                            Err(McpError::request_cancelled()),
+                            || cleanup,
+                        );
+                    }
                     if Instant::now() >= retry_deadline {
                         let cleanup = client.close();
                         return combine_operation_with_cleanup(
@@ -890,6 +917,13 @@ impl ClientBuilder {
 
         match self.try_connect(command, args, cx, retry_deadline) {
             Ok(mut client) => {
+                if cx.checkpoint().is_err() {
+                    let cleanup = client.close();
+                    return combine_operation_with_cleanup(
+                        Err(McpError::request_cancelled()),
+                        || cleanup,
+                    );
+                }
                 if Instant::now() >= retry_deadline {
                     let cleanup = client.close();
                     return combine_operation_with_cleanup(

@@ -15,8 +15,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use asupersync::Cx;
-//! use fastmcp_rust::Client;
+//! use fastmcp_rust::{Client, Cx};
 //!
 //! let mut client = Client::stdio_with_cx(
 //!     "uvx",
@@ -11228,6 +11227,10 @@ impl HttpClient {
                 }
             };
 
+        if cx.checkpoint().is_err() {
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+
         Ok(Self {
             connection,
             client_info,
@@ -13848,6 +13851,12 @@ impl Client {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Argument and stdio setup may consume the caller's cancellation
+        // budget. Re-admit the subprocess immediately before creation so an
+        // observed cancellation cannot still produce a child.
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
         let child = command
             .spawn()
             .map_err(|e| McpError::internal_error(format!("Failed to spawn subprocess: {e}")))?;
@@ -13957,6 +13966,10 @@ impl Client {
         {
             let cleanup = client.close();
             return combine_operation_and_cleanup(Err(error), cleanup);
+        }
+        if client.cx.checkpoint().is_err() {
+            let cleanup = client.close();
+            return combine_operation_and_cleanup(Err(McpError::request_cancelled()), cleanup);
         }
 
         client.activate_selected_io();
