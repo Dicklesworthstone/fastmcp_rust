@@ -15,9 +15,14 @@
 //! # Example
 //!
 //! ```ignore
+//! use asupersync::Cx;
 //! use fastmcp_rust::Client;
 //!
-//! let mut client = Client::stdio("uvx", &["my-mcp-server"])?;
+//! let mut client = Client::stdio_with_cx(
+//!     "uvx",
+//!     &["my-mcp-server"],
+//!     Cx::for_request(),
+//! )?;
 //!
 //! // List tools
 //! let tools = client.list_tools()?;
@@ -13766,24 +13771,13 @@ impl Client {
         }
     }
 
-    /// Creates a client connecting to a subprocess via stdio.
+    /// Creates a stdio client with the caller's cancellation context.
     ///
-    /// # Arguments
+    /// ```compile_fail
+    /// use fastmcp_client::Client;
     ///
-    /// * `command` - The command to run (e.g., "uvx", "npx")
-    /// * `args` - Arguments to pass to the command
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the subprocess fails to start or initialization fails.
-    pub fn stdio(command: &str, args: &[&str]) -> McpResult<Self> {
-        block_on(async {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            Self::stdio_with_cx(command, args, cx)
-        })
-    }
-
-    /// Creates a client with a provided Cx for cancellation support.
+    /// let _client = Client::stdio("server", &[]);
+    /// ```
     pub fn stdio_with_cx(command: &str, args: &[&str], cx: Cx) -> McpResult<Self> {
         // The public convenience constructor follows the same modern-first,
         // bounded Auto selection as ClientBuilder. A correlated discovery
@@ -13799,7 +13793,8 @@ impl Client {
         )
     }
 
-    /// Creates a stdio client from an immutable protocol plan.
+    /// Creates a plan-aware stdio client with a caller-provided cancellation
+    /// context.
     ///
     /// `ModernOnly` performs a modern `server/discover` exchange, while
     /// `LegacyOnly` performs the exact 2024-11-05 initialization lifecycle.
@@ -13807,19 +13802,13 @@ impl Client {
     /// exact-2024 process only for a correlated discovery refusal or an
     /// Unix-observable clean first-probe timeout. Transport failures and
     /// malformed modern discovery never authorize a downgrade.
-    pub fn stdio_with_protocol_plan(
-        command: &str,
-        args: &[&str],
-        protocol_plan: ClientProtocolPlan,
-    ) -> McpResult<Self> {
-        block_on(async {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            Self::stdio_with_protocol_plan_with_cx(command, args, protocol_plan, cx)
-        })
-    }
-
-    /// Creates a plan-aware stdio client with a caller-provided cancellation
-    /// context.
+    ///
+    /// ```compile_fail
+    /// use fastmcp_client::{Client, ClientProtocolPlan, ProtocolPolicy};
+    ///
+    /// let plan = ClientProtocolPlan::stdio(ProtocolPolicy::Auto);
+    /// let _client = Client::stdio_with_protocol_plan("server", &[], plan);
+    /// ```
     pub fn stdio_with_protocol_plan_with_cx(
         command: &str,
         args: &[&str],
@@ -31919,7 +31908,8 @@ mod tests {
     #[test]
     #[allow(clippy::err_expect)] // Client deliberately has no Debug surface
     fn client_stdio_fails_for_nonexistent_command() {
-        let result = Client::stdio("definitely-not-a-real-command-xyz", &[]);
+        let result =
+            Client::stdio_with_cx("definitely-not-a-real-command-xyz", &[], Cx::for_testing());
         assert!(result.is_err());
         let err = result.err().expect("should be error");
         assert_eq!(err.code, fastmcp_core::McpErrorCode::InternalError);
@@ -31951,7 +31941,7 @@ mod tests {
         let script = modern_typed_call_client_script(
             r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"public auto modern"}],"isError":false}}"#,
         );
-        let mut client = Client::stdio("sh", &["-c", script.as_str()])
+        let mut client = Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_testing())
             .expect("the public stdio constructor completes its modern Auto probe");
 
         assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
@@ -31974,7 +31964,7 @@ mod tests {
     #[test]
     fn clt_02_public_stdio_auto_reopens_one_fresh_exact_legacy_child() {
         let script = auto_discovery_refusal_client_script(-32_601);
-        let mut client = Client::stdio("sh", &["-c", script.as_str()])
+        let mut client = Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_testing())
             .expect("only a discovery MethodNotFound authorizes the fresh legacy child");
 
         assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
@@ -31998,7 +31988,7 @@ mod tests {
         // Only the discovery refusal code differs from the paired fallback
         // positive. No second process may be used as a legacy replay path.
         let script = auto_discovery_refusal_client_script(-32_602);
-        let error = match Client::stdio("sh", &["-c", script.as_str()]) {
+        let error = match Client::stdio_with_cx("sh", &["-c", script.as_str()], Cx::for_testing()) {
             Ok(_) => panic!("InvalidParams discovery refusal cannot authorize legacy fallback"),
             Err(error) => error,
         };

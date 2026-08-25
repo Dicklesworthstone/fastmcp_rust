@@ -7,9 +7,10 @@
 //!
 //! ```ignore
 //! use std::time::Duration;
+//! use asupersync::Cx;
 //! use fastmcp_rust::{Client, ClientBuilder, McpResult, RequestTimeoutPolicy};
 //!
-//! fn connect() -> McpResult<Client> {
+//! fn connect(cx: &Cx) -> McpResult<Client> {
 //!     ClientBuilder::new()
 //!         .client_info("my-client", "1.0.0")
 //!         .request_timeout_policy(RequestTimeoutPolicy::new(
@@ -20,7 +21,7 @@
 //!         .retry_delay_ms(1000)
 //!         .working_dir("/tmp")
 //!         .env("DEBUG", "1")
-//!         .connect_stdio("uvx", &["my-server"])
+//!         .connect_stdio_with_cx("uvx", &["my-server"], cx)
 //! }
 //! ```
 
@@ -614,9 +615,11 @@ impl ClientBuilder {
     /// # Example
     ///
     /// ```ignore
+    /// # use asupersync::Cx;
+    /// # let cx = Cx::for_testing();
     /// let client = ClientBuilder::new()
     ///     .auto_initialize(true)
-    ///     .connect_stdio("uvx", &["my-server"])?;
+    ///     .connect_stdio_with_cx("uvx", &["my-server"], &cx)?;
     ///
     /// // Subprocess is running but not yet initialized
     /// // Initialization happens on first use:
@@ -796,34 +799,23 @@ impl ClientBuilder {
         Ok(client)
     }
 
-    /// Connects to a server via stdio subprocess.
+    /// Connects to a server via a stdio subprocess under the caller's context.
     ///
-    /// Spawns the specified command as a subprocess and communicates via
-    /// stdin/stdout using JSON-RPC over NDJSON framing.
+    /// The caller-owned context is mandatory; the client library never creates
+    /// or re-enters a runtime merely to make stdio construction look
+    /// context-free.
     ///
-    /// # Arguments
+    /// ```compile_fail
+    /// use fastmcp_client::ClientBuilder;
     ///
-    /// * `command` - The command to run (e.g., "uvx", "npx")
-    /// * `args` - Arguments to pass to the command
+    /// let _client = ClientBuilder::new().connect_stdio("server", &[]);
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The request idle/absolute policy is invalid
-    /// - The subprocess fails to spawn
-    /// - The initialization handshake fails
-    /// - All retry attempts are exhausted
-    pub fn connect_stdio(self, command: &str, args: &[&str]) -> McpResult<Client> {
-        block_on(async {
-            let cx = Cx::current().expect("fastmcp runtime should install a current Cx");
-            self.connect_stdio_with_cx(command, args, &cx)
-        })
-    }
-
-    /// Connects to a server via stdio subprocess with a provided Cx.
-    ///
-    /// Same as [`connect_stdio`](Self::connect_stdio) but allows providing
-    /// a custom capability context for cancellation support.
+    /// Returns an error if the timeout or retry policy is invalid, the caller
+    /// is cancelled, the subprocess fails to spawn, initialization fails, or
+    /// all bounded retry attempts are exhausted.
     pub fn connect_stdio_with_cx(self, command: &str, args: &[&str], cx: &Cx) -> McpResult<Client> {
         // Reject unusable configuration once, before cancellation checks,
         // retries, command resolution, or subprocess creation. In particular,
@@ -2539,9 +2531,11 @@ mod tests {
 
     #[test]
     fn connect_stdio_nonexistent_command_fails() {
-        let result = ClientBuilder::new()
-            .max_retries(0)
-            .connect_stdio("fastmcp_nonexistent_binary_xyz", &["--version"]);
+        let result = ClientBuilder::new().max_retries(0).connect_stdio_with_cx(
+            "fastmcp_nonexistent_binary_xyz",
+            &["--version"],
+            &Cx::for_testing(),
+        );
         assert!(result.is_err());
     }
 
@@ -2673,7 +2667,7 @@ mod tests {
                 RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(40))
                     .unwrap(),
             )
-            .connect_stdio("sh", &["-c", "exec sleep 5"]);
+            .connect_stdio_with_cx("sh", &["-c", "exec sleep 5"], &Cx::for_testing());
 
         let Err(error) = result else {
             panic!("silent initialization should time out");
@@ -2698,7 +2692,11 @@ mod tests {
             .connection_retry_policy(1, Duration::ZERO, Duration::from_millis(25))
             .expect("bounded retry policy is valid");
 
-        let error = match builder.connect_stdio("sh", &["-c", "exec sleep 5"]) {
+        let error = match builder.connect_stdio_with_cx(
+            "sh",
+            &["-c", "exec sleep 5"],
+            &Cx::for_testing(),
+        ) {
             Ok(mut client) => {
                 let _ = client.close();
                 panic!("slow initialization must not outlive the retry elapsed cap");
@@ -2906,9 +2904,11 @@ mod tests {
 
     #[test]
     fn connect_stdio_spawn_failure_error_message() {
-        let result = ClientBuilder::new()
-            .max_retries(0)
-            .connect_stdio("fastmcp_no_such_binary_abc123", &[]);
+        let result = ClientBuilder::new().max_retries(0).connect_stdio_with_cx(
+            "fastmcp_no_such_binary_abc123",
+            &[],
+            &Cx::for_testing(),
+        );
         match result {
             Err(err) => assert!(
                 err.message.contains("spawn"),

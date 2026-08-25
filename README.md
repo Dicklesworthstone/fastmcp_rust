@@ -382,16 +382,16 @@ supplied a progress token can reset idle.
 ```rust
 use std::time::Duration;
 
-use fastmcp_rust::prelude::{Client, ClientBuilder, McpResult, RequestTimeoutPolicy};
+use fastmcp_rust::prelude::{Client, ClientBuilder, Cx, McpResult, RequestTimeoutPolicy};
 
-fn connect() -> McpResult<Client> {
+fn connect(cx: &Cx) -> McpResult<Client> {
     let policy = RequestTimeoutPolicy::new(
         Duration::from_secs(20),
         Duration::from_secs(90),
     )?;
     ClientBuilder::new()
         .request_timeout_policy(policy)
-        .connect_stdio("my-mcp-server", &[])
+        .connect_stdio_with_cx("my-mcp-server", &[], cx)
 }
 ```
 
