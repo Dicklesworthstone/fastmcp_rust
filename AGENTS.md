@@ -4,7 +4,7 @@
 
 **MCP 2026-07-28 support is under implementation and remains unverified.**  
 **Aggregate MCP 2026-07-28 support is not claimed by FND-01.**  
-Toolchain: pinned `nightly-2026-08-20` (rustc 1.100.0-nightly) with workspace `rust-version = "1.100"`.
+Toolchain: pinned `nightly-2026-08-25` (rustc 1.100.0-nightly) with workspace `rust-version = "1.100"`.
 
 ---
 
@@ -53,7 +53,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 We only use **Cargo** in this project, NEVER any other package manager.
 
-- **Edition:** Rust 2024 (pinned `nightly-2026-08-20` — see `rust-toolchain.toml`)
+- **Edition:** Rust 2024 (pinned `nightly-2026-08-25` — see `rust-toolchain.toml`)
 - **Dependency versions:** Explicit versions for stability
 - **Configuration:** Cargo.toml workspace with `workspace = true` pattern
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)

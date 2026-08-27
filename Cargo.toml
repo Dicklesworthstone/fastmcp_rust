@@ -17,7 +17,7 @@ version = "0.7.1"
 edition = "2024"
 license = "MIT"
 # Cargo lower-bound check only; the supported compiler is the dated nightly
-# pinned in rust-toolchain.toml (nightly-2026-08-20 / rustc 1.100.0-nightly).
+# pinned in rust-toolchain.toml (nightly-2026-08-25 / rustc 1.100.0-nightly).
 rust-version = "1.100"
 repository = "https://github.com/Dicklesworthstone/fastmcp_rust"
 homepage = "https://github.com/Dicklesworthstone/fastmcp_rust"

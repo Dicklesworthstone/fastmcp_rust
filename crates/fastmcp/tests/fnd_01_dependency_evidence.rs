@@ -34284,7 +34284,7 @@ mod ordinary {
     const HARD_MAX_POLICY_BYTES: u64 = 8 * 1024 * 1024;
     const EXACT_RUST_TOOLCHAIN_TOML: &str = concat!(
         "[toolchain]\n",
-        "channel = \"nightly-2026-08-20\"\n",
+        "channel = \"nightly-2026-08-25\"\n",
         "profile = \"minimal\"\n",
         "components = [\"rustfmt\", \"clippy\"]\n",
         "targets = [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", ",
@@ -77942,7 +77942,7 @@ activate = 1\n";
         document: &toml::Value,
     ) -> VResult<(String, String, String)> {
         const SUBJECT: &str = "toolchain/asupersync contract";
-        const TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-20";
+        const TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-25";
         const RELEASE_PIN: &str = "0.4.9";
         const RELEASE_SHA: &str =
             "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd";
@@ -79670,8 +79670,8 @@ activate = 1\n";
             format!("# comment\n{EXACT_RUST_TOOLCHAIN_TOML}"),
             format!("\u{feff}{EXACT_RUST_TOOLCHAIN_TOML}"),
             EXACT_RUST_TOOLCHAIN_TOML.replacen(
-                "channel = \"nightly-2026-08-20\"\nprofile = \"minimal\"",
-                "profile = \"minimal\"\nchannel = \"nightly-2026-08-20\"",
+                "channel = \"nightly-2026-08-25\"\nprofile = \"minimal\"",
+                "profile = \"minimal\"\nchannel = \"nightly-2026-08-25\"",
                 1,
             ),
             EXACT_RUST_TOOLCHAIN_TOML.replacen(
@@ -84639,7 +84639,7 @@ original = "value"
         let accepted =
             validate_toolchain_asupersync_contract(&root, &files, &policy, &document).verified();
         assert_eq!(accepted.0, "0.4.9");
-        assert_eq!(accepted.1, "nightly-2026-08-20");
+        assert_eq!(accepted.1, "nightly-2026-08-25");
         assert_eq!(
             accepted.2,
             "8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807"
@@ -88465,7 +88465,7 @@ original = "value"
         // validator at the typed source-tree boundary instead of bypassing
         // it, followed by unchanged-state pristine reacceptance.
         const TREE_PLANT_TARGET: &str = "evidence/fnd-01/probes/toolchain-2026-08-20.json";
-        const TREE_PLANT_NEEDLE: &[u8] = b"\"channel\": \"nightly-2026-08-20\",";
+        const TREE_PLANT_NEEDLE: &[u8] = b"\"channel\": \"nightly-2026-08-25\",";
         const TREE_PLANT_REPLACEMENT: &[u8] = b"\"channel\": \"nightly-2026-08-21\",";
         let drifted = sdk_matrix_raw_candidate(
             &files,

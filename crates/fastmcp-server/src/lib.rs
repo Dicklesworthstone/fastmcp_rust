@@ -52,6 +52,9 @@
 //! replacement does not change the fixed peer error, but FastMCP cannot promise
 //! payload-free local diagnostics after its hook has been replaced.
 
+// Raised for the trait solver: proving `Send` for the nested async blocks in
+// `serve_http_connection` overflows the default limit on newer rustc.
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
