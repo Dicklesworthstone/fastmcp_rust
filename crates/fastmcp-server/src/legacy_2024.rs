@@ -711,13 +711,14 @@ where
     ) -> Result<Legacy2024Outbound, Legacy2024AdapterError> {
         self.require_binding(binding)?;
         let response_shaped = wire.as_object().is_some_and(|object| {
-            // A frame without a method is attempting to be a response, even
-            // when its result/error member is malformed or missing. Never
-            // manufacture a response to that peer response attempt.
-            !object.contains_key("method")
-                && (object.contains_key("id")
-                    || object.contains_key("result")
-                    || object.contains_key("error"))
+            // A result/error member makes the frame response-shaped even when
+            // a malformed or conflicting method member is also present. An
+            // id-bearing frame without a method is likewise attempting to be
+            // a response. JSON-RPC must never answer either peer response
+            // attempt with another response.
+            object.contains_key("result")
+                || object.contains_key("error")
+                || (!object.contains_key("method") && object.contains_key("id"))
         });
         let request_id = response_id_from_wire(&wire);
         let envelope = match decode_legacy_2024_11_05_envelope_classified(wire) {
@@ -1805,7 +1806,8 @@ mod tests {
                 TOOLS_LIST,
                 RESOURCES_LIST,
                 PROMPTS_LIST,
-                COMPLETION_COMPLETE
+                COMPLETION_COMPLETE,
+                RESOURCES_SUBSCRIBE,
             ]
         );
     }
@@ -1905,7 +1907,7 @@ mod tests {
             .expect_err("changing only the URI must not notify an unsubscribed resource");
         assert_eq!(error.code().as_i32(), Some(-32600));
         assert_eq!(adapter.snapshot(), before);
-        assert_eq!(adapter.handler.methods.len(), 0);
+        assert_eq!(adapter.handler.methods, [RESOURCES_SUBSCRIBE]);
     }
 
     #[test]
@@ -2275,7 +2277,11 @@ mod tests {
             *calls
                 .lock()
                 .expect("live handler call log must not be poisoned"),
-            vec![(left, TOOLS_LIST), (right, TOOLS_LIST)]
+            vec![
+                (left, TOOLS_LIST),
+                (right, TOOLS_LIST),
+                (left, RESOURCES_SUBSCRIBE),
+            ]
         );
     }
 

@@ -1332,6 +1332,32 @@ fn insert_negotiated_tasks_client_extension(
     Ok(())
 }
 
+#[cfg(feature = "tasks")]
+fn remove_tasks_client_extension(parameters: &mut serde_json::Value) {
+    let Some(metadata) = parameters
+        .get_mut("_meta")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(capabilities) = metadata
+        .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    let Some(extensions) = capabilities
+        .get_mut("extensions")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    extensions.remove(fastmcp_protocol::TASKS_EXTENSION);
+    if extensions.is_empty() {
+        capabilities.remove("extensions");
+    }
+}
+
 /// Overlays inbound sampling/elicitation/roots without replacing extension
 /// advertisements already stamped on `_meta` client capabilities.
 fn overlay_inbound_core_client_capabilities_on_metadata(
@@ -5626,6 +5652,7 @@ where
                 params: CancelledParams {
                     request_id: request_id.clone(),
                     reason: None,
+                    meta: None,
                 },
             },
             ProtocolEra::Modern2026 => CancellationWireMessage::Modern2026 {
@@ -9521,6 +9548,7 @@ fn stdio_cancellation_control_message(
             params: CancelledParams {
                 request_id: request_id.clone(),
                 reason: None,
+                meta: None,
             },
         },
         ProtocolEra::Modern2026 => CancellationWireMessage::Modern2026 {
@@ -15249,7 +15277,11 @@ impl Client {
         let cancellation = match self.session.selected_era() {
             Some(ProtocolEra::Legacy2024) => CancellationWireMessage::Legacy2024 {
                 sender: CancellationSender::Client,
-                params: CancelledParams { request_id, reason },
+                params: CancelledParams {
+                    request_id,
+                    reason,
+                    meta: None,
+                },
             },
             Some(ProtocolEra::Modern2026) => CancellationWireMessage::Modern2026 {
                 sender: CancellationSender::Client,
@@ -15648,11 +15680,72 @@ impl Client {
     where
         F: FnOnce(&RequestId),
     {
+        self.request_core_with_cancellation_policy(
+            cx,
+            cancellation,
+            method,
+            params_value,
+            true,
+            on_committed,
+        )
+    }
+
+    /// Sends one selected-era core request without advertising the official
+    /// Tasks extension on that request.
+    ///
+    /// This is an integration hook for a gateway whose downstream caller did
+    /// not negotiate Tasks. It preserves every other configured extension and
+    /// prevents an upstream from committing a Task the gateway cannot relay.
+    #[cfg(feature = "tasks")]
+    #[doc(hidden)]
+    pub fn request_core_with_cancellation_without_tasks<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        params_value: serde_json::Value,
+        on_committed: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnOnce(&RequestId),
+    {
+        self.request_core_with_cancellation_policy(
+            cx,
+            cancellation,
+            method,
+            params_value,
+            false,
+            on_committed,
+        )
+    }
+
+    fn request_core_with_cancellation_policy<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        params_value: serde_json::Value,
+        advertise_tasks: bool,
+        on_committed: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnOnce(&RequestId),
+    {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
         self.ensure_initialized()?;
         let params_value = self.prepare_request_parameters(params_value)?;
+        #[cfg(feature = "tasks")]
+        let params_value = {
+            let mut params_value = params_value;
+            if !advertise_tasks {
+                remove_tasks_client_extension(&mut params_value);
+            }
+            params_value
+        };
+        #[cfg(not(feature = "tasks"))]
+        let _ = advertise_tasks;
         let core_request = self
             .prepared_core_request(method, &params_value)?
             .ok_or_else(|| {
@@ -20633,6 +20726,17 @@ mod tests {
     #[cfg(feature = "websocket-experimental")]
     use std::io;
 
+    fn wait_for_test_flag(flag: &AtomicBool, description: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !flag.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     #[cfg(feature = "tasks")]
     fn inbound_capability_overlay_preserves_official_tasks_extension() {
@@ -20688,6 +20792,37 @@ mod tests {
             metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["sampling"],
             serde_json::json!({})
         );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn no_tasks_request_removes_only_official_tasks_extension() {
+        let mut parameters = serde_json::json!({
+            "_meta": {
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {
+                    "sampling": {},
+                    "extensions": {
+                        fastmcp_protocol::TASKS_EXTENSION: {},
+                        "com.example/retained": {"enabled": true}
+                    }
+                },
+                "com.example/meta": {"retained": true}
+            }
+        });
+
+        remove_tasks_client_extension(&mut parameters);
+
+        assert!(
+            parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                .get(fastmcp_protocol::TASKS_EXTENSION)
+                .is_none()
+        );
+        assert_eq!(
+            parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]["com.example/retained"]
+                ["enabled"],
+            true
+        );
+        assert_eq!(parameters["_meta"]["com.example/meta"]["retained"], true);
     }
     #[cfg(feature = "websocket-experimental")]
     use std::net::SocketAddr;
@@ -20758,6 +20893,18 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:45101".parse().expect("client address");
         let server_addr: SocketAddr = "127.0.0.1:45102".parse().expect("server address");
         asupersync::net::tcp::VirtualTcpStream::pair(client_addr, server_addr)
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn wait_for_websocket_test_flag(cx: &Cx, flag: &AtomicBool, description: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !flag.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
     }
 
     /// Counts terminal RFC 6455 Close-frame elections on the client writer.
@@ -23435,13 +23582,12 @@ mod tests {
                         )
                         .await
                         .expect("peer sends parked callback");
-                    for _ in 0..1_024 {
-                        if peer_callback_started.load(Ordering::Acquire) {
-                            break;
-                        }
-                        asupersync::runtime::yield_now().await;
-                    }
-                    assert!(peer_callback_started.load(Ordering::Acquire));
+                    wait_for_websocket_test_flag(
+                        &peer_cx,
+                        &peer_callback_started,
+                        "matching-cancellation callback admission",
+                    )
+                    .await;
                     server
                         .send(
                             &peer_cx,
@@ -23545,13 +23691,12 @@ mod tests {
                 .complete(&cx, completion.clone())
                 .await
                 .expect("matching cancellation leaves the owner request readable");
-            for _ in 0..1_024 {
-                if callback_dropped.load(Ordering::Acquire) {
-                    break;
-                }
-                asupersync::runtime::yield_now().await;
-            }
-            assert!(callback_dropped.load(Ordering::Acquire));
+            wait_for_websocket_test_flag(
+                &cx,
+                &callback_dropped,
+                "matching-cancellation callback teardown",
+            )
+            .await;
             assert!(
                 callback_cx
                     .lock()
@@ -23591,13 +23736,12 @@ mod tests {
                     let _ = server.recv(&peer_cx).await.expect("initialized");
                     let JsonRpcMessage::Request(completion) = server.recv(&peer_cx).await.expect("completion") else { panic!("expected completion"); };
                     server.send(&peer_cx, &JsonRpcMessage::Request(JsonRpcRequest::new("sampling/createMessage", Some(serde_json::json!({"messages":[],"maxTokens":3})), RequestId::Number(41)))).await.expect("callback request");
-                    for _ in 0..1_024 {
-                        if peer_callback_started.load(Ordering::Acquire) {
-                            break;
-                        }
-                        asupersync::runtime::yield_now().await;
-                    }
-                    assert!(peer_callback_started.load(Ordering::Acquire));
+                    wait_for_websocket_test_flag(
+                        &peer_cx,
+                        &peer_callback_started,
+                        "foreign-cancellation callback admission",
+                    )
+                    .await;
                     server.send(&peer_cx, &JsonRpcMessage::Request(JsonRpcRequest::notification("notifications/cancelled", Some(serde_json::json!({"requestId":42}))))).await.expect("foreign cancellation");
                     peer_foreign_cancellation_sent.store(true, Ordering::Release);
                     let JsonRpcMessage::Response(callback) = server.recv(&peer_cx).await.expect("one callback response") else { panic!("foreign cancellation must not suppress callback response"); };
@@ -23638,16 +23782,18 @@ mod tests {
                     let callback_started = Arc::clone(&callback_started);
                     let foreign_cancellation_sent = Arc::clone(&foreign_cancellation_sent);
                     move |release_cx| async move {
-                        for _ in 0..1_024 {
-                            if callback_started.load(Ordering::Acquire)
-                                && foreign_cancellation_sent.load(Ordering::Acquire)
-                            {
-                                break;
-                            }
-                            asupersync::runtime::yield_now().await;
-                        }
-                        assert!(callback_started.load(Ordering::Acquire));
-                        assert!(foreign_cancellation_sent.load(Ordering::Acquire));
+                        wait_for_websocket_test_flag(
+                            &release_cx,
+                            &callback_started,
+                            "foreign-cancellation callback admission",
+                        )
+                        .await;
+                        wait_for_websocket_test_flag(
+                            &release_cx,
+                            &foreign_cancellation_sent,
+                            "foreign cancellation control",
+                        )
+                        .await;
                         park_sender.send(&release_cx, ()).expect("release callback");
                     }
                 })
@@ -23736,13 +23882,12 @@ mod tests {
                         )
                         .await
                         .expect("callback request");
-                    for _ in 0..1_024 {
-                        if peer_callback_started.load(Ordering::Acquire) {
-                            break;
-                        }
-                        asupersync::runtime::yield_now().await;
-                    }
-                    assert!(peer_callback_started.load(Ordering::Acquire));
+                    wait_for_websocket_test_flag(
+                        &peer_cx,
+                        &peer_callback_started,
+                        "malformed-cancellation callback admission",
+                    )
+                    .await;
                     // `requestId: null` is the same control envelope as the
                     // positive case, but fails exact legacy cancellation
                     // parameter admission and must be inert.
@@ -23829,16 +23974,18 @@ mod tests {
                     let callback_started = Arc::clone(&callback_started);
                     let malformed_sent = Arc::clone(&malformed_sent);
                     move |release_cx| async move {
-                        for _ in 0..1_024 {
-                            if callback_started.load(Ordering::Acquire)
-                                && malformed_sent.load(Ordering::Acquire)
-                            {
-                                break;
-                            }
-                            asupersync::runtime::yield_now().await;
-                        }
-                        assert!(callback_started.load(Ordering::Acquire));
-                        assert!(malformed_sent.load(Ordering::Acquire));
+                        wait_for_websocket_test_flag(
+                            &release_cx,
+                            &callback_started,
+                            "malformed-cancellation callback admission",
+                        )
+                        .await;
+                        wait_for_websocket_test_flag(
+                            &release_cx,
+                            &malformed_sent,
+                            "malformed cancellation control",
+                        )
+                        .await;
                         release_sender
                             .send(&release_cx, ())
                             .expect("release callback after malformed control");
@@ -23897,13 +24044,12 @@ mod tests {
                 let _ = server.recv(&peer_cx).await.expect("initialized");
                 let JsonRpcMessage::Request(completion) = server.recv(&peer_cx).await.expect("completion") else { panic!("expected completion"); };
                 server.send(&peer_cx, &JsonRpcMessage::Request(JsonRpcRequest::new("sampling/createMessage", Some(serde_json::json!({"messages":[],"maxTokens":3})), RequestId::Number(41)))).await.expect("callback request");
-                for _ in 0..1_024 {
-                    if peer_callback_started.load(Ordering::Acquire) {
-                        break;
-                    }
-                    asupersync::runtime::yield_now().await;
-                }
-                assert!(peer_callback_started.load(Ordering::Acquire));
+                wait_for_websocket_test_flag(
+                    &peer_cx,
+                    &peer_callback_started,
+                    "panicking callback admission",
+                )
+                .await;
                 let _ = completion;
                 assert!(
                     matches!(server.recv(&peer_cx).await, Err(TransportError::Closed)),
@@ -29046,13 +29192,9 @@ mod tests {
             .send_request("test/noncooperative-callback", serde_json::json!({}))
             .expect("the peer response remains independently readable");
         assert_eq!(response, serde_json::json!({"request": true}));
-        let start_deadline = Instant::now() + Duration::from_millis(250);
-        while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            started.load(Ordering::Acquire),
-            "callback must be running before shutdown"
+        wait_for_test_flag(
+            &started,
+            "noncooperative callback admission before shutdown",
         );
 
         let close_started = Instant::now();
@@ -29116,14 +29258,7 @@ mod tests {
             .send_request("test/cooperative-callback", serde_json::json!({}))
             .expect("the peer response remains independently readable");
         assert_eq!(response, serde_json::json!({"request": true}));
-        let start_deadline = Instant::now() + Duration::from_millis(250);
-        while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            started.load(Ordering::Acquire),
-            "callback must be running before cooperative shutdown"
-        );
+        wait_for_test_flag(&started, "cooperative callback admission before shutdown");
 
         client
             .close()
@@ -29186,11 +29321,7 @@ mod tests {
             .send_request("test/drop-owned-callback", serde_json::json!({}))
             .expect("the peer response remains independently readable");
         assert_eq!(response, serde_json::json!({"request": true}));
-        let start_deadline = Instant::now() + Duration::from_millis(250);
-        while !started.load(Ordering::Acquire) && Instant::now() < start_deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(started.load(Ordering::Acquire));
+        wait_for_test_flag(&started, "dropped-client callback admission");
 
         drop(first);
 
@@ -29205,13 +29336,9 @@ mod tests {
                 .is_empty(),
             "a fresh client has no dependency on a dropped client's callback observers"
         );
-        let cancellation_deadline = Instant::now() + Duration::from_millis(250);
-        while !cancelled.load(Ordering::Acquire) && Instant::now() < cancellation_deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            cancelled.load(Ordering::Acquire),
-            "drop must request callback cancellation while its owner region settles the task"
+        wait_for_test_flag(
+            &cancelled,
+            "dropped-client callback cancellation in its owner region",
         );
         sibling.close().expect("sibling client cleanup");
     }
@@ -29255,13 +29382,9 @@ mod tests {
             .expect("the sole reader must receive the caller response while the callback waits");
         assert_eq!(result, serde_json::json!({"readerRemainedLive": true}));
 
-        let deadline = Instant::now() + Duration::from_millis(250);
-        while !observed_cancellation.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            observed_cancellation.load(Ordering::Acquire),
-            "the live callback must observe its matching server cancellation"
+        wait_for_test_flag(
+            &observed_cancellation,
+            "matching legacy reverse-callback cancellation",
         );
 
         let follow_up: serde_json::Value = client
@@ -35448,7 +35571,11 @@ mod tests {
                 ..SubscriptionFilter::default()
             })
             .expect_err("EOF cannot replace the final complete result");
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.code,
+            McpErrorCode::InvalidRequest,
+            "EOF-before-terminal must retain its protocol classification: {error:?}"
+        );
         assert_eq!(
             error.message,
             "Subscription listener reached EOF before terminal complete result"
@@ -35508,7 +35635,7 @@ mod tests {
     #[test]
     fn cache_03_final_tools_list_replays_the_complete_result_without_a_second_request() {
         let script = modern_typed_list_client_script(
-            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":1000,"cacheScope":"private","x-retained":9007199254740993123456789}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":30000,"cacheScope":"private","x-retained":9007199254740993123456789}}"#,
         );
         let mut client = Client::stdio_with_protocol_plan_with_cx(
             "sh",
@@ -35519,7 +35646,7 @@ mod tests {
         .expect("modern discovery initializes the cache client");
         client
             .set_request_timeout_policy(
-                RequestTimeoutPolicy::new(Duration::from_millis(10), Duration::from_millis(10))
+                RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
                     .expect("short test policy is valid"),
             )
             .expect("cache test policy is accepted");

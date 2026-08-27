@@ -2641,6 +2641,13 @@ impl LegacyHttpRequest {
                 self.terminal = true;
                 Ok(JsonRpcMessage::Response(response))
             }
+            Ok(LegacyPersistentResponse::IdMismatch { actual }) => {
+                self.terminal = true;
+                Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
+                    expected: self.commit.request_id.clone(),
+                    actual: Some(actual),
+                })
+            }
             Ok(LegacyPersistentResponse::Cancelled) => {
                 self.terminal = true;
                 Err(ClientHttpConnectionError::LegacyRequestCancelled {
@@ -2674,6 +2681,7 @@ impl LegacyHttpRequest {
         let params = serde_json::to_value(fastmcp_protocol::CancelledParams {
             request_id: self.commit.request_id.clone(),
             reason,
+            meta: None,
         })
         .map_err(|_| {
             ClientHttpConnectionError::Legacy(LegacySseHttpClientError::MessageEncodingFailed)
@@ -6422,6 +6430,7 @@ struct LegacyPersistentResponseWaiter {
 
 enum LegacyPersistentResponse {
     Response(JsonRpcResponse),
+    IdMismatch { actual: RequestId },
     Cancelled,
 }
 
@@ -6804,11 +6813,17 @@ impl LegacySsePersistentReceiver {
             state: Arc::clone(&reverse_callbacks.state),
             tasks: Arc::clone(&reverse_callbacks.tasks),
         };
-        // API callers may pass a request-scoped cancellation token while the
-        // surrounding runtime has the spawn gateway. Prefer that ambient
-        // runtime context for the region-owned reader, retaining the caller's
-        // context only when it is itself spawn-capable.
-        let task_cx = Cx::current().unwrap_or_else(|| cx.clone());
+        // A runtime-wired caller owns this long-lived reader even when a sync
+        // adapter temporarily installs a different ambient runtime. This is
+        // essential for proxy construction: the gateway Cx must keep driving
+        // reverse sampling/roots after the nested `block_on` returns. Detached
+        // test/request contexts have no I/O driver, so only those fall back to
+        // the ambient runtime. `spawn` remains the fail-closed authority check.
+        let task_cx = if cx.has_io() {
+            cx.clone()
+        } else {
+            Cx::current().unwrap_or_else(|| cx.clone())
+        };
         let task = task_cx
             .spawn(move |child_cx| async move {
                 loop {
@@ -6906,7 +6921,7 @@ impl LegacySsePersistentReceiver {
                                 state.stop();
                                 break;
                             };
-                            let waiter = {
+                            let routed = {
                                 let mut state = task_state
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6918,18 +6933,31 @@ impl LegacySsePersistentReceiver {
                                     state.cancelled_response_ids.remove(position);
                                     continue;
                                 }
-                                let waiter = state.pending.remove(&key);
-                                if waiter.is_none() {
+                                if let Some(waiter) = state.pending.remove(&key) {
+                                    Some((waiter, LegacyPersistentResponse::Response(response)))
+                                } else if state.pending.len() == 1 {
+                                    let waiter = state
+                                        .pending
+                                        .drain()
+                                        .next()
+                                        .map(|(_, waiter)| waiter)
+                                        .expect("sole pending legacy waiter must exist");
                                     state.stop();
+                                    Some((
+                                        waiter,
+                                        LegacyPersistentResponse::IdMismatch {
+                                            actual: response_id,
+                                        },
+                                    ))
+                                } else {
+                                    state.stop();
+                                    None
                                 }
-                                waiter
                             };
-                            let Some(waiter) = waiter else {
+                            let Some((waiter, response)) = routed else {
                                 break;
                             };
-                            let _ = waiter
-                                .sender
-                                .send(&child_cx, LegacyPersistentResponse::Response(response));
+                            let _ = waiter.sender.send(&child_cx, response);
                         }
                     }
                 }
@@ -9127,6 +9155,16 @@ mod tests {
     }
 
     fn read_request(stream: &mut TcpStream) -> CapturedHttpRequest {
+        // Accepted sockets inherit O_NONBLOCK from nonblocking listeners on
+        // BSD-derived platforms. This helper requires a complete request, so
+        // normalize every accepted peer before reading instead of racing the
+        // client's first write and panicking on a transient WouldBlock.
+        stream
+            .set_nonblocking(false)
+            .expect("make native HTTP request stream blocking");
+        stream
+            .set_read_timeout(Some(LEGACY_TEST_PEER_BOUND))
+            .expect("bound native HTTP request read");
         let mut wire = Vec::new();
         let mut buffer = [0_u8; 4096];
         let head_end = loop {
@@ -12761,10 +12799,17 @@ mod tests {
         assert!(client.legacy_server_capabilities().is_some());
         assert!(client.server_discovery().is_none());
         assert!(!client.mcp_apps_active());
-        std::thread::sleep(Duration::from_millis(20));
-        let notification = client
-            .take_legacy_notification()
-            .expect("ready legacy client drains notifications before a client request");
+        let notification_deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+        let notification = loop {
+            if let Some(notification) = client.take_legacy_notification() {
+                break notification;
+            }
+            assert!(
+                Instant::now() < notification_deadline,
+                "ready legacy client must receive the bounded pre-request notification"
+            );
+            std::thread::sleep(LEGACY_TEST_PEER_POLL_INTERVAL);
+        };
         assert_eq!(notification.method, "notifications/progress");
         let response = runtime_block_on(client.connection_mut().request_json(
             &cx,

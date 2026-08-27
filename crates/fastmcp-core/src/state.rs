@@ -345,6 +345,23 @@ impl SessionState {
     #[doc(hidden)]
     #[must_use]
     pub fn cache_partition(&self) -> Option<([u8; CACHE_PARTITION_BYTES], u64)> {
+        if self.ephemeral || self.local.is_some() {
+            return None;
+        }
+        self.cache_admission_revision()
+    }
+
+    /// Returns a request-internal cache admission token and state revision.
+    ///
+    /// Unlike [`Self::cache_partition`], this remains available for ephemeral
+    /// modern HTTP state. Cache middleware must ignore the opaque token when
+    /// constructing a cross-request key for such state, but can use the full
+    /// value to reject a lookup or population if the request-local bag changes
+    /// during dispatch. Layered local views remain ineligible because their
+    /// identity cannot safely describe both storage layers.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn cache_admission_revision(&self) -> Option<([u8; CACHE_PARTITION_BYTES], u64)> {
         if self.local.is_some() {
             return None;
         }
@@ -358,6 +375,22 @@ impl SessionState {
             return None;
         }
         Some((self.cache_partition?, revision))
+    }
+
+    /// Returns the stable opaque identity of this state owner for retained
+    /// continuation binding.
+    ///
+    /// Unlike [`Self::cache_partition`], this remains available for
+    /// request-local state. A one-shot transport request must not use this
+    /// value as a cross-request response-cache identity, but it still needs a
+    /// unique identity so a continuation minted during that request cannot be
+    /// replayed through another request. Transport admission remains
+    /// responsible for deciding whether the identity is authorized for
+    /// continuation ownership.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_continuation_partition(&self) -> Option<[u8; CACHE_PARTITION_BYTES]> {
+        self.cache_partition
     }
 }
 
@@ -595,7 +628,14 @@ mod tests {
     fn ephemeral_session_state_stays_request_local_across_clone_and_snapshot() {
         let state = SessionState::ephemeral();
         assert!(state.is_ephemeral());
+        assert!(state.cache_partition().is_none());
+        assert!(state.cache_admission_revision().is_some());
+        assert!(state.retained_continuation_partition().is_some());
         assert!(state.clone().is_ephemeral());
+        assert_eq!(
+            state.clone().retained_continuation_partition(),
+            state.retained_continuation_partition()
+        );
         assert!(state.with_local_overrides().is_ephemeral());
         assert!(state.snapshot().is_ephemeral());
         assert!(!SessionState::new().is_ephemeral());

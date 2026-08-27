@@ -419,6 +419,7 @@ fn leg_02_a_positive() {
             RESOURCES_TEMPLATES_LIST,
             "prompts/list",
             COMPLETION_COMPLETE,
+            RESOURCES_SUBSCRIBE,
         ]
     );
 }
@@ -441,7 +442,7 @@ fn leg_02_a_planted_negative() {
             "jsonrpc": "2.0", "id": 1,
             "error": {
                 "code": -32600,
-                "message": "invalid exact MCP 2024-11-05 envelope",
+                "message": "initialize protocolVersion must be exact MCP 2024-11-05",
             },
         }))
     );

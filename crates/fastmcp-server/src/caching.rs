@@ -2351,6 +2351,38 @@ mod tests {
     }
 
     #[test]
+    fn mutated_request_local_response_does_not_poison_stateless_cache_partition() {
+        let middleware =
+            ResponseCachingMiddleware::new().include_tools(vec!["pure_tool".to_string()]);
+        let state = SessionState::ephemeral();
+        let mutating = anonymous_partitioned_context(&state, 32);
+        let request = test_request(
+            "tools/call",
+            Some(serde_json::json!({"name": "pure_tool", "arguments": {"n": 1}})),
+        );
+
+        assert!(matches!(
+            middleware.on_request(&mutating, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+        assert!(state.set("changed-during-dispatch", true));
+        middleware
+            .on_response(
+                &mutating,
+                &request,
+                serde_json::json!({"resultType": "complete", "content": []}),
+            )
+            .unwrap();
+
+        assert_eq!(middleware.stats().entries, 0);
+        let fresh = anonymous_partitioned_context(&SessionState::ephemeral(), 33);
+        assert!(matches!(
+            middleware.on_request(&fresh, &request).unwrap(),
+            MiddlewareDecision::Continue
+        ));
+    }
+
+    #[test]
     fn durable_sessions_do_not_share_request_local_cache_entries() {
         let middleware = ResponseCachingMiddleware::new();
         let ephemeral = anonymous_partitioned_context(&SessionState::ephemeral(), 40);

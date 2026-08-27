@@ -59,7 +59,7 @@ fn pxy_leg_01_a_positive() {
     assert_eq!(legacy_only.era(), ProtocolEra::Legacy2024);
     assert_eq!(legacy_only.policy(), ProtocolPolicy::LegacyOnly);
 
-    let legacy_http = bindings
+    let legacy_http_error = bindings
         .bind_http(
             "route-legacy-http",
             "http:peer-c",
@@ -79,11 +79,42 @@ fn pxy_leg_01_a_positive() {
                 body: HttpProbeBody::Empty,
             },
         )
-        .expect("Auto selects configured exact legacy HTTP transport");
-    assert_eq!(legacy_http.era(), ProtocolEra::Legacy2024);
-    assert_eq!(legacy_http.policy(), ProtocolPolicy::Auto);
-    assert!(legacy_http.uses_legacy_adapter());
-    assert!(legacy_http.uses_http_transport());
+        .expect_err("Auto fallback authorization cannot pre-bind exact legacy HTTP");
+    assert_eq!(
+        legacy_http_error.code,
+        fastmcp_core::McpErrorCode::InvalidRequest
+    );
+    assert!(
+        legacy_http_error
+            .message
+            .contains("before endpoint validation")
+    );
+
+    let auto_modern_after_refusal = bindings
+        .bind_http(
+            "route-legacy-http",
+            "http:peer-c",
+            "leg-http-01-receipt-c",
+            8,
+            ProtocolPolicy::Auto,
+            Some(url("https://modern.example.test/mcp")),
+            Some(url("https://legacy.example.test/sse")),
+            Some(url("https://legacy.example.test/messages")),
+            "partition-c".to_owned(),
+            "security-partition-c".to_owned(),
+            "http-profile-c".to_owned(),
+            3,
+            11,
+            HttpModernProbe {
+                status: 200,
+                body: HttpProbeBody::RecognizedModernJsonRpc,
+            },
+        )
+        .expect("rejected fallback leaves Auto free to bind recognized modern HTTP");
+    assert_eq!(auto_modern_after_refusal.era(), ProtocolEra::Modern2026);
+    assert_eq!(auto_modern_after_refusal.policy(), ProtocolPolicy::Auto);
+    assert!(!auto_modern_after_refusal.uses_legacy_adapter());
+    assert!(auto_modern_after_refusal.uses_http_transport());
 
     let modern_http = bindings
         .bind_http(

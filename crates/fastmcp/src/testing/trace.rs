@@ -345,7 +345,7 @@ pub struct TestTraceOutput {
     /// Summary statistics.
     pub summary: TraceSummary,
     /// Custom metadata.
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -1692,6 +1692,14 @@ mod tests {
         assert!(wire["entries"][1]["duration_ms"].is_number());
         assert!(wire["entries"][2]["value"].is_number());
         assert!(wire["summary"]["method_timings"]["tools/list"]["total_ms"].is_number());
+        assert!(
+            wire.get("metadata").is_none(),
+            "empty custom metadata retains the established compact wire shape"
+        );
+
+        let legacy_decoded: TestTraceOutput = serde_json::from_value(wire)
+            .expect("older trace output without metadata remains readable");
+        assert!(legacy_decoded.metadata.is_empty());
 
         let decoded: TestTraceOutput =
             serde_json::from_str(&json).expect("deserialize trace floats");

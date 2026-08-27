@@ -3248,6 +3248,7 @@ fn cancellation_control_message_for_era(
             params: CancelledParams {
                 request_id: request_id.clone(),
                 reason: None,
+                meta: None,
             },
         },
         ResultPeerEra::Modern => CancellationWireMessage::Modern2026 {

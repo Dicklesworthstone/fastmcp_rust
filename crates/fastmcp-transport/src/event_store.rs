@@ -1892,7 +1892,7 @@ mod tests {
     fn cleanup_expired_removes_empty_streams() {
         let config = EventStoreConfig {
             max_events_per_stream: 100,
-            ttl: Some(Duration::from_millis(10)),
+            ttl: Some(Duration::from_secs(1)),
             ..EventStoreConfig::default()
         };
         let store = EventStore::with_config(config).unwrap();
@@ -1905,7 +1905,24 @@ mod tests {
             .unwrap();
         assert_eq!(store.stream_count(), 2);
 
-        std::thread::sleep(Duration::from_millis(20));
+        // Age both retained entries explicitly. A short real-time sleep made
+        // the first event eligible for opportunistic cleanup while the test
+        // thread was descheduled between the two insertions, so the positive
+        // setup itself was nondeterministic under a parallel workspace run.
+        let expired_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("the monotonic clock can represent a two-second-old event");
+        {
+            let mut streams = store
+                .streams
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for stream in streams.values_mut() {
+                for event in &mut stream.events {
+                    event.entry.created_at = expired_at;
+                }
+            }
+        }
         store.cleanup_expired();
 
         // Streams whose events all expired should be removed entirely

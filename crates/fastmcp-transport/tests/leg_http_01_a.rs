@@ -2,7 +2,7 @@
 
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc::sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,7 +14,10 @@ use fastmcp_transport::{
     sse::{LegacySseClientTransport, LegacySseServerTransport, SseEvent},
 };
 
-const LOOPBACK_PEER_BOUND: Duration = Duration::from_secs(2);
+// Compile-probe test binaries can briefly saturate a loaded release host. Keep
+// the fixture bounded while leaving enough room for the connected client test
+// thread to be rescheduled before its first header write.
+const LOOPBACK_PEER_BOUND: Duration = Duration::from_secs(10);
 
 struct ServerThread(Option<thread::JoinHandle<()>>);
 
@@ -364,10 +367,13 @@ fn leg_http_01_a_rejects_malformed_redirect_eof_and_oversized_post_heads() {
     ));
 
     let eof = rejected_legacy_post(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n".to_vec());
-    assert!(matches!(
-        eof,
-        TransportError::Io(ref error) if error.kind() == std::io::ErrorKind::UnexpectedEof
-    ));
+    assert!(
+        matches!(
+            &eof,
+            TransportError::Io(error) if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ),
+        "incomplete response head must fail as EOF, got {eof:?}"
+    );
 
     let mut oversized = b"HTTP/1.1 202 Accepted\r\nX-Fill: ".to_vec();
     oversized.extend(vec![b'x'; 16 * 1024]);
@@ -446,35 +452,38 @@ fn leg_http_01_a_post_wait_observes_caller_deadline_and_latches_closed() {
             .local_addr()
             .expect("the listener exposes its loopback address")
     );
+    let (release_sender, release_receiver) = sync_channel(1);
     let server = ServerThread::spawn(move || {
-        let mut post_socket = accept_loopback(&listener);
+        let post_socket = accept_loopback(&listener);
         let _post = read_http_request(
             post_socket
                 .try_clone()
                 .expect("the advertised POST socket clones"),
         );
-        post_socket
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("the withheld-response peer read is bounded");
-        let mut eof = [0_u8; 1];
-        assert_eq!(
-            post_socket
-                .read(&mut eof)
-                .expect("deadline completion closes the withheld-response POST"),
-            0
-        );
+        // The client deliberately half-closes its write side after the POST,
+        // so reading here would observe EOF immediately and accidentally
+        // close the response side before the caller deadline. Retain the
+        // socket until the caller reports that its bounded send has settled.
+        release_receiver
+            .recv_timeout(LOOPBACK_PEER_BOUND)
+            .expect("the deadline-bounded client releases the withheld-response peer");
+        drop(post_socket);
     });
     let established_cx = Cx::for_testing();
     let mut client = established_legacy_post_client(endpoint, &established_cx);
     let deadline_cx = Cx::for_testing_with_budget(
-        Budget::new().with_deadline(Cx::for_testing().now() + Duration::from_millis(50)),
+        Budget::new().with_deadline(Cx::for_testing().now() + Duration::from_millis(250)),
     );
 
-    assert!(matches!(
-        client.send(&deadline_cx, &legacy_post_request()),
-        Err(TransportError::Timeout)
-    ));
+    let deadline_result = client.send(&deadline_cx, &legacy_post_request());
+    release_sender
+        .send(())
+        .expect("the withheld-response peer remains available through deadline settlement");
     server.join();
+    assert!(
+        matches!(deadline_result, Err(TransportError::Timeout)),
+        "withheld legacy POST response must exhaust the caller deadline, got {deadline_result:?}"
+    );
     assert!(matches!(
         client.send(&established_cx, &legacy_post_request()),
         Err(TransportError::Closed)

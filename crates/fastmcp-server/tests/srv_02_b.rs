@@ -8,10 +8,8 @@ use fastmcp_core::{McpContext, McpResult};
 use fastmcp_derive::tool;
 #[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::JsonRpcMessage;
-#[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
-#[cfg(not(feature = "legacy-2024-11-05"))]
 use fastmcp_protocol::{
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, SERVER_DISCOVER_METHOD,
 };
@@ -118,7 +116,16 @@ fn srv_02_b_positive() {
         .tool(Discoverable)
         .build();
     let stdio = InboundRequestContext::new(Cx::for_testing(), 401, InboundRequestTransport::Stdio);
-    let discover = JsonRpcRequest::new("server/discover", None, 401_i64);
+    let discover = JsonRpcRequest::new(
+        SERVER_DISCOVER_METHOD,
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        401_i64,
+    );
 
     let first_response = server
         .dispatch_with_protocol_policy(ProtocolPolicy::ModernOnly, &stdio, &discover)
@@ -128,13 +135,17 @@ fn srv_02_b_positive() {
         .as_ref()
         .expect("first discovery request succeeds");
 
-    assert_eq!(first_result["protocolVersions"], json!(["2026-07-28"]));
     assert_eq!(
-        first_result["serverInfo"]["name"],
+        first_result["supportedVersions"],
+        json!([MODERN_PROTOCOL_VERSION])
+    );
+    assert_eq!(
+        first_result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         json!("discoverable-server")
     );
     assert_eq!(first_result["instructions"], json!(""));
-    assert_eq!(first_result["cacheHints"]["maxAgeSeconds"], json!(60));
+    assert_eq!(first_result["ttlMs"], json!(60_000));
+    assert_eq!(first_result["cacheScope"], json!("private"));
     assert!(first_result["capabilities"].get("tools").is_some());
     assert!(first_result["capabilities"].get("logging").is_none());
     assert!(first_result["capabilities"].get("completions").is_none());
@@ -167,7 +178,16 @@ fn srv_02_b_positive() {
     );
 
     let auto = InboundRequestContext::new(Cx::for_testing(), 402, InboundRequestTransport::Http);
-    let auto_discover = JsonRpcRequest::new("server/discover", None, 402_i64);
+    let auto_discover = JsonRpcRequest::new(
+        SERVER_DISCOVER_METHOD,
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        402_i64,
+    );
     let auto_response = server
         .dispatch_with_protocol_policy(ProtocolPolicy::Auto, &auto, &auto_discover)
         .expect("Auto-composed discovery request has an id");
@@ -175,8 +195,8 @@ fn srv_02_b_positive() {
         auto_response
             .result
             .as_ref()
-            .and_then(|result| result.get("protocolVersions")),
-        Some(&json!(["2026-07-28"]))
+            .and_then(|result| result.get("supportedVersions")),
+        Some(&json!([MODERN_PROTOCOL_VERSION]))
     );
 
     let initialize = JsonRpcRequest::new("initialize", None, 403_i64);
@@ -215,7 +235,16 @@ fn srv_02_b_planted_negative() {
     let server = Server::new("discover-negative", "1.0.0").build();
     let inbound =
         InboundRequestContext::new(Cx::for_testing(), 404, InboundRequestTransport::Memory);
-    let baseline = JsonRpcRequest::new("server/discover", None, 404_i64);
+    let baseline = JsonRpcRequest::new(
+        SERVER_DISCOVER_METHOD,
+        Some(json!({
+            "_meta": {
+                FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            },
+        })),
+        404_i64,
+    );
     let mut planted = baseline.clone();
     planted.method = "initialize".to_owned();
 
@@ -235,16 +264,10 @@ fn srv_02_b_planted_negative() {
         .expect("planted initialize request responds");
     let planted_error = planted_response
         .error
-        .expect("ModernOnly initialize reaches the typed refusal boundary");
+        .expect("modern-marked initialize reaches the final method refusal boundary");
     assert_eq!(planted_error.code.as_i32(), Some(-32601));
-    assert_eq!(
-        planted_error.message,
-        "Initialization-based MCP is not enabled"
-    );
-    assert_eq!(
-        planted_error.data,
-        Some(json!({"supported": ["2026-07-28"]}))
-    );
+    assert_eq!(planted_error.message, "Method not found");
+    assert_eq!(planted_error.data, None);
     assert_eq!(
         serde_json::to_vec(&planted).expect("planted request remains serializable"),
         input_before,
@@ -308,7 +331,7 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
         modern_response
             .result
             .as_ref()
-            .and_then(|result| result["protocolVersions"].as_array())
+            .and_then(|result| result["supportedVersions"].as_array())
             .and_then(|versions| versions.first())
             .and_then(serde_json::Value::as_str),
         Some(MODERN_PROTOCOL_VERSION),
@@ -347,7 +370,7 @@ fn srv_02_b_feature_off_http_modern_positive_and_legacy_route_refusal() {
         modern_stdio_response
             .result
             .as_ref()
-            .and_then(|result| result["protocolVersions"].as_array())
+            .and_then(|result| result["supportedVersions"].as_array())
             .and_then(|versions| versions.first())
             .and_then(serde_json::Value::as_str),
         Some(MODERN_PROTOCOL_VERSION),

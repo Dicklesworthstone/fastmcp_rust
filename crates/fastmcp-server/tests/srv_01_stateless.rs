@@ -113,6 +113,7 @@ fn srv_01_a_positive() {
         Some(serde_json::json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
             },
         })),
         71_i64,
@@ -137,7 +138,7 @@ fn srv_01_a_positive() {
         response
             .result
             .as_ref()
-            .and_then(|result| result.get("protocolVersions")),
+            .and_then(|result| result.get("supportedVersions")),
         Some(&serde_json::json!(["2026-07-28"]))
     );
     assert_eq!(response.id, request.id);
@@ -183,6 +184,7 @@ fn srv_01_a_planted_negative() {
         Some(serde_json::json!({
             "_meta": {
                 "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
             },
         })),
         72_i64,
@@ -240,6 +242,10 @@ fn srv_01_b_positive() {
         Some(serde_json::json!({
             "name": "declined",
             "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
         })),
         73_i64,
     );
@@ -280,6 +286,10 @@ fn srv_01_b_planted_negative() {
         Some(serde_json::json!({
             "name": "declined",
             "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
         })),
         74_i64,
     );
@@ -347,7 +357,7 @@ fn srv_01_b_planted_negative() {
             .error
             .as_ref()
             .map(|error| error.code.clone()),
-        Some(McpErrorCode::MethodNotFound.into())
+        Some(McpErrorCode::InvalidParams.into())
     );
     assert_eq!(
         serde_json::to_vec(&planted).expect("planted request remains serializable"),

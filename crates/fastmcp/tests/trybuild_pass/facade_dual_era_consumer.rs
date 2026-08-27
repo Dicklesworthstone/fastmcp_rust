@@ -9,7 +9,14 @@ use fastmcp_rust::{
 
 #[tool]
 fn downstream_final_task_tool() -> fastmcp_rust::FinalToolOutcome {
-    unreachable!("the downstream macro probe compiles a final tool outcome without Tasks opt-in")
+    fastmcp_rust::FinalToolOutcome::Complete(fastmcp_rust::CompleteResult::new(
+        fastmcp_rust::FinalCallToolResult {
+            content: Vec::new(),
+            is_error: false,
+            structured_content: None,
+        },
+        fastmcp_rust::ResultMeta::empty(),
+    ))
 }
 
 #[resource(uri = "facade://mrtr-resumable-resource")]
@@ -94,6 +101,15 @@ impl modern::ResourceHandler for DownstreamMrtrResourceHandler {
         }
     }
 
+    fn read(
+        &self,
+        _ctx: &modern::McpContext,
+    ) -> modern::McpResult<Vec<fastmcp_rust::ResourceContent>> {
+        Err(modern::McpError::internal_error(
+            "compile-only downstream MRTR resource handler",
+        ))
+    }
+
     fn read_final_outcome_async_with_uri_resuming_in_request<'a>(
         &'a self,
         _ctx: &'a modern::McpContext,
@@ -128,6 +144,16 @@ impl modern::PromptHandler for DownstreamMrtrPromptHandler {
             version: None,
             tags: Vec::new(),
         }
+    }
+
+    fn get(
+        &self,
+        _ctx: &modern::McpContext,
+        _arguments: std::collections::HashMap<String, String>,
+    ) -> modern::McpResult<Vec<fastmcp_rust::PromptMessage>> {
+        Err(modern::McpError::internal_error(
+            "compile-only downstream MRTR prompt handler",
+        ))
     }
 
     fn get_final_outcome_async_resuming_in_request<'a>(
@@ -353,7 +379,8 @@ where
         P,
     ) -> Result<modern::McpAppsHost<T, P>, modern::McpAppsHostError> =
         modern::HttpClient::mcp_apps_host::<T, P>;
-    let _ = <FacadeAppsUiMacroTool as ToolHandler>::final_metadata(&FacadeAppsUiMacroTool);
+    let _ =
+        <FacadeAppsUiMacroTool as modern::ToolHandler>::final_metadata(&FacadeAppsUiMacroTool);
 }
 
 fn assert_final_resource_read_cache_hint_provenance() {
@@ -363,15 +390,29 @@ fn assert_final_resource_read_cache_hint_provenance() {
         modern::FinalResourceReadCacheHintProvenance::Explicit;
 }
 
-fn legacy_sampling_callback(
+fn legacy_sampling_callback<'cx>(
+    _cx: &'cx fastmcp_rust::Cx,
     _cancellation: legacy_2024::ReverseRequestCancellation,
     _params: legacy_2024::CreateMessageParams,
-) -> fastmcp_rust::McpResult<legacy_2024::CreateMessageResult> {
-    unreachable!("compile-only legacy callback signature")
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = fastmcp_rust::McpResult<legacy_2024::CreateMessageResult>,
+            > + Send
+            + 'cx,
+    >,
+> {
+    Box::pin(async {
+        Ok(legacy_2024::CreateMessageResult::text(
+            "compile-only response",
+            "fixture-model",
+        ))
+    })
 }
 
 fn assert_legacy_reverse_callback_cancellation_export() {
-    let _: legacy_2024::LegacySamplingRequestHandler = Box::new(legacy_sampling_callback);
+    let _: legacy_2024::LegacySamplingRequestHandler =
+        std::sync::Arc::new(legacy_sampling_callback);
     let _: Option<fastmcp_rust::ReverseRequestCancellation> = None;
     let _: legacy_2024::ProgressMarker =
         legacy_2024::ProgressMarker::Number(legacy_2024::JsonInteger::from(7_i64));
@@ -463,13 +504,9 @@ fn assert_raw_http_session_metadata_exports() {
         "ping",
         None,
     )
-    .expect("root modern request constructor is available")
-    .with_mcp_session_id("session-1")
-    .expect("root modern request session builder is available");
+    .expect("root modern request constructor is available");
     assert_eq!(request.target(), "https://example.test/mcp");
     let _: Option<fastmcp_rust::ModernHttpResponseKind> = None;
-    let _: for<'a> fn(&'a fastmcp_rust::ModernHttpResponseMetadata) -> Option<&'a str> =
-        fastmcp_rust::ModernHttpResponseMetadata::mcp_session_id;
     let _: for<'a> fn(
         &'a fastmcp_rust::ModernHttpResponseStream,
     ) -> &'a fastmcp_rust::ModernHttpResponseMetadata =
@@ -533,8 +570,6 @@ mod prelude_stdio_and_http_metadata_reachability {
     pub(super) fn assert_reachable() {
         let _: Option<FinalToolSchemaAuthority> = None;
         let _: Option<ModernHttpResponseKind> = None;
-        let _: for<'a> fn(&'a ModernHttpResponseMetadata) -> Option<&'a str> =
-            ModernHttpResponseMetadata::mcp_session_id;
         let _: for<'a> fn(&'a ModernHttpResponseStream) -> &'a ModernHttpResponseMetadata =
             ModernHttpResponseStream::metadata;
         let _ = final_tool_schema_authority::<super::DownstreamFinalTaskTool>;
@@ -776,9 +811,6 @@ fn assert_client_http_and_subscription_exports() {
     let _ = modern::HttpClient::read_resource_result_with_cancellation;
     let _ = modern::HttpClient::get_prompt_with_cancellation;
     let _ = modern::HttpClient::get_prompt_result_with_cancellation;
-    let _ = modern::HttpClient::call_tool_with_mrtr_retry;
-    let _ = modern::HttpClient::read_resource_with_mrtr_retry;
-    let _ = modern::HttpClient::get_prompt_with_mrtr_retry;
     let _ = modern::HttpClient::open_subscriptions_listener;
     let _ = modern::HttpClient::listen_subscriptions;
     let _ = modern::HttpClient::get_task;
@@ -922,7 +954,6 @@ fn assert_client_roots_facade_exports() {
 
 fn assert_modern_companion_facade_exports() {
     let _: modern::FinalArguments<String> = modern::FinalArguments::Absent;
-    let _: modern::FinalArguments<String> = modern::FinalArguments::ExplicitNull;
     let _: modern::FinalArguments<String> = modern::FinalArguments::Value("modern".to_owned());
 
     let _: fn(usize) -> modern::McpResult<modern::InMemoryFinalTaskStore> =
@@ -975,7 +1006,6 @@ fn assert_modern_companion_facade_exports() {
 
     let _: Option<fastmcp_rust::FinalCacheStats> = None;
     let _: fastmcp_rust::FinalArguments<String> = fastmcp_rust::FinalArguments::Absent;
-    let _: fastmcp_rust::FinalArguments<String> = fastmcp_rust::FinalArguments::ExplicitNull;
     let _: fastmcp_rust::FinalArguments<String> =
         fastmcp_rust::FinalArguments::Value("root".to_owned());
     let _: Option<fastmcp_rust::FinalTaskAcceptedInput> = None;
@@ -1010,7 +1040,6 @@ mod prelude_companion_facade_reachability {
 
     pub(super) fn assert_reachable() {
         let _: FinalArguments<String> = FinalArguments::Absent;
-        let _: FinalArguments<String> = FinalArguments::ExplicitNull;
         let _: FinalArguments<String> = FinalArguments::Value("prelude".to_owned());
 
         let _: fn(&[u8], usize) -> Result<JsonRpcMessage, JsonRpcAdmissionError> =
@@ -1166,8 +1195,12 @@ fn assert_root_directional_notification_exports() {
             progress_token: fastmcp_rust::ProgressMarker::Number(fastmcp_rust::JsonInteger::from(
                 41_i64,
             )),
-            progress: 1.0,
-            total: Some(1.0),
+            progress: fastmcp_rust::ExactNonNegativeJsonNumber::parse("1.0")
+                .expect("root exact progress value is valid"),
+            total: Some(
+                fastmcp_rust::ExactNonNegativeJsonNumber::parse("1.0")
+                    .expect("root exact progress total is valid"),
+            ),
             message: Some("complete".to_owned()),
             meta: None,
             additional: BTreeMap::new(),
@@ -1194,8 +1227,12 @@ fn assert_modern_directional_notification_exports() {
 
     let server = modern::ServerNotification::Progress(modern::FinalProgressNotificationParams {
         progress_token: modern::ProgressMarker::Number(modern::JsonInteger::from(42_i64)),
-        progress: 1.0,
-        total: Some(1.0),
+        progress: modern::ExactNonNegativeJsonNumber::parse("1.0")
+            .expect("modern exact progress value is valid"),
+        total: Some(
+            modern::ExactNonNegativeJsonNumber::parse("1.0")
+                .expect("modern exact progress total is valid"),
+        ),
         message: Some("complete".to_owned()),
         meta: None,
         additional: BTreeMap::new(),
@@ -1394,8 +1431,12 @@ mod prelude_directional_notification_reachability {
 
         let server = ServerNotification::Progress(FinalProgressNotificationParams {
             progress_token: ProgressMarker::Number(JsonInteger::from(43_i64)),
-            progress: 1.0,
-            total: Some(1.0),
+            progress: ExactNonNegativeJsonNumber::parse("1.0")
+                .expect("prelude exact progress value is valid"),
+            total: Some(
+                ExactNonNegativeJsonNumber::parse("1.0")
+                    .expect("prelude exact progress total is valid"),
+            ),
             message: Some("complete".to_owned()),
             meta: None,
             additional: BTreeMap::new(),

@@ -8159,11 +8159,19 @@ mod tests {
         ));
         runtime
             .cancel_task(&task_id)
-            .expect("created task accepts cancellation intent");
-        assert!(
+            .expect("created unelected task accepts terminal cancellation");
+        assert!(matches!(
             runtime
+                .get_task(&task_id)
+                .expect("terminally cancelled task remains readable")
+                .task,
+            FinalTask::Cancelled(_)
+        ));
+        assert!(
+            !runtime
                 .is_cancellation_requested(&task_id)
-                .expect("cancellation intent remains readable")
+                .expect("terminal task has no outstanding cooperative intent"),
+            "an unelected task is cancelled atomically instead of leaving worker intent"
         );
     }
 
@@ -8715,33 +8723,25 @@ mod tests {
         const ONE_OVER_U64: &str = "18446744073709551616";
         let (store, _) = in_memory_store_with_test_clock(2);
 
-        for (task_id, ttl_ms, poll_interval_ms, field) in [
-            (
-                "task-unrepresentable-ttl",
-                Some(ONE_OVER_U64),
-                None,
-                "ttlMs",
-            ),
-            (
-                "task-unrepresentable-poll",
-                None,
-                Some(ONE_OVER_U64),
-                "pollIntervalMs",
-            ),
+        for (task_id, field) in [
+            ("task-unrepresentable-ttl", "ttlMs"),
+            ("task-unrepresentable-poll", "pollIntervalMs"),
         ] {
-            let task = final_working_task_with_wire_durations(task_id, ttl_ms, poll_interval_ms);
+            let task = final_working_task_without_ttl(task_id);
             let task_id = task.base().task_id.clone();
-            let error = store
-                .create_task(task.clone(), final_task_notification(&task))
-                .expect_err("unbounded wire duration cannot enter the bounded in-memory runtime");
+            let mut wire = serde_json::to_value(task).expect("serialize valid task baseline");
+            wire[field] = serde_json::from_str(ONE_OVER_U64)
+                .expect("retain the oversized mathematical JSON integer");
+            let error = serde_json::from_value::<FinalTask>(wire)
+                .expect_err("unrepresentable duration must fail typed admission");
 
-            assert!(error.message.contains(field));
+            assert_eq!(error.classify(), serde_json::error::Category::Data);
             assert!(
                 store
                     .get_task(&task_id)
                     .expect("rejected task lookup remains readable")
                     .is_none(),
-                "the rejected {field} duration leaves no retained task"
+                "the rejected {field} duration cannot reach retained task state"
             );
             assert!(store.latest_notification(&task_id).is_none());
             assert_eq!(store.task_count(), 0);
@@ -9344,17 +9344,19 @@ mod tests {
             serde_json::to_value(cancel).expect("encode empty cancel acknowledgement")["resultType"],
             "complete"
         );
-        assert!(
-            runtime
-                .is_cancellation_requested(&task_id)
-                .expect("read durable cancellation intent")
-        );
         assert!(matches!(
             runtime
-                .honor_cancellation(&task_id, Some("cancelled".to_owned()))
-                .expect("caller-owned worker honors cancellation"),
+                .get_task(&task_id)
+                .expect("read durable terminal cancellation")
+                .task,
             FinalTask::Cancelled(_)
         ));
+        assert!(
+            !runtime
+                .is_cancellation_requested(&task_id)
+                .expect("terminal task has no outstanding cooperative intent"),
+            "only an elected handoff retains cooperative cancellation intent"
+        );
         assert!(
             store.latest_notification(&task_id).is_some(),
             "the bounded store retains the terminal typed notification"
@@ -9619,10 +9621,17 @@ mod tests {
             dispatch_final_tasks_cancel(&runtime, final_task_method_parameters(&task_id))
                 .expect("official final tasks/cancel parameters are admitted");
         assert_eq!(response["resultType"], "complete");
-        assert!(
+        assert!(matches!(
             runtime
+                .get_task(&task_id)
+                .expect("official final cancellation persists terminal state")
+                .task,
+            FinalTask::Cancelled(_)
+        ));
+        assert!(
+            !runtime
                 .is_cancellation_requested(&task_id)
-                .expect("official final cancellation persists cooperative intent")
+                .expect("terminal task has no outstanding cooperative intent")
         );
     }
 

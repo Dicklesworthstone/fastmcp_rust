@@ -3,12 +3,13 @@
 use std::collections::HashMap;
 
 use asupersync::Cx;
-use fastmcp_core::{McpContext, McpErrorCode, McpResult};
+use fastmcp_core::{McpContext, McpError, McpErrorCode, McpResult};
 use fastmcp_protocol::protocol_policy::{
     ProtocolEra, ProtocolPolicy, ProtocolVersion, StdioOpeningFrame,
 };
 use fastmcp_protocol::{
-    Content, Prompt, PromptMessage, Resource, ResourceContent, ResourceTemplate, Tool,
+    Content, CoreRequest, CoreResult, Prompt, PromptMessage, Resource, ResourceContent,
+    ResourceTemplate, Tool,
 };
 use fastmcp_server::{ProxyBackend, ProxyClient};
 use serde_json::json;
@@ -16,6 +17,7 @@ use serde_json::json;
 #[derive(Clone)]
 struct ResultBackend {
     content: Vec<Content>,
+    era: ProtocolEra,
 }
 
 impl ProxyBackend for ResultBackend {
@@ -33,6 +35,41 @@ impl ProxyBackend for ResultBackend {
     }
     fn call_tool(&mut self, _: &str, _: serde_json::Value) -> McpResult<Vec<Content>> {
         Ok(self.content.clone())
+    }
+    fn call_tool_result(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let params = match self.era {
+            ProtocolEra::Legacy2024 => json!({"name": name, "arguments": arguments}),
+            ProtocolEra::Modern2026 => json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "name": name,
+                "arguments": arguments
+            }),
+        };
+        let request = CoreRequest::decode(
+            self.era,
+            fastmcp_protocol::methods::TOOLS_CALL,
+            Some(&params),
+        )
+        .map_err(|error| McpError::invalid_request(error.to_string()))?;
+        let result = match self.era {
+            ProtocolEra::Legacy2024 => json!({"content": self.content}),
+            ProtocolEra::Modern2026 => {
+                json!({"resultType": "complete", "content": self.content})
+            }
+        };
+        request
+            .decode_result(
+                &serde_json::to_string(&result)
+                    .map_err(|error| McpError::internal_error(error.to_string()))?,
+            )
+            .map_err(|error| McpError::invalid_request(error.to_string()))
     }
     fn call_tool_with_progress(
         &mut self,
@@ -173,6 +210,7 @@ fn pxy_leg_01_i_positive() {
     let legacy_client = ProxyClient::from_backend_with_upstream_binding(
         ResultBackend {
             content: legacy_content.clone(),
+            era: ProtocolEra::Legacy2024,
         },
         legacy,
         "2024-11-05",
@@ -181,6 +219,7 @@ fn pxy_leg_01_i_positive() {
     let modern_client = ProxyClient::from_backend_with_upstream_binding(
         ResultBackend {
             content: modern_content.clone(),
+            era: ProtocolEra::Modern2026,
         },
         modern,
         "2026-07-28",
@@ -190,22 +229,33 @@ fn pxy_leg_01_i_positive() {
 
     assert_eq!(legacy_client.upstream_binding(), Some(legacy));
     assert_eq!(modern_client.upstream_binding(), Some(modern));
+    let legacy_result = legacy_client
+        .call_tool_typed(&context, "echo", json!({}))
+        .expect("lossless legacy result crosses ordinary typed proxy execution");
+    assert_eq!(legacy_result.era(), ProtocolEra::Legacy2024);
+    let legacy_wire: serde_json::Value = serde_json::from_str(
+        &legacy_result
+            .encode()
+            .expect("legacy typed result re-encodes"),
+    )
+    .expect("legacy result wire");
     assert_eq!(
-        serde_json::to_value(
-            legacy_client
-                .call_tool(&context, "echo", json!({}))
-                .expect("lossless legacy result crosses ordinary ProxyClient execution"),
-        )
-        .expect("legacy result wire"),
+        legacy_wire["content"],
         serde_json::to_value(legacy_content).expect("legacy baseline wire"),
     );
+
+    let modern_result = modern_client
+        .call_tool_typed(&context, "echo", json!({}))
+        .expect("modern sibling remains independent");
+    assert_eq!(modern_result.era(), ProtocolEra::Modern2026);
+    let modern_wire: serde_json::Value = serde_json::from_str(
+        &modern_result
+            .encode()
+            .expect("modern typed result re-encodes"),
+    )
+    .expect("modern result wire");
     assert_eq!(
-        serde_json::to_value(
-            modern_client
-                .call_tool(&context, "echo", json!({}))
-                .expect("modern sibling remains independent"),
-        )
-        .expect("modern result wire"),
+        modern_wire["content"],
         serde_json::to_value(modern_content).expect("modern baseline wire"),
     );
 }
@@ -231,6 +281,7 @@ fn pxy_leg_01_i_planted_negative() {
     let error = match ProxyClient::from_backend_with_upstream_binding(
         ResultBackend {
             content: baseline.clone(),
+            era: ProtocolEra::Modern2026,
         },
         modern,
         "2025-11-25",
@@ -244,18 +295,24 @@ fn pxy_leg_01_i_planted_negative() {
     let client = ProxyClient::from_backend_with_upstream_binding(
         ResultBackend {
             content: baseline.clone(),
+            era: ProtocolEra::Modern2026,
         },
         modern,
         "2026-07-28",
     )
     .expect("rejection leaves the exact modern route usable");
+    let result = client
+        .call_tool_typed(&McpContext::new(Cx::for_testing(), 911), "echo", json!({}))
+        .expect("ordinary typed execution after rejected planted era");
+    assert_eq!(result.era(), ProtocolEra::Modern2026);
+    let result_wire: serde_json::Value = serde_json::from_str(
+        &result
+            .encode()
+            .expect("post-rejection typed result re-encodes"),
+    )
+    .expect("post-rejection result wire");
     assert_eq!(
-        serde_json::to_value(
-            client
-                .call_tool(&McpContext::new(Cx::for_testing(), 911), "echo", json!({}))
-                .expect("ordinary execution after rejected planted era"),
-        )
-        .expect("post-rejection result wire"),
+        result_wire["content"],
         serde_json::to_value(baseline).expect("post-rejection baseline wire"),
     );
 }

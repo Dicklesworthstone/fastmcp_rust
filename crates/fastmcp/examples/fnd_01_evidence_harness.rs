@@ -23,6 +23,10 @@
 #[path = "../tests/fnd_01_dependency_evidence.rs"]
 mod evidence;
 
+// `cargo test --all-targets` also compiles examples as test harnesses. The
+// included verifier deliberately keeps its executable entry point out of
+// `cfg(test)`, so only bind that entry point for the actual example binary.
+#[cfg(not(test))]
 fn main() {
     std::process::exit(evidence::harness_main(std::env::args_os()));
 }

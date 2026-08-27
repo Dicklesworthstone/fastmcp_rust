@@ -14,7 +14,7 @@ const FROZEN_POLICY_SHA256: &str =
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 fn fresh_test_root(namespace: &str) -> std::path::PathBuf {
     static NEXT_ROOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     for _ in 0..1_024 {
@@ -2834,7 +2834,8 @@ mod trust_std {
         }
     }
 
-    fn linux_identity(metadata: &Metadata, _subject: &str) -> TrustResult<LinuxFileIdentity> {
+    fn linux_identity(metadata: &Metadata, subject: &str) -> TrustResult<LinuxFileIdentity> {
+        let _ = subject;
         require_qualified_platform()?;
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -2854,7 +2855,7 @@ mod trust_std {
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         {
             let _ = metadata;
-            Err(TrustError::new("E_UNQUALIFIED_PLATFORM", _subject))
+            Err(TrustError::new("E_UNQUALIFIED_PLATFORM", subject))
         }
     }
 
@@ -34169,6 +34170,16 @@ mod bootstrap {
 // This module intentionally contains frozen byte-level fixture records and
 // source-order guards.  Keep its existing layout stable; R4 edits below are
 // formatted manually rather than applying a whole-file formatter.
+#[cfg_attr(
+    not(all(target_os = "linux", target_arch = "x86_64")),
+    allow(
+        dead_code,
+        unreachable_code,
+        unused_mut,
+        unused_variables,
+        clippy::diverging_sub_expression
+    )
+)]
 #[rustfmt::skip]
 mod ordinary {
 
@@ -34318,7 +34329,7 @@ mod ordinary {
         (ACTION_GITHUB_RELEASE, 0, 1),
     ];
     const WORKFLOW_ACTION_IDENTITY_COUNT: usize = 38;
-    const PACKAGE_VERSION: &str = "0.7.0";
+    const PACKAGE_VERSION: &str = "0.8.0";
     const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const SPARSE_PARSER_VERSION: &str = concat!(
         "cargo-1.99.0-nightly-",
@@ -77826,8 +77837,8 @@ activate = 1\n";
     }
 
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
-        ("Cargo.toml", 6_778, "d06fd2b7314aa708fe257bb30b256924a6d2563c125f7dc2ae8cd081ccab6696"),
-        ("Cargo.lock", 99_029, "136aa4cc90d154ed1724a58568b7ae241e290ad137dc1266f200e291e510fa62"),
+        ("Cargo.toml", 7_041, "e9b30339bb04a77abb1bbc2f3eed680910e9263fb633223a783dd3a7560eac06"),
+        ("Cargo.lock", 97_891, "6acbb50d0d1db03bf7d839c1379ba4f10393269e00d62ac84250ac1e362151f0"),
         ("rust-toolchain.toml", 239, "3dfb847b66ecd2cae1194e79c1c60d58e03991f926b6ef89590598216e2d34e3"),
     ];
     const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
@@ -93090,6 +93101,20 @@ fn fallible(value: Option<u8>) {
         let (policy, _) = read_policy(&source_root).map_err(|error| error.stable())?;
         let sources = load_sources(&source_root, &policy).map_err(|error| error.stable())?;
         for source in &sources { ordinary_fixture_write_new(&root, &source.contract.path, &source.bytes)?; }
+        // This oversized upstream HTML snapshot is intentionally excluded from
+        // the ordinary source tree, but the Tasks/Apps supplemental validator
+        // still consumes it as a bounded refusal subject. A faithful attester
+        // fixture therefore has to carry the real excluded input as well.
+        let blocked_source = fs::read(source_root.join(TA_BLOCKED_PATH))
+            .map_err(|error| pending!("read supplemental {TA_BLOCKED_PATH}: {error}"))?;
+        let blocked_length = u64::try_from(blocked_source.len())
+            .map_err(|_| pending!("supplemental {TA_BLOCKED_PATH} length overflow"))?;
+        if blocked_source.is_empty() || blocked_length > TA_BLOCKED_LIMIT {
+            return Err(pending!(
+                "supplemental {TA_BLOCKED_PATH} length {blocked_length} outside 1..={TA_BLOCKED_LIMIT}",
+            ));
+        }
+        ordinary_fixture_write_new(&root, TA_BLOCKED_PATH, &blocked_source)?;
         for path in ["Cargo.toml", "rust-toolchain.toml"] {
             let bytes = fs::read(source_root.join(path)).map_err(|error| error.to_string())?;
             ordinary_fixture_write_new(&root, path, &bytes)?;
@@ -93440,8 +93465,20 @@ fn fallible(value: Option<u8>) {
         test_id: &str,
         plant: OrdinaryPlant,
     ) {
+        const JUNIT_PRELUDE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+
         let output = Command::new(&subject.fixture_driver)
-            .args(["--exact", test_id, "--nocapture"])
+            // The pinned libtest JUnit formatter emits this fixed prelude but
+            // deliberately emits no long-running-test progress record. That
+            // keeps slow-host diagnostics out of the byte-exact proof stream.
+            .args([
+                "--exact",
+                test_id,
+                "--nocapture",
+                "-Z",
+                "unstable-options",
+                "--format=junit",
+            ])
             .env_clear()
             .env("FASTMCP_FND01_AUTHORING_CLOSURE", &subject.authoring_marker)
             .env(
@@ -93465,9 +93502,9 @@ fn fallible(value: Option<u8>) {
             .unwrap_or_else(|error| panic!("Attest self-reexec spawn: {error}"));
         let stdout = String::from_utf8(output.stdout).expect("public harness stdout UTF-8");
         let stderr = String::from_utf8(output.stderr).expect("public harness stderr UTF-8");
-        let stdout = stdout
-            .strip_prefix("\nrunning 1 test\n")
-            .expect("exact fixture-driver stdout prelude");
+        // `exec` can run before libtest flushes its formatter buffer, so the
+        // fixed prelude is either present in full or absent in full.
+        let stdout = stdout.strip_prefix(JUNIT_PRELUDE).unwrap_or(&stdout);
         let child_ran = subject.root.join(format!(
             ".fnd01-run/independent-attester/{}/self-reexec-child-ran", subject.run_id));
         assert_eq!(
@@ -93477,7 +93514,11 @@ fn fallible(value: Option<u8>) {
             "Attest self-reexec exact child body did not run",
         );
         if plant == OrdinaryPlant::None {
-            assert_eq!(output.status.code(), Some(0));
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "public harness positive failed: stdout={stdout:?}; stderr={stderr:?}",
+            );
             assert!(stdout.is_empty() && stderr.is_empty());
         } else {
             let stderr = stderr

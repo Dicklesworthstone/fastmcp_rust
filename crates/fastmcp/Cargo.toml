@@ -171,10 +171,16 @@ path = "examples/calculator_server.rs"
 [[example]]
 name = "fnd_01_evidence_harness"
 path = "examples/fnd_01_evidence_harness.rs"
+# This is an executable proof runner whose included verifier module owns its
+# tests separately; never execute it as an example test harness.
+test = false
 
 [[example]]
 name = "fnd_01_sdk_batch"
 path = "examples/fnd_01_sdk_batch.rs"
+# Like the evidence harness above, this is a shipped proof runner rather than
+# a Cargo test target.
+test = false
 
 [[example]]
 name = "notes_server"

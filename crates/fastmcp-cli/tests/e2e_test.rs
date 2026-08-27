@@ -1345,9 +1345,13 @@ fn loopback_fixture_timeout_acknowledges_before_settled_join() {
         },
     );
 
+    // `catch_unwind` cannot publish the completion receipt until the panic
+    // hook has finished. Full backtraces under a loaded workspace can outlive
+    // the planted 30 ms I/O deadline, so use the fixture's bounded ownership
+    // acknowledgement window rather than inventing a second 250 ms bound.
     let completion = fixture
         .completion
-        .recv_timeout(Duration::from_millis(250))
+        .recv_timeout(LOOPBACK_FIXTURE_ACK_DEADLINE)
         .expect("timed-out loopback fixture must acknowledge completion");
     fixture
         .worker
@@ -1360,7 +1364,7 @@ fn loopback_fixture_timeout_acknowledges_before_settled_join() {
         "absent loopback client must fail the fixture"
     );
     assert!(
-        started.elapsed() < Duration::from_millis(250),
+        started.elapsed() < LOOPBACK_FIXTURE_ACK_DEADLINE,
         "absent loopback client must fail within the fixture deadline"
     );
 }

@@ -157,11 +157,12 @@ impl InboundRequestContext {
     }
 
     /// Creates sanitized facts for a request that belongs to one live modern
-    /// transport connection. The connection owns both the durable partition
+    /// transport connection. The connection owns both the opaque partition
     /// used to bind MRTR retries and the cancellation authority that makes
-    /// retained continuations unusable after peer disconnect.
+    /// retained continuations unusable after peer disconnect. The partition
+    /// may be request-local and therefore ineligible for response caching.
     #[must_use]
-    pub(crate) fn with_modern_connection(
+    pub fn with_modern_connection(
         cx: Cx,
         request_id: u64,
         transport: InboundRequestTransport,
@@ -231,10 +232,15 @@ impl InboundRequestContext {
         // fresh SessionState so disable_*/enable_* can mutate and publish
         // list_changed to live subscriptions/listen streams without inventing
         // a durable Mcp-Session-Id.
-        self.state.clone().map_or_else(
+        let context = self.state.clone().map_or_else(
             || McpContext::with_state(self.cx.clone(), self.request_id, SessionState::new()),
             |state| McpContext::with_state(self.cx.clone(), self.request_id, state),
-        )
+        );
+        if self.mrtr_continuation_cancellation.is_some() {
+            context.with_retained_continuation_owner()
+        } else {
+            context
+        }
     }
 
     pub(crate) fn mrtr_continuation_cancellation(
@@ -271,7 +277,7 @@ impl InboundRequestContext {
 /// MRTR continuation minted by requests on this connection or session.
 /// Request contexts retain only clones of its state and cancellation capability, so a retained
 /// continuation cannot outlive the connection or session that issued it.
-pub(crate) struct ModernConnection {
+pub struct ModernConnection {
     state: SessionState,
     continuation_cancellation: fastmcp_core::McpRequestCancellation,
     principal_binding: SessionPrincipalBinding,
@@ -285,7 +291,10 @@ pub(crate) struct ModernConnectionRequestContext {
 }
 
 impl ModernConnection {
-    pub(crate) fn new() -> Self {
+    /// Creates durable state and continuation ownership for one custom modern
+    /// transport connection.
+    #[must_use]
+    pub fn new() -> Self {
         Self::with_state(SessionState::new())
     }
 
@@ -304,7 +313,9 @@ impl ModernConnection {
         }
     }
 
-    pub(crate) fn disconnect(&self) {
+    /// Marks the connection as disconnected and cancels every continuation it
+    /// previously minted.
+    pub fn disconnect(&self) {
         self.continuation_cancellation.cancel();
     }
 
@@ -314,6 +325,12 @@ impl ModernConnection {
             continuation_cancellation: self.continuation_cancellation.clone(),
             principal_binding: self.principal_binding.clone(),
         }
+    }
+}
+
+impl Default for ModernConnection {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -660,11 +677,11 @@ fn final_mrtr_binding(
     if target.len() > MAX_MRTR_BINDING_BYTES {
         return Err(McpError::invalid_params("MRTR target exceeds its limit"));
     }
-    // A binding is only consumable where retry state can live. Fresh
-    // dispatches on a session-less context stay valid; the binding is
-    // demanded again at the points that actually need it (retry resolution
-    // and input_required issuance).
-    let Some((session_partition, _revision)) = request_ctx.session_cache_partition() else {
+    // A binding is only consumable where transport admission installed an
+    // owner. Request-local HTTP state is intentionally cache-ineligible, but
+    // its unique per-request continuation partition still prevents a later
+    // POST from consuming the issued state.
+    let Some(session_partition) = request_ctx.retained_continuation_partition() else {
         return Ok(None);
     };
     let principal_digest = request_ctx
@@ -1730,6 +1747,26 @@ fn budget_error(ctx: &McpContext) -> Option<McpError> {
     None
 }
 
+fn handler_budget_error(ctx: &McpContext, budget: Budget) -> Option<McpError> {
+    if budget.is_past_deadline(ctx.cx().now()) {
+        return Some(McpError::new(
+            McpErrorCode::RequestCancelled,
+            "Request timeout exceeded",
+        ));
+    }
+    budget_error(ctx)
+}
+
+/// Returns whether a pending child-context cancellation is currently visible.
+///
+/// `Cx::is_cancel_requested` reports the raw pending signal even inside an
+/// asupersync cancellation mask. Probe a checkpoint only after that cheap bit
+/// test so an active mask can defer cancellation without charging ordinary
+/// requests (including a valid zero poll balance).
+fn request_cx_cancellation_is_visible(request_cx: &Cx) -> bool {
+    request_cx.is_cancel_requested() && request_cx.checkpoint().is_err()
+}
+
 fn sanitized_handler_panic(_request_lifetime: &Cx, handler_class: &'static str) -> McpError {
     let incident_id = NEXT_HANDLER_INCIDENT_ID.fetch_add(1, Ordering::Relaxed);
     log::error!(
@@ -1841,8 +1878,11 @@ async fn run_handler_in_request<'a, T>(
     handler_class: &'static str,
     make_future: impl FnOnce(&'a Cx) -> BoxFuture<'a, McpOutcome<T>>,
 ) -> McpResult<McpOutcome<T>> {
-    if request_cx.is_cancel_requested() || budget_error(ctx).is_some() {
+    if request_cx_cancellation_is_visible(request_cx) {
         return Err(McpError::request_cancelled());
+    }
+    if let Some(error) = handler_budget_error(ctx, budget) {
+        return Err(error);
     }
 
     let future = crate::catch_extension_unwind(|| make_future(request_cx))
@@ -1873,11 +1913,13 @@ async fn run_handler_in_request<'a, T>(
         },
     };
 
-    if request_cx.is_cancel_requested() || budget_error(ctx).is_some() {
-        Err(McpError::request_cancelled())
-    } else {
-        Ok(outcome)
+    if request_cx_cancellation_is_visible(request_cx) {
+        return Err(McpError::request_cancelled());
     }
+    if let Some(error) = handler_budget_error(ctx, budget) {
+        return Err(error);
+    }
+    Ok(outcome)
 }
 
 fn derive_handler_context(
@@ -3716,7 +3758,7 @@ impl Router {
         params: FinalCompletionParams,
     ) -> McpResult<FinalCompletionResult> {
         let dispatch_started_at = request_ctx.cx().now();
-        if request_cx.is_cancel_requested() {
+        if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
         }
         if let Some(error) = budget_error(request_ctx) {
@@ -4046,7 +4088,7 @@ impl Router {
         raw_params: Option<&str>,
         continuation_cancellation: &fastmcp_core::McpRequestCancellation,
     ) -> McpResult<serde_json::Value> {
-        if request_cx.is_cancel_requested() {
+        if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
         }
         if let Some(error) = budget_error(request_ctx) {
@@ -4296,7 +4338,7 @@ impl Router {
             _ => return Err(McpError::method_not_found(&request.method)),
         };
 
-        if request_cx.is_cancel_requested() {
+        if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
         }
         if let Some(error) = budget_error(request_ctx) {
@@ -4973,7 +5015,7 @@ impl Router {
         );
 
         let dispatch_started_at = request_ctx.cx().now();
-        if request_cx.is_cancel_requested() {
+        if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
         }
         if let Some(error) = budget_error(request_ctx) {
@@ -5002,7 +5044,8 @@ impl Router {
             .as_ref()
             .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {}", params.name)))?;
         let handler = &entry.handler;
-        if handler.declares_final_mrtr() && request_ctx.session_cache_partition().is_none() {
+        if handler.declares_final_mrtr() && request_ctx.retained_continuation_partition().is_none()
+        {
             return Err(McpError::invalid_params(
                 MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
             ));
@@ -5050,16 +5093,6 @@ impl Router {
                 .as_ref()
                 .map(|errors| errors.input_validation.clone());
             return Ok(FinalToolOutcome::Complete(result));
-        }
-
-        // A route-bound proxy asks its selected upstream to create a task
-        // during this handler call. Unlike a local handler's deferred
-        // `CreateTask`, that side effect cannot be rolled back after the
-        // proxy returns. Require the exact downstream Tasks declaration
-        // before invoking any task-capable proxy handler.
-        #[cfg(all(feature = "proxy", feature = "tasks"))]
-        if declares_final_tasks && self.final_task_relay.is_some() {
-            require_final_tasks_capability(&params.meta)?;
         }
 
         let ctx = derive_handler_context(
@@ -5381,7 +5414,7 @@ impl Router {
         );
 
         let dispatch_started_at = request_ctx.cx().now();
-        if request_cx.is_cancel_requested() {
+        if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
         }
         if let Some(error) = budget_error(request_ctx) {
@@ -5410,7 +5443,8 @@ impl Router {
                 "resource is registered only for exact MCP 2024-11-05 dispatch",
             ));
         }
-        if resolved.handler.declares_final_mrtr() && request_ctx.session_cache_partition().is_none()
+        if resolved.handler.declares_final_mrtr()
+            && request_ctx.retained_continuation_partition().is_none()
         {
             return Err(McpError::invalid_params(
                 MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
@@ -5682,7 +5716,7 @@ impl Router {
         );
 
         let dispatch_started_at = request_ctx.cx().now();
-        if request_cx.is_cancel_requested() {
+        if request_cx_cancellation_is_visible(request_cx) {
             return Err(McpError::request_cancelled());
         }
         if let Some(error) = budget_error(request_ctx) {
@@ -5707,7 +5741,8 @@ impl Router {
         let final_registration = self.final_prompts.get(&params.name).ok_or_else(|| {
             McpError::invalid_params("prompt is registered only for exact MCP 2024-11-05 dispatch")
         })?;
-        if handler.declares_final_mrtr() && request_ctx.session_cache_partition().is_none() {
+        if handler.declares_final_mrtr() && request_ctx.retained_continuation_partition().is_none()
+        {
             return Err(McpError::invalid_params(
                 MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
             ));
@@ -7789,7 +7824,8 @@ impl RouterResourceReader {
                 "resource is registered only for exact MCP 2024-11-05 dispatch",
             ));
         }
-        if resolved.handler.declares_final_mrtr() && parent_ctx.session_cache_partition().is_none()
+        if resolved.handler.declares_final_mrtr()
+            && parent_ctx.retained_continuation_partition().is_none()
         {
             return Err(McpError::invalid_params(
                 MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
@@ -8097,7 +8133,7 @@ impl RouterToolCaller {
             .as_ref()
             .ok_or_else(|| McpError::invalid_params(format!("Unknown tool: {name}")))?;
         let handler = &entry.handler;
-        if handler.declares_final_mrtr() && parent_ctx.session_cache_partition().is_none() {
+        if handler.declares_final_mrtr() && parent_ctx.retained_continuation_partition().is_none() {
             return Err(McpError::invalid_params(
                 MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
             ));
@@ -8280,6 +8316,13 @@ impl RouterPromptCaller {
     pub(crate) fn new(router: Arc<Router>, session_state: SessionState) -> Self {
         Self {
             router: RouterAccess::Shared(router),
+            session_state,
+        }
+    }
+
+    pub(crate) fn request_scoped(router: Weak<Router>, session_state: SessionState) -> Self {
+        Self {
+            router: RouterAccess::RequestScoped(router),
             session_state,
         }
     }
@@ -8469,7 +8512,7 @@ impl RouterPromptCaller {
         let final_registration = router.final_prompts.get(&name).ok_or_else(|| {
             McpError::invalid_params("prompt is registered only for exact MCP 2024-11-05 dispatch")
         })?;
-        if handler.declares_final_mrtr() && parent_ctx.session_cache_partition().is_none() {
+        if handler.declares_final_mrtr() && parent_ctx.retained_continuation_partition().is_none() {
             return Err(McpError::invalid_params(
                 MRTR_REQUIRES_BOUND_MODERN_CONNECTION,
             ));
@@ -12049,7 +12092,7 @@ mod router_tests {
                     "WM-PROBE requery backtrace:\n{}",
                     std::backtrace::Backtrace::force_capture()
                 );
-                std::thread::sleep(Duration::from_millis(15));
+                std::thread::sleep(Duration::from_secs(2));
             }
             Tool {
                 name: "slow_definition".to_string(),
@@ -12064,7 +12107,7 @@ mod router_tests {
         }
 
         fn timeout(&self) -> Option<Duration> {
-            Some(Duration::from_millis(1))
+            Some(Duration::from_secs(1))
         }
 
         fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
@@ -17363,7 +17406,7 @@ mod router_tests {
             final_calls: Arc::clone(&final_calls),
         });
         router.add_resource(NamedResource::new("resource://static"));
-        router.add_resource_template(marked_template("resource://{id}", "registered"));
+        router.add_resource_template(marked_template("resource:///items/{id}", "registered"));
         router
             .add_legacy_resource_template(marked_template("resource://{legacy_id}", "legacy-only"));
         let cx = Cx::for_testing();
@@ -17376,7 +17419,7 @@ mod router_tests {
                     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
                     "io.modelcontextprotocol/clientCapabilities": {},
                 },
-                "ref": {"type": "ref/resource", "uri": "resource://{id}"},
+                "ref": {"type": "ref/resource", "uri": "resource:///items/{id}"},
                 "argument": {"name": "id", "value": "sta"},
             })),
             188_i64,
@@ -18311,7 +18354,7 @@ mod router_tests {
             .expect("the scalar-explode form remains admitted on the final route");
         final_router
             .add_resource_template_with_behavior(
-                marked_template("mcp://resource{?collection*,revision*}", "final-multi"),
+                marked_template("mcp://catalog{?collection*,revision*}", "final-multi"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("the named multi-variable form remains admitted on the final route");
@@ -20241,10 +20284,11 @@ mod router_tests {
         )
         .request_context();
 
-        let error = router
+        let refusal = router
             .dispatch_stateless(&context, &request)
-            .expect_err("changing only client elicitation capability must refuse the request");
-        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            .expect("changing only client elicitation capability returns a final tool result");
+        assert_eq!(refusal["resultType"], "complete");
+        assert_eq!(refusal["isError"], true);
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resumed_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -20601,7 +20645,7 @@ mod router_tests {
         });
 
         let cx = Cx::for_testing();
-        let state = SessionState::new();
+        let state = SessionState::ephemeral();
         let request_ctx = request_context(&cx, 1433, Budget::INFINITE, &state);
         let metadata = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -22274,8 +22318,7 @@ mod router_tests {
         });
 
         let cx = Cx::for_testing();
-        let state = SessionState::new();
-        let request_ctx = request_context(&cx, 973, Budget::INFINITE, &state);
+        let connection = ModernConnection::new();
         let metadata = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientCapabilities": {},
@@ -22283,7 +22326,13 @@ mod router_tests {
 
         let prompt = router
             .dispatch_stateless(
-                &request_ctx,
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    973,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                )
+                .request_context(),
                 &JsonRpcRequest::new(
                     "prompts/get",
                     Some(serde_json::json!({
@@ -22301,7 +22350,13 @@ mod router_tests {
 
         let initial = router
             .dispatch_stateless(
-                &request_ctx,
+                &InboundRequestContext::with_modern_connection(
+                    cx.clone(),
+                    974,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                )
+                .request_context(),
                 &JsonRpcRequest::new(
                     "resources/read",
                     Some(serde_json::json!({
@@ -22329,9 +22384,20 @@ mod router_tests {
             })),
             975_i64,
         );
-        let error = router.dispatch_stateless(&request_ctx, &retry).expect_err(
-            "an MRTR-resumed HTTPS embedded resource remains server-mediated and is refused",
-        );
+        let error = router
+            .dispatch_stateless(
+                &InboundRequestContext::with_modern_connection(
+                    cx,
+                    975,
+                    InboundRequestTransport::Memory,
+                    &connection,
+                )
+                .request_context(),
+                &retry,
+            )
+            .expect_err(
+                "an MRTR-resumed HTTPS embedded resource remains server-mediated and is refused",
+            );
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);

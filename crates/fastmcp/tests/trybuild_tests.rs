@@ -6,17 +6,42 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-const COMPILE_DEADLINE: Duration = Duration::from_mins(10);
-const PROCESS_CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
+// Cold, isolated facade consumers compile the full asupersync stack without
+// borrowing workspace artifacts. Measured RCH runs needed 14m39s to build the
+// sandbox and were still compiling the first negative case after 20 minutes,
+// so retain a hard bound with enough room for the complete diagnostic matrix.
+const COMPILE_DEADLINE: Duration = Duration::from_mins(45);
+// A terminated rustc process group can need more than two seconds to leave an
+// uninterruptible filesystem wait before SIGKILL becomes observable. Keep the
+// cleanup bounded while avoiding false leak reports for a group that is still
+// settling after the mandatory TERM/KILL sequence.
+const PROCESS_CLEANUP_DEADLINE: Duration = Duration::from_secs(10);
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(unix)]
 const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 const TRYBUILD_WORKER_ENV: &str = "FASTMCP_TRYBUILD_BOUNDED_WORKER";
+const BOUNDED_EXIT_WORKER_ENV: &str = "FASTMCP_TRYBUILD_BOUNDED_EXIT_WORKER";
+const BOUNDED_EXIT_DESCENDANT_ENV: &str = "FASTMCP_TRYBUILD_BOUNDED_EXIT_DESCENDANT";
+
+// These probes need a target separate from the outer workspace because their
+// dependency features deliberately differ. Running several cold target graphs
+// concurrently multiplies rustc's peak memory enough for the OS to kill
+// otherwise-valid builds, so serialize only these heavyweight probes and let
+// them share one fingerprinted Cargo cache. The rest of the suite stays
+// parallel.
+static COMPILE_PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+fn compile_probe_guard() -> MutexGuard<'static, ()> {
+    COMPILE_PROBE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Facade feature selections that must compile from the manifest itself.
 ///
@@ -92,7 +117,7 @@ fn apps_ui_tool() -> String {
     "weather".to_owned()
 }
 
-fn generic_client_host<T, P>(
+pub fn generic_client_host<T, P>(
     client: &mcp::modern::Client,
     transport: T,
     configuration: mcp::modern::McpAppsHostConfiguration,
@@ -105,7 +130,7 @@ where
     client.mcp_apps_host(transport, configuration, policy)
 }
 
-fn generic_http_host<T, P>(
+pub fn generic_http_host<T, P>(
     client: &mcp::modern::HttpClient,
     transport: T,
     configuration: mcp::modern::McpAppsHostConfiguration,
@@ -396,7 +421,6 @@ pub fn probe<IO>() {
     let _: Option<prelude::WebSocketResponse> = None;
     let _: Option<prelude::BoundWebSocketServer> = None;
     let _: Option<prelude::WebSocketServerShutdown> = None;
-    let _ = mcp::modern::Server::bind_websocket;
     let _ = composes_actual_async_websocket_client;
 }
 "#,
@@ -417,7 +441,7 @@ async fn connects_only_through_legacy_builder(cx: &Cx) -> McpResult<()> {
         mcp::legacy_2024::ClientBuilder::new()
             .connect_websocket_with_cx(cx, transport)
             .await?;
-    let _ = client.session();
+    let _ = client.protocol_version();
     Ok(())
 }
 
@@ -551,7 +575,7 @@ use mcp::modern::WebSocketClient;
 
 pub fn probe<IO>()
 where
-    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+    IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
 {
     let _ = WebSocketClient::<IO>::connect_with_cx;
 }
@@ -567,7 +591,7 @@ use mcp::client::WebSocketClient;
 
 pub fn probe<IO>()
 where
-    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+    IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
 {
     let _ = WebSocketClient::<IO>::connect_with_cx;
 }
@@ -648,7 +672,7 @@ use mcp::legacy_2024::WebSocketClient;
 
 pub fn probe<IO>()
 where
-    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+    IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
 {
     let _ = WebSocketClient::<IO>::connect_with_cx;
 }
@@ -677,7 +701,7 @@ use mcp::auto::WebSocketClient;
 
 pub fn probe<IO>()
 where
-    IO: mcp::asupersync::io::AsyncRead + mcp::asupersync::io::AsyncWrite + Unpin,
+    IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin,
 {
     let _ = WebSocketClient::<IO>::connect_with_cx;
 }
@@ -702,9 +726,10 @@ pub fn probe() {
 
 #[test]
 fn facade_feature_profile_compile_probes() {
+    let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = manifest_dir.join("Cargo.toml");
-    let target_dir = cargo_target_dir(manifest_dir).join("facade-feature-compile-probes");
+    let target_dir = shared_compile_probe_target_dir(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
 
     for (profile, arguments) in FACADE_FEATURE_COMPILE_PROBES {
@@ -734,6 +759,7 @@ fn facade_feature_profile_compile_probes() {
 
 #[test]
 fn downstream_feature_symbol_probes() {
+    let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let facade_path = toml_path(manifest_dir);
     let target_dir = cargo_target_dir(manifest_dir).join("downstream-feature-symbol-probes");
@@ -764,6 +790,7 @@ publish = false
 
 [dependencies]
 mcp = {{ package = "fastmcp-rust", path = "{facade_path}", default-features = false, features = [{features}] }}
+asupersync = {{ version = "=0.4.9", default-features = false }}
 "#,
                 probe.name,
             ),
@@ -773,7 +800,11 @@ mcp = {{ package = "fastmcp-rust", path = "{facade_path}", default-features = fa
             .unwrap_or_else(|error| panic!("write {} fixture source: {error}", probe.name));
 
         let fixture_manifest = fixture_root.join("Cargo.toml");
-        let fixture_target_dir = target_dir.join(format!("{}-target", probe.name));
+        // Each fixture keeps its own manifest and lockfile, while Cargo's
+        // fingerprints isolate dependency feature selections inside one
+        // shared artifact cache. Separate target directories would rebuild
+        // the full dependency graph for every positive/negative probe.
+        let fixture_target_dir = shared_compile_probe_target_dir(manifest_dir);
         let mut lock_command = Command::new(&cargo);
         lock_command
             .arg("generate-lockfile")
@@ -875,6 +906,8 @@ fn compile_fail_tests() {
         return;
     }
 
+    let _compile_probe_guard = compile_probe_guard();
+
     // trybuild owns nested Cargo processes internally and exposes no timeout.
     // Run the ordinary suite in an exact, recursively selected copy of this
     // test binary so the parent can bound and clean up the whole process group.
@@ -893,6 +926,7 @@ fn compile_fail_tests() {
 /// `fastmcp-rust` facade.
 #[test]
 fn renamed_facade_only_consumer_compiles_every_macro_family() {
+    let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let target_dir = cargo_target_dir(manifest_dir);
     let fixture_root = target_dir.join("facade-only-renamed-consumer");
@@ -921,7 +955,7 @@ mcp = {{ package = "fastmcp-rust", path = "{facade_path}" }}
         .expect("write facade-only consumer source");
 
     let fixture_manifest = fixture_root.join("Cargo.toml");
-    let fixture_target_dir = target_dir.join("facade-only-renamed-consumer-target");
+    let fixture_target_dir = shared_compile_probe_target_dir(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut lock_command = Command::new(&cargo);
     lock_command
@@ -973,6 +1007,7 @@ mcp = {{ package = "fastmcp-rust", path = "{facade_path}" }}
 /// from `fastmcp-derive`, without a `fastmcp-rust` facade dependency.
 #[test]
 fn direct_derive_tasks_consumer_compiles() {
+    let _compile_probe_guard = compile_probe_guard();
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
         .parent()
@@ -1012,7 +1047,7 @@ serde_json = "=1.0.151"
         .expect("write direct-derive consumer source");
 
     let fixture_manifest = fixture_root.join("Cargo.toml");
-    let fixture_target_dir = target_dir.join("direct-derive-tasks-consumer-target");
+    let fixture_target_dir = shared_compile_probe_target_dir(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut lock_command = Command::new(&cargo);
     lock_command
@@ -1057,6 +1092,45 @@ serde_json = "=1.0.151"
     );
 }
 
+#[test]
+fn bounded_process_preserves_completed_child_exit_status() {
+    if std::env::var_os(BOUNDED_EXIT_DESCENDANT_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        std::thread::sleep(Duration::from_secs(5));
+        std::process::exit(0);
+    }
+    if std::env::var_os(BOUNDED_EXIT_WORKER_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        #[cfg(unix)]
+        Command::new(std::env::current_exe().expect("resolve descendant test binary"))
+            .args([
+                "--exact",
+                "bounded_process_preserves_completed_child_exit_status",
+            ])
+            .env(BOUNDED_EXIT_DESCENDANT_ENV, "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn planted live process-group descendant");
+        std::process::exit(23);
+    }
+
+    let mut command = Command::new(std::env::current_exe().expect("resolve current test binary"));
+    command
+        .args([
+            "--exact",
+            "bounded_process_preserves_completed_child_exit_status",
+        ])
+        .env(BOUNDED_EXIT_WORKER_ENV, "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = run_bounded(
+        command,
+        "planted nonzero-exit worker",
+        Duration::from_secs(10),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(status.code(), Some(23));
+}
+
 fn run_bounded(mut command: Command, label: &str, timeout: Duration) -> Result<ExitStatus, String> {
     let mut process = OwnedProcessGroup::spawn(&mut command)
         .map_err(|error| format!("failed to start {label}: {error}"))?;
@@ -1094,7 +1168,7 @@ impl OwnedProcessGroup {
             match self.child_has_exited("failed to inspect bounded child") {
                 Ok(true) => {
                     return self
-                        .terminate()
+                        .terminate_with_observed_child_state(Some(true))
                         .map_err(|error| {
                             format!("failed to clean up {label} descendants after exit: {error}")
                         })?
@@ -1160,9 +1234,15 @@ impl OwnedProcessGroup {
         Ok(false)
     }
 
-    fn wait_for_cleanup_state(&mut self, deadline: Instant) -> Result<(bool, bool), String> {
+    fn wait_for_cleanup_state(
+        &mut self,
+        deadline: Instant,
+        mut child_exited: bool,
+    ) -> Result<(bool, bool), String> {
         loop {
-            let child_exited = self.child_has_exited("failed to inspect exact child")?;
+            if !child_exited {
+                child_exited = self.child_has_exited("failed to inspect exact child")?;
+            }
             let group_live = self.process_group_has_live_member()?;
             if (child_exited && !group_live) || Instant::now() >= deadline {
                 return Ok((child_exited, group_live));
@@ -1172,6 +1252,13 @@ impl OwnedProcessGroup {
     }
 
     fn terminate(&mut self) -> Result<Option<ExitStatus>, String> {
+        self.terminate_with_observed_child_state(None)
+    }
+
+    fn terminate_with_observed_child_state(
+        &mut self,
+        observed_child_exited: Option<bool>,
+    ) -> Result<Option<ExitStatus>, String> {
         if !self.armed {
             return Ok(None);
         }
@@ -1187,13 +1274,16 @@ impl OwnedProcessGroup {
             // outside this harness's portable containment boundary.
             let _ = self.owns_process_group;
         }
-        let mut child_exited = match self.child_has_exited("failed to inspect exact child") {
-            Ok(exited) => exited,
-            Err(error) => {
-                self.owns_process_group = false;
-                self.armed = false;
-                return Err(format!("{error}; guard disarmed without signaling"));
-            }
+        let mut child_exited = match observed_child_exited {
+            Some(exited) => exited,
+            None => match self.child_has_exited("failed to inspect exact child") {
+                Ok(exited) => exited,
+                Err(error) => {
+                    self.owns_process_group = false;
+                    self.armed = false;
+                    return Err(format!("{error}; guard disarmed without signaling"));
+                }
+            },
         };
         // On Unix, child_has_exited observes zombie state without wait(2).
         // The live/zombie leader therefore pins its PGID until every group
@@ -1224,7 +1314,7 @@ impl OwnedProcessGroup {
                         .checked_add(PROCESS_TERM_GRACE)
                         .unwrap_or(deadline),
                 );
-                match self.wait_for_cleanup_state(term_deadline) {
+                match self.wait_for_cleanup_state(term_deadline, child_exited) {
                     Ok((exited, live)) => {
                         child_exited = exited;
                         group_live = live;
@@ -1266,7 +1356,7 @@ impl OwnedProcessGroup {
             }
         }
 
-        match self.wait_for_cleanup_state(deadline) {
+        match self.wait_for_cleanup_state(deadline, child_exited) {
             Ok((exited, live)) => {
                 child_exited = exited;
                 group_live = live;
@@ -1290,12 +1380,12 @@ impl OwnedProcessGroup {
                 "owned process group still has live members after {PROCESS_CLEANUP_DEADLINE:?}"
             ));
         }
-        let exit_status = match self
-            .child
-            .as_mut()
-            .expect("owned process guard is armed")
-            .try_wait()
-        {
+        let child = self.child.as_mut().expect("owned process guard is armed");
+        let exit_status = match if child_exited {
+            child.wait().map(Some)
+        } else {
+            child.try_wait()
+        } {
             Ok(status) => status,
             Err(error) => {
                 errors.push(format!(
@@ -1485,6 +1575,10 @@ fn cargo_target_dir(manifest_dir: &Path) -> PathBuf {
     )
 }
 
+fn shared_compile_probe_target_dir(manifest_dir: &Path) -> PathBuf {
+    cargo_target_dir(manifest_dir).join("shared-downstream-compile-probes")
+}
+
 fn toml_path(path: &Path) -> String {
     path.display()
         .to_string()
@@ -1515,7 +1609,14 @@ fn facade_tool(count: u64) -> String {
 
 #[tool]
 fn renamed_facade_final_task_tool() -> mcp::FinalToolOutcome {
-    unreachable!("the renamed-facade probe compiles a final tool outcome without Tasks opt-in")
+    mcp::FinalToolOutcome::Complete(mcp::CompleteResult::new(
+        mcp::FinalCallToolResult {
+            content: Vec::new(),
+            is_error: false,
+            structured_content: None,
+        },
+        mcp::ResultMeta::empty(),
+    ))
 }
 
 #[resource(uri = "facade://status")]
@@ -1768,19 +1869,26 @@ fn assert_prelude_dual_era_surface() {
 }
 "#;
 
-const DIRECT_DERIVE_TASKS_CONSUMER: &str = r#"
+const DIRECT_DERIVE_TASKS_CONSUMER: &str = r"
 use fastmcp_derive::tool;
 use fastmcp_server::ToolHandler;
 
 #[tool(tasks)]
 fn direct_derive_tasks_opt_in() -> fastmcp_server::FinalToolOutcome {
-    unreachable!("compile-only direct fastmcp-derive Tasks consumer")
+    fastmcp_server::FinalToolOutcome::Complete(fastmcp_protocol::CompleteResult::new(
+        fastmcp_protocol::FinalCallToolResult {
+            content: Vec::new(),
+            is_error: false,
+            structured_content: None,
+        },
+        fastmcp_protocol::ResultMeta::empty(),
+    ))
 }
 
-fn assert_tool_handler<T: ToolHandler>(_: T) {}
+pub fn assert_tool_handler<T: ToolHandler>(_: T) {}
 
-fn direct_derive_tasks_opt_in_declares_tasks() {
+pub fn direct_derive_tasks_opt_in_declares_tasks() {
     assert_tool_handler(DirectDeriveTasksOptIn);
     assert!(DirectDeriveTasksOptIn.declares_final_tasks());
 }
-"#;
+";

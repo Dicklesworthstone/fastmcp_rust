@@ -1141,6 +1141,8 @@ pub struct ClientCapabilityInfo {
     pub roots: bool,
     /// Whether the client wants list_changed notifications for roots.
     pub roots_list_changed: bool,
+    /// Whether the client advertised the official MCP Tasks extension.
+    pub tasks: bool,
 }
 
 impl ClientCapabilityInfo {
@@ -1171,6 +1173,13 @@ impl ClientCapabilityInfo {
     pub fn with_roots(mut self, list_changed: bool) -> Self {
         self.roots = true;
         self.roots_list_changed = list_changed;
+        self
+    }
+
+    /// Creates capability info with the official MCP Tasks extension enabled.
+    #[must_use]
+    pub fn with_tasks(mut self) -> Self {
+        self.tasks = true;
         self
     }
 }
@@ -1451,6 +1460,13 @@ pub struct McpContext {
     /// Nested component access follows this surface so a modern parent cannot
     /// bypass final argument admission by calling [`Self::get_prompt`].
     final_request_surface: bool,
+    /// Whether a live transport connection owns retained MRTR continuations
+    /// created by this request.
+    ///
+    /// This is distinct from durable session state: a one-shot modern HTTP
+    /// POST has request-local state but still owns continuations until that
+    /// request connection closes.
+    retained_continuation_owner: bool,
     /// Optional progress reporter for long-running operations.
     progress_reporter: Option<ProgressReporter>,
     /// Session state for per-session key-value storage.
@@ -1525,6 +1541,10 @@ impl std::fmt::Debug for McpContext {
             )
             .field("request_id", &self.request_id)
             .field("final_request_surface", &self.final_request_surface)
+            .field(
+                "retained_continuation_owner",
+                &self.retained_continuation_owner,
+            )
             .field("progress_reporter", &self.progress_reporter)
             .field("state", &self.state.is_some())
             .field(
@@ -1674,6 +1694,7 @@ impl McpContext {
             request_cancellation: McpRequestCancellation::new(),
             request_id,
             final_request_surface: false,
+            retained_continuation_owner: false,
             progress_reporter: None,
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1716,6 +1737,7 @@ impl McpContext {
             request_cancellation: McpRequestCancellation::new(),
             request_id,
             final_request_surface: false,
+            retained_continuation_owner: false,
             progress_reporter: None,
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1759,6 +1781,7 @@ impl McpContext {
             request_cancellation: McpRequestCancellation::new(),
             request_id,
             final_request_surface: false,
+            retained_continuation_owner: false,
             progress_reporter: Some(reporter),
             state: None,
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -1806,6 +1829,7 @@ impl McpContext {
             request_cancellation: McpRequestCancellation::new(),
             request_id,
             final_request_surface: false,
+            retained_continuation_owner: false,
             progress_reporter: Some(reporter),
             state: Some(state),
             cache_admission_partition: Arc::new(Mutex::new(None)),
@@ -2066,6 +2090,42 @@ impl McpContext {
     #[must_use]
     pub fn is_final_request_surface(&self) -> bool {
         self.final_request_surface
+    }
+
+    /// Marks this request as owning any retained MRTR continuation it emits.
+    ///
+    /// Only transport admission may install this fact. Ordinary stateful or
+    /// request-local contexts do not gain continuation authority merely by
+    /// carrying a [`SessionState`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_retained_continuation_owner(mut self) -> Self {
+        self.retained_continuation_owner = true;
+        self
+    }
+
+    /// Returns whether transport admission installed retained-continuation
+    /// ownership for this request.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn has_retained_continuation_owner(&self) -> bool {
+        self.request_scope_is_active() && self.retained_continuation_owner
+    }
+
+    /// Returns the transport-authorized partition used to bind retained
+    /// continuations created by this request.
+    ///
+    /// Request-local HTTP state deliberately has no response-cache partition,
+    /// but still carries a unique per-request identity. Requiring the explicit
+    /// transport owner flag prevents an ordinary context with state from
+    /// manufacturing continuation authority.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn retained_continuation_partition(&self) -> Option<[u8; 32]> {
+        if !self.has_retained_continuation_owner() {
+            return None;
+        }
+        self.state.as_ref()?.retained_continuation_partition()
     }
 
     /// Sets the prompt get depth for this context.
@@ -2948,15 +3008,19 @@ impl McpContext {
         self.state.as_ref()?.cache_partition()
     }
 
-    /// Captures the current session cache partition for this request.
+    /// Captures the current cache-admission revision for this request.
     ///
-    /// Repeated callers receive the same partition only while session state has
-    /// not changed. This lets cache middleware prove that a response completed
-    /// against the same state revision used for lookup.
+    /// Repeated callers receive the same value only while session state has not
+    /// changed. For ephemeral modern HTTP state, middleware uses this value
+    /// only as a within-request mutation guard and constructs the cross-request
+    /// key from the stateless partition instead.
     #[doc(hidden)]
     #[must_use]
     pub fn begin_session_cache_partition(&self) -> Option<([u8; 32], u64)> {
-        let current = self.session_cache_partition()?;
+        if !self.request_scope_is_active() {
+            return None;
+        }
+        let current = self.state.as_ref()?.cache_admission_revision()?;
         let mut admitted = self
             .cache_admission_partition
             .lock()
@@ -2984,7 +3048,7 @@ impl McpContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let admitted = admitted?;
-        (self.state.as_ref()?.cache_partition() == Some(admitted)).then_some(admitted)
+        (self.state.as_ref()?.cache_admission_revision() == Some(admitted)).then_some(admitted)
     }
 
     /// Marks that one middleware instance produced this request's response from
@@ -3110,6 +3174,12 @@ impl McpContext {
     #[must_use]
     pub fn client_supports_roots(&self) -> bool {
         self.client_capabilities.as_ref().is_some_and(|c| c.roots)
+    }
+
+    /// Returns whether the client advertised the official MCP Tasks extension.
+    #[must_use]
+    pub fn client_supports_tasks(&self) -> bool {
+        self.client_capabilities.as_ref().is_some_and(|c| c.tasks)
     }
 
     // ========================================================================
@@ -4380,6 +4450,35 @@ mod tests {
     }
 
     #[test]
+    fn retained_continuation_ownership_is_explicit_clone_stable_and_lease_bound() {
+        let ordinary = McpContext::with_state(Cx::for_testing(), 1, SessionState::ephemeral());
+        assert!(!ordinary.has_retained_continuation_owner());
+        assert!(ordinary.retained_continuation_partition().is_none());
+
+        let marked = ordinary.with_retained_continuation_owner();
+        assert!(marked.has_retained_continuation_owner());
+        assert!(marked.clone().has_retained_continuation_owner());
+        assert!(marked.retained_continuation_partition().is_some());
+        assert_eq!(
+            marked.clone().retained_continuation_partition(),
+            marked.retained_continuation_partition()
+        );
+
+        let (scoped, guard) = marked
+            .clone()
+            .begin_request_scope()
+            .expect("new context should create one request lease");
+        assert!(scoped.has_retained_continuation_owner());
+        assert_eq!(
+            scoped.retained_continuation_partition(),
+            marked.retained_continuation_partition()
+        );
+        drop(guard);
+        assert!(!scoped.has_retained_continuation_owner());
+        assert!(scoped.retained_continuation_partition().is_none());
+    }
+
+    #[test]
     fn test_mcp_context_masked_section() {
         let cx = Cx::for_testing();
         let ctx = McpContext::new(cx, 1);
@@ -5429,6 +5528,7 @@ mod tests {
         assert!(!ctx.client_supports_sampling());
         assert!(!ctx.client_supports_elicitation());
         assert!(!ctx.client_supports_roots());
+        assert!(!ctx.client_supports_tasks());
     }
 
     #[test]
@@ -5437,7 +5537,8 @@ mod tests {
         let caps = ClientCapabilityInfo::new()
             .with_sampling()
             .with_elicitation(true, false)
-            .with_roots(true);
+            .with_roots(true)
+            .with_tasks();
 
         let ctx = McpContext::new(cx, 1).with_client_capabilities(caps);
 
@@ -5447,6 +5548,7 @@ mod tests {
         assert!(ctx.client_supports_elicitation_form());
         assert!(!ctx.client_supports_elicitation_url());
         assert!(ctx.client_supports_roots());
+        assert!(ctx.client_supports_tasks());
     }
 
     #[test]

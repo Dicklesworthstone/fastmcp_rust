@@ -853,6 +853,7 @@ impl FastMcpConsole {
             Console::builder()
                 .file(Box::new(io::stderr()))
                 .force_terminal(true)
+                .color_system(ColorSystem::TrueColor)
                 .markup(true)
                 .emoji(true)
                 .highlight(false)
@@ -888,7 +889,10 @@ impl FastMcpConsole {
         }
 
         let inner = if enabled {
-            builder.force_terminal(true).build()
+            builder
+                .force_terminal(true)
+                .color_system(ColorSystem::TrueColor)
+                .build()
         } else {
             builder.build()
         };

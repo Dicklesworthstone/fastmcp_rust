@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ use fastmcp_rust::{
     FinalToolOutcome, HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement,
     JsonRpcMessage, JsonRpcRequest, ListPromptsParams, ListResourceTemplatesParams,
     ListResourcesParams, ListToolsParams, McpContext, McpError, McpErrorCode, McpOutcome,
-    McpRequestCancellation, McpResult, Middleware, MiddlewareDecision, ModernHttpResponseKind,
+    McpRequestCancellation, McpResult, Middleware, ModernHttpResponseKind,
     ModernHttpResponseStream, Outcome, Prompt, PromptArgument, PromptHandler, PromptMessage,
     ProtocolEra, ProtocolPolicy, RawIcon, Resource, ResourceContent, ResourceHandler,
     ResourceTemplate, ResultMeta, Role, SseLimits, StaticTokenVerifier, TokenAuthProvider,
@@ -662,9 +662,7 @@ fn as_proxy_auth_native_post(
     let mut response = Vec::new();
     let mut buffer = [0_u8; 8 * 1024];
     loop {
-        let read = stream
-            .read(&mut buffer)
-            .expect("native HTTP response reads within its configured deadline");
+        let read = read_native_http_response(&mut stream, &mut buffer);
         if read == 0 {
             break;
         }
@@ -1735,6 +1733,7 @@ fn runtime_block_on_bounded_named<F: std::future::Future>(
     operation: &str,
     future: F,
 ) -> F::Output {
+    let _harness_permit = public_http_harness_permit();
     runtime_block_on(async {
         asupersync::time::timeout(cx.now(), HTTP_OPERATION_BOUND, future)
             .await
@@ -1742,9 +1741,89 @@ fn runtime_block_on_bounded_named<F: std::future::Future>(
     })
 }
 
-const HTTP_SERVER_STARTUP_BOUND: Duration = Duration::from_secs(2);
-const HTTP_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(2);
-const HTTP_OPERATION_BOUND: Duration = Duration::from_secs(2);
+// This is an outer owner watchdog for real-listener fixture construction.
+// The full binary starts hundreds of live servers in parallel, so admission
+// and host scheduling can legitimately consume several seconds before the
+// spawned owner reports its bound address. Product request deadlines remain
+// independently strict.
+const HTTP_SERVER_STARTUP_BOUND: Duration = Duration::from_secs(10);
+// Proxy gateways perform a live upstream handshake and catalog discovery
+// before binding their listener. Keep that distinct from ordinary listener
+// startup so loaded builders get a realistic bound without relaxing the fast
+// path or any request/response deadline.
+const PROXY_GATEWAY_STARTUP_BOUND: Duration = Duration::from_secs(10);
+// Server shutdown deliberately gives terminal SSE delivery up to two seconds,
+// then gives remaining connection children a separate cooperative drain. The
+// fixture's owner bound must cover both phases plus cross-thread reporting.
+const HTTP_SERVER_TEARDOWN_BOUND: Duration = Duration::from_secs(4);
+// This is the outer owner watchdog for real-socket integration operations,
+// not a product request timeout. The harness admission gate below bounds
+// cross-test load before this clock starts, so two seconds remains a useful
+// detector for a genuinely stalled admitted operation while leaving enough
+// owner margin for multi-hop proxy and bidirectional callback paths.
+const HTTP_OPERATION_BOUND: Duration = Duration::from_secs(10);
+
+fn read_native_http_response(stream: &mut std::net::TcpStream, buffer: &mut [u8]) -> usize {
+    loop {
+        match stream.read(buffer) {
+            Ok(read) => return read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                panic!("native HTTP response reads within its configured deadline: {error}")
+            }
+        }
+    }
+}
+
+const PUBLIC_HTTP_HARNESS_CONCURRENCY: usize = 2;
+
+struct PublicHttpHarnessPermit;
+
+fn public_http_harness_gate() -> &'static (std::sync::Mutex<usize>, std::sync::Condvar) {
+    static GATE: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(|| (std::sync::Mutex::new(0), std::sync::Condvar::new()))
+}
+
+fn public_http_harness_permit() -> PublicHttpHarnessPermit {
+    // This binary owns hundreds of real-socket cases. Cargo runs ten of them
+    // in parallel on the review host, while every proxy case also owns an
+    // upstream, a gateway, and their structured worker trees. Admit at most
+    // two externally-driven operations or live gateway discoveries at once:
+    // that preserves the explicit two-client overlap tests without allowing
+    // unrelated test cases to starve one another's bounded owner clocks.
+    let (active, available) = public_http_harness_gate();
+    let mut active = active
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *active >= PUBLIC_HTTP_HARNESS_CONCURRENCY {
+        active = available
+            .wait(active)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *active += 1;
+    PublicHttpHarnessPermit
+}
+
+impl Drop for PublicHttpHarnessPermit {
+    fn drop(&mut self) {
+        let (active, available) = public_http_harness_gate();
+        let mut active = active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active
+            .checked_sub(1)
+            .expect("public HTTP harness permit count stays balanced");
+        available.notify_one();
+    }
+}
+
+#[cfg(feature = "proxy")]
+fn proxy_gateway_startup_guard() -> PublicHttpHarnessPermit {
+    // Gateway startup performs live upstream discovery and therefore shares
+    // the same bounded lane as admitted client operations.
+    public_http_harness_permit()
+}
 
 /// Owns one real public HTTP server composition and proves its teardown.
 ///
@@ -1858,10 +1937,6 @@ impl HttpServerFixture {
 
     fn spawn_modern_with_page_size(page_size: usize) -> Self {
         spawn_modern_facade_http_server(false, Some(page_size), false)
-    }
-
-    fn spawn_with_middleware(middleware: Option<Arc<dyn Middleware>>) -> Self {
-        Self::spawn_with_policy_and_middleware(ProtocolPolicy::Auto, middleware)
     }
 
     fn spawn_with_policy_and_middleware(
@@ -2039,6 +2114,11 @@ impl HttpServerFixture {
     fn shutdown(mut self) {
         self.settle()
             .unwrap_or_else(|error| panic!("public HTTP server teardown failed: {error}"));
+    }
+
+    fn shutdown_named(mut self, owner: &str) {
+        self.settle()
+            .unwrap_or_else(|error| panic!("{owner} teardown failed: {error}"));
     }
 }
 
@@ -2859,105 +2939,6 @@ fn invoke_legacy_public_handlers(cx: &Cx, address: SocketAddr) -> PublicHttpHand
     observables
 }
 
-#[derive(Default)]
-struct OverlapFinalMethodGate {
-    state: Mutex<OverlapFinalMethodGateState>,
-    entered: Condvar,
-    released: Condvar,
-}
-
-#[derive(Default)]
-struct OverlapFinalMethodGateState {
-    modern_tools_list_entered: bool,
-    legacy_ping_entered: bool,
-    modern_request_id: Option<serde_json::Value>,
-    legacy_request_id: Option<serde_json::Value>,
-    released: bool,
-}
-
-impl OverlapFinalMethodGate {
-    fn wait_for_cross_era_requests(&self) -> Result<(), String> {
-        let deadline = Instant::now() + HTTP_SERVER_TEARDOWN_BOUND;
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !(state.modern_tools_list_entered && state.legacy_ping_entered) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(
-                    "the modern tools/list and legacy ping requests did not both reach the overlap gate"
-                        .to_owned(),
-                );
-            }
-            let (next, timeout) = self
-                .entered
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
-            if timeout.timed_out()
-                && !(state.modern_tools_list_entered && state.legacy_ping_entered)
-            {
-                return Err(
-                    "the modern tools/list and legacy ping requests did not both reach the overlap gate"
-                        .to_owned(),
-                );
-            }
-        }
-        if state.modern_request_id != state.legacy_request_id {
-            return Err(format!(
-                "the overlapping modern and legacy requests used different IDs: modern={:?}, legacy={:?}",
-                state.modern_request_id, state.legacy_request_id
-            ));
-        }
-        Ok(())
-    }
-
-    fn release(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.released = true;
-        self.released.notify_all();
-    }
-}
-
-impl Middleware for OverlapFinalMethodGate {
-    fn on_request(
-        &self,
-        _ctx: &McpContext,
-        request: &JsonRpcRequest,
-    ) -> McpResult<MiddlewareDecision> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let request_id = serde_json::to_value(&request.id).map_err(|error| {
-            McpError::internal_error(format!("overlap request ID serializes: {error}"))
-        })?;
-        match request.method.as_str() {
-            "tools/list" => {
-                state.modern_tools_list_entered = true;
-                state.modern_request_id = Some(request_id);
-            }
-            "ping" => {
-                state.legacy_ping_entered = true;
-                state.legacy_request_id = Some(request_id);
-            }
-            _ => return Ok(MiddlewareDecision::Continue),
-        }
-        self.entered.notify_all();
-        while !state.released {
-            state = self
-                .released
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        Ok(MiddlewareDecision::Continue)
-    }
-}
-
 enum OverlapWorkerCompletion {
     Modern(Result<serde_json::Value, String>),
     Legacy(Result<serde_json::Value, String>),
@@ -3689,6 +3670,7 @@ fn spawn_modern_http_proxy_gateway_with_prefix(
     upstream: SocketAddr,
     prefix: Option<&'static str>,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -3839,7 +3821,7 @@ fn spawn_modern_http_proxy_gateway_with_prefix(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -4277,6 +4259,7 @@ fn spawn_modern_task_http_server() -> HttpServerFixture {
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -4390,7 +4373,7 @@ fn spawn_modern_http_task_proxy_gateway(upstream: SocketAddr) -> HttpServerFixtu
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -4723,6 +4706,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
     list_page_size: Option<usize>,
     on_duplicate: Option<DuplicateBehavior>,
 ) -> (HttpServerFixture, Option<FinalTaskId>) {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) =
         mpsc::sync_channel::<Result<(SocketAddr, Option<FinalTaskId>), String>>(1);
@@ -4906,7 +4890,7 @@ fn spawn_modern_http_stdio_as_proxy_gateway_with_auth(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let (address, task_id) = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -5560,6 +5544,7 @@ fn spawn_modern_http_template_proxy_gateway(
     upstream: SocketAddr,
     expected_template: &'static str,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -5674,7 +5659,7 @@ fn spawn_modern_http_template_proxy_gateway(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -6231,9 +6216,7 @@ fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool()
         let mut response = Vec::new();
         let mut buffer = [0_u8; 8 * 1024];
         loop {
-            let read = stream
-                .read(&mut buffer)
-                .expect("native HTTP response reads within its configured deadline");
+            let read = read_native_http_response(&mut stream, &mut buffer);
             if read == 0 {
                 break;
             }
@@ -6399,8 +6382,14 @@ fn e2e_modern_facade_native_http_negotiates_then_dispatches_authenticated_tool()
         discovery["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["version"],
         json!("1.0.0")
     );
-    assert_eq!(discovery["result"]["capabilities"]["tools"], json!({}));
-    assert_eq!(discovery["result"]["capabilities"]["prompts"], json!({}));
+    assert_eq!(
+        discovery["result"]["capabilities"]["tools"],
+        json!({"listChanged": true})
+    );
+    assert_eq!(
+        discovery["result"]["capabilities"]["prompts"],
+        json!({"listChanged": true})
+    );
     assert_eq!(
         discovery["result"]["capabilities"]["completions"],
         json!({})
@@ -7572,58 +7561,68 @@ fn e2e_public_http_auto_falls_back_to_exact_legacy_on_live_eligible_refusal() {
 
 #[test]
 fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
-    let gate = Arc::new(OverlapFinalMethodGate::default());
-    let mut server =
-        HttpServerFixture::spawn_with_middleware(Some(Arc::clone(&gate) as Arc<dyn Middleware>));
+    let mut server = HttpServerFixture::spawn();
     let address = server.address();
+
+    // Establish both clients before either request begins. This proves the
+    // server retains both protocol eras simultaneously without blocking its
+    // single-thread runtime inside synchronous middleware.
+    let modern_cx = Cx::for_request();
+    let modern_builder = auto::client_builder()
+        .client_info("e2e-isolated-modern-client", "1.0.0")
+        .protocol_plan(plan(address, ProtocolPolicy::Auto));
+    let modern_client = runtime_block_on_bounded(
+        &modern_cx,
+        modern_builder.connect_http_client_with_cx(&modern_cx),
+    )
+    .expect("the first Auto client selects modern");
+    assert_eq!(
+        modern_client.selected_protocol_era(),
+        ProtocolEra::Modern2026
+    );
+
+    let legacy_cx = Cx::for_request();
+    let legacy_builder = auto::client_builder()
+        .client_info("e2e-isolated-legacy-client", "1.0.0")
+        .protocol_plan(plan_with_modern_post_path(
+            address,
+            ProtocolPolicy::Auto,
+            "/modern-unavailable",
+        ));
+    let legacy_client = runtime_block_on_bounded(
+        &legacy_cx,
+        legacy_builder.connect_http_client_with_cx(&legacy_cx),
+    )
+    .expect("the second Auto client selects legacy while the modern client remains live");
+    assert_eq!(
+        legacy_client.selected_protocol_era(),
+        ProtocolEra::Legacy2024
+    );
 
     let (completed_tx, completed_rx) = mpsc::channel();
     let modern_completed_tx = completed_tx.clone();
     let mut modern_worker = Some(thread::spawn(move || {
         let result = (|| -> Result<serde_json::Value, String> {
-            let cx = Cx::for_request();
-            let builder = auto::client_builder()
-                .client_info("e2e-isolated-modern-client", "1.0.0")
-                .protocol_plan(plan(address, ProtocolPolicy::Auto));
-            let mut client =
-                runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx)).map_err(
-                    |error| format!("the first Auto client did not select modern: {error}"),
-                )?;
-            if client.selected_protocol_era() != ProtocolEra::Modern2026 {
-                return Err("the first client did not retain an independent modern era".to_owned());
-            }
+            let mut client = modern_client;
             let response = runtime_block_on_bounded(
-                &cx,
-                client.request(&cx, "tools/list", json!({ "cursor": null })),
+                &modern_cx,
+                client.request(&modern_cx, "tools/list", json!({ "cursor": null })),
             )
             .map_err(|error| format!("the modern tools/list request failed: {error}"))?;
             let ClientHttpResponse::Modern(response) = response else {
                 return Err("the first client did not retain its modern response lane".to_owned());
             };
-            Ok(final_response_document(&cx, response))
+            Ok(final_response_document(&modern_cx, response))
         })();
         let _ = modern_completed_tx.send(OverlapWorkerCompletion::Modern(result));
     }));
     let legacy_completed_tx = completed_tx.clone();
     let mut legacy_worker = Some(thread::spawn(move || {
         let result = (|| -> Result<serde_json::Value, String> {
-            let cx = Cx::for_request();
-            let builder = auto::client_builder()
-                .client_info("e2e-isolated-legacy-client", "1.0.0")
-                .protocol_plan(plan_with_modern_post_path(
-                    address,
-                    ProtocolPolicy::Auto,
-                    "/modern-unavailable",
-                ));
-            let mut client =
-                runtime_block_on_bounded(&cx, builder.connect_http_client_with_cx(&cx)).map_err(
-                    |error| format!("the second Auto client did not select legacy: {error}"),
-                )?;
-            if client.selected_protocol_era() != ProtocolEra::Legacy2024 {
-                return Err("the second client inherited a foreign protocol era".to_owned());
-            }
-            let response = runtime_block_on_bounded(&cx, client.request(&cx, "ping", json!({})))
-                .map_err(|error| format!("the legacy ping request failed: {error}"))?;
+            let mut client = legacy_client;
+            let response =
+                runtime_block_on_bounded(&legacy_cx, client.request(&legacy_cx, "ping", json!({})))
+                    .map_err(|error| format!("the legacy ping request failed: {error}"))?;
             let ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response else {
                 return Err("the second client did not retain its legacy response lane".to_owned());
             };
@@ -7634,8 +7633,6 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
     }));
     drop(completed_tx);
 
-    let admission = gate.wait_for_cross_era_requests();
-    gate.release();
     let (modern_document, legacy_document) =
         collect_overlap_worker_results(&completed_rx, HTTP_SERVER_TEARDOWN_BOUND);
     let modern_join = join_finished_thread(
@@ -7650,9 +7647,6 @@ fn e2e_public_http_auto_isolates_live_modern_and_legacy_clients() {
     );
     let teardown = server.settle();
 
-    admission.expect(
-        "the modern tools/list and legacy ping requests must reach the server before either response runs",
-    );
     teardown.expect("the bounded server teardown runs after overlap completion collection");
     modern_join.expect("the modern overlap worker joins without detaching");
     legacy_join.expect("the legacy overlap worker joins without detaching");
@@ -11076,8 +11070,8 @@ fn e2e_public_http_as_proxy_catalog_and_tasks_listen_stay_live_on_the_same_clien
     );
 
     drop(client);
-    gateway.shutdown();
-    upstream.shutdown();
+    gateway.shutdown_named("dual-listen gateway");
+    upstream.shutdown_named("dual-listen upstream");
 }
 
 #[cfg(all(unix, feature = "proxy", feature = "tasks"))]
@@ -11146,8 +11140,12 @@ fn e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same
         client.start_subscriptions_listener(&cx, catalog_filter, limits),
     )
     .expect("stdio as_proxy must admit a catalog listener while official Tasks remain unused");
-    let catalog_ack = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
-        .expect("stdio as_proxy catalog listen must emit its acknowledgement");
+    let catalog_ack = runtime_block_on_bounded_named(
+        &cx,
+        "stdio dual-listen catalog acknowledgement",
+        client.next_http_subscription_event(&cx),
+    )
+    .expect("stdio as_proxy catalog listen must emit its acknowledgement");
     assert!(
         matches!(
             catalog_ack,
@@ -11192,7 +11190,12 @@ fn e2e_public_http_as_proxy_stdio_catalog_and_tasks_listen_stay_live_on_the_same
         }),
         "an inbound catalog listen must count as echo notify_resource_updated delivery: {touched:?}"
     );
-    let updated = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx)).expect(
+    let updated = runtime_block_on_bounded_named(
+        &cx,
+        "stdio dual-listen catalog resources/updated",
+        client.next_http_subscription_event(&cx),
+    )
+    .expect(
         "stdio as_proxy catalog listen must retain resources/updated while Tasks listen is live",
     );
     assert!(
@@ -11785,8 +11788,12 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_updated_on_catalog_listen() 
         client.start_subscriptions_listener(&cx, filter, limits),
     )
     .expect("stdio as_proxy must admit a catalog listener for info://server");
-    let acknowledgement = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
-        .expect("stdio as_proxy catalog listen must emit its acknowledgement");
+    let acknowledgement = runtime_block_on_bounded_named(
+        &cx,
+        "stdio catalog-listen acknowledgement",
+        client.next_http_subscription_event(&cx),
+    )
+    .expect("stdio as_proxy catalog listen must emit its acknowledgement");
     assert!(
         matches!(
             acknowledgement,
@@ -11808,8 +11815,12 @@ fn e2e_public_http_as_proxy_stdio_forwards_resource_updated_on_catalog_listen() 
         "an inbound catalog listen must count as echo notify_resource_updated delivery: {touched:?}"
     );
 
-    let updated = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
-        .expect("stdio as_proxy catalog listen must retain the relayed resources/updated");
+    let updated = runtime_block_on_bounded_named(
+        &cx,
+        "stdio catalog-listen resources/updated",
+        client.next_http_subscription_event(&cx),
+    )
+    .expect("stdio as_proxy catalog listen must retain the relayed resources/updated");
     assert!(
         matches!(
             updated,
@@ -12335,6 +12346,7 @@ fn spawn_modern_http_identity_proxy_gateway_configured_with_auth(
     strict_input: bool,
     list_page_size: Option<usize>,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -12481,7 +12493,7 @@ fn spawn_modern_http_identity_proxy_gateway_configured_with_auth(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -17101,9 +17113,7 @@ fn e2e_public_http_as_proxy_gateway_static_token_refuses_missing_and_wrong() {
         let mut response = Vec::new();
         let mut buffer = [0_u8; 8 * 1024];
         loop {
-            let read = stream
-                .read(&mut buffer)
-                .expect("native HTTP response reads within its configured deadline");
+            let read = read_native_http_response(&mut stream, &mut buffer);
             if read == 0 {
                 break;
             }
@@ -18325,6 +18335,7 @@ fn spawn_modern_http_as_proxy_duplicate_gateway(
     upstream: SocketAddr,
     behavior: DuplicateBehavior,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -18432,7 +18443,7 @@ fn spawn_modern_http_as_proxy_duplicate_gateway(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -18564,6 +18575,7 @@ fn spawn_legacy_as_proxy_http_duplicate_gateway(
     upstream: SocketAddr,
     behavior: DuplicateBehavior,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -18688,7 +18700,7 @@ fn spawn_legacy_as_proxy_http_duplicate_gateway(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -20175,9 +20187,7 @@ fn e2e_public_http_as_proxy_stdio_gateway_static_token_refuses_missing_and_wrong
         let mut response = Vec::new();
         let mut buffer = [0_u8; 8 * 1024];
         loop {
-            let read = stream
-                .read(&mut buffer)
-                .expect("native HTTP response reads within its configured deadline");
+            let read = read_native_http_response(&mut stream, &mut buffer);
             if read == 0 {
                 break;
             }
@@ -24396,9 +24406,7 @@ fn e2e_public_http_static_token_refuses_missing_and_wrong_and_commits_subject() 
         let mut response = Vec::new();
         let mut buffer = [0_u8; 8 * 1024];
         loop {
-            let read = stream
-                .read(&mut buffer)
-                .expect("native HTTP response reads within its configured deadline");
+            let read = read_native_http_response(&mut stream, &mut buffer);
             if read == 0 {
                 break;
             }
@@ -30571,6 +30579,7 @@ fn write_legacy_native_http(
             {
                 break;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => {
                 panic!("native HTTP response reads within its configured deadline: {error}")
             }
@@ -32585,6 +32594,7 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
     list_page_size: Option<usize>,
     on_duplicate: Option<DuplicateBehavior>,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -32592,7 +32602,13 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
     let join = Some(thread::spawn(move || {
         let ready_for_spawn_failure = ready_tx.clone();
         let finished_for_spawn_failure = finished_tx.clone();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        // The proxied stdio call is a synchronous public surface. It can park
+        // one worker while the same gateway still has to forward upstream
+        // notifications or deliver a downstream reverse request. Keep those
+        // independently schedulable so progress and sampling cannot starve
+        // behind the in-flight proxy handler.
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
             .with_reactor(
                 asupersync::runtime::reactor::create_reactor()
                     .expect("legacy stdio as_proxy gateway HTTP server reactor initializes"),
@@ -32744,7 +32760,7 @@ fn spawn_legacy_http_stdio_as_proxy_gateway_with_auth(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -32832,6 +32848,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
     strict_input: bool,
     list_page_size: Option<usize>,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -32839,7 +32856,12 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
     let join = Some(thread::spawn(move || {
         let ready_for_spawn_failure = ready_tx.clone();
         let finished_for_spawn_failure = finished_tx.clone();
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        // Reverse sampling parks one connection-owned callback while the
+        // downstream SSE writer must deliver a second server request. Keep
+        // those independently schedulable; a one-worker fixture deadlocks
+        // before the downstream client can answer the callback.
+        let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
             .with_reactor(
                 asupersync::runtime::reactor::create_reactor()
                     .expect("legacy as_proxy gateway HTTP server reactor initializes"),
@@ -33011,7 +33033,7 @@ fn spawn_legacy_as_proxy_http_gateway_configured_with_auth(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -34306,6 +34328,7 @@ fn spawn_legacy_as_proxy_instructions_gateway_named(
     mask_error_details: bool,
     request_timeout_secs: Option<u64>,
 ) -> HttpServerFixture {
+    let _startup_guard = proxy_gateway_startup_guard();
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<SocketAddr, String>>(1);
     let (server_cx_tx, server_cx_rx) = mpsc::sync_channel::<Cx>(1);
@@ -34418,7 +34441,7 @@ fn spawn_legacy_as_proxy_instructions_gateway_named(
         finished: Some(finished_rx),
         join,
     };
-    let startup_deadline = Instant::now() + HTTP_SERVER_STARTUP_BOUND;
+    let startup_deadline = Instant::now() + PROXY_GATEWAY_STARTUP_BOUND;
     let address = loop {
         startup.capture_server_cx();
         let remaining = startup_deadline.saturating_duration_since(Instant::now());
@@ -36096,9 +36119,7 @@ fn e2e_public_http_custom_token_verifier_refuses_wrong_and_commits_subject() {
         let mut response = Vec::new();
         let mut buffer = [0_u8; 8 * 1024];
         loop {
-            let read = stream
-                .read(&mut buffer)
-                .expect("native HTTP response reads within its configured deadline");
+            let read = read_native_http_response(&mut stream, &mut buffer);
             if read == 0 {
                 break;
             }

@@ -2478,14 +2478,30 @@ fn validate_standard_base64(value: &str) -> Result<(), CommonTypeError> {
 }
 
 fn valid_mime_type(value: &str) -> bool {
-    let Some((kind, subtype)) = value.split_once('/') else {
+    let mut segments = value.split(';');
+    let Some(media_type) = segments.next() else {
         return false;
     };
-    !kind.is_empty()
+    let Some((kind, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    let valid_media_type = !kind.is_empty()
         && !subtype.is_empty()
         && !subtype.contains('/')
         && kind.bytes().all(is_mime_token)
-        && subtype.bytes().all(is_mime_token)
+        && subtype.bytes().all(is_mime_token);
+    valid_media_type
+        && segments.all(|parameter| {
+            let Some((name, value)) = parameter.split_once('=') else {
+                return false;
+            };
+            let name = name.trim();
+            let value = value.trim();
+            !name.is_empty()
+                && !value.is_empty()
+                && name.bytes().all(is_mime_token)
+                && value.bytes().all(is_mime_token)
+        })
 }
 
 fn is_mime_token(byte: u8) -> bool {
@@ -3589,6 +3605,28 @@ mod tests {
             CancellationRequestId::IntegerExact(value)
                 if value.as_str() == "922337203685477580812345678901234567890"
         ));
+    }
+
+    #[test]
+    fn embedded_resource_accepts_bounded_mime_parameters_and_rejects_missing_values() {
+        let accepted = json!({
+            "uri": "ui://weather/dashboard",
+            "text": "<main>weather</main>",
+            "mimeType": "text/html;profile=mcp-app",
+        });
+        let resource: EmbeddedResourceContents = serde_json::from_value(accepted.clone())
+            .expect("the official MCP Apps MIME parameter is valid resource content");
+        assert_eq!(
+            serde_json::to_value(resource).expect("parameterized MIME type re-encodes"),
+            accepted
+        );
+
+        let mut missing_value = accepted;
+        missing_value["mimeType"] = json!("text/html;profile");
+        assert!(
+            serde_json::from_value::<EmbeddedResourceContents>(missing_value).is_err(),
+            "removing only the MIME parameter value must reject"
+        );
     }
 
     #[test]

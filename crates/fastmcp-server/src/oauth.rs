@@ -8100,7 +8100,10 @@ mod tests {
         // 43-byte floor outright, so the most permissive LEGAL configuration
         // is the floor itself; the short verifier below must still bounce.
         config.min_code_verifier_length = PKCE_CODE_VERIFIER_MIN_BYTES;
-        let server = OAuthServer::new(config);
+        let server = OAuthServer::with_approval_backend(
+            config,
+            Arc::new(TestDefaultAuthorizationApprovalBackend),
+        );
         let client = OAuthClient::builder("c")
             .redirect_uri("http://127.0.0.1/cb")
             .build()
@@ -11117,7 +11120,7 @@ mod tests {
     fn oauth_crypto_ownership_and_fallbacks_are_denied() {
         let source = include_str!("oauth.rs");
         let production = source
-            .split_once("\n#[cfg(test)]")
+            .split_once("\n#[cfg(test)]\nmod tests")
             .map_or(source, |(production, _)| production);
 
         assert!(!production.contains("getrandom::"));

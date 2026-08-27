@@ -39,10 +39,13 @@ use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt, Open
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, OpenOptions};
 
+use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
-use fastmcp_protocol::{FinalResourceTemplate, Resource, ResourceContent, ResourceTemplate};
+use fastmcp_protocol::{
+    FinalReadResourceResult, FinalResourceTemplate, Resource, ResourceContent, ResourceTemplate,
+};
 
-use crate::handler::{BoxFuture, ResourceHandler, UriParams};
+use crate::handler::{BoxFuture, FinalMethodOutcome, ResourceHandler, UriParams};
 
 /// Default maximum file size (10 MB).
 const DEFAULT_MAX_SIZE: usize = 10 * 1024 * 1024;
@@ -1208,29 +1211,12 @@ impl FilesystemResourceHandler {
 async fn run_filesystem_blocking<T, F>(ctx: &McpContext, work: F) -> McpOutcome<T>
 where
     T: Send + 'static,
-    F: FnOnce(&McpContext) -> McpResult<T> + Clone + Send + 'static,
+    F: FnOnce(&McpContext) -> McpResult<T> + Send + 'static,
 {
-    let request_id = ctx.request_id();
-    let runtime_cx = ctx.cx();
-    // Retain a clone for the no-blocking-pool fallback: spawn_blocking consumes
-    // the closure whether or not it succeeds in scheduling it.
-    let fallback = work.clone();
-    match runtime_cx.spawn_blocking(move |child| {
-        let child_ctx = McpContext::new(child, request_id);
-        work(&child_ctx)
-    }) {
-        Ok(mut handle) => match handle.join(runtime_cx).await {
-            Ok(Ok(value)) => Outcome::Ok(value),
-            Ok(Err(error)) => Outcome::Err(error),
-            Err(asupersync::runtime::JoinError::Cancelled(_)) => {
-                Outcome::Err(McpError::request_cancelled())
-            }
-            Err(error) => Outcome::Err(McpError::internal_error(error.to_string())),
-        },
-        Err(_) => match fallback(ctx) {
-            Ok(value) => Outcome::Ok(value),
-            Err(error) => Outcome::Err(error),
-        },
+    let worker_ctx = ctx.clone();
+    match asupersync::runtime::spawn_blocking(move || work(&worker_ctx)).await {
+        Ok(value) => Outcome::Ok(value),
+        Err(error) => Outcome::Err(error),
     }
 }
 
@@ -1307,6 +1293,42 @@ impl ResourceHandler for FilesystemResourceHandler {
         Box::pin(async move {
             run_filesystem_blocking(ctx, move |child| {
                 handler.read_with_uri(child, &uri, &params)
+            })
+            .await
+        })
+    }
+
+    fn read_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        let handler = self.clone();
+        let uri = uri.to_owned();
+        let params = params.clone();
+        Box::pin(async move {
+            run_filesystem_blocking(ctx, move |child| {
+                handler.read_with_uri(child, &uri, &params)
+            })
+            .await
+        })
+    }
+
+    fn read_final_outcome_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<FinalMethodOutcome<FinalReadResourceResult>>> {
+        let handler = self.clone();
+        let uri = uri.to_owned();
+        let params = params.clone();
+        Box::pin(async move {
+            run_filesystem_blocking(ctx, move |child| {
+                handler.read_final_outcome_with_uri(child, &uri, &params)
             })
             .await
         })

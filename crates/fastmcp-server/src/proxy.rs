@@ -18,19 +18,23 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 #[cfg(feature = "tasks")]
 use fastmcp_client::FinalToolCallOutcome;
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_client::StdioRequestExecution;
 #[cfg(feature = "tasks")]
 use fastmcp_client::StdioTaskSubscriptionEvent;
-use fastmcp_client::http_executor::{
-    LegacyHttpRequest, LegacySsePersistentReceiver, ModernHttpClient, ModernHttpResponseKind,
-};
+use fastmcp_client::http_executor::{ModernHttpClient, ModernHttpResponseKind};
 #[cfg(feature = "tasks")]
 use fastmcp_client::http_executor::{ModernHttpFinalCoreEvent, ModernHttpSubscriptionListenError};
 use fastmcp_client::sse::SseLimits;
 use fastmcp_client::{
-    Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse,
-    ClientProtocolPlan, CompletionParams, CompletionReference, ModernHttpSubscriptionListenEvent,
-    ModernHttpSubscriptionListener, ReverseRequestHandlers, StdioRequestExecution,
+    Client, ClientHttpConnection, ClientHttpConnectionError, ClientProtocolPlan, CompletionParams,
+    CompletionReference, ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
     StdioSubscriptionEvent,
+};
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_client::{
+    ClientHttpResponse, LegacyHttpRequest, ReverseRequestHandlers,
+    http_executor::LegacySsePersistentReceiver,
 };
 use fastmcp_core::{
     CanonicalHttpUrl, McpContext, McpError, McpErrorCode, McpLogLevel, McpOutcome, McpResult,
@@ -50,18 +54,18 @@ use fastmcp_protocol::protocol_policy::{
 };
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
-    CompletionValues, Content, CoreRequest, CoreResult, CreateMessageParams, CreateMessageResult,
-    ElicitationCapability, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
-    FINAL_LOG_LEVEL_META_KEY, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
-    FinalCoreResult, FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
+    CompletionValues, Content, CoreRequest, CoreResult, CreateMessageParams, ElicitationCapability,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
+    FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
+    FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
-    InitializeParams, InitializeResult, InputRequiredResult, JsonRpcMessage, JsonRpcRequest,
-    JsonRpcResponse, LegacyCompletionParams, LegacyCompletionReference, LegacyContent,
-    LegacyCoreResult, LegacyPromptMessage, LegacyResourceContent, ListRootsResult, ProgressParams,
-    Prompt, PromptMessage, ReadResourceResult, RequestId, Resource, ResourceContent,
-    ResourceTemplate, Root, RootsCapability, SamplingCapability, SamplingContent,
-    ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool, ToolAnnotations,
-    UrlElicitationCapability, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
+    InputRequiredResult, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
+    LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
+    LegacyResourceContent, ProgressParams, Prompt, PromptMessage, ReadResourceResult, RequestId,
+    Resource, ResourceContent, ResourceTemplate, RootsCapability, SamplingCapability,
+    SamplingContent, ServerDiscoverResult, ServerNotification, SubscriptionFilter, Tool,
+    ToolAnnotations, UrlElicitationCapability, decode_strict_jsonrpc_message,
+    decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::{
@@ -70,6 +74,10 @@ use fastmcp_protocol::{
     FinalGetTaskResult, FinalTaskId, ServerExtensionDiscovery, Task as FinalTask,
     TaskInputResponses as FinalTaskInputResponses, UpdateTaskParams, UpdateTaskResult,
     task_subscription_ids,
+};
+#[cfg(feature = "legacy-2024-11-05")]
+use fastmcp_protocol::{
+    CreateMessageResult, InitializeParams, InitializeResult, ListRootsResult, Root,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -480,12 +488,14 @@ impl ProxyCatalogListener for ProxyHttpCatalogListener {
 /// before constructing [`LegacyHttpRequest`], so a downstream cancellation
 /// can never emit a legacy control for an uncommitted request.
 #[doc(hidden)]
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct ProxyLegacyHttpRequest {
     request: CoreRequest,
     handle: LegacyHttpRequest,
 }
 
 /// Prepared exact-2024 HTTP start that can POST after the route mutex drops.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct PreparedLegacyHttpStart {
     request: CoreRequest,
     method: String,
@@ -496,6 +506,7 @@ pub struct PreparedLegacyHttpStart {
 }
 
 /// Prepared exact-2024 stdio start that can yield after the route mutex drops.
+#[cfg(feature = "legacy-2024-11-05")]
 pub struct PreparedLegacyStdioStart {
     request: CoreRequest,
     execution: StdioRequestExecution,
@@ -527,6 +538,7 @@ impl PreparedIncrementalHttpListen {
     }
 }
 
+#[cfg(feature = "legacy-2024-11-05")]
 impl ProxyLegacyHttpRequest {
     fn new(request: CoreRequest, handle: LegacyHttpRequest) -> Self {
         Self { request, handle }
@@ -1069,6 +1081,22 @@ pub trait ProxyBackend: Send {
         self.call_tool_result_with_final_progress(name, arguments, on_progress)
     }
 
+    /// Runs a final tool request without advertising Tasks upstream.
+    ///
+    /// Backends without a request-local extension surface fall back to their
+    /// ordinary call. Native stdio overrides this so a downstream caller that
+    /// did not negotiate Tasks cannot cause an unowned upstream Task commit.
+    #[cfg(feature = "tasks")]
+    fn call_tool_result_without_tasks_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        self.call_tool_result_with_context_and_final_progress(ctx, name, arguments, on_progress)
+    }
+
     /// Runs one exact-2024 tool request and forwards its legacy progress
     /// notifications through the request-scoped callback.
     fn call_tool_result_with_context_and_legacy_progress(
@@ -1089,6 +1117,7 @@ pub trait ProxyBackend: Send {
     /// route, where the returned handle owns its response correlation and
     /// bounded late-response retirement.
     #[doc(hidden)]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_request_with_context(
         &mut self,
         _ctx: &McpContext,
@@ -1105,6 +1134,7 @@ pub trait ProxyBackend: Send {
     /// route lock while still returning the detached request handle before the
     /// caller waits or sends cancellation control.
     #[doc(hidden)]
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_completion_with_context(
         &mut self,
         _ctx: &McpContext,
@@ -1163,12 +1193,14 @@ pub trait ProxyBackend: Send {
     /// gateway serve runtime. Starting the pump inside `block_on` orphans it
     /// on the process-wide runtime, which is idle while the inbound loop
     /// waits for reverse sampling/roots.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_receive_pump(&mut self) -> McpResult<()> {
         Ok(())
     }
 
     /// Prepares one exact-2024 HTTP start so the POST can be awaited after
     /// the route mutex is released.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn prepare_legacy_http_start(
         &mut self,
         _ctx: &McpContext,
@@ -1180,6 +1212,7 @@ pub trait ProxyBackend: Send {
 
     /// Starts one exact-2024 stdio request on the multiplexed executor so the
     /// inbound serve loop can yield while reverse sampling/roots complete.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_stdio_yielding(
         &mut self,
         _ctx: &McpContext,
@@ -1190,6 +1223,7 @@ pub trait ProxyBackend: Send {
     }
 
     /// Takes one already-routed exact-2024 stdio result without reading.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn try_take_legacy_stdio_yielding(
         &mut self,
         _start: &mut PreparedLegacyStdioStart,
@@ -1198,11 +1232,13 @@ pub trait ProxyBackend: Send {
     }
 
     /// Drives one bounded stdio ingress turn, then returns so the caller can yield.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn drive_legacy_stdio_yielding(&mut self) -> McpResult<()> {
         Ok(())
     }
 
     /// Cancels one yielding exact-2024 stdio request.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn cancel_legacy_stdio_yielding(
         &mut self,
         _start: &mut PreparedLegacyStdioStart,
@@ -1248,6 +1284,17 @@ pub trait ProxyBackend: Send {
         Err(McpError::invalid_request(
             "Proxy backend cannot resume an official MRTR continuation",
         ))
+    }
+
+    /// Resumes a final continuation without advertising Tasks upstream.
+    #[cfg(feature = "tasks")]
+    fn request_final_core_without_tasks_with_parameters(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        self.request_final_core_with_parameters(ctx, method, parameters)
     }
 
     /// Runs one prompt lookup under the downstream request's cancellation domain.
@@ -2322,6 +2369,7 @@ impl ProxyBackend for Client {
         Client::unbind_inbound_legacy_reverse(self)
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_stdio_yielding(
         &mut self,
         ctx: &McpContext,
@@ -2353,6 +2401,7 @@ impl ProxyBackend for Client {
         Ok(Some(PreparedLegacyStdioStart { request, execution }))
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn try_take_legacy_stdio_yielding(
         &mut self,
         start: &mut PreparedLegacyStdioStart,
@@ -2378,10 +2427,12 @@ impl ProxyBackend for Client {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn drive_legacy_stdio_yielding(&mut self) -> McpResult<()> {
         self.drive_yielding_stdio_slice()
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn cancel_legacy_stdio_yielding(
         &mut self,
         start: &mut PreparedLegacyStdioStart,
@@ -2410,26 +2461,36 @@ impl ProxyBackend for Client {
                     Client::list_tools(self).map(ProxyToolCatalog::Legacy)
                 }
             }
-            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
-                fastmcp_protocol::methods::TOOLS_LIST,
-                |cursor| match Client::list_tools_typed(self, cursor)? {
-                    CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
-                        let payload = result.payload;
-                        Ok((
-                            payload.tools,
-                            payload.next_cursor,
-                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
-                        ))
-                    }
-                    CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
-                        Err(McpError::invalid_request(
-                            "Modern proxy client received a legacy tools/list result",
-                        ))
-                    }
-                    _ => Err(unexpected_proxy_result("tools/list")),
-                },
-            )
-            .map(ProxyToolCatalog::Final),
+            ProtocolEra::Modern2026 => {
+                let advertised = self
+                    .server_discovery()
+                    .map(|discovery| discovery_supports_final_capability(discovery, "tools"))
+                    .transpose()?
+                    .unwrap_or(false);
+                if !advertised {
+                    return Ok(ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::new())));
+                }
+                collect_modern_proxy_catalog_pages(
+                    fastmcp_protocol::methods::TOOLS_LIST,
+                    |cursor| match Client::list_tools_typed(self, cursor)? {
+                        CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
+                            let payload = result.payload;
+                            Ok((
+                                payload.tools,
+                                payload.next_cursor,
+                                ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                            ))
+                        }
+                        CoreResult::Legacy(LegacyCoreResult::ToolsList(_)) => {
+                            Err(McpError::invalid_request(
+                                "Modern proxy client received a legacy tools/list result",
+                            ))
+                        }
+                        _ => Err(unexpected_proxy_result("tools/list")),
+                    },
+                )
+                .map(ProxyToolCatalog::Final)
+            }
         }
     }
 
@@ -2468,26 +2529,38 @@ impl ProxyBackend for Client {
                     _ => Err(unexpected_proxy_result("resources/list")),
                 }
             }
-            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
-                fastmcp_protocol::methods::RESOURCES_LIST,
-                |cursor| match Client::list_resources_typed(self, cursor)? {
-                    CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
-                        let payload = result.payload;
-                        Ok((
-                            payload.resources,
-                            payload.next_cursor,
-                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
-                        ))
-                    }
-                    CoreResult::Legacy(LegacyCoreResult::ResourcesList(_)) => {
-                        Err(McpError::invalid_request(
-                            "Modern proxy client received a legacy resources/list result",
-                        ))
-                    }
-                    _ => Err(unexpected_proxy_result("resources/list")),
-                },
-            )
-            .map(ProxyResourceCatalog::Final),
+            ProtocolEra::Modern2026 => {
+                let advertised = self
+                    .server_discovery()
+                    .map(|discovery| discovery_supports_final_capability(discovery, "resources"))
+                    .transpose()?
+                    .unwrap_or(false);
+                if !advertised {
+                    return Ok(ProxyResourceCatalog::Final(ProxyFinalCatalog::new(
+                        Vec::new(),
+                    )));
+                }
+                collect_modern_proxy_catalog_pages(
+                    fastmcp_protocol::methods::RESOURCES_LIST,
+                    |cursor| match Client::list_resources_typed(self, cursor)? {
+                        CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
+                            let payload = result.payload;
+                            Ok((
+                                payload.resources,
+                                payload.next_cursor,
+                                ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                            ))
+                        }
+                        CoreResult::Legacy(LegacyCoreResult::ResourcesList(_)) => {
+                            Err(McpError::invalid_request(
+                                "Modern proxy client received a legacy resources/list result",
+                            ))
+                        }
+                        _ => Err(unexpected_proxy_result("resources/list")),
+                    },
+                )
+                .map(ProxyResourceCatalog::Final)
+            }
         }
     }
 
@@ -2530,9 +2603,20 @@ impl ProxyBackend for Client {
                     _ => Err(unexpected_proxy_result("resources/templates/list")),
                 }
             }
-            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
-                fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
-                |cursor| match Client::list_resource_templates_typed(self, cursor)? {
+            ProtocolEra::Modern2026 => {
+                let advertised = self
+                    .server_discovery()
+                    .map(|discovery| discovery_supports_final_capability(discovery, "resources"))
+                    .transpose()?
+                    .unwrap_or(false);
+                if !advertised {
+                    return Ok(ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(
+                        Vec::new(),
+                    )));
+                }
+                collect_modern_proxy_catalog_pages(
+                    fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
+                    |cursor| match Client::list_resource_templates_typed(self, cursor)? {
                     CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
                         result, ..
                     }) => {
@@ -2549,9 +2633,10 @@ impl ProxyBackend for Client {
                         ))
                     }
                     _ => Err(unexpected_proxy_result("resources/templates/list")),
-                },
-            )
-            .map(ProxyResourceTemplateCatalog::Final),
+                    },
+                )
+                .map(ProxyResourceTemplateCatalog::Final)
+            }
         }
     }
 
@@ -2588,26 +2673,38 @@ impl ProxyBackend for Client {
                     _ => Err(unexpected_proxy_result("prompts/list")),
                 }
             }
-            ProtocolEra::Modern2026 => collect_modern_proxy_catalog_pages(
-                fastmcp_protocol::methods::PROMPTS_LIST,
-                |cursor| match Client::list_prompts_typed(self, cursor)? {
-                    CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
-                        let payload = result.payload;
-                        Ok((
-                            payload.prompts,
-                            payload.next_cursor,
-                            ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
-                        ))
-                    }
-                    CoreResult::Legacy(LegacyCoreResult::PromptsList(_)) => {
-                        Err(McpError::invalid_request(
-                            "Modern proxy client received a legacy prompts/list result",
-                        ))
-                    }
-                    _ => Err(unexpected_proxy_result("prompts/list")),
-                },
-            )
-            .map(ProxyPromptCatalog::Final),
+            ProtocolEra::Modern2026 => {
+                let advertised = self
+                    .server_discovery()
+                    .map(|discovery| discovery_supports_final_capability(discovery, "prompts"))
+                    .transpose()?
+                    .unwrap_or(false);
+                if !advertised {
+                    return Ok(ProxyPromptCatalog::Final(
+                        ProxyFinalCatalog::new(Vec::new()),
+                    ));
+                }
+                collect_modern_proxy_catalog_pages(
+                    fastmcp_protocol::methods::PROMPTS_LIST,
+                    |cursor| match Client::list_prompts_typed(self, cursor)? {
+                        CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
+                            let payload = result.payload;
+                            Ok((
+                                payload.prompts,
+                                payload.next_cursor,
+                                ProxyCatalogCacheHint::new(payload.ttl_ms, payload.cache_scope),
+                            ))
+                        }
+                        CoreResult::Legacy(LegacyCoreResult::PromptsList(_)) => {
+                            Err(McpError::invalid_request(
+                                "Modern proxy client received a legacy prompts/list result",
+                            ))
+                        }
+                        _ => Err(unexpected_proxy_result("prompts/list")),
+                    },
+                )
+                .map(ProxyPromptCatalog::Final)
+            }
         }
     }
 
@@ -2786,6 +2883,44 @@ impl ProxyBackend for Client {
             parameters,
             |_| {},
         )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        for progress in self.take_final_progress_notifications() {
+            if expected_marker.as_ref() == Some(&progress.progress_token) {
+                on_progress(progress);
+            }
+        }
+        Ok(result)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn call_tool_result_without_tasks_with_context_and_final_progress(
+        &mut self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        let mut parameters = serde_json::json!({"name": name, "arguments": arguments});
+        let expected_marker = ctx_progress_marker(ctx);
+        if let Some(marker) = ctx.progress_marker() {
+            overlay_legacy_progress_token(&mut parameters, marker)?;
+        }
+        parameters = stdio_parameters_with_inbound_identity(
+            self.selected_protocol_era(),
+            parameters,
+            ctx.client_implementation(),
+            inbound_logging_level(ctx),
+            inbound_client_capabilities(ctx),
+        );
+        let result = self.request_core_with_cancellation_without_tasks(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            fastmcp_protocol::methods::TOOLS_CALL,
+            parameters,
+            |_| {},
+        )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
             if expected_marker.as_ref() == Some(&progress.progress_token) {
@@ -2814,6 +2949,32 @@ impl ProxyBackend for Client {
             ),
             |_| {},
         )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
+        relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
+        Ok(result)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn request_final_core_without_tasks_with_parameters(
+        &mut self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let result = self.request_core_with_cancellation_without_tasks(
+            ctx.cx(),
+            &ctx.request_cancellation(),
+            method,
+            stdio_parameters_with_inbound_identity(
+                self.selected_protocol_era(),
+                parameters,
+                ctx.client_implementation(),
+                inbound_logging_level(ctx),
+                inbound_client_capabilities(ctx),
+            ),
+            |_| {},
+        )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         Ok(result)
     }
@@ -2868,6 +3029,7 @@ impl ProxyBackend for Client {
             parameters,
             |_| {},
         )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
             if expected_marker.as_ref() == Some(&progress.progress_token) {
@@ -2916,6 +3078,7 @@ impl ProxyBackend for Client {
             parameters,
             |_| {},
         )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
             if expected_marker.as_ref() == Some(&progress.progress_token) {
@@ -2966,6 +3129,7 @@ impl ProxyBackend for Client {
             parameters,
             |_| {},
         )?;
+        relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         for progress in self.take_final_progress_notifications() {
             if expected_marker.as_ref() == Some(&progress.progress_token) {
@@ -4306,6 +4470,22 @@ pub struct ProxyHttpClient {
     task_listener_opening: bool,
 }
 
+fn modern_http_client(connection: &ClientHttpConnection) -> Option<&ModernHttpClient> {
+    match connection {
+        ClientHttpConnection::Modern(client) => Some(client),
+        #[cfg(feature = "legacy-2024-11-05")]
+        ClientHttpConnection::LegacySse(_) => None,
+    }
+}
+
+fn modern_http_client_mut(connection: &mut ClientHttpConnection) -> Option<&mut ModernHttpClient> {
+    match connection {
+        ClientHttpConnection::Modern(client) => Some(client),
+        #[cfg(feature = "legacy-2024-11-05")]
+        ClientHttpConnection::LegacySse(_) => None,
+    }
+}
+
 impl std::fmt::Debug for ProxyHttpClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -4493,6 +4673,7 @@ impl ProxyHttpClient {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn ensure_legacy_initialized(&mut self) -> McpResult<()> {
         if self.legacy_initialized {
             return Ok(());
@@ -4545,6 +4726,14 @@ impl ProxyHttpClient {
         Ok(())
     }
 
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    fn ensure_legacy_initialized(&mut self) -> McpResult<()> {
+        Err(McpError::invalid_request(
+            "Exact-2024 proxy initialization requires feature `legacy-2024-11-05`",
+        ))
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
     fn configure_legacy_reverse_request_handlers(&mut self) -> McpResult<()> {
         if self.connection.selected_protocol_era() != ProtocolEra::Legacy2024 {
             return Err(McpError::internal_error(
@@ -4614,6 +4803,7 @@ impl ProxyHttpClient {
             .set_legacy_reverse_request_handlers(handlers)
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn request_legacy_response(
         &mut self,
         ctx: &McpContext,
@@ -4646,6 +4836,19 @@ impl ProxyHttpClient {
                 "Modern HTTP proxy connection entered a legacy request path",
             )),
         }
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    fn request_legacy_response(
+        &mut self,
+        _ctx: &McpContext,
+        _method: &str,
+        _parameters: serde_json::Value,
+        _request_id: RequestId,
+    ) -> McpResult<JsonRpcResponse> {
+        Err(McpError::invalid_request(
+            "Exact-2024 proxy requests require feature `legacy-2024-11-05`",
+        ))
     }
 
     fn request_result(
@@ -4699,7 +4902,7 @@ impl ProxyHttpClient {
         let request_id = self.next_request_id()?;
         let response_result = match self.connection.selected_protocol_era() {
             ProtocolEra::Modern2026 => {
-                let ClientHttpConnection::Modern(client) = &mut self.connection else {
+                let Some(client) = modern_http_client_mut(&mut self.connection) else {
                     return Err(McpError::internal_error(
                         "HTTP proxy connection era disagrees with its modern transport",
                     ));
@@ -4737,17 +4940,15 @@ impl ProxyHttpClient {
                 response,
                 raw_result,
             }) => (response, raw_result),
-            Err(error)
-                if ctx.is_some_and(|ctx| ctx.request_cancellation().is_cancel_requested())
-                    && self.connection.selected_protocol_era() == ProtocolEra::Legacy2024 =>
-            {
-                self.cancel_legacy_request(
-                    ctx.expect("cancellation context was checked"),
-                    &request_id,
-                )?;
+            Err(error) => {
+                if let Some(ctx) = ctx
+                    && ctx.request_cancellation().is_cancel_requested()
+                    && self.connection.selected_protocol_era() == ProtocolEra::Legacy2024
+                {
+                    self.cancel_legacy_request(ctx, &request_id)?;
+                }
                 return Err(error);
             }
-            Err(error) => return Err(error),
         };
         if let Some(error) = response.error.as_ref() {
             return Err(proxy_http_upstream_rpc_error(method, error));
@@ -4770,6 +4971,7 @@ impl ProxyHttpClient {
         })
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn request_legacy_response_unscoped(
         &mut self,
         method: &str,
@@ -4797,6 +4999,18 @@ impl ProxyHttpClient {
                 "Modern HTTP proxy connection entered a legacy request path",
             )),
         }
+    }
+
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    fn request_legacy_response_unscoped(
+        &mut self,
+        _method: &str,
+        _parameters: serde_json::Value,
+        _request_id: RequestId,
+    ) -> McpResult<JsonRpcResponse> {
+        Err(McpError::invalid_request(
+            "Exact-2024 proxy requests require feature `legacy-2024-11-05`",
+        ))
     }
 
     fn request_result_with_context(
@@ -4850,12 +5064,14 @@ impl ProxyBackend for ProxyHttpClient {
         Ok(())
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_receive_pump(&mut self) -> McpResult<()> {
         self.connection
             .start_legacy_receive_pump(&self.cx)
             .map_err(proxy_http_connection_error)
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn prepare_legacy_http_start(
         &mut self,
         ctx: &McpContext,
@@ -4899,6 +5115,7 @@ impl ProxyBackend for ProxyHttpClient {
         }))
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_request_with_context(
         &mut self,
         ctx: &McpContext,
@@ -4934,6 +5151,7 @@ impl ProxyBackend for ProxyHttpClient {
         Ok(Some(ProxyLegacyHttpRequest::new(request, handle)))
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_completion_with_context(
         &mut self,
         ctx: &McpContext,
@@ -5215,6 +5433,7 @@ impl ProxyBackend for ProxyHttpClient {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn take_legacy_peer_notifications(&mut self) -> McpResult<ProxyLegacyPeerNotifications> {
         let mut notifications = Vec::new();
         while let Some(notification) = self.connection.take_legacy_notification() {
@@ -5387,6 +5606,7 @@ impl ProxyBackend for ProxyHttpClient {
         )
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn call_tool_result_with_context_and_legacy_progress(
         &mut self,
         ctx: &McpContext,
@@ -5603,7 +5823,7 @@ impl ProxyBackend for ProxyHttpClient {
                 "Proxy upstream does not admit the complete final Tasks relay surface",
             ));
         }
-        let ClientHttpConnection::Modern(client) = &self.connection else {
+        let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
         Ok(Some(ProxyFinalTaskRequest {
@@ -5624,7 +5844,7 @@ impl ProxyBackend for ProxyHttpClient {
                 "Proxy upstream does not admit the complete final Tasks relay surface",
             ));
         }
-        let ClientHttpConnection::Modern(client) = &self.connection else {
+        let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
         Ok(Some(ProxyFinalTaskListenerRequest {
@@ -5640,7 +5860,7 @@ impl ProxyBackend for ProxyHttpClient {
         &mut self,
         notifications: SubscriptionFilter,
     ) -> McpResult<Option<ProxyCatalogListenerRequest>> {
-        let ClientHttpConnection::Modern(client) = &self.connection else {
+        let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
         Ok(Some(ProxyCatalogListenerRequest {
@@ -5705,7 +5925,7 @@ impl ProxyBackend for ProxyHttpClient {
                 "A live catalog subscription cannot include taskIds; use start_final_task_listener",
             ));
         }
-        let ClientHttpConnection::Modern(client) = &self.connection else {
+        let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
         if self.connection.selected_protocol_era() != ProtocolEra::Modern2026 {
@@ -5840,7 +6060,7 @@ impl ProxyBackend for ProxyHttpClient {
                 "A live final Tasks subscription requires taskIds",
             ));
         }
-        let ClientHttpConnection::Modern(client) = &self.connection else {
+        let Some(client) = modern_http_client(&self.connection) else {
             return Ok(None);
         };
         if self.connection.selected_protocol_era() != ProtocolEra::Modern2026 {
@@ -6110,13 +6330,47 @@ fn legacy_progress_matches_marker(
     expected == Some(&progress.progress_marker)
 }
 
-fn discovery_supports_final_completion(discovery: &ServerDiscoverResult) -> McpResult<bool> {
+/// Forwards progress retained by one yielding exact-2024 stdio execution.
+///
+/// The multiplexed executor owns matching progress while the request is live,
+/// so those frames never enter the client's connection-level notification
+/// queue. Drain them before consuming the terminal response; consuming the
+/// response deliberately retires the execution and makes its stream
+/// unavailable.
+fn relay_request_owned_legacy_progress(
+    ctx: &McpContext,
+    notifications: impl IntoIterator<Item = JsonRpcRequest>,
+) {
+    let expected = ctx_progress_marker(ctx);
+    for notification in notifications {
+        let Some(progress) = progress_from_legacy_notification(&notification) else {
+            continue;
+        };
+        if !legacy_progress_matches_marker(expected.as_ref(), &progress) {
+            continue;
+        }
+        if let Some(total) = progress.total {
+            ctx.report_progress_with_total(progress.progress, total, progress.message.as_deref());
+        } else {
+            ctx.report_progress(progress.progress, progress.message.as_deref());
+        }
+    }
+}
+
+fn discovery_supports_final_capability(
+    discovery: &ServerDiscoverResult,
+    capability: &str,
+) -> McpResult<bool> {
     let capabilities = serde_json::to_value(discovery.capabilities()).map_err(|error| {
         McpError::internal_error(format!(
-            "Proxy final completion discovery capabilities could not be encoded: {error}"
+            "Proxy final discovery capabilities could not be encoded: {error}"
         ))
     })?;
-    Ok(capabilities.get("completions").is_some())
+    Ok(capabilities.get(capability).is_some())
+}
+
+fn discovery_supports_final_completion(discovery: &ServerDiscoverResult) -> McpResult<bool> {
+    discovery_supports_final_capability(discovery, "completions")
 }
 
 /// Proves the complete Tasks surface before the proxy advertises it downstream.
@@ -7368,6 +7622,7 @@ impl ProxyClient {
         Ok(ProxyInboundLegacyReverseGuard { client: self })
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_receive_pump(&self) -> McpResult<()> {
         self.with_backend(|backend| backend.start_legacy_receive_pump())
     }
@@ -7376,6 +7631,7 @@ impl ProxyClient {
     /// held, then returns its independent client handle.  Waiting and any
     /// cancellation control deliberately happen after this function returns,
     /// when the route mutex has been dropped.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_request_with_context(
         &self,
         ctx: &McpContext,
@@ -7389,6 +7645,7 @@ impl ProxyClient {
 
     /// Starts an exact-2024 completion under the mutable route lock, then
     /// releases that lock before the returned handle is awaited or cancelled.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn start_legacy_completion_with_context(
         &self,
         ctx: &McpContext,
@@ -7403,6 +7660,7 @@ impl ProxyClient {
     /// acknowledged, so the cancellation branch may emit its control without
     /// risking a pre-commit legacy notification. The handle, rather than the
     /// route lock, owns response correlation and late-frame retirement.
+    #[cfg(feature = "legacy-2024-11-05")]
     fn await_legacy_request_with_context(
         &self,
         ctx: &McpContext,
@@ -7417,6 +7675,7 @@ impl ProxyClient {
     /// Reverse `sampling/createMessage` / `roots/list` POSTs land on the same
     /// inbound HTTP serve loop as the originating tools/call. Parking that
     /// loop inside `block_on` leaves the sampling-response POST unaccepted.
+    #[cfg(feature = "legacy-2024-11-05")]
     async fn await_legacy_request_with_context_async(
         &self,
         ctx: &McpContext,
@@ -7436,6 +7695,65 @@ impl ProxyClient {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Starts and drives one exact-2024 request without nesting a blocking
+    /// executor inside the caller's runtime.
+    ///
+    /// HTTP requests yield while the detached response handle waits. Stdio
+    /// requests explicitly yield between bounded pump steps so the inbound
+    /// server runtime remains able to make progress and observe cancellation.
+    #[cfg(feature = "legacy-2024-11-05")]
+    async fn request_legacy_yielding_with_context(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<Option<CoreResult>> {
+        if let Some(prepared) = self.with_backend(|backend| {
+            backend.prepare_legacy_http_start(ctx, method, parameters.clone())
+        })? {
+            let handle = prepared
+                .receiver
+                .start_request(
+                    &prepared.cx,
+                    &prepared.method,
+                    prepared.parameters,
+                    prepared.request_id,
+                )
+                .await
+                .map_err(proxy_http_connection_error)?;
+            let request = ProxyLegacyHttpRequest::new(prepared.request, handle);
+            return self
+                .await_legacy_request_with_context_async(ctx, request, method)
+                .await
+                .map(Some);
+        }
+        if let Some(mut prepared) = self
+            .with_backend(|backend| backend.start_legacy_stdio_yielding(ctx, method, parameters))?
+        {
+            let result = loop {
+                if ctx.checkpoint().is_err() {
+                    let _ = self.with_backend(|backend| {
+                        backend.cancel_legacy_stdio_yielding(&mut prepared)
+                    });
+                    return Err(McpError::request_cancelled());
+                }
+                relay_request_owned_legacy_progress(
+                    ctx,
+                    prepared.execution.take_stream_notifications()?,
+                );
+                if let Some(result) = self
+                    .with_backend(|backend| backend.try_take_legacy_stdio_yielding(&mut prepared))?
+                {
+                    break result;
+                }
+                self.with_backend(|backend| backend.drive_legacy_stdio_yielding())?;
+                asupersync::runtime::yield_now().await;
+            };
+            return Ok(Some(result));
+        }
+        Ok(None)
     }
 
     /// Returns whether the selected upstream has an executable
@@ -7531,6 +7849,7 @@ impl ProxyClient {
         ctx.checkpoint()?;
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(request) = self.start_legacy_completion_with_context(ctx, params.clone())? {
             let result = self.await_legacy_request_with_context(
                 ctx,
@@ -7682,6 +8001,25 @@ impl ProxyClient {
         }
     }
 
+    /// Yielding counterpart of [`Self::read_resource`].
+    async fn read_resource_async(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<Vec<ResourceContent>> {
+        match self.read_resource_typed_async(ctx, uri).await? {
+            CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result)) => {
+                legacy_resource_result_to_handler(result)
+            }
+            CoreResult::Final(FinalCoreResult::ResourcesRead { .. }) => {
+                Err(McpError::invalid_request(
+                    "Proxy cannot project a final resources/read result to the legacy handler surface",
+                ))
+            }
+            _ => Err(unexpected_proxy_result("resources/read")),
+        }
+    }
+
     pub fn get_prompt(
         &self,
         ctx: &McpContext,
@@ -7689,6 +8027,26 @@ impl ProxyClient {
         arguments: HashMap<String, String>,
     ) -> McpResult<Vec<PromptMessage>> {
         match self.get_prompt_typed(ctx, name, arguments)? {
+            CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
+                legacy_prompt_result_to_handler(result)
+            }
+            CoreResult::Final(FinalCoreResult::PromptsGet { .. }) => {
+                Err(McpError::invalid_request(
+                    "Proxy cannot project a final prompts/get result to the legacy handler surface",
+                ))
+            }
+            _ => Err(unexpected_proxy_result("prompts/get")),
+        }
+    }
+
+    /// Yielding counterpart of [`Self::get_prompt`].
+    async fn get_prompt_async(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<Vec<PromptMessage>> {
+        match self.get_prompt_typed_async(ctx, name, arguments).await? {
             CoreResult::Legacy(LegacyCoreResult::PromptsGet(result)) => {
                 legacy_prompt_result_to_handler(result)
             }
@@ -7729,7 +8087,9 @@ impl ProxyClient {
         ctx.checkpoint()?;
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        #[cfg(feature = "legacy-2024-11-05")]
         let parameters = serde_json::json!({"name": name, "arguments": arguments.clone()});
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(request) = self.start_legacy_request_with_context(
             ctx,
             fastmcp_protocol::methods::TOOLS_CALL,
@@ -7757,9 +8117,33 @@ impl ProxyClient {
         self.admit_upstream_result("tools/call", result)
     }
 
+    #[cfg(feature = "tasks")]
+    fn call_tool_typed_without_tasks_with_final_progress(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+        on_progress: FinalProgressCallback<'_>,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        let result = self.with_backend(|backend| {
+            backend.call_tool_result_without_tasks_with_context_and_final_progress(
+                ctx,
+                name,
+                arguments,
+                on_progress,
+            )
+        })?;
+        ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
+        self.admit_upstream_result("tools/call", result)
+    }
+
     /// Yielding counterpart of [`Self::call_tool_typed`].
     ///
-    /// When the HTTP backend returns a detached [`ProxyLegacyHttpRequest`],
+    /// When the HTTP backend returns a detached `ProxyLegacyHttpRequest`,
     /// wait on the inbound request Cx instead of a nested `block_on` runtime.
     async fn call_tool_typed_async(
         &self,
@@ -7768,10 +8152,13 @@ impl ProxyClient {
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
         ctx.checkpoint()?;
+        #[cfg(feature = "legacy-2024-11-05")]
         self.start_legacy_receive_pump()?;
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        #[cfg(feature = "legacy-2024-11-05")]
         let parameters = serde_json::json!({"name": name, "arguments": arguments.clone()});
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(prepared) = self.with_backend(|backend| {
             backend.prepare_legacy_http_start(
                 ctx,
@@ -7801,6 +8188,7 @@ impl ProxyClient {
             self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("tools/call", result);
         }
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(mut prepared) = self.with_backend(|backend| {
             backend.start_legacy_stdio_yielding(
                 ctx,
@@ -7815,6 +8203,10 @@ impl ProxyClient {
                     });
                     return Err(McpError::request_cancelled());
                 }
+                relay_request_owned_legacy_progress(
+                    ctx,
+                    prepared.execution.take_stream_notifications()?,
+                );
                 if let Some(result) = self
                     .with_backend(|backend| backend.try_take_legacy_stdio_yielding(&mut prepared))?
                 {
@@ -7914,6 +8306,55 @@ impl ProxyClient {
         Ok(outcome)
     }
 
+    /// Forwards an ordinary final tools/call without advertising Tasks to the
+    /// upstream. Complete and MRTR outcomes remain available; an unsolicited
+    /// Task is rejected because the downstream request did not negotiate a
+    /// route capable of relaying it.
+    #[cfg(feature = "tasks")]
+    fn call_tool_final_non_task_outcome(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> McpResult<FinalToolCallOutcome> {
+        let mut progress_error = None;
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = self.call_tool_typed_without_tasks_with_final_progress(
+            ctx,
+            name,
+            arguments,
+            &mut forward_progress,
+        )?;
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
+        match result {
+            CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+                Ok(FinalToolCallOutcome::Complete(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. }) => {
+                self.store_pending_mrtr(
+                    mrtr_operation_key(fastmcp_protocol::methods::TOOLS_CALL, name),
+                    result.clone(),
+                )?;
+                Ok(FinalToolCallOutcome::InputRequired(result))
+            }
+            CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }) => {
+                Err(McpError::invalid_request(
+                    "Proxy upstream returned a Task without a negotiated downstream Tasks relay",
+                ))
+            }
+            CoreResult::Legacy(LegacyCoreResult::ToolsCall(_)) => Err(McpError::invalid_request(
+                "Proxy cannot use an exact legacy tools/call result for a final handler path",
+            )),
+            _ => Err(unexpected_proxy_result("tools/call")),
+        }
+    }
+
     /// Forwards a tools/call, optionally resuming a stored upstream
     /// `input_required` with the downstream-admitted MRTR inputs.
     #[cfg(feature = "tasks")]
@@ -7923,7 +8364,9 @@ impl ProxyClient {
         name: &str,
         arguments: serde_json::Value,
         resume_inputs: Option<&MrtrCompletedInputs>,
+        allow_tasks: bool,
     ) -> McpResult<FinalToolCallOutcome> {
+        let tasks_negotiated = allow_tasks && ctx.client_supports_tasks();
         if let Some(resume) = resume_inputs {
             let key = mrtr_operation_key(fastmcp_protocol::methods::TOOLS_CALL, name);
             let pending = self.take_pending_mrtr(&key)?;
@@ -7932,11 +8375,20 @@ impl ProxyClient {
                 &pending,
                 resume,
             )?;
-            match self.request_upstream_final_core(
-                ctx,
-                fastmcp_protocol::methods::TOOLS_CALL,
-                parameters,
-            )? {
+            let result = if tasks_negotiated {
+                self.request_upstream_final_core(
+                    ctx,
+                    fastmcp_protocol::methods::TOOLS_CALL,
+                    parameters,
+                )
+            } else {
+                self.request_upstream_final_core_without_tasks(
+                    ctx,
+                    fastmcp_protocol::methods::TOOLS_CALL,
+                    parameters,
+                )
+            }?;
+            match result {
                 CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
                     Ok(FinalToolCallOutcome::Complete(result))
                 }
@@ -7945,12 +8397,20 @@ impl ProxyClient {
                     Ok(FinalToolCallOutcome::InputRequired(result))
                 }
                 CoreResult::Final(FinalCoreResult::ToolsCallTask { result, .. }) => {
-                    Ok(FinalToolCallOutcome::Task(result))
+                    if tasks_negotiated {
+                        Ok(FinalToolCallOutcome::Task(result))
+                    } else {
+                        Err(McpError::invalid_request(
+                            "Proxy upstream returned a Task without a negotiated downstream Tasks relay",
+                        ))
+                    }
                 }
                 _ => Err(unexpected_proxy_result("tools/call")),
             }
-        } else {
+        } else if tasks_negotiated {
             self.call_tool_final_outcome(ctx, name, arguments)
+        } else {
+            self.call_tool_final_non_task_outcome(ctx, name, arguments)
         }
     }
 
@@ -8044,6 +8504,7 @@ impl ProxyClient {
         block_on(self.open_final_task_listener_async(ctx, notifications))
     }
 
+    #[cfg(feature = "tasks")]
     async fn open_final_task_listener_async(
         &self,
         ctx: &McpContext,
@@ -8208,6 +8669,7 @@ impl ProxyClient {
         ctx.checkpoint()?;
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(request) = self.start_legacy_request_with_context(
             ctx,
             fastmcp_protocol::methods::RESOURCES_READ,
@@ -8243,6 +8705,51 @@ impl ProxyClient {
         self.admit_upstream_result("resources/read", result)
     }
 
+    /// Yielding counterpart of [`Self::read_resource_typed`].
+    async fn read_resource_typed_async(
+        &self,
+        ctx: &McpContext,
+        uri: &str,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        self.start_legacy_receive_pump()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        if let Some(result) = self
+            .request_legacy_yielding_with_context(
+                ctx,
+                fastmcp_protocol::methods::RESOURCES_READ,
+                serde_json::json!({"uri": uri}),
+            )
+            .await?
+        {
+            ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
+            return self.admit_upstream_result("resources/read", result);
+        }
+        let mut progress_error = None;
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = self.with_backend(|backend| {
+            backend.read_resource_result_with_context_and_final_progress(
+                ctx,
+                uri,
+                &mut forward_progress,
+            )
+        })?;
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
+        ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
+        self.admit_upstream_result("resources/read", result)
+    }
+
     /// Gets a prompt without erasing exact legacy fields or final result state.
     pub fn get_prompt_typed(
         &self,
@@ -8253,6 +8760,7 @@ impl ProxyClient {
         ctx.checkpoint()?;
         self.forward_inbound_log_level(ctx)?;
         let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        #[cfg(feature = "legacy-2024-11-05")]
         if let Some(request) = self.start_legacy_request_with_context(
             ctx,
             fastmcp_protocol::methods::PROMPTS_GET,
@@ -8263,6 +8771,53 @@ impl ProxyClient {
                 request,
                 fastmcp_protocol::methods::PROMPTS_GET,
             )?;
+            ctx.checkpoint()?;
+            self.relay_resource_updated_notifications(ctx)?;
+            return self.admit_upstream_result("prompts/get", result);
+        }
+        let mut progress_error = None;
+        let mut forward_progress = |progress: FinalProgressNotificationParams| {
+            if let Err(error) = forward_final_progress_to_context(ctx, progress) {
+                progress_error = Some(error);
+            }
+        };
+        let result = self.with_backend(|backend| {
+            backend.get_prompt_result_with_context_and_final_progress(
+                ctx,
+                name,
+                arguments,
+                &mut forward_progress,
+            )
+        })?;
+        if let Some(error) = progress_error {
+            return Err(error);
+        }
+        ctx.checkpoint()?;
+        self.relay_resource_updated_notifications(ctx)?;
+        self.admit_upstream_result("prompts/get", result)
+    }
+
+    /// Yielding counterpart of [`Self::get_prompt_typed`].
+    async fn get_prompt_typed_async(
+        &self,
+        ctx: &McpContext,
+        name: &str,
+        arguments: HashMap<String, String>,
+    ) -> McpResult<CoreResult> {
+        ctx.checkpoint()?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        self.start_legacy_receive_pump()?;
+        self.forward_inbound_log_level(ctx)?;
+        let _inbound_reverse = self.inbound_legacy_reverse_guard(ctx)?;
+        #[cfg(feature = "legacy-2024-11-05")]
+        if let Some(result) = self
+            .request_legacy_yielding_with_context(
+                ctx,
+                fastmcp_protocol::methods::PROMPTS_GET,
+                serde_json::json!({"name": name, "arguments": arguments.clone()}),
+            )
+            .await?
+        {
             ctx.checkpoint()?;
             self.relay_resource_updated_notifications(ctx)?;
             return self.admit_upstream_result("prompts/get", result);
@@ -8440,6 +8995,19 @@ impl ProxyClient {
     ) -> McpResult<CoreResult> {
         let result = self.with_backend(|backend| {
             backend.request_final_core_with_parameters(ctx, method, parameters)
+        })?;
+        self.admit_upstream_result(method, result)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn request_upstream_final_core_without_tasks(
+        &self,
+        ctx: &McpContext,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult> {
+        let result = self.with_backend(|backend| {
+            backend.request_final_core_without_tasks_with_parameters(ctx, method, parameters)
         })?;
         self.admit_upstream_result(method, result)
     }
@@ -8820,24 +9388,27 @@ impl ToolHandler for ProxyToolHandler {
         ctx: &McpContext,
         arguments: serde_json::Value,
     ) -> McpResult<FinalToolOutcome> {
-        let Some(task_relay) = self.task_relay.as_ref() else {
-            return self
-                .call_final(ctx, arguments)
-                .map(FinalToolOutcome::Complete);
-        };
-        let reservation = task_relay.reserve_task_creation()?;
-        match self
-            .client
-            .call_tool_final_outcome(ctx, &self.external_name, arguments)?
-        {
+        match self.client.call_tool_final_outcome_with_resume(
+            ctx,
+            &self.external_name,
+            arguments,
+            None,
+            self.task_relay.is_some(),
+        )? {
             FinalToolCallOutcome::Complete(result) => Ok(FinalToolOutcome::Complete(result)),
             FinalToolCallOutcome::InputRequired(result) => {
                 Ok(FinalToolOutcome::InputRequired(result))
             }
-            FinalToolCallOutcome::Task(result) => Ok(FinalToolOutcome::CreateTask {
-                work_descriptor: task_relay.encode_task_carrier(reservation, result)?,
-                status_message: None,
-            }),
+            FinalToolCallOutcome::Task(result) => {
+                let task_relay = self.task_relay.as_ref().ok_or_else(|| {
+                    McpError::internal_error("Proxy official Task result has no route-bound relay")
+                })?;
+                let reservation = task_relay.reserve_task_creation()?;
+                Ok(FinalToolOutcome::CreateTask {
+                    work_descriptor: task_relay.encode_task_carrier(reservation, result)?,
+                    status_message: None,
+                })
+            }
         }
     }
 
@@ -8859,6 +9430,7 @@ impl ToolHandler for ProxyToolHandler {
                 &self.external_name,
                 arguments,
                 resume_inputs,
+                self.task_relay.is_some(),
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => return Outcome::Err(error),
@@ -9028,6 +9600,25 @@ impl ResourceHandler for ProxyResourceHandler {
         self.client.read_resource(ctx, self.upstream_uri(uri))
     }
 
+    fn read_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+        Box::pin(async move {
+            match self
+                .client
+                .read_resource_async(ctx, self.upstream_uri(uri))
+                .await
+            {
+                Ok(contents) => Outcome::Ok(contents),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     fn declares_final_mrtr(&self) -> bool {
         true
     }
@@ -9126,6 +9717,24 @@ impl PromptHandler for ProxyPromptHandler {
     ) -> McpResult<Vec<PromptMessage>> {
         // Forward using the original external name
         self.client.get_prompt(ctx, &self.external_name, arguments)
+    }
+
+    fn get_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
+        Box::pin(async move {
+            match self
+                .client
+                .get_prompt_async(ctx, &self.external_name, arguments)
+                .await
+            {
+                Ok(messages) => Outcome::Ok(messages),
+                Err(error) => Outcome::Err(error),
+            }
+        })
     }
 
     fn declares_final_mrtr(&self) -> bool {
@@ -9359,21 +9968,21 @@ mod tests {
             decode_modern_server_notification(baseline.as_bytes(), &baseline_request)
                 .expect("baseline final progress is admitted");
 
-        let negative = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-17","progress":-1,"total":12000.0}}"#;
-        let JsonRpcMessage::Request(negative_request) =
-            decode_strict_jsonrpc_message(negative.as_bytes(), 4096)
-                .expect("one-variable negative progress notification parses")
+        let invalid = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"job-17","progress":"-1","total":12000.0}}"#;
+        let JsonRpcMessage::Request(invalid_request) =
+            decode_strict_jsonrpc_message(invalid.as_bytes(), 4096)
+                .expect("one-variable string progress notification parses as JSON-RPC")
         else {
-            panic!("negative is a JSON-RPC notification");
+            panic!("invalid progress fixture is a JSON-RPC notification");
         };
         let mut delivered = Vec::new();
         let error = forward_modern_progress_notification(
-            negative.as_bytes(),
-            &negative_request,
+            invalid.as_bytes(),
+            &invalid_request,
             &mut |params| delivered.push(params),
             None,
         )
-        .expect_err("changing only progress to a negative number must be rejected");
+        .expect_err("changing only progress from a number to a string must be rejected");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(
             delivered.is_empty(),
@@ -9835,6 +10444,30 @@ mod tests {
             Err(fastmcp_core::McpError::internal_error(
                 "final Tasks relay test must not project through legacy progress",
             ))
+        }
+
+        fn call_tool_result_with_context_and_final_progress(
+            &mut self,
+            _ctx: &McpContext,
+            _name: &str,
+            _arguments: serde_json::Value,
+            _on_progress: super::FinalProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<CoreResult> {
+            Err(fastmcp_core::McpError::internal_error(
+                "ordinary downstream calls must use the no-Tasks backend path",
+            ))
+        }
+
+        fn call_tool_result_without_tasks_with_context_and_final_progress(
+            &mut self,
+            ctx: &McpContext,
+            _name: &str,
+            _arguments: serde_json::Value,
+            _on_progress: super::FinalProgressCallback<'_>,
+        ) -> fastmcp_core::McpResult<CoreResult> {
+            ctx.checkpoint()?;
+            self.record("ordinary-tools/call");
+            Ok(final_tool_result_with_open_members())
         }
 
         fn read_resource(&mut self, _uri: &str) -> fastmcp_core::McpResult<Vec<ResourceContent>> {
@@ -10570,7 +11203,8 @@ mod tests {
                 serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
-        );
+        )
+        .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_tasks());
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -10624,7 +11258,8 @@ mod tests {
                 serde_json::json!("downstream-progress"),
                 Arc::clone(&capture) as Arc<dyn NotificationSender>,
             ),
-        );
+        )
+        .with_client_capabilities(fastmcp_core::ClientCapabilityInfo::new().with_tasks());
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -10659,6 +11294,46 @@ mod tests {
                 .expect("capture is not poisoned")
                 .is_empty(),
             "only the differing progress marker prevents handler delivery"
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_handler_uses_ordinary_call_without_downstream_tasks_capability() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            FinalTaskRelayBackend {
+                calls: Arc::clone(&calls),
+                task: final_task_relay_result(),
+                listener_events: None,
+                cancel_after_task_commit: None,
+                final_progress: None,
+            },
+            final_task_relay_binding(ProtocolEra::Modern2026),
+            "2026-07-28",
+        )
+        .expect("the modern route binding is exact");
+        let relay = proxy
+            .final_tasks_relay()
+            .expect("relay discovery is available")
+            .expect("the selected modern route installs a relay");
+        let handler =
+            ProxyToolHandler::from_final_with_task_relay(final_catalog_tool(), proxy, relay)
+                .expect("exact final task handler is constructed");
+        let context = McpContext::new(Cx::for_testing(), 743);
+
+        let outcome = handler
+            .call_final_outcome(&context, serde_json::json!({}))
+            .expect("ordinary Complete remains available without downstream Tasks");
+
+        assert!(matches!(outcome, FinalToolOutcome::Complete(_)));
+        assert_eq!(
+            calls
+                .lock()
+                .expect("call capture is not poisoned")
+                .as_slice(),
+            &["ordinary-tools/call"],
+            "the proxy must not advertise Tasks upstream for an ordinary downstream call"
         );
     }
 
@@ -13928,13 +14603,14 @@ exec sleep 2
                     "tools/call",
                 ],
             };
-            let expected_post_count = expected_methods.len();
             let expected_request_ids: Vec<Option<i64>> = match path {
                 HttpProxyPublicPath::Catalog => vec![Some(1), None, Some(2)],
                 HttpProxyPublicPath::Handler => {
                     vec![Some(1), None, Some(2), Some(3), Some(4), Some(5), Some(6)]
                 }
             };
+            let scripted_request_ids = expected_request_ids.clone();
+            let (release_sse, release_sse_receiver) = std::sync::mpsc::sync_channel(1);
             let server = thread::spawn(move || {
                 let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
                 let probe_request = read_http_request(&mut probe);
@@ -13942,27 +14618,47 @@ exec sleep 2
 
                 let (mut sse, _) = listener.accept().expect("accept exact legacy SSE GET");
                 let sse_request = read_http_request(&mut sse);
-                let mut body = format!("event: endpoint\ndata: {expected_message_target}\n\n");
-                for (id, result) in messages {
-                    let message = fastmcp_protocol::JsonRpcMessage::Response(
-                        fastmcp_protocol::JsonRpcResponse::success(
-                            fastmcp_protocol::RequestId::Number(id),
-                            result,
-                        ),
-                    );
-                    body.push_str("event: message\ndata: ");
-                    body.push_str(&serde_json::to_string(&message).expect("serialize SSE message"));
-                    body.push_str("\n\n");
-                }
-                write_http_response(&mut sse, 200, "text/event-stream", body.as_bytes());
+                write!(
+                    sse,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                )
+                .expect("write streaming legacy SSE response head");
+                let endpoint = format!("event: endpoint\ndata: {expected_message_target}\n\n");
+                write_chunked_sse_event(&mut sse, endpoint.as_bytes());
+                sse.flush().expect("flush legacy endpoint event");
 
                 let mut posts = Vec::new();
-                for _ in 0..expected_post_count {
+                let mut messages = messages.into_iter();
+                for expected_id in &scripted_request_ids {
                     let (mut post, _) = listener.accept().expect("accept advertised legacy POST");
                     let request = read_http_request(&mut post);
                     write_http_response(&mut post, 202, "application/json", b"");
+                    if expected_id.is_some() {
+                        let (id, result) = messages
+                            .next()
+                            .expect("every legacy request ID has one scripted response");
+                        let message = fastmcp_protocol::JsonRpcMessage::Response(
+                            fastmcp_protocol::JsonRpcResponse::success(
+                                fastmcp_protocol::RequestId::Number(id),
+                                result,
+                            ),
+                        );
+                        let event = format!(
+                            "event: message\ndata: {}\n\n",
+                            serde_json::to_string(&message).expect("serialize SSE message")
+                        );
+                        write_chunked_sse_event(&mut sse, event.as_bytes());
+                        sse.flush().expect("flush correlated legacy SSE response");
+                    }
                     posts.push(request);
                 }
+                assert!(messages.next().is_none());
+                release_sse_receiver
+                    .recv()
+                    .expect("the client releases the legacy SSE stream after observing refusal");
+                sse.write_all(b"0\r\n\r\n")
+                    .expect("finish chunked legacy SSE response");
+                sse.flush().expect("flush terminal legacy SSE chunk");
                 (probe_request, sse_request, posts)
             });
             let plan = http_proxy_plan(&modern_target, &legacy_sse_target, &legacy_message_target);
@@ -14006,7 +14702,13 @@ exec sleep 2
                 }
             };
 
-            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.code,
+                McpErrorCode::InvalidRequest,
+                "{} legacy ID mismatch returned: {}",
+                path.name(),
+                error.message
+            );
             assert_eq!(bindings.live_http.len(), 1);
             let cached = bindings
                 .connect_http_with_protocol_plan(
@@ -14021,6 +14723,9 @@ exec sleep 2
                 .expect("a legacy response-ID refusal must not alter the selected cache binding");
             assert_eq!(cached.upstream_binding(), Some(binding));
             assert_eq!(bindings.live_http.len(), 1);
+            release_sse
+                .send(())
+                .expect("release the legacy SSE test stream");
 
             let (probe, sse, posts) = server.join().expect("legacy ID-mismatch server must join");
             assert!(probe.head.contains("Mcp-Method: server/discover\r\n"));
@@ -14370,28 +15075,64 @@ exec sleep 2
     #[cfg(unix)]
     #[test]
     fn proxy_catalog_initializes_real_client_before_capability_checks() {
-        let initialize = fastmcp_protocol::InitializeResult {
-            protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_string(),
-            capabilities: fastmcp_protocol::ServerCapabilities {
-                tools: Some(fastmcp_protocol::ToolsCapability::default()),
-                resources: Some(fastmcp_protocol::ResourcesCapability::default()),
-                prompts: Some(fastmcp_protocol::PromptsCapability::default()),
-                ..fastmcp_protocol::ServerCapabilities::default()
+        let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+            &fastmcp_protocol::ServerBehaviorRegistry::from_behaviors([
+                fastmcp_protocol::ServerBehavior::ToolsList,
+                fastmcp_protocol::ServerBehavior::ResourcesList,
+                fastmcp_protocol::ServerBehavior::PromptsList,
+            ]),
+            BTreeMap::new(),
+        )
+        .expect("the advertised final catalog behaviors are coherent");
+        let discovery = fastmcp_protocol::ServerDiscoverResult::new(
+            capabilities,
+            fastmcp_protocol::ServerInfo {
+                name: "proxy-script".to_owned(),
+                version: "1.0.0".to_owned(),
             },
-            server_info: fastmcp_protocol::ServerInfo {
-                name: "proxy-script".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            instructions: None,
-        };
-        let initialize = scripted_response_line(
-            1,
-            serde_json::to_value(initialize).expect("serialize initialize result"),
+            None,
+            fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
         );
-        let tools = scripted_response_line(2, serde_json::json!({"tools": []}));
-        let resources = scripted_response_line(3, serde_json::json!({"resources": []}));
-        let templates = scripted_response_line(4, serde_json::json!({"resourceTemplates": []}));
-        let prompts = scripted_response_line(5, serde_json::json!({"prompts": []}));
+        let discovery = scripted_response_line(
+            1,
+            serde_json::to_value(discovery).expect("serialize discovery result"),
+        );
+        let tools = scripted_response_line(
+            2,
+            serde_json::json!({
+                "resultType": "complete",
+                "tools": [],
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+        );
+        let resources = scripted_response_line(
+            3,
+            serde_json::json!({
+                "resultType": "complete",
+                "resources": [],
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+        );
+        let templates = scripted_response_line(
+            4,
+            serde_json::json!({
+                "resultType": "complete",
+                "resourceTemplates": [],
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+        );
+        let prompts = scripted_response_line(
+            5,
+            serde_json::json!({
+                "resultType": "complete",
+                "prompts": [],
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }),
+        );
         // Act as a minimal real peer: require every request in protocol order
         // before releasing its response. A watchdog bounds failures where the
         // client stops writing while the peer is waiting for the next line.
@@ -14409,9 +15150,8 @@ expect_method() (
         *) exit 91 ;;
     esac
 )
-expect_method initialize || exit $?
-printf '%s\n' '{initialize}'
-expect_method notifications/initialized || exit $?
+expect_method server/discover || exit $?
+printf '%s\n' '{discovery}'
 expect_method tools/list || exit $?
 printf '%s\n' '{tools}'
 expect_method resources/list || exit $?
@@ -14429,6 +15169,7 @@ exec sleep 2
         let mut client = block_on(
             fastmcp_client::ClientBuilder::new()
                 .auto_initialize(true)
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
                 .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
         )
@@ -14449,24 +15190,15 @@ exec sleep 2
     #[cfg(unix)]
     #[test]
     fn proxy_catalog_initializes_before_skipping_unadvertised_lists() {
-        let initialize = fastmcp_protocol::InitializeResult {
-            protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_string(),
-            capabilities: fastmcp_protocol::ServerCapabilities::default(),
-            server_info: fastmcp_protocol::ServerInfo {
-                name: "proxy-script".to_string(),
-                version: "1.0.0".to_string(),
-            },
-            instructions: None,
-        };
-        let initialize = scripted_response_line(
-            1,
-            serde_json::to_value(initialize).expect("serialize initialize result"),
+        let discovery = modern_discovery_response_line("proxy-script", &["2026-07-28"]);
+        let script = format!(
+            "IFS= read -r request || exit 90; case \"$request\" in *server/discover*) ;; *) exit 91 ;; esac; printf '%s\\n' '{discovery}'; exec sleep 2"
         );
-        let script = format!("printf '%s\\n' '{initialize}'; exec sleep 2");
         let cx = Cx::for_testing();
         let mut client = block_on(
             fastmcp_client::ClientBuilder::new()
                 .auto_initialize(true)
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(scripted_peer_timeout_policy())
                 .connect_stdio_with_cx("sh", &["-c", script.as_str()], &cx),
         )

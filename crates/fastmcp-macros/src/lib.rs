@@ -995,6 +995,27 @@ fn generate_tool_tasks_declaration(tasks: bool) -> TokenStream2 {
     }
 }
 
+/// Emits the immutable MRTR capability for every handler whose return algebra
+/// can produce `InputRequired`.
+///
+/// A resume-input parameter changes which hook receives a retry, but it is not
+/// what makes the handler MRTR-capable: a canonical final-outcome return can
+/// mint a continuation on its initial call too. Declaring that capability
+/// before invocation lets the router reject an unbound transport without
+/// executing application code or degrading the failure into an internal
+/// post-handler error.
+fn generate_final_mrtr_declaration(enabled: bool) -> TokenStream2 {
+    if enabled {
+        quote! {
+            fn declares_final_mrtr(&self) -> bool {
+                true
+            }
+        }
+    } else {
+        TokenStream2::new()
+    }
+}
+
 /// Emits typed final MCP Apps UI metadata for a validated tool declaration.
 #[cfg(feature = "apps")]
 fn generate_tool_apps_metadata(ui: Option<&ToolAppsUi>) -> TokenStream2 {
@@ -1437,10 +1458,6 @@ fn generate_tool_mrtr_resume_method(
     };
 
     quote! {
-        fn declares_final_mrtr(&self) -> bool {
-            true
-        }
-
         fn call_final_outcome_async_resuming_in_request<'a>(
             &'a self,
             ctx: &'a fastmcp_core::McpContext,
@@ -2211,10 +2228,6 @@ fn generate_prompt_mrtr_outcome_methods(
     };
 
     quote! {
-        fn declares_final_mrtr(&self) -> bool {
-            true
-        }
-
         fn get_final_outcome_async_in_request<'a>(
             &'a self,
             ctx: &'a fastmcp_core::McpContext,
@@ -3831,10 +3844,6 @@ fn generate_resource_mrtr_outcome_methods(
     let explicit_cache_hints = explicit_final_resource_cache_hint_methods();
 
     quote! {
-        fn declares_final_mrtr(&self) -> bool {
-            true
-        }
-
         #explicit_cache_hints
 
         fn read_final_outcome_async_with_uri_in_request<'a>(
@@ -4372,9 +4381,10 @@ fn validate_output_schema_expr(schema_expr: &syn::Expr) -> syn::Result<()> {
 #[allow(clippy::items_after_test_module)]
 mod mrtr_resume_expansion_tests {
     use super::{
-        contains_mrtr_completed_inputs, generate_prompt_mrtr_outcome_methods,
-        generate_resource_mrtr_outcome_methods, generate_tool_mrtr_resume_method,
-        invalid_mrtr_resume_parameter_error, is_mrtr_completed_inputs_option_ref,
+        contains_mrtr_completed_inputs, generate_final_mrtr_declaration,
+        generate_prompt_mrtr_outcome_methods, generate_resource_mrtr_outcome_methods,
+        generate_tool_mrtr_resume_method, invalid_mrtr_resume_parameter_error,
+        is_mrtr_completed_inputs_option_ref,
     };
     use quote::{format_ident, quote};
 
@@ -4404,10 +4414,7 @@ mod mrtr_resume_expansion_tests {
             tool.contains("completed_inputs : Option < & MrtrCompletedInputs > = resume_inputs"),
             "{tool}"
         );
-        assert!(
-            tool.contains("fn declares_final_mrtr (& self) -> bool { true }"),
-            "{tool}"
-        );
+        assert!(!tool.contains("fn declares_final_mrtr"), "{tool}");
 
         let call_args = quote! { ctx, completed_inputs };
         let resource = generate_resource_mrtr_outcome_methods(
@@ -4429,10 +4436,7 @@ mod mrtr_resume_expansion_tests {
             resource.contains("completed_inputs : Option < & MrtrCompletedInputs > = None"),
             "{resource}"
         );
-        assert!(
-            resource.contains("fn declares_final_mrtr (& self) -> bool { true }"),
-            "{resource}"
-        );
+        assert!(!resource.contains("fn declares_final_mrtr"), "{resource}");
         assert!(
             resource.contains("FinalResourceReadCacheHintProvenance :: Explicit"),
             "{resource}"
@@ -4458,10 +4462,14 @@ mod mrtr_resume_expansion_tests {
             prompt.contains("completed_inputs : Option < & MrtrCompletedInputs > = None"),
             "{prompt}"
         );
+        assert!(!prompt.contains("fn declares_final_mrtr"), "{prompt}");
+
+        let declaration = generate_final_mrtr_declaration(true).to_string();
         assert!(
-            prompt.contains("fn declares_final_mrtr (& self) -> bool { true }"),
-            "{prompt}"
+            declaration.contains("fn declares_final_mrtr (& self) -> bool { true }"),
+            "{declaration}"
         );
+        assert!(generate_final_mrtr_declaration(false).is_empty());
     }
 
     #[test]
@@ -4921,6 +4929,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         .into();
     }
     let tasks_declaration = generate_tool_tasks_declaration(attrs.tasks);
+    let mrtr_declaration = generate_final_mrtr_declaration(final_outcome_conversion.is_some());
     #[cfg(feature = "apps")]
     let apps_metadata = generate_tool_apps_metadata(attrs.apps_ui.as_ref());
     #[cfg(not(feature = "apps"))]
@@ -5002,6 +5011,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #apps_metadata
 
                 #tasks_declaration
+
+                #mrtr_declaration
 
                 #execution_methods
 
@@ -5396,6 +5407,7 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    let mrtr_declaration = generate_final_mrtr_declaration(final_outcome_conversion.is_some());
     let resource_result_conversion =
         if final_result_conversion.is_some() || final_outcome_conversion.is_some() {
             generate_final_legacy_rejection("resource", "ResourceHandler::read_final")
@@ -5468,6 +5480,8 @@ pub fn resource(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #timeout_tokens
 
                 #icon_hooks
+
+                #mrtr_declaration
 
                 #execution_methods
 
@@ -5828,6 +5842,7 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+    let mrtr_declaration = generate_final_mrtr_declaration(final_outcome_conversion.is_some());
     let prompt_result_conversion =
         if final_result_conversion.is_some() || final_outcome_conversion.is_some() {
             generate_final_legacy_rejection("prompt", "PromptHandler::get_final")
@@ -5904,6 +5919,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #timeout_tokens
 
                 #icon_hooks
+
+                #mrtr_declaration
 
                 #execution_methods
 

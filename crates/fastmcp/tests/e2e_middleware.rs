@@ -485,8 +485,14 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
     // Clear so we only capture the failing request.
     let _ = take_events(&events);
 
-    // Send invalid params to force an actual dispatch error (not an "isError" tool result).
-    let err = client.send_request_json("tools/call", json!({}));
+    // Use a structurally valid call that fails during routing. A malformed
+    // payload is rejected by typed admission before extension middleware,
+    // while an unknown tool reaches the entered middleware stack and produces
+    // an actual dispatch error (not an `isError` tool result).
+    let err = client.send_request_json(
+        "tools/call",
+        json!({"name": "missing-tool", "arguments": {}}),
+    );
     assert!(err.is_err());
     let (err_code, err_message) = match err {
         Ok(_) => (None, None),
@@ -521,7 +527,7 @@ fn middleware_error_path_calls_on_error_in_reverse_and_can_rewrite() {
 
     assert!(
         err_code.is_some() && err_message.is_some(),
-        "expected error from invalid tools/call params"
+        "expected routing error from unknown tools/call target"
     );
     let Some(message) = err_message else {
         return;

@@ -51,9 +51,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(feature = "legacy-2024-11-05")]
-use std::net::{Shutdown, TcpStream as StdTcpStream};
+use std::net::TcpStream as StdTcpStream;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(test)]
 use std::pin::Pin;
 use std::sync::{
@@ -73,6 +73,7 @@ use asupersync::{
     },
     time,
     tls::TlsConnector,
+    types::{CancelKind, CancelReason},
 };
 use fastmcp_core::{McpRequestCancellation, draw_security_identifier, sha256_bounded};
 #[cfg(feature = "legacy-2024-11-05")]
@@ -606,9 +607,6 @@ impl crate::sse::LegacySsePostSink for LegacySseHttpPostSink {
         legacy_sse_http_post_write_all(cx, deadline, &mut stream, post.body())?;
         legacy_sse_http_post_flush(cx, deadline, &mut stream)?;
         legacy_sse_http_post_checkpoint(cx, deadline)?;
-        stream
-            .shutdown(Shutdown::Write)
-            .map_err(TransportError::Io)?;
         legacy_sse_http_post_requires_accepted(cx, deadline, &mut stream)
     }
 }
@@ -1781,7 +1779,7 @@ where
         .spawn(move |phase_cx| async move {
             let mut future = Box::pin(phase(phase_cx.clone()));
             std::future::poll_fn(|task_cx| {
-                if let Err(error) = guarded_fetch_checkpoint(&phase_cx) {
+                if let Err(error) = guarded_phase_checkpoint(&phase_cx) {
                     return Poll::Ready(Err(error));
                 }
                 future.as_mut().poll(task_cx)
@@ -1789,9 +1787,14 @@ where
             .await
         })
         .map_err(|error| GuardedHttpFetchError::Http(error.to_string()))?;
-    match time::timeout_at(deadline, task.join(cx)).await {
+    match time::timeout_at(
+        deadline,
+        task.join_with_drop_reason(cx, CancelReason::timeout()),
+    )
+    .await
+    {
         Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(guarded_join_error(error, cx)),
+        Ok(Err(error)) => Err(guarded_join_error(error, cx, deadline)),
         Err(_) => {
             // `timeout` drops its join future, which requests cancellation.
             // Abort again explicitly, then settle the task before returning so
@@ -1802,17 +1805,29 @@ where
                     Err(GuardedHttpFetchError::DeadlineExceeded)
                 }
                 Ok(Err(error)) => Err(error),
-                Err(error) => Err(guarded_join_error(error, cx)),
+                Err(error) => Err(guarded_join_error(error, cx, deadline)),
             }
         }
     }
 }
 
-fn guarded_join_error(error: asupersync::runtime::JoinError, cx: &Cx) -> GuardedHttpFetchError {
+fn guarded_join_error(
+    error: asupersync::runtime::JoinError,
+    cx: &Cx,
+    deadline: asupersync::Time,
+) -> GuardedHttpFetchError {
     match error {
-        asupersync::runtime::JoinError::Cancelled(_) => guarded_fetch_checkpoint(cx)
-            .err()
-            .unwrap_or(GuardedHttpFetchError::Cancelled),
+        asupersync::runtime::JoinError::Cancelled(reason) => {
+            if let Err(error) = guarded_fetch_checkpoint(cx) {
+                error
+            } else if matches!(reason.kind, CancelKind::Deadline | CancelKind::Timeout)
+                || time::wall_now() >= deadline
+            {
+                GuardedHttpFetchError::DeadlineExceeded
+            } else {
+                GuardedHttpFetchError::Cancelled
+            }
+        }
         asupersync::runtime::JoinError::Panicked(payload) => {
             GuardedHttpFetchError::Http(format!("guarded fetch phase panicked: {payload}"))
         }
@@ -1825,6 +1840,19 @@ fn guarded_join_error(error: asupersync::runtime::JoinError, cx: &Cx) -> Guarded
 fn guarded_fetch_checkpoint(cx: &Cx) -> Result<(), GuardedHttpFetchError> {
     cx.checkpoint()
         .map_err(|_| GuardedHttpFetchError::Cancelled)
+}
+
+fn guarded_phase_checkpoint(cx: &Cx) -> Result<(), GuardedHttpFetchError> {
+    cx.checkpoint().map_err(|_| {
+        if cx
+            .cancel_reason()
+            .is_some_and(|reason| matches!(reason.kind, CancelKind::Deadline | CancelKind::Timeout))
+        {
+            GuardedHttpFetchError::DeadlineExceeded
+        } else {
+            GuardedHttpFetchError::Cancelled
+        }
+    })
 }
 
 fn parse_guarded_https_authority(authority: &str) -> Result<(String, u16), GuardedHttpFetchError> {
@@ -7273,17 +7301,18 @@ X0vllj6GAR7hSJSwFZLfZ/pjk1HkmjwU7V/qjXdvf4W9UdEQcIZ2+mkv
     #[test]
     fn guarded_fetch_resolver_delay_consumes_the_single_exchange_budget() {
         let exchange_started = Arc::new(AtomicUsize::new(0));
-        let deadline = Duration::from_millis(20);
+        let deadline = Duration::from_millis(500);
         let fetcher = GuardedHttpFetcher::new_with_test_exchange(
             Arc::new(DelayedGuardedResolver {
-                delay: Duration::from_millis(15),
+                delay: Duration::from_millis(25),
                 answers: vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
             }),
-            // Only the helper's TLS-handshake bound changes: 15ms resolver
-            // plus 15ms exchange still exceeds this same 20ms fetch deadline.
+            // Only the helper's TLS-handshake bound changes. The resolver has
+            // ample room to start the exchange even under suite load, while
+            // the exchange still cannot finish inside this one fetch budget.
             guarded_test_policy_with_handshake(16, deadline, deadline),
             Arc::new(DelayedGuardedExchange {
-                delay: Duration::from_millis(15),
+                delay: Duration::from_secs(1),
                 response: guarded_test_wire_response(200, Vec::new(), b"late".to_vec()),
                 started: Arc::clone(&exchange_started),
             }),
@@ -12535,7 +12564,10 @@ Content-Length: {}\r\n\
         let cx = Cx::for_testing();
         let raw_result =
             r#"{"resultType":"complete","opaque":{"decimal":1.20e+4,"order":{"z":1,"a":2}}}"#;
-        let absent = format!("data: {{\"jsonrpc\":\"2.0\",\"result\":{raw_result}}}\n\n");
+        // JSON-RPC success requires an ID, so use the one valid response form
+        // whose ID may be absent: an uncorrelated error. This reaches the
+        // collector's correlation gate instead of failing typed decoding.
+        let absent = "data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}\n\n";
         let mut collector =
             ModernHttpSseCollector::new(request_id.clone(), limits).expect("valid request ID");
 

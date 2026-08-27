@@ -129,6 +129,13 @@ impl ArgTransform {
         self
     }
 
+    /// Makes this argument optional (even if it was required).
+    #[must_use]
+    pub fn optional(mut self) -> Self {
+        self.required = Some(false);
+        self
+    }
+
     /// Sets the JSON Schema type for this argument.
     #[must_use]
     pub fn type_schema(mut self, schema: serde_json::Value) -> Self {
@@ -655,6 +662,9 @@ fn transform_input_schema(
                 // Apply required override
                 if transform.required == Some(true) {
                     required_adds.push(new_name.clone());
+                } else if transform.required == Some(false) {
+                    required_removes.push(new_name.clone());
+                    required_removes.push(original_name.clone());
                 }
 
                 if new_name != original_name {
@@ -1309,6 +1319,32 @@ mod tests {
         assert!(required.iter().any(|v| v == "limit"));
         assert!(!required.iter().any(|v| v == "n"));
         assert!(required.iter().any(|v| v == "q"));
+    }
+
+    #[test]
+    fn transform_schema_optional_makes_required_arg_optional() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("q", ArgTransform::new().optional())
+            .build();
+
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|v| v == "q"));
+        assert!(!required.iter().any(|v| v == "n"));
+    }
+
+    #[test]
+    fn transform_schema_renamed_and_optional() {
+        let tool = SearchToolFixture::new("s");
+        let transformed = TransformedTool::from_tool(tool)
+            .transform_arg("q", ArgTransform::new().name("query").optional())
+            .build();
+
+        let def = transformed.definition();
+        let required = def.input_schema["required"].as_array().unwrap();
+        assert!(!required.iter().any(|v| v == "query"));
+        assert!(!required.iter().any(|v| v == "q"));
     }
 
     // ── Combined transforms ──────────────────────────────────────────

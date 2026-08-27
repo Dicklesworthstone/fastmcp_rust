@@ -2,4 +2,23 @@ error[E0432]: unresolved import `fastmcp_rust::legacy_2024::AsyncWsClientTranspo
  --> tests/trybuild/websocket/legacy_wrapper_escape.rs:1:5
   |
 1 | use fastmcp_rust::legacy_2024::AsyncWsClientTransport;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `AsyncWsClientTransport` in `legacy_2024`
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^----------------------
+  |                                |
+  |                                no `AsyncWsClientTransport` in `legacy_2024`
+  |
+help: a similar name exists in the module
+  |
+1 - use fastmcp_rust::legacy_2024::AsyncWsClientTransport;
+1 + use fastmcp_rust::legacy_2024::LegacySseClientTransport;
+  |
+help: consider importing one of these structs instead
+  |
+1 - use fastmcp_rust::legacy_2024::AsyncWsClientTransport;
+1 + use fastmcp_client::AsyncWsClientTransport;
+  |
+1 - use fastmcp_rust::legacy_2024::AsyncWsClientTransport;
+1 + use fastmcp_rust::AsyncWsClientTransport;
+  |
+1 - use fastmcp_rust::legacy_2024::AsyncWsClientTransport;
+1 + use fastmcp_transport::websocket::AsyncWsClientTransport;
+  |

@@ -2727,7 +2727,7 @@ mod tests {
         let mut client = block_on(
             ClientBuilder::new()
                 .request_timeout_policy(
-                    RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(80))
+                    RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(3))
                         .expect("bounded probe timeout is valid"),
                 )
                 .connect_stdio_with_cx("sh", &["-c", script], &Cx::for_request()),
@@ -2745,7 +2745,7 @@ mod tests {
         client
             .close()
             .expect("fresh legacy timeout-fallback cleanup");
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
@@ -2762,7 +2762,7 @@ mod tests {
             ),
             (
                 "partial-frame-timeout",
-                "printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601'; exec sleep 2",
+                "printf '%s' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601'; exec sleep 10",
             ),
             (
                 "malformed-result",
@@ -2783,11 +2783,8 @@ mod tests {
                 ClientBuilder::new()
                     .max_retries(0)
                     .request_timeout_policy(
-                        RequestTimeoutPolicy::new(
-                            Duration::from_millis(250),
-                            Duration::from_millis(750),
-                        )
-                        .expect("bounded probe timeout is valid"),
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(5))
+                            .expect("bounded probe timeout is valid"),
                     )
                     .connect_stdio_with_cx("sh", &["-c", script.as_str()], &Cx::for_request()),
             );

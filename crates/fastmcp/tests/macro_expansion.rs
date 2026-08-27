@@ -35,9 +35,9 @@ use fastmcp_rust::{
     FinalAbsoluteUri, FinalCallToolResult, FinalGetPromptResult, FinalPromptMessage,
     FinalReadResourceResult, FinalToolOutcome, Implementation, InboundRequestContext,
     InboundRequestTransport, InputRequiredResult, JsonRpcRequest, JsonSchema,
-    MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, Outcome, PromptHandler,
-    PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role, ToolHandler, prompt,
-    resource, tool,
+    MODERN_PROTOCOL_VERSION, McpContext, McpError, McpOutcome, McpResult, ModernConnection,
+    Outcome, PromptHandler, PromptMessage, ResourceContent, ResourceHandler, ResultMeta, Role,
+    ToolHandler, prompt, resource, tool,
 };
 use fastmcp_server::Server;
 use std::collections::{BTreeMap, HashMap};
@@ -1238,8 +1238,13 @@ fn facade_final_tool_outcome_request(
     )
 }
 
-fn facade_final_inbound() -> InboundRequestContext {
-    InboundRequestContext::new(Cx::for_testing(), 64, InboundRequestTransport::Memory)
+fn facade_final_inbound(connection: &ModernConnection) -> InboundRequestContext {
+    InboundRequestContext::with_modern_connection(
+        Cx::for_testing(),
+        64,
+        InboundRequestTransport::Memory,
+        connection,
+    )
 }
 
 #[cfg(feature = "tasks")]
@@ -1306,6 +1311,10 @@ fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
 
     for handler in handlers {
         assert!(
+            handler.declares_final_mrtr(),
+            "every canonical final-outcome return algebra can mint InputRequired"
+        );
+        assert!(
             handler.call(&ctx, json!({"mode": "complete"})).is_err(),
             "the disjoint final outcome must not leak through the legacy hook"
         );
@@ -1347,12 +1356,13 @@ fn tool_final_outcome_variants_reach_the_final_outcome_hook() {
 
 #[test]
 fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
+    let connection = ModernConnection::new();
     let server = Server::new("facade-final-outcome", "1.0.0")
         .tool(FinalToolOutcomeResult)
         .build();
     let response = server
         .dispatch_stateless(
-            &facade_final_inbound(),
+            &facade_final_inbound(&connection),
             &facade_final_tool_outcome_request(
                 "final_tool_outcome_result",
                 "input-required",
@@ -1379,6 +1389,7 @@ fn facade_final_tool_outcome_encodes_input_required_through_modern_wire() {
 #[cfg(feature = "tasks")]
 #[test]
 fn facade_final_tool_outcome_creates_task_through_modern_wire() {
+    let connection = ModernConnection::new();
     let notifications = std::sync::Arc::new(AtomicUsize::new(0));
     let emitted_notifications = std::sync::Arc::clone(&notifications);
     let runtime = FinalTaskRuntime::in_memory(
@@ -1404,7 +1415,7 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
         .build();
     let response = server
         .dispatch_stateless(
-            &facade_final_inbound(),
+            &facade_final_inbound(&connection),
             &facade_final_tool_outcome_request("final_tool_outcome_direct", "create-task", true),
         )
         .expect("task-capable facade final tools/call returns a wire response");
@@ -1442,6 +1453,7 @@ fn facade_final_tool_outcome_creates_task_through_modern_wire() {
 #[cfg(feature = "tasks")]
 #[test]
 fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
+    let connection = ModernConnection::new();
     let notifications = std::sync::Arc::new(AtomicUsize::new(0));
     let emitted_notifications = std::sync::Arc::clone(&notifications);
     let task_store = std::sync::Arc::new(InMemoryFinalTaskStore::default());
@@ -1489,7 +1501,7 @@ fn facade_final_tool_outcome_rejects_declared_task_without_client_capability() {
         .build();
     let response = server
         .dispatch_stateless(
-            &facade_final_inbound(),
+            &facade_final_inbound(&connection),
             &facade_final_tool_outcome_request("final_tool_outcome_direct", "create-task", false),
         )
         .expect("missing task capability returns a JSON-RPC error response");
@@ -2281,6 +2293,7 @@ fn resource_final_complete_results_keep_final_payloads() {
 
 #[test]
 fn async_macro_final_resource_outcome_reaches_public_final_resources_read() {
+    let connection = ModernConnection::new();
     let server = Server::new("facade-final-resource-outcome", "1.0.0")
         .resource(AsyncFinalResourceOutcomeResource)
         .build();
@@ -2296,7 +2309,7 @@ fn async_macro_final_resource_outcome_reaches_public_final_resources_read() {
         64_i64,
     );
     let response = server
-        .dispatch_stateless(&facade_final_inbound(), &request)
+        .dispatch_stateless(&facade_final_inbound(&connection), &request)
         .expect("the public final resources/read route invokes the async macro outcome hook");
     assert!(
         response.error.is_none(),

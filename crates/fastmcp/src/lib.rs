@@ -298,7 +298,7 @@ pub mod server {
         FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
         HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement,
         InboundRequestContext, InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware,
-        MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+        MiddlewareDecision, ModernConnection, MountResult, NotificationSender, PendingRequests,
         ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
         ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
         ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
@@ -447,8 +447,8 @@ pub use modern::extensions;
 pub use fastmcp_protocol::common_types::{
     AbsoluteUri as FinalAbsoluteUri, AnnotationAudience, Annotations, CancellationNotification,
     CancellationRequestId, CommonTypeError, CommonWireDirection, ContentBlock,
-    EmbeddedResourceContents, FinalCommonTypesSchema, IconTheme, Implementation, JsonInteger,
-    LoggingLevel, MAX_ABSOLUTE_URI_BYTES,
+    EmbeddedResourceContents, ExactNonNegativeJsonNumber, FinalCommonTypesSchema, IconTheme,
+    Implementation, JsonInteger, LoggingLevel, MAX_ABSOLUTE_URI_BYTES,
     MAX_CANCELLATION_REASON_BYTES as MAX_FINAL_CANCELLATION_REASON_BYTES,
     MAX_CONTENT_ENCODED_BYTES, MAX_CURSOR_BYTES, MAX_ICON_DATA_URI_DECODED_BYTES,
     MAX_ICON_DATA_URI_ENCODED_BYTES, MAX_ICON_DATA_URI_PREFIX_BYTES, MAX_ICON_SIZE_BYTES,
@@ -679,7 +679,7 @@ pub use fastmcp_server::{
     FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
     FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
     HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, Middleware,
-    MiddlewareDecision, MountResult, NotificationSender, PendingRequests,
+    MiddlewareDecision, ModernConnection, MountResult, NotificationSender, PendingRequests,
     ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
     ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
     ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
@@ -2035,20 +2035,24 @@ pub mod modern {
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, Cx,
-        MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH, McpCatalogKind,
-        McpContext, McpContextLeaseGuard, McpError, McpLogLevel, McpOutcome,
-        McpRequestCancellation, McpResult, NoOpNotificationSender, NotificationSender, Outcome,
-        ProgressReporter, PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole,
-        ResourceContentItem, ResourceReadResult, ResourceReader, RootsProvider,
-        ServerCapabilityInfo, ToolCallResult, ToolCaller, ToolContentItem,
+        ElicitationAction, ElicitationMode, ElicitationRequest, ElicitationResponse,
+        ElicitationSender, MAX_PROMPT_GET_DEPTH, MAX_RESOURCE_READ_DEPTH, MAX_TOOL_CALL_DEPTH,
+        McpCatalogKind, McpContext, McpContextLeaseGuard, McpError, McpLogLevel, McpOutcome,
+        McpRequestCancellation, McpResult, NoOpElicitationSender, NoOpNotificationSender,
+        NoOpSamplingSender, NotificationSender, Outcome, ProgressReporter, PromptCaller,
+        PromptGetResult, PromptMessageItem, PromptMessageRole, ResourceContentItem,
+        ResourceReadResult, ResourceReader, RootsProvider, SamplingRequest, SamplingRequestMessage,
+        SamplingResponse, SamplingRole, SamplingSender, SamplingStopReason, ServerCapabilityInfo,
+        ToolCallResult, ToolCaller, ToolContentItem,
     };
     pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
     pub use fastmcp_protocol::common_types::{
         AbsoluteUri, AnnotationAudience, Annotations, CancellationNotification,
         CancellationRequestId, CommonTypeError, CommonWireDirection, ContentBlock,
-        EmbeddedResourceContents, FinalCommonTypesSchema, IconTheme, Implementation, JsonInteger,
-        LoggingLevel, OpaqueCursor, OpenMetadata, RawIcon, RawIconSourceUri, ResourceLink,
-        SamplingContentBlock, TraceContext, UntrustedCancellationReason,
+        EmbeddedResourceContents, ExactNonNegativeJsonNumber, FinalCommonTypesSchema, IconTheme,
+        Implementation, JsonInteger, LoggingLevel, OpaqueCursor, OpenMetadata, RawIcon,
+        RawIconSourceUri, ResourceLink, SamplingContentBlock, TraceContext,
+        UntrustedCancellationReason,
     };
     pub use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, EffectiveExtensionSettings, ExtensionDescriptor,
@@ -2190,10 +2194,11 @@ pub mod modern {
         FinalResourceReadCacheHintProvenance, FinalRoots, FinalRootsContextExt, FinalSampling,
         FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
         HttpNonquiescentShutdown, HttpServerShutdown, HttpShutdownSettlement, LifespanHooks,
-        LoggingConfig, Middleware, MiddlewareDecision, MountResult, ProgressNotificationSender,
-        PromptHandler, ResourceHandler, ServerExtensionConfigurationError, ShutdownHook,
-        StartupHook, TagFilters, ToolErrorKind, ToolHandler, TrafficVerbosity,
-        create_context_with_progress,
+        LoggingConfig, Middleware, MiddlewareDecision, MountResult, PendingRequests,
+        ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler,
+        ServerExtensionConfigurationError, ShutdownHook, StartupHook, TagFilters, ToolErrorKind,
+        ToolHandler, TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
+        TransportSamplingSender, create_context_with_progress,
     };
     #[cfg(feature = "websocket-experimental")]
     pub use fastmcp_server::{
@@ -9624,7 +9629,11 @@ pub mod legacy_2024 {
                 .notify(
                     cx,
                     methods::NOTIFICATIONS_CANCELLED,
-                    Some(Self::encode_params(CancelledParams { request_id, reason })?),
+                    Some(Self::encode_params(CancelledParams {
+                        request_id,
+                        reason,
+                        meta: None,
+                    })?),
                 )
                 .await
         }
@@ -9755,6 +9764,7 @@ pub mod prelude {
         DecodedResult,
         DiscoveryCacheHints,
         DuplicateBehavior,
+        ExactNonNegativeJsonNumber,
         ExtensionDescriptor,
         ExtensionDescriptorRegistry,
         ExtensionSettings,
@@ -10968,7 +10978,7 @@ mod tests {
         );
         assert_eq!(
             discovery["capabilities"]["resources"],
-            serde_json::json!({})
+            serde_json::json!({"listChanged": true})
         );
 
         let error = match modern::server_builder("facade-ui", "1.0").mcp_apps_ui_resource(resource)

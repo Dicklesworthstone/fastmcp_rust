@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/MCP%202026--07--28-under%20implementation-yellow.svg" alt="MCP status">
 </p>
 
-> **Protocol status (2026-08-25):** MCP 2026-07-28 support is under
+> **Protocol status (2026-08-27):** MCP 2026-07-28 support is under
 > implementation and remains unverified. The root compatibility
 > `PROTOCOL_VERSION` is `2024-11-05`; the modern facade's
 > `modern::PROTOCOL_VERSION` is `2026-07-28`. Source presence, examples, and
@@ -327,7 +327,7 @@ These are FastMCP Rust design surfaces, not benchmark results or an MCP 2026-07-
 
 ### From crates.io (current 0.8.0 package)
 
-The `0.8.0` package was published on 2026-08-25. Publication does
+The `0.8.0` package was published on 2026-08-27. Publication does
 not establish aggregate MCP 2026-07-28 conformance, production readiness, or
 qualification of every in-tree feature.
 

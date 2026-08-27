@@ -4357,6 +4357,20 @@ mod tests {
         frame
     }
 
+    fn assert_masked_normal_close(frame: &[u8; 8]) {
+        assert_eq!(frame[0], 0x88, "close must use the RFC 6455 close opcode");
+        assert_eq!(
+            frame[1], 0x82,
+            "client normal close must mask its two-byte status code"
+        );
+        let status = [frame[6] ^ frame[2], frame[7] ^ frame[3]];
+        assert_eq!(
+            u16::from_be_bytes(status),
+            u16::from(CloseCode::Normal),
+            "normal close must carry status 1000"
+        );
+    }
+
     fn build_unmasked_frame(opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
         frame.push((if fin { 0x80 } else { 0x00 }) | opcode);
@@ -4793,7 +4807,8 @@ mod tests {
         run_test(|| async {
             let cx = Cx::current().expect("runtime root context");
             let (mut peer, server_socket) = virtual_socket_pair();
-            let mut inbound = build_masked_frame(0x01, false, br#"{"jsonrpc":"2.0","method":"#);
+            let mut inbound =
+                build_masked_frame(0x01, false, b"{\"jsonrpc\":\"2.0\",\"method\":\"");
             inbound.extend(build_masked_frame(0x09, true, b"p"));
             inbound.extend(build_masked_frame(
                 0x00,
@@ -4879,7 +4894,7 @@ mod tests {
             let (client_socket, mut peer) = virtual_socket_pair();
             let mut peer_task = cx
                 .spawn(move |_task_cx| async move {
-                    let mut frame = [0_u8; 6];
+                    let mut frame = [0_u8; 8];
                     peer.read_exact(&mut frame)
                         .await
                         .expect("read masked client close frame");
@@ -4894,8 +4909,7 @@ mod tests {
                 .await
                 .expect("caller-context split close must emit one close frame");
             let frame = peer_task.join(&cx).await.expect("join split close peer");
-            assert_eq!(frame[0], 0x88, "close must use the RFC 6455 close opcode");
-            assert_eq!(frame[1], 0x80, "client close must be masked");
+            assert_masked_normal_close(&frame);
             assert!(matches!(sender.close(&cx).await, Ok(())));
             assert!(matches!(
                 receiver.recv_with_source(&cx).await,
@@ -4912,19 +4926,34 @@ mod tests {
             let client = AsyncWsClientTransport::from_upgraded(client_socket);
             let (mut receiver, mut sender) = client.into_split();
             let writer = Arc::clone(&sender.writer);
-            let held_writer = OwnedMutexGuard::lock(writer, &cx)
+            let held_writer = OwnedMutexGuard::lock(Arc::clone(&writer), &cx)
                 .await
                 .expect("hold the split writer before close election");
 
-            let mut cancelled_close = cx
-                .spawn(move |task_cx| async move { sender.close(&task_cx).await })
-                .expect("spawn close blocked on writer lock");
-            asupersync::runtime::yield_now().await;
-            cancelled_close.abort();
+            let close_cx = Cx::for_testing();
+            let mut cancelled_close = Box::pin(sender.close(&close_cx));
+            std::future::poll_fn(|task_cx| {
+                assert!(
+                    cancelled_close.as_mut().poll(task_cx).is_pending(),
+                    "the held writer must keep the close future pending"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                writer.waiters(),
+                1,
+                "the close operation must be parked on the held writer before cancellation"
+            );
+            close_cx.cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("cancel blocked close"),
+            );
             assert!(matches!(
-                cancelled_close.join(&cx).await,
-                Ok(Err(TransportError::Cancelled))
+                cancelled_close.await,
+                Err(TransportError::Cancelled)
             ));
+            assert_eq!(writer.waiters(), 0, "cancellation must retire its waiter");
             assert_eq!(
                 WebSocketTerminalState::load(&receiver.terminal),
                 WebSocketTerminalState::Open,
@@ -4936,12 +4965,11 @@ mod tests {
                 .close(&cx)
                 .await
                 .expect("a close cancelled before election must be safely retryable");
-            let mut close = [0_u8; 6];
+            let mut close = [0_u8; 8];
             peer.read_exact(&mut close)
                 .await
                 .expect("the retry must write one masked Close frame");
-            assert_eq!(close[0], 0x88);
-            assert_eq!(close[1], 0x80);
+            assert_masked_normal_close(&close);
         });
     }
 
@@ -5854,16 +5882,6 @@ mod tests {
     fn blocking_websocket_fixture_mask_ownership_and_fallbacks_are_denied() {
         let blocking_fixture = include_str!("websocket.rs");
 
-        assert_eq!(blocking_fixture.matches("draw_websocket_mask()").count(), 1);
-        assert_eq!(
-            blocking_fixture
-                .matches(".map_err(map_mask_draw_error)")
-                .count(),
-            1
-        );
-        assert!(!blocking_fixture.contains("getrandom::"));
-        assert!(!blocking_fixture.contains("draw_security_identifier"));
-
         let writer_impl_start = blocking_fixture
             .find("impl<W: Write> WsClientWriter<W> {")
             .expect("client writer implementation marker");
@@ -5872,6 +5890,13 @@ mod tests {
             .map(|offset| writer_impl_start + offset)
             .expect("client writer implementation end marker");
         let writer_impl = &blocking_fixture[writer_impl_start..writer_impl_end];
+        assert_eq!(writer_impl.matches("draw_websocket_mask()").count(), 1);
+        assert_eq!(
+            writer_impl.matches(".map_err(map_mask_draw_error)").count(),
+            1
+        );
+        assert!(!writer_impl.contains("getrandom::"));
+        assert!(!writer_impl.contains("draw_security_identifier"));
         let mask_decl = writer_impl
             .lines()
             .find(|line| line.contains("fn generate_mask()"))

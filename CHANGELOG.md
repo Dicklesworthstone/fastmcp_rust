@@ -8,7 +8,7 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ## [Unreleased] (after v0.8.0)
 
-## [v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.0) -- 2026-08-25 (GitHub Release)
+## [v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.8.0) -- 2026-08-27 (GitHub Release)
 
 Pre-1.0 minor release making caller-owned asupersync contexts explicit across
 library connection and server-runner boundaries. This release does **not**
@@ -54,6 +54,30 @@ qualification of every in-tree profile.
 - Modern HTTP requests advertise the official Tasks extension only on
   Tasks-aware operations, and `FinalTaskHandle::watch` now reaches the
   task-capable subscription path instead of the task-refusing catalog helper.
+- Ordinary proxied tool calls and MRTR resume legs suppress upstream Tasks
+  negotiation, preventing a peer from creating an unowned task. Auto HTTP
+  fallback does not cache an exact-2024 binding until live initialize
+  validation succeeds.
+- Modern handler futures now retain request-owned cancellation and deadline
+  classification through nested tool, resource, and prompt calls. MRTR
+  continuations require a live transport-owned connection rather than merely
+  a state object.
+- Final subscription acknowledgement, event delivery, peer cancellation, and
+  server termination now share one ordered election. Modern HTTP response
+  bodies have distinct ownership even when clients reuse JSON-RPC IDs, and
+  bounded listener shutdown retains any nonquiescent child handles for caller
+  settlement.
+- Exact-2024 cancellation notifications preserve application `_meta` while
+  rejecting final-era reserved metadata, and malformed response-shaped legacy
+  frames cannot trigger response-to-response loops.
+- Legacy SSE message POSTs no longer perform a redundant TCP write-half close
+  after sending their complete `Content-Length`-framed request. This prevents a
+  fast-closing peer from masking its HTTP response with macOS `EINVAL`.
+- macOS development-process cleanup distinguishes zombie-only process groups
+  and treats signal-zero `EPERM` as existence evidence.
+- Explicit rich-console construction is deterministic even when ambient
+  `NO_COLOR` is set, while automatic console construction still honors
+  environment detection.
 
 ### Packaging
 
@@ -64,6 +88,12 @@ qualification of every in-tree profile.
 - Aligned every published crate on the rider-bearing root `LICENSE` through
   Cargo `license-file` metadata. `LICENSE-MIT` remains a reference copy of the
   underlying MIT text, not an alternative project license.
+- Marked the FND-01 evidence executables as non-test examples so
+  `cargo test --all-targets` compiles the runners without executing their
+  environment-bound verifier modules as ordinary example tests.
+- Updated the all-feature syntax-highlighting graph to `plist 1.10.0` and
+  `quick-xml 0.41.0`, clearing the two high-severity RustSec denial-of-service
+  advisories affecting the previous XML parser.
 
 **Exact changes:** [v0.7.1...v0.8.0](https://github.com/Dicklesworthstone/fastmcp_rust/compare/v0.7.1...v0.8.0)
 

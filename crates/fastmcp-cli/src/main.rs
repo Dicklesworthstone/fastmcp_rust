@@ -4078,6 +4078,8 @@ const DEV_PROCESS_REAP_PERIOD: std::time::Duration = std::time::Duration::from_s
 const DEV_GROUP_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 #[cfg(target_os = "linux")]
 const DEV_GROUP_INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(all(unix, not(target_os = "linux")))]
+const DEV_GROUP_STATUS_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const DEV_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(15);
 const DEV_BUILD_CAPTURE_LIMIT: usize = 256 * 1024;
 const DEV_BUILD_RENDER_LIMIT: usize = 32 * 1024;
@@ -4182,11 +4184,62 @@ fn kernel_process_group_exists(process_group_id: i32) -> McpResult<bool> {
     // positive; it can never signal the unrelated replacement group.
     match rustix::process::test_kill_process_group(process_group_id) {
         Ok(()) => Ok(true),
+        // POSIX permits EPERM when the group exists but one or more members
+        // are not signalable by this process. For signal 0 that is still
+        // affirmative existence evidence; treating it as an observation
+        // failure makes ordinary macOS watchdog cleanup fail spuriously.
+        Err(rustix::io::Errno::PERM) => Ok(true),
         Err(rustix::io::Errno::SRCH) => Ok(false),
         Err(_) => Err(fastmcp_core::McpError::internal_error(
             "Managed-process-group observation failed",
         )),
     }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn non_linux_process_group_has_live_member(process_group_id: i32) -> McpResult<bool> {
+    if process_group_id <= 0 {
+        return Err(fastmcp_core::McpError::internal_error(
+            "Managed development process group has an invalid identifier",
+        ));
+    }
+
+    // BSD/macOS `kill(-pgid, 0)` reports zombie-only groups as present. Ask
+    // the platform process table for the fixed-width state field so bounded
+    // cleanup can distinguish dead members from runnable or sleeping work.
+    // The absolute binary path and decimal PGID avoid shell or PATH custody.
+    let output = Command::new("/bin/ps")
+        .args(["-o", "state=", "-g", process_group_id.to_string().as_str()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|_| {
+            fastmcp_core::McpError::internal_error(
+                "Managed-process-group liveness inspection failed",
+            )
+        })?;
+
+    if output.stdout.len() > DEV_GROUP_STATUS_OUTPUT_MAX_BYTES {
+        // Conservatively retain ownership when an unexpectedly large group
+        // cannot be classified within the fixed observation bound.
+        return Ok(true);
+    }
+    if !output.status.success() {
+        return if !kernel_process_group_exists(process_group_id)? {
+            Ok(false)
+        } else {
+            Err(fastmcp_core::McpError::internal_error(
+                "Managed-process-group liveness inspection failed",
+            ))
+        };
+    }
+
+    Ok(output.stdout.split(|byte| *byte == b'\n').any(|line| {
+        line.iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|state| state != b'Z')
+    }))
 }
 
 fn wait_for_owned_dev_group_cleanup(child: &mut asupersync::process::Child) -> McpResult<()> {
@@ -4226,6 +4279,15 @@ fn wait_for_owned_dev_group_cleanup(child: &mut asupersync::process::Child) -> M
                             process_group_id,
                             second_inspection_deadline,
                         )? {
+                            return Ok(());
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if !non_linux_process_group_has_live_member(process_group_id)? {
+                        std::thread::sleep(DEV_PROCESS_POLL_INTERVAL);
+                        if !non_linux_process_group_has_live_member(process_group_id)? {
                             return Ok(());
                         }
                     }
@@ -15562,8 +15624,9 @@ mod tests {
                     linux_process_group_has_live_member(process_group_id, deadline)
                         .expect("inspect managed process-group cleanup");
                 #[cfg(not(target_os = "linux"))]
-                let group_has_live_member = kernel_process_group_exists(process_group_id)
-                    .expect("observe managed process-group cleanup");
+                let group_has_live_member =
+                    non_linux_process_group_has_live_member(process_group_id)
+                        .expect("observe managed process-group cleanup");
 
                 if !group_has_live_member {
                     break;
@@ -15648,7 +15711,7 @@ mod tests {
             );
             #[cfg(not(target_os = "linux"))]
             assert!(
-                !kernel_process_group_exists(process_group_id)
+                !non_linux_process_group_has_live_member(process_group_id)
                     .expect("observe explicitly cleaned process group")
             );
         }

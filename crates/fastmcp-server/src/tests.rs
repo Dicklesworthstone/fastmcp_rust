@@ -512,7 +512,7 @@ struct TemplateResource;
 impl ResourceHandler for TemplateResource {
     fn definition(&self) -> Resource {
         Resource {
-            uri: "resource://{id}".to_string(),
+            uri: "resource:///items/{id}".to_string(),
             name: "Template Resource".to_string(),
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -524,7 +524,7 @@ impl ResourceHandler for TemplateResource {
 
     fn template(&self) -> Option<ResourceTemplate> {
         Some(ResourceTemplate {
-            uri_template: "resource://{id}".to_string(),
+            uri_template: "resource:///items/{id}".to_string(),
             name: "Template Resource".to_string(),
             description: Some("Template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -564,7 +564,7 @@ struct SpecificTemplateResource;
 impl ResourceHandler for SpecificTemplateResource {
     fn definition(&self) -> Resource {
         Resource {
-            uri: "resource://foo/{id}".to_string(),
+            uri: "resource:///items/foo/{id}".to_string(),
             name: "Specific Template Resource".to_string(),
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -576,7 +576,7 @@ impl ResourceHandler for SpecificTemplateResource {
 
     fn template(&self) -> Option<ResourceTemplate> {
         Some(ResourceTemplate {
-            uri_template: "resource://foo/{id}".to_string(),
+            uri_template: "resource:///items/foo/{id}".to_string(),
             name: "Specific Template Resource".to_string(),
             description: Some("Specific template resource for tests".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -766,7 +766,7 @@ mod router_tests {
 
         // Register resource templates
         router.add_resource_template(ResourceTemplate {
-            uri_template: "resource://{name}".to_string(),
+            uri_template: "resource:///named/{name}".to_string(),
             name: "Manual Template".to_string(),
             description: Some("Resource template for manual listing".to_string()),
             mime_type: Some("text/plain".to_string()),
@@ -1232,8 +1232,8 @@ mod router_tests {
             .iter()
             .map(|template| template.uri_template.as_str())
             .collect();
-        assert!(template_uris.contains(&"resource://{id}"));
-        assert!(template_uris.contains(&"resource://{name}"));
+        assert!(template_uris.contains(&"resource:///items/{id}"));
+        assert!(template_uris.contains(&"resource:///named/{name}"));
     }
 
     // ========================================================================
@@ -1320,7 +1320,7 @@ mod router_tests {
 
         // Disable a template by its URI template
         let mut disabled: std::collections::HashSet<String> = std::collections::HashSet::new();
-        disabled.insert("resource://{id}".to_string());
+        disabled.insert("resource:///items/{id}".to_string());
         state.set("fastmcp.disabled_resources", disabled);
 
         // Now filtered list should have one less template
@@ -1329,12 +1329,12 @@ mod router_tests {
         assert!(
             !filtered_templates
                 .iter()
-                .any(|t| t.uri_template == "resource://{id}")
+                .any(|t| t.uri_template == "resource:///items/{id}")
         );
         assert!(
             filtered_templates
                 .iter()
-                .any(|t| t.uri_template == "resource://{name}")
+                .any(|t| t.uri_template == "resource:///named/{name}")
         );
     }
 
@@ -1350,14 +1350,14 @@ mod router_tests {
         let templates = result.unwrap().resource_templates;
 
         assert_eq!(templates.len(), 2);
-        assert_eq!(templates[0].uri_template, "resource://{id}");
+        assert_eq!(templates[0].uri_template, "resource:///items/{id}");
         assert_eq!(templates[0].name, "Template Resource");
         assert_eq!(
             templates[0].description.as_deref(),
             Some("Template resource for tests")
         );
         assert_eq!(templates[0].mime_type.as_deref(), Some("text/plain"));
-        assert_eq!(templates[1].uri_template, "resource://{name}");
+        assert_eq!(templates[1].uri_template, "resource:///named/{name}");
         assert_eq!(templates[1].name, "Manual Template");
         assert_eq!(
             templates[1].description.as_deref(),
@@ -1477,6 +1477,7 @@ mod router_tests {
         let params = CancelledParams {
             request_id: RequestId::Number(1),
             reason: Some("unit test".to_string()),
+            meta: None,
         };
         let request = fastmcp_protocol::JsonRpcRequest::notification(
             "notifications/cancelled",
@@ -1518,6 +1519,7 @@ mod router_tests {
         let params = CancelledParams {
             request_id: request_id.clone(),
             reason: Some("test cancellation".to_string()),
+            meta: None,
         };
         server.handle_cancelled_notification(session_id, params);
 
@@ -1550,6 +1552,7 @@ mod router_tests {
         let params = CancelledParams {
             request_id: request_id.clone(),
             reason: Some("test cancellation".to_string()),
+            meta: None,
         };
         let start = Instant::now();
         server.handle_cancelled_notification(session_id, params);
@@ -1688,14 +1691,31 @@ mod router_tests {
         ready_rx.recv().expect("ready recv failed");
 
         let (done_tx, done_rx) = mpsc::channel::<()>();
+        let (cancel_started_tx, cancel_started_rx) = mpsc::channel::<()>();
         let server_for_cancel = Arc::clone(&server);
         let canceler = thread::spawn(move || {
+            cancel_started_tx
+                .send(())
+                .expect("cancel-started send failed");
             server_for_cancel.cancel_active_requests(CancelKind::User, true);
             done_tx.send(()).expect("done send failed");
         });
 
-        thread::sleep(Duration::from_millis(25));
-        assert!(done_rx.try_recv().is_err());
+        cancel_started_rx
+            .recv()
+            .expect("cancel-started recv failed");
+        let cancellation_deadline = Instant::now() + Duration::from_secs(5);
+        while !cx.is_cancel_requested() && Instant::now() < cancellation_deadline {
+            thread::yield_now();
+        }
+        assert!(
+            cx.is_cancel_requested(),
+            "the shutdown thread must cancel the registered request before cleanup can wait"
+        );
+        assert!(
+            done_rx.try_recv().is_err(),
+            "shutdown cleanup must remain blocked while the active guard is alive"
+        );
 
         release_tx.send(()).expect("release send failed");
         worker.join().expect("worker join failed");
@@ -1707,7 +1727,6 @@ mod router_tests {
             .lock()
             .expect("active_requests lock poisoned");
         assert!(guard.is_empty());
-        assert!(cx.is_cancel_requested());
     }
 
     #[test]
@@ -3201,7 +3220,7 @@ mod router_tests {
         let budget = Budget::INFINITE;
 
         let params = ReadResourceParams {
-            uri: "resource://abc".to_string(),
+            uri: "resource:///items/abc".to_string(),
             meta: None,
         };
 
@@ -3224,7 +3243,7 @@ mod router_tests {
         let budget = Budget::INFINITE;
 
         let params = ReadResourceParams {
-            uri: "resource://hello%20world".to_string(),
+            uri: "resource:///items/hello%20world".to_string(),
             meta: None,
         };
 
@@ -3318,16 +3337,30 @@ mod router_tests {
     }
 
     #[test]
-    fn test_handle_resources_read_template_precedence() {
+    fn test_overlapping_resource_template_registration_is_rejected_without_mutation() {
         let mut router = Router::new();
         router.add_resource(TemplateResource);
-        router.add_resource(SpecificTemplateResource);
+        let templates_before = serde_json::to_value(router.resource_templates())
+            .expect("resource template catalog serializes");
+        let error = router
+            .add_resource_with_behavior(SpecificTemplateResource, crate::DuplicateBehavior::Replace)
+            .expect_err("a conservatively overlapping final template must be rejected");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "resource template collides with an admitted final resource template"
+        );
+        assert_eq!(
+            serde_json::to_value(router.resource_templates())
+                .expect("resource template catalog serializes"),
+            templates_before
+        );
 
         let cx = Cx::for_testing();
         let budget = Budget::INFINITE;
 
         let params = ReadResourceParams {
-            uri: "resource://foo/123".to_string(),
+            uri: "resource:///items/123".to_string(),
             meta: None,
         };
 
@@ -3339,7 +3372,7 @@ mod router_tests {
         let read_result = result.unwrap();
         assert!(matches!(
             &read_result.contents[0],
-            LegacyResourceContent::Text { text, .. } if text == "Specific 123"
+            LegacyResourceContent::Text { text, .. } if text == "Template 123"
         ));
     }
 
@@ -6222,7 +6255,7 @@ mod handler_direct_tests {
         let resource = TemplateResource;
         let tmpl = resource.template();
         assert!(tmpl.is_some());
-        assert_eq!(tmpl.unwrap().uri_template, "resource://{id}");
+        assert_eq!(tmpl.unwrap().uri_template, "resource:///items/{id}");
     }
 
     #[test]
@@ -6402,7 +6435,7 @@ mod handler_direct_tests {
     fn mounted_resource_handler_with_template() {
         let inner: Box<dyn ResourceHandler> = Box::new(TemplateResource);
         let tmpl = ResourceTemplate {
-            uri_template: "ns/resource://{id}".to_string(),
+            uri_template: "ns/resource:///items/{id}".to_string(),
             name: "Mounted Template".to_string(),
             description: None,
             mime_type: None,
@@ -6412,13 +6445,13 @@ mod handler_direct_tests {
         };
         let mounted = MountedResourceHandler::with_template(
             inner,
-            "resource://{id}".to_string(),
-            "ns/resource://{id}".to_string(),
+            "resource:///items/{id}".to_string(),
+            "ns/resource:///items/{id}".to_string(),
             tmpl,
         );
         let template = mounted.template();
         assert!(template.is_some());
-        assert_eq!(template.unwrap().uri_template, "ns/resource://{id}");
+        assert_eq!(template.unwrap().uri_template, "ns/resource:///items/{id}");
     }
 
     // ── MountedPromptHandler ─────────────────────────────────────────
@@ -7442,18 +7475,35 @@ mod builder_tests {
     #[test]
     fn tools_list_handles_extreme_cursor_offset_without_overflow() {
         let router = ServerBuilder::new("s", "0.1")
-            .list_page_size(2)
+            .list_page_size(1)
             .tool(BuilderT1Tool)
+            .tool(BuilderT2Tool)
             .build()
             .into_router();
 
-        let payload = serde_json::json!({ "offset": usize::MAX });
-        let cursor = BASE64_STANDARD
-            .encode(serde_json::to_vec(&payload).expect("extreme cursor payload should serialize"));
-
         let cx = Cx::for_testing();
         let request_ctx = McpContext::new(cx, 1);
-        let page = router
+        let first = router
+            .handle_tools_list(
+                &request_ctx,
+                fastmcp_protocol::ListToolsParams::default(),
+                None,
+            )
+            .expect("tools/list should mint a bound continuation cursor");
+        let cursor = first
+            .next_cursor
+            .expect("the first page has a continuation");
+        let mut payload: serde_json::Value = serde_json::from_slice(
+            &BASE64_STANDARD
+                .decode(cursor)
+                .expect("router-minted cursor is base64"),
+        )
+        .expect("router-minted cursor is JSON");
+        payload["offset"] = serde_json::json!(u64::MAX);
+        let cursor = BASE64_STANDARD
+            .encode(serde_json::to_vec(&payload).expect("extreme bound cursor should serialize"));
+
+        let error = router
             .handle_tools_list(
                 &request_ctx,
                 fastmcp_protocol::ListToolsParams {
@@ -7462,10 +7512,13 @@ mod builder_tests {
                 },
                 None,
             )
-            .expect("tools/list should not overflow on extreme cursor offset");
+            .expect_err("an extreme offset must fail closed without overflowing");
 
-        assert!(page.tools.is_empty());
-        assert!(page.next_cursor.is_none());
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(
+            error.message,
+            "final catalog cursor offset is outside the requested catalog page"
+        );
     }
 }
 
@@ -7653,6 +7706,7 @@ mod helper_function_tests {
                                             serde_json::to_value(CancelledParams {
                                                 request_id: RequestId::Number(2),
                                                 reason: Some("test cancellation".to_string()),
+                                                meta: None,
                                             })
                                             .expect("serialize cancellation"),
                                         ),

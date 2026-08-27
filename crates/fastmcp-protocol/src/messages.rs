@@ -5130,6 +5130,12 @@ pub struct CancelledParams {
         deserialize_with = "deserialize_cancellation_reason"
     )]
     pub reason: Option<String>,
+    /// Optional exact-2024 notification metadata.
+    ///
+    /// Application-defined entries remain inert. Era-reserved final metadata
+    /// is rejected by [`CancellationWireMessage`], the negotiated wire codec.
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<OpenMetadata>,
 }
 
 /// Peer that originates a cancellation notification.
@@ -5198,6 +5204,11 @@ impl CancellationWireMessage {
 
         match era {
             ProtocolEra::Legacy2024 => {
+                if has_final_only_metadata(params) {
+                    return Err(CancellationWireCodecError::InvalidParameters {
+                        era: ProtocolEra::Legacy2024,
+                    });
+                }
                 let params =
                     serde_json::from_value::<CancelledParams>(params.clone()).map_err(|_| {
                         CancellationWireCodecError::InvalidParameters {
@@ -5260,6 +5271,9 @@ impl CancellationWireMessage {
             }
         }
         .map_err(|_| CancellationWireCodecError::EncodeFailure { era })?;
+        if matches!(era, ProtocolEra::Legacy2024) && has_final_only_metadata(&params) {
+            return Err(CancellationWireCodecError::InvalidParameters { era });
+        }
         Ok(JsonRpcRequest::notification(
             NOTIFICATIONS_CANCELLED,
             Some(params),
@@ -10462,6 +10476,60 @@ mod tests {
             baseline_wire,
             "the metadata-free baseline remains unchanged"
         );
+
+        let legacy_application_metadata = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": "legacy-request-8",
+                "_meta": {"com.example/application": true},
+            })),
+        );
+        let legacy = CancellationWireMessage::decode(
+            ProtocolEra::Legacy2024,
+            CancellationSender::Client,
+            &legacy_application_metadata,
+        )
+        .expect("exact-2024 cancellation retains application notification metadata");
+        assert_eq!(
+            serde_json::to_value(legacy.encode().expect("legacy metadata re-encodes"))
+                .expect("metadata-bearing legacy cancellation remains JSON"),
+            serde_json::to_value(&legacy_application_metadata)
+                .expect("legacy metadata baseline remains JSON")
+        );
+
+        let legacy_with_final_metadata = JsonRpcRequest::notification(
+            NOTIFICATIONS_CANCELLED,
+            Some(serde_json::json!({
+                "requestId": "legacy-request-8",
+                "_meta": {"io.modelcontextprotocol/subscriptionId": "legacy-request-8"},
+            })),
+        );
+        assert!(matches!(
+            CancellationWireMessage::decode(
+                ProtocolEra::Legacy2024,
+                CancellationSender::Client,
+                &legacy_with_final_metadata,
+            ),
+            Err(CancellationWireCodecError::InvalidParameters {
+                era: ProtocolEra::Legacy2024,
+            })
+        ));
+        let locally_constructed_legacy_with_final_metadata = CancellationWireMessage::Legacy2024 {
+            sender: CancellationSender::Client,
+            params: serde_json::from_value(
+                legacy_with_final_metadata
+                    .params
+                    .clone()
+                    .expect("legacy final-metadata negative retains params"),
+            )
+            .expect("the individual legacy fields remain structurally valid"),
+        };
+        assert!(matches!(
+            locally_constructed_legacy_with_final_metadata.encode(),
+            Err(CancellationWireCodecError::InvalidParameters {
+                era: ProtocolEra::Legacy2024,
+            })
+        ));
     }
 
     #[test]
@@ -10561,6 +10629,7 @@ mod tests {
         let params = CancelledParams {
             request_id: RequestId::Number(5),
             reason: None,
+            meta: None,
         };
         let value = serde_json::to_value(&params).expect("serialize");
         assert_eq!(value["requestId"], 5);
@@ -10573,6 +10642,7 @@ mod tests {
         let params = CancelledParams {
             request_id: RequestId::String("req-7".to_string()),
             reason: Some("User cancelled".to_string()),
+            meta: None,
         };
         let value = serde_json::to_value(&params).expect("serialize");
         assert_eq!(value["requestId"], "req-7");
@@ -10586,7 +10656,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_params_reason_is_unbounded_by_the_spec_and_shape_is_closed() {
+    fn cancelled_params_reason_is_unbounded_and_application_metadata_is_open() {
         let beyond_historical_bound = "x".repeat(MAX_CANCELLATION_REASON_BYTES + 1);
         let admitted_json = serde_json::json!({
             "requestId": 1,
@@ -10615,10 +10685,19 @@ mod tests {
             }))
             .is_err()
         );
+        assert!(
+            serde_json::from_value::<CancelledParams>(serde_json::json!({
+                "requestId": 1,
+                "_meta": {"com.example/application": true},
+            }))
+            .is_ok(),
+            "notification metadata is inherited while unknown parameter members stay closed"
+        );
 
         let outbound = CancelledParams {
             request_id: RequestId::Number(1),
             reason: Some("x".repeat(MAX_CANCELLATION_REASON_BYTES + 1)),
+            meta: None,
         };
         assert!(serde_json::to_value(outbound).is_ok());
     }

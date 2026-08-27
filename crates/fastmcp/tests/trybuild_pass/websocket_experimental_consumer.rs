@@ -36,7 +36,8 @@ async fn composes_actual_async_websocket_client(cx: &Cx) -> McpResult<()> {
         let legacy_client = fastmcp_rust::legacy_2024::ClientBuilder::new()
             .connect_websocket_with_cx(cx, legacy_transport)
             .await?;
-        let _ = legacy_client.session();
+        let _ = legacy_client.protocol_policy();
+        let _ = legacy_client.protocol_version();
 
         let auto_client = fastmcp_rust::auto::ClientBuilder::new()
             .connect_websocket_auto_with_cx(cx, move |_| async move {
@@ -67,11 +68,6 @@ fn exposes_async_websocket_types<IO>() {
     let _: Option<prelude::WebSocketResponse> = None;
     let _: Option<prelude::BoundWebSocketServer> = None;
     let _: Option<prelude::WebSocketServerShutdown> = None;
-    let _ = fastmcp_rust::modern::Server::bind_websocket;
-    #[cfg(feature = "legacy-2024-11-05")]
-    {
-        let _ = fastmcp_rust::legacy_2024::Server::bind_websocket;
-    }
 }
 
 fn main() {

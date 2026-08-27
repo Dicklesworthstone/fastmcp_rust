@@ -594,7 +594,10 @@ impl ServerBuilder {
         if let Some(extension_runtime) = self.extension_runtime.as_mut() {
             extension_runtime.install_official_mcp_apps()?;
         } else {
+            #[cfg(feature = "tasks")]
             let mut extension_runtime = ServerExtensionRuntime::with_official_mcp_apps()?;
+            #[cfg(not(feature = "tasks"))]
+            let extension_runtime = ServerExtensionRuntime::with_official_mcp_apps()?;
             #[cfg(feature = "tasks")]
             if let Some(task_runtime) = self.final_task_runtime.as_ref() {
                 extension_runtime.install_final_tasks(task_runtime)?;
@@ -1906,7 +1909,10 @@ impl ServerBuilder {
         proxy_client.admit_typed_catalog(&catalog)?;
         self.adopt_upstream_proxy_instructions(&proxy_client)?;
         self.adopt_upstream_proxy_implementation(&proxy_client)?;
+        #[cfg(feature = "tasks")]
         let catalog_era = catalog.era()?;
+        #[cfg(not(feature = "tasks"))]
+        catalog.era()?;
         let completion_supported = proxy_client.supports_completion()?;
         #[cfg(feature = "tasks")]
         let task_relay = if catalog_era == ProtocolEra::Modern2026 {
@@ -4291,9 +4297,11 @@ mod tests {
 
         assert!(main.has_tools());
         assert!(main.has_resources());
-        assert!(
-            main.extension_registry_receipt().is_none(),
-            "rejecting a child must not adopt its Apps extension runtime"
+        assert_eq!(
+            main.extension_registry_receipt()
+                .map(|receipt| receipt.descriptor_count()),
+            cfg!(feature = "tasks").then_some(1),
+            "rejecting a child must retain only the parent's feature-selected runtime"
         );
 
         let router = main.into_router();
@@ -4320,7 +4328,7 @@ mod tests {
             main.extension_registry_receipt()
                 .expect("parent retains its Apps extension runtime")
                 .descriptor_count(),
-            1,
+            1 + usize::from(cfg!(feature = "tasks")),
             "mounting does not transfer or merge the child extension runtime"
         );
 
@@ -4339,9 +4347,11 @@ mod tests {
 
         assert!(!main.has_tools());
         assert!(main.has_resources());
-        assert!(
-            main.extension_registry_receipt().is_none(),
-            "rejecting a child must not adopt its Apps extension runtime"
+        assert_eq!(
+            main.extension_registry_receipt()
+                .map(|receipt| receipt.descriptor_count()),
+            cfg!(feature = "tasks").then_some(1),
+            "rejecting a child must retain only the parent's feature-selected runtime"
         );
 
         let router = main.into_router();
@@ -4376,7 +4386,7 @@ mod tests {
             main.extension_registry_receipt()
                 .expect("parent retains its Apps extension runtime")
                 .descriptor_count(),
-            1,
+            1 + usize::from(cfg!(feature = "tasks")),
             "mounting does not transfer or merge the child extension runtime"
         );
 
@@ -4395,9 +4405,11 @@ mod tests {
 
         assert!(main.has_tools());
         assert!(!main.has_resources());
-        assert!(
-            main.extension_registry_receipt().is_none(),
-            "rejecting a child must not adopt its Apps extension runtime"
+        assert_eq!(
+            main.extension_registry_receipt()
+                .map(|receipt| receipt.descriptor_count()),
+            cfg!(feature = "tasks").then_some(1),
+            "rejecting a child must retain only the parent's feature-selected runtime"
         );
 
         let router = main.into_router();
@@ -4428,7 +4440,7 @@ mod tests {
             main.extension_registry_receipt()
                 .expect("parent retains its Apps extension runtime")
                 .descriptor_count(),
-            1,
+            1 + usize::from(cfg!(feature = "tasks")),
             "mounting does not transfer or merge the child extension runtime"
         );
 
@@ -4654,6 +4666,33 @@ mod tests {
                     }]),
                     meta: None,
                 })
+            }
+
+            fn get(
+                &self,
+                _ctx: &McpContext,
+                _args: std::collections::HashMap<String, String>,
+            ) -> McpResult<Vec<fastmcp_protocol::PromptMessage>> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct LocalLegacyCompletionPrompt;
+
+        impl crate::PromptHandler for LocalLegacyCompletionPrompt {
+            fn definition(&self) -> Prompt {
+                Prompt {
+                    name: "legacy-deploy".to_owned(),
+                    description: Some("local legacy completion target".to_owned()),
+                    arguments: vec![fastmcp_protocol::PromptArgument {
+                        name: "environment".to_owned(),
+                        description: None,
+                        required: false,
+                    }],
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
             }
 
             fn get(
@@ -5324,7 +5363,7 @@ mod tests {
             .expect("final discovery serializes");
             assert_eq!(
                 discovery.pointer("/capabilities/tools"),
-                Some(&serde_json::json!({}))
+                Some(&serde_json::json!({"listChanged": true}))
             );
             let inbound = crate::InboundRequestContext::new(
                 Cx::for_testing(),
@@ -5373,7 +5412,15 @@ mod tests {
             let response = server
                 .dispatch_stateless(&inbound, &final_tools_list_request(702))
                 .expect("the public final tools/list path responds for an empty catalog");
-            assert_eq!(response.result, Some(serde_json::json!({"tools": []})));
+            assert_eq!(
+                response.result,
+                Some(serde_json::json!({
+                    "resultType": "complete",
+                    "tools": [],
+                    "ttlMs": 300_000,
+                    "cacheScope": "private",
+                }))
+            );
             assert!(
                 server.tools().is_empty(),
                 "removing only the final catalog entry leaves no legacy registry mutation"
@@ -5702,12 +5749,14 @@ mod tests {
                 .expect("the legacy tools/call response has a result payload");
             assert_eq!(legacy_call["content"][0]["text"], "bound legacy proxy");
 
-            let final_call_inbound = crate::InboundRequestContext::new(
+            let final_connection = crate::ModernConnection::new();
+            let final_call_inbound = crate::InboundRequestContext::with_modern_connection(
                 Cx::for_testing(),
                 804,
                 crate::InboundRequestTransport::Memory,
+                &final_connection,
             );
-            let final_call = server
+            let final_call_response = server
                 .dispatch_stateless(
                     &final_call_inbound,
                     &final_tools_call_request(
@@ -5716,7 +5765,13 @@ mod tests {
                         804,
                     ),
                 )
-                .expect("the final tools/call request receives a response")
+                .expect("the final tools/call request receives a response");
+            assert!(
+                final_call_response.error.is_none(),
+                "the bound final proxy call must succeed: {:?}",
+                final_call_response.error
+            );
+            let final_call = final_call_response
                 .result
                 .expect("the final tools/call response has a result payload");
             assert_eq!(final_call["resultType"], "complete");
@@ -6415,7 +6470,7 @@ mod tests {
                 )
                 .expect("the legacy resource-template proxy installs")
                 .on_duplicate(DuplicateBehavior::Replace)
-                .legacy_prompt(LocalFinalCompletionPrompt)
+                .legacy_prompt(LocalLegacyCompletionPrompt)
                 .legacy_resource_template(local_completion_template())
                 .build();
             let mut legacy_session = initialized_legacy_proxy_session(&evicted);
@@ -6493,7 +6548,7 @@ mod tests {
                 )
                 .expect("the legacy resource-template proxy installs")
                 .on_duplicate(DuplicateBehavior::Replace)
-                .legacy_prompt(LocalFinalCompletionPrompt)
+                .legacy_prompt(LocalLegacyCompletionPrompt)
                 .legacy_resource_template(local_completion_template())
                 .legacy_completion_handler(TestCompletion)
                 .build();
@@ -6662,7 +6717,7 @@ mod tests {
         #[test]
         fn typed_proxy_registration_retains_final_resource_template_and_prompt_metadata() {
             let resource = serde_json::json!({
-                "uri": "mcp://upstream/resource",
+                "uri": "mcp://static-upstream/resource",
                 "name": "upstream-resource",
                 "size": 4096,
                 "_meta": {"com.example/resource": {"retained": true}}

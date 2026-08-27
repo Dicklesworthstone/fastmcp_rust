@@ -2,4 +2,18 @@ error[E0432]: unresolved import `fastmcp_rust::auto::AsyncWsClientTransport`
  --> tests/trybuild/websocket/auto_wrapper_escape.rs:1:5
   |
 1 | use fastmcp_rust::auto::AsyncWsClientTransport;
-  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `AsyncWsClientTransport` in `auto`
+  |     ^^^^^^^^^^^^^^^^^^^^----------------------
+  |                         |
+  |                         no `AsyncWsClientTransport` in `auto`
+  |
+help: consider importing one of these structs instead
+  |
+1 - use fastmcp_rust::auto::AsyncWsClientTransport;
+1 + use fastmcp_client::AsyncWsClientTransport;
+  |
+1 - use fastmcp_rust::auto::AsyncWsClientTransport;
+1 + use fastmcp_rust::AsyncWsClientTransport;
+  |
+1 - use fastmcp_rust::auto::AsyncWsClientTransport;
+1 + use fastmcp_transport::websocket::AsyncWsClientTransport;
+  |

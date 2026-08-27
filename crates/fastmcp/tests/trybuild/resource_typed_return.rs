@@ -4,7 +4,15 @@ use fastmcp_rust::resource;
 
 #[resource(uri = "final://resource")]
 fn final_resource() -> fastmcp_rust::CompleteResult<fastmcp_rust::GetPromptResult> {
-    unimplemented!()
+    fastmcp_rust::CompleteResult::new(
+        fastmcp_rust::GetPromptResult {
+            description: None,
+            messages: Vec::new(),
+            meta: None,
+            additional: std::collections::BTreeMap::new(),
+        },
+        fastmcp_rust::ResultMeta::empty(),
+    )
 }
 
 fn main() {}
