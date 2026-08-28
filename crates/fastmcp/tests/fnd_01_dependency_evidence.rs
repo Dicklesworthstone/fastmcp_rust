@@ -94525,13 +94525,39 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    fn ordinary_rustup_executable_from_cargo_home(cargo_home: &str) -> Result<PathBuf, String> {
-        let cargo_home = super::trust_std::validate_absolute_lexical_path(
-            cargo_home,
-            "Attest self-reexec CARGO_HOME",
+    fn ordinary_rustup_home_from_values(
+        rustup_home: Option<&str>,
+        home: Option<&str>,
+    ) -> Result<PathBuf, String> {
+        if let Some(rustup_home) = rustup_home {
+            return super::trust_std::validate_absolute_lexical_path(
+                rustup_home,
+                "Attest self-reexec RUSTUP_HOME",
+            )
+            .map_err(|error| pending!("RUSTUP_HOME authority: {error}"));
+        }
+        let home = home.ok_or_else(|| {
+            pending!("HOME authority is required when RUSTUP_HOME is absent")
+        })?;
+        let home = super::trust_std::validate_absolute_lexical_path(
+            home,
+            "Attest self-reexec HOME",
         )
-        .map_err(|error| pending!("CARGO_HOME authority: {error}"))?;
-        Ok(cargo_home.join("bin/rustup"))
+        .map_err(|error| pending!("HOME authority: {error}"))?;
+        Ok(home.join(".rustup"))
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_rustup_home_from_environment() -> Result<PathBuf, String> {
+        match super::trust_std::read_unique_environment("RUSTUP_HOME") {
+            Ok(rustup_home) => ordinary_rustup_home_from_values(Some(&rustup_home), None),
+            Err(error) if error.code() == "E_ENV_MISSING" => {
+                let home = super::trust_std::read_unique_environment("HOME")
+                    .map_err(|error| pending!("read HOME authority: {error}"))?;
+                ordinary_rustup_home_from_values(None, Some(&home))
+            }
+            Err(error) => Err(pending!("read RUSTUP_HOME authority: {error}")),
+        }
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -94564,32 +94590,31 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    fn ordinary_checked_rustup_authority(
-        cargo_home: &str,
-    ) -> Result<(PathBuf, CheckedSnapshot), String> {
-        let rustup = ordinary_rustup_executable_from_cargo_home(cargo_home)?;
-        let cargo_home = rustup
-            .parent()
-            .and_then(Path::parent)
-            .ok_or_else(|| pending!("rustup authority has no CARGO_HOME parent"))?;
-        ordinary_require_physical_directory_chain(cargo_home, "CARGO_HOME authority")?;
+    fn ordinary_checked_rustc_authority(
+        rustup_home: &str,
+        current_toolchain: &str,
+    ) -> Result<(PathBuf, PathBuf, CheckedSnapshot), String> {
+        let expected_sysroot = ordinary_expected_rust_sysroot(rustup_home, current_toolchain)?;
+        ordinary_require_physical_directory_chain(&expected_sysroot, "current rust sysroot")?;
+        let toolchain_bin = expected_sysroot.join("bin");
+        ordinary_require_physical_directory_chain(&toolchain_bin, "current rust toolchain bin")?;
         let snapshot = checked_snapshot(
-            cargo_home,
-            "bin/rustup",
+            &expected_sysroot,
+            "bin/rustc",
             MAX_GATE_EXECUTABLE_BYTES,
             None,
         )
-        .map_err(|error| pending!("rustup authority: {error}"))?;
+        .map_err(|error| pending!("pinned rustc authority: {error}"))?;
         if snapshot.byte_length == 0
             || snapshot.identity.file_type != 0o100_000
             || snapshot.identity.mode & 0o100 == 0
             || snapshot.identity.link_count != 1
         {
             return Err(pending!(
-                "rustup authority must be nonempty, physical, owner-executable, and nlink-one",
+                "pinned rustc authority must be nonempty, physical, owner-executable, and nlink-one",
             ));
         }
-        Ok((rustup, snapshot))
+        Ok((toolchain_bin.join("rustc"), expected_sysroot, snapshot))
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -94727,28 +94752,29 @@ fn fallible(value: Option<u8>) {
         }
         let authoring_marker = live_authoring_marker_text(&root);
 
-        let cargo_home = super::trust_std::read_unique_environment("CARGO_HOME")
-            .map_err(|error| pending!("read CARGO_HOME authority: {error}"))?;
-        let rustup_home = super::trust_std::read_unique_environment("RUSTUP_HOME")
-            .map_err(|error| pending!("read RUSTUP_HOME authority: {error}"))?;
-        let (rustup_executable, rustup_pre) =
-            ordinary_checked_rustup_authority(&cargo_home)?;
-        let expected_sysroot = ordinary_expected_rust_sysroot(
-            &rustup_home,
+        let rustup_home = ordinary_rustup_home_from_environment()?;
+        let rustup_home_text = ordinary_utf8_path(&rustup_home, "RUSTUP_HOME authority")?;
+        let (rustc_executable, expected_sysroot, rustc_pre) = ordinary_checked_rustc_authority(
+            &rustup_home_text,
             current_identity.toolchain.as_str(),
         )?;
-        let sysroot_output = Command::new(&rustup_executable)
-            .args([
-                "run",
-                current_identity.toolchain.as_str(),
-                "rustc",
-                "--print",
-                "sysroot",
-            ])
+        let sysroot_output = Command::new(&rustc_executable)
+            .args(["--print", "sysroot"])
+            .env_clear()
+            .env("LANG", "C")
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
             .output();
-        let (rustup_post_path, rustup_post) = ordinary_checked_rustup_authority(&cargo_home)?;
-        if rustup_post_path != rustup_executable || rustup_post != rustup_pre {
-            return Err(pending!("rustup authority changed during sysroot query"));
+        let (rustc_post_path, expected_sysroot_post, rustc_post) =
+            ordinary_checked_rustc_authority(
+                &rustup_home_text,
+                current_identity.toolchain.as_str(),
+            )?;
+        if rustc_post_path != rustc_executable
+            || expected_sysroot_post != expected_sysroot
+            || rustc_post != rustc_pre
+        {
+            return Err(pending!("pinned rustc authority changed during sysroot query"));
         }
         let sysroot_output =
             sysroot_output.map_err(|error| pending!("query rust sysroot: {error}"))?;
@@ -98636,23 +98662,66 @@ fn fallible(value: Option<u8>) {
         root
     }
 
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_pinned_rustc_fixture(mode: u32) -> (PathBuf, PathBuf, PathBuf) {
+        let root = super::fresh_test_root("ordinary-pinned-rustc");
+        let rustup_home = root.join("rustup-home");
+        let rustc_relative = format!(
+            "rustup-home/toolchains/{}-x86_64-unknown-linux-gnu/bin/rustc",
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+        );
+        ordinary_fixture_write_new(&root, &rustc_relative, b"#!/bin/sh\nexit 0\n")
+            .expect("write pinned rustc authority fixture");
+        let rustc = root.join(rustc_relative);
+        let mut permissions = fs::metadata(&rustc)
+            .expect("pinned rustc authority fixture metadata")
+            .permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(&rustc, permissions)
+            .expect("pinned rustc authority fixture chmod");
+        (root, rustup_home, rustc)
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_b_r1_qualified_linux_dual_path_tool_reprobe() {
         assert_eq!(
-            ordinary_rustup_executable_from_cargo_home("/fixture/cargo-home")
-                .expect("absolute CARGO_HOME authority"),
-            Path::new("/fixture/cargo-home/bin/rustup"),
+            ordinary_rustup_home_from_values(Some("/fixture/rustup-home"), None)
+                .expect("explicit absolute RUSTUP_HOME authority"),
+            Path::new("/fixture/rustup-home"),
         );
         assert_eq!(
-            ordinary_rustup_executable_from_cargo_home("fixture/cargo-home")
-                .expect_err("relative CARGO_HOME must fail closed"),
-            "E_ORDINARY_HANDOFF_PENDING: CARGO_HOME authority: E_ROOT_PATH|Attest self-reexec CARGO_HOME: invalid absolute lexical path",
+            ordinary_rustup_home_from_values(None, Some("/fixture/home"))
+                .expect("default HOME-based rustup authority"),
+            Path::new("/fixture/home/.rustup"),
         );
         assert_eq!(
-            ordinary_rustup_executable_from_cargo_home("/fixture/../cargo-home")
-                .expect_err("parent-traversing CARGO_HOME must fail closed"),
-            "E_ORDINARY_HANDOFF_PENDING: CARGO_HOME authority: E_ROOT_PATH|Attest self-reexec CARGO_HOME: invalid component",
+            ordinary_rustup_home_from_values(
+                Some("/fixture/rustup-home"),
+                Some("relative/ignored-home"),
+            )
+            .expect("explicit RUSTUP_HOME takes precedence over HOME fallback"),
+            Path::new("/fixture/rustup-home"),
+        );
+        assert_eq!(
+            ordinary_rustup_home_from_values(Some("fixture/rustup-home"), None)
+                .expect_err("relative RUSTUP_HOME must fail closed"),
+            "E_ORDINARY_HANDOFF_PENDING: RUSTUP_HOME authority: E_ROOT_PATH|Attest self-reexec RUSTUP_HOME: invalid absolute lexical path",
+        );
+        assert_eq!(
+            ordinary_rustup_home_from_values(Some("/fixture/../rustup-home"), None)
+                .expect_err("parent-traversing RUSTUP_HOME must fail closed"),
+            "E_ORDINARY_HANDOFF_PENDING: RUSTUP_HOME authority: E_ROOT_PATH|Attest self-reexec RUSTUP_HOME: invalid component",
+        );
+        assert_eq!(
+            ordinary_rustup_home_from_values(None, Some("relative/home"))
+                .expect_err("relative fallback HOME must fail closed"),
+            "E_ORDINARY_HANDOFF_PENDING: HOME authority: E_ROOT_PATH|Attest self-reexec HOME: invalid absolute lexical path",
+        );
+        assert_eq!(
+            ordinary_rustup_home_from_values(None, None)
+                .expect_err("missing rustup and HOME authority must fail closed"),
+            "E_ORDINARY_HANDOFF_PENDING: HOME authority is required when RUSTUP_HOME is absent",
         );
         let expected_sysroot = ordinary_expected_rust_sysroot(
             "/fixture/rustup-home",
@@ -98696,6 +98765,35 @@ fn fallible(value: Option<u8>) {
                 b"unexpected stderr".to_vec(),
                 "E_ORDINARY_HANDOFF_PENDING: rust sysroot query stderr must be empty",
             ),
+            (
+                expected_sysroot_line
+                    .strip_suffix('\n')
+                    .expect("fixture terminal LF")
+                    .as_bytes()
+                    .to_vec(),
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: rust sysroot query terminal LF missing",
+            ),
+            (
+                vec![0xff, b'\n'],
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: rust sysroot query is not UTF-8",
+            ),
+            (
+                [b"\xef\xbb\xbf".as_slice(), expected_sysroot_line.as_bytes()].concat(),
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: rust sysroot query stdout framing is invalid",
+            ),
+            (
+                [expected_sysroot.display().to_string().as_bytes(), b"\r\n"].concat(),
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: rust sysroot query must contain one canonical line",
+            ),
+            (
+                [expected_sysroot.display().to_string().as_bytes(), b"\0\n"].concat(),
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: rust sysroot query must contain one canonical line",
+            ),
         ] {
             assert_eq!(
                 ordinary_parse_rust_sysroot_output(&stdout, &stderr, &expected_sysroot)
@@ -98713,54 +98811,113 @@ fn fallible(value: Option<u8>) {
             expected_sysroot,
         );
 
-        let rustup_fixture = ordinary_cargo_example_hardlink_fixture(
-            "fnd_01_evidence_harness-0123456789abcdef",
+        let (rustc_fixture, rustup_home, _rustc_path) =
+            ordinary_pinned_rustc_fixture(0o755);
+        let isolated_cargo_home = rustc_fixture.join("isolated-cargo-home");
+        fs::create_dir(&isolated_cargo_home).expect("isolated Cargo cache fixture");
+        assert!(
+            !isolated_cargo_home.join("bin/rustup").exists(),
+            "a valid isolated Cargo cache need not contain a rustup launcher",
         );
-        let cargo_home = rustup_fixture.join("cargo-home");
-        ordinary_fixture_write_new(
-            &rustup_fixture,
-            "cargo-home/bin/rustup",
-            b"#!/bin/sh\nexit 0\n",
+        let rustup_home_text = ordinary_utf8_path(&rustup_home, "rustc fixture RUSTUP_HOME")
+            .expect("rustc fixture RUSTUP_HOME UTF-8");
+        let pristine = ordinary_checked_rustc_authority(
+            &rustup_home_text,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
         )
-        .expect("write physical rustup authority fixture");
-        let rustup_path = cargo_home.join("bin/rustup");
-        let mut rustup_permissions = fs::metadata(&rustup_path)
-            .expect("rustup authority fixture metadata")
-            .permissions();
-        rustup_permissions.set_mode(0o755);
-        fs::set_permissions(&rustup_path, rustup_permissions)
-            .expect("rustup authority fixture chmod");
-        let cargo_home_text = ordinary_utf8_path(&cargo_home, "rustup fixture CARGO_HOME")
-            .expect("rustup fixture CARGO_HOME UTF-8");
-        let pristine = ordinary_checked_rustup_authority(&cargo_home_text)
-            .expect("physical rustup authority fixture");
-        let cargo_home_alias = rustup_fixture.join("cargo-home-alias");
-        std::os::unix::fs::symlink(&cargo_home, &cargo_home_alias)
-            .expect("symlinked CARGO_HOME negative");
-        let before = ordinary_fixture_tree_state(&rustup_fixture)
-            .expect("symlinked CARGO_HOME fixture state");
-        let alias_text = ordinary_utf8_path(&cargo_home_alias, "symlinked CARGO_HOME")
-            .expect("symlinked CARGO_HOME UTF-8");
-        let error = ordinary_checked_rustup_authority(&alias_text)
-            .expect_err("symlinked CARGO_HOME must fail closed");
+        .expect("physical pinned rustc authority fixture");
+        let rustup_home_alias = rustc_fixture.join("rustup-home-alias");
+        std::os::unix::fs::symlink(&rustup_home, &rustup_home_alias)
+            .expect("symlinked RUSTUP_HOME negative");
+        let before = ordinary_fixture_tree_state(&rustc_fixture)
+            .expect("symlinked RUSTUP_HOME fixture state");
+        let alias_text = ordinary_utf8_path(&rustup_home_alias, "symlinked RUSTUP_HOME")
+            .expect("symlinked RUSTUP_HOME UTF-8");
+        let error = ordinary_checked_rustc_authority(
+            &alias_text,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+        )
+        .expect_err("symlinked RUSTUP_HOME must fail closed");
         assert_eq!(
             error,
             format!(
-                "E_ORDINARY_HANDOFF_PENDING: CARGO_HOME authority: {} is not a physical directory",
-                cargo_home_alias.display(),
+                "E_ORDINARY_HANDOFF_PENDING: current rust sysroot: {} is not a physical directory",
+                rustup_home_alias.display(),
             ),
         );
         assert_eq!(
-            ordinary_fixture_tree_state(&rustup_fixture)
-                .expect("symlinked CARGO_HOME fixture-state recheck"),
+            ordinary_fixture_tree_state(&rustc_fixture)
+                .expect("symlinked RUSTUP_HOME fixture-state recheck"),
             before,
-            "rejected symlinked CARGO_HOME leaves the complete fixture unchanged",
+            "rejected symlinked RUSTUP_HOME leaves the complete fixture unchanged",
         );
         assert_eq!(
-            ordinary_checked_rustup_authority(&cargo_home_text)
-                .expect("physical rustup authority pristine reacceptance"),
+            ordinary_checked_rustc_authority(
+                &rustup_home_text,
+                super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+            )
+            .expect("physical pinned rustc pristine reacceptance"),
             pristine,
         );
+
+        let (hardlink_root, hardlink_rustup_home, hardlinked_rustc) =
+            ordinary_pinned_rustc_fixture(0o755);
+        fs::hard_link(&hardlinked_rustc, hardlink_root.join("rustc-peer"))
+            .expect("pinned rustc hardlink negative");
+        let hardlink_before = ordinary_fixture_tree_state(&hardlink_root)
+            .expect("hardlinked pinned rustc fixture state");
+        let hardlink_rustup_home_text =
+            ordinary_utf8_path(&hardlink_rustup_home, "hardlink RUSTUP_HOME")
+                .expect("hardlink RUSTUP_HOME UTF-8");
+        let hardlink_error = ordinary_checked_rustc_authority(
+            &hardlink_rustup_home_text,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+        )
+        .expect_err("hardlinked pinned rustc must fail closed");
+        assert_eq!(
+            hardlink_error,
+            "E_ORDINARY_HANDOFF_PENDING: pinned rustc authority: E_FILE_HARDLINK|bin/rustc: nlink=2 differs from exact admitted count 1",
+        );
+        assert_eq!(
+            ordinary_fixture_tree_state(&hardlink_root)
+                .expect("hardlinked pinned rustc fixture-state recheck"),
+            hardlink_before,
+            "rejected hardlinked pinned rustc leaves the complete fixture unchanged",
+        );
+
+        let (nonexec_root, nonexec_rustup_home, nonexec_rustc) =
+            ordinary_pinned_rustc_fixture(0o655);
+        let nonexec_before = ordinary_fixture_tree_state(&nonexec_root)
+            .expect("non-executable pinned rustc fixture state");
+        let nonexec_rustup_home_text =
+            ordinary_utf8_path(&nonexec_rustup_home, "non-executable RUSTUP_HOME")
+                .expect("non-executable RUSTUP_HOME UTF-8");
+        let nonexec_error = ordinary_checked_rustc_authority(
+            &nonexec_rustup_home_text,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+        )
+        .expect_err("non-owner-executable pinned rustc must fail closed");
+        assert_eq!(
+            nonexec_error,
+            "E_ORDINARY_HANDOFF_PENDING: pinned rustc authority must be nonempty, physical, owner-executable, and nlink-one",
+        );
+        assert_eq!(
+            ordinary_fixture_tree_state(&nonexec_root)
+                .expect("non-executable pinned rustc fixture-state recheck"),
+            nonexec_before,
+            "rejected non-executable pinned rustc leaves the complete fixture unchanged",
+        );
+        let mut restored_permissions = fs::metadata(&nonexec_rustc)
+            .expect("non-executable pinned rustc metadata")
+            .permissions();
+        restored_permissions.set_mode(0o755);
+        fs::set_permissions(&nonexec_rustc, restored_permissions)
+            .expect("restore pinned rustc owner-executable bit");
+        ordinary_checked_rustc_authority(
+            &nonexec_rustup_home_text,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+        )
+        .expect("restored pinned rustc pristine reacceptance");
 
         let fixture_binding = ordinary_cargo_example_fixture_binding();
         let valid = ordinary_cargo_example_hardlink_fixture(
