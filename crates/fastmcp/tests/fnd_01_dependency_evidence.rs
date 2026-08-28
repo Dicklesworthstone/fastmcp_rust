@@ -34299,6 +34299,15 @@ mod ordinary {
     const EXPECTED_SDKS: usize = 4;
     const MAX_SDK_EXECUTION_FACT_BYTES: usize = 1024 * 1024;
     const HARD_MAX_POLICY_BYTES: u64 = 8 * 1024 * 1024;
+    const MAX_CAMPAIGN_ISSUES_JSONL_BYTES: usize = 32 * 1024 * 1024;
+    const CAMPAIGN_PROOF_FIELD_COUNT: usize = 524;
+    const CAMPAIGN_PROOF_FIELD_SHA256: &str =
+        "5611cb1c304cd609900713a21451fa7c890771b58366c0d9a530081dfb98467f";
+    const CAMPAIGN_PROOF_CONTROL_BEAD: &str = "bd-rebase-proof-toolchain-vjd8z";
+    const CAMPAIGN_PROOF_NEGATIVE_PREFIX: &str =
+        "- [ ] REALITY-PROOF-NEGATIVE:";
+    const SUPERSEDED_CAMPAIGN_TOOLCHAINS: [&str; 2] =
+        ["nightly-2026-07-11", "nightly-2026-08-20"];
     const EXACT_RUST_TOOLCHAIN_TOML: &str = concat!(
         "[toolchain]\n",
         "channel = \"nightly-2026-08-25\"\n",
@@ -51270,6 +51279,244 @@ activate = 1\n";
         bytes == EXACT_RUST_TOOLCHAIN_TOML.as_bytes()
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CampaignProofIdentity {
+        toolchain: String,
+        rust_version: String,
+    }
+
+    fn canonical_campaign_proof_identity() -> VResult<CampaignProofIdentity> {
+        let toolchain_document = toml::from_str::<toml::Value>(EXACT_RUST_TOOLCHAIN_TOML)
+            .map_err(|_| {
+                Diagnostic::error(
+                    "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                    "rust-toolchain.toml",
+                )
+            })?;
+        let toolchain = pointer_get(
+            &toolchain_document,
+            "/toolchain/channel",
+            "rust-toolchain.toml",
+        )?
+        .as_str()
+        .ok_or_else(|| {
+            Diagnostic::error(
+                "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                "rust-toolchain.toml",
+            )
+            .at("toolchain.channel")
+        })?;
+        let cargo_document = toml::from_str::<toml::Value>(include_str!("../../../Cargo.toml"))
+            .map_err(|_| {
+                Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "Cargo.toml")
+            })?;
+        let rust_version = pointer_get(
+            &cargo_document,
+            "/workspace/package/rust-version",
+            "Cargo.toml",
+        )?
+        .as_str()
+        .ok_or_else(|| {
+            Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "Cargo.toml")
+                .at("workspace.package.rust-version")
+        })?;
+        Ok(CampaignProofIdentity {
+            toolchain: toolchain.to_owned(),
+            rust_version: rust_version.to_owned(),
+        })
+    }
+
+    fn dated_nightly_tokens<'a>(value: &'a str, subject: &str) -> VResult<Vec<&'a str>> {
+        const PREFIX: &str = "nightly-";
+        const TOKEN_BYTES: usize = "nightly-2026-08-25".len();
+        let mut tokens = Vec::new();
+        let mut remainder = value;
+        while let Some(offset) = remainder.find(PREFIX) {
+            let invalid_boundary = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_');
+            if remainder
+                .get(..offset)
+                .and_then(|prefix| prefix.as_bytes().last())
+                .is_some_and(|byte| invalid_boundary(*byte))
+            {
+                return Err(Diagnostic::error("E_CAMPAIGN_PROOF_TOOLCHAIN", subject)
+                    .at("invalid dated-nightly prefix boundary"));
+            }
+            let candidate = remainder.get(offset..offset.saturating_add(TOKEN_BYTES))
+                .ok_or_else(|| {
+                    Diagnostic::error("E_CAMPAIGN_PROOF_TOOLCHAIN", subject)
+                        .at("truncated dated nightly")
+                })?;
+            let bytes = candidate.as_bytes();
+            if bytes.len() != TOKEN_BYTES
+                || bytes[8..12].iter().any(|byte| !byte.is_ascii_digit())
+                || bytes[12] != b'-'
+                || bytes[13..15].iter().any(|byte| !byte.is_ascii_digit())
+                || bytes[15] != b'-'
+                || bytes[16..18].iter().any(|byte| !byte.is_ascii_digit())
+            {
+                return Err(
+                    Diagnostic::error("E_CAMPAIGN_PROOF_TOOLCHAIN", subject).at(candidate)
+                );
+            }
+            if remainder
+                .as_bytes()
+                .get(offset + TOKEN_BYTES)
+                .is_some_and(|byte| invalid_boundary(*byte))
+            {
+                return Err(Diagnostic::error("E_CAMPAIGN_PROOF_TOOLCHAIN", subject)
+                    .at("invalid dated-nightly suffix boundary"));
+            }
+            tokens.push(candidate);
+            remainder = &remainder[offset + TOKEN_BYTES..];
+        }
+        Ok(tokens)
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CampaignProofInventory {
+        fields: BTreeSet<String>,
+        current_predicates: usize,
+        planted_negative_fields: usize,
+        field_sha256: String,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct ExpectedCampaignProofInventory<'a> {
+        field_count: usize,
+        current_predicates: usize,
+        planted_negative_fields: usize,
+        field_sha256: &'a str,
+    }
+
+    fn campaign_proof_field_sha256(fields: &BTreeSet<String>) -> String {
+        let mut bytes = Vec::new();
+        for field in fields {
+            bytes.extend_from_slice(field.as_bytes());
+            bytes.extend_from_slice(b"\tacceptance_criteria\n");
+        }
+        lower_hex(&sha256(&bytes))
+    }
+
+    fn validate_campaign_executable_toolchain_contracts(
+        issues_jsonl: &[u8],
+        identity: &CampaignProofIdentity,
+        expected: ExpectedCampaignProofInventory<'_>,
+    ) -> VResult<CampaignProofInventory> {
+        const SUBJECT: &str = ".beads/issues.jsonl";
+        if issues_jsonl.is_empty() || issues_jsonl.len() > MAX_CAMPAIGN_ISSUES_JSONL_BYTES {
+            return Err(Diagnostic::error("E_CAMPAIGN_PROOF_LIMIT", SUBJECT)
+                .at(issues_jsonl.len().to_string()));
+        }
+        let text = std::str::from_utf8(issues_jsonl)
+            .map_err(|_| Diagnostic::error("E_CAMPAIGN_PROOF_ENCODING", SUBJECT))?;
+        let mut fields = BTreeSet::new();
+        let mut issue_ids = BTreeSet::new();
+        let mut current_predicates = 0usize;
+        let mut planted_negative_fields = 0usize;
+        for (line_index, line) in text.lines().enumerate() {
+            let line_subject = format!("{SUBJECT}:{}", line_index + 1);
+            if line.is_empty() {
+                return Err(Diagnostic::error("E_CAMPAIGN_PROOF_JSONL", line_subject)
+                    .at("empty line"));
+            }
+            let value = parse_strict_json(line.as_bytes(), &line_subject)?;
+            let object = strict_json_object(&value, &line_subject)?;
+            let id = strict_json_string(object, "id", &line_subject)?;
+            if !issue_ids.insert(id.to_owned()) {
+                return Err(Diagnostic::error("E_CAMPAIGN_PROOF_JSONL", id)
+                    .at("duplicate issue id"));
+            }
+            let status = strict_json_string(object, "status", &line_subject)?;
+            if matches!(status, "closed" | "tombstone") {
+                continue;
+            }
+            let Some(StrictJson::String(acceptance)) = object.get("acceptance_criteria") else {
+                continue;
+            };
+            let field_subject = format!("{id}/acceptance_criteria");
+            let mut field_predicates = 0usize;
+            for acceptance_line in acceptance.lines() {
+                let tokens = dated_nightly_tokens(acceptance_line, &field_subject)?;
+                if acceptance_line.starts_with(CAMPAIGN_PROOF_NEGATIVE_PREFIX) {
+                    if id != CAMPAIGN_PROOF_CONTROL_BEAD
+                        || tokens
+                            != [
+                                identity.toolchain.as_str(),
+                                SUPERSEDED_CAMPAIGN_TOOLCHAINS[0],
+                                SUPERSEDED_CAMPAIGN_TOOLCHAINS[1],
+                            ]
+                    {
+                        return Err(Diagnostic::error(
+                            "E_CAMPAIGN_PROOF_NEGATIVE_CONTRACT",
+                            &field_subject,
+                        )
+                        .at(acceptance_line));
+                    }
+                    planted_negative_fields = planted_negative_fields
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            Diagnostic::error(
+                                "E_CAMPAIGN_PROOF_COUNT",
+                                &field_subject,
+                            )
+                        })?;
+                    continue;
+                }
+                for token in tokens {
+                    if token != identity.toolchain.as_str() {
+                        return Err(Diagnostic::error(
+                            "E_CAMPAIGN_PROOF_TOOLCHAIN",
+                            &field_subject,
+                        )
+                        .at(token));
+                    }
+                    field_predicates = field_predicates.checked_add(1).ok_or_else(|| {
+                        Diagnostic::error("E_CAMPAIGN_PROOF_COUNT", &field_subject)
+                    })?;
+                }
+            }
+            if field_predicates == 0 {
+                continue;
+            }
+            if field_predicates != 1 {
+                return Err(Diagnostic::error("E_CAMPAIGN_PROOF_COUNT", &field_subject)
+                    .at(field_predicates.to_string()));
+            }
+            if id == CAMPAIGN_PROOF_CONTROL_BEAD
+                && !acceptance.contains(&format!("rust-version == {}", identity.rust_version))
+            {
+                return Err(Diagnostic::error(
+                    "E_CAMPAIGN_PROOF_RUST_VERSION",
+                    &field_subject,
+                )
+                .at(identity.rust_version.clone()));
+            }
+            if !fields.insert(id.to_owned()) {
+                return Err(Diagnostic::error("E_CAMPAIGN_PROOF_COUNT", &field_subject)
+                    .at("duplicate executable field"));
+            }
+            current_predicates = current_predicates.checked_add(field_predicates)
+                .ok_or_else(|| Diagnostic::error("E_CAMPAIGN_PROOF_COUNT", &field_subject))?;
+        }
+        let field_sha256 = campaign_proof_field_sha256(&fields);
+        if fields.len() != expected.field_count
+            || current_predicates != expected.current_predicates
+            || planted_negative_fields != expected.planted_negative_fields
+            || field_sha256 != expected.field_sha256
+        {
+            return Err(Diagnostic::error("E_CAMPAIGN_PROOF_INVENTORY", SUBJECT).at(format!(
+                "fields={};current={current_predicates};negatives={planted_negative_fields};sha256={field_sha256}",
+                fields.len(),
+            )));
+        }
+        Ok(CampaignProofInventory {
+            fields,
+            current_predicates,
+            planted_negative_fields,
+            field_sha256,
+        })
+    }
+
     fn validate_workflow_action_reference(reference: &str, subject: &str) -> VResult<()> {
         if reference.is_empty()
             || reference.bytes().any(|byte| byte.is_ascii_whitespace())
@@ -52081,6 +52328,7 @@ activate = 1\n";
         workflow: &RestrictedYamlValue,
         subject: &str,
     ) -> VResult<usize> {
+        let identity = canonical_campaign_proof_identity()?;
         let jobs = workflow_jobs(workflow, subject)?;
         let mut invoking_job_count = 0usize;
         for (job_id, value) in jobs {
@@ -52122,7 +52370,7 @@ activate = 1\n";
                     .at("immutable toolchain action identity"));
             }
             let with = yaml_mapping_field(setup, "with", &logical)?.as_mapping(&logical)?;
-            if yaml_scalar_field(with, "toolchain", &logical)? != "nightly-2026-07-11" {
+            if yaml_scalar_field(with, "toolchain", &logical)? != identity.toolchain {
                 return Err(
                     Diagnostic::error("E_WORKFLOW_TOOLCHAIN", &logical).at("with.toolchain")
                 );
@@ -79665,6 +79913,119 @@ activate = 1\n";
             parse_restricted_workflow_yaml(workflow, subject)
                 .verified();
         }
+    }
+
+    #[test]
+    fn reality_proof_positive_workflow_toolchain_consumer_uses_checked_in_pin() {
+        let identity = canonical_campaign_proof_identity().verified();
+        let fixture = format!(
+            "jobs:\n  build:\n    steps:\n      - uses: {ACTION_RUST_TOOLCHAIN}\n        with:\n          toolchain: {}\n      - run: cargo check\n",
+            identity.toolchain,
+        );
+        let workflow = parse_restricted_workflow_yaml(&fixture, "toolchain consumer").verified();
+        assert_eq!(
+            validate_workflow_toolchain_closure(&workflow, "toolchain consumer").verified(),
+            1,
+        );
+
+        for (subject, workflow, expected_setups) in [
+            (
+                ".github/workflows/ci.yml",
+                include_str!("../../../.github/workflows/ci.yml"),
+                8,
+            ),
+            (
+                ".github/workflows/release.yml",
+                include_str!("../../../.github/workflows/release.yml"),
+                2,
+            ),
+        ] {
+            assert_eq!(
+                workflow.matches(&format!("toolchain: {}", identity.toolchain)).count(),
+                expected_setups,
+                "{subject}",
+            );
+            for stale in SUPERSEDED_CAMPAIGN_TOOLCHAINS {
+                assert!(!workflow.contains(stale), "{subject}: {stale}");
+            }
+        }
+    }
+
+    fn campaign_issues_jsonl_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(".beads/issues.jsonl")
+    }
+
+    #[test]
+    fn reality_proof_positive_executable_toolchain_contracts_match_checked_in_pin() {
+        let identity = canonical_campaign_proof_identity().verified();
+        assert_eq!(identity.toolchain, "nightly-2026-08-25");
+        assert_eq!(identity.rust_version, "1.100");
+        let issues = fs::read(campaign_issues_jsonl_path())
+            .expect("read live campaign issues JSONL");
+        let inventory = validate_campaign_executable_toolchain_contracts(
+            &issues,
+            &identity,
+            ExpectedCampaignProofInventory {
+                field_count: CAMPAIGN_PROOF_FIELD_COUNT,
+                current_predicates: CAMPAIGN_PROOF_FIELD_COUNT,
+                planted_negative_fields: 1,
+                field_sha256: CAMPAIGN_PROOF_FIELD_SHA256,
+            },
+        )
+        .verified();
+        assert_eq!(inventory.fields.len(), CAMPAIGN_PROOF_FIELD_COUNT);
+        assert_eq!(inventory.current_predicates, CAMPAIGN_PROOF_FIELD_COUNT);
+        assert_eq!(inventory.planted_negative_fields, 1);
+        assert_eq!(inventory.field_sha256, CAMPAIGN_PROOF_FIELD_SHA256);
+    }
+
+    #[test]
+    fn reality_proof_negative_stale_toolchain_contract_is_rejected_without_mutation() {
+        let identity = canonical_campaign_proof_identity().verified();
+        let fixture = format!(
+            "{{\"id\":\"fixture-proof\",\"status\":\"open\",\"acceptance_criteria\":\"- [ ] Proof configuration is frozen in the batch receipt: toolchain {}; workspace target and platform\"}}\n",
+            identity.toolchain,
+        );
+        let mut fields = BTreeSet::new();
+        assert!(fields.insert("fixture-proof".to_owned()));
+        let fixture_field_sha256 = campaign_proof_field_sha256(&fields);
+        validate_campaign_executable_toolchain_contracts(
+            fixture.as_bytes(),
+            &identity,
+            ExpectedCampaignProofInventory {
+                field_count: 1,
+                current_predicates: 1,
+                planted_negative_fields: 0,
+                field_sha256: &fixture_field_sha256,
+            },
+        )
+        .verified();
+
+        let live_path = campaign_issues_jsonl_path();
+        let live_before = fs::read(&live_path).expect("read live campaign state before negatives");
+        for stale in SUPERSEDED_CAMPAIGN_TOOLCHAINS {
+            let negative = fixture.replacen(&identity.toolchain, stale, 1);
+            assert_eq!(negative.matches(stale).count(), 1);
+            assert_eq!(negative.replacen(stale, &identity.toolchain, 1), fixture);
+            let error = validate_campaign_executable_toolchain_contracts(
+                negative.as_bytes(),
+                &identity,
+                ExpectedCampaignProofInventory {
+                    field_count: 1,
+                    current_predicates: 1,
+                    planted_negative_fields: 0,
+                    field_sha256: &fixture_field_sha256,
+                },
+            )
+            .expect_err("a stale executable toolchain identity must fail closed");
+            assert_eq!(error.code, "E_CAMPAIGN_PROOF_TOOLCHAIN");
+            assert_eq!(error.subject, "fixture-proof/acceptance_criteria");
+            assert_eq!(error.logical_path, stale);
+        }
+        let live_after = fs::read(live_path).expect("read live campaign state after negatives");
+        assert_eq!(live_after, live_before, "negative evaluation must not mutate live state");
     }
 
     #[test]

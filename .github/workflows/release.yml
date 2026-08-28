@@ -31,12 +31,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly-2026-07-11
+          toolchain: nightly-2026-08-25
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          key: release-preflight-${{ runner.os }}-nightly-2026-07-11
+          key: release-preflight-${{ runner.os }}-nightly-2026-08-25
 
       - name: Verify workspace package versions agree
         run: |
@@ -126,13 +126,13 @@ jobs:
       # FND-01: pin the exact dated nightly from rust-toolchain.toml (not floating "nightly").
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
-          toolchain: nightly-2026-07-11
+          toolchain: nightly-2026-08-25
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          key: release-${{ matrix.target }}-nightly-2026-07-11
+          key: release-${{ matrix.target }}-nightly-2026-08-25
 
       - name: Build optimized CLI diagnostic
         run: cargo build --release --locked -p fastmcp-cli --target "${{ matrix.target }}"
