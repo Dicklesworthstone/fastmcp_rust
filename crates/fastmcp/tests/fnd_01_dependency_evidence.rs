@@ -29401,7 +29401,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                         "libgit2: 1.9.6 (sys:0.21.0 vendored)",
                         "libcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)",
                         "ssl: OpenSSL 3.6.3 9 Jun 2026",
-                        "os: Ubuntu 26.4.0 (resolute) [unknown bitness]",
+                        "os: Ubuntu 26.4.0 (resolute) [64-bit]",
                     ],
                     tool_id,
                 )
@@ -93557,7 +93557,7 @@ fn fallible(value: Option<u8>) {
         )
         .expect("current Ordinary rustc pristine reacceptance");
 
-        let current_cargo = b"cargo 1.100.0-nightly (e8cb624d5 2026-08-22)\nrelease: 1.100.0-nightly\ncommit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c\ncommit-date: 2026-08-22\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 26.4.0 (resolute) [unknown bitness]\n";
+        let current_cargo = b"cargo 1.100.0-nightly (e8cb624d5 2026-08-22)\nrelease: 1.100.0-nightly\ncommit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c\ncommit-date: 2026-08-22\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 26.4.0 (resolute) [64-bit]\n";
         validate_version_stream_for_role(
             "cargo",
             "cargo-vv-current-1.100",
@@ -93567,8 +93567,8 @@ fn fallible(value: Option<u8>) {
         .expect("current Ordinary Cargo parser positive");
         let changed_current_cargo = ordinary_probe_replace_once_same_length(
             current_cargo,
-            b"os: Ubuntu 26.4.0 (resolute) [unknown bitness]",
-            b"os: Ubuntu 26.4.0 (resolute) [unknowo bitness]",
+            b"os: Ubuntu 26.4.0 (resolute) [64-bit]",
+            b"os: Ubuntu 26.4.0 (resolute) [65-bit]",
         );
         assert_eq!(
             current_cargo
@@ -93587,8 +93587,8 @@ fn fallible(value: Option<u8>) {
         )
         .expect_err("current Ordinary Cargo OS drift must fail closed");
         assert_eq!(changed_cargo_error.code(), "E_PHASE_B_TOOL_VERSION");
-        let actual_line = b"os: Ubuntu 26.4.0 (resolute) [unknowo bitness]";
-        let expected_line = b"os: Ubuntu 26.4.0 (resolute) [unknown bitness]";
+        let actual_line = b"os: Ubuntu 26.4.0 (resolute) [65-bit]";
+        let expected_line = b"os: Ubuntu 26.4.0 (resolute) [64-bit]";
         assert_eq!(
             changed_cargo_error.detail(),
             format!(
