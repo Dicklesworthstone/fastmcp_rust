@@ -10,7 +10,7 @@
 
 const FROZEN_POLICY_BYTES: usize = 904756;
 const FROZEN_POLICY_SHA256: &str =
-    "a80603ff6eaa7b768cc1bf1f9f1107f8919b081828d529c0e65ddf20444cc198";
+    "7b6d7b7713d5301acafb3dc78351209b966322cf6bfd4b3dd78ee5d2f7fac0da";
 const RECORD_SET_PREFIX: &[u8] = b"FND01RECv2\0";
 const METADATA_GRAPH_PREFIX: &[u8] = b"FND01METAGRAPHv1\0";
 
@@ -34325,19 +34325,19 @@ mod ordinary {
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
     const ACTION_DOWNLOAD_ARTIFACT: &str =
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
-    const ACTION_INSTALL: &str = "taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad";
+    const ACTION_INSTALL: &str = "taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518";
     const ACTION_GITHUB_RELEASE: &str =
         "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65";
     const WORKFLOW_ACTION_IDENTITIES: &[(&str, usize, usize)] = &[
-        (ACTION_CHECKOUT, 8, 3),
+        (ACTION_CHECKOUT, 8, 2),
         (ACTION_RUST_TOOLCHAIN, 8, 2),
         (ACTION_RUST_CACHE, 7, 2),
         (ACTION_UPLOAD_ARTIFACT, 3, 1),
-        (ACTION_DOWNLOAD_ARTIFACT, 0, 1),
-        (ACTION_INSTALL, 2, 0),
-        (ACTION_GITHUB_RELEASE, 0, 1),
+        (ACTION_DOWNLOAD_ARTIFACT, 0, 0),
+        (ACTION_INSTALL, 2, 1),
+        (ACTION_GITHUB_RELEASE, 0, 0),
     ];
-    const WORKFLOW_ACTION_IDENTITY_COUNT: usize = 38;
+    const WORKFLOW_ACTION_IDENTITY_COUNT: usize = 36;
     const PACKAGE_VERSION: &str = "0.8.0";
     const CRATES_IO_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
     const SPARSE_PARSER_VERSION: &str = concat!(
@@ -78085,9 +78085,9 @@ activate = 1\n";
     }
 
     const TOOLCHAIN_WORKSPACE_INPUTS: [(&str, u64, &str); 3] = [
-        ("Cargo.toml", 7_041, "e9b30339bb04a77abb1bbc2f3eed680910e9263fb633223a783dd3a7560eac06"),
-        ("Cargo.lock", 97_891, "6acbb50d0d1db03bf7d839c1379ba4f10393269e00d62ac84250ac1e362151f0"),
-        ("rust-toolchain.toml", 239, "3dfb847b66ecd2cae1194e79c1c60d58e03991f926b6ef89590598216e2d34e3"),
+        ("Cargo.toml", 7_041, "4d6c6c07984fc12aa662cdba99428ec9013ac72e4ba962bf912c5ef84decea97"),
+        ("Cargo.lock", 97_891, "de75ff76455a777e5bfa0e79e5d847766737f9769b392ed0ceb84aa1013e4a2a"),
+        ("rust-toolchain.toml", 239, "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13"),
     ];
     const TOOLCHAIN_SOURCE_INPUTS: [(&str, &str, FileFamily, u64, &str); 7] = [
         ("s05", "evidence/fnd-01/probes/asupersync/candidate-0.3.10.toml", FileFamily::Toml, 10_446, "e892edd804f93e09ba03bcc9042d0628f5e149c3ee48c24b184af4814eeb3aed"),
@@ -78207,7 +78207,12 @@ activate = 1\n";
         document: &toml::Value,
     ) -> VResult<(String, String, String)> {
         const SUBJECT: &str = "toolchain/asupersync contract";
-        const TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-25";
+        // This document and its distribution probe are retained immutable
+        // evidence for the August 20 asupersync baseline. The current workspace
+        // pin is checked independently through TOOLCHAIN_WORKSPACE_INPUTS and
+        // is_exact_rust_toolchain_document; historical evidence must not be
+        // relabelled as a current receipt.
+        const TOOLCHAIN_CHANNEL: &str = "nightly-2026-08-20";
         const RELEASE_PIN: &str = "0.4.9";
         const RELEASE_SHA: &str =
             "be81588a09a28a312b09d4af71e8aa8c6736e1d670a69a42e6779e874fbad1bd";
@@ -80033,7 +80038,7 @@ activate = 1\n";
         assert_eq!(EXACT_RUST_TOOLCHAIN_TOML.len(), 239);
         assert_eq!(
             lower_hex(&sha256(EXACT_RUST_TOOLCHAIN_TOML.as_bytes())),
-            "3dfb847b66ecd2cae1194e79c1c60d58e03991f926b6ef89590598216e2d34e3",
+            "aa154c66183237823589b4f2a52f9142355387860e22decda21e260e3e003d13",
         );
         assert!(is_exact_rust_toolchain_document(
             EXACT_RUST_TOOLCHAIN_TOML.as_bytes(),
@@ -85017,7 +85022,11 @@ original = "value"
         let accepted =
             validate_toolchain_asupersync_contract(&root, &files, &policy, &document).verified();
         assert_eq!(accepted.0, "0.4.9");
-        assert_eq!(accepted.1, "nightly-2026-08-25");
+        assert_eq!(accepted.1, "nightly-2026-08-20");
+        assert_eq!(
+            canonical_campaign_proof_identity().verified().toolchain,
+            "nightly-2026-08-25",
+        );
         assert_eq!(
             accepted.2,
             "8ccaced09f209becc9c732ff86e5ec3373cc4b45e3ccd80c1cfb06bbabd88807"
@@ -88843,7 +88852,7 @@ original = "value"
         // validator at the typed source-tree boundary instead of bypassing
         // it, followed by unchanged-state pristine reacceptance.
         const TREE_PLANT_TARGET: &str = "evidence/fnd-01/probes/toolchain-2026-08-20.json";
-        const TREE_PLANT_NEEDLE: &[u8] = b"\"channel\": \"nightly-2026-08-25\",";
+        const TREE_PLANT_NEEDLE: &[u8] = b"\"channel\": \"nightly-2026-08-20\",";
         const TREE_PLANT_REPLACEMENT: &[u8] = b"\"channel\": \"nightly-2026-08-21\",";
         let drifted = sdk_matrix_raw_candidate(
             &files,
