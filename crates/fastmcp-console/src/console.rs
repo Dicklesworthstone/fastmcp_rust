@@ -862,6 +862,7 @@ impl FastMcpConsole {
             Console::builder()
                 .file(Box::new(io::stderr()))
                 .no_color()
+                .force_terminal(false)
                 .markup(false)
                 .emoji(false)
                 .highlight(false)
@@ -885,7 +886,7 @@ impl FastMcpConsole {
             .highlight(false);
 
         if !enabled {
-            builder = builder.no_color();
+            builder = builder.no_color().force_terminal(false);
         }
 
         let inner = if enabled {
@@ -965,11 +966,21 @@ impl FastMcpConsole {
 
     /// Print a renderable.
     ///
-    /// Non-rich consoles still render the value through the color-disabled
-    /// backend so structured content is preserved in agent and CI logs.
+    /// Non-rich consoles export the value as plain text before writing it so
+    /// structured content is preserved without terminal styling.
     pub fn render<R: Renderable>(&self, renderable: &R) {
         let console = self.lock_inner();
-        console.print_renderable(renderable);
+        if self.enabled {
+            console.print_renderable(renderable);
+        } else {
+            let plain = console.export_renderable_text(renderable);
+            console.print_with_options(
+                &plain,
+                &rich_rust::console::PrintOptions::new()
+                    .with_markup(false)
+                    .with_no_newline(true),
+            );
+        }
     }
 
     /// Print a renderable with a trusted plain-text fallback closure.
@@ -1819,16 +1830,122 @@ mod tests {
 
     #[test]
     fn disabled_render_preserves_renderable_content_without_placeholder() {
-        let (writer, captured) = SharedWriter::new();
-        let console = FastMcpConsole::with_writer(writer, false);
-        let panel = Panel::from_text("plain-render-content-canary");
+        const CHILD_ENV: &str = "FASTMCP_CONSOLE_DISABLED_RENDER_CHILD";
+        const CHILD_ARGV_MARKER: &str = "fastmcp-console-disabled-render-child-marker";
+        const FROZEN_TEST_ID: &str =
+            "console::tests::disabled_render_preserves_renderable_content_without_placeholder";
+        const PROOF_PREFIX: &str = "FASTMCP_CONSOLE_DISABLED_RENDER_PROOF";
 
-        console.render(&panel);
+        let child_label = match std::env::var(CHILD_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("{CHILD_ENV} must be absent or valid Unicode")
+            }
+        };
+        let argv = std::env::args().collect::<Vec<_>>();
+        let child_argv_marker = argv
+            .windows(2)
+            .any(|pair| pair[0] == "--skip" && pair[1] == CHILD_ARGV_MARKER);
+        match (child_label.as_ref(), child_argv_marker) {
+            (None, false) | (Some(_), true) => {}
+            (Some(label), false) => {
+                panic!("child environment label {label:?} arrived without argv marker")
+            }
+            (None, true) => panic!("child argv marker arrived without environment label"),
+        }
 
-        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap_or_default();
-        assert_eq!(output.matches("plain-render-content-canary").count(), 1);
-        assert!(!output.contains("[Complex Output]"), "output: {output:?}");
-        assert!(!output.contains('\u{1b}'), "output: {output:?}");
+        if let Some(force_color) = child_label {
+            assert!(matches!(force_color.as_str(), "0" | "1"));
+            let actual_force_color =
+                std::env::var("FORCE_COLOR").expect("child FORCE_COLOR must be valid Unicode");
+            assert_eq!(
+                actual_force_color, force_color,
+                "child FORCE_COLOR must equal its independent label",
+            );
+            assert_eq!(
+                std::env::var("TERM").expect("child TERM must be valid Unicode"),
+                "xterm-256color",
+                "child TERM must match the planted color-capable terminal",
+            );
+            assert!(
+                std::env::var_os("NO_COLOR").is_none(),
+                "child NO_COLOR must be absent",
+            );
+
+            let stderr_console = FastMcpConsole::with_enabled(false);
+            assert!(
+                !stderr_console.lock_inner().is_terminal(),
+                "explicitly disabled stderr console must remain non-terminal when FORCE_COLOR={force_color}",
+            );
+
+            let canary = format!(
+                "plain-render-content-canary-{}-{force_color}",
+                std::process::id(),
+            );
+            let (writer, captured) = SharedWriter::new();
+            let console = FastMcpConsole::with_writer(writer, false);
+            assert!(
+                !console.lock_inner().is_terminal(),
+                "explicitly disabled writer console must remain non-terminal when FORCE_COLOR={force_color}",
+            );
+            let panel = Panel::from_text(&canary)
+                .border_style(Style::new().color(Color::from_rgb(55, 65, 81)));
+
+            console.render(&panel);
+
+            let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap_or_default();
+            assert_eq!(
+                output.matches(canary.as_str()).count(),
+                1,
+                "output: {output:?}",
+            );
+            assert!(!output.contains("[Complex Output]"), "output: {output:?}");
+            assert!(!output.contains('\u{1b}'), "output: {output:?}");
+            println!("{PROOF_PREFIX}::{FROZEN_TEST_ID}::FORCE_COLOR={actual_force_color}");
+            return;
+        }
+
+        for force_color in ["0", "1"] {
+            let result = std::process::Command::new(
+                std::env::current_exe().expect("current console test executable"),
+            )
+            .arg(FROZEN_TEST_ID)
+            .arg("--exact")
+            .arg("--nocapture")
+            .arg("--skip")
+            .arg(CHILD_ARGV_MARKER)
+            .env(CHILD_ENV, force_color)
+            .env("FORCE_COLOR", force_color)
+            .env("TERM", "xterm-256color")
+            .env_remove("NO_COLOR")
+            .output()
+            .expect("isolated disabled-render child test");
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(
+                result.status.success(),
+                "disabled-render child failed for FORCE_COLOR={force_color}: stdout={:?}, stderr={:?}",
+                stdout,
+                stderr,
+            );
+            let expected_proof =
+                format!("{PROOF_PREFIX}::{FROZEN_TEST_ID}::FORCE_COLOR={force_color}");
+            assert!(
+                stdout.contains("running 1 test"),
+                "disabled-render child did not execute the exact frozen test for FORCE_COLOR={force_color}: stdout={stdout:?}, stderr={stderr:?}",
+            );
+            assert_eq!(
+                stdout.matches(PROOF_PREFIX).count(),
+                1,
+                "disabled-render child must emit exactly one proof token for FORCE_COLOR={force_color}: stdout={stdout:?}, stderr={stderr:?}",
+            );
+            assert_eq!(
+                stdout.matches(expected_proof.as_str()).count(),
+                1,
+                "disabled-render child emitted the wrong proof token for FORCE_COLOR={force_color}: stdout={stdout:?}, stderr={stderr:?}",
+            );
+        }
     }
 
     #[test]
