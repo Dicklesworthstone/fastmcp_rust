@@ -960,7 +960,7 @@ mod trust_std {
             ("openssl", &[("LANG", "C"), ("LC_ALL", "C"), ("OPENSSL_CONF", "{exact-kat-openssl-config}"), ("PATH", "{closed-execution-bin}"), ("TZ", "UTC")]),
     ];
 
-    pub fn environment_set_digest() -> TrustResult<[u8; 32]> {
+    fn environment_set_digest_for_toolchain(toolchain: &str) -> TrustResult<[u8; 32]> {
         fn append(output: &mut Vec<u8>, bytes: &[u8]) -> TrustResult<()> {
             let length = u32::try_from(bytes.len()).map_err(|_| TrustError::new(
                 "E_PHASE_B_BOUND", "environment field length exceeds u32"))?;
@@ -977,10 +977,32 @@ mod trust_std {
             append(&mut output, id.as_bytes())?;
             output.extend_from_slice(&u32::try_from(required.len()).map_err(|_| TrustError::new(
                 "E_PHASE_B_BOUND", "environment assignment count exceeds u32"))?.to_be_bytes());
-            for (key, value) in *required { append(&mut output, key.as_bytes())?; append(&mut output, value.as_bytes())?; }
+            for (key, value) in *required {
+                append(&mut output, key.as_bytes())?;
+                let value = if *key == "RUSTUP_TOOLCHAIN" {
+                    toolchain
+                } else {
+                    value
+                };
+                append(&mut output, value.as_bytes())?;
+            }
             output.extend_from_slice(&0u32.to_be_bytes());
         }
         sha256(&output)
+    }
+
+    pub const CURRENT_ORDINARY_TOOLCHAIN: &str = "nightly-2026-08-25";
+    pub const CURRENT_ORDINARY_RUST_VERSION: &str = "1.100";
+
+    const CURRENT_ORDINARY_CARGO_CANDIDATES: &[&str] =
+        &["{pinned-toolchain-bin}/cargo-rch-real"];
+
+    pub fn environment_set_digest() -> TrustResult<[u8; 32]> {
+        environment_set_digest_for_toolchain("nightly-2026-07-11")
+    }
+
+    pub fn current_ordinary_environment_set_digest() -> TrustResult<[u8; 32]> {
+        environment_set_digest_for_toolchain(CURRENT_ORDINARY_TOOLCHAIN)
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1015,9 +1037,49 @@ mod trust_std {
         NativeToolDescriptor { id:"windows-lld-link", candidates:&["/usr/bin/lld-link-22","/usr/bin/lld-link","/usr/bin/lld-link-21","/usr/bin/lld-link-20","/usr/bin/lld-link-19","/usr/bin/lld-link-18","/usr/bin/lld-link-17","/usr/bin/lld-link-16"], version_argv:&["--version"], stream:"stdout", parser:"lld-coff-version" },
     ];
 
-    pub fn compiled_native_tool_registry_identity(
+    pub fn current_ordinary_native_tool_descriptors() -> Vec<NativeToolDescriptor> {
+        let mut descriptors = NATIVE_TOOL_DESCRIPTORS.to_vec();
+        for (ordinal, parser) in [
+            "rustc-vv-current-1.100",
+            "cargo-vv-current-1.100",
+            "rustdoc-current-1.100",
+            "rustfmt-current-nightly",
+            "rustfmt-current-nightly",
+            "clippy-current-nightly",
+            "clippy-current-nightly",
+            "lld-current-gnu-version",
+            "llvm-current-version-family",
+            "openssl-current-version-a",
+            "host-c-compiler-current-v",
+            "archiver-current-version",
+            "archiver-current-version",
+            "aarch64-c-compiler-current-v",
+            "archiver-current-version",
+            "apple-clang-current-version",
+            "llvm-current-version-family",
+            "windows-clang-cl-current-version",
+            "llvm-lib-current-help",
+            "lld-coff-current-version",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            descriptors[ordinal].parser = parser;
+        }
+        // The qualified RCH worker deliberately wraps the toolchain `cargo`
+        // entry point. That wrapper is an orchestration surface, not the
+        // compiler artifact whose version the Ordinary evidence binds, and it
+        // cannot execute inside the closed twenty-tool PATH. The public
+        // runner independently admits and bookends the wrapper plus its
+        // sibling real Cargo binary before this descriptor set is consumed.
+        descriptors[1].candidates = CURRENT_ORDINARY_CARGO_CANDIDATES;
+        descriptors
+    }
+
+    fn native_tool_registry_identity(
+        descriptors: &[NativeToolDescriptor],
+        prefix: &[u8],
     ) -> TrustResult<(usize, usize, [u8; 32])> {
-        const PREFIX: &[u8] = b"FND01BOOTSTRAPNATIVETOOLSv1\0";
 
         fn append_u32_bytes(
             output: &mut Vec<u8>,
@@ -1043,13 +1105,13 @@ mod trust_std {
             Ok(())
         }
 
-        let count = u32::try_from(NATIVE_TOOL_DESCRIPTORS.len()).map_err(|_| {
+        let count = u32::try_from(descriptors.len()).map_err(|_| {
             TrustError::new("E_NATIVE_TOOL_REGISTRY", "tool count exceeds u32")
         })?;
         let mut registry = Vec::new();
-        registry.extend_from_slice(PREFIX);
+        registry.extend_from_slice(prefix);
         registry.extend_from_slice(&count.to_be_bytes());
-        for (ordinal, row) in NATIVE_TOOL_DESCRIPTORS.iter().enumerate() {
+        for (ordinal, row) in descriptors.iter().enumerate() {
             let ordinal = u32::try_from(ordinal).map_err(|_| {
                 TrustError::new("E_NATIVE_TOOL_REGISTRY", "tool ordinal exceeds u32")
             })?;
@@ -1078,10 +1140,31 @@ mod trust_std {
             )?;
         }
         Ok((
-            NATIVE_TOOL_DESCRIPTORS.len(),
+            descriptors.len(),
             registry.len(),
             sha256(&registry)?,
         ))
+    }
+
+    pub fn compiled_native_tool_registry_identity(
+    ) -> TrustResult<(usize, usize, [u8; 32])> {
+        native_tool_registry_identity(
+            NATIVE_TOOL_DESCRIPTORS,
+            b"FND01BOOTSTRAPNATIVETOOLSv1\0",
+        )
+    }
+
+    pub fn current_ordinary_native_tool_registry_identity(
+    ) -> TrustResult<(usize, usize, [u8; 32])> {
+        current_ordinary_native_tool_registry_identity_for(
+            &current_ordinary_native_tool_descriptors(),
+        )
+    }
+
+    pub fn current_ordinary_native_tool_registry_identity_for(
+        descriptors: &[NativeToolDescriptor],
+    ) -> TrustResult<(usize, usize, [u8; 32])> {
+        native_tool_registry_identity(descriptors, b"FND01ORDINARYNATIVETOOLSv1\0")
     }
 
     #[allow(clippy::struct_field_names)]
@@ -3805,6 +3888,7 @@ mod trust_std {
         root: &Path,
         relative: &str,
         subject: &str,
+        expected_link_count: u64,
     ) -> TrustResult<(PathBuf, Metadata, LinuxFileIdentity)> {
         validate_existing_directory_root(root, "repository root")?;
         validate_relative_path(relative, subject)?;
@@ -3828,10 +3912,13 @@ mod trust_std {
                     ));
                 }
                 let identity = linux_identity(&metadata, subject)?;
-                if identity.link_count != 1 {
+                if identity.link_count != expected_link_count {
                     return Err(TrustError::new(
                         "E_FILE_HARDLINK",
-                        format!("{subject}: nlink={}", identity.link_count),
+                        format!(
+                            "{subject}: nlink={} differs from exact admitted count {expected_link_count}",
+                            identity.link_count,
+                        ),
                     ));
                 }
                 return Ok((current, metadata, identity));
@@ -3854,6 +3941,7 @@ mod trust_std {
         relative: &str,
         maximum_bytes: u64,
         expected: Option<FileBinding>,
+        expected_link_count: u64,
         hook: &mut H,
         mut observe: F,
     ) -> TrustResult<CheckedSnapshot>
@@ -3862,7 +3950,14 @@ mod trust_std {
         F: FnMut(&[u8]) -> TrustResult<()>,
     {
         let subject = relative;
-        let (path, pre_metadata, pre_identity) = precheck_leaf(root, relative, subject)?;
+        if expected_link_count == 0 {
+            return Err(TrustError::new(
+                "E_FILE_HARDLINK",
+                format!("{subject}: admitted link count must be nonzero"),
+            ));
+        }
+        let (path, pre_metadata, pre_identity) =
+            precheck_leaf(root, relative, subject, expected_link_count)?;
         if pre_metadata.len() > maximum_bytes {
             return Err(TrustError::new(
                 "E_FILE_BOUND",
@@ -3936,7 +4031,8 @@ mod trust_std {
             ));
         }
         hook.at(SnapshotStage::PostReadPreFinalMetadata, &path)?;
-        let (post_path, _post_metadata, post_identity) = precheck_leaf(root, relative, subject)?;
+        let (post_path, _post_metadata, post_identity) =
+            precheck_leaf(root, relative, subject, expected_link_count)?;
         if post_path != path || post_identity != pre_identity {
             return Err(TrustError::new(
                 "E_FILE_RACE",
@@ -3971,6 +4067,25 @@ mod trust_std {
             relative,
             maximum_bytes,
             expected,
+            1,
+            &mut hook,
+            |_| Ok(()),
+        )
+    }
+
+    pub(super) fn checked_cargo_hardlink_snapshot(
+        root: &Path,
+        relative: &str,
+        maximum_bytes: u64,
+        expected: Option<FileBinding>,
+    ) -> TrustResult<CheckedSnapshot> {
+        let mut hook = NoopSnapshotHook;
+        checked_stream_with_hook(
+            root,
+            relative,
+            maximum_bytes,
+            expected,
+            2,
             &mut hook,
             |_| Ok(()),
         )
@@ -3991,6 +4106,7 @@ mod trust_std {
             relative,
             maximum_bytes,
             expected,
+            1,
             hook,
             |_| Ok(()),
         )
@@ -4009,6 +4125,7 @@ mod trust_std {
             relative,
             maximum_bytes,
             expected,
+            1,
             &mut hook,
             |chunk| {
                 bytes.try_reserve(chunk.len()).map_err(|_| {
@@ -14003,7 +14120,7 @@ mod trust_std {
         maximum_bytes: u64,
         expected: &CheckedSnapshot,
     ) -> TrustResult<RetainedMember> {
-        let (path, metadata, identity) = precheck_leaf(root, relative, relative)?;
+        let (path, metadata, identity) = precheck_leaf(root, relative, relative, 1)?;
         if metadata.len() > maximum_bytes || identity != expected.identity {
             return Err(TrustError::new(
                 "E_SET_RACE",
@@ -14028,7 +14145,7 @@ mod trust_std {
         };
         let _ = read_retained_member(&mut retained)?;
         let (post_path, _, post_identity) =
-            precheck_leaf(root, relative, relative)?;
+            precheck_leaf(root, relative, relative, 1)?;
         if post_path != path || post_identity != identity {
             return Err(TrustError::new(
                 "E_SET_RACE",
@@ -14103,6 +14220,7 @@ mod trust_std {
                     &self.root,
                     &member.snapshot.logical_path,
                     &member.snapshot.logical_path,
+                    1,
                 )
                 .map_err(|error| {
                     TrustError::new("E_SET_RACE", error.to_string())
@@ -28598,6 +28716,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     pub(super) struct OrdinaryNativeToolInventory {
         repository_root: PathBuf,
         execution_bin_relative: String,
+        uses_current_ordinary_descriptors: bool,
         tool_set_sha256: [u8; 32],
         execution_bin_sha256: [u8; 32],
         acquisition_tools: AcquisitionToolPaths,
@@ -28622,11 +28741,23 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
 
         pub(super) fn require_unchanged(&self) -> TrustResult<()> {
-            let actual = revalidate_native_tool_surface(
-                &self.repository_root,
-                &self.execution_bin_relative,
-                &self.selected_tools,
-            )?;
+            let actual = if self.uses_current_ordinary_descriptors {
+                let descriptors =
+                    super::trust_std::current_ordinary_native_tool_descriptors();
+                revalidate_native_tool_surface_with_descriptors(
+                    &self.repository_root,
+                    &self.execution_bin_relative,
+                    &self.selected_tools,
+                    &descriptors,
+                )?
+            } else {
+                revalidate_native_tool_surface_with_descriptors(
+                    &self.repository_root,
+                    &self.execution_bin_relative,
+                    &self.selected_tools,
+                    NATIVE_TOOLS,
+                )?
+            };
             if actual != self.execution_bin_sha256 {
                 return Err(phase_b_error(
                     "E_PHASE_B_EXECUTION_BIN",
@@ -28787,12 +28918,13 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(())
     }
 
-    fn execution_bin_set_sha256(
+    fn execution_bin_set_sha256_with_descriptors(
         repository_root: &Path,
         execution_bin_relative: &str,
         tools: &[SelectedTool],
+        descriptors: &[NativeTool],
     ) -> TrustResult<[u8; 32]> {
-        if tools.len() != NATIVE_TOOLS.len()
+        if tools.len() != descriptors.len()
             || tools.len() != EXECUTION_BIN_NAMES.len()
         {
             return Err(phase_b_error(
@@ -28857,7 +28989,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &usize_u32(tools.len(), "execution-bin count")?.to_be_bytes(),
         );
         for (ordinal, tool) in tools.iter().enumerate() {
-            let expected_tool = NATIVE_TOOLS.get(ordinal).ok_or_else(|| {
+            let expected_tool = descriptors.get(ordinal).ok_or_else(|| {
                 phase_b_error(
                     "E_PHASE_B_EXECUTION_BIN",
                     "native-tool ordinal is missing",
@@ -28981,19 +29113,34 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         sha256(&preimage)
     }
 
-    fn revalidate_native_tool_surface(
+    fn revalidate_native_tool_surface_with_descriptors(
         repository_root: &Path,
         execution_bin_relative: &str,
         tools: &[SelectedTool],
+        descriptors: &[NativeTool],
     ) -> TrustResult<[u8; 32]> {
         for tool in tools {
             revalidate_selected_tool(tool)?;
         }
         validate_selected_tool_aliases(tools)?;
-        execution_bin_set_sha256(
+        execution_bin_set_sha256_with_descriptors(
             repository_root,
             execution_bin_relative,
             tools,
+            descriptors,
+        )
+    }
+
+    fn revalidate_native_tool_surface(
+        repository_root: &Path,
+        execution_bin_relative: &str,
+        tools: &[SelectedTool],
+    ) -> TrustResult<[u8; 32]> {
+        revalidate_native_tool_surface_with_descriptors(
+            repository_root,
+            execution_bin_relative,
+            tools,
+            NATIVE_TOOLS,
         )
     }
 
@@ -29067,6 +29214,37 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             .or((lines.len() != expected.len()).then_some(lines.len().min(expected.len())))
         {
             return Err(tool_version_error(format!("{parser}|{tool}: exact-line[{index}]")));
+        }
+        Ok(())
+    }
+
+    fn require_exact_version_lines_with_bounded_mismatch_receipt(
+        parser: &str,
+        lines: StrictVersionLines<'_>,
+        expected: &[&str],
+        tool: &str,
+    ) -> TrustResult<()> {
+        if let Some(index) = lines
+            .iter()
+            .zip(expected)
+            .position(|(actual, expected)| actual != *expected)
+            .or((lines.len() != expected.len()).then_some(lines.len().min(expected.len())))
+        {
+            let actual = lines.get(index);
+            let expected_line = expected.get(index).copied();
+            let actual_bytes = actual.unwrap_or_default().as_bytes();
+            let expected_bytes = expected_line.unwrap_or_default().as_bytes();
+            return Err(tool_version_error(format!(
+                "{parser}|{tool}: exact-line[{index}] actual_present={} actual_line_count={} actual_length={} actual_sha256={} expected_present={} expected_line_count={} expected_length={} expected_sha256={}",
+                actual.is_some(),
+                lines.len(),
+                actual_bytes.len(),
+                encode_lower_hex(&sha256(actual_bytes)?),
+                expected_line.is_some(),
+                expected.len(),
+                expected_bytes.len(),
+                encode_lower_hex(&sha256(expected_bytes)?),
+            )));
         }
         Ok(())
     }
@@ -29196,6 +29374,257 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
     ) -> TrustResult<()> {
         let lines = version_stream_lines(parser, stream)?;
         match (parser, tool_id) {
+            ("rustc-vv-current-1.100", "rustc") => require_exact_version_lines(
+                parser,
+                lines,
+                &[
+                    "rustc 1.100.0-nightly (e7769602a 2026-08-24)",
+                    "binary: rustc",
+                    "commit-hash: e7769602aca3770e8d8ea55716becb22e839a579",
+                    "commit-date: 2026-08-24",
+                    "host: x86_64-unknown-linux-gnu",
+                    "release: 1.100.0-nightly",
+                    "LLVM version: 23.1.0",
+                ],
+                tool_id,
+            ),
+            ("cargo-vv-current-1.100", "cargo") => {
+                require_exact_version_lines_with_bounded_mismatch_receipt(
+                    parser,
+                    lines,
+                    &[
+                        "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)",
+                        "release: 1.100.0-nightly",
+                        "commit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c",
+                        "commit-date: 2026-08-22",
+                        "host: x86_64-unknown-linux-gnu",
+                        "libgit2: 1.9.6 (sys:0.21.0 vendored)",
+                        "libcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)",
+                        "ssl: OpenSSL 3.6.3 9 Jun 2026",
+                        "os: Ubuntu 26.4.0 (resolute) [unknown bitness]",
+                    ],
+                    tool_id,
+                )
+            }
+            ("rustdoc-current-1.100", "rustdoc") => require_exact_version_lines(
+                parser,
+                lines,
+                &["rustdoc 1.100.0-nightly (e7769602a 2026-08-24)"],
+                tool_id,
+            ),
+            ("rustfmt-current-nightly", "rustfmt" | "cargo-fmt") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &["rustfmt 1.10.0-nightly (e7769602ac 2026-08-24)"],
+                    tool_id,
+                )
+            }
+            ("clippy-current-nightly", "cargo-clippy" | "clippy-driver") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &["clippy 0.1.100 (e7769602ac 2026-08-24)"],
+                    tool_id,
+                )
+            }
+            ("lld-current-gnu-version", "rust-lld") => require_exact_version_lines(
+                parser,
+                lines,
+                &["LLD 23.1.0 (/checkout/src/llvm-project/llvm 16696adcd119e6ba9cc175207d984d7021211acb) (compatible with GNU linkers)"],
+                tool_id,
+            ),
+            ("llvm-current-version-family", "llvm-nm") => require_exact_version_lines(
+                parser,
+                lines,
+                &[
+                    "llvm-nm, compatible with GNU nm",
+                    "Ubuntu LLVM version 22.1.2",
+                    "  Optimized build.",
+                ],
+                tool_id,
+            ),
+            ("llvm-current-version-family", "apple-ar") => require_exact_version_lines(
+                parser,
+                lines,
+                &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                tool_id,
+            ),
+            ("openssl-current-version-a", "openssl") => {
+                if lines.len() != 10
+                    || lines.required(0)
+                        != "OpenSSL 3.5.5 27 Jan 2026 (Library: OpenSSL 3.5.5 27 Jan 2026)"
+                    || lines.required(2) != "platform: debian-amd64"
+                {
+                    return Err(tool_version_error(format!(
+                        "{parser}: OpenSSL identity/platform grammar"
+                    )));
+                }
+                for (line, prefix, field) in [
+                    (lines.required(1), "built on: ", "built-on"),
+                    (lines.required(3), "options:  ", "options"),
+                    (lines.required(4), "compiler: ", "compiler"),
+                    (lines.required(8), "Seeding source: ", "seeding-source"),
+                    (lines.required(9), "CPUINFO: ", "CPUINFO"),
+                ] {
+                    require_nonempty_version_field(parser, line, prefix, field)?;
+                }
+                for (line, prefix, field) in [
+                    (lines.required(5), "OPENSSLDIR: \"", "OPENSSLDIR"),
+                    (lines.required(6), "ENGINESDIR: \"", "ENGINESDIR"),
+                    (lines.required(7), "MODULESDIR: \"", "MODULESDIR"),
+                ] {
+                    let value = line
+                        .strip_prefix(prefix)
+                        .and_then(|value| value.strip_suffix('"'))
+                        .ok_or_else(|| tool_version_error(format!("{parser}: {field}")))?;
+                    validate_absolute_lexical_path(value, field)
+                        .map_err(|_| tool_version_error(format!("{parser}: {field} path")))?;
+                }
+                Ok(())
+            }
+            ("host-c-compiler-current-v", "host-cc") => {
+                if matches!(
+                    selected_lexical.rsplit('/').next(),
+                    Some("clang-22" | "clang")
+                ) {
+                    require_exact_version_lines(
+                        parser,
+                        lines,
+                        &[
+                            "Ubuntu clang version 22.1.2 (1ubuntu1)",
+                            "Target: x86_64-pc-linux-gnu",
+                            "Thread model: posix",
+                            "InstalledDir: /usr/lib/llvm-22/bin",
+                            "Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/13",
+                            "Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15",
+                            "Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15",
+                            "Candidate multilib: .;@m64",
+                            "Selected multilib: .;@m64",
+                        ],
+                        tool_id,
+                    )
+                } else {
+                    require_gcc_version_lines(
+                        parser,
+                        selected_lexical,
+                        lines,
+                        "Target: x86_64-linux-gnu",
+                        false,
+                    )?;
+                    if !lines.required(6).contains(
+                        "--with-pkgversion='Ubuntu 15.2.0-16ubuntu1'",
+                    ) || lines.required(9)
+                        != "gcc version 15.2.0 (Ubuntu 15.2.0-16ubuntu1) "
+                    {
+                        return Err(tool_version_error(format!(
+                            "{parser}: current GCC package identity"
+                        )));
+                    }
+                    Ok(())
+                }
+            }
+            (
+                "archiver-current-version",
+                "host-ar" | "host-ranlib",
+            ) => require_exact_version_lines(
+                parser,
+                lines,
+                &["Ubuntu LLVM version 22.1.2", "  Optimized build."],
+                tool_id,
+            ),
+            ("archiver-current-version", "aarch64-linux-ar") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &[
+                        "GNU ar (GNU Binutils for Ubuntu) 2.46",
+                        "Copyright (C) 2026 Free Software Foundation, Inc.",
+                        "This program is free software; you may redistribute it under the terms of",
+                        "the GNU General Public License version 3 or (at your option) any later version.",
+                        "This program has absolutely no warranty.",
+                    ],
+                    tool_id,
+                )
+            }
+            ("aarch64-c-compiler-current-v", "aarch64-linux-cc") => {
+                require_gcc_version_lines(
+                    parser,
+                    selected_lexical,
+                    lines,
+                    "Target: aarch64-linux-gnu",
+                    true,
+                )?;
+                if !lines.required(4).contains(
+                    "--with-pkgversion='Ubuntu 15.2.0-16ubuntu1'",
+                ) || lines.required(7)
+                    != "gcc version 15.2.0 (Ubuntu 15.2.0-16ubuntu1) "
+                {
+                    return Err(tool_version_error(format!(
+                        "{parser}: current GCC package identity"
+                    )));
+                }
+                Ok(())
+            }
+            ("apple-clang-current-version", "apple-clang") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &[
+                        "Ubuntu clang version 22.1.2 (1ubuntu1)",
+                        "Target: aarch64-apple-darwin",
+                        "Thread model: posix",
+                        "InstalledDir: /usr/lib/llvm-22/bin",
+                    ],
+                    tool_id,
+                )
+            }
+            ("windows-clang-cl-current-version", "windows-clang-cl") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &[
+                        "Ubuntu clang version 22.1.2 (1ubuntu1)",
+                        "Target: x86_64-pc-windows-msvc",
+                        "Thread model: posix",
+                        "InstalledDir: /usr/lib/llvm-22/bin",
+                    ],
+                    tool_id,
+                )
+            }
+            ("llvm-lib-current-help", "windows-lib") => require_exact_version_lines(
+                parser,
+                lines,
+                &[
+                    "OVERVIEW: LLVM Lib",
+                    "",
+                    "USAGE: llvm-lib [options] file...",
+                    "",
+                    "OPTIONS:",
+                    "  /def:<value>            def file to use to generate import library",
+                    "  /defArm64Native:<value> def file to use to generate native ARM64 symbols in ARM64EC import library",
+                    "  /ignore:<value>         Specify warning codes to ignore",
+                    "  /libpath:<value>        Object file search path",
+                    "  /list                   List contents of .lib file on stdout",
+                    "  /llvmlibempty           When given no contents, produce an empty .lib file",
+                    "  /llvmlibindex:no        Do not write an index to the output",
+                    "  /llvmlibindex           Write an index to the output (default)",
+                    "  /llvmlibthin            Make .lib point to .obj files instead of copying their contents",
+                    "  /machine:<value>        Specify target platform",
+                    "  /out:<value>            Path to file to write output",
+                    "  /WX:no                  Don't treat warnings as errors (default)",
+                    "  /WX                     Treat warnings as errors",
+                ],
+                tool_id,
+            ),
+            ("lld-coff-current-version", "windows-lld-link") => {
+                require_exact_version_lines(
+                    parser,
+                    lines,
+                    &["Ubuntu LLD 22.1.2"],
+                    tool_id,
+                )
+            }
             ("rustc-vv-pinned-1.99", "rustc") => require_exact_version_lines(
                 parser,
                 lines,
@@ -29500,8 +29929,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         false
     }
 
-    fn validate_tool_probe_authority(authority: &ToolProbeAuthority) -> TrustResult<&'static NativeTool> {
-        let descriptor = NATIVE_TOOLS.get(authority.ordinal).ok_or_else(|| {
+    fn validate_tool_probe_authority_with_descriptors<'a>(
+        authority: &ToolProbeAuthority,
+        descriptors: &'a [NativeTool],
+    ) -> TrustResult<&'a NativeTool> {
+        let descriptor = descriptors.get(authority.ordinal).ok_or_else(|| {
             tool_version_error("context.ordinal: outside exact 20-role registry")
         })?;
         if authority.tool_id != descriptor.id {
@@ -29540,11 +29972,12 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         Ok(descriptor)
     }
 
-    pub(super) fn validate_tool_probe_observation(
+    fn validate_tool_probe_observation_with_descriptors(
         authority: &ToolProbeAuthority,
         input: &ToolProbeInput,
+        descriptors: &[NativeTool],
     ) -> TrustResult<ValidatedToolProbeObservation> {
-        let _descriptor = validate_tool_probe_authority(authority)?;
+        let _descriptor = validate_tool_probe_authority_with_descriptors(authority, descriptors)?;
         for (equal, detail) in [
             (input.ordinal == authority.ordinal, "context.ordinal"),
             (input.tool_id == authority.tool_id, "context.tool_id"),
@@ -29613,11 +30046,23 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         })
     }
 
-    pub(super) fn validate_tool_probe_batch(
+    pub(super) fn validate_tool_probe_observation(
+        authority: &ToolProbeAuthority,
+        input: &ToolProbeInput,
+    ) -> TrustResult<ValidatedToolProbeObservation> {
+        validate_tool_probe_observation_with_descriptors(authority, input, NATIVE_TOOLS)
+    }
+
+    fn validate_tool_probe_batch_with_descriptors(
         authorities: &[ToolProbeAuthority],
         inputs: &[ToolProbeInput],
+        descriptors: &[NativeTool],
     ) -> TrustResult<ValidatedToolProbeBatch> {
-        if authorities.len() != 20 || inputs.len() != 20 || authorities.len() != inputs.len() {
+        if authorities.len() != 20
+            || inputs.len() != 20
+            || descriptors.len() != 20
+            || authorities.len() != inputs.len()
+        {
             return Err(tool_version_error(
                 "batch.cardinality: exact 20-role inventory required",
             ));
@@ -29630,7 +30075,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             if authority.ordinal != ordinal || input.ordinal != ordinal {
                 return Err(tool_version_error("batch.order: policy ordinal mismatch"));
             }
-            observations.push(validate_tool_probe_observation(authority, input)?);
+            observations.push(validate_tool_probe_observation_with_descriptors(
+                authority,
+                input,
+                descriptors,
+            )?);
         }
         let rustc = observations
             .iter()
@@ -29644,15 +30093,33 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             .map_err(|_| tool_version_error("batch.rustc-rustdoc-join: rustc UTF-8"))?;
         let rustdoc_text = std::str::from_utf8(&rustdoc.raw_bytes)
             .map_err(|_| tool_version_error("batch.rustc-rustdoc-join: rustdoc UTF-8"))?;
-        if !rustc_text.contains("commit-hash: 375b1431b7d89d1c2e2bc168c011848ae12b7d14\n")
-            || !rustc_text.contains("commit-date: 2026-07-10\n")
-            || rustdoc_text != "rustdoc 1.99.0-nightly (375b1431b 2026-07-10)\n"
-        {
+        let joined = match rustc.parser_id.as_str() {
+            "rustc-vv-pinned-1.99" => {
+                rustc_text.contains(
+                    "commit-hash: 375b1431b7d89d1c2e2bc168c011848ae12b7d14\n",
+                ) && rustc_text.contains("commit-date: 2026-07-10\n")
+                    && rustdoc_text
+                        == "rustdoc 1.99.0-nightly (375b1431b 2026-07-10)\n"
+            }
+            "rustc-vv-current-1.100" => {
+                rustc_text.contains(
+                    "commit-hash: e7769602aca3770e8d8ea55716becb22e839a579\n",
+                ) && rustc_text.contains("commit-date: 2026-08-24\n")
+                    && rustdoc_text
+                        == "rustdoc 1.100.0-nightly (e7769602a 2026-08-24)\n"
+            }
+            _ => false,
+        };
+        if !joined {
             return Err(tool_version_error(
                 "batch.rustc-rustdoc-join: short/full commit or date mismatch",
             ));
         }
-        let mut preimage = b"FND01TOOLPROBEBATCHv1\0".to_vec();
+        let mut preimage = if rustc.parser_id == "rustc-vv-current-1.100" {
+            b"FND01ORDINARYTOOLPROBEBATCHv1\0".to_vec()
+        } else {
+            b"FND01TOOLPROBEBATCHv1\0".to_vec()
+        };
         preimage.extend_from_slice(&20u32.to_be_bytes());
         for observation in &observations {
             preimage.extend_from_slice(
@@ -29687,10 +30154,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         })
     }
 
+    pub(super) fn validate_tool_probe_batch(
+        authorities: &[ToolProbeAuthority],
+        inputs: &[ToolProbeInput],
+    ) -> TrustResult<ValidatedToolProbeBatch> {
+        validate_tool_probe_batch_with_descriptors(authorities, inputs, NATIVE_TOOLS)
+    }
+
     fn probe_tool_version(
         repository_root: &Path,
         execution_bin_relative: &str,
         selected_tools: &[SelectedTool],
+        descriptors: &[NativeTool],
+        toolchain: &str,
         expected_execution_bin_sha256: [u8; 32],
         authority: &ProduceAcquisitionAuthority,
         space_guard: &PhaseBSpaceGuard<'_>,
@@ -29707,7 +30183,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             ("LC_ALL".to_owned(), "C".to_owned()),
             ("PATH".to_owned(), execution_bin.to_owned()),
             ("RUSTFMT".to_owned(), rustfmt.to_owned()),
-            ("RUSTUP_TOOLCHAIN".to_owned(), "nightly-2026-07-11".to_owned()),
+            ("RUSTUP_TOOLCHAIN".to_owned(), toolchain.to_owned()),
             ("TZ".to_owned(), "UTC".to_owned()),
         ];
         let mut argv = Vec::new();
@@ -29715,10 +30191,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         for arg in tool.version_argv {
             argv.push((*arg).to_owned());
         }
-        let before = revalidate_native_tool_surface(
+        let before = revalidate_native_tool_surface_with_descriptors(
             repository_root,
             execution_bin_relative,
             selected_tools,
+            descriptors,
         )?;
         if before != expected_execution_bin_sha256 {
             return Err(phase_b_error(
@@ -29744,10 +30221,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             },
             &format!("tool-probe.{}", tool.id),
         );
-        let after = revalidate_native_tool_surface(
+        let after = revalidate_native_tool_surface_with_descriptors(
             repository_root,
             execution_bin_relative,
             selected_tools,
+            descriptors,
         );
         let post_bookend = (|| -> TrustResult<()> {
             let after = after?;
@@ -29767,6 +30245,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             (Ok(_), Err(post_error)) => return Err(post_error),
             (Ok(capture), Ok(())) => capture,
         };
+        if capture.exit_code != 0 {
+            return Err(tool_version_error(format!(
+                "context.exit_code: tool={} parser={} selected={} observed={} expected=0 stdout_length={} stdout_sha256={} stderr_length={} stderr_sha256={}",
+                tool.id,
+                tool.parser,
+                selected_path,
+                capture.exit_code,
+                capture.stdout.binding.byte_length,
+                encode_lower_hex(&capture.stdout.binding.sha256),
+                capture.stderr.binding.byte_length,
+                encode_lower_hex(&capture.stderr.binding.sha256),
+            )));
+        }
         let selected_authority = selected_tools.get(ordinal).ok_or_else(|| {
             tool_version_error("context.ordinal: missing selected-tool authority")
         })?;
@@ -29805,14 +30296,19 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             stderr: capture.stderr.bytes,
             raw_sha256,
         };
-        let validated = validate_tool_probe_observation(&probe_authority, &input)?;
+        let validated = validate_tool_probe_observation_with_descriptors(
+            &probe_authority,
+            &input,
+            descriptors,
+        )?;
         Ok((validated.raw_bytes, validated.raw_sha256))
     }
 
     fn validate_selected_tool_probe_batch(
         tools: &[SelectedTool],
+        descriptors: &[NativeTool],
     ) -> TrustResult<ValidatedToolProbeBatch> {
-        if tools.len() != NATIVE_TOOLS.len() {
+        if tools.len() != descriptors.len() {
             return Err(tool_version_error(
                 "batch.cardinality: selected-tool inventory is not exact",
             ));
@@ -29825,7 +30321,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         inputs.try_reserve_exact(tools.len()).map_err(|_| {
             tool_version_error("batch.allocation: input reservation")
         })?;
-        for (ordinal, (tool, descriptor)) in tools.iter().zip(NATIVE_TOOLS).enumerate() {
+        for (ordinal, (tool, descriptor)) in tools.iter().zip(descriptors).enumerate() {
             let mut argv = Vec::new();
             argv.try_reserve_exact(descriptor.version_argv.len() + 1).map_err(|_| {
                 tool_version_error("batch.allocation: argv reservation")
@@ -29869,7 +30365,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             });
             authorities.push(authority);
         }
-        validate_tool_probe_batch(&authorities, &inputs)
+        validate_tool_probe_batch_with_descriptors(&authorities, &inputs, descriptors)
     }
 
     fn append_resolved_candidate(
@@ -29929,8 +30425,10 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         authority: &ProduceAcquisitionAuthority,
         space_guard: &PhaseBSpaceGuard<'_>,
         execution_bin_admission: ExecutionBinAdmission,
+        descriptors: &[NativeTool],
+        toolchain: &str,
     ) -> TrustResult<([u8; 32], [u8; 32], Vec<SelectedTool>)> {
-        if NATIVE_TOOLS.len() != authority.native_tool_count {
+        if descriptors.len() != authority.native_tool_count {
             return Err(phase_b_error(
                 "E_PHASE_B_TOOL_SET",
                 "compiled native tool count is not 20",
@@ -29944,9 +30442,9 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         )?;
 
         // Phase 1: resolve every candidate for every role.
-        let mut roles: Vec<(usize, &'static NativeTool, Vec<ResolvedCandidate>, Option<usize>)> =
+        let mut roles: Vec<(usize, &NativeTool, Vec<ResolvedCandidate>, Option<usize>)> =
             Vec::new();
-        for (ordinal, tool) in NATIVE_TOOLS.iter().enumerate() {
+        for (ordinal, tool) in descriptors.iter().enumerate() {
             let mut candidates = Vec::new();
             let mut selected_index = None;
             for template in tool.candidates {
@@ -30144,10 +30642,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 candidates: candidates.clone(),
             });
         }
-        let execution_bin_sha256 = revalidate_native_tool_surface(
+        let execution_bin_sha256 = revalidate_native_tool_surface_with_descriptors(
             repository_root,
             execution_bin_relative,
             &selected_authorities,
+            descriptors,
         )?;
 
         // Phase 3: version probe every selected role under tool_identity env.
@@ -30202,6 +30701,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
                 repository_root,
                 execution_bin_relative,
                 &selected_authorities,
+                descriptors,
+                toolchain,
                 execution_bin_sha256,
                 authority,
                 space_guard,
@@ -30226,7 +30727,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         }
         validate_selected_tool_aliases(&selected_tools)?;
         validate_required_tool_probe_aliases(&selected_tools)?;
-        let validated_probe_batch = validate_selected_tool_probe_batch(&selected_tools)?;
+        let validated_probe_batch =
+            validate_selected_tool_probe_batch(&selected_tools, descriptors)?;
         if validated_probe_batch.observations.len() != selected_tools.len() {
             return Err(tool_version_error(
                 "batch.cardinality: validated observation count drifted",
@@ -30272,10 +30774,11 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             output.extend_from_slice(&tool.version_bytes);
         }
         let tool_set_sha256 = sha256(&output)?;
-        if revalidate_native_tool_surface(
+        if revalidate_native_tool_surface_with_descriptors(
             repository_root,
             execution_bin_relative,
             &selected_tools,
+            descriptors,
         )? != execution_bin_sha256
         {
             return Err(phase_b_error(
@@ -30309,6 +30812,8 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             authority,
             space_guard,
             ExecutionBinAdmission::CreateFresh,
+            NATIVE_TOOLS,
+            "nightly-2026-07-11",
         )
     }
 
@@ -30353,12 +30858,26 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         })
     }
 
-    pub(super) fn inventory_existing_native_tools(
+    fn inventory_native_tools_for_runtime(
         repository_root: &Path,
         mode: BootstrapMode,
         run_id: &str,
         closed_path: &str,
+        admission: ExecutionBinAdmission,
+        descriptors: &[NativeTool],
+        toolchain: &str,
+        subject: &str,
     ) -> TrustResult<OrdinaryNativeToolInventory> {
+        let uses_current_ordinary_descriptors = match toolchain {
+            "nightly-2026-07-11" => false,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN => true,
+            _ => {
+                return Err(phase_b_error(
+                    "E_PHASE_B_TOOL_SET",
+                    format!("{subject} selected an unknown toolchain epoch"),
+                ));
+            }
+        };
         if run_id.len() != 32
             || !run_id
                 .bytes()
@@ -30366,7 +30885,7 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         {
             return Err(phase_b_error(
                 "E_PHASE_B_TOOL_SET",
-                "ordinary native-tool inventory requires a 32-hex run ID",
+                format!("{subject} requires a 32-hex run ID"),
             ));
         }
         let role = role_name(mode)?;
@@ -30392,17 +30911,38 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
             &execution_bin_relative,
             &authority,
             &space_guard,
-            ExecutionBinAdmission::RequireExisting,
+            admission,
+            descriptors,
+            toolchain,
         )?;
         let acquisition_tools = acquisition_tool_paths(&selected_tools)?;
         Ok(OrdinaryNativeToolInventory {
             repository_root: repository_root.to_path_buf(),
             execution_bin_relative,
+            uses_current_ordinary_descriptors,
             tool_set_sha256,
             execution_bin_sha256,
             acquisition_tools,
             selected_tools,
         })
+    }
+
+    pub(super) fn inventory_existing_native_tools(
+        repository_root: &Path,
+        mode: BootstrapMode,
+        run_id: &str,
+        closed_path: &str,
+    ) -> TrustResult<OrdinaryNativeToolInventory> {
+        inventory_native_tools_for_runtime(
+            repository_root,
+            mode,
+            run_id,
+            closed_path,
+            ExecutionBinAdmission::RequireExisting,
+            NATIVE_TOOLS,
+            "nightly-2026-07-11",
+            "historical ordinary native-tool inventory",
+        )
     }
 
     #[cfg(test)]
@@ -30412,47 +30952,55 @@ claim_ceiling = "online population of the fresh acquisition Cargo home; no retai
         run_id: &str,
         closed_path: &str,
     ) -> TrustResult<OrdinaryNativeToolInventory> {
-        if run_id.len() != 32
-            || !run_id
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-        {
-            return Err(phase_b_error(
-                "E_PHASE_B_TOOL_SET",
-                "fresh ordinary native-tool inventory requires a 32-hex run ID",
-            ));
-        }
-        let role = role_name(mode)?;
-        let execution_bin_relative =
-            format!(".fnd01-run/{role}/{run_id}/execution-bin");
-        validate_relative_path(
-            &execution_bin_relative,
-            "fresh ordinary execution-bin path",
-        )?;
-        let authority = compiled_produce_acquisition_authority();
-        let space_guard = PhaseBSpaceGuard::new(
+        inventory_native_tools_for_runtime(
             repository_root,
+            mode,
             run_id,
-            authority.space_budget,
-        )?;
-        let (tool_set_sha256, execution_bin_sha256, selected_tools) =
-            inventory_native_tools_with_admission(
-                repository_root,
-                closed_path,
-                &execution_bin_relative,
-                &authority,
-                &space_guard,
-                ExecutionBinAdmission::CreateFresh,
-            )?;
-        let acquisition_tools = acquisition_tool_paths(&selected_tools)?;
-        Ok(OrdinaryNativeToolInventory {
-            repository_root: repository_root.to_path_buf(),
-            execution_bin_relative,
-            tool_set_sha256,
-            execution_bin_sha256,
-            acquisition_tools,
-            selected_tools,
-        })
+            closed_path,
+            ExecutionBinAdmission::CreateFresh,
+            NATIVE_TOOLS,
+            "nightly-2026-07-11",
+            "fresh historical ordinary native-tool inventory",
+        )
+    }
+
+    pub(super) fn inventory_current_ordinary_existing_native_tools(
+        repository_root: &Path,
+        mode: BootstrapMode,
+        run_id: &str,
+        closed_path: &str,
+    ) -> TrustResult<OrdinaryNativeToolInventory> {
+        let descriptors = super::trust_std::current_ordinary_native_tool_descriptors();
+        inventory_native_tools_for_runtime(
+            repository_root,
+            mode,
+            run_id,
+            closed_path,
+            ExecutionBinAdmission::RequireExisting,
+            &descriptors,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+            "current ordinary native-tool inventory",
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn inventory_current_ordinary_fresh_native_tools(
+        repository_root: &Path,
+        mode: BootstrapMode,
+        run_id: &str,
+        closed_path: &str,
+    ) -> TrustResult<OrdinaryNativeToolInventory> {
+        let descriptors = super::trust_std::current_ordinary_native_tool_descriptors();
+        inventory_native_tools_for_runtime(
+            repository_root,
+            mode,
+            run_id,
+            closed_path,
+            ExecutionBinAdmission::CreateFresh,
+            &descriptors,
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+            "fresh current ordinary native-tool inventory",
+        )
     }
 
     fn produce_phase_b_control_plane(
@@ -34190,7 +34738,8 @@ mod ordinary {
     };
 
     use super::trust_std::{
-        bootstrap_role_name, checked_read, checked_snapshot, emit_entry_diagnostic,
+        bootstrap_role_name, checked_cargo_hardlink_snapshot, checked_read, checked_snapshot,
+        emit_entry_diagnostic,
         emit_entry_diagnostic_parts, encode_canonical_record, encode_lower_hex,
         entry_diagnostic_code_is_valid, expected_ordinary_handoff_argv,
         expected_ordinary_handoff_environment, expected_ordinary_supply_relative_path,
@@ -51285,8 +51834,29 @@ activate = 1\n";
         rust_version: String,
     }
 
-    fn canonical_campaign_proof_identity() -> VResult<CampaignProofIdentity> {
-        let toolchain_document = toml::from_str::<toml::Value>(EXACT_RUST_TOOLCHAIN_TOML)
+    fn canonical_campaign_proof_identity_at(root: &Path) -> VResult<CampaignProofIdentity> {
+        let toolchain_bytes = fs::read(root.join("rust-toolchain.toml")).map_err(|error| {
+            Diagnostic::error(
+                "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                "rust-toolchain.toml",
+            )
+            .at(error.to_string())
+        })?;
+        if !is_exact_rust_toolchain_document(&toolchain_bytes) {
+            return Err(Diagnostic::error(
+                "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                "rust-toolchain.toml",
+            )
+            .at("checked-in bytes differ from the compiled authority"));
+        }
+        let toolchain_text = std::str::from_utf8(&toolchain_bytes).map_err(|_| {
+            Diagnostic::error(
+                "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                "rust-toolchain.toml",
+            )
+            .at("toolchain document is not UTF-8")
+        })?;
+        let toolchain_document = toml::from_str::<toml::Value>(toolchain_text)
             .map_err(|_| {
                 Diagnostic::error(
                     "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
@@ -51306,8 +51876,29 @@ activate = 1\n";
             )
             .at("toolchain.channel")
         })?;
-        let cargo_document = toml::from_str::<toml::Value>(include_str!("../../../Cargo.toml"))
-            .map_err(|_| {
+        let cargo_bytes = fs::read(root.join("Cargo.toml")).map_err(|error| {
+            Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "Cargo.toml")
+                .at(error.to_string())
+        })?;
+        if cargo_bytes.is_empty() || cargo_bytes.len() > 65_536 {
+            return Err(Diagnostic::error(
+                "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                "Cargo.toml",
+            )
+            .at("workspace manifest length outside 1..=65536"));
+        }
+        if cargo_bytes.as_slice() != include_bytes!("../../../Cargo.toml") {
+            return Err(Diagnostic::error(
+                "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                "Cargo.toml",
+            )
+            .at("workspace manifest bytes differ from the compiled authority"));
+        }
+        let cargo_text = std::str::from_utf8(&cargo_bytes).map_err(|_| {
+            Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "Cargo.toml")
+                .at("workspace manifest is not UTF-8")
+        })?;
+        let cargo_document = toml::from_str::<toml::Value>(cargo_text).map_err(|_| {
                 Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "Cargo.toml")
             })?;
         let rust_version = pointer_get(
@@ -51320,10 +51911,27 @@ activate = 1\n";
             Diagnostic::error("E_CAMPAIGN_PROOF_SOURCE_IDENTITY", "Cargo.toml")
                 .at("workspace.package.rust-version")
         })?;
-        Ok(CampaignProofIdentity {
+        let identity = CampaignProofIdentity {
             toolchain: toolchain.to_owned(),
             rust_version: rust_version.to_owned(),
-        })
+        };
+        if identity.toolchain != super::trust_std::CURRENT_ORDINARY_TOOLCHAIN
+            || identity.rust_version != super::trust_std::CURRENT_ORDINARY_RUST_VERSION
+        {
+            return Err(Diagnostic::error(
+                "E_CAMPAIGN_PROOF_SOURCE_IDENTITY",
+                "current campaign toolchain",
+            )
+            .at(format!(
+                "toolchain={};rust-version={}",
+                identity.toolchain, identity.rust_version,
+            )));
+        }
+        Ok(identity)
+    }
+
+    fn canonical_campaign_proof_identity() -> VResult<CampaignProofIdentity> {
+        canonical_campaign_proof_identity_at(&repository_root())
     }
 
     fn dated_nightly_tokens<'a>(value: &'a str, subject: &str) -> VResult<Vec<&'a str>> {
@@ -91478,9 +92086,9 @@ fn fallible(value: Option<u8>) {
     }
 
     const ORDINARY_NATIVE_TOOL_COUNT: usize = 20;
-    const ORDINARY_NATIVE_TOOL_REGISTRY_BYTES: usize = 3911;
+    const ORDINARY_NATIVE_TOOL_REGISTRY_BYTES: usize = 4033;
     const ORDINARY_NATIVE_TOOL_REGISTRY_SHA256: &str =
-        "f699966ccfc01221f2dd81d6e801825c0f9fc56583ce6d474cdb03baaa47dc9b";
+        "89c20a9b4ea763d7695ea8805f689bc24217307d3b4d86dfd72349a0ca49ea2f";
     const ORDINARY_HANDOFF_ARGV_ARITY: usize = 5;
 
     fn validate_ordinary_native_tool_descriptor_authority(
@@ -91489,7 +92097,7 @@ fn fallible(value: Option<u8>) {
         expected_sha256_text: &str,
     ) -> Result<(), OrdinaryEntryFailure> {
         let (count, byte_length, sha256) =
-            super::trust_std::compiled_native_tool_registry_identity()
+            super::trust_std::current_ordinary_native_tool_registry_identity()
                 .map_err(|error| OrdinaryEntryFailure::from_site(
                     OrdinaryFailureSite::ProbeToolSet,
                     error.detail(),
@@ -91508,7 +92116,10 @@ fn fallible(value: Option<u8>) {
         {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                 OrdinaryFailureSite::ProbeToolSet,
-                "pure twenty-tool descriptor registry drift",
+                format!(
+                    "pure twenty-tool descriptor registry drift: actual count {count}, bytes {byte_length}, sha256 {}",
+                    lower_hex(&sha256),
+                ),
             ));
         }
         Ok(())
@@ -91533,7 +92144,8 @@ fn fallible(value: Option<u8>) {
         -> Result<OrdinaryDualPathPureAuthority, OrdinaryEntryFailure>
     {
         ordinary_native_tool_descriptor_authority()?;
-        let descriptors = super::trust_std::NATIVE_TOOL_DESCRIPTORS;
+        let descriptors =
+            super::trust_std::current_ordinary_native_tool_descriptors();
         if descriptors.len() != ORDINARY_NATIVE_TOOL_COUNT {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                 OrdinaryFailureSite::ProbeToolSet,
@@ -91574,7 +92186,7 @@ fn fallible(value: Option<u8>) {
             ));
         }
         let (count, byte_length, sha256) =
-            super::trust_std::compiled_native_tool_registry_identity()
+            super::trust_std::current_ordinary_native_tool_registry_identity()
                 .map_err(|error| OrdinaryEntryFailure::from_site(
                     OrdinaryFailureSite::ProbeToolSet,
                     error.detail(),
@@ -91585,7 +92197,10 @@ fn fallible(value: Option<u8>) {
         {
             return std::result::Result::Err(OrdinaryEntryFailure::from_site(
                 OrdinaryFailureSite::ProbeToolSet,
-                "pure dual-path registry identity drift",
+                format!(
+                    "pure dual-path registry identity drift: actual count {count}, bytes {byte_length}, sha256 {}",
+                    lower_hex(&sha256),
+                ),
             ));
         }
         Ok(OrdinaryDualPathPureAuthority {
@@ -91770,6 +92385,17 @@ fn fallible(value: Option<u8>) {
             || bootstrap_environment.closed_path.is_empty()
         {
             return Err(pending!("sealed bootstrap environment incomplete"));
+        }
+        let current_tool_bin = bootstrap_environment
+            .closed_path
+            .strip_suffix(":/usr/bin:/bin")
+            .filter(|path| path.starts_with('/') && !path.contains(':'))
+            .ok_or_else(|| pending!("sealed bootstrap closed PATH differs from authority"))?;
+        let expected_cargo_executable = format!("{current_tool_bin}/cargo-rch-real");
+        if cargo_executable != expected_cargo_executable {
+            return Err(pending!(
+                "sealed cargo_executable differs from current real Cargo authority"
+            ));
         }
 
         match mode {
@@ -92226,7 +92852,7 @@ fn fallible(value: Option<u8>) {
         let repository_root = PathBuf::from("/repo/fastmcp_rust");
         let bootstrap_environment = BootstrapEnvironment {
             authoring_marker: "FND01AUTHORv2:fixture".to_owned(),
-            closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+            closed_path: "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin".to_owned(),
             integration_seal: None,
             producer_outer_record_path: None,
             attester_outer_record_path: None,
@@ -92239,7 +92865,7 @@ fn fallible(value: Option<u8>) {
             ordinary_sealed_nonzero_digest(0x61),
             [0; 32],
             ordinary_sealed_nonzero_digest(0x62),
-            "/toolchains/nightly-2026-07-11/bin/cargo",
+            "/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
             bootstrap_environment,
         )?;
         let package_root = ordinary_role_absolute_path(
@@ -92297,6 +92923,23 @@ fn fallible(value: Option<u8>) {
     const ORDINARY_PROBE_LLVM_LIB_B64: &str = "T1ZFUlZJRVc6IExMVk0gTGliCgpVU0FHRTogbGx2bS1saWIgW29wdGlvbnNdIGZpbGUuLi4KCk9QVElPTlM6CiAgL2RlZjo8dmFsdWU+ICAgICAgICAgICAgZGVmIGZpbGUgdG8gdXNlIHRvIGdlbmVyYXRlIGltcG9ydCBsaWJyYXJ5CiAgL2RlZkFybTY0TmF0aXZlOjx2YWx1ZT4gZGVmIGZpbGUgdG8gdXNlIHRvIGdlbmVyYXRlIG5hdGl2ZSBBUk02NCBzeW1ib2xzIGluIEFSTTY0RUMgaW1wb3J0IGxpYnJhcnkKICAvaWdub3JlOjx2YWx1ZT4gICAgICAgICBTcGVjaWZ5IHdhcm5pbmcgY29kZXMgdG8gaWdub3JlCiAgL2xpYnBhdGg6PHZhbHVlPiAgICAgICAgT2JqZWN0IGZpbGUgc2VhcmNoIHBhdGgKICAvbGlzdCAgICAgICAgICAgICAgICAgICBMaXN0IGNvbnRlbnRzIG9mIC5saWIgZmlsZSBvbiBzdGRvdXQKICAvbGx2bWxpYmVtcHR5ICAgICAgICAgICBXaGVuIGdpdmVuIG5vIGNvbnRlbnRzLCBwcm9kdWNlIGFuIGVtcHR5IC5saWIgZmlsZQogIC9sbHZtbGliaW5kZXg6bm8gICAgICAgIERvIG5vdCB3cml0ZSBhbiBpbmRleCB0byB0aGUgb3V0cHV0CiAgL2xsdm1saWJpbmRleCAgICAgICAgICAgV3JpdGUgYW4gaW5kZXggdG8gdGhlIG91dHB1dCAoZGVmYXVsdCkKICAvbGx2bWxpYnRoaW4gICAgICAgICAgICBNYWtlIC5saWIgcG9pbnQgdG8gLm9iaiBmaWxlcyBpbnN0ZWFkIG9mIGNvcHlpbmcgdGhlaXIgY29udGVudHMKICAvbWFjaGluZTo8dmFsdWU+ICAgICAgICBTcGVjaWZ5IHRhcmdldCBwbGF0Zm9ybQogIC9vdXQ6PHZhbHVlPiAgICAgICAgICAgIFBhdGggdG8gZmlsZSB0byB3cml0ZSBvdXRwdXQKICAvV1g6bm8gICAgICAgICAgICAgICAgICBEb24ndCB0cmVhdCB3YXJuaW5ncyBhcyBlcnJvcnMgKGRlZmF1bHQpCiAgL1dYICAgICAgICAgICAgICAgICAgICAgVHJlYXQgd2FybmluZ3MgYXMgZXJyb3JzCg==";
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     const ORDINARY_PROBE_LLD_LINK_B64: &str = "VWJ1bnR1IExMRCAyMC4xLjgK";
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_LLVM_NM_B64: &str = "bGx2bS1ubSwgY29tcGF0aWJsZSB3aXRoIEdOVSBubQpVYnVudHUgTExWTSB2ZXJzaW9uIDIyLjEuMgogIE9wdGltaXplZCBidWlsZC4K";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_LLVM_TOOL_B64: &str = "VWJ1bnR1IExMVk0gdmVyc2lvbiAyMi4xLjIKICBPcHRpbWl6ZWQgYnVpbGQuCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_OPENSSL_B64: &str = "T3BlblNTTCAzLjUuNSAyNyBKYW4gMjAyNiAoTGlicmFyeTogT3BlblNTTCAzLjUuNSAyNyBKYW4gMjAyNikKYnVpbHQgb246IFR1ZSBBdWcgMTggMTE6NTY6MzQgMjAyNiBVVEMKcGxhdGZvcm06IGRlYmlhbi1hbWQ2NApvcHRpb25zOiAgYm4oNjQsNjQpCmNvbXBpbGVyOiBnY2MgLWZQSUMgLXB0aHJlYWQgLW02NCAtV2EsLS1ub2V4ZWNzdGFjayAtV2FsbCAtZnplcm8tY2FsbC11c2VkLXJlZ3M9dXNlZC1ncHIgLVdhLC0tbm9leGVjc3RhY2sgLWcgLU8yIC1XZXJyb3I9aW1wbGljaXQtZnVuY3Rpb24tZGVjbGFyYXRpb24gLWZuby1vbWl0LWZyYW1lLXBvaW50ZXIgLW1uby1vbWl0LWxlYWYtZnJhbWUtcG9pbnRlciAtZmZpbGUtcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC1wQ0E0YUIvb3BlbnNzbC0zLjUuNT0uIC1mc3RhY2stcHJvdGVjdG9yLXN0cm9uZyAtZnN0YWNrLWNsYXNoLXByb3RlY3Rpb24gLVdmb3JtYXQgLVdlcnJvcj1mb3JtYXQtc2VjdXJpdHkgLWZjZi1wcm90ZWN0aW9uIC1mZGVidWctcHJlZml4LW1hcD0vYnVpbGQvb3BlbnNzbC1wQ0E0YUIvb3BlbnNzbC0zLjUuNT0vdXNyL3NyYy9vcGVuc3NsLTMuNS41LTF1YnVudHUzLjQgLURPUEVOU1NMX1VTRV9OT0RFTEVURSAtRExfRU5ESUFOIC1ET1BFTlNTTF9QSUMgLURPUEVOU1NMX0JVSUxESU5HX09QRU5TU0wgLURaTElCIC1EWlNURCAtRE5ERUJVRyAtV2RhdGUtdGltZSAtRF9GT1JUSUZZX1NPVVJDRT0zCk9QRU5TU0xESVI6ICIvdXNyL2xpYi9zc2wiCkVOR0lORVNESVI6ICIvdXNyL2xpYi94ODZfNjQtbGludXgtZ251L2VuZ2luZXMtMyIKTU9EVUxFU0RJUjogIi91c3IvbGliL3g4Nl82NC1saW51eC1nbnUvb3NzbC1tb2R1bGVzIgpTZWVkaW5nIHNvdXJjZTogb3Mtc3BlY2lmaWMgSklUVEVSICgzMDYwMzAwKQpDUFVJTkZPOiBPUEVOU1NMX2lhMzJjYXA9MHg3ZWQ4MzIwYjA3OGJmZmZmOjB4MDA0MDAwMDQyMTljOTFhOToweDAwMDAwMDAwMDAwMDAwMDA6MHgwMDAwMDAwMDAwMDAwMDAwOjB4MDAwMDAwMDAwMDAwMDAwMAo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_HOST_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiB4ODZfNjQtcGMtbGludXgtZ251ClRocmVhZCBtb2RlbDogcG9zaXgKSW5zdGFsbGVkRGlyOiAvdXNyL2xpYi9sbHZtLTIyL2JpbgpGb3VuZCBjYW5kaWRhdGUgR0NDIGluc3RhbGxhdGlvbjogL3Vzci9saWIvZ2NjL3g4Nl82NC1saW51eC1nbnUvMTMKRm91bmQgY2FuZGlkYXRlIEdDQyBpbnN0YWxsYXRpb246IC91c3IvbGliL2djYy94ODZfNjQtbGludXgtZ251LzE1ClNlbGVjdGVkIEdDQyBpbnN0YWxsYXRpb246IC91c3IvbGliL2djYy94ODZfNjQtbGludXgtZ251LzE1CkNhbmRpZGF0ZSBtdWx0aWxpYjogLjtAbTY0ClNlbGVjdGVkIG11bHRpbGliOiAuO0BtNjQK";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_GNU_AR_B64: &str = "R05VIGFyIChHTlUgQmludXRpbHMgZm9yIFVidW50dSkgMi40NgpDb3B5cmlnaHQgKEMpIDIwMjYgRnJlZSBTb2Z0d2FyZSBGb3VuZGF0aW9uLCBJbmMuClRoaXMgcHJvZ3JhbSBpcyBmcmVlIHNvZnR3YXJlOyB5b3UgbWF5IHJlZGlzdHJpYnV0ZSBpdCB1bmRlciB0aGUgdGVybXMgb2YKdGhlIEdOVSBHZW5lcmFsIFB1YmxpYyBMaWNlbnNlIHZlcnNpb24gMyBvciAoYXQgeW91ciBvcHRpb24pIGFueSBsYXRlciB2ZXJzaW9uLgpUaGlzIHByb2dyYW0gaGFzIGFic29sdXRlbHkgbm8gd2FycmFudHkuCg==";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_APPLE_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiBhYXJjaDY0LWFwcGxlLWRhcndpbgpUaHJlYWQgbW9kZWw6IHBvc2l4Ckluc3RhbGxlZERpcjogL3Vzci9saWIvbGx2bS0yMi9iaW4K";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_WINDOWS_CLANG_B64: &str = "VWJ1bnR1IGNsYW5nIHZlcnNpb24gMjIuMS4yICgxdWJ1bnR1MSkKVGFyZ2V0OiB4ODZfNjQtcGMtd2luZG93cy1tc3ZjClRocmVhZCBtb2RlbDogcG9zaXgKSW5zdGFsbGVkRGlyOiAvdXNyL2xpYi9sbHZtLTIyL2Jpbgo=";
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const CURRENT_ORDINARY_PROBE_LLD_LINK_B64: &str = "VWJ1bnR1IExMRCAyMi4xLjIK";
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_probe_decode_base64(encoded: &str) -> Vec<u8> {
@@ -92373,6 +93016,25 @@ fn fallible(value: Option<u8>) {
             OrdinaryToolProbeFixture { tool_id: "windows-clang-cl", parser_id: "windows-clang-cl-version", selected_lexical: "/usr/bin/clang-cl-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_WINDOWS_CLANG_B64, raw_sha256: "7754c7b152bef66cb2c8b945914c2dbb4f7e7807adfde46493f95b006392c7f2" },
             OrdinaryToolProbeFixture { tool_id: "windows-lib", parser_id: "llvm-lib-help", selected_lexical: "/usr/bin/llvm-lib-22", argv_tail: &["/help"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_LIB_B64, raw_sha256: "815c4f3d012e79d0f2c3d0a7ffb23bf69c648249ad5187ad1246bac69c6a0f1c" },
             OrdinaryToolProbeFixture { tool_id: "windows-lld-link", parser_id: "lld-coff-version", selected_lexical: "/usr/bin/lld-link-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLD_LINK_B64, raw_sha256: "fe472e86073d215e48682fc92d9a214c6eba2bd1416813dfe68f6bac941a056c" },
+        ]
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn current_ordinary_system_tool_probe_fixtures()
+    -> [OrdinaryToolProbeFixture; 12] {
+        [
+            OrdinaryToolProbeFixture { tool_id: "llvm-nm", parser_id: "llvm-current-version-family", selected_lexical: "/usr/bin/llvm-nm-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_LLVM_NM_B64, raw_sha256: "a68721459737cfa09b9215344fed1aa8d05068472fc496b5ec1ba53fa9dff24b" },
+            OrdinaryToolProbeFixture { tool_id: "openssl", parser_id: "openssl-current-version-a", selected_lexical: "/usr/bin/openssl", argv_tail: &["version", "-a"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_OPENSSL_B64, raw_sha256: "b1e3e913e3c5b63a9afed03239f2b7b330878e4dd4ed28a624f2e67a0f64faf9" },
+            OrdinaryToolProbeFixture { tool_id: "host-cc", parser_id: "host-c-compiler-current-v", selected_lexical: "/usr/bin/clang-22", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: CURRENT_ORDINARY_PROBE_HOST_CLANG_B64, raw_sha256: "a54903d8704de4a7aa2821b50ab83355a3c4ce98089d636ef4f2f1929c634286" },
+            OrdinaryToolProbeFixture { tool_id: "host-ar", parser_id: "archiver-current-version", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "host-ranlib", parser_id: "archiver-current-version", selected_lexical: "/usr/bin/llvm-ranlib-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-cc", parser_id: "aarch64-c-compiler-current-v", selected_lexical: "/usr/bin/aarch64-linux-gnu-gcc", argv_tail: &["-v"], selected_stream: "stderr", raw_base64: ORDINARY_PROBE_AARCH64_GCC_B64, raw_sha256: "20a5376b7b7e218a03789f05f3d4c29e49d31eb0e54c0356d20e2747629243ae" },
+            OrdinaryToolProbeFixture { tool_id: "aarch64-linux-ar", parser_id: "archiver-current-version", selected_lexical: "/usr/bin/aarch64-linux-gnu-ar", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_GNU_AR_B64, raw_sha256: "43f5d0d9d22ba26ea2f3bf7843526d9397252213091aed88da1d21894008536e" },
+            OrdinaryToolProbeFixture { tool_id: "apple-clang", parser_id: "apple-clang-current-version", selected_lexical: "/usr/bin/clang-22", argv_tail: &["--target=aarch64-apple-darwin", "--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_APPLE_CLANG_B64, raw_sha256: "921c5adaf09212c716a5405f4c8e3142f73213575ee60d31811a04aa68f28f91" },
+            OrdinaryToolProbeFixture { tool_id: "apple-ar", parser_id: "llvm-current-version-family", selected_lexical: "/usr/bin/llvm-ar-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_LLVM_TOOL_B64, raw_sha256: "848b318083f68670d0b17fe451cb8c8bf3f5188cd3e1ca450057aaf5f6daf446" },
+            OrdinaryToolProbeFixture { tool_id: "windows-clang-cl", parser_id: "windows-clang-cl-current-version", selected_lexical: "/usr/bin/clang-cl-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_WINDOWS_CLANG_B64, raw_sha256: "4cf331bc93b25c3c6c31cc7654125723dadbdb9e8806571f56dd6354786beb76" },
+            OrdinaryToolProbeFixture { tool_id: "windows-lib", parser_id: "llvm-lib-current-help", selected_lexical: "/usr/bin/llvm-lib-22", argv_tail: &["/help"], selected_stream: "stdout", raw_base64: ORDINARY_PROBE_LLVM_LIB_B64, raw_sha256: "815c4f3d012e79d0f2c3d0a7ffb23bf69c648249ad5187ad1246bac69c6a0f1c" },
+            OrdinaryToolProbeFixture { tool_id: "windows-lld-link", parser_id: "lld-coff-current-version", selected_lexical: "/usr/bin/lld-link-22", argv_tail: &["--version"], selected_stream: "stdout", raw_base64: CURRENT_ORDINARY_PROBE_LLD_LINK_B64, raw_sha256: "170a202b75f25f80cbb26fa3e6e3c7ec02e74a8a7f190aa861d31d59774ff8eb" },
         ]
     }
 
@@ -92615,6 +93277,80 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn current_ordinary_system_parser_semantic_negative(
+        fixture: OrdinaryToolProbeFixture,
+        raw: &[u8],
+    ) -> (Vec<u8>, String) {
+        let (needle, replacement, expected): (&[u8], &[u8], String) =
+            match (fixture.parser_id, fixture.tool_id) {
+                ("llvm-current-version-family", "llvm-nm") => (
+                    b"22.1.2",
+                    b"22.1.3",
+                    "llvm-current-version-family|llvm-nm: exact-line[1]".to_owned(),
+                ),
+                ("llvm-current-version-family", "apple-ar") => (
+                    b"22.1.2",
+                    b"22.1.3",
+                    "llvm-current-version-family|apple-ar: exact-line[0]".to_owned(),
+                ),
+                ("openssl-current-version-a", "openssl") => (
+                    b"(Library: OpenSSL",
+                    b"(Librarz: OpenSSL",
+                    "openssl-current-version-a: OpenSSL identity/platform grammar".to_owned(),
+                ),
+                ("host-c-compiler-current-v", "host-cc") => (
+                    b"22.1.2",
+                    b"22.1.3",
+                    "host-c-compiler-current-v|host-cc: exact-line[0]".to_owned(),
+                ),
+                ("archiver-current-version", "host-ar" | "host-ranlib") => (
+                    b"22.1.2",
+                    b"22.1.3",
+                    format!(
+                        "archiver-current-version|{}: exact-line[0]",
+                        fixture.tool_id,
+                    ),
+                ),
+                ("aarch64-c-compiler-current-v", "aarch64-linux-cc") => (
+                    b"Target: aarch64-linux-gnu",
+                    b"Target: aarch64-linux-gnv",
+                    "aarch64-c-compiler-current-v: gcc target field".to_owned(),
+                ),
+                ("archiver-current-version", "aarch64-linux-ar") => (
+                    b"2.46",
+                    b"2.47",
+                    "archiver-current-version|aarch64-linux-ar: exact-line[0]".to_owned(),
+                ),
+                ("apple-clang-current-version", "apple-clang") => (
+                    b"Target: aarch64-apple-darwin",
+                    b"Target: aarch64-apple-darwio",
+                    "apple-clang-current-version|apple-clang: exact-line[1]".to_owned(),
+                ),
+                ("windows-clang-cl-current-version", "windows-clang-cl") => (
+                    b"msvc",
+                    b"msvx",
+                    "windows-clang-cl-current-version|windows-clang-cl: exact-line[1]"
+                        .to_owned(),
+                ),
+                ("llvm-lib-current-help", "windows-lib") => (
+                    b"OVERVIEW: LLVM Lib",
+                    b"OVERVIEW: LLVM Lip",
+                    "llvm-lib-current-help|windows-lib: exact-line[0]".to_owned(),
+                ),
+                ("lld-coff-current-version", "windows-lld-link") => (
+                    b"22.1.2",
+                    b"22.1.3",
+                    "lld-coff-current-version|windows-lld-link: exact-line[0]".to_owned(),
+                ),
+                unknown => panic!("unknown current Ordinary system parser case {unknown:?}"),
+            };
+        (
+            ordinary_probe_replace_once_same_length(raw, needle, replacement),
+            expected,
+        )
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_tool_probe_role_index(
         inputs: &[ToolProbeInput],
         parser_id: &str,
@@ -92748,6 +93484,281 @@ fn fallible(value: Option<u8>) {
         }
         assert_eq!(accepted, 15, "exact parser positive floor");
         assert_eq!(rejected, 15, "exact parser semantic-negative floor");
+
+        let current_rustc = b"rustc 1.100.0-nightly (e7769602a 2026-08-24)\nbinary: rustc\ncommit-hash: e7769602aca3770e8d8ea55716becb22e839a579\ncommit-date: 2026-08-24\nhost: x86_64-unknown-linux-gnu\nrelease: 1.100.0-nightly\nLLVM version: 23.1.0\n";
+        validate_version_stream_for_role(
+            "rustc",
+            "rustc-vv-current-1.100",
+            "/fixture/toolchains/nightly-2026-08-25/bin/rustc",
+            current_rustc,
+        )
+        .expect("current Ordinary rustc parser positive");
+        let changed_current_rustc = ordinary_probe_replace_once_same_length(
+            current_rustc,
+            b"e7769602aca3770e8d8ea55716becb22e839a579",
+            b"e7769602aca3770e8d8ea55716becb22e839a578",
+        );
+        assert_eq!(
+            current_rustc
+                .iter()
+                .zip(&changed_current_rustc)
+                .filter(|(left, right)| left != right)
+                .count(),
+            1,
+            "current Ordinary rustc negative differs by one commit byte",
+        );
+        let current_error = validate_version_stream_for_role(
+            "rustc",
+            "rustc-vv-current-1.100",
+            "/fixture/toolchains/nightly-2026-08-25/bin/rustc",
+            &changed_current_rustc,
+        )
+        .expect_err("current Ordinary rustc commit drift must fail closed");
+        assert_eq!(current_error.code(), "E_PHASE_B_TOOL_VERSION");
+        assert_eq!(
+            current_error.detail(),
+            "rustc-vv-current-1.100|rustc: exact-line[2]",
+        );
+        let historical_rustc = ordinary_tool_probe_fixture_for(
+            "rustc-vv-pinned-1.99",
+            "rustc",
+        );
+        let historical_rustc_raw =
+            ordinary_probe_decode_base64(historical_rustc.raw_base64);
+        assert_eq!(
+            encode_lower_hex(
+                &trust_sha256(&historical_rustc_raw)
+                    .expect("historical rustc capture digest"),
+            ),
+            historical_rustc.raw_sha256,
+            "historical July rustc evidence bytes remain unchanged",
+        );
+        for (parser_id, raw) in [
+            ("rustc-vv-pinned-1.99", &current_rustc[..]),
+            (
+                "rustc-vv-current-1.100",
+                historical_rustc_raw.as_slice(),
+            ),
+        ] {
+            let error = validate_version_stream_for_role(
+                "rustc",
+                parser_id,
+                "/fixture/toolchains/epoch-mismatch/bin/rustc",
+                raw,
+            )
+            .expect_err("historical and current rustc epochs must not cross-admit");
+            assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
+        }
+        validate_version_stream_for_role(
+            "rustc",
+            "rustc-vv-current-1.100",
+            "/fixture/toolchains/nightly-2026-08-25/bin/rustc",
+            current_rustc,
+        )
+        .expect("current Ordinary rustc pristine reacceptance");
+
+        let current_cargo = b"cargo 1.100.0-nightly (e8cb624d5 2026-08-22)\nrelease: 1.100.0-nightly\ncommit-hash: e8cb624d5701824f46a2ec5873cfd59ee3d2f66c\ncommit-date: 2026-08-22\nhost: x86_64-unknown-linux-gnu\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.21.0-DEV (sys:0.4.90+curl-8.21.0 vendored ssl:OpenSSL/3.6.3)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Ubuntu 26.4.0 (resolute) [unknown bitness]\n";
+        validate_version_stream_for_role(
+            "cargo",
+            "cargo-vv-current-1.100",
+            "/fixture/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
+            current_cargo,
+        )
+        .expect("current Ordinary Cargo parser positive");
+        let changed_current_cargo = ordinary_probe_replace_once_same_length(
+            current_cargo,
+            b"os: Ubuntu 26.4.0 (resolute) [unknown bitness]",
+            b"os: Ubuntu 26.4.0 (resolute) [unknowo bitness]",
+        );
+        assert_eq!(
+            current_cargo
+                .iter()
+                .zip(&changed_current_cargo)
+                .filter(|(left, right)| left != right)
+                .count(),
+            1,
+            "current Ordinary Cargo negative differs by one bitness byte",
+        );
+        let changed_cargo_error = validate_version_stream_for_role(
+            "cargo",
+            "cargo-vv-current-1.100",
+            "/fixture/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
+            &changed_current_cargo,
+        )
+        .expect_err("current Ordinary Cargo OS drift must fail closed");
+        assert_eq!(changed_cargo_error.code(), "E_PHASE_B_TOOL_VERSION");
+        let actual_line = b"os: Ubuntu 26.4.0 (resolute) [unknowo bitness]";
+        let expected_line = b"os: Ubuntu 26.4.0 (resolute) [unknown bitness]";
+        assert_eq!(
+            changed_cargo_error.detail(),
+            format!(
+                "cargo-vv-current-1.100|cargo: exact-line[8] actual_present=true actual_line_count=9 actual_length={} actual_sha256={} expected_present=true expected_line_count=9 expected_length={} expected_sha256={}",
+                actual_line.len(),
+                encode_lower_hex(&trust_sha256(actual_line).expect("changed Cargo line digest")),
+                expected_line.len(),
+                encode_lower_hex(&trust_sha256(expected_line).expect("expected Cargo line digest")),
+            ),
+        );
+        validate_version_stream_for_role(
+            "cargo",
+            "cargo-vv-current-1.100",
+            "/fixture/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
+            current_cargo,
+        )
+        .expect("current Ordinary Cargo pristine reacceptance");
+
+        let current_descriptors =
+            super::trust_std::current_ordinary_native_tool_descriptors();
+        assert_eq!(
+            super::trust_std::NATIVE_TOOL_DESCRIPTORS[1].candidates,
+            &["{pinned-toolchain-bin}/cargo"],
+            "historical Cargo evidence keeps the toolchain entry-point candidate",
+        );
+        assert_eq!(
+            current_descriptors[1].candidates,
+            &["{pinned-toolchain-bin}/cargo-rch-real"],
+            "current Ordinary evidence binds the independently admitted real Cargo binary",
+        );
+        let mut wrapped_cargo_descriptors = current_descriptors.clone();
+        wrapped_cargo_descriptors[1].candidates =
+            super::trust_std::NATIVE_TOOL_DESCRIPTORS[1].candidates;
+        let wrapped_cargo_registry =
+            super::trust_std::current_ordinary_native_tool_registry_identity_for(
+                &wrapped_cargo_descriptors,
+            )
+            .expect("near-identical wrapped-Cargo registry identity");
+        let current_descriptors_baseline = current_descriptors.clone();
+        let current_registry_baseline =
+            super::trust_std::current_ordinary_native_tool_registry_identity()
+                .expect("current Ordinary registry identity");
+        assert_ne!(
+            wrapped_cargo_registry, current_registry_baseline,
+            "changing only the current Cargo candidate back to the orchestration wrapper must invalidate the frozen registry",
+        );
+        let historical_fixtures = ordinary_tool_probe_fixtures();
+        let mut current_system_positives = 0usize;
+        let mut current_system_negatives = 0usize;
+        let mut cross_epoch_rejections = 0usize;
+        let mut byte_identical_cross_epoch_roles = 0usize;
+        for (offset, fixture) in current_ordinary_system_tool_probe_fixtures()
+            .into_iter()
+            .enumerate()
+        {
+            let ordinal = offset + 8;
+            let descriptor = current_descriptors[ordinal];
+            assert_eq!(descriptor.id, fixture.tool_id, "current tool role {ordinal}");
+            assert_eq!(
+                descriptor.parser, fixture.parser_id,
+                "current parser role {ordinal}",
+            );
+            assert_eq!(
+                descriptor.candidates.first().copied(),
+                Some(fixture.selected_lexical),
+                "qualified current candidate role {ordinal}",
+            );
+            assert_eq!(
+                descriptor.version_argv,
+                fixture.argv_tail,
+                "current argv role {ordinal}",
+            );
+            assert_eq!(
+                descriptor.stream, fixture.selected_stream,
+                "current stream role {ordinal}",
+            );
+
+            let raw = ordinary_probe_decode_base64(fixture.raw_base64);
+            assert_eq!(
+                encode_lower_hex(
+                    &trust_sha256(&raw).expect("current system capture digest"),
+                ),
+                fixture.raw_sha256,
+                "current system capture role {ordinal}",
+            );
+            validate_version_stream_for_role(
+                fixture.tool_id,
+                fixture.parser_id,
+                fixture.selected_lexical,
+                &raw,
+            )
+            .expect("current system parser positive");
+            current_system_positives += 1;
+
+            let (changed, expected_diagnostic) =
+                current_ordinary_system_parser_semantic_negative(fixture, &raw);
+            assert_eq!(
+                raw.iter()
+                    .zip(&changed)
+                    .filter(|(left, right)| left != right)
+                    .count(),
+                1,
+                "current system role {ordinal} negative differs by one byte",
+            );
+            let error = validate_version_stream_for_role(
+                fixture.tool_id,
+                fixture.parser_id,
+                fixture.selected_lexical,
+                &changed,
+            )
+            .expect_err("current system semantic drift must fail closed");
+            assert_eq!(error.code(), "E_PHASE_B_TOOL_VERSION");
+            assert_eq!(error.detail(), expected_diagnostic);
+            assert_eq!(
+                current_descriptors, current_descriptors_baseline,
+                "parser rejection leaves the current descriptor authority unchanged",
+            );
+            validate_version_stream_for_role(
+                fixture.tool_id,
+                fixture.parser_id,
+                fixture.selected_lexical,
+                &raw,
+            )
+            .expect("current system pristine reacceptance");
+            current_system_negatives += 1;
+
+            let historical = historical_fixtures
+                .iter()
+                .copied()
+                .find(|candidate| candidate.tool_id == fixture.tool_id)
+                .expect("historical role twin");
+            assert_ne!(
+                historical.parser_id, fixture.parser_id,
+                "every current role has an epoch-specific parser identity",
+            );
+            let historical_raw = ordinary_probe_decode_base64(historical.raw_base64);
+            if historical_raw == raw {
+                assert!(
+                    matches!(fixture.tool_id, "aarch64-linux-cc" | "windows-lib"),
+                    "only captured byte-identical cross-epoch roles are admitted",
+                );
+                byte_identical_cross_epoch_roles += 1;
+            } else {
+                validate_version_stream_for_role(
+                    fixture.tool_id,
+                    fixture.parser_id,
+                    fixture.selected_lexical,
+                    &historical_raw,
+                )
+                .expect_err("historical bytes must not satisfy a distinct current parser");
+                validate_version_stream_for_role(
+                    historical.tool_id,
+                    historical.parser_id,
+                    historical.selected_lexical,
+                    &raw,
+                )
+                .expect_err("current bytes must not satisfy a distinct historical parser");
+                cross_epoch_rejections += 1;
+            }
+        }
+        assert_eq!(current_system_positives, 12);
+        assert_eq!(current_system_negatives, 12);
+        assert_eq!(cross_epoch_rejections, 10);
+        assert_eq!(byte_identical_cross_epoch_roles, 2);
+        assert_eq!(
+            super::trust_std::current_ordinary_native_tool_registry_identity()
+                .expect("current Ordinary registry identity after parser negatives"),
+            current_registry_baseline,
+            "parser negatives leave the complete current registry identity unchanged",
+        );
 
         let mut supplementary_role_grammars = 0usize;
         ordinary_assert_parser_role_variant(
@@ -93272,56 +94283,144 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_public_harness_receipt_binding() -> Result<FileBinding, String> {
+        let byte_length = std::env::var("FASTMCP_FND01_PUBLIC_HARNESS_BYTES")
+            .map_err(|_| pending!("FASTMCP_FND01_PUBLIC_HARNESS_BYTES is required"))?;
+        if byte_length.is_empty()
+            || byte_length.starts_with('0')
+            || !byte_length.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(pending!(
+                "FASTMCP_FND01_PUBLIC_HARNESS_BYTES must be canonical positive decimal",
+            ));
+        }
+        let byte_length = byte_length.parse::<u64>().map_err(|_| {
+            pending!("FASTMCP_FND01_PUBLIC_HARNESS_BYTES exceeds u64")
+        })?;
+        if byte_length == 0 || byte_length > MAX_GATE_EXECUTABLE_BYTES {
+            return Err(pending!(
+                "public harness receipt length {byte_length} outside 1..={MAX_GATE_EXECUTABLE_BYTES}",
+            ));
+        }
+        let sha256 = std::env::var("FASTMCP_FND01_PUBLIC_HARNESS_SHA256")
+            .map_err(|_| pending!("FASTMCP_FND01_PUBLIC_HARNESS_SHA256 is required"))?;
+        let sha256 = super::trust_std::decode_lower_hex::<32>(
+            &sha256,
+            "FASTMCP_FND01_PUBLIC_HARNESS_SHA256",
+        )
+        .map_err(|error| pending!("public harness receipt digest: {}", error.detail()))?;
+        Ok(FileBinding {
+            byte_length,
+            sha256,
+        })
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_checked_cargo_example_binding(
+        target_root: &Path,
+        expected: FileBinding,
+    ) -> Result<(CheckedSnapshot, ValidatedFileBinding), String> {
+        const RELATIVE: &str = "debug/examples/fnd_01_evidence_harness";
+
+        let path = target_root.join(RELATIVE);
+        let preliminary = fs::symlink_metadata(&path)
+            .map_err(|error| pending!("Cargo-built public harness metadata: {error}"))?;
+        if preliminary.file_type().is_symlink()
+            || !preliminary.is_file()
+            || preliminary.mode() & 0o100 == 0
+        {
+            return Err(pending!(
+                "Cargo-built public harness must be a regular owner-executable file",
+            ));
+        }
+        let exact_link_count = preliminary.nlink();
+        if !matches!(exact_link_count, 1 | 2) {
+            return Err(pending!(
+                "Cargo-built public harness link count {exact_link_count} is not an admitted Cargo layout",
+            ));
+        }
+        let snapshot = match exact_link_count {
+            1 => checked_snapshot(
+                target_root,
+                RELATIVE,
+                MAX_GATE_EXECUTABLE_BYTES,
+                Some(expected),
+            ),
+            2 => checked_cargo_hardlink_snapshot(
+                target_root,
+                RELATIVE,
+                MAX_GATE_EXECUTABLE_BYTES,
+                Some(expected),
+            ),
+            _ => unreachable!("link count was admitted above"),
+        }
+        .map_err(|error| pending!("Cargo-built public harness: {}", error.detail()))?;
+        if snapshot.identity.file_type != 0o100_000
+            || snapshot.identity.mode & 0o100 == 0
+            || snapshot.identity.link_count != exact_link_count
+        {
+            return Err(pending!(
+                "Cargo-built public harness identity differs from admitted executable",
+            ));
+        }
+
+        let file_binding = FileBinding {
+            byte_length: snapshot.byte_length,
+            sha256: snapshot.sha256,
+        };
+        if file_binding != expected {
+            return Err(pending!(
+                "Cargo-built public harness differs from the build receipt binding",
+            ));
+        }
+        let final_snapshot = match exact_link_count {
+            1 => checked_snapshot(
+                target_root,
+                RELATIVE,
+                MAX_GATE_EXECUTABLE_BYTES,
+                Some(file_binding),
+            ),
+            2 => checked_cargo_hardlink_snapshot(
+                target_root,
+                RELATIVE,
+                MAX_GATE_EXECUTABLE_BYTES,
+                Some(file_binding),
+            ),
+            _ => unreachable!("link count was admitted above"),
+        }
+        .map_err(|error| pending!("recheck Cargo-built public harness: {}", error.detail()))?;
+        if final_snapshot != snapshot {
+            return Err(pending!(
+                "Cargo-built public harness identity changed during layout admission",
+            ));
+        }
+        let binding = ValidatedFileBinding {
+            path: ordinary_utf8_path(&path, "Cargo-built public harness")?,
+            binding: file_binding,
+        };
+        Ok((snapshot, binding))
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_fixture_copy_bounded_executable(
         source: &Path,
         destination: &Path,
     ) -> Result<u64, String> {
         let source_metadata = fs::symlink_metadata(source)
             .map_err(|error| pending!("source executable metadata: {error}"))?;
-        let debug_input_maximum = MAX_GATE_EXECUTABLE_BYTES
-            .checked_mul(2)
-            .ok_or_else(|| pending!("debug executable input cap overflow"))?;
         if source_metadata.file_type().is_symlink()
             || !source_metadata.is_file()
             || source_metadata.len() == 0
-            || source_metadata.len() > debug_input_maximum
+            || source_metadata.len() > MAX_GATE_EXECUTABLE_BYTES
+            || source_metadata.mode() & 0o100 == 0
         {
             return Err(pending!(
-                "debug executable length {} outside 1..={debug_input_maximum}",
+                "source executable must be owner-executable with length {} inside 1..={MAX_GATE_EXECUTABLE_BYTES}; build proof binaries without debug info when necessary",
                 source_metadata.len(),
             ));
         }
-        if source_metadata.len() <= MAX_GATE_EXECUTABLE_BYTES {
-            fs::copy(source, destination)
-                .map_err(|error| pending!("copy selected executable: {error}"))?;
-        } else {
-            let strip = Path::new("/usr/bin/strip");
-            let strip_metadata = fs::metadata(strip)
-                .map_err(|error| pending!("strip fixture tool metadata: {error}"))?;
-            if !strip_metadata.is_file() || strip_metadata.mode() & 0o111 == 0 {
-                return Err(pending!("strip fixture tool is not executable"));
-            }
-            let status = Command::new(strip)
-                .arg("--strip-debug")
-                .arg("-o")
-                .arg(destination)
-                .arg(source)
-                .env_clear()
-                .env("LANG", "C")
-                .env("LC_ALL", "C")
-                .env("TZ", "UTC")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map_err(|error| pending!("strip debug executable: {error}"))?;
-            if !status.success() {
-                return Err(pending!(
-                    "strip debug executable exit {:?}",
-                    status.code(),
-                ));
-            }
-        }
+        fs::copy(source, destination)
+            .map_err(|error| pending!("copy selected executable: {error}"))?;
         let output_metadata = fs::symlink_metadata(destination)
             .map_err(|error| pending!("selected executable metadata: {error}"))?;
         if output_metadata.file_type().is_symlink()
@@ -93426,6 +94525,134 @@ fn fallible(value: Option<u8>) {
     }
 
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_rustup_executable_from_cargo_home(cargo_home: &str) -> Result<PathBuf, String> {
+        let cargo_home = super::trust_std::validate_absolute_lexical_path(
+            cargo_home,
+            "Attest self-reexec CARGO_HOME",
+        )
+        .map_err(|error| pending!("CARGO_HOME authority: {error}"))?;
+        Ok(cargo_home.join("bin/rustup"))
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_require_physical_directory_chain(
+        path: &Path,
+        subject: &str,
+    ) -> Result<(), String> {
+        let path_text = ordinary_utf8_path(path, subject)?;
+        let path = super::trust_std::validate_absolute_lexical_path(&path_text, subject)
+            .map_err(|error| pending!("{subject}: {error}"))?;
+        let mut current = PathBuf::from("/");
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(component) => {
+                    current.push(component);
+                    let metadata = fs::symlink_metadata(&current)
+                        .map_err(|error| pending!("{subject} metadata: {error}"))?;
+                    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                        return Err(pending!(
+                            "{subject}: {} is not a physical directory",
+                            current.display(),
+                        ));
+                    }
+                }
+                _ => return Err(pending!("{subject}: non-lexical path component")),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_checked_rustup_authority(
+        cargo_home: &str,
+    ) -> Result<(PathBuf, CheckedSnapshot), String> {
+        let rustup = ordinary_rustup_executable_from_cargo_home(cargo_home)?;
+        let cargo_home = rustup
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| pending!("rustup authority has no CARGO_HOME parent"))?;
+        ordinary_require_physical_directory_chain(cargo_home, "CARGO_HOME authority")?;
+        let snapshot = checked_snapshot(
+            cargo_home,
+            "bin/rustup",
+            MAX_GATE_EXECUTABLE_BYTES,
+            None,
+        )
+        .map_err(|error| pending!("rustup authority: {error}"))?;
+        if snapshot.byte_length == 0
+            || snapshot.identity.file_type != 0o100_000
+            || snapshot.identity.mode & 0o100 == 0
+            || snapshot.identity.link_count != 1
+        {
+            return Err(pending!(
+                "rustup authority must be nonempty, physical, owner-executable, and nlink-one",
+            ));
+        }
+        Ok((rustup, snapshot))
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_expected_rust_sysroot(
+        rustup_home: &str,
+        current_toolchain: &str,
+    ) -> Result<PathBuf, String> {
+        if current_toolchain != super::trust_std::CURRENT_ORDINARY_TOOLCHAIN {
+            return Err(pending!(
+                "rust sysroot toolchain differs from the current compiled authority",
+            ));
+        }
+        let rustup_home = super::trust_std::validate_absolute_lexical_path(
+            rustup_home,
+            "Attest self-reexec RUSTUP_HOME",
+        )
+        .map_err(|error| pending!("RUSTUP_HOME authority: {error}"))?;
+        let expected = rustup_home
+            .join("toolchains")
+            .join(format!("{current_toolchain}-x86_64-unknown-linux-gnu"));
+        let expected_text = ordinary_utf8_path(&expected, "expected rust sysroot")?;
+        super::trust_std::validate_absolute_lexical_path(&expected_text, "expected rust sysroot")
+            .map_err(|error| pending!("expected rust sysroot: {error}"))
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_parse_rust_sysroot_output(
+        stdout: &[u8],
+        stderr: &[u8],
+        expected: &Path,
+    ) -> Result<PathBuf, String> {
+        if !stderr.is_empty() {
+            return Err(pending!("rust sysroot query stderr must be empty"));
+        }
+        if stdout.is_empty() || stdout.len() > 4097 || stdout.starts_with(&[0xef, 0xbb, 0xbf]) {
+            return Err(pending!("rust sysroot query stdout framing is invalid"));
+        }
+        let line = stdout
+            .strip_suffix(b"\n")
+            .ok_or_else(|| pending!("rust sysroot query terminal LF missing"))?;
+        if line.is_empty()
+            || line.contains(&b'\n')
+            || line.contains(&b'\r')
+            || line.contains(&0)
+        {
+            return Err(pending!("rust sysroot query must contain one canonical line"));
+        }
+        let line = std::str::from_utf8(line)
+            .map_err(|_| pending!("rust sysroot query is not UTF-8"))?;
+        let observed = super::trust_std::validate_absolute_lexical_path(
+            line,
+            "observed rust sysroot",
+        )
+        .map_err(|error| pending!("observed rust sysroot: {error}"))?;
+        if observed != expected {
+            return Err(pending!(
+                "observed rust sysroot differs from the current toolchain formula",
+            ));
+        }
+        Ok(observed)
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
     fn ordinary_attest_self_reexec_subject() -> Result<OrdinaryAttestSelfReexecSubject, String> {
         use super::trust_std::{AUTHORING_PATHS, INTEGRATION_SEAL_PATHS};
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -93433,6 +94660,9 @@ fn fallible(value: Option<u8>) {
 
         static NEXT_SUBJECT: AtomicU64 = AtomicU64::new(1);
 
+        let source_root = repository_root();
+        let current_identity = canonical_campaign_proof_identity_at(&source_root)
+            .map_err(|error| error.stable())?;
         let sequence = NEXT_SUBJECT.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -93462,7 +94692,6 @@ fn fallible(value: Option<u8>) {
         let (run_id, root) =
             fresh.ok_or_else(|| pending!("collision-safe fresh root allocation exhausted"))?;
 
-        let source_root = repository_root();
         for path in AUTHORING_PATHS {
             let bytes = fs::read(source_root.join(path))
                 .map_err(|error| pending!("read source authoring {path}: {error}"))?;
@@ -93489,23 +94718,54 @@ fn fallible(value: Option<u8>) {
             let bytes = fs::read(source_root.join(path)).map_err(|error| error.to_string())?;
             ordinary_fixture_write_new(&root, path, &bytes)?;
         }
+        let fixture_identity =
+            canonical_campaign_proof_identity_at(&root).map_err(|error| error.stable())?;
+        if fixture_identity != current_identity {
+            return Err(pending!(
+                "copied fixture toolchain identity differs from source authority",
+            ));
+        }
         let authoring_marker = live_authoring_marker_text(&root);
 
-        let sysroot_output = Command::new("rustup")
-            .args(["run", "nightly-2026-07-11", "rustc", "--print", "sysroot"])
-            .output()
-            .map_err(|error| pending!("query rust sysroot: {error}"))?;
+        let cargo_home = super::trust_std::read_unique_environment("CARGO_HOME")
+            .map_err(|error| pending!("read CARGO_HOME authority: {error}"))?;
+        let rustup_home = super::trust_std::read_unique_environment("RUSTUP_HOME")
+            .map_err(|error| pending!("read RUSTUP_HOME authority: {error}"))?;
+        let (rustup_executable, rustup_pre) =
+            ordinary_checked_rustup_authority(&cargo_home)?;
+        let expected_sysroot = ordinary_expected_rust_sysroot(
+            &rustup_home,
+            current_identity.toolchain.as_str(),
+        )?;
+        let sysroot_output = Command::new(&rustup_executable)
+            .args([
+                "run",
+                current_identity.toolchain.as_str(),
+                "rustc",
+                "--print",
+                "sysroot",
+            ])
+            .output();
+        let (rustup_post_path, rustup_post) = ordinary_checked_rustup_authority(&cargo_home)?;
+        if rustup_post_path != rustup_executable || rustup_post != rustup_pre {
+            return Err(pending!("rustup authority changed during sysroot query"));
+        }
+        let sysroot_output =
+            sysroot_output.map_err(|error| pending!("query rust sysroot: {error}"))?;
         if !sysroot_output.status.success() {
             return Err(pending!(
                 "query rust sysroot exit {:?}",
                 sysroot_output.status.code(),
             ));
         }
-        let sysroot = std::str::from_utf8(&sysroot_output.stdout)
-            .map_err(|_| pending!("rust sysroot is not UTF-8"))?
-            .strip_suffix('\n')
-            .ok_or_else(|| pending!("rust sysroot newline missing"))?;
-        let toolchain_bin = Path::new(sysroot).join("bin");
+        let sysroot = ordinary_parse_rust_sysroot_output(
+            &sysroot_output.stdout,
+            &sysroot_output.stderr,
+            &expected_sysroot,
+        )?;
+        ordinary_require_physical_directory_chain(&sysroot, "current rust sysroot")?;
+        let toolchain_bin = sysroot.join("bin");
+        ordinary_require_physical_directory_chain(&toolchain_bin, "current rust toolchain bin")?;
         let closed_path = format!(
             "{}:/usr/bin:/bin",
             toolchain_bin
@@ -93571,8 +94831,11 @@ fn fallible(value: Option<u8>) {
         if !target.is_absolute(){return Err(pending!("CARGO_TARGET_DIR must be absolute"));}
         let expected=target.join("debug/examples/fnd_01_evidence_harness");
         if public_harness!=expected{return Err(pending!("public harness must be the Cargo example artifact"));}
-        let (_,public_binding)=ordinary_checked_file_binding(&target,"debug/examples/fnd_01_evidence_harness",MAX_GATE_EXECUTABLE_BYTES,None,"Cargo-built public harness")?;
+        let public_receipt_binding=ordinary_public_harness_receipt_binding()?;
+        let (_,public_binding)=ordinary_checked_cargo_example_binding(&target,public_receipt_binding)?;
         ordinary_fixture_install_executable(&public_harness, &selected_executable)?;
+        let (_,rebound_public_binding)=ordinary_checked_cargo_example_binding(&target,public_receipt_binding)?;
+        if rebound_public_binding.binding!=public_binding.binding{return Err(pending!("Cargo-built public harness changed during fixture installation"));}
         let (_,installed_binding)=ordinary_checked_file_binding(&root,&selected_relative,MAX_GATE_EXECUTABLE_BYTES,None,"installed public harness")?;
         if public_binding.binding!=installed_binding.binding{return Err(pending!("installed public harness bytes differ"));}
         let fixture_driver = selected_executable.with_file_name("fnd_01_evidence_fixture_driver");
@@ -93724,7 +94987,7 @@ fn fallible(value: Option<u8>) {
             &public_harness,
         )
         .map_err(|error| error.to_string())?;
-        let fresh_inventory = super::phase_b_std::inventory_fresh_native_tools(
+        let fresh_inventory = super::phase_b_std::inventory_current_ordinary_fresh_native_tools(
             &invocation.repository_root,
             invocation.mode,
             &invocation.run_id,
@@ -94030,7 +95293,7 @@ fn fallible(value: Option<u8>) {
             ("RUSTFMT".to_owned(), tools.rustfmt.clone()),
             (
                 "RUSTUP_TOOLCHAIN".to_owned(),
-                "nightly-2026-07-11".to_owned(),
+                super::trust_std::CURRENT_ORDINARY_TOOLCHAIN.to_owned(),
             ),
             ("SOURCE_DATE_EPOCH".to_owned(), "0".to_owned()),
             ("TZ".to_owned(), "UTC".to_owned()),
@@ -96635,7 +97898,7 @@ fn fallible(value: Option<u8>) {
         let marker = live_authoring_marker_text(&repository_root);
         let environment = BootstrapEnvironment {
             authoring_marker: marker,
-            closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+            closed_path: "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin".to_owned(),
             integration_seal: None,
             producer_outer_record_path: None,
             attester_outer_record_path: None,
@@ -96669,7 +97932,7 @@ fn fallible(value: Option<u8>) {
         let marker = live_authoring_marker_text(&repository_root);
         let environment = BootstrapEnvironment {
             authoring_marker: marker,
-            closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+            closed_path: "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin".to_owned(),
             integration_seal: None,
             producer_outer_record_path: None,
             attester_outer_record_path: None,
@@ -96957,7 +98220,7 @@ fn fallible(value: Option<u8>) {
             ORDINARY_NATIVE_TOOL_COUNT,
         );
         ordinary_closed_path_toolchain_authority(
-            "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+            "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin",
         )
         .expect("pure closed PATH grammar");
         let env_digest = ordinary_environment_set_digest();
@@ -96991,7 +98254,7 @@ fn fallible(value: Option<u8>) {
         let repository_root = PathBuf::from("/repo/fastmcp_rust");
         let bootstrap_environment = BootstrapEnvironment {
             authoring_marker: "FND01AUTHORv2:fixture".to_owned(),
-            closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+            closed_path: "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin".to_owned(),
             integration_seal: None,
             producer_outer_record_path: None,
             attester_outer_record_path: None,
@@ -97004,7 +98267,7 @@ fn fallible(value: Option<u8>) {
             ordinary_sealed_nonzero_digest(0x61),
             [0; 32],
             ordinary_sealed_nonzero_digest(0x62),
-            "/toolchains/nightly-2026-07-11/bin/cargo",
+            "/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
             bootstrap_environment.clone(),
         )
         .expect("Produce sealed full-field join");
@@ -97031,7 +98294,7 @@ fn fallible(value: Option<u8>) {
         assert_eq!(expectation.environment_set_sha256, env_digest);
         assert_eq!(
             expectation.cargo_executable,
-            "/toolchains/nightly-2026-07-11/bin/cargo"
+            "/toolchains/nightly-2026-08-25/bin/cargo-rch-real"
         );
         assert!(!expectation.build_environment.is_empty());
         assert!(expectation
@@ -97057,7 +98320,7 @@ fn fallible(value: Option<u8>) {
         .expect("attest pure control");
         let attest_env = BootstrapEnvironment {
             authoring_marker: "FND01AUTHORv2:fixture".to_owned(),
-            closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+            closed_path: "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin".to_owned(),
             integration_seal: Some("FND01SEALv1:fixture".to_owned()),
             producer_outer_record_path: Some(format!(
                 ".fnd01-run/controller/{run_id}/producer-outer.bin"
@@ -97072,7 +98335,7 @@ fn fallible(value: Option<u8>) {
             ordinary_sealed_nonzero_digest(0x71),
             ordinary_sealed_nonzero_digest(0x72),
             ordinary_sealed_nonzero_digest(0x73),
-            "/toolchains/nightly-2026-07-11/bin/cargo",
+            "/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
             attest_env,
         )
         .expect("Attest sealed full-field join");
@@ -97086,7 +98349,7 @@ fn fallible(value: Option<u8>) {
             ordinary_sealed_nonzero_digest(1),
             [0; 32],
             ordinary_sealed_nonzero_digest(2),
-            "/toolchains/nightly-2026-07-11/bin/cargo",
+            "/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
             bootstrap_environment.clone(),
         )
         .expect_err("Gate cannot seal ordinary expectation");
@@ -97105,11 +98368,41 @@ fn fallible(value: Option<u8>) {
             ordinary_sealed_nonzero_digest(1),
             [0; 32],
             [0; 32],
-            "/toolchains/nightly-2026-07-11/bin/cargo",
+            "/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
             bootstrap_environment.clone(),
         )
         .expect_err("zero tool_set must fail closed");
         assert!(zero_tool.contains("tool_set_sha256"), "{zero_tool}");
+        let wrapper_cargo = ordinary_sealed_control_ledger_expectation_join(
+            BootstrapMode::Produce,
+            &repository_root,
+            &control,
+            ordinary_sealed_nonzero_digest(1),
+            [0; 32],
+            ordinary_sealed_nonzero_digest(2),
+            "/toolchains/nightly-2026-08-25/bin/cargo",
+            bootstrap_environment.clone(),
+        )
+        .expect_err("current orchestration wrapper must not satisfy the real Cargo authority");
+        assert_eq!(
+            wrapper_cargo,
+            "E_ORDINARY_HANDOFF_PENDING: sealed cargo_executable differs from current real Cargo authority",
+        );
+        assert_eq!(
+            ordinary_sealed_control_ledger_expectation_join(
+                BootstrapMode::Produce,
+                &repository_root,
+                &control,
+                ordinary_sealed_nonzero_digest(1),
+                [0; 32],
+                ordinary_sealed_nonzero_digest(2),
+                "/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
+                bootstrap_environment.clone(),
+            )
+            .expect("real Cargo pristine sealed-ledger reacceptance")
+            .cargo_executable,
+            "/toolchains/nightly-2026-08-25/bin/cargo-rch-real",
+        );
         let relative_cargo = ordinary_sealed_control_ledger_expectation_join(
             BootstrapMode::Produce,
             &repository_root,
@@ -97204,7 +98497,7 @@ fn fallible(value: Option<u8>) {
         assert_eq!(control.role, "integration-producer");
         assert_ne!(control.process_id, 0);
         ordinary_closed_path_toolchain_authority(
-            "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+            "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin",
         )
         .expect("B-R3 pure closed PATH");
         assert_eq!(
@@ -97242,7 +98535,7 @@ fn fallible(value: Option<u8>) {
         let pure = ordinary_reprobe_dual_path_pure_authority().expect(label);
         assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
         let subject = ordinary_attest_self_reexec_subject().expect(label);
-        let fresh = super::phase_b_std::inventory_fresh_native_tools(
+        let fresh = super::phase_b_std::inventory_current_ordinary_fresh_native_tools(
             &subject.root,
             BootstrapMode::Attest,
             &subject.run_id,
@@ -97297,9 +98590,243 @@ fn fallible(value: Option<u8>) {
         assert_eq!(error.route().stage().as_str(), "reprobe");
     }
 
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    const ORDINARY_CARGO_EXAMPLE_FIXTURE_BYTES: &[u8] = b"#!/bin/sh\nexit 0\n";
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_cargo_example_fixture_binding() -> FileBinding {
+        FileBinding {
+            byte_length: u64::try_from(ORDINARY_CARGO_EXAMPLE_FIXTURE_BYTES.len())
+                .expect("Cargo example fixture length fits u64"),
+            sha256: trust_sha256(ORDINARY_CARGO_EXAMPLE_FIXTURE_BYTES)
+                .expect("Cargo example fixture digest"),
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+    fn ordinary_cargo_example_hardlink_fixture(peer_name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Cargo example fixture clock")
+            .as_nanos();
+        let root = Path::new("/tmp").join(format!(
+            "fastmcp-fnd01-cargo-example-{:032x}",
+            now ^ (u128::from(std::process::id()) << 64) ^ u128::from(sequence),
+        ));
+        fs::create_dir(&root).expect("exclusive Cargo example fixture root");
+        let stable_relative = "debug/examples/fnd_01_evidence_harness";
+        ordinary_fixture_write_new(
+            &root,
+            stable_relative,
+            ORDINARY_CARGO_EXAMPLE_FIXTURE_BYTES,
+        )
+        .expect("write Cargo example fixture");
+        let stable = root.join(stable_relative);
+        let mut permissions = fs::metadata(&stable)
+            .expect("Cargo example fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&stable, permissions).expect("Cargo example fixture chmod");
+        fs::hard_link(&stable, root.join("debug/examples").join(peer_name))
+            .expect("Cargo example fixture hardlink");
+        root
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn ordinary_b_r1_qualified_linux_dual_path_tool_reprobe() {
+        assert_eq!(
+            ordinary_rustup_executable_from_cargo_home("/fixture/cargo-home")
+                .expect("absolute CARGO_HOME authority"),
+            Path::new("/fixture/cargo-home/bin/rustup"),
+        );
+        assert_eq!(
+            ordinary_rustup_executable_from_cargo_home("fixture/cargo-home")
+                .expect_err("relative CARGO_HOME must fail closed"),
+            "E_ORDINARY_HANDOFF_PENDING: CARGO_HOME authority: E_ROOT_PATH|Attest self-reexec CARGO_HOME: invalid absolute lexical path",
+        );
+        assert_eq!(
+            ordinary_rustup_executable_from_cargo_home("/fixture/../cargo-home")
+                .expect_err("parent-traversing CARGO_HOME must fail closed"),
+            "E_ORDINARY_HANDOFF_PENDING: CARGO_HOME authority: E_ROOT_PATH|Attest self-reexec CARGO_HOME: invalid component",
+        );
+        let expected_sysroot = ordinary_expected_rust_sysroot(
+            "/fixture/rustup-home",
+            super::trust_std::CURRENT_ORDINARY_TOOLCHAIN,
+        )
+        .expect("current rust sysroot formula");
+        let expected_sysroot_line = format!("{}\n", expected_sysroot.display());
+        assert_eq!(
+            ordinary_parse_rust_sysroot_output(
+                expected_sysroot_line.as_bytes(),
+                b"",
+                &expected_sysroot,
+            )
+            .expect("canonical rust sysroot output"),
+            expected_sysroot,
+        );
+        assert_eq!(
+            ordinary_expected_rust_sysroot("/fixture/rustup-home", "nightly-2026-08-20")
+                .expect_err("stale toolchain sysroot formula must fail closed"),
+            "E_ORDINARY_HANDOFF_PENDING: rust sysroot toolchain differs from the current compiled authority",
+        );
+        for (stdout, stderr, expected_error) in [
+            (
+                format!("{}\n\n", expected_sysroot.display()).into_bytes(),
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: rust sysroot query must contain one canonical line",
+            ),
+            (
+                b"relative/toolchain\n".to_vec(),
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: observed rust sysroot: E_ROOT_PATH|observed rust sysroot: invalid absolute lexical path",
+            ),
+            (
+                b"/fixture/rustup-home/toolchains/nightly-2026-08-20-x86_64-unknown-linux-gnu\n"
+                    .to_vec(),
+                Vec::new(),
+                "E_ORDINARY_HANDOFF_PENDING: observed rust sysroot differs from the current toolchain formula",
+            ),
+            (
+                expected_sysroot_line.as_bytes().to_vec(),
+                b"unexpected stderr".to_vec(),
+                "E_ORDINARY_HANDOFF_PENDING: rust sysroot query stderr must be empty",
+            ),
+        ] {
+            assert_eq!(
+                ordinary_parse_rust_sysroot_output(&stdout, &stderr, &expected_sysroot)
+                    .expect_err("rust sysroot output drift must fail closed"),
+                expected_error,
+            );
+        }
+        assert_eq!(
+            ordinary_parse_rust_sysroot_output(
+                expected_sysroot_line.as_bytes(),
+                b"",
+                &expected_sysroot,
+            )
+            .expect("canonical rust sysroot pristine reacceptance"),
+            expected_sysroot,
+        );
+
+        let rustup_fixture = ordinary_cargo_example_hardlink_fixture(
+            "fnd_01_evidence_harness-0123456789abcdef",
+        );
+        let cargo_home = rustup_fixture.join("cargo-home");
+        ordinary_fixture_write_new(
+            &rustup_fixture,
+            "cargo-home/bin/rustup",
+            b"#!/bin/sh\nexit 0\n",
+        )
+        .expect("write physical rustup authority fixture");
+        let rustup_path = cargo_home.join("bin/rustup");
+        let mut rustup_permissions = fs::metadata(&rustup_path)
+            .expect("rustup authority fixture metadata")
+            .permissions();
+        rustup_permissions.set_mode(0o755);
+        fs::set_permissions(&rustup_path, rustup_permissions)
+            .expect("rustup authority fixture chmod");
+        let cargo_home_text = ordinary_utf8_path(&cargo_home, "rustup fixture CARGO_HOME")
+            .expect("rustup fixture CARGO_HOME UTF-8");
+        let pristine = ordinary_checked_rustup_authority(&cargo_home_text)
+            .expect("physical rustup authority fixture");
+        let cargo_home_alias = rustup_fixture.join("cargo-home-alias");
+        std::os::unix::fs::symlink(&cargo_home, &cargo_home_alias)
+            .expect("symlinked CARGO_HOME negative");
+        let before = ordinary_fixture_tree_state(&rustup_fixture)
+            .expect("symlinked CARGO_HOME fixture state");
+        let alias_text = ordinary_utf8_path(&cargo_home_alias, "symlinked CARGO_HOME")
+            .expect("symlinked CARGO_HOME UTF-8");
+        let error = ordinary_checked_rustup_authority(&alias_text)
+            .expect_err("symlinked CARGO_HOME must fail closed");
+        assert_eq!(
+            error,
+            format!(
+                "E_ORDINARY_HANDOFF_PENDING: CARGO_HOME authority: {} is not a physical directory",
+                cargo_home_alias.display(),
+            ),
+        );
+        assert_eq!(
+            ordinary_fixture_tree_state(&rustup_fixture)
+                .expect("symlinked CARGO_HOME fixture-state recheck"),
+            before,
+            "rejected symlinked CARGO_HOME leaves the complete fixture unchanged",
+        );
+        assert_eq!(
+            ordinary_checked_rustup_authority(&cargo_home_text)
+                .expect("physical rustup authority pristine reacceptance"),
+            pristine,
+        );
+
+        let fixture_binding = ordinary_cargo_example_fixture_binding();
+        let valid = ordinary_cargo_example_hardlink_fixture(
+            "fnd_01_evidence_harness-0123456789abcdef",
+        );
+        let (valid_snapshot, _) = ordinary_checked_cargo_example_binding(
+            &valid,
+            fixture_binding,
+        )
+        .expect("Cargo hardlink receipt binding");
+        assert_eq!(valid_snapshot.identity.link_count, 2);
+        let generic_error = checked_snapshot(
+            &valid,
+            "debug/examples/fnd_01_evidence_harness",
+            MAX_GATE_EXECUTABLE_BYTES,
+            None,
+        )
+        .expect_err("generic snapshot must retain nlink-one authority");
+        assert_eq!(generic_error.code(), "E_FILE_HARDLINK");
+        assert_eq!(
+            generic_error.detail(),
+            "debug/examples/fnd_01_evidence_harness: nlink=2 differs from exact admitted count 1",
+        );
+
+        let mismatched = ordinary_cargo_example_hardlink_fixture(
+            "fnd_01_evidence_harness-fedcba9876543210",
+        );
+        let before = ordinary_fixture_tree_state(&mismatched)
+            .expect("snapshot mismatched Cargo binding fixture");
+        let mut wrong_binding = fixture_binding;
+        wrong_binding.sha256[31] ^= 1;
+        let error = ordinary_checked_cargo_example_binding(&mismatched, wrong_binding)
+            .expect_err("one-byte Cargo receipt digest mismatch");
+        assert_eq!(
+            error,
+            "E_ORDINARY_HANDOFF_PENDING: Cargo-built public harness: debug/examples/fnd_01_evidence_harness: marker digest mismatch",
+        );
+        assert_eq!(
+            ordinary_fixture_tree_state(&mismatched)
+                .expect("re-snapshot mismatched Cargo binding fixture"),
+            before,
+            "rejected Cargo receipt binding must remain byte-for-byte unchanged",
+        );
+
+        let overlinked = ordinary_cargo_example_hardlink_fixture(
+            "fnd_01_evidence_harness-fedcba9876543210",
+        );
+        fs::hard_link(
+            overlinked.join("debug/examples/fnd_01_evidence_harness"),
+            overlinked.join("debug/examples/fnd_01_evidence_harness-extra"),
+        )
+        .expect("third Cargo example fixture hardlink");
+        let before = ordinary_fixture_tree_state(&overlinked)
+            .expect("snapshot overlinked Cargo fixture");
+        let error = ordinary_checked_cargo_example_binding(&overlinked, fixture_binding)
+            .expect_err("three-link Cargo artifact");
+        assert_eq!(
+            error,
+            "E_ORDINARY_HANDOFF_PENDING: Cargo-built public harness link count 3 is not an admitted Cargo layout",
+        );
+        assert_eq!(
+            ordinary_fixture_tree_state(&overlinked)
+                .expect("re-snapshot overlinked Cargo fixture"),
+            before,
+            "rejected three-link Cargo layout must remain byte-for-byte unchanged",
+        );
         qualified_linux_live_reprobe("B-R1");
     }
 
@@ -97366,7 +98893,7 @@ fn fallible(value: Option<u8>) {
             };
             let environment = BootstrapEnvironment {
                 authoring_marker: live_authoring_marker_text(&fresh_root),
-                closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+                closed_path: "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin".to_owned(),
                 integration_seal: None,
                 producer_outer_record_path: None,
                 attester_outer_record_path: None,
@@ -97441,7 +98968,7 @@ fn fallible(value: Option<u8>) {
             };
             let environment = BootstrapEnvironment {
                 authoring_marker: live_authoring_marker_text(&repository_root),
-                closed_path: "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin".to_owned(),
+                closed_path: "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin".to_owned(),
                 integration_seal: None,
                 producer_outer_record_path: None,
                 attester_outer_record_path: None,
@@ -97479,7 +99006,7 @@ fn fallible(value: Option<u8>) {
             &repository_root,
             BootstrapMode::Produce,
             "0123456789abcdef0123456789abcdef",
-            "/toolchains/nightly-2026-07-11/bin:/usr/bin:/bin",
+            "/toolchains/nightly-2026-08-25/bin:/usr/bin:/bin",
         );
         match result {
             Ok(reprobe) => {
@@ -97857,8 +99384,8 @@ fn fallible(value: Option<u8>) {
     }
 
     fn ordinary_environment_set_digest() -> [u8; 32] {
-        super::trust_std::environment_set_digest()
-            .expect("compiled environment profile digest")
+        super::trust_std::current_ordinary_environment_set_digest()
+            .expect("current ordinary environment profile digest")
     }
 
     #[derive(Debug)]
@@ -97910,7 +99437,7 @@ fn fallible(value: Option<u8>) {
         debug_assert_eq!(pure.native_tool_count, ORDINARY_NATIVE_TOOL_COUNT);
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let inventory = super::phase_b_std::inventory_existing_native_tools(
+            let inventory = super::phase_b_std::inventory_current_ordinary_existing_native_tools(
                 repository_root,
                 mode,
                 run_id,
