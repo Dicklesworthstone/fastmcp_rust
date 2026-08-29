@@ -1185,7 +1185,10 @@ fn locked_source_packages(lock_path: &Path, label: &str) -> BTreeSet<LockedSourc
         .iter()
         .filter_map(|package| {
             let table = package.as_table().unwrap_or_else(|| {
-                panic!("{label} lock {} has a non-table package", lock_path.display())
+                panic!(
+                    "{label} lock {} has a non-table package",
+                    lock_path.display()
+                )
             });
             let source = table.get("source")?.as_str().unwrap_or_else(|| {
                 panic!(
